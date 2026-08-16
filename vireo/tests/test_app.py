@@ -8296,6 +8296,40 @@ def test_wildlife_excluded_route_does_not_add_landscape_keyword(app_and_db):
     assert all(k["name"] != "Landscape" for k in keywords)
 
 
+def test_batch_wildlife_excluded_updates_only_changed_photos_and_undoes(app_and_db):
+    app, db = app_and_db
+    photo_ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY id LIMIT 2"
+        ).fetchall()
+    ]
+    db.update_photo_wildlife_excluded(photo_ids[0], True)
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/batch/wildlife-excluded",
+        json={"photo_ids": photo_ids, "excluded": True},
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["photo_ids"] == [photo_ids[1]]
+    states = db.conn.execute(
+        "SELECT id, wildlife_excluded FROM photos WHERE id IN (?, ?) ORDER BY id",
+        photo_ids,
+    ).fetchall()
+    assert [row["wildlife_excluded"] for row in states] == [1, 1]
+
+    undo = client.post("/api/undo")
+    assert undo.status_code == 200
+    states = db.conn.execute(
+        "SELECT id, wildlife_excluded FROM photos WHERE id IN (?, ?) ORDER BY id",
+        photo_ids,
+    ).fetchall()
+    assert [row["wildlife_excluded"] for row in states] == [1, 0]
+
+
 def test_batch_keyword_route_handles_non_string_type(app_and_db):
     """Same regression for the batch endpoint."""
     app, db = app_and_db
@@ -8797,14 +8831,8 @@ def test_batch_keyword_route_chunks_large_existing_keyword_lookup(app_and_db):
     assert resp.get_json()["updated"] == len(ids)
 
 
-def test_create_app_runs_wildlife_backfill_synchronously_on_first_boot(tmp_path, monkeypatch):
-    """Regression: on first boot after upgrade (wildlife_backfill_done
-    marker unset), create_app must complete the species-marking +
-    Wildlife-backfill pipeline synchronously before returning, so user
-    edits via the served HTTP API can't race with the one-shot backfill
-    overwriting their Wildlife removals."""
-    from unittest.mock import MagicMock, patch
-
+def test_create_app_retires_builtin_wildlife_synchronously(tmp_path, monkeypatch):
+    """The old generated genre is gone before the HTTP app is returned."""
     from db import Database
 
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -8820,38 +8848,40 @@ def test_create_app_runs_wildlife_backfill_synchronously_on_first_boot(tmp_path,
     thumb_dir = str(tmp_path / "thumbs")
     os.makedirs(thumb_dir)
 
-    # Pre-create the DB with the marker UNSET (simulates first boot
-    # post-upgrade).
     db = Database(db_path)
     ws_id = db.ensure_default_workspace()
     db.set_active_workspace(ws_id)
-    assert db.get_meta(Database._WILDLIFE_BACKFILL_DONE_KEY) != "1", (
-        "Pre-condition: marker should be unset before create_app"
+    folder_id = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws_id, folder_id)
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
     )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        (photo_id, wildlife_id),
+    )
+    db.conn.execute(
+        "DELETE FROM db_meta WHERE key = ?",
+        (Database._RETIRED_WILDLIFE_GENRE_KEY,),
+    )
+    db.conn.commit()
     db.close()
 
-    # Stub taxonomy loading to return a non-None object so the sync path
-    # runs mark_species + backfill. mark_species_keywords gets a real DB
-    # call but the stub taxonomy returns None for every lookup, so no
-    # rows are actually changed — we just need it to complete without
-    # raising so the marker gets set.
-    fake_tax = MagicMock()
-    fake_tax.lookup.return_value = None
-
-    with patch("taxonomy.load_local_taxonomy", return_value=fake_tax):
-        app = create_app(
-            db_path=db_path, thumb_cache_dir=thumb_dir, api_token="test",
-        )
-        assert app is not None
-
-    # After create_app returns, the marker MUST be set — the synchronous
-    # path ran. (If it had been async, we'd be racing the background
-    # thread here and the marker might or might not be set yet.)
-    db2 = Database(db_path)
-    assert db2.get_meta(Database._WILDLIFE_BACKFILL_DONE_KEY) == "1", (
-        "Wildlife backfill marker must be set synchronously by create_app "
-        "on first boot — otherwise user edits race the backfill."
+    app = create_app(
+        db_path=db_path, thumb_cache_dir=thumb_dir, api_token="test",
     )
+    assert app is not None
+
+    db2 = Database(db_path, initialize_schema=False)
+    assert db2.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+    assert db2.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (photo_id, wildlife_id),
+    ).fetchone() is None
     db2.close()
 
 
@@ -8947,7 +8977,6 @@ def test_create_app_skips_taxonomy_when_duplicate_repair_is_impossible(
     db = Database(db_path)
     ws_id = db.ensure_default_workspace()
     db.set_active_workspace(ws_id)
-    db.set_meta(Database._WILDLIFE_BACKFILL_DONE_KEY, "1")
     db.conn.execute(
         "DELETE FROM db_meta WHERE key = ?",
         (Database._DUPLICATE_PHOTO_SPECIES_REPAIR_KEY,),

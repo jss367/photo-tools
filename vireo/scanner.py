@@ -278,6 +278,10 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
     """Read flat and hierarchical keywords from XMP and populate the database."""
     flat_keywords = read_keywords(xmp_path_str)
     hier_keywords = read_hierarchical_keywords(xmp_path_str)
+    pending_flat_removals = db.get_pending_keyword_removal_keys(photo_id)
+    pending_hierarchical_removals = db.get_pending_keyword_removal_keys(
+        photo_id, hierarchical=True,
+    )
 
     # Build hierarchy from lr:hierarchicalSubject
     # e.g., 'Birds|Raptors|Black kite' creates Birds -> Raptors -> Black kite
@@ -288,6 +292,11 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
     for hier in hier_keywords:
         parts = hier.split("|")
         if any(not keyword_match_key(part) for part in parts):
+            continue
+        if any(
+            keyword_match_key(part) in pending_hierarchical_removals
+            for part in parts
+        ):
             continue
         parent_id = None
         for part in parts:
@@ -310,6 +319,11 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
     for kw in flat_keywords:
         key = keyword_match_key(kw)
         if not key:
+            continue
+        # A sidecar write can be intentionally deferred in the sync panel.
+        # Do not resurrect the DB association from the still-stale sidecar
+        # while its removal is pending.
+        if key in pending_flat_removals:
             continue
         if key in existing_keys:
             continue

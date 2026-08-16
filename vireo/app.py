@@ -4986,6 +4986,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     # tags or stale XMP. The method is idempotent (db_meta-gated) so
     # subsequent boots are a cheap SELECT.
     init_db.normalize_keyword_data()
+    retired_wildlife = init_db.retire_builtin_wildlife_genre()
+    if retired_wildlife:
+        log.info(
+            "Retired the built-in Wildlife genre from %d photo(s)",
+            retired_wildlife,
+        )
     repaired_location_ancestors = init_db.repair_misclassified_location_ancestors()
     if repaired_location_ancestors:
         log.info(
@@ -5153,31 +5159,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         cfg.migrate_default_strategy_to_process_id(init_db)
     init_db.create_default_collections_for_all_workspaces()
 
-    # Wildlife backfill timing:
-    # - Subsequent boots: marker is set, nothing to do, fast.
-    # - First boot after upgrade (marker unset): run species marking +
-    #   backfill SYNCHRONOUSLY before accepting requests. Otherwise a
-    #   user could remove Wildlife from a species-tagged photo during
-    #   the few-second window before the background thread completes,
-    #   and the backfill would silently re-add it (clobbering user
-    #   intent before the marker gets set).
-    # - mark_species runs in the background regardless, to catch new
-    #   species keywords added between boots. The backfill won't re-run
-    #   from the background path (marker check inside backfill).
+    # Keep taxonomy typing and duplicate-species repair fresh in the
+    # background. Wildlife classification eligibility is stored separately
+    # on photos; species marking no longer materializes a Wildlife keyword.
     import threading
 
-    from db import Database as _Database  # avoid shadowing in nested fn
-
-    _WILDLIFE_BACKFILL_DONE_KEY = _Database._WILDLIFE_BACKFILL_DONE_KEY
-
-    def _mark_species_and_maybe_backfill(db, log_label):
-        """Load taxonomy, mark species keywords, and run the one-shot
-        Wildlife backfill. Returns silently on any failure so callers
-        can choose between sync (block startup) and async (log only)."""
+    def _mark_species_and_repair(db, log_label):
+        """Load taxonomy, mark species keywords, and repair duplicates."""
         tax = _load_startup_taxonomy()
         if tax is None:
-            # No taxonomy yet — leave the marker unset so the backfill
-            # retries on a future boot once taxonomy is downloaded.
             log.debug("[%s] taxonomy not loaded; deferring species marking", log_label)
             return
         try:
@@ -5195,22 +5185,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             log.debug(
                 "[%s] species marking/repair failed", log_label, exc_info=True,
             )
-            return
-        try:
-            db.backfill_wildlife_genre()
-        except Exception:
-            log.debug("[%s] backfill_wildlife_genre failed", log_label, exc_info=True)
-
-    if init_db.get_meta(_WILDLIFE_BACKFILL_DONE_KEY) != "1":
-        # First boot after upgrade. Block startup until the one-shot
-        # backfill completes so concurrent user edits in that window
-        # can't be overwritten.
-        log.info("Wildlife backfill marker unset; running species marking "
-                 "+ backfill synchronously before serving requests")
-        _t1 = time.time()
-        _mark_species_and_maybe_backfill(init_db, "sync-startup")
-        log.info("Synchronous species marking + backfill took %.2fs",
-                 time.time() - _t1)
 
     def _mark_species():
         bg_db = None
@@ -5220,7 +5194,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             log.debug("Could not open background db for species marking", exc_info=True)
             return
         try:
-            _mark_species_and_maybe_backfill(bg_db, "background")
+            _mark_species_and_repair(bg_db, "background")
         finally:
             bg_db.close()
 
@@ -11162,6 +11136,81 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             db.record_edit('keyword_add', f'Added "{name}" to {len(added_ids)} photos',
                            str(kid), items, is_batch=True)
         return jsonify({"ok": True, "updated": len(added_ids)})
+
+    @app.route("/api/batch/wildlife-excluded", methods=["POST"])
+    def api_batch_wildlife_excluded():
+        """Include or exclude a selection from wildlife processing."""
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        raw_ids = body.get("photo_ids", [])
+        excluded = body.get("excluded")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return json_error("photo_ids required")
+        if not isinstance(excluded, bool):
+            return json_error("excluded must be a boolean")
+
+        photo_ids = []
+        seen = set()
+        for raw in raw_ids:
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                return json_error("photo_ids must be integers")
+            if raw not in seen:
+                photo_ids.append(raw)
+                seen.add(raw)
+
+        photos_map = db.get_photos_by_ids(photo_ids)
+        if len(photos_map) != len(photo_ids):
+            return json_error("One or more photos were not found", 404)
+        try:
+            for photo_id in photo_ids:
+                db._verify_photo_in_workspace(photo_id)
+        except ValueError as exc:
+            return json_error(str(exc), 403)
+
+        desired = 1 if excluded else 0
+        changed_ids = [
+            photo_id
+            for photo_id in photo_ids
+            if int(photos_map[photo_id]["wildlife_excluded"] or 0) != desired
+        ]
+        items = []
+        for photo_id in changed_ids:
+            old_value = (
+                "1" if photos_map[photo_id]["wildlife_excluded"] else "0"
+            )
+            db.conn.execute(
+                "UPDATE photos SET wildlife_excluded = ? WHERE id = ?",
+                (desired, photo_id),
+            )
+            items.append({
+                "photo_id": photo_id,
+                "old_value": old_value,
+                "new_value": "1" if excluded else "0",
+            })
+
+        if items:
+            description = (
+                "Excluded from wildlife classification"
+                if excluded
+                else "Included in wildlife classification"
+            )
+            db.record_edit(
+                "wildlife_excluded",
+                f"{description}: {len(items)} photos",
+                "1" if excluded else "0",
+                items,
+                is_batch=True,
+                _commit=False,
+            )
+            db.conn.commit()
+            db._prune_edit_history()
+
+        return jsonify({
+            "ok": True,
+            "updated": len(changed_ids),
+            "wildlife_excluded": excluded,
+            "photo_ids": changed_ids,
+        })
 
     @app.route("/api/batch/keyword-remove", methods=["POST"])
     def api_batch_keyword_remove():

@@ -555,19 +555,18 @@ class Database:
             raise
         self.repair_missing_folder_parents()
         self.ensure_default_workspace()
-        # Idempotent legacy-type migration. MUST run before genre seeding
-        # so an upgraded DB with e.g. 'descriptive'/'event'/'people' rows
-        # named 'Wildlife' gets normalized first. Otherwise the seed's
-        # UNIQUE(name, parent_id) INSERT OR IGNORE skips the Wildlife
-        # genre, then the migration converts that legacy row to 'general',
-        # leaving auto-Wildlife and backfill queries unable to find a
-        # canonical 'Wildlife' / type='genre' row. Cheap warm-path (single
-        # SELECT 1 LIMIT 1) once all legacy rows are gone.
+        # Normalize retired keyword types before seeding the built-in genres.
+        # Cheap warm-path (single SELECT 1 LIMIT 1) once all legacy rows are
+        # gone.
         self.migrate_legacy_keyword_types()
         # Idempotent default-keyword seed. Cheap warm-path (single
         # SELECT 1 LIMIT 1 short-circuit) — matches ensure_default_workspace
         # above.
         self.ensure_default_genre_keywords()
+        # Retire the old automatically-attached Wildlife genre. The migration
+        # is idempotent and keeps the keyword row itself as an orphan so old
+        # edit-history ids and user-created hierarchy children remain valid.
+        self.retire_builtin_wildlife_genre()
         # Idempotent, one-shot: seed species_highlights from legacy
         # photo_preferences rows with purpose='highlights' so upgraded
         # DBs don't lose their prior Highlights picks the first time the
@@ -732,9 +731,6 @@ class Database:
             );
 
             -- Singleton key/value table for one-shot migration markers.
-            -- Used to gate non-idempotent backfills (where re-running would
-            -- overwrite user intent — e.g. Wildlife genre backfill that
-            -- would clobber sticky-removed Wildlife rows).
             CREATE TABLE IF NOT EXISTS db_meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT
@@ -1130,9 +1126,8 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_keywords_name ON keywords(name);
             CREATE INDEX IF NOT EXISTS idx_keywords_parent_id ON keywords(parent_id);
             CREATE INDEX IF NOT EXISTS idx_keywords_taxon_id ON keywords(taxon_id);
-            -- type is low-cardinality (5-value enum) but heavily filtered:
-            -- has_subject rule, filter_out_subject_tagged, backfill_wildlife,
-            -- and the warm-path migration probes all do WHERE type [IN/=] ...
+            -- type is low-cardinality (5-value enum) but heavily filtered by
+            -- subject rules, classifier skip gates, and migration probes.
             -- Without an index those scan the full keywords table on every
             -- _get_db()-per-request Database instantiation.
             CREATE INDEX IF NOT EXISTS idx_keywords_type ON keywords(type);
@@ -3089,14 +3084,11 @@ class Database:
 
         Upgrade path: if a same-name top-level keyword exists with type='general'
         (legacy free-form tag with the same name as a default genre), promote
-        it to type='genre' rather than silently leaving it as 'general'. The
-        UNIQUE(name, parent_id) constraint would block INSERT OR IGNORE in
-        that case, leaving e.g. an existing 'Wildlife' general keyword to
-        defeat _maybe_apply_auto_wildlife and backfill_wildlife_genre. Other
+        it to type='genre' rather than silently leaving it as 'general'. Other
         explicit user types (individual, location) are preserved — the user
         meant something specific.
         """
-        defaults = ("Landscape", "Sunset", "Architecture", "Abstract", "Wildlife")
+        defaults = ("Landscape", "Sunset", "Architecture", "Abstract")
         # Warm-path short-circuit: if any genre row already exists, the
         # database has already been seeded — nothing to do. Cheap (single
         # SELECT 1 LIMIT 1).
@@ -3106,9 +3098,8 @@ class Database:
         if existing:
             return
         # Cold / upgrade path: promote any same-name top-level 'general'
-        # rows to 'genre' first, so an upgraded DB with a hand-tagged
-        # 'general' Wildlife (or other default name) ends up with a
-        # canonical genre row.
+        # rows to 'genre' first, so an upgraded DB with a hand-tagged default
+        # name ends up with a canonical genre row.
         for name in defaults:
             self.conn.execute(
                 """UPDATE keywords SET type = 'genre'
@@ -3120,8 +3111,7 @@ class Database:
         # only when a same-name + same-type ('genre') row already exists.
         # If a user has previously tagged e.g. 'Landscape' as 'location'
         # (a deliberate non-default type), we still create the genre
-        # 'Landscape' alongside it so the lightbox "Not Wildlife" flow
-        # (which tags with type='genre') has a canonical row to reuse.
+        # 'Landscape' alongside it.
         # This intentionally permits duplicates BY NAME across different
         # types — disambiguation is handled by add_keyword's lookup,
         # which prefers same-typed matches when kw_type is supplied.
@@ -3140,6 +3130,100 @@ class Database:
                 (name,),
             )
         self.conn.commit()
+
+    _RETIRED_WILDLIFE_GENRE_KEY = "retired_builtin_wildlife_genre_v1"
+
+    def retire_builtin_wildlife_genre(self, force=False):
+        """Detach the retired built-in ``Wildlife`` genre from photos.
+
+        Older Vireo versions attached a top-level, ``type='genre'`` Wildlife
+        keyword whenever a photo received its first taxonomy keyword. That
+        duplicated the taxonomy fact and exposed a misleading independent
+        removal action. Wildlife-processing eligibility now lives solely in
+        ``photos.wildlife_excluded``.
+
+        Direct associations are removed and a flat-only sidecar removal is
+        queued. Flat-only is important: a user may have a real hierarchy such
+        as ``Wildlife|Birds|House Sparrow``; retiring the generated flat term
+        must not delete that hierarchy. A not-yet-synced pending add is simply
+        cancelled. The keyword row is deliberately retained as an unused
+        orphan so edit-history ids and any user-created children remain valid;
+        workspace keyword queries only expose rows reachable from photos.
+        """
+        if (
+            not force
+            and self.get_meta(self._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+        ):
+            return 0
+
+        wildlife_rows = self.conn.execute(
+            """SELECT id, name FROM keywords
+               WHERE name = 'Wildlife' COLLATE NOCASE
+                 AND type = 'genre' AND parent_id IS NULL"""
+        ).fetchall()
+        if not wildlife_rows:
+            self.set_meta(self._RETIRED_WILDLIFE_GENRE_KEY, "1")
+            return 0
+
+        keyword_ids = [row["id"] for row in wildlife_rows]
+        placeholders = ",".join("?" for _ in keyword_ids)
+        fallback_workspace = self._active_workspace_id
+        if fallback_workspace is None:
+            fallback_row = self.conn.execute(
+                "SELECT MIN(id) AS id FROM workspaces"
+            ).fetchone()
+            fallback_workspace = fallback_row["id"] if fallback_row else None
+        associations = self.conn.execute(
+            f"""SELECT DISTINCT pk.photo_id,
+                       COALESCE(MIN(wf.workspace_id), ?) AS workspace_id
+                FROM photo_keywords pk
+                JOIN photos p ON p.id = pk.photo_id
+                LEFT JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+                WHERE pk.keyword_id IN ({placeholders})
+                GROUP BY pk.photo_id""",
+            [fallback_workspace, *keyword_ids],
+        ).fetchall()
+
+        for association in associations:
+            photo_id = association["photo_id"]
+            workspace_id = association["workspace_id"]
+            # A pending add means the generated term has not reached the
+            # sidecar yet. Cancel every workspace copy rather than stacking a
+            # removal behind it.
+            pending_add = self.conn.execute(
+                """DELETE FROM pending_changes
+                   WHERE photo_id = ? AND change_type = 'keyword_add'
+                     AND value = 'Wildlife' COLLATE NOCASE""",
+                (photo_id,),
+            ).rowcount
+            if pending_add == 0:
+                existing_remove = self.conn.execute(
+                    """SELECT 1 FROM pending_changes
+                       WHERE photo_id = ?
+                         AND change_type IN ('keyword_remove', 'keyword_remove_flat')
+                         AND value = 'Wildlife' COLLATE NOCASE
+                       LIMIT 1""",
+                    (photo_id,),
+                ).fetchone()
+                if existing_remove is None and workspace_id is not None:
+                    self.queue_change(
+                        photo_id,
+                        "keyword_remove_flat",
+                        "Wildlife",
+                        workspace_id=workspace_id,
+                        _commit=False,
+                    )
+
+        if keyword_ids:
+            self.conn.execute(
+                f"DELETE FROM photo_keywords WHERE keyword_id IN ({placeholders})",
+                keyword_ids,
+            )
+        self.set_meta(
+            self._RETIRED_WILDLIFE_GENRE_KEY, "1", _commit=False,
+        )
+        self.conn.commit()
+        return len(associations)
 
     _SPECIES_HIGHLIGHTS_BACKFILL_KEY = "species_highlights_from_preferences_backfill"
     _SPECIES_REPRESENTATIVES_BACKFILL_KEY = "species_representatives_from_preferences_backfill"
@@ -3277,13 +3361,8 @@ class Database:
         short-circuits cheaply (single SELECT 1 LIMIT 1) so this is safe to
         call from Database.__init__ on every instantiation.
 
-        Order matters: this runs BEFORE ensure_default_genre_keywords in
-        __init__ so a legacy 'descriptive'/'event'/'people'-typed Wildlife
-        gets normalized first. Otherwise the seed's UNIQUE(name, parent_id)
-        INSERT OR IGNORE would silently skip Wildlife, then this migration
-        would convert the legacy row to 'general', leaving the auto-Wildlife
-        and backfill queries (WHERE name='Wildlife' AND type='genre') with
-        no canonical row to find.
+        This runs before default genre seeding so old rows settle onto the
+        canonical enum before same-name defaults are reconciled.
         """
         legacy = self.conn.execute(
             "SELECT 1 FROM keywords WHERE type IN ('people', 'descriptive', 'event') LIMIT 1"
@@ -10285,7 +10364,7 @@ class Database:
                 if _commit:
                     self.conn.commit()
             # Upgrade an existing 'general' row to the explicitly requested type.
-            # Without this, callers like the "Not Wildlife" button would hit the
+            # Without this, explicitly typed callers would hit the
             # case-insensitive fast path and silently get back a wrong-typed row.
             if kw_type and kw_type != 'general':
                 self.conn.execute(
@@ -10296,9 +10375,8 @@ class Database:
                     # Gate on type='taxonomy' so a preserved deliberate type
                     # (e.g. 'individual') doesn't get is_species=1 stamped on
                     # it when the type update above was a no-op. Otherwise
-                    # _maybe_apply_auto_wildlife / backfill_wildlife_genre /
-                    # subject filters with `OR is_species=1` would treat that
-                    # non-taxonomy row as a species.
+                    # Subject filters with `OR is_species=1` would otherwise
+                    # treat that non-taxonomy row as a species.
                     self.conn.execute(
                         "UPDATE keywords SET is_species = 1 "
                         "WHERE id = ? AND type = 'taxonomy'",
@@ -13706,56 +13784,12 @@ class Database:
             _commit: If False, skip the internal commit (caller is responsible
                      for committing the transaction).
         """
-        cur = self.conn.execute(
+        self.conn.execute(
             "INSERT OR IGNORE INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
             (photo_id, keyword_id),
         )
-        # Only fire auto-Wildlife when we actually inserted a new association.
-        # A no-op INSERT OR IGNORE (re-tag of an already-tagged keyword) must
-        # not retrigger the rule — otherwise removing Wildlife and re-tagging
-        # the same species would silently re-add Wildlife and break sticky
-        # removal.
-        if cur.rowcount > 0:
-            self._maybe_apply_auto_wildlife(photo_id, keyword_id)
         if _commit:
             self.conn.commit()
-
-    def _maybe_apply_auto_wildlife(self, photo_id, just_added_keyword_id):
-        """If just_added_keyword_id is a species keyword (taxonomy type OR
-        legacy is_species=1) AND it's the only such keyword on this photo,
-        also add the Wildlife genre.
-
-        Treats ``is_species=1`` as a species candidate too: upgraded databases
-        carry legacy species rows whose ``type`` hasn't been retyped to
-        ``taxonomy`` yet by the background ``mark_species_keywords`` pass,
-        and the auto-Wildlife trigger needs to fire for those tags during
-        that window."""
-        row = self.conn.execute(
-            "SELECT type, is_species FROM keywords WHERE id = ?",
-            (just_added_keyword_id,),
-        ).fetchone()
-        if not row or (row["type"] != "taxonomy" and not row["is_species"]):
-            return
-        # Count species keywords on this photo. If > 1, this isn't the first
-        # — skip (sticky removal).
-        species_count = self.conn.execute(
-            """SELECT COUNT(*) AS n FROM photo_keywords pk
-               JOIN keywords k ON k.id = pk.keyword_id
-               WHERE pk.photo_id = ?
-                 AND (k.type = 'taxonomy' OR k.is_species = 1)""",
-            (photo_id,),
-        ).fetchone()["n"]
-        if species_count != 1:
-            return
-        wildlife_row = self.conn.execute(
-            "SELECT id FROM keywords WHERE name = 'Wildlife' AND type = 'genre' LIMIT 1"
-        ).fetchone()
-        if not wildlife_row:
-            return
-        self.conn.execute(
-            "INSERT OR IGNORE INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-            (photo_id, wildlife_row["id"]),
-        )
 
     def get_meta(self, key):
         """Return the db_meta value for `key`, or None if unset."""
@@ -13773,47 +13807,6 @@ class Database:
         )
         if _commit:
             self.conn.commit()
-
-    _WILDLIFE_BACKFILL_DONE_KEY = "wildlife_backfill_done"
-
-    def backfill_wildlife_genre(self, force=False):
-        """One-shot backfill: every photo that has at least one species
-        keyword AND no Wildlife genre keyword gets Wildlife added.
-
-        Gated by a db_meta marker so it runs at most once per database.
-        Re-running unconditionally would clobber sticky-removed Wildlife rows
-        (a user who intentionally removed Wildlife from a species-tagged
-        photo would see it re-added on the next app restart).
-
-        Matches keywords by ``type='taxonomy' OR is_species=1``. Plain-text
-        species tags on upgraded DBs start as ``is_species=0`` /
-        non-taxonomy and won't be matched until ``mark_species_keywords``
-        retypes them — so callers must run that pass *before* this backfill
-        on upgraded databases, otherwise the one-shot marker gets set on a
-        zero-row scan and species photos are permanently missed.
-
-        Args:
-            force: re-run even if the marker is set. Used by tests; not for
-                   normal startup.
-        """
-        if not force and self.get_meta(self._WILDLIFE_BACKFILL_DONE_KEY) == "1":
-            return
-        wildlife_row = self.conn.execute(
-            "SELECT id FROM keywords WHERE name = 'Wildlife' AND type = 'genre' LIMIT 1"
-        ).fetchone()
-        if not wildlife_row:
-            return  # No Wildlife keyword exists yet (very early init); nothing to do.
-        wildlife_id = wildlife_row["id"]
-        self.conn.execute(
-            """INSERT OR IGNORE INTO photo_keywords (photo_id, keyword_id)
-               SELECT DISTINCT pk.photo_id, ?
-               FROM photo_keywords pk
-               JOIN keywords k ON k.id = pk.keyword_id
-               WHERE k.type = 'taxonomy' OR k.is_species = 1""",
-            (wildlife_id,),
-        )
-        self.set_meta(self._WILDLIFE_BACKFILL_DONE_KEY, "1", _commit=False)
-        self.conn.commit()
 
     def untag_photo(self, photo_id, keyword_id, _commit=True):
         """Remove a keyword association from a photo.
@@ -18714,6 +18707,32 @@ class Database:
             "SELECT * FROM pending_changes WHERE workspace_id = ? ORDER BY created_at",
             (self._ws_id(),),
         ).fetchall()
+
+    def get_pending_keyword_removal_keys(self, photo_id, hierarchical=False):
+        """Return normalized keyword keys awaiting removal for a photo.
+
+        Reads across workspaces because photo metadata is global even though
+        the sync queue is presented per workspace. ``keyword_remove_flat``
+        suppresses flat XMP re-imports only; callers processing hierarchical
+        entries request ``hierarchical=True`` and receive full removals only.
+        """
+        change_types = (
+            ("keyword_remove",)
+            if hierarchical
+            else ("keyword_remove", "keyword_remove_flat")
+        )
+        placeholders = ",".join("?" for _ in change_types)
+        rows = self.conn.execute(
+            f"""SELECT value FROM pending_changes
+                WHERE photo_id = ?
+                  AND change_type IN ({placeholders})""",
+            [photo_id, *change_types],
+        ).fetchall()
+        return {
+            key
+            for row in rows
+            if (key := keyword_match_key(row["value"]))
+        }
 
     def remove_pending_changes(self, photo_id, change_type=None, value=None, workspace_id=None, _commit=True):
         """Delete matching pending changes. Returns rows removed.

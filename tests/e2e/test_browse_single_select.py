@@ -1118,6 +1118,58 @@ def test_multiselect_shows_and_removes_keyword_shared_by_all_photos(live_server,
     expect(row).to_have_count(0)
 
 
+def test_multiselect_groups_metadata_and_bulk_updates_wildlife_workflow(
+    live_server, page,
+):
+    db = live_server["db"]
+    selected_ids = live_server["data"]["photos"]
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    location_id = db.add_keyword("Grangettes nature reserve", kw_type="location")
+    for photo_id in selected_ids:
+        db.tag_photo(photo_id, species_id)
+        db.tag_photo(photo_id, location_id)
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.wait_for(state="visible")
+    page.evaluate("""
+      photos.forEach(function(p) { selectedPhotos.add(p.id); });
+      renderGrid();
+      updateBatchBar();
+    """)
+
+    taxonomy = page.locator(
+        '.selection-keyword-group[data-keyword-type="taxonomy"]'
+    )
+    location = page.locator(
+        '.selection-keyword-group[data-keyword-type="location"]'
+    )
+    expect(taxonomy.locator(".selection-keyword-group-title")).to_have_text(
+        "Species"
+    )
+    expect(taxonomy).to_contain_text("House Sparrow")
+    expect(location.locator(".selection-keyword-group-title")).to_have_text(
+        "Locations"
+    )
+    expect(location).to_contain_text("Grangettes nature reserve")
+
+    exclude = page.locator("#selectionWildlifeActions button", has_text="Exclude 5")
+    expect(exclude).to_be_visible()
+    exclude.click()
+    page.wait_for_function(
+        """
+        async (photoIds) => {
+          const details = await Promise.all(
+            photoIds.map(id => fetch('/api/photos/' + id).then(r => r.json()))
+          );
+          return details.every(photo => photo.wildlife_excluded);
+        }
+        """,
+        arg=selected_ids,
+    )
+    include = page.locator("#selectionWildlifeActions button", has_text="Include 5")
+    expect(include).to_be_visible()
+
+
 def test_multiselect_shrink_to_focused_photo_restores_detail(live_server, page):
     """Leaving multi-select with a focused photo must restore the detail pane."""
     url = live_server["url"]

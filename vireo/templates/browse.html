@@ -494,6 +494,20 @@ body.sidebar-resizing {
   flex-direction: column;
   gap: 8px;
 }
+.selection-keyword-group + .selection-keyword-group { margin-top: 6px; }
+.selection-keyword-group-title {
+  margin-bottom: 6px;
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.selection-keyword-group-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
 .selection-keyword-row {
   display: flex;
   align-items: center;
@@ -1726,7 +1740,12 @@ body.sidebar-resizing {
         <div class="selection-action-hint" id="pasteEditHint"></div>
       </div>
       <div class="detail-section">
-        <div class="detail-section-title">Keywords</div>
+        <div class="detail-section-title">Wildlife Classification</div>
+        <div class="selection-empty" id="selectionWildlifeStatus"></div>
+        <div class="selection-keyword-actions" id="selectionWildlifeActions" style="margin-top:8px;"></div>
+      </div>
+      <div class="detail-section">
+        <div class="detail-section-title">Metadata</div>
         <div class="selection-keyword-list" id="selectionKeywordSuggestions"></div>
       </div>
     </div>
@@ -5675,6 +5694,7 @@ function updateSelectionPanel(ids) {
     selectionKeywordRequestSeq++;
     var list = document.getElementById('selectionKeywordSuggestions');
     if (list) list.innerHTML = '';
+    renderSelectionWildlifeState([]);
     if (wasVisible && selectedPhotoId) {
       loadDetail(selectedPhotoId);
     } else if (wasVisible) {
@@ -5700,6 +5720,7 @@ function updateSelectionPanel(ids) {
   panel.classList.remove('hidden');
   document.getElementById('selectionCount').textContent = ids.length.toLocaleString() + ' photos selected';
   updatePasteEditSection(ids);
+  renderSelectionWildlifeState(ids);
   // Keep any EXIF suggestion fetched for the anchor photo: Accept is
   // batch-aware (_locationApplyPhotoIds), so growing the selection is the
   // designed way to apply one suggestion to many photos.
@@ -6103,7 +6124,20 @@ function renderSelectionKeywordSuggestions(keywords, selectedCount) {
   selectionKeywordMissingById = {};
   selectionKeywordPresentById = {};
   selectionKeywordNameById = {};
+  var groupDefinitions = [
+    { type: 'taxonomy', label: 'Species' },
+    { type: 'location', label: 'Locations' },
+    { type: 'individual', label: 'Individuals' },
+    { type: 'genre', label: 'Genres' },
+    { type: 'general', label: 'Keywords' }
+  ];
+  var keywordsByType = {};
   keywords.forEach(function(k) {
+    var type = k.type || 'general';
+    if (!keywordsByType[type]) keywordsByType[type] = [];
+    keywordsByType[type].push(k);
+  });
+  function renderKeywordRow(k) {
     var missing = k.missing_count || 0;
     var count = k.count || 0;
     selectionKeywordMissingById[String(k.id)] = k.missing_photo_ids || [];
@@ -6116,15 +6150,77 @@ function renderSelectionKeywordSuggestions(keywords, selectedCount) {
     if (count > 0) {
       actions += '<button class="selection-keyword-remove" onclick="removeSelectionKeyword(' + k.id + ')" title="Remove this keyword from selected photos that have it">Remove from ' + count + '</button>';
     }
-    html += '<div class="selection-keyword-row">' +
+    return '<div class="selection-keyword-row">' +
       '<div style="min-width:0;">' +
         '<div class="selection-keyword-name">' + escapeHtml(k.name) + '</div>' +
         '<div class="selection-keyword-meta">On ' + count + ' of ' + selectedCount + (missing ? ', missing from ' + missing : '') + '</div>' +
       '</div>' +
       '<div class="selection-keyword-actions">' + actions + '</div>' +
-    '</div>';
+      '</div>';
+  }
+  groupDefinitions.forEach(function(group) {
+    var rows = keywordsByType[group.type] || [];
+    if (!rows.length) return;
+    html += '<div class="selection-keyword-group" data-keyword-type="' + group.type + '">' +
+      '<div class="selection-keyword-group-title">' + group.label + '</div>' +
+      '<div class="selection-keyword-group-rows">' + rows.map(renderKeywordRow).join('') + '</div>' +
+      '</div>';
   });
   list.innerHTML = html;
+}
+
+function renderSelectionWildlifeState(ids) {
+  var status = document.getElementById('selectionWildlifeStatus');
+  var actions = document.getElementById('selectionWildlifeActions');
+  if (!status || !actions) return;
+  var selected = new Set(ids);
+  var selectedPhotos = photos.filter(function(photo) { return selected.has(photo.id); });
+  var excludedCount = selectedPhotos.filter(function(photo) {
+    return !!photo.wildlife_excluded;
+  }).length;
+  var includedCount = selectedPhotos.length - excludedCount;
+  if (!selectedPhotos.length) {
+    status.textContent = '';
+    actions.innerHTML = '';
+    return;
+  }
+  if (excludedCount === 0) {
+    status.textContent = 'All selected photos are included in wildlife processing.';
+  } else if (includedCount === 0) {
+    status.textContent = 'All selected photos are excluded from wildlife processing.';
+  } else {
+    status.textContent = includedCount + ' included · ' + excludedCount + ' excluded';
+  }
+  var html = '';
+  if (includedCount > 0) {
+    html += '<button class="selection-keyword-remove" onclick="setSelectionWildlifeExcluded(true)">Exclude ' + includedCount + '</button>';
+  }
+  if (excludedCount > 0) {
+    html += '<button class="selection-keyword-add" onclick="setSelectionWildlifeExcluded(false)">Include ' + excludedCount + '</button>';
+  }
+  actions.innerHTML = html;
+}
+
+async function setSelectionWildlifeExcluded(excluded) {
+  var ids = getActiveSelection();
+  if (!ids.length) return;
+  var data;
+  try {
+    data = await safeFetch('/api/batch/wildlife-excluded', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({photo_ids: ids, excluded: excluded}),
+    });
+  } catch (e) { return; }
+  var changed = new Set((data && data.photo_ids) || ids);
+  photos.forEach(function(photo) {
+    if (changed.has(photo.id)) photo.wildlife_excluded = excluded ? 1 : 0;
+  });
+  refreshGridCards(ids);
+  renderSelectionWildlifeState(ids);
+  scheduleCollectionCountsRefresh();
+  refreshActiveCollectionAfterMembershipChange();
+  showUndoToast();
 }
 
 async function applySelectionKeyword(keywordId) {

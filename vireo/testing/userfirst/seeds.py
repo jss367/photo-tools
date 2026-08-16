@@ -111,15 +111,12 @@ def browse_seed(db_path, thumb_dir, photos_root):
     k_eagle = db.add_keyword("Eagle", is_species=True)
     k_robin = db.add_keyword("Robin", is_species=True)
     k_sparrow = db.add_keyword("Sparrow", is_species=True)
-    k_wildlife = db.add_keyword("Wildlife")
 
     db.tag_photo(photos[0], k_eagle)
     db.tag_photo(photos[1], k_eagle)
     db.tag_photo(photos[2], k_robin)
     db.tag_photo(photos[3], k_robin)
     db.tag_photo(photos[4], k_sparrow)
-    db.tag_photo(photos[0], k_wildlife)
-    db.tag_photo(photos[2], k_wildlife)
 
     # Create thumbnails
     os.makedirs(thumb_dir, exist_ok=True)

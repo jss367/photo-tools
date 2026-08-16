@@ -344,6 +344,24 @@ def test_sync_from_xmp_updates_db(tmp_path):
     assert 'Sparrow' not in kw_names
 
 
+def test_sync_from_xmp_does_not_restore_keyword_with_pending_removal(tmp_path):
+    """A stale sidecar cannot resurrect metadata awaiting a sync removal."""
+    from db import Database
+    from sync import sync_from_xmp
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    pid, _xmp_path = _setup_photo_with_xmp(
+        tmp_path, db, keywords={"Wildlife"},
+    )
+    db.queue_change(pid, "keyword_remove_flat", "Wildlife")
+
+    sync_from_xmp(db, [pid])
+
+    assert db.get_photo_keywords(pid) == []
+
+
 def test_sync_from_xmp_preserves_keyword_when_only_case_differs(tmp_path):
     """Case-only differences between DB and XMP keyword names should not drop the tag."""
     from db import Database

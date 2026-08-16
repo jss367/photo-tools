@@ -336,10 +336,11 @@ def sync_from_xmp(db, photo_ids):
         # abort the whole sidecar reconcile on a malformed edge-quote
         # keyword instead of ignoring it and processing the rest.
         xmp_keywords = read_keywords(xmp_path)
+        pending_removals = db.get_pending_keyword_removal_keys(photo_id)
         xmp_keywords_by_key = {}
         for kw in xmp_keywords:
             key = keyword_match_key(kw)
-            if not key:
+            if not key or key in pending_removals:
                 continue
             xmp_keywords_by_key.setdefault(key, kw)
 

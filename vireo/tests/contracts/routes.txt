@@ -222,6 +222,7 @@ POST         /api/batch/location
 POST         /api/batch/location/from-exif
 POST         /api/batch/location/text
 POST         /api/batch/rating
+POST         /api/batch/wildlife-excluded
 POST         /api/browse/mkdir
 POST         /api/browse/photo-counts
 POST         /api/capture-time/preview

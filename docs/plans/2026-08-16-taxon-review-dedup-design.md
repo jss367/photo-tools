@@ -155,19 +155,29 @@ so distinct taxa can never collide, then URL-safe encoded (see "Card ID
 encoding" below).
 
 **Node identity.** The graph keys each burst-group node as
-`(classifier_model, labels_fingerprint, group_id)`, not by `group_id`
-alone. `_store_grouped_predictions` mints group IDs as
-`f"g{job_id[-6:]}-{group_count:04d}"`, which can collide across process
-restarts or between concurrent classify jobs whose truncated `job_id`
-suffix happens to match. Keying by the full `(model, fingerprint,
-group_id)` tuple guarantees that two unrelated bursts never occupy the same
-node even if their raw `group_id`s collide, so the connected-component
-computation stays sound without depending on `group_id` uniqueness.
-Singleton nodes key on `(classifier_model, labels_fingerprint,
-"p" + prediction_id)`. A follow-up cleanup should also widen
-`_store_grouped_predictions` to use the full `job_id` (or a UUID) so
-downstream storage and history are collision-free too — but the merge
-graph does not depend on that landing first.
+`(classifier_model, labels_fingerprint, job_id, group_id)`, not by
+`group_id` alone and not by `(model, fingerprint, group_id)` either.
+`_store_grouped_predictions` mints group IDs as
+`f"g{job_id[-6:]}-{group_count:04d}"`, so two classify jobs commonly
+share both `classifier_model` and `labels_fingerprint` — a re-run of the
+same model against the same label set is exactly that case — and if
+their truncated `job_id[-6:]` suffix plus per-job group counter also
+happens to match, the `(model, fingerprint, group_id)` tuple is still
+identical. That would let two unrelated bursts occupy one graph node
+and become one card without any same-taxon overlap edge, contradicting
+the goal. Adding the full `job_id` to the key makes the node identity
+collision-resistant on its own — two jobs cannot share a `job_id`
+regardless of what the group ID generator does — and eliminates any
+dependency on the group-ID uniqueness landing first. `job_id` is
+already available on every stored prediction row (via the job that
+wrote it), so the merge graph reads it alongside `group_id` without a
+schema change. Singleton nodes key on `(classifier_model,
+labels_fingerprint, job_id, "p" + prediction_id)` for the same reason
+— `job_id` is required for the group case, so keeping it in the
+singleton tuple keeps the shape uniform. A follow-up cleanup should
+still widen `_store_grouped_predictions` to use the full `job_id` (or a
+UUID) so downstream storage and history are collision-free too, but
+the merge graph does not depend on that landing first.
 
 Why overlap, not identical membership: the two models' burst groups for the
 same event frequently differ by a frame or two — grouping runs per job, and
@@ -256,8 +266,8 @@ collapse to `!== 'all'`; the design does not require that change.)
 row set; the client, whenever a filter is active, ignores `card_id` and
 dedups over the filtered rows by the row's **node identity** — the same
 tuple the server uses when building the merge graph (§2, "Node
-identity"): `(classifier_model, labels_fingerprint, group_id)` for
-grouped rows, and `(classifier_model, labels_fingerprint,
+identity"): `(classifier_model, labels_fingerprint, job_id, group_id)`
+for grouped rows, and `(classifier_model, labels_fingerprint, job_id,
 "p" + prediction_id)` for singletons. Using node identity — not
 `(taxon_key, group_id)` — is essential: (a) singleton rows all carry
 `group_id = NULL`, so `(taxon_key, group_id)` would collapse every
@@ -288,21 +298,34 @@ and, if grouped, its group siblings — restricted to `pr.classifier_model =
 union**, not just the clicked group's photos:
 
 1. **Resolve the card, with the same filter scope the client rendered.**
-   The mutation POST carries the `card_id` **plus** whichever of `rules`,
-   `collection_id`, `model` (from `currentModel`), and `labels_fingerprint`
-   (from `currentLabelsFingerprint`) were in force on the GET that produced
-   the displayed card — the client already threads `rules`/`collection_id`
-   into `/api/predictions` (`review.html:1091-1111`); the mutation is
-   extended to carry the same tuple (`review.html:1576-1581` and the reject
-   path) verbatim. The server re-runs the same card-building graph over the
-   same scoped row set the GET used, then intersects the resolved
-   component with the returned rows so mutation membership can never exceed
-   the displayed membership. Where the client sends only a
-   `prediction_id`/`group_id` (older payloads, deep-link buttons), the
-   server treats the scope as "unfiltered" and resolves the full-workspace
-   card; a stale-but-scoped POST is therefore safe (narrower than what the
-   user sees), and a stale-and-unscoped POST is a legacy behavior that
-   simply matches today's semantics.
+   The mutation POST carries the `card_id` **plus every filter
+   `getVisibleItems` applies** on the way from `/api/predictions` rows to
+   what the card actually shows. Concretely that is: `rules`,
+   `collection_id`, `model` (from `currentModel`), `labels_fingerprint`
+   (from `currentLabelsFingerprint`), `min_confidence` (from
+   `minConfidence`, `review.html:1281-1283`), and `status` (from
+   `currentTab`, `review.html:1298-1300`) — server-applied filters that
+   affected the GET plus client-applied filters that affected the
+   displayed card, one uniform tuple. The client already threads
+   `rules`/`collection_id` into `/api/predictions`
+   (`review.html:1091-1111`); the mutation is extended to carry the full
+   tuple (`review.html:1576-1581` and the reject path) verbatim. Note
+   the two hidden failure modes this closes: (a) a
+   below-`minConfidence` sibling row that bridges two groups would
+   otherwise stitch the server's full component through a row the user
+   couldn't see; (b) a `status != currentTab` row (e.g. an already-
+   accepted sibling on the "pending" tab) could similarly bridge or be
+   re-mutated. Both are excluded from the resolved component by
+   forwarding the same predicates. The server re-runs the same
+   card-building graph over the same scoped row set the GET used, then
+   intersects the resolved component with the returned rows so mutation
+   membership can never exceed the displayed membership. Where the
+   client sends only a `prediction_id`/`group_id` (older payloads,
+   deep-link buttons), the server treats the scope as "unfiltered" and
+   resolves the full-workspace card; a stale-but-scoped POST is
+   therefore safe (narrower than what the user sees), and a
+   stale-and-unscoped POST is a legacy behavior that simply matches
+   today's semantics.
 2. **Enumerate photos from the resolved (filtered) component.** The
    candidate photo set is the union of every member group's/singleton's
    photos *within the resolved card* — not the clicked group's photos, and
@@ -349,9 +372,10 @@ union**, not just the clicked group's photos:
 (all models) across the same union photo set and card taxon. Today reject
 is per prediction/group; it gains the same sibling pass, scoped to the
 same component-wide photo union so transitive cards resolve completely,
-and it carries the same `rules`/`collection_id`/`model`/`labels_fingerprint`
-scope tuple as accept so that a rejection issued from a filtered view
-never touches rows the user could not see.
+and it carries the same full scope tuple as accept
+(`rules`/`collection_id`/`model`/`labels_fingerprint`/`min_confidence`/`status`)
+so that a rejection issued from a filtered view never touches rows the
+user could not see.
 
 **Compare.** `accept_subject_species` swaps its
 `lower(trim(species))` equality for the same taxon-key helper. Its
@@ -366,11 +390,31 @@ chips ("iNat21: Blue Tit · BioCLIP-2.5: Eurasian Blue Tit"). Unresolved
 
 **Keyword written on accept** — precedence:
 
-1. If a keyword already exists whose `keywords.taxon_id` matches the card's
-   taxon, reuse it — *its* name is what gets written. This keeps new accepts
-   consistent with photos already tagged (no "Blue Tit" keyword appearing
-   alongside an established "Eurasian Blue Tit" keyword), because keywords
-   are global across workspaces and feed XMP sidecars on disk.
+1. If a keyword already exists whose `keywords.taxon_id` matches the
+   card's taxon, reuse it — *its* name is what gets written. This keeps
+   new accepts consistent with photos already tagged (no "Blue Tit"
+   keyword appearing alongside an established "Eurasian Blue Tit"
+   keyword), because keywords are global across workspaces and feed
+   XMP sidecars on disk.
+
+   **ID-space translation is required before this comparison.** The
+   card's `taxon_key` carries the *iNaturalist* ID: `Taxonomy.lookup`
+   populates its entries from the taxonomy payload's `taxon_id` field,
+   which is the iNat identifier (`taxonomy.py:1217`). But
+   `keywords.taxon_id` is a foreign key to the local
+   autoincrement `taxa.id` (`db.py:724`), and the iNat value is stored
+   separately as `taxa.inat_id` (`db.py:706-708`). Comparing the card's
+   iNat id directly against `keywords.taxon_id` will therefore usually
+   miss an established synonym keyword — and, worse, an accidental
+   numeric collision (`taxa.id == some_other_taxon.inat_id`) would
+   silently reuse an *unrelated* keyword. Precedence-1 lookup therefore
+   resolves through `taxa.inat_id` first:
+   `SELECT id FROM taxa WHERE inat_id = ?` with the card's iNat id,
+   and only then `SELECT id FROM keywords WHERE taxon_id = ?` with
+   that local `taxa.id`. If the taxa row is absent (an unknown iNat
+   id, or a payload that predates the taxa refresh), precedence-1
+   yields no match and step 2 runs. For `name:`-keyed cards (no
+   resolved taxon), precedence-1 is skipped entirely.
 2. Otherwise, create/use the preferred common name.
 
 **Transparency requirement (CORE_PHILOSOPHY):** when the keyword string that
@@ -445,9 +489,12 @@ Each phase lands as its own PR and is independently useful.
    don't merge; model filter yields per-model cards; **transitive overlap
    fixture** (three groups A/B/C forming an A-B-C chain, same taxon) yields
    one `card_id` covering the full union; **group-id-collision fixture**
-   (two classify jobs whose truncated `job_id` suffix collides, minting the
-   same raw `group_id` for disjoint photo sets) stays as two separate
-   nodes and does not merge into one card; **cross-fingerprint hidden-row
+   (two classify jobs with the *same* `classifier_model` and
+   `labels_fingerprint` whose truncated `job_id` suffix and group counter
+   both collide, minting identical raw `group_id`s for disjoint photo
+   sets) stays as two separate nodes — because their full `job_id`s
+   differ, the four-tuple node identity distinguishes them — and does
+   not merge into one card; **cross-fingerprint hidden-row
    fixture** (groups A and C at fingerprint X, group B at fingerprint Y
    bridging them by shared photos, plus a singleton S with the same
    taxon on an unrelated photo) — with the fingerprint filter set to X,
@@ -473,12 +520,29 @@ Each phase lands as its own PR and is independently useful.
    **scoped-mutation fixture** — with a collection filter that excludes
    group D (same taxon, overlapping photos), the accept POST carries the
    collection scope and D's rows stay pending; without the filter, D
-   merges and is accepted; a stale POST that omits the scope tuple resolves
-   the full-workspace card (documented legacy behavior); a POST that carries
-   a scope narrower than the server's full component cannot exceed the
-   displayed membership.
+   merges and is accepted; a **min-confidence-scoped fixture** —
+   `minConfidence` is set above group E's confidence so E is hidden and
+   would otherwise bridge two visible groups A and F through a shared
+   photo, the accept POST carries `min_confidence` and E's rows stay
+   pending while A and F resolve; a **status-scoped fixture** — with
+   `currentTab` = `pending`, an already-accepted sibling row G on a
+   bridging photo is excluded from the displayed component and the
+   POST carries `status = "pending"` so G is not re-mutated and does
+   not stitch unrelated groups together; a stale POST that omits the
+   scope tuple resolves the full-workspace card (documented legacy
+   behavior); a POST that carries a scope narrower than the server's
+   full component cannot exceed the displayed membership.
 5. **Keyword canonicalization** (taxon-matched keyword reuse) + the
-   "tags as …" transparency note.
+   "tags as …" transparency note. DB tests: **inat-id-translation
+   fixture** — an existing "Eurasian Blue Tit" keyword linked to the
+   local *Cyanistes caeruleus* taxa row is reused when a new accept's
+   card carries the iNat id for *Cyanistes caeruleus* (precedence 1
+   hits after `taxa.inat_id` translation); a fabricated collision case
+   where `taxa.id` for taxon A equals `taxa.inat_id` for taxon B does
+   *not* reuse taxon B's keyword when accepting a card for taxon A;
+   an unknown iNat id (not in the local `taxa` table) falls through
+   to precedence 2 rather than raising or reusing an arbitrary
+   keyword; a `name:`-keyed card skips precedence 1 entirely.
 
 ## Test plan
 

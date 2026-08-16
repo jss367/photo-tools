@@ -24,30 +24,44 @@ _SESSION_CPU_THREADS_FALLBACK_LIMIT = 64
 
 @contextlib.contextmanager
 def acquire_session_cache_lock(lock, *, label="ONNX session cache"):
-    """Acquire a model-session cache lock with bound pause/cancel support."""
+    """Acquire a model-session cache lock with bound pause/cancel support.
+
+    The pre-acquire probe is pause-aware: a Pause request parks the caller
+    BEFORE any lock is taken, so no other pipeline is blocked while the
+    paused job waits for Resume. Once the lock is held, the post-acquire
+    recheck uses the pure-cancel probe instead — a Pause arriving in the
+    tiny window between lock acquisition and yield must NOT park the
+    holder inside ``wait_if_paused``, or every unpaused peer waiting on
+    the same DINO/detector/SAM/keypoint session cache would block until
+    Resume. Cancel still releases the lock and raises.
+    """
     from resource_ledger import (
         ResourceWaitCancelled,
         get_resource_ledger,
         resolve_resource_cancel_check,
+        resolve_resource_pure_cancel_check,
     )
 
     cancel_check = resolve_resource_cancel_check()
+    pure_cancel_check = resolve_resource_pure_cancel_check()
     if cancel_check is not None and cancel_check():
         raise ResourceWaitCancelled(f"Cancelled while waiting for {label}")
 
     def _post_acquire_recheck():
         """Return True to keep the lock; release + raise otherwise.
 
-        The probe itself may raise (a bound pipeline probe can surface
-        an unrelated internal error). Either way — cancel returned True,
-        or the probe raised — the lock we just acquired must be released
-        so a cancelled/errored caller doesn't hold the cache mutex for
-        the duration of its unwind.
+        Uses the pure-cancel probe so a Pause pending between
+        ``lock.acquire()`` and this call does not park the holder. The
+        probe itself may raise (a bound pipeline probe can surface an
+        unrelated internal error). Either way — cancel returned True, or
+        the probe raised — the lock we just acquired must be released so
+        a cancelled/errored caller doesn't hold the cache mutex for the
+        duration of its unwind.
         """
-        if cancel_check is None:
+        if pure_cancel_check is None:
             return True
         try:
-            cancelled = cancel_check()
+            cancelled = pure_cancel_check()
         except BaseException:
             lock.release()
             raise
@@ -88,9 +102,12 @@ def acquire_session_cache_lock(lock, *, label="ONNX session cache"):
                 # one file on disk. Release and raise so the cancel
                 # wins the race, matching the GPU-lease recheck in
                 # ``pipeline_locks._GpuLockContext``. ``_post_acquire_recheck``
-                # also releases the lock if the probe itself raises,
-                # keeping a bug in a bound probe from leaking the cache
-                # mutex.
+                # uses the PURE-cancel probe — a Pause arriving in this
+                # race window must NOT park the holder inside
+                # ``wait_if_paused`` or every unpaused peer waiting on
+                # the same model cache would block until Resume. It also
+                # releases the lock if the probe itself raises, keeping
+                # a bug in a bound probe from leaking the cache mutex.
                 _post_acquire_recheck()
                 break
     try:

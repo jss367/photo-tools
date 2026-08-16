@@ -251,6 +251,124 @@ def test_session_cache_lock_releases_on_post_acquire_probe_raise():
         resource_ledger._set_resource_ledger_for_tests(previous)
 
 
+def test_session_cache_lock_post_acquire_uses_pure_cancel_probe():
+    """The post-acquire recheck must use the pure-cancel probe, not the
+    pause-aware one — a Pause arriving in the race window between
+    ``lock.acquire()`` and the recheck must NOT park the caller inside
+    ``wait_if_paused``. Parking there would block every unpaused peer
+    waiting on the same DINO/detector/SAM/keypoint session cache until
+    Resume. Cancel still releases the lock and raises.
+    """
+    import onnx_runtime
+    import resource_ledger
+
+    # Pause probe blocks until released; cancel probe returns False.
+    pause_gate = threading.Event()
+    pause_probe_calls = {"n": 0}
+    pure_probe_calls = {"n": 0}
+
+    def pause_aware_probe():
+        pause_probe_calls["n"] += 1
+        # Simulate ``_pause_checkpoint`` parking on pause — would block
+        # here if called from inside the post-acquire recheck. Test
+        # times out if the recheck picks up the pause-aware probe.
+        pause_gate.wait(timeout=2.0)
+        return False
+
+    def pure_cancel_probe():
+        pure_probe_calls["n"] += 1
+        return False
+
+    lock = threading.Lock()
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    finished = threading.Event()
+    outcome = []
+
+    def runner():
+        with (
+            resource_ledger.bind_resource_cancel_check(pause_aware_probe),
+            resource_ledger.bind_resource_pure_cancel_check(pure_cancel_probe),
+        ):
+            try:
+                # Entry probe uses the pause-aware probe (parks on pause) —
+                # release the gate immediately so the entry call returns
+                # quickly; the interesting probe is the post-acquire one.
+                pause_gate.set()
+                with onnx_runtime.acquire_session_cache_lock(lock):
+                    outcome.append("acquired")
+            except Exception as exc:  # pragma: no cover - shouldn't happen
+                outcome.append(f"error:{type(exc).__name__}")
+            finally:
+                finished.set()
+
+    thread = threading.Thread(target=runner)
+    thread.start()
+    try:
+        assert finished.wait(timeout=1.0), (
+            "acquire_session_cache_lock did not return; the post-acquire "
+            "recheck may still be using the pause-aware probe and blocking "
+            "on ``wait_if_paused`` while the session lock is held."
+        )
+        thread.join(timeout=1.0)
+        assert outcome == ["acquired"]
+        # The post-acquire recheck must have consulted the pure probe.
+        assert pure_probe_calls["n"] >= 1, (
+            f"Pure-cancel probe never called (n={pure_probe_calls['n']}); "
+            "recheck fell back to the pause-aware probe."
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
+def test_session_cache_lock_post_acquire_still_releases_on_pure_cancel():
+    """Pure-cancel probe returning True must release the lock and raise
+    ``ResourceWaitCancelled`` from the post-acquire recheck, same as the
+    legacy pause-aware probe path.
+    """
+    import onnx_runtime
+    import resource_ledger
+
+    lock = threading.Lock()
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    entry_calls = {"n": 0}
+    pure_calls = {"n": 0}
+    outcome = []
+
+    def entry_probe():
+        # Pause-aware probe used ONLY for the pre-acquire check; return
+        # False so we get past the entry and reach the post-acquire path.
+        entry_calls["n"] += 1
+        return False
+
+    def pure_probe():
+        # First call is the post-acquire recheck — flip the cancel bit
+        # right there to force release+raise.
+        pure_calls["n"] += 1
+        return True
+
+    try:
+        with (
+            resource_ledger.bind_resource_cancel_check(entry_probe),
+            resource_ledger.bind_resource_pure_cancel_check(pure_probe),
+        ):
+            with pytest.raises(resource_ledger.ResourceWaitCancelled):
+                with onnx_runtime.acquire_session_cache_lock(lock):
+                    outcome.append("acquired")
+        assert outcome == [], "body must not run when post-acquire cancel fires"
+        assert pure_calls["n"] == 1, (
+            f"Pure-cancel probe should fire exactly once from the recheck; "
+            f"got {pure_calls['n']}"
+        )
+        assert lock.acquire(blocking=False), (
+            "Lock leaked when pure-cancel post-acquire probe returned True"
+        )
+        lock.release()
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
 def test_acquire_gpu_if_session_uses_it_takes_lock_for_cuda_session():
     sess = _FakeSession(["CUDAExecutionProvider", "CPUExecutionProvider"])
     before = _GPU_SEMAPHORE._value

@@ -58,6 +58,7 @@ from resource_ledger import (
     ResourceWaitCancelled,
     bind_resource_cancel_check,
     bind_resource_owner,
+    bind_resource_pure_cancel_check,
     suspend_resource_wait_timing,
 )
 
@@ -1621,9 +1622,16 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             # attributed to the parent job's diagnostics, and so ledger waits
             # (including CPU inference on the ``cpu_ml`` lane) wake promptly
             # on cancellation or park promptly on pause instead of blocking
-            # until the current holder releases.
-            with bind_resource_owner(job["id"]), bind_resource_cancel_check(
-                _pause_checkpoint,
+            # until the current holder releases. The pure-cancel probe is
+            # bound alongside the pause-aware one so ``acquire_session_cache_lock``
+            # can release on cancel without parking the lock holder inside
+            # ``wait_if_paused`` — that would keep every unpaused peer
+            # waiting on the same DINO/detector/SAM/keypoint model until
+            # Resume.
+            with (
+                bind_resource_owner(job["id"]),
+                bind_resource_cancel_check(_pause_checkpoint),
+                bind_resource_pure_cancel_check(_cancellation_requested),
             ):
                 _pause_checkpoint()
                 return work_fn()

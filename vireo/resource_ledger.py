@@ -21,6 +21,16 @@ _RESOURCE_OWNER = contextvars.ContextVar("vireo_resource_owner", default=None)
 _RESOURCE_CANCEL_CHECK = contextvars.ContextVar(
     "vireo_resource_cancel_check", default=None,
 )
+# A probe that reports cancellation WITHOUT parking on pause. Callers that
+# check for cancel while holding a shared model-session lock use this so a
+# pending Pause never blocks the lock holder inside ``wait_if_paused`` —
+# releasing the lock and parking would risk duplicate ONNX construction,
+# and retaining the lock during Pause would block unpaused peers requesting
+# the same model until Resume. The pipeline binds both this and the
+# pause-aware probe so the two behaviors stay side by side.
+_RESOURCE_PURE_CANCEL_CHECK = contextvars.ContextVar(
+    "vireo_resource_pure_cancel_check", default=None,
+)
 _RESOURCE_ACTIVE_WAIT = contextvars.ContextVar(
     "vireo_resource_active_wait", default=None,
 )
@@ -520,6 +530,21 @@ def resolve_resource_cancel_check(cancel_check=None):
     )
 
 
+def resolve_resource_pure_cancel_check(cancel_check=None):
+    """Return the pure-cancel probe (never parks on pause) for the current job.
+
+    Falls back to the pause-aware probe when no pure probe is bound so
+    callers that upgrade one site at a time keep working. An explicit
+    ``cancel_check`` argument always wins.
+    """
+    if cancel_check is not None:
+        return cancel_check
+    pure = _RESOURCE_PURE_CANCEL_CHECK.get()
+    if pure is not None:
+        return pure
+    return _RESOURCE_CANCEL_CHECK.get()
+
+
 class ResourceLease:
     """An idempotently releasable allocation returned by ``ResourceLedger``."""
 
@@ -901,6 +926,23 @@ def bind_resource_cancel_check(cancel_check):
         yield
     finally:
         _RESOURCE_CANCEL_CHECK.reset(token)
+
+
+@contextlib.contextmanager
+def bind_resource_pure_cancel_check(cancel_check):
+    """Bind a probe that reports cancel-only state (never parks on pause).
+
+    Companion to :func:`bind_resource_cancel_check`. Sites that check
+    cancellation while owning a shared model-session cache lock use this
+    so a Pause request cannot block the lock holder inside
+    ``wait_if_paused`` — that would keep unpaused peers waiting for the
+    same model until Resume.
+    """
+    token = _RESOURCE_PURE_CANCEL_CHECK.set(cancel_check)
+    try:
+        yield
+    finally:
+        _RESOURCE_PURE_CANCEL_CHECK.reset(token)
 
 
 def _set_resource_ledger_for_tests(ledger):

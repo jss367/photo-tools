@@ -1226,6 +1226,59 @@ class Database:
                 SET value = CAST(value AS INTEGER) + 1
                 WHERE key = 'folder_health_version';
             END;
+
+            -- Per-workspace monotonic write counter for `pending_changes`.
+            -- The sync-preview cache in app.py keys its snapshot on this
+            -- version to detect row replacements — `pending_changes.id` is
+            -- a plain INTEGER PRIMARY KEY (no AUTOINCREMENT), so SQLite
+            -- will reuse the highest deleted id on the next INSERT. A
+            -- cheap COUNT/MAX/SUM aggregate can stay identical across
+            -- such a delete+insert even though `change_token`, `value`,
+            -- `change_type`, or `photo_id` differ; this counter changes
+            -- for every row write and closes that stale-hit window.
+            CREATE TRIGGER IF NOT EXISTS trg_pending_changes_version_insert
+            AFTER INSERT ON pending_changes
+            BEGIN
+                INSERT OR IGNORE INTO db_meta(key, value)
+                    VALUES ('pending_changes_version:' || NEW.workspace_id, '0');
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'pending_changes_version:' || NEW.workspace_id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_pending_changes_version_delete
+            AFTER DELETE ON pending_changes
+            BEGIN
+                INSERT OR IGNORE INTO db_meta(key, value)
+                    VALUES ('pending_changes_version:' || OLD.workspace_id, '0');
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'pending_changes_version:' || OLD.workspace_id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_pending_changes_version_update
+            AFTER UPDATE ON pending_changes
+            BEGIN
+                INSERT OR IGNORE INTO db_meta(key, value)
+                    VALUES ('pending_changes_version:' || NEW.workspace_id, '0');
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'pending_changes_version:' || NEW.workspace_id;
+            END;
+            -- When move_folders_to_workspace() reassigns a pending_changes
+            -- row from one workspace to another, the update trigger above
+            -- only bumps the destination workspace's counter. Without this
+            -- second trigger, a cached progressive preview for the source
+            -- workspace keeps its fingerprint and continues serving the
+            -- rows that have already moved away instead of returning 409.
+            CREATE TRIGGER IF NOT EXISTS trg_pending_changes_version_update_source_ws
+            AFTER UPDATE OF workspace_id ON pending_changes
+            WHEN OLD.workspace_id IS NOT NEW.workspace_id
+            BEGIN
+                INSERT OR IGNORE INTO db_meta(key, value)
+                    VALUES ('pending_changes_version:' || OLD.workspace_id, '0');
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'pending_changes_version:' || OLD.workspace_id;
+            END;
         """
         )
         cur = self.conn.cursor()

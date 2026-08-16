@@ -138,6 +138,43 @@ def test_api_add_keyword_accepts_existing_keyword_id(app_and_db):
     assert "Cardinal" in names
 
 
+def test_api_add_keyword_clears_shared_flat_removals(app_and_db):
+    """A manual re-add supersedes migration cleanup in every workspace."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.conn.execute(
+        "SELECT id, folder_id FROM photos WHERE filename = 'bird3.jpg'"
+    ).fetchone()
+    wildlife_id = db.add_keyword("Wildlife", kw_type="genre")
+    ws1 = db._ws_id()
+    ws2 = db.create_workspace("keyword-readd-sibling")
+    db.add_workspace_folder(ws2, photo["folder_id"])
+    for ws_id in (ws1, ws2):
+        db.queue_change(
+            photo["id"], "keyword_remove_flat", "Wildlife",
+            workspace_id=ws_id,
+        )
+
+    resp = client.post(
+        f"/api/photos/{photo['id']}/keywords",
+        json={"keyword_id": wildlife_id},
+    )
+
+    assert resp.status_code == 200
+    assert db.conn.execute(
+        """SELECT 1 FROM pending_changes
+           WHERE photo_id = ? AND change_type = 'keyword_remove_flat'""",
+        (photo["id"],),
+    ).fetchone() is None
+    pending_add = db.conn.execute(
+        """SELECT workspace_id FROM pending_changes
+           WHERE photo_id = ? AND change_type = 'keyword_add'
+             AND value = 'Wildlife'""",
+        (photo["id"],),
+    ).fetchall()
+    assert [row["workspace_id"] for row in pending_add] == [ws1]
+
+
 def test_help_static_assets_served(app_and_db):
     """The help modal's JS, JSON, and vendored Fuse library must be served.
 

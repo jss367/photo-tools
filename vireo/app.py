@@ -8383,6 +8383,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             photo_id, "keyword_remove", keyword_name,
             workspace_id=workspace_id, _commit=_commit,
         )
+        # A migration-generated flat removal is obsolete as soon as the user
+        # explicitly re-adds that term. Clear it across every workspace that
+        # owns the shared sidecar; otherwise "Use XMP" can filter the term
+        # out and detach this fresh association before the add is written.
+        db.clear_equivalent_flat_removals(
+            [{
+                "photo_id": photo_id,
+                "change_type": "keyword_remove_flat",
+                "value": keyword_name,
+            }],
+            _commit=_commit,
+        )
         if removed == 0:
             db.queue_change(
                 photo_id, "keyword_add", keyword_name,

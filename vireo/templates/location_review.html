@@ -351,7 +351,37 @@ body {
   border-top: 1px solid var(--border-primary);
   background: var(--bg-secondary);
 }
+.location-review-assign-column {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.location-review-assignment-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.location-review-assignment-status {
+  color: var(--text-dim);
+  font-size: 10px;
+  line-height: 1.2;
+}
+.location-review-assignment-track {
+  height: 5px;
+  border-radius: 999px;
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+.location-review-assignment-fill {
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width .2s;
+}
 .location-review-assign {
+  width: 100%;
   border: 0;
   border-radius: 5px;
   background: var(--accent);
@@ -498,7 +528,15 @@ body {
 
       <div class="location-review-actions">
         <button class="location-review-button" id="locationReviewSkip" type="button">Skip for now</button>
-        <button class="location-review-assign" id="locationReviewAssign" type="button" disabled>Select a location</button>
+        <div class="location-review-assign-column">
+          <div class="location-review-assignment-progress location-review-hidden" id="locationReviewAssignmentProgress">
+            <div class="location-review-assignment-status" id="locationReviewAssignmentStatus" aria-live="polite"></div>
+            <div class="location-review-assignment-track" id="locationReviewAssignmentTrack" role="progressbar" aria-labelledby="locationReviewAssignmentStatus" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
+              <div class="location-review-assignment-fill" id="locationReviewAssignmentFill"></div>
+            </div>
+          </div>
+          <button class="location-review-assign" id="locationReviewAssign" type="button" disabled>Select a location</button>
+        </div>
       </div>
     </aside>
   </div>
@@ -541,6 +579,8 @@ body {
     autocomplete: null,
     googleMapsUnavailableReason: null,
     renderToken: 0,
+    assignment: null,
+    isAssigning: false,
   };
 
   var NATURAL_TYPES = {
@@ -661,6 +701,41 @@ body {
     document.getElementById('locationReviewProgressText').textContent = completed + ' of ' + total + ' assigned';
     document.getElementById('locationReviewRemaining').textContent = state.groups.length ? state.groups.length + ' in queue' : '';
     document.getElementById('locationReviewProgressFill').style.width = pct + '%';
+  }
+
+  function resetAssignmentProgress() {
+    var progress = document.getElementById('locationReviewAssignmentProgress');
+    var status = document.getElementById('locationReviewAssignmentStatus');
+    var track = document.getElementById('locationReviewAssignmentTrack');
+    progress.classList.add('location-review-hidden');
+    status.textContent = '';
+    document.getElementById('locationReviewAssignmentFill').style.width = '0%';
+    track.setAttribute('aria-valuemax', '0');
+    track.setAttribute('aria-valuenow', '0');
+    track.removeAttribute('aria-valuetext');
+  }
+
+  function updateAssignmentProgress(completed, total, interrupted) {
+    var progress = document.getElementById('locationReviewAssignmentProgress');
+    var status = document.getElementById('locationReviewAssignmentStatus');
+    var track = document.getElementById('locationReviewAssignmentTrack');
+    var pct = total ? Math.round((completed / total) * 100) : 100;
+    var remaining = Math.max(0, total - completed);
+    var statusText = interrupted
+      ? formatNumber(completed) + ' of ' + formatNumber(total) + ' assigned · ' + formatNumber(remaining) + ' remaining'
+      : 'Assigning ' + formatNumber(completed) + ' of ' + formatNumber(total) + ' photos · ' + pct + '%';
+    progress.classList.remove('location-review-hidden');
+    status.textContent = statusText;
+    document.getElementById('locationReviewAssignmentFill').style.width = pct + '%';
+    track.setAttribute('aria-valuemax', String(total));
+    track.setAttribute('aria-valuenow', String(completed));
+    track.setAttribute('aria-valuetext', statusText);
+  }
+
+  function setAssignmentNavigationDisabled(disabled) {
+    document.getElementById('locationReviewSkip').disabled = disabled;
+    document.getElementById('locationReviewPrevious').disabled = disabled || state.groups.length < 2;
+    document.getElementById('locationReviewNext').disabled = disabled || state.groups.length < 2;
   }
 
   function clearMapObjects() {
@@ -886,12 +961,22 @@ body {
   }
 
   function selectChoice(choice) {
+    if (state.isAssigning) return;
+    var choiceKey = candidateKey(choice);
+    if (state.assignment && state.assignment.choiceKey !== choiceKey) {
+      state.assignment = null;
+      resetAssignmentProgress();
+    }
     state.selectedChoice = choice;
     renderCandidates();
     renderCandidateMarkers();
     var assign = document.getElementById('locationReviewAssign');
     assign.disabled = false;
-    assign.textContent = 'Assign “' + choice.name + '”';
+    if (state.assignment && state.assignment.choiceKey === choiceKey && state.assignment.completed) {
+      assign.textContent = 'Retry ' + formatNumber(state.assignment.total - state.assignment.completed) + ' remaining';
+    } else {
+      assign.textContent = 'Assign “' + choice.name + '”';
+    }
   }
 
   function renderCandidates() {
@@ -967,6 +1052,10 @@ body {
   }
 
   function renderCurrentGroup() {
+    state.assignment = null;
+    state.isAssigning = false;
+    resetAssignmentProgress();
+    setAssignmentNavigationDisabled(false);
     var group = currentGroup();
     if (!group) {
       if (state.skippedGroups.length) {
@@ -1332,11 +1421,20 @@ body {
     var choice = state.selectedChoice;
     if (!group || !choice) return;
     var button = document.getElementById('locationReviewAssign');
+    var choiceKey = candidateKey(choice);
+    var total = group.photo_ids.length;
+    if (!state.assignment || state.assignment.group !== group || state.assignment.choiceKey !== choiceKey) {
+      state.assignment = {group: group, choiceKey: choiceKey, completed: 0, total: total};
+    }
+    var assignment = state.assignment;
+    state.isAssigning = true;
+    setAssignmentNavigationDisabled(true);
     button.disabled = true;
     button.textContent = 'Assigning…';
+    updateAssignmentProgress(assignment.completed, total);
     try {
       if (choice.kind === 'google') choice = await hydrateGoogleChoice(choice);
-      for (var offset = 0; offset < group.photo_ids.length; offset += 1000) {
+      for (var offset = assignment.completed; offset < total; offset += 1000) {
         var chunk = group.photo_ids.slice(offset, offset + 1000);
         var endpoint = '/api/batch/location';
         var body = {photo_ids: chunk};
@@ -1353,20 +1451,33 @@ body {
         await safeFetch(endpoint, {
           method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
         });
+        assignment.completed = offset + chunk.length;
+        updateAssignmentProgress(assignment.completed, total);
       }
       showToast('Assigned “' + choice.name + '” to ' + formatNumber(group.count) + (group.count === 1 ? ' photo' : ' photos'), 'success');
+      state.assignment = null;
+      state.isAssigning = false;
       state.groups.splice(state.currentIndex, 1);
       state.assignedGroups += 1;
       if (state.currentIndex >= state.groups.length) state.currentIndex = Math.max(0, state.groups.length - 1);
       renderCurrentGroup();
     } catch (e) {
+      state.isAssigning = false;
+      setAssignmentNavigationDisabled(false);
       button.disabled = false;
-      button.textContent = 'Assign “' + choice.name + '”';
+      if (assignment.completed) {
+        var remaining = total - assignment.completed;
+        updateAssignmentProgress(assignment.completed, total, true);
+        button.textContent = 'Retry ' + formatNumber(remaining) + ' remaining';
+      } else {
+        resetAssignmentProgress();
+        button.textContent = 'Retry “' + choice.name + '”';
+      }
     }
   }
 
   function moveGroup(direction) {
-    if (state.groups.length < 2) return;
+    if (state.isAssigning || state.groups.length < 2) return;
     state.currentIndex = (state.currentIndex + direction + state.groups.length) % state.groups.length;
     renderCurrentGroup();
   }
@@ -1378,6 +1489,7 @@ body {
     renderCandidates();
   });
   document.getElementById('locationReviewSkip').addEventListener('click', function() {
+    if (state.isAssigning) return;
     var group = currentGroup();
     if (!group) return;
     state.skippedGroups.push(group);

@@ -229,6 +229,135 @@ def test_location_review_assigns_a_custom_name_to_coordinate_group(
     ]
 
 
+def test_location_review_reports_and_resumes_batch_assignment_progress(
+    live_server, page,
+):
+    """Large groups report committed chunks and retry only the remainder."""
+    photo_id = live_server["data"]["photos"][0]
+    synthetic_photo_ids = list(range(1, 2502))
+    preview = {
+        "total": len(synthetic_photo_ids),
+        "reviewable": len(synthetic_photo_ids),
+        "unresolved": [],
+        "skipped": [],
+        "groups": [{
+            "photo_ids": synthetic_photo_ids,
+            "photos": [{
+                "id": photo_id,
+                "filename": "batch-example.jpg",
+                "latitude": 33.255,
+                "longitude": -116.405,
+                "timestamp": "2026-08-04T10:17:00",
+            }],
+            "count": len(synthetic_photo_ids),
+            "center": {"lat": 33.255, "lng": -116.405},
+            "bounds": {
+                "south": 33.255,
+                "west": -116.405,
+                "north": 33.255,
+                "east": -116.405,
+            },
+            "spread_m": 0,
+            "captured_from": "2026-08-04T10:17:00",
+            "captured_to": "2026-08-04T10:17:00",
+        }],
+    }
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.route(
+        "**/api/location-review/preview",
+        lambda route: route.fulfill(json=preview),
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text(
+        "2,501 photos"
+    )
+
+    page.locator("#locationReviewSearch").fill("Large batch location")
+    page.locator("#locationReviewCustom").click()
+    page.evaluate(
+        """() => {
+          window.__locationReviewOriginalSafeFetch = window.safeFetch;
+          window.__locationReviewAssignmentRequests = [];
+          window.__locationReviewAssignmentPending = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__locationReviewOriginalSafeFetch(url, opts, options);
+            }
+            window.__locationReviewAssignmentRequests.push(JSON.parse(opts.body));
+            return new Promise(function(resolve, reject) {
+              window.__locationReviewAssignmentPending.push({resolve: resolve, reject: reject});
+            });
+          };
+          window.__settleLocationAssignment = function(result) {
+            var pending = window.__locationReviewAssignmentPending.shift();
+            if (result === 'reject') pending.reject(new Error('Synthetic interruption'));
+            else pending.resolve({ok: true, updated: result});
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function(
+        "() => window.__locationReviewAssignmentRequests.length === 1"
+    )
+    progress = page.locator("#locationReviewAssignmentProgress")
+    progress_bar = page.locator("#locationReviewAssignmentTrack")
+    expect(progress).to_be_visible()
+    expect(page.locator("#locationReviewAssignmentStatus")).to_have_text(
+        "Assigning 0 of 2,501 photos · 0%"
+    )
+    expect(progress_bar).to_have_attribute("aria-valuemax", "2501")
+    expect(progress_bar).to_have_attribute("aria-valuenow", "0")
+    expect(page.locator("#locationReviewSkip")).to_be_disabled()
+
+    page.evaluate("window.__settleLocationAssignment(1000)")
+    page.wait_for_function(
+        "() => window.__locationReviewAssignmentRequests.length === 2"
+    )
+    expect(page.locator("#locationReviewAssignmentStatus")).to_have_text(
+        "Assigning 1,000 of 2,501 photos · 40%"
+    )
+    expect(progress_bar).to_have_attribute("aria-valuenow", "1000")
+
+    page.evaluate("window.__settleLocationAssignment('reject')")
+    expect(page.locator("#locationReviewAssign")).to_have_text(
+        "Retry 1,501 remaining"
+    )
+    expect(page.locator("#locationReviewAssignmentStatus")).to_have_text(
+        "1,000 of 2,501 assigned · 1,501 remaining"
+    )
+    expect(page.locator("#locationReviewSkip")).to_be_enabled()
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function(
+        "() => window.__locationReviewAssignmentRequests.length === 3"
+    )
+    page.evaluate("window.__settleLocationAssignment(1000)")
+    page.wait_for_function(
+        "() => window.__locationReviewAssignmentRequests.length === 4"
+    )
+    expect(page.locator("#locationReviewAssignmentStatus")).to_have_text(
+        "Assigning 2,000 of 2,501 photos · 80%"
+    )
+    page.evaluate("window.__settleLocationAssignment(501)")
+
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text(
+        "All locations reviewed"
+    )
+    requests = page.evaluate("window.__locationReviewAssignmentRequests")
+    assert [len(request["photo_ids"]) for request in requests] == [
+        1000, 1000, 1000, 501,
+    ]
+    assert requests[2]["photo_ids"] == synthetic_photo_ids[1000:2000]
+
+
 def test_location_review_missing_google_key_links_to_settings(live_server, page):
     """The empty suggestion state explains how to enable nearby places."""
     photo_id = live_server["data"]["photos"][0]

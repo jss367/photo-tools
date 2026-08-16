@@ -454,6 +454,43 @@ def test_sync_preview_rejects_stale_progressive_revision(app_and_db):
     assert stale.get_json()["code"] == "sync_preview_changed"
 
 
+def test_sync_preview_revalidates_after_final_page_enrichment(
+    app_and_db, tmp_path,
+):
+    """A queue write during slow final-page enrichment returns a conflict."""
+    import app as vireo_app
+
+    app, db = app_and_db
+    photo_ids = [photo["id"] for photo in db.get_photos()[:2]]
+    first_photo = db.get_photo(photo_ids[0])
+    db.conn.execute(
+        "UPDATE folders SET path = ? WHERE id = ?",
+        (str(tmp_path), first_photo["folder_id"]),
+    )
+    db.conn.commit()
+    db.queue_change(photo_ids[0], "rating", "3")
+    original_read = vireo_app.read_sync_preview_metadata
+    mutated = False
+
+    def mutate_queue_during_read(path):
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            db.queue_change(photo_ids[1], "rating", "4")
+        return original_read(path)
+
+    vireo_app.read_sync_preview_metadata = mutate_queue_during_read
+    try:
+        response = app.test_client().get(
+            "/api/sync/preview?limit=25&offset=0"
+        )
+    finally:
+        vireo_app.read_sync_preview_metadata = original_read
+
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "sync_preview_changed"
+
+
 def test_sync_preview_reuses_snapshot_across_page_requests(app_and_db):
     """Subsequent page requests skip the full pending-changes scan.
 
@@ -1595,6 +1632,44 @@ def test_sync_discard_records_history(app_and_db):
     history = db.get_edit_history()
     assert len(history) == 1
     assert history[0]['action_type'] == 'discard'
+    assert db.get_pending_changes() == []
+
+
+def test_sync_discard_all_rejects_stale_preview_revision(app_and_db):
+    """Discard All never removes changes that appeared after the review."""
+    app, db = app_and_db
+    photos = db.get_photos()[:2]
+    db.queue_change(photos[0]["id"], "rating", "3")
+    client = app.test_client()
+    revision = client.get("/api/sync/preview").get_json()["revision"]
+
+    db.queue_change(photos[1]["id"], "rating", "4")
+    response = client.post(
+        "/api/sync/discard",
+        json={"discard_all": True, "revision": revision},
+    )
+
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "sync_preview_changed"
+    assert len(db.get_pending_changes()) == 2
+
+
+def test_sync_discard_all_uses_reviewed_revision(app_and_db):
+    """A current reviewed revision atomically clears the whole workspace."""
+    app, db = app_and_db
+    photos = db.get_photos()[:2]
+    db.queue_change(photos[0]["id"], "rating", "3")
+    db.queue_change(photos[1]["id"], "rating", "4")
+    client = app.test_client()
+    revision = client.get("/api/sync/preview").get_json()["revision"]
+
+    response = client.post(
+        "/api/sync/discard",
+        json={"discard_all": True, "revision": revision},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["discarded"] == 2
     assert db.get_pending_changes() == []
 
 

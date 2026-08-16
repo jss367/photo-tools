@@ -872,17 +872,20 @@ async function discardAllChanges() {
   if (!_syncPreviewComplete || !_syncPreviewData) return;
   if (!confirm('Discard ALL pending changes? Nothing will be written to XMP.')) return;
   try {
-    var allIds = [];
-    _syncPreviewData.photos.forEach(function(p) {
-      p.changes.forEach(function(c) { allIds.push(c.id); });
-    });
     await safeFetch('/api/sync/discard', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({change_ids: allIds}),
+      body: JSON.stringify({
+        discard_all: true,
+        revision: _syncPreviewData.revision,
+      }),
     });
     closeSyncPreview();
-  } catch(e) {}
+  } catch(e) {
+    if (e && e.code === 'sync_preview_changed' && _syncModalOpen) {
+      await _syncStartPreviewLoad(0);
+    }
+  }
 }
 
 function toggleSyncFilter(type) {

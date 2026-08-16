@@ -12460,6 +12460,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
         for photo in page_photos:
             photo["edit_recipe"] = recipe_map.get(photo["photo_id"])
+        # A slow sidecar or network-folder read can leave the queue time to
+        # change after the snapshot was validated above. Never mark the final
+        # page complete from that stale snapshot: the client will restart the
+        # progressive review on this existing conflict response.
+        if (
+            not has_more
+            and _sync_preview_pending_fingerprint(db, db._ws_id())
+            != snapshot["fingerprint"]
+        ):
+            return json_error(
+                "pending changes changed while the review was loading",
+                409,
+                code="sync_preview_changed",
+                message="Pending changes changed. Restarting the review.",
+            )
         return jsonify(result)
 
     @app.route("/api/sync/discard", methods=["POST"])
@@ -12467,6 +12482,66 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Discard specific pending changes."""
         db = _get_db()
         body = request.get_json(silent=True) or {}
+        if body.get("discard_all") is True:
+            revision = body.get("revision")
+            if not isinstance(revision, str) or not revision:
+                return json_error("revision required for discard_all")
+
+            ws_id = db._ws_id()
+            try:
+                # Validate and delete under one write transaction. This keeps
+                # another request from replacing or adding a pending row
+                # between the revision check and the workspace-wide delete.
+                db.conn.execute("BEGIN IMMEDIATE")
+                snapshot = _sync_preview_get_snapshot(db, ws_id, revision)
+                if snapshot["revision"] != revision:
+                    db.conn.rollback()
+                    return json_error(
+                        "pending changes changed since they were reviewed",
+                        409,
+                        code="sync_preview_changed",
+                        message=(
+                            "Pending changes changed. Review them again before "
+                            "discarding all."
+                        ),
+                    )
+                changes = db.conn.execute(
+                    "SELECT * FROM pending_changes WHERE workspace_id = ?",
+                    (ws_id,),
+                ).fetchall()
+                db.conn.execute(
+                    "DELETE FROM pending_changes WHERE workspace_id = ?",
+                    (ws_id,),
+                )
+                if changes:
+                    items = [
+                        {
+                            "photo_id": change["photo_id"],
+                            "old_value": (
+                                f'{change["change_type"]}:{change["value"]}'
+                            ),
+                            "new_value": "",
+                        }
+                        for change in changes
+                    ]
+                    db.record_edit(
+                        "discard",
+                        f"Discarded {len(changes)} pending changes",
+                        "",
+                        items,
+                        is_batch=len(changes) > 1,
+                        _commit=False,
+                    )
+                db.conn.commit()
+            except Exception:
+                db.conn.rollback()
+                raise
+
+            if changes:
+                db._prune_edit_history()
+            log.info("Discarded all %d pending changes", len(changes))
+            return jsonify({"ok": True, "discarded": len(changes)})
+
         change_ids = body.get("change_ids", [])
         if not change_ids:
             return json_error("change_ids required")

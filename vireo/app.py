@@ -6024,7 +6024,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     focus_index = (page - 1) * per_page + local_index
                 else:
                     try:
-                        ordered_ids = db.get_photo_ids(
+                        focus_index = db.get_photo_position(
+                            focus_photo_id,
                             folder_id=folder_id,
                             collection_id=collection_id,
                             sort=sort,
@@ -6032,10 +6033,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     except ValueError as exc:
                         db.conn.rollback()
                         return json_error(str(exc), 400)
-                    try:
-                        focus_index = ordered_ids.index(focus_photo_id)
-                    except ValueError:
-                        pass
                 # Return only the bounded page containing the target from the
                 # same SQLite read snapshot as its position and total. Sending
                 # every preceding row can freeze Browse for a focus deep in a

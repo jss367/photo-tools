@@ -16461,8 +16461,11 @@ def test_predictions_api_photo_ids_rejects_foreign_photo(app_and_db):
 def test_selection_prediction_suggestions_aggregates_by_species(app_and_db):
     """Predictions aggregate per species across the selection.
 
-    Two photos predict Bald Eagle; one already carries the keyword. The
-    panel must report both counts separately so "Accept on 1" is honest.
+    Two photos predict Bald Eagle; one already carries the keyword. Its
+    pending prediction still needs to leave Review, so it lands in
+    ``acceptable_prediction_ids`` for a status-only accept — the panel
+    reports how many of the targets are already keyworded so the user
+    knows some of them will only flip status.
     """
     app, db = app_and_db
     client = app.test_client()
@@ -16483,10 +16486,19 @@ def test_selection_prediction_suggestions_aggregates_by_species(app_and_db):
 
     by_species = {p["species"]: p for p in data["predictions"]}
     eagle = by_species["Bald Eagle"]
+    pred_a = _prediction_id(db, photo_a, "Bald Eagle")
+    pred_b = _prediction_id(db, photo_b, "Bald Eagle")
     assert eagle["predicted_count"] == 2
     assert eagle["keyworded_count"] == 1
     assert eagle["missing_photo_ids"] == [photo_b]
-    assert eagle["prediction_ids"] == [_prediction_id(db, photo_b, "Bald Eagle")]
+    # Both photos' pending prediction rows must be actionable: the
+    # already-keyworded photo goes through as a status-only accept, and
+    # the missing photo gets both the keyword and the accepted status.
+    assert set(eagle["prediction_ids"]) == {pred_a, pred_b}
+    assert set(eagle["acceptable_prediction_ids"]) == {pred_a, pred_b}
+    assert eagle["acceptable_photo_count"] == 2
+    assert set(eagle["acceptable_photo_ids"]) == {photo_a, photo_b}
+    assert eagle["acceptable_keyworded_count"] == 1
     assert eagle["ambiguous_prediction_ids"] == []
     assert eagle["min_confidence"] == 0.83
     assert eagle["max_confidence"] == 0.91
@@ -16495,6 +16507,7 @@ def test_selection_prediction_suggestions_aggregates_by_species(app_and_db):
     assert osprey["predicted_count"] == 1
     assert osprey["keyworded_count"] == 0
     assert osprey["missing_photo_ids"] == [photo_c]
+    assert osprey["acceptable_keyworded_count"] == 0
 
 
 def test_selection_prediction_suggestions_marks_ambiguous(app_and_db):
@@ -17105,3 +17118,258 @@ def test_selection_prediction_suggestions_marks_photo_ambiguous_across_siblings(
     assert entry["acceptable_photo_count"] == 0
     assert set(entry["ambiguous_prediction_ids"]) == verdin_ids
     assert entry["ambiguous_photo_ids"] == [photo_id]
+
+
+def test_selection_prediction_suggestions_uses_burst_consensus_species(app_and_db):
+    """A minority-frame burst prediction aggregates under the winning species.
+
+    ``accept_prediction`` derives a grouped prediction's species from the
+    individual-vote consensus stored in ``prediction_review.individual`` — a
+    Robin/Robin/Sparrow burst accepts as Robin from every frame, including
+    the minority Sparrow one. If the selection aggregator keyed by the raw
+    per-frame ``species`` instead, the Sparrow frame would surface its own
+    bucket advertising an Accept button that silently tags Robin.
+    """
+    import json as _json
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_burst_photo(name, species):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        # ``individual`` carries the vote counts across the burst; the
+        # consensus is Robin (2 votes) even in the Sparrow-labelled frame.
+        db.add_prediction(
+            det_id, species, 0.9, "bioclip",
+            group_id="burst-consensus-1",
+            individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
+        )
+        return photo_id
+
+    robin_a = _seed_burst_photo("burst-robin-a.jpg", "Robin")
+    robin_b = _seed_burst_photo("burst-robin-b.jpg", "Robin")
+    sparrow_frame = _seed_burst_photo("burst-sparrow.jpg", "Sparrow")
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [robin_a, robin_b, sparrow_frame]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    predictions = resp.get_json()["predictions"]
+    # The Sparrow-labelled minority frame must NOT surface as its own
+    # bucket — every burst member aggregates under the accept-time
+    # consensus so the Accept button and the resulting tag agree.
+    assert {p["species"] for p in predictions} == {"Robin"}
+    robin = predictions[0]
+    assert robin["predicted_count"] == 3
+    assert robin["acceptable_photo_count"] == 3
+    assert set(robin["acceptable_photo_ids"]) == {robin_a, robin_b, sparrow_frame}
+
+    # And a real accept over the aggregated ids tags every photo with the
+    # consensus species — including the Sparrow-labelled frame.
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": robin["acceptable_prediction_ids"]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    for pid in (robin_a, robin_b, sparrow_frame):
+        names = {k["name"] for k in db.get_photo_keywords(pid)}
+        assert "Robin" in names
+        assert "Sparrow" not in names
+
+
+def test_predictions_api_exposes_consensus_species_for_burst(app_and_db):
+    """/api/predictions surfaces the accept-time species as consensus_species.
+
+    Browse's single-photo panel groups rows by species and offers an
+    Accept per bucket. Without the accept-time consensus in the payload
+    the panel groups by the raw per-frame label — a minority Sparrow
+    frame in a majority-Robin burst then renders a Sparrow row whose
+    Accept button tags Robin.
+    """
+    import json as _json
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="consensus.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    db.add_prediction(
+        det_id, "Sparrow", 0.9, "bioclip",
+        group_id="burst-consensus-2",
+        individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
+    )
+
+    resp = client.get(f"/api/predictions?photo_ids={photo_id}")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    preds = resp.get_json()["predictions"]
+    assert len(preds) == 1
+    pred = preds[0]
+    # Raw per-frame label is preserved for provenance…
+    assert pred["species"] == "Sparrow"
+    # …but the accept-time species is what the panel groups and labels by.
+    assert pred["consensus_species"] == "Robin"
+
+
+def test_predictions_api_consensus_species_falls_back_to_raw(app_and_db):
+    """Non-grouped predictions expose the raw species as consensus.
+
+    Groups only exist for burst photos; ordinary single-photo predictions
+    have no ``individual`` blob. Their consensus is simply their own
+    species — the panel must not receive a null and skip grouping.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(
+        db, "consensus-plain.jpg", "Bald Eagle", 0.9,
+    )
+    resp = client.get(f"/api/predictions?photo_ids={photo_id}")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    preds = resp.get_json()["predictions"]
+    assert [p["consensus_species"] for p in preds] == ["Bald Eagle"]
+
+
+def test_browse_detail_panel_groups_by_consensus_species(app_and_db):
+    """The single-photo panel keys its species groups off consensus_species.
+
+    A regression to the raw ``p.species`` would let a minority-frame
+    burst row render its own Accept button that tags the majority
+    species. The template must consult ``consensus_species`` first.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    # The rendered grouping key uses the consensus species when present.
+    assert "p.consensus_species || p.species" in html
+
+
+def test_selection_prediction_suggestions_flips_status_on_already_keyworded_photo(
+    app_and_db,
+):
+    """A pending prediction on an already-keyworded photo is still acceptable.
+
+    ``accept_prediction`` supports a status-only accept: ``add_keyword``
+    is idempotent and the ``already_has_species`` branch skips the re-tag.
+    Dropping the row entirely — the previous behaviour — left the
+    prediction pending in Review while the panel reported "already
+    keyworded", stranding the user.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_keyworded, _ = _seed_prediction_photo(
+        db, "keyworded-pending.jpg", "Bald Eagle", 0.9,
+    )
+    photo_missing, _ = _seed_prediction_photo(
+        db, "missing-pending.jpg", "Bald Eagle", 0.85,
+    )
+    # Manually keyword one photo before running the aggregator.
+    kid = db.add_keyword("Bald Eagle", is_species=True)
+    db.tag_photo(photo_keyworded, kid)
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_keyworded, photo_missing]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    entry = next(
+        p for p in resp.get_json()["predictions"] if p["species"] == "Bald Eagle"
+    )
+    pred_keyworded = _prediction_id(db, photo_keyworded, "Bald Eagle")
+    pred_missing = _prediction_id(db, photo_missing, "Bald Eagle")
+    assert set(entry["acceptable_prediction_ids"]) == {pred_keyworded, pred_missing}
+    assert entry["acceptable_photo_count"] == 2
+    assert entry["acceptable_keyworded_count"] == 1
+    assert entry["keyworded_count"] == 1
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": entry["acceptable_prediction_ids"]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    # Both prediction rows flip to accepted; neither photo gains a
+    # duplicate tag, and the pre-existing keyword survives.
+    statuses = {
+        row["photo_id"]: row["status"]
+        for row in db.get_predictions(
+            photo_ids=[photo_keyworded, photo_missing],
+        )
+        if row["species"] == "Bald Eagle"
+    }
+    assert statuses == {
+        photo_keyworded: "accepted",
+        photo_missing: "accepted",
+    }
+    for pid in (photo_keyworded, photo_missing):
+        names = [k["name"] for k in db.get_photo_keywords(pid)]
+        assert names.count("Bald Eagle") == 1
+
+
+def test_batch_accept_admits_payload_larger_than_1000(app_and_db):
+    """Payloads emitted by a 1,000-photo selection must not 400.
+
+    The selection endpoint caps at 1,000 photos, but a single photo can
+    emit several prediction rows (multiple detections, or the same
+    detection classified by more than one model). Codex flagged that
+    capping batch-accept at 1,000 prediction ids rejected any selection
+    where the multiplier crossed one, so the panel's own Accept button
+    could 400 on a legal selection.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    # 600 photos × 2 classifier models on one detection = 1,200 ids, above
+    # the old 1,000 cap. Kept modest so the test is quick but still crosses
+    # the previous boundary.
+    photos = []
+    for i in range(600):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=f"bulk-{i}.jpg", extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(det_id, "Bald Eagle", 0.9, "bioclip")
+        db.add_prediction(det_id, "Bald Eagle", 0.7, "inat21")
+        photos.append(photo_id)
+
+    all_ids = [
+        row["id"] for row in db.get_predictions(photo_ids=photos)
+        if row["species"] == "Bald Eagle"
+    ]
+    assert len(all_ids) == 1200
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": all_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    # A single undo entry — even a 1,200-row payload lands as one action.
+    accept_rows = [
+        row for row in db.get_edit_history()
+        if row["action_type"] == "prediction_accept"
+    ]
+    assert len(accept_rows) == 1

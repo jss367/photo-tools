@@ -10035,6 +10035,34 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "suggestions": suggestions,
         })
 
+    def _prediction_consensus_species(row):
+        """Species ``accept_prediction`` will actually apply for this row.
+
+        Non-grouped predictions accept as their own ``species``. A grouped
+        (burst) prediction accepts as the burst's winning species, derived
+        from the per-individual vote counts stored in
+        ``prediction_review.individual`` — a Robin/Robin/Sparrow burst
+        accepts as Robin even from the minority Sparrow frame.
+
+        The Browse panel and the selection aggregator both group by species,
+        so they must group by *this* species — otherwise a minority frame
+        surfaces a Sparrow Accept button that silently tags Robin. Kept as a
+        module-level helper so the two callers stay in lockstep.
+        """
+        species = row["species"]
+        if not row["group_id"] or not row["individual"]:
+            return species
+        try:
+            votes = json.loads(row["individual"])
+        except (TypeError, ValueError):
+            return species
+        if not isinstance(votes, dict) or not votes:
+            return species
+        try:
+            return max(votes, key=lambda sp: votes[sp])
+        except (TypeError, ValueError):
+            return species
+
     def _parse_selection_photo_ids(body):
         """Validate a selection payload's ``photo_ids``.
 
@@ -10115,7 +10143,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         order = {pid: i for i, pid in enumerate(photo_ids)}
         by_key = {}
         for row in pending:
-            species = row["species"]
+            # Group by the species the accept path will actually apply, not
+            # the raw per-frame label: for a burst whose frames disagree,
+            # ``accept_prediction`` uses the individual-vote consensus, so a
+            # Robin/Robin/Sparrow burst must aggregate under Robin — the
+            # Sparrow minority frame would otherwise surface its own bucket
+            # advertising an Accept button that tags Robin.
+            species = _prediction_consensus_species(row)
             if not species:
                 continue
             key = keyword_match_key(species) or species.casefold()
@@ -10171,8 +10205,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 if kid is not None else set()
             )
             missing_ids = [p for p in predicted_ids if p not in keyworded]
+            # A pending prediction on an already-keyworded photo still has to
+            # go somewhere: dropping it would leave Review holding the same
+            # row the panel just told the user was "already keyworded", and
+            # the user has no way to clear it from Browse. ``accept_prediction``
+            # already supports a status-only accept — ``add_keyword`` is
+            # idempotent and the ``already_has_species`` branch skips the
+            # re-tag — so an unambiguous keyworded row is safe to include
+            # here. Ambiguous keyworded rows still route to Review, same as
+            # ambiguous missing ones, because their resolution needs Review's
+            # full comparison UI.
             acceptable, ambiguous_ids, ambiguous_photos = [], [], []
-            for pid in missing_ids:
+            acceptable_photos = []
+            for pid in predicted_ids:
                 row = entry["rows_by_photo"][pid]
                 # Highest confidence first so a stable, obvious order lands in
                 # the payload (and any downstream truncation keeps the
@@ -10185,19 +10230,32 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     ambiguous_photos.append(pid)
                 else:
                     acceptable.extend(ids_here)
+                    acceptable_photos.append(pid)
             # Photo-level count for the button label. A photo with several
-            # matching detections contributes several ids to `acceptable`, so
-            # `len(acceptable)` overcounts the photos that would be keyworded.
-            acceptable_photo_count = len(missing_ids) - len(ambiguous_photos)
+            # matching detections contributes several ids to ``acceptable``, so
+            # ``len(acceptable)`` overcounts the photos that would be touched.
+            acceptable_photo_count = len(acceptable_photos)
+            already_keyworded_acceptable = sum(
+                1 for pid in acceptable_photos if pid in keyworded
+            )
             results.append({
                 "species": entry["species"],
                 "models": sorted(entry["models"]),
                 "predicted_count": len(predicted_ids),
+                # Count of photos already carrying this species keyword. Kept
+                # informational — the panel labels them so the user knows
+                # some of the "Accept on N" targets will status-only flip
+                # without re-tagging.
                 "keyworded_count": len(predicted_ids) - len(missing_ids),
+                # Subset of ``acceptable_photo_count`` whose keyword is
+                # already present. Lets the UI say "already keyworded on M
+                # of N" without recomputing the intersection client-side.
+                "acceptable_keyworded_count": already_keyworded_acceptable,
                 "predicted_photo_ids": predicted_ids,
                 "missing_photo_ids": missing_ids,
                 "prediction_ids": acceptable + ambiguous_ids,
                 "acceptable_prediction_ids": acceptable,
+                "acceptable_photo_ids": acceptable_photos,
                 "acceptable_photo_count": acceptable_photo_count,
                 "ambiguous_prediction_ids": ambiguous_ids,
                 "ambiguous_photo_ids": ambiguous_photos,
@@ -15984,6 +16042,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # Attach alternatives
             key = (d.get("detection_id"), d.get("model"))
             d["alternatives"] = alts_by_key.get(key, [])
+            # Species the accept path will actually apply. For an ordinary
+            # prediction this is the row's own species; for a grouped/burst
+            # prediction whose frames disagree, ``accept_prediction`` derives
+            # the burst consensus from ``individual`` vote counts. The Browse
+            # panel labels and groups rows by this so a Sparrow frame in a
+            # majority-Robin burst never surfaces a Sparrow row whose Accept
+            # actually tags Robin.
+            d["consensus_species"] = _prediction_consensus_species(d)
             results.append(d)
         # Surface the visual clause's status so the Review filter bar's
         # visual chip can warn on fallback. Without this the chip would
@@ -16438,7 +16504,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if raw not in seen:
                 pred_ids.append(raw)
                 seen.add(raw)
-        if len(pred_ids) > 1000:
+        # The selection endpoint caps at 1,000 photos, but a single photo can
+        # emit many prediction rows for one species — several detections, or
+        # the same detection classified by multiple models. Codex flagged that
+        # capping this at 1,000 prediction ids rejected valid payloads: 501
+        # photos × 2 models emits 1,002 acceptable ids, so the panel's own
+        # Accept button 400ed. Cap high enough that every payload the selection
+        # endpoint can produce is accepted (1,000 photos × 25 rows per photo
+        # comfortably covers real wildlife catalogs) while still shutting the
+        # door on a runaway request.
+        if len(pred_ids) > 25000:
             return None, None, json_error("too many prediction_ids", 400)
 
         placeholders = ",".join("?" for _ in pred_ids)

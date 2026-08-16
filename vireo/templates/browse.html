@@ -6362,15 +6362,23 @@ function renderDetailPredictions(data, photoId) {
   // same bird lists that bird a dozen times. Group by species+status: the
   // question the panel answers is "what species is in this photo", and the
   // detection count is the interesting detail, not a reason to repeat.
+  //
+  // The species used for grouping and display is the one accept_prediction()
+  // will actually apply — the backend exposes it as `consensus_species`. For
+  // a non-grouped prediction that's just `p.species`; for a burst whose
+  // frames disagree it's the individual-vote consensus. Grouping by the raw
+  // per-frame `p.species` here would let a minority Sparrow frame surface
+  // its own row with an Accept button that tags Robin.
   var groups = [];
   var groupByKey = {};
   visible.forEach(function(p) {
     var decided = p.status === 'accepted' || p.status === 'rejected';
-    var key = (p.species || 'Unknown').toLowerCase() + '|' + (decided ? p.status : 'pending');
+    var displaySpecies = p.consensus_species || p.species || 'Unknown';
+    var key = displaySpecies.toLowerCase() + '|' + (decided ? p.status : 'pending');
     var g = groupByKey[key];
     if (!g) {
       g = groupByKey[key] = {
-        species: p.species || 'Unknown', status: decided ? p.status : 'pending',
+        species: displaySpecies, status: decided ? p.status : 'pending',
         decided: decided, ids: [], models: {}, ambiguous: [], best: null, count: 0,
       };
       groups.push(g);

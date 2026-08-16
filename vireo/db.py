@@ -17936,6 +17936,7 @@ class Database:
         weak_confidence=None,
         fresh_detections_by_photo=None,
         fresh_processed_photo_ids=None,
+        expected_classifier_runtime_by_detector_runtime=None,
     ):
         """Return the SET of photo IDs from ``photo_ids`` that the classify
         preflight would consider fully cached under
@@ -17981,6 +17982,28 @@ class Database:
         stale rows from another detector either adding uncached work or hiding
         a fresh uncached target. Photos the detector failed to process retain
         the DB fallback, matching the classify loop.
+
+        ``expected_classifier_runtime_by_detector_runtime`` maps each
+        ``detections.runtime_fingerprint`` value present in this batch to the
+        classifier_runtime_fingerprint the runtime gate will accept for
+        classifier_runs rows anchored on that detection. When provided, the
+        preflight matches the runtime's per-detection gate: a
+        ``classifier_runs`` row counts only when its ``runtime_fingerprint``
+        equals the expected value for its detection's detector runtime, or is
+        the ``'legacy'`` sentinel, or the prediction carries a real
+        prediction_review override. Without this predicate the preflight
+        overcounts obsolete-runtime rows the runtime will reject and the
+        observation-based correction cannot deflate the estimate until those
+        rejected rows are actually visited — leading
+        ``_classification_eta_progress`` to report "finishing…" while
+        substantial inference work still remains (Codex #1468 P2). Passing
+        ``None`` retains the pre-Codex behaviour (no runtime filter); this
+        is the correct choice on reclassify runs, where the runtime gate is
+        bypassed anyway. Values may be ``None`` when the caller cannot
+        compute an expected fingerprint (e.g. portable identity not wired
+        up): matching detections then skip the runtime filter, mirroring
+        the unfiltered ``get_classifier_run_keys`` fallback the runtime
+        applies.
         """
         if not photo_ids:
             return set()
@@ -18006,6 +18029,74 @@ class Database:
         # Match the 500-element chunks used elsewhere in this file.
         CHUNK = 500
         matched = set()
+
+        # Runtime-fingerprint gate for classifier_runs, mirroring what
+        # ``get_classifier_run_key_gate`` accepts at runtime. Without this
+        # predicate the preflight would count rows whose ``runtime_fingerprint``
+        # the runtime rejects (typically stale after a detector fingerprint
+        # roll), and no observation could correct the estimate until those
+        # rows were visited — collapsing ``remaining_uncached`` to zero
+        # prematurely (Codex #1468 P2).
+        rt_map = expected_classifier_runtime_by_detector_runtime
+        rt_predicate_sql = ""
+        rt_predicate_params: list = []
+        if rt_map is not None and rt_map:
+            strict_pairs = [
+                (det_rt, cls_rt)
+                for det_rt, cls_rt in rt_map.items()
+                if cls_rt is not None
+            ]
+            permissive_det_rts = [
+                det_rt
+                for det_rt, cls_rt in rt_map.items()
+                if cls_rt is None
+            ]
+            # Assemble a predicate that, given a classifier_runs alias
+            # ``{cr}``, requires at least one of:
+            #   1. ``{cr}.runtime_fingerprint`` matches the expected value for
+            #      the anchor detection's ``detections.runtime_fingerprint``.
+            #   2. ``{cr}.runtime_fingerprint`` is ``'legacy'`` (grandfathered).
+            #   3. A prediction on the same row carries a real
+            #      prediction_review override (mirrors ``get_classifier_run_keys``).
+            # A permissive detector-runtime entry (expected value ``None``)
+            # accepts any classifier_runs.runtime_fingerprint for its
+            # detections, matching the pipeline's unfiltered fallback when
+            # portable identity is not wired up.
+            def _runtime_predicate(alias):
+                pair_terms = " OR ".join(
+                    f"(d_src.runtime_fingerprint IS ? AND {alias}.runtime_fingerprint IS ?)"
+                    for _ in strict_pairs
+                )
+                permissive_terms = " OR ".join(
+                    "d_src.runtime_fingerprint IS ?"
+                    for _ in permissive_det_rts
+                )
+                detector_match_terms = " OR ".join(
+                    part for part in (pair_terms, permissive_terms) if part
+                )
+                pred_sql = (
+                    f" AND ({alias}.runtime_fingerprint = 'legacy'"
+                    f" OR EXISTS (SELECT 1 FROM detections d_src"
+                    f"             WHERE d_src.id = {alias}.detection_id"
+                    f"               AND ({detector_match_terms}))"
+                    f" OR EXISTS (SELECT 1 FROM predictions p_ov"
+                    f"             JOIN prediction_review pr_ov"
+                    f"               ON pr_ov.prediction_id = p_ov.id"
+                    f"            WHERE p_ov.detection_id = {alias}.detection_id"
+                    f"              AND p_ov.classifier_model = {alias}.classifier_model"
+                    f"              AND p_ov.labels_fingerprint = {alias}.labels_fingerprint"
+                    f"              AND pr_ov.status IN ('accepted', 'rejected')"
+                    f"              AND COALESCE(pr_ov.individual, '') != ?))"
+                )
+                params: list = []
+                for det_rt, cls_rt in strict_pairs:
+                    params.extend([det_rt, cls_rt])
+                params.extend(permissive_det_rts)
+                params.append(AUTO_MATCH_REVIEW_MARKER)
+                return pred_sql, params
+
+            rt_predicate_sql_cr, rt_predicate_params = _runtime_predicate("cr")
+            rt_predicate_sql = rt_predicate_sql_cr
 
         # For photos whose detector iteration completed, mirror the runtime's
         # in-memory target selection rather than querying every detection row
@@ -18127,8 +18218,9 @@ class Database:
                                 AND p.labels_fingerprint
                                     = cr.labels_fingerprint
                                 AND p.confidence >= 0
-                           )""",
-                [*chunk, classifier_model, labels_fingerprint],
+                           )""" + rt_predicate_sql,
+                [*chunk, classifier_model, labels_fingerprint,
+                 *rt_predicate_params],
             ).fetchall()
             cached_fresh_detection_ids.update(
                 row["detection_id"] for row in rows
@@ -18187,10 +18279,11 @@ class Database:
                 f"                    = cr.labels_fingerprint "
                 f"                AND p.confidence >= 0 "
                 f"          ) "
-                f"      ) "
-                f"  )",
+                + rt_predicate_sql +
+                "      ) "
+                "  )",
                 [min_conf, *chunk, min_conf, classifier_model,
-                 labels_fingerprint],
+                 labels_fingerprint, *rt_predicate_params],
             ).fetchall()
             for r in rows:
                 matched.add(r["photo_id"])
@@ -18252,8 +18345,9 @@ class Database:
                                 AND p.labels_fingerprint
                                     = cr.labels_fingerprint
                                 AND p.confidence >= 0
-                           )""",
-                [weak_conf, *chunk, classifier_model, labels_fingerprint],
+                           )""" + rt_predicate_sql,
+                [weak_conf, *chunk, classifier_model, labels_fingerprint,
+                 *rt_predicate_params],
             ).fetchall()
             for r in rows:
                 matched.add(r["photo_id"])
@@ -18301,8 +18395,9 @@ class Database:
                                 AND p.labels_fingerprint
                                     = cr.labels_fingerprint
                                 AND p.confidence >= 0
-                           )""",
-                [*chunk, classifier_model, labels_fingerprint, min_conf],
+                           )""" + rt_predicate_sql,
+                [*chunk, classifier_model, labels_fingerprint, min_conf,
+                 *rt_predicate_params],
             ).fetchall()
             for r in rows:
                 matched.add(r["photo_id"])
@@ -18318,6 +18413,7 @@ class Database:
         weak_confidence=None,
         fresh_detections_by_photo=None,
         fresh_processed_photo_ids=None,
+        expected_classifier_runtime_by_detector_runtime=None,
     ):
         """Return ``len(get_classifier_run_cache_hits(...))``.
 
@@ -18334,6 +18430,9 @@ class Database:
             weak_confidence=weak_confidence,
             fresh_detections_by_photo=fresh_detections_by_photo,
             fresh_processed_photo_ids=fresh_processed_photo_ids,
+            expected_classifier_runtime_by_detector_runtime=(
+                expected_classifier_runtime_by_detector_runtime
+            ),
         ))
 
     def get_unclassifiable_photos(

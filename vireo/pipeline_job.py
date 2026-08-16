@@ -5592,6 +5592,67 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         )
                     )
                     if not params.reclassify:
+                        # Precompute the classifier runtime_fingerprint the
+                        # runtime gate will accept for each distinct
+                        # ``detections.runtime_fingerprint`` present in this
+                        # batch. Passing this map lets the preflight reject
+                        # obsolete-runtime classifier_runs rows the same way
+                        # the per-detection ``get_classifier_run_key_gate``
+                        # does at runtime; without it, the preflight
+                        # overcounts rows whose runtime rolled since the
+                        # prior classify pass, and no observation can correct
+                        # the estimate until those rows are visited — so the
+                        # UI reads "finishing…" while inference is still
+                        # pending (Codex #1468 P2).
+                        preflight_expected_rt_map = None
+                        portable_labels_full = loaded_models.get(
+                            "labels_fingerprint_full"
+                        )
+                        portable_model_identity = loaded_models.get(
+                            "classifier_model_identity"
+                        )
+                        portable_tax_identity = loaded_models.get(
+                            "taxonomy_identity", "no-tax",
+                        )
+                        if portable_labels_full and portable_model_identity:
+                            from computation_cache import (
+                                classifier_runtime_fingerprint,
+                            )
+                            detector_runtimes: set = set()
+                            photo_id_list = [p["id"] for p in photos]
+                            det_chunk = 500
+                            for i in range(0, len(photo_id_list), det_chunk):
+                                chunk = photo_id_list[i:i + det_chunk]
+                                placeholders = ",".join("?" * len(chunk))
+                                rows = thread_db.conn.execute(
+                                    f"SELECT DISTINCT runtime_fingerprint "
+                                    f"FROM detections "
+                                    f"WHERE photo_id IN ({placeholders})",
+                                    chunk,
+                                ).fetchall()
+                                for row in rows:
+                                    detector_runtimes.add(
+                                        row["runtime_fingerprint"]
+                                    )
+                            preflight_expected_rt_map = {}
+                            for det_rt in detector_runtimes:
+                                if det_rt is None:
+                                    # Detector runtime not recorded — matches
+                                    # ``classifier_runtime_for_detection``'s
+                                    # None return; permissive entry preserves
+                                    # the unfiltered fallback.
+                                    preflight_expected_rt_map[det_rt] = None
+                                else:
+                                    preflight_expected_rt_map[det_rt] = (
+                                        classifier_runtime_fingerprint(
+                                            portable_model_identity,
+                                            portable_labels_full,
+                                            det_rt,
+                                            taxonomy_identity=(
+                                                portable_tax_identity
+                                            ),
+                                        )
+                                    )
                         preflight_cached_ids = (
                             thread_db.get_classifier_run_cache_hits(
                                 [p["id"] for p in photos],
@@ -5614,6 +5675,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     detect_state["processed_ids"]
                                     if detect_state.get("ran")
                                     else None
+                                ),
+                                expected_classifier_runtime_by_detector_runtime=(
+                                    preflight_expected_rt_map
                                 ),
                             )
                         )

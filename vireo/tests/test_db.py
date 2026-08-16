@@ -18699,6 +18699,141 @@ def test_get_classifier_run_cache_hits_requires_usable_prediction(tmp_path):
     ) == {photo_id}
 
 
+def test_get_classifier_run_cache_hits_rejects_obsolete_runtime_fingerprint(
+    tmp_path,
+):
+    """A classifier_runs row the runtime gate rejects because its
+    ``runtime_fingerprint`` no longer matches must NOT count as a cache
+    hit at preflight either.
+
+    Regression for Codex #1468 P2 (final unresolved thread): the earlier
+    preflight required only a row + a matching prediction and left the
+    runtime-fingerprint check to observation-time reconciliation. Rows in
+    the unvisited tail never registered as misses, so
+    ``_classification_eta_progress`` trusted the inflated ``cached_est``
+    and prematurely collapsed ``remaining_uncached`` to zero after the
+    representative uncached batch. Passing the caller-computed
+    ``expected_classifier_runtime_by_detector_runtime`` map now mirrors
+    what ``get_classifier_run_key_gate`` accepts at runtime, so the
+    preflight excludes obsolete-runtime rows up front. ``'legacy'`` rows
+    remain accepted (grandfathered) and prediction_review overrides
+    still surface, matching the runtime gate.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+
+    p_stale = db.add_photo(
+        folder_id=fid, filename="stale.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_legacy = db.add_photo(
+        folder_id=fid, filename="legacy.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_current = db.add_photo(
+        folder_id=fid, filename="current.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+
+    # Every detection is tied to detector runtime ``rt-current``. Only the
+    # classifier_runs.runtime_fingerprint varies — the runtime gate accepts
+    # ``cls-current`` and the ``'legacy'`` sentinel but rejects ``cls-old``.
+    def _det_with_rt(photo_id, det_rt):
+        det_id = _add_one_detection(db, photo_id)
+        db.conn.execute(
+            "UPDATE detections SET runtime_fingerprint = ? WHERE id = ?",
+            (det_rt, det_id),
+        )
+        db.conn.commit()
+        return det_id
+
+    stale_det = _det_with_rt(p_stale, "rt-current")
+    legacy_det = _det_with_rt(p_legacy, "rt-current")
+    current_det = _det_with_rt(p_current, "rt-current")
+
+    db.record_classifier_run(
+        stale_det, "BioCLIP-2.5", "fp-a", prediction_count=1,
+        runtime_fingerprint="cls-old",
+    )
+    db.add_prediction(
+        stale_det, species="Robin", confidence=0.9,
+        model="BioCLIP-2.5", labels_fingerprint="fp-a",
+    )
+    db.record_classifier_run(
+        legacy_det, "BioCLIP-2.5", "fp-a", prediction_count=1,
+        runtime_fingerprint="legacy",
+    )
+    db.add_prediction(
+        legacy_det, species="Robin", confidence=0.9,
+        model="BioCLIP-2.5", labels_fingerprint="fp-a",
+    )
+    db.record_classifier_run(
+        current_det, "BioCLIP-2.5", "fp-a", prediction_count=1,
+        runtime_fingerprint="cls-current",
+    )
+    db.add_prediction(
+        current_det, species="Robin", confidence=0.9,
+        model="BioCLIP-2.5", labels_fingerprint="fp-a",
+    )
+
+    # Without the map, all three count (preserves prior behaviour on the
+    # reclassify path and for callers that don't wire up portable identity).
+    assert db.get_classifier_run_cache_hits(
+        [p_stale, p_legacy, p_current], "BioCLIP-2.5", "fp-a",
+    ) == {p_stale, p_legacy, p_current}
+
+    # With the map, the stale-runtime row is filtered out — matching what
+    # ``get_classifier_run_key_gate`` returns at runtime. The observation
+    # tracker no longer has to reconcile a phantom cache hit for the
+    # unvisited tail.
+    hits = db.get_classifier_run_cache_hits(
+        [p_stale, p_legacy, p_current], "BioCLIP-2.5", "fp-a",
+        expected_classifier_runtime_by_detector_runtime={
+            "rt-current": "cls-current",
+        },
+    )
+    assert hits == {p_legacy, p_current}, (
+        "Obsolete-runtime classifier_runs rows must not count as cache "
+        "hits; 'legacy' remains grandfathered. Without this filter the "
+        "preflight overcounts the tail and remaining_uncached collapses "
+        "to zero before real inference completes (Codex #1468 P2)."
+    )
+
+    # A permissive entry (expected value ``None``) preserves the pre-Codex
+    # fallback: detections whose runtime maps to ``None`` accept any
+    # classifier_runs.runtime_fingerprint. This mirrors the pipeline's
+    # ``get_classifier_run_keys`` else branch when portable identity is
+    # not available to compute an expected value.
+    permissive_hits = db.get_classifier_run_cache_hits(
+        [p_stale, p_legacy, p_current], "BioCLIP-2.5", "fp-a",
+        expected_classifier_runtime_by_detector_runtime={"rt-current": None},
+    )
+    assert permissive_hits == {p_stale, p_legacy, p_current}
+
+    # Prediction_review overrides on the stale row must still surface it,
+    # matching the runtime gate's individual-override branch.
+    ws_id = db._ws_id()
+    pred_id = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?",
+        (stale_det,),
+    ).fetchone()["id"]
+    db.set_review_status(
+        pred_id, ws_id, "accepted", individual="Robin",
+    )
+    hits_with_override = db.get_classifier_run_cache_hits(
+        [p_stale, p_legacy, p_current], "BioCLIP-2.5", "fp-a",
+        expected_classifier_runtime_by_detector_runtime={
+            "rt-current": "cls-current",
+        },
+    )
+    assert hits_with_override == {p_stale, p_legacy, p_current}, (
+        "A real prediction_review override must rescue an "
+        "obsolete-runtime row, matching get_classifier_run_key_gate's "
+        "individual-override branch."
+    )
+
+
 def test_get_classifier_run_cache_hits_uses_fresh_runtime_candidates(tmp_path):
     """Processed photos must be scored from the detector map the runtime uses.
 

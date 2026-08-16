@@ -13983,8 +13983,8 @@ def test_retire_builtin_wildlife_detaches_associations_and_queues_flat_removal(t
     species_id = db.add_keyword("House Sparrow", is_species=True)
     db.tag_photo(p1, species_id)
     db.conn.execute(
-        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-        (p1, wildlife_id),
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        (p1, wildlife_id, "generated"),
     )
     db.conn.commit()
     db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
@@ -14030,8 +14030,8 @@ def test_retire_builtin_wildlife_preserves_manual_tag_during_mixed_cleanup(tmp_p
     species_id = db.add_keyword("House Sparrow", is_species=True)
     db.tag_photo(p2, species_id)
     db.conn.executemany(
-        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-        [(p1, wildlife_id), (p2, wildlife_id)],
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        [(p1, wildlife_id, None), (p2, wildlife_id, "generated")],
     )
     db.queue_change(p1, "keyword_add", "Wildlife", _commit=False)
     db.conn.commit()
@@ -14072,8 +14072,8 @@ def test_retire_builtin_wildlife_preserves_unsynced_manual_add(tmp_path):
     species_id = db.add_keyword("House Sparrow", is_species=True)
     db.tag_photo(p1, species_id)
     db.conn.execute(
-        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-        (p1, wildlife_id),
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        (p1, wildlife_id, "generated"),
     )
     db.queue_change(p1, "keyword_add", "Wildlife", _commit=False)
     db.conn.commit()
@@ -14170,6 +14170,50 @@ def test_retire_builtin_wildlife_preserves_imported_xmp_term(tmp_path):
     assert db.conn.execute(
         "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
     ).fetchone() is None
+
+
+def test_retire_builtin_wildlife_preserves_legacy_import_without_sidecar(tmp_path):
+    """Unknown no-XMP associations may be catalog-imported user metadata.
+
+    Lightroom imports historically defaulted to ``write_xmp=False`` and
+    attached the existing Wildlife genre directly, leaving no sidecar,
+    pending change, edit-history record, or durable source. That legacy row
+    is indistinguishable from the retired automatic association, so deleting
+    it would risk user-authored metadata. Preserve it conservatively and latch
+    the verdict so later forced runs cannot reinterpret it.
+    """
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    # Legacy execute_import(write_xmp=False) shape: direct association with
+    # NULL source and no XMP mtime, pending change, or edit history.
+    db.tag_photo(p1, wildlife_id)
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 0
+    association = db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone()
+    assert association is not None
+    assert association["source"] == "manual"
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
 
 
 def test_retire_builtin_wildlife_defers_when_sidecar_unavailable(tmp_path):
@@ -14655,8 +14699,8 @@ def test_retire_builtin_wildlife_queues_removal_in_every_owning_workspace(tmp_pa
     species_id = db.add_keyword("House Sparrow", is_species=True)
     db.tag_photo(p1, species_id)
     db.conn.execute(
-        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-        (p1, wildlife_id),
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        (p1, wildlife_id, "generated"),
     )
     db.conn.commit()
     db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
@@ -14705,8 +14749,11 @@ def test_retire_builtin_wildlife_preserves_same_name_top_level_survivor(tmp_path
     species_id = db.add_keyword("House Sparrow", is_species=True)
     db.tag_photo(p1, species_id)
     db.conn.executemany(
-        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-        [(p1, wildlife_genre_id), (p1, wildlife_individual_id)],
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        [
+            (p1, wildlife_genre_id, "generated"),
+            (p1, wildlife_individual_id, "manual"),
+        ],
     )
     db.conn.commit()
     db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
@@ -14835,8 +14882,8 @@ def test_retire_builtin_wildlife_handles_photo_counts_over_bind_limit(tmp_path):
         [(pid, species_id) for pid in photo_ids],
     )
     db.conn.executemany(
-        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-        [(pid, wildlife_id) for pid in photo_ids],
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        [(pid, wildlife_id, "generated") for pid in photo_ids],
     )
     db.conn.commit()
     db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
@@ -15303,8 +15350,8 @@ def test_retire_builtin_wildlife_preserves_keyword_children(tmp_path):
     species_id = db.add_keyword("House Sparrow", is_species=True)
     db.tag_photo(p1, species_id)
     db.conn.execute(
-        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-        (p1, wildlife_id),
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        (p1, wildlife_id, "generated"),
     )
     db.conn.commit()
     db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")

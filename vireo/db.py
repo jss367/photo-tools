@@ -3287,7 +3287,8 @@ class Database:
         self.conn.commit()
 
         rows = self.conn.execute(
-            f"""SELECT DISTINCT pk.photo_id, pk.keyword_id, wf.workspace_id,
+            f"""SELECT DISTINCT pk.photo_id, pk.keyword_id, pk.source,
+                       wf.workspace_id,
                        p.filename, p.xmp_mtime, f.path AS folder_path,
                        (
                            SELECT COUNT(*)
@@ -3343,7 +3344,9 @@ class Database:
         photo_workspaces = {}
         # pid -> "manual" (readable sidecar carries a flat Wildlife term),
         # "defer" (sidecar unreadable/corrupt — decide on a later run), or
-        # "generated" (readable sidecar with no Wildlife term).
+        # "generated" (readable sidecar with no Wildlife term), or "absent"
+        # (no sidecar was ever imported, so a legacy NULL source cannot be
+        # distinguished from metadata imported with write_xmp=False).
         sidecar_verdict_by_photo = {}
         sidecar_manual_pairs = []
         deferred_unavailable_sidecar = False
@@ -3366,7 +3369,7 @@ class Database:
                         sidecar_verdict_by_photo[pid] = "defer"
                         deferred_unavailable_sidecar = True
                     else:
-                        sidecar_verdict_by_photo[pid] = "generated"
+                        sidecar_verdict_by_photo[pid] = "absent"
                 else:
                     # read_keywords() swallows ``ET.ParseError`` and returns
                     # an empty set for a corrupt sidecar, which is
@@ -3413,7 +3416,13 @@ class Database:
                             sidecar_verdict_by_photo[pid] = "defer"
                             deferred_unavailable_sidecar = True
             verdict = sidecar_verdict_by_photo[pid]
-            if verdict == "manual" and not survivor:
+            preserve_unknown_without_sidecar = (
+                verdict == "absent" and row["source"] is None
+            )
+            if (
+                (verdict == "manual" and not survivor)
+                or preserve_unknown_without_sidecar
+            ):
                 # The sidecar itself carries the flat term, so a person put it
                 # there. Latch that verdict: a later run may not be able to
                 # reach the file (offline volume), and a sidecar rewrite must
@@ -3431,6 +3440,15 @@ class Database:
                 # recover it. Fall through so the genre is detached from the
                 # DB below; ``entry["survivor"]`` still suppresses the flat
                 # XMP removal so the survivor's sidecar term stays intact.
+                #
+                # A legacy NULL-source association with no sidecar is also
+                # preserved. Lightroom catalog imports historically called
+                # execute_import(write_xmp=False) by default and attached the
+                # keyword directly, leaving exactly the same observable shape
+                # as the retired automatic rule. There is no safe retroactive
+                # discriminator, so prefer metadata preservation and latch
+                # the association as manual. New catalog imports are stamped
+                # at write time and known generated sources can still retire.
                 sidecar_manual_pairs.append((pid, row["keyword_id"]))
                 continue
             if verdict == "defer":

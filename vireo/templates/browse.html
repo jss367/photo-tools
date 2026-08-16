@@ -1421,6 +1421,14 @@ body.sidebar-resizing {
   max-height: 80vh;
   overflow-y: auto;
 }
+#batchKeywordModal .modal {
+  /* The autocomplete list is absolutely positioned below the input. The
+     generic modal scroll container clips that list to the modal's short
+     content box, which makes batch keyword matches appear to be missing.
+     This modal has bounded, fixed-height content, so let its picker escape
+     the box just like the single-photo keyword picker does. */
+  overflow: visible;
+}
 #collectionModal .modal {
   width: 680px;
   max-width: calc(100vw - 32px);

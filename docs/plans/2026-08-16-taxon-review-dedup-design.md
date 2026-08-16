@@ -77,17 +77,42 @@ Resolution ladder:
    taxonomy metadata, so it is the most reliable signal when present.
 2. `predictions.species` → `Taxonomy.lookup()` (common name, scientific name,
    punctuation-normalized common name).
-3. `predictions.species` → `Taxonomy.api_lookup()`. This already exists and
-   already solves the motivating case: iNat's autocomplete matches
+3. `predictions.species` → **cached** `Taxonomy.api_lookup` result only —
+   i.e., the request path reads the persistent iNat-lookup cache but must
+   never issue a live HTTP request. iNat's autocomplete matches
    *alternate/regional* common names ("Eurasian Blue Tit" is precisely an
-   alternate name for *Cyanistes caeruleus*), and both hits and misses are
-   cached persistently, so the network cost is one-time per unique label.
-   Offline or API failure degrades to step 4 — cards simply don't merge until
-   the name resolves; no error surfaces.
+   alternate name for *Cyanistes caeruleus*), so cached hits let the merge
+   work; cache misses degrade to step 4 until a background resolver (below)
+   populates the cache.
 4. Fallback: `('name', ascii_folded(species))` using the same folding rules
    as `_folded_species_key` in `classify_job.py`. Unresolvable labels
    (custom label files, informal groups like "gull sp.") merge only when the
    strings are identical — i.e., current behavior is preserved for them.
+
+**No live network I/O in `/api/predictions`.** `Taxonomy.api_lookup`'s
+existing 10-second HTTP timeout and its silent-on-failure behavior (a
+connection error returns without adding the label to `_api_misses`, so a
+firewalled host would retry per-refresh) are the reason: calling it inline
+would let one offline install stall Review for 10s per unresolved label on
+every load. Resolution therefore splits in two:
+
+- **Request path (§1 above):** cache-only reads. `taxon_key_for` calls a new
+  `Taxonomy.cached_api_lookup(label)` that returns a hit from the persistent
+  cache, a sentinel for a cached negative, or `None` for "unknown, ask the
+  resolver". Never issues an HTTP request; never blocks.
+- **Background resolver:** unresolved labels are enqueued (a) at classify
+  time when `_store_grouped_predictions` first stores a row whose
+  `species`/`scientific_name` don't hit steps 1–2, and (b) opportunistically
+  when `/api/predictions` observes a `name:` fallback for a label it has
+  not seen. A single-flight background job in `jobs.py`
+  (`resolve_taxonomy_labels`) drains the queue, calls `api_lookup` with the
+  existing 10s timeout, and **persists both hits and misses** — extending
+  `Taxonomy._api_misses` to a bounded on-disk negative cache (label →
+  {resolved_at, retry_after}) with an exponential-then-daily retry so a
+  transient outage doesn't pin a label as unresolvable forever, and so an
+  offline host never re-hits the network on refresh. The Review card for a
+  still-unresolved label simply doesn't merge until the resolver succeeds
+  and the next refresh sees the cache entry.
 
 Rules:
 
@@ -97,14 +122,17 @@ Rules:
 - Rank is respected implicitly: genus and species resolve to different
   `taxon_id`s, so they never merge.
 
-**No schema change.** The key is computed at read time. The taxonomy JSON is
-already held in memory as dicts, so per-row resolution is O(1); `api_lookup`
-runs only on cache misses. If profiling later shows cost on large Review
-payloads, an additive nullable `predictions.taxon_id` column with lazy
-write-back is the escape hatch — explicitly deferred (solo-user DB, easy to
-add later; see also the `user_version` drift caveat in memory — any future
-column should be guarded by a `db_meta` marker or a PRAGMA column check, not
-a version-gated migration).
+**No schema change to `predictions`.** The key is computed at read time
+from the in-memory taxonomy dict (O(1) per row) plus the cached iNat lookup
+table. The background resolver's negative cache is stored in the existing
+`taxonomy_api_cache` mechanism (or a peer table with the same lifecycle) —
+additive rows, not a schema migration on hot tables. If profiling later
+shows cost on large Review payloads even with a cold cache, an additive
+nullable `predictions.taxon_id` column with lazy write-back is the escape
+hatch — explicitly deferred (solo-user DB, easy to add later; see also the
+`user_version` drift caveat in memory — any future column should be guarded
+by a `db_meta` marker or a PRAGMA column check, not a version-gated
+migration).
 
 ### 2. Server-side card building in `/api/predictions`
 
@@ -172,12 +200,26 @@ string matching to taxon matching, and from Compare-only to Review.
 
 **Accept.** `db.accept_prediction` currently accepts the clicked prediction
 and, if grouped, its group siblings — restricted to `pr.classifier_model =
-?`. After that pass, add a sibling-resolution pass: for each affected photo,
-find pending predictions on that photo whose taxon key matches the accepted
-taxon, from **any** classifier model, restricted per model to its latest
-`labels_fingerprint` (reuse the latest-fingerprint subquery from
-`accept_subject_species`), and accept each via the existing
-`_accept_for_photo` primitive.
+?`. The taxon-keyed accept operates on the **entire card component's photo
+union**, not just the clicked group's photos:
+
+1. **Resolve the card.** Given the clicked prediction, look up its
+   `card_id` (accept API accepts a `card_id`; where the client still sends a
+   `prediction_id`/`group_id`, the server maps it to the containing card
+   using the same graph as `/api/predictions`, so a stale or narrower client
+   can't downgrade the accept scope). The card exposes both `taxon_key` and
+   the **union photo set** across every group/singleton in its component.
+2. **Enumerate photos from the component.** The candidate photo set is the
+   union of every member group's/singleton's photos — not the clicked
+   group's photos. This is what fixes the transitive case: if the card is
+   {A: photos 1-2, B: photos 2-3, C: photos 3-4}, accept iterates photos
+   {1, 2, 3, 4}, not {1, 2}.
+3. **Sibling pass, taxon-matched, per photo.** For each photo in the union,
+   find pending predictions on that photo whose taxon key matches the card's
+   `taxon_key`, from **any** classifier model, restricted per model to its
+   latest `labels_fingerprint` (reuse the latest-fingerprint subquery from
+   `accept_subject_species`), and accept each via the existing
+   `_accept_for_photo` primitive.
 
 - Matching is by `(photo_id, taxon_key)`, not `detection_id`. This covers
   models that classified detections from different detectors (different
@@ -185,19 +227,28 @@ taxon, from **any** classifier model, restricted per model to its latest
   photos: two birds of *different* species have different taxon keys and are
   untouched; two detections of the *same* species on one photo collapse into
   one photo-level keyword anyway.
-- Taxon keys are computed in Python via §1's helper (the candidate set — 
-  pending predictions on the card's photos — is small), so no SQL-side
-  taxonomy join is needed.
+- Taxon keys are computed in Python via §1's helper (the candidate set —
+  pending predictions on the card's union photos — is bounded by the card
+  size), so no SQL-side taxonomy join is needed.
+- **No need to iterate to closure.** The card component is fully materialized
+  before the accept fires (§2 already builds it via connected components
+  over `(same taxon_key, overlapping photos)`). Iterating photo-by-photo
+  over the pre-computed union is closure — sibling matches on photo 4 are
+  reached even though the clicked group only covered photos 1-2. A later
+  push that introduces a *new* group after accept fires does not retroactively
+  join this card; that new group appears as a fresh pending card on the next
+  Review load, which is the intended behavior.
 - **Undo:** `_accept_for_photo` already records every status flip —
   including status-only no-ops — in `affected`, which feeds the
   edit-history/undo machinery. Sibling accepts go through the same
   primitive, so their flips are recorded and undoable for free. The
-  `prediction_accept` history entry therefore restores *both* models' rows
-  to pending on undo.
+  `prediction_accept` history entry therefore restores *every* member row
+  across the component to pending on undo, not just the clicked group's.
 
 **Reject.** Mirror logic: rejecting a card rejects all member predictions
-(all models) for the card's photos and taxon. Today reject is per
-prediction/group; it gains the same sibling pass.
+(all models) across the same union photo set and card taxon. Today reject
+is per prediction/group; it gains the same sibling pass, scoped to the
+same component-wide photo union so transitive cards resolve completely.
 
 **Compare.** `accept_subject_species` swaps its
 `lower(trim(species))` equality for the same taxon-key helper. Its
@@ -238,9 +289,14 @@ caeruleus*") on the Keywords page with a one-click merge.
   from card building and untouched by sibling resolution.
 - **Workspace scoping:** all card building and sibling resolution joins
   through `prediction_review` for the active workspace, as accept does now.
-- **`api_lookup` latency:** only on first-ever sight of an unresolved label,
-  10s timeout, result (or miss) cached persistently. Never in a tight loop:
-  resolution iterates unique labels, not rows.
+- **`api_lookup` latency:** never on the request path. The Review GET
+  reads cached results only; unresolved labels degrade to `name:` fallback
+  until the background resolver populates the cache. Offline/firewalled
+  installs therefore never wait on the network to render Review, and a
+  transient outage does not degrade page latency at all.
+- **Transitive card components:** the accept path always operates on the
+  card's pre-computed union of photos, so a chain (A: 1-2, B: 2-3, C: 3-4)
+  resolves in one click. See §3, "Enumerate photos from the component".
 - **Two same-taxon groups from one model** (e.g. re-runs under different
   fingerprints): they merge into one card if their photos overlap — which is
   the correct de-duplication, and the fingerprint filter still separates
@@ -269,17 +325,30 @@ caeruleus*") on the Keywords page with a one-click merge.
 Each phase lands as its own PR and is independently useful.
 
 1. **Taxon key helper** (`taxonomy.py`) + unit tests: scientific-name hit,
-   common-name hit, normalized hit, alternate-name via mocked `api_lookup`,
-   unresolvable fallback, NULL handling, rank separation.
-2. **Server-side cards**: `taxon_key`/`card_id`/`display_name` in
+   common-name hit, normalized hit, alternate-name via **pre-seeded lookup
+   cache** (no live HTTP in the test path), unresolvable fallback,
+   NULL handling, rank separation. Also: `cached_api_lookup` returns
+   `None` on miss and never opens a socket.
+2. **Background taxonomy resolver** (`jobs.py::resolve_taxonomy_labels`):
+   drains the enqueued-labels queue, persists hits and misses (with
+   exponential-then-daily retry on misses), single-flight. Tests use a
+   stubbed `api_lookup` and assert (a) hits populate the cache, (b) misses
+   are recorded with a retry timestamp, (c) `/api/predictions` never calls
+   `api_lookup` directly.
+3. **Server-side cards**: `taxon_key`/`card_id`/`display_name` in
    `/api/predictions`, card endpoint, `review.html` dedup + merged-card
    rendering + filter semantics. API tests: the Blue Tit fixture (two
    models, same taxon, 8-vs-7 overlap) yields one `card_id`; different taxa
-   don't merge; model filter yields per-model cards.
-3. **Cross-model accept/reject** + undo coverage. DB tests: accepting the
+   don't merge; model filter yields per-model cards; **transitive overlap
+   fixture** (three groups A/B/C forming an A-B-C chain, same taxon) yields
+   one `card_id` covering the full union.
+4. **Cross-model accept/reject** + undo coverage. DB tests: accepting the
    merged card flips both models' rows; undo restores both; reject mirrors;
-   Compare's `accept_subject_species` matches across name variants.
-4. **Keyword canonicalization** (taxon-matched keyword reuse) + the
+   Compare's `accept_subject_species` matches across name variants;
+   **transitive-component accept fixture** — accepting the A-B-C card flips
+   every pending row on photos 1-4 for the matching taxon and leaves other
+   taxa untouched; undo restores every flipped row (including C's).
+5. **Keyword canonicalization** (taxon-matched keyword reuse) + the
    "tags as …" transparency note.
 
 ## Test plan

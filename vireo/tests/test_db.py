@@ -14192,6 +14192,54 @@ def test_retire_builtin_wildlife_scopes_pending_add_to_same_name_survivor(tmp_pa
     assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
 
 
+def test_retire_builtin_wildlife_preserves_ambiguous_pruned_pending_add(tmp_path):
+    """Name-only provenance stays conservative after exact history is gone."""
+    from db import Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    xmp_path = photo_dir / "p1.xmp"
+    write_sidecar(
+        str(xmp_path), flat_keywords=set(), hierarchical_keywords=set(),
+    )
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_path.stat().st_mtime,
+    )
+    wildlife_ids = [
+        db.conn.execute(
+            "INSERT INTO keywords (name, type) VALUES (?, 'genre')",
+            (name,),
+        ).lastrowid
+        for name in ("Wildlife", "wildlife")
+    ]
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    for keyword_id in wildlife_ids:
+        db.tag_photo(p1, keyword_id)
+    # Legacy pending row after its exact keyword_add history was pruned.
+    db.queue_change(p1, "keyword_add", "Wildlife")
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 0
+    associations = db.conn.execute(
+        "SELECT keyword_id, source FROM photo_keywords WHERE photo_id = ?",
+        (p1,),
+    ).fetchall()
+    by_id = {row["keyword_id"]: row["source"] for row in associations}
+    assert {keyword_id: by_id[keyword_id] for keyword_id in wildlife_ids} == {
+        keyword_id: "manual" for keyword_id in wildlife_ids
+    }
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+
+
 def test_retire_builtin_wildlife_preserves_synced_manual_add_history(tmp_path):
     """A retained keyword-add edit proves the synced tag was user-authored."""
     from db import Database

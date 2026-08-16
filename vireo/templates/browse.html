@@ -9600,7 +9600,15 @@ async function _runPhotoDeepLink(photoId) {
     // advances loadEpoch (and scope changes also advance browseScopeGen).
     // Snapshot both generations before the first folder request so an older
     // deep-link response cannot overwrite the user's newer Browse dataset.
-    var deepLinkLoadEpoch = loadEpoch;
+    //
+    // Advance loadEpoch first so a loadPhotos() started before the deep-link
+    // took ownership discards its response.  If applyFilters()/resetAndLoad()
+    // ran while /api/photos/<id> was pending, its workspace-scoped loadPhotos
+    // captured the same epoch we are about to snapshot; without the bump its
+    // ``epoch !== loadEpoch`` guard would still match and append unscoped
+    // workspace photos to the newly claimed folder-scoped grid (Codex review
+    // r3792769108).
+    var deepLinkLoadEpoch = ++loadEpoch;
     var deepLinkScopeGen = browseScopeGen;
     var deepLinkFolderId = photo.folder_id;
     var deepLinkSort = document.getElementById('sortSelect').value;

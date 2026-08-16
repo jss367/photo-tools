@@ -16691,6 +16691,44 @@ def test_batch_accept_rejects_foreign_prediction(app_and_db):
     assert resp.status_code == 403
 
 
+def test_batch_accept_rejects_replace_species_flag(app_and_db):
+    """``replace_species=True`` would strip conflicting keywords from every
+    tagged photo, but the batch endpoint records one ``prediction_accept``
+    edit whose ``old_value`` only names the prediction id — no room for the
+    removed keyword names. Undo would then restore prediction status but
+    leave the replaced species permanently gone. The single-photo
+    ``/replace-keywords`` route sidesteps this by recording
+    ``prediction_replace_species`` (explicitly non-undoable). The batch
+    endpoint must refuse the flag rather than silently accept a lossy
+    operation.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "rep-flag.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_id], "replace_species": True},
+    )
+    assert resp.status_code == 400
+    assert "replace_species" in resp.get_json()["error"]
+
+    # The rejection must not partially mutate: the prediction stays pending.
+    row = db.conn.execute(
+        "SELECT status FROM prediction_review WHERE prediction_id = ?",
+        (pred_id,),
+    ).fetchone()
+    assert row is None or row["status"] == "pending"
+
+    # A falsy value should NOT trip the guard — accept still works normally.
+    resp2 = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_id], "replace_species": False},
+    )
+    assert resp2.status_code == 200
+
+
 def test_browse_page_has_prediction_panels(app_and_db):
     """Browse ships both prediction surfaces: single-photo and selection."""
     app, _ = app_and_db

@@ -16391,6 +16391,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """
         db = _get_db()
         body = request.get_json(silent=True) or {}
+        # ``replace_species=True`` strips conflicting species keywords from
+        # every tagged photo, but the batch endpoint records one
+        # ``prediction_accept`` edit whose ``old_value`` carries only the
+        # prediction id — no room for the removed keyword names. Undoing
+        # that entry would restore prediction status but leave the
+        # replaced species permanently gone. The single-photo replace
+        # route (``/api/predictions/<id>/replace-keywords``) sidesteps this
+        # by recording ``prediction_replace_species``, which is explicitly
+        # non-undoable. Refuse the flag here rather than silently drop it
+        # so a mis-wired caller learns immediately.
+        if bool(body.get("replace_species")):
+            return json_error(
+                "replace_species is not supported on batch-accept because "
+                "the batched undo entry cannot restore removed keywords; "
+                "use /api/predictions/<pred_id>/replace-keywords for a "
+                "single-photo replacement",
+                400,
+            )
         pred_ids, pred_meta, err = _parse_prediction_ids(db, body)
         if err is not None:
             return err
@@ -16438,7 +16456,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
         pred_ids = [pid for pid in pred_ids if pid not in already_accepted]
 
-        replace_species = bool(body.get("replace_species"))
         items = []
         keyword_id = None
         species = None
@@ -16452,7 +16469,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 allowed_photo_ids = sorted(photos_by_bucket[bucket])
                 result = db.accept_prediction(
                     pid,
-                    replace_species=replace_species,
                     photo_ids=allowed_photo_ids,
                     _commit=False,
                 )

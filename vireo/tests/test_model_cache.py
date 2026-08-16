@@ -172,6 +172,140 @@ def test_concurrent_acquire_from_multiple_threads_only_loads_once():
     assert values == ["loaded", "loaded"]
 
 
+def test_contended_cold_load_wait_records_owner_timing():
+    """Regression: when two jobs cold-load the same key concurrently,
+    the second thread waits on the producer's ``load_lock`` — which can
+    take minutes for a BioCLIP / SAM2 / DINOv2 cold construction, and
+    even longer if the producer is itself blocked on the ONNX
+    construction lease. Prior to this fix that wait bypassed the
+    resource ledger entirely: the waiter's ``owner_timing`` still
+    reported zero waits even though the job was resource-blocked for
+    the whole load, so the per-job live and persisted resource-wait
+    diagnostics under-reported reality. This asserts the contended
+    wait shows up as an external wait in ``owner_timing``.
+
+    Uncontended fast path is covered by
+    ``test_uncontended_load_does_not_record_owner_timing`` — an
+    unconditional wrap would also inflate wait_count on every cache
+    hit (per-photo detection/masking runs), so the uncontended branch
+    must NOT touch the ledger.
+    """
+    import resource_ledger
+
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        cache = ModelCache(idle_secs=60)
+        load_started = threading.Event()
+        release_load = threading.Event()
+
+        def slow_factory():
+            load_started.set()
+            release_load.wait(timeout=2.0)
+            return "loaded"
+
+        producer_done = threading.Event()
+
+        def producer():
+            try:
+                with cache.acquire("k", slow_factory):
+                    pass
+            finally:
+                producer_done.set()
+
+        waiter_done = threading.Event()
+
+        def waiter():
+            with resource_ledger.bind_resource_owner("waiter-job"):
+                try:
+                    with cache.acquire(
+                        "k",
+                        lambda: pytest.fail(
+                            "waiter must not run the factory — producer's "
+                            "value is what it should receive",
+                        ),
+                    ) as value:
+                        assert value == "loaded"
+                finally:
+                    waiter_done.set()
+
+        tp = threading.Thread(target=producer)
+        tp.start()
+        assert load_started.wait(timeout=1.0)
+
+        tw = threading.Thread(target=waiter)
+        tw.start()
+        # Give the waiter time to attempt the non-blocking acquire, fail,
+        # and enter the tracked-wait branch (blocking acquire on
+        # load_lock). Then release the producer so the waiter unblocks.
+        time.sleep(0.15)
+        release_load.set()
+
+        assert producer_done.wait(timeout=2.0)
+        assert waiter_done.wait(timeout=2.0)
+        tp.join(timeout=1.0)
+        tw.join(timeout=1.0)
+        assert not tp.is_alive()
+        assert not tw.is_alive()
+
+        # The waiter's contended wait must show up in owner_timing.
+        # Under the pre-fix behavior wait_count is 0 and wait_seconds is
+        # 0.0 because the load_lock.acquire() call bypassed the ledger.
+        waiter_timing = ledger.owner_timing("waiter-job")
+        assert waiter_timing["wait_count"] >= 1, (
+            f"Contended ModelCache wait must record at least one wait; got "
+            f"wait_count={waiter_timing['wait_count']}. Without this the "
+            f"per-job resource-wait diagnostics under-report the time the "
+            f"waiter spent blocked on the producer's factory."
+        )
+        assert waiter_timing["wait_seconds"] > 0.0, (
+            f"Contended ModelCache wait must record positive wait_seconds; "
+            f"got {waiter_timing['wait_seconds']}. A minute-long BioCLIP "
+            f"cold load would otherwise show zero blocked time on the "
+            f"waiter's job."
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
+def test_uncontended_load_does_not_record_owner_timing():
+    """The uncontended fast path (nobody else holds ``load_lock``) must
+    NOT touch the resource ledger: an unconditional wrap would inflate
+    ``wait_count`` on every cache HIT — per-photo detection/masking
+    runs would then show hundreds of zero-duration waits per job, which
+    is meaningless noise in the diagnostics panel.
+
+    The pattern mirrors ``onnx_runtime.acquire_session_cache_lock``,
+    which also gates its ledger interaction on non-blocking acquire
+    failing first.
+    """
+    import resource_ledger
+
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        cache = ModelCache(idle_secs=60)
+
+        with resource_ledger.bind_resource_owner("owner-job"):
+            # First (miss) acquire is uncontended.
+            with cache.acquire("k", lambda: "v"):
+                pass
+            # Subsequent hits: still uncontended (nobody else is inside).
+            for _ in range(3):
+                with cache.acquire("k", lambda: "v"):
+                    pass
+
+        timing = ledger.owner_timing("owner-job")
+        assert timing["wait_count"] == 0, (
+            f"Uncontended ModelCache acquires must NOT record any wait; "
+            f"got wait_count={timing['wait_count']}. An unconditional "
+            f"track_external_wait wrap would flood diagnostics with "
+            f"zero-duration entries on every cache hit."
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
 def test_cancelled_load_waiter_retries_instead_of_inheriting_cancel():
     from classifier import ClassificationCancelled
 

@@ -168,17 +168,41 @@ class ModelCache:
                 # the race with the timer thread firing.
                 entry.evict_token = None
 
-            if cancel_check is not None:
-                # Waiter-local cancellation: poll the load_lock instead of
-                # blocking indefinitely so this caller can abandon its wait
-                # while another caller's factory is still running. The other
-                # caller is unaffected and their factory continues.
-                while not entry.load_lock.acquire(timeout=_WAITER_POLL_SECS):
-                    if cancel_check():
-                        self._release_entry(entry)
-                        raise _make_cancellation_error()
+            if entry.load_lock.acquire(blocking=False):
+                # Uncontended fast path: nobody else is producing this
+                # entry, so we own the load_lock immediately without
+                # touching the resource ledger. Uncontended acquires must
+                # not count as waits — track_external_wait() records both
+                # duration and count, and per-photo detection/masking
+                # runs would inflate wait_count with zero-duration entries
+                # on every cache hit or first-caller miss.
+                pass
             else:
-                entry.load_lock.acquire()
+                # Contended: another caller is already producing this
+                # entry's value under load_lock. That wait can be minutes
+                # long for a cold BioCLIP / SAM2 / DINOv2 load — and if
+                # the producer is itself blocked on the ONNX construction
+                # lease, this waiter is resource-blocked without ever
+                # reaching ResourceLedger.acquire(). Expose it as an
+                # external wait so it feeds the same per-job live and
+                # persisted resource-wait diagnostics as the
+                # session-cache locks in onnx_runtime.
+                from resource_ledger import get_resource_ledger
+
+                with get_resource_ledger().track_external_wait():
+                    if cancel_check is not None:
+                        # Waiter-local cancellation: poll the load_lock so
+                        # this caller can abandon its wait while another
+                        # caller's factory is still running. The other
+                        # caller is unaffected and their factory continues.
+                        while not entry.load_lock.acquire(
+                            timeout=_WAITER_POLL_SECS,
+                        ):
+                            if cancel_check():
+                                self._release_entry(entry)
+                                raise _make_cancellation_error()
+                    else:
+                        entry.load_lock.acquire()
 
             try:
                 if entry.value is None and entry.load_error is None:

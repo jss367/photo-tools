@@ -3303,7 +3303,13 @@ class Database:
                            WHERE survivor_pk.photo_id = pk.photo_id
                              AND survivor_k.parent_id IS NULL
                              AND survivor_k.name = 'Wildlife' COLLATE NOCASE
-                             AND survivor_k.id NOT IN ({placeholders})
+                             AND (
+                                 survivor_k.id NOT IN ({placeholders})
+                                 OR (
+                                     survivor_k.id <> pk.keyword_id
+                                     AND survivor_pk.source = 'manual'
+                                 )
+                             )
                        ) AS has_same_name_survivor
                 FROM photo_keywords pk
                 JOIN photos p ON p.id = pk.photo_id

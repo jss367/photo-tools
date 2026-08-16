@@ -14576,15 +14576,25 @@ def test_retire_builtin_wildlife_deletes_only_generated_duplicate(tmp_path):
     flat term must not be queued for sidecar removal.
     """
     from db import Database
+    from xmp import write_sidecar
 
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    xmp_path = photo_dir / "p1.xmp"
+    write_sidecar(
+        str(xmp_path),
+        flat_keywords={"Wildlife"},
+        hierarchical_keywords=set(),
+    )
     db = Database(str(tmp_path / "test.db"))
     ws = db.create_workspace("ws")
     db.set_active_workspace(ws)
-    fid = db.add_folder("/photos", name="photos")
+    fid = db.add_folder(str(photo_dir), name="photos")
     db.add_workspace_folder(ws, fid)
     p1 = db.add_photo(
         folder_id=fid, filename="p1.jpg", extension=".jpg",
         file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_path.stat().st_mtime,
     )
     generated_id = db.conn.execute(
         "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
@@ -14595,7 +14605,7 @@ def test_retire_builtin_wildlife_deletes_only_generated_duplicate(tmp_path):
     species_id = db.add_keyword("House Sparrow", is_species=True)
     db.tag_photo(p1, species_id)
     db.tag_photo(p1, generated_id)
-    db.tag_photo(p1, manual_id)
+    db.tag_photo(p1, manual_id, source="manual")
     db.record_edit(
         "keyword_add",
         'Added keyword "wildlife"',

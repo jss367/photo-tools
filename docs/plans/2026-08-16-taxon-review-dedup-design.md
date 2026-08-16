@@ -146,12 +146,28 @@ available, and where the accept path needs the same key anyway.
   `"name:blue tit"`.
 - `card_id` — the merge unit, computed as follows.
 
-**Merge rule.** Build a graph whose nodes are burst groups (by `group_id`)
-plus singleton predictions (no group). Connect two nodes when they have the
-**same `taxon_key`** and their **photo memberships intersect**. Each
-connected component is one card; `card_id` is the lexicographically smallest
-member `group_id` (or `p<prediction_id>` for pure singletons), prefixed with
-the taxon key so distinct taxa can never collide.
+**Merge rule.** Build a graph whose nodes are burst groups plus singleton
+predictions (no group). Connect two nodes when they have the **same
+`taxon_key`** and their **photo memberships intersect**. Each connected
+component is one card; `card_id` is derived from the lexicographically
+smallest member's stable node key (see below) prefixed with the taxon key
+so distinct taxa can never collide, then URL-safe encoded (see "Card ID
+encoding" below).
+
+**Node identity.** The graph keys each burst-group node as
+`(classifier_model, labels_fingerprint, group_id)`, not by `group_id`
+alone. `_store_grouped_predictions` mints group IDs as
+`f"g{job_id[-6:]}-{group_count:04d}"`, which can collide across process
+restarts or between concurrent classify jobs whose truncated `job_id`
+suffix happens to match. Keying by the full `(model, fingerprint,
+group_id)` tuple guarantees that two unrelated bursts never occupy the same
+node even if their raw `group_id`s collide, so the connected-component
+computation stays sound without depending on `group_id` uniqueness.
+Singleton nodes key on `(classifier_model, labels_fingerprint,
+"p" + prediction_id)`. A follow-up cleanup should also widen
+`_store_grouped_predictions` to use the full `job_id` (or a UUID) so
+downstream storage and history are collision-free too — but the merge
+graph does not depend on that landing first.
 
 Why overlap, not identical membership: the two models' burst groups for the
 same event frequently differ by a frame or two — grouping runs per job, and
@@ -178,20 +194,52 @@ instead of `group_id`, so per-model detail remains available for rendering.
   consensus confidence and vote counts (e.g.
   `BioCLIP-2.5 92% · iNat21 88%`); the display name (§4).
 - The group review modal opens with the union membership. New endpoint
-  `GET /api/predictions/card/<card_id>` returns the union of member groups
-  with per-photo, per-model rows — the existing
+  `GET /api/predictions/card?id=<card_id>` returns the union of member
+  groups with per-photo, per-model rows — the existing
   `/api/predictions/group/<group_id>` machinery stays for compatibility and
   is what the card endpoint composes.
 
+**Card ID encoding.** `card_id` is treated as opaque bytes on the wire.
+For `name:`-keyed cards the folded label is embedded in the id, and folded
+labels come from arbitrary user-supplied label files that may contain `/`,
+`?`, `#`, `%`, or other URL-significant characters. A Flask
+`<card_id>` path converter does not match a decoded slash even when the
+client uses `encodeURIComponent`, so the merged-card modal for a label
+like `hawk/owl` would 404. Two-part rule to avoid that:
+
+1. The card endpoint takes the id as a **query parameter**
+   (`/api/predictions/card?id=<card_id>`), not as a path segment, so any
+   byte survives the round trip once percent-encoded.
+2. The server-emitted `card_id` string is base64url-encoded (RFC 4648
+   §5, unpadded — alphabet `[A-Za-z0-9_-]`) over the raw
+   `<taxon_key>|<smallest_member_key>` bytes. This makes ids safe to
+   embed anywhere (DOM attributes, path segments if some future route
+   wants them, log lines) without further escaping, keeps them opaque to
+   the client, and gives a stable string that the server can decode back
+   to `(taxon_key, member_key)` when looking up the component. Where the
+   client persists an id (e.g. in URL hash for deep links), it stores the
+   already-encoded form verbatim.
+
 **Filter semantics.** When the model filter (`currentModel !== 'all'`) or
-the labels-fingerprint filter is active, cards are built from the matching
-rows only — merging becomes an intra-model no-op and the page shows exactly
-what that model said. This keeps "filter by model" honest (a merged card has
-no single model) and costs nothing: the server already receives the filter
-context, or the client can group the filtered subset by `(taxon_key,
-group_id)`. Simplest implementation: server computes `card_id` per row from
-the *full* row set; the client, when a model filter is active, falls back to
-`group_id` dedup for the filtered rows.
+the labels-fingerprint filter (`currentLabelsFingerprint !== 'all'`) is
+active, cards are built from the matching rows only — merging becomes an
+intra-filter no-op and the page shows exactly what that model/fingerprint
+said. This keeps "filter by model" and "filter by label set" honest (a
+merged card has no single model or fingerprint) and costs nothing: the
+server already receives the filter context, or the client can group the
+filtered subset by `(taxon_key, group_id)`. Simplest implementation:
+server computes `card_id` per row from the *full* row set; the client,
+whenever **either** the model filter or the labels-fingerprint filter is
+active, falls back to `(taxon_key, group_id)` dedup over the filtered
+rows and never invokes the merged-card endpoint from that view. This
+matters for both correctness and privacy of the filter: if server-computed
+components stitched groups A and C together only through a group B whose
+fingerprint the user has just filtered out, opening the "A+C card" from
+the filtered view would otherwise re-expose B's hidden rows through the
+`/api/predictions/card/<card_id>` union. Falling back to per-group cards
+in filtered views eliminates that exposure entirely. When the user clears
+the filter, the full server components (and the merged card endpoint)
+apply again.
 
 ### 3. Cross-model accept and reject
 
@@ -341,7 +389,18 @@ Each phase lands as its own PR and is independently useful.
    models, same taxon, 8-vs-7 overlap) yields one `card_id`; different taxa
    don't merge; model filter yields per-model cards; **transitive overlap
    fixture** (three groups A/B/C forming an A-B-C chain, same taxon) yields
-   one `card_id` covering the full union.
+   one `card_id` covering the full union; **group-id-collision fixture**
+   (two classify jobs whose truncated `job_id` suffix collides, minting the
+   same raw `group_id` for disjoint photo sets) stays as two separate
+   nodes and does not merge into one card; **cross-fingerprint hidden-row
+   fixture** (groups A and C at fingerprint X, group B at fingerprint Y
+   bridging them by shared photos) — with the fingerprint filter set to
+   X, the client dedups A and C into per-group cards and the merged-card
+   endpoint is not called; with the filter cleared, A+B+C become one card
+   as expected; **URL-hostile card-id fixture** (a `name:`-keyed card
+   derived from a custom label containing `/`, `?`, and `#`) round-trips
+   through the base64url-encoded id and the card endpoint's query
+   parameter without a 404.
 4. **Cross-model accept/reject** + undo coverage. DB tests: accepting the
    merged card flips both models' rows; undo restores both; reject mirrors;
    Compare's `accept_subject_species` matches across name variants;

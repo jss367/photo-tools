@@ -14591,6 +14591,62 @@ def test_retire_builtin_wildlife_preserves_discarded_manual_add(tmp_path):
     ).fetchone() is None
 
 
+def test_retire_builtin_wildlife_scopes_discard_to_exact_homonym(tmp_path):
+    """Exact discard provenance must not preserve a generated namesake."""
+    from db import Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    write_sidecar(
+        str(photo_dir / "p1.xmp"),
+        flat_keywords={"Wildlife"},
+        hierarchical_keywords=set(),
+    )
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    generated_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    manual_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'individual')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.executemany(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        [(p1, generated_id), (p1, manual_id)],
+    )
+    db.record_edit(
+        "discard",
+        "Discarded 1 pending change",
+        "",
+        [{
+            "photo_id": p1,
+            "old_value": "keyword_add:Wildlife",
+            "new_value": str(manual_id),
+        }],
+    )
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, generated_id),
+    ).fetchone() is None
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, manual_id),
+    ).fetchone() is not None
+
+
 def test_wildlife_discard_provenance_survives_history_pruning(tmp_path, monkeypatch):
     """Keep discarded-add evidence while retirement is still retryable.
 

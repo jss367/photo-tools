@@ -15779,6 +15779,38 @@ def test_sync_discard_reports_true_count(app_and_db):
     assert db.get_pending_changes() == []
 
 
+def test_sync_discard_records_exact_same_name_keyword(app_and_db):
+    """Discard history identifies a manual association among homonyms."""
+    app, db = app_and_db
+    client = app.test_client()
+    pid = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()["id"]
+    generated_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    manual_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'individual')"
+    ).lastrowid
+    db.tag_photo(pid, generated_id)
+    db.tag_photo(pid, manual_id, source="manual")
+    db.queue_change(pid, "keyword_add", "Wildlife")
+    change_id = db.get_pending_changes()[0]["id"]
+
+    resp = client.post(
+        "/api/sync/discard", json={"change_ids": [change_id]},
+    )
+
+    assert resp.status_code == 200
+    item = db.conn.execute(
+        """SELECT item.old_value, item.new_value
+           FROM edit_history_items item
+           JOIN edit_history edit ON edit.id = item.edit_id
+           WHERE edit.action_type = 'discard'
+           ORDER BY item.id DESC LIMIT 1"""
+    ).fetchone()
+    assert item["old_value"] == "keyword_add:Wildlife"
+    assert item["new_value"] == str(manual_id)
+
+
 def test_sync_discard_chunks_large_change_sets(app_and_db):
     """Selective discard keeps its history lookup below SQLite's bind limit."""
     from db import _SQLITE_PARAM_CHUNK_SIZE

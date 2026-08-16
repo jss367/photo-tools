@@ -3331,6 +3331,32 @@ class Database:
                             AND discard_edit.undone = 0
                             AND discard_item.old_value
                                 = 'keyword_add:Wildlife' COLLATE NOCASE
+                            AND (
+                                discard_item.new_value
+                                    = CAST(
+                                        photo_keywords.keyword_id AS TEXT
+                                    )
+                                OR (
+                                    COALESCE(discard_item.new_value, '') = ''
+                                    AND NOT EXISTS (
+                                        -- Older discard rows retained only
+                                        -- the name. Treat that evidence as
+                                        -- exact only when no homonymous
+                                        -- association makes it ambiguous.
+                                        SELECT 1
+                                        FROM photo_keywords discard_other_pk
+                                        JOIN keywords discard_other_k
+                                          ON discard_other_k.id
+                                             = discard_other_pk.keyword_id
+                                        WHERE discard_other_pk.photo_id
+                                              = photo_keywords.photo_id
+                                          AND discard_other_pk.keyword_id
+                                              <> photo_keywords.keyword_id
+                                          AND discard_other_k.name
+                                              = 'Wildlife' COLLATE NOCASE
+                                    )
+                                )
+                            )
                       )
                   )""",
             keyword_ids,

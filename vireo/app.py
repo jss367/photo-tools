@@ -334,6 +334,45 @@ def _sync_preview_flag_label(value):
     }.get(value, str(value))
 
 
+def _discard_history_items(db, changes):
+    """Build durable discard history without conflating keyword homonyms."""
+    items = []
+    for change in changes:
+        discarded_keyword_id = ""
+        if change["change_type"] == "keyword_add":
+            associations = db.conn.execute(
+                """SELECT pk.keyword_id, pk.source,
+                          EXISTS (
+                              SELECT 1
+                              FROM edit_history_items item
+                              JOIN edit_history edit ON edit.id = item.edit_id
+                              WHERE item.photo_id = pk.photo_id
+                                AND edit.action_type = 'keyword_add'
+                                AND edit.undone = 0
+                                AND item.new_value = CAST(pk.keyword_id AS TEXT)
+                          ) AS has_exact_history
+                   FROM photo_keywords pk
+                   JOIN keywords k ON k.id = pk.keyword_id
+                   WHERE pk.photo_id = ?
+                     AND k.name = ? COLLATE NOCASE""",
+                (change["photo_id"], change["value"]),
+            ).fetchall()
+            evidenced = [
+                row for row in associations
+                if row["source"] == "manual" or row["has_exact_history"]
+            ]
+            if len(associations) == 1:
+                discarded_keyword_id = str(associations[0]["keyword_id"])
+            elif len(evidenced) == 1:
+                discarded_keyword_id = str(evidenced[0]["keyword_id"])
+        items.append({
+            "photo_id": change["photo_id"],
+            "old_value": f'{change["change_type"]}:{change["value"]}',
+            "new_value": discarded_keyword_id,
+        })
+    return items
+
+
 def _sync_preview_presentation(
     change, metadata, *, assigned_location=None, write_locations=False,
     sidecar_will_exist=False, sync_flags=False, paired_keyword_rename=False,
@@ -12665,16 +12704,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
                 db.clear_equivalent_flat_removals(changes, _commit=False)
                 if changes:
-                    items = [
-                        {
-                            "photo_id": change["photo_id"],
-                            "old_value": (
-                                f'{change["change_type"]}:{change["value"]}'
-                            ),
-                            "new_value": "",
-                        }
-                        for change in changes
-                    ]
+                    items = _discard_history_items(db, changes)
                     db.record_edit(
                         "discard",
                         f"Discarded {len(changes)} pending changes",
@@ -12716,10 +12746,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         # Record discard in history (not undoable)
         if changes:
-            items = [{'photo_id': c['photo_id'],
-                      'old_value': f'{c["change_type"]}:{c["value"]}',
-                      'new_value': ''}
-                     for c in changes]
+            items = _discard_history_items(db, changes)
             db.record_edit('discard',
                            f'Discarded {len(changes)} pending changes',
                            '', items, is_batch=len(changes) > 1)

@@ -36,6 +36,41 @@ def test_job_scan_returns_job_id(app_and_db, tmp_path):
     assert data['job_id'].startswith('scan-')
 
 
+def test_job_scan_passes_pause_probe_to_scanner(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Standalone scan jobs let scanner release CPU before parking."""
+    import scanner
+
+    app, _db = app_and_db
+    runner = app._job_runner
+    client = app.test_client()
+    scan_dir = str(tmp_path / "scanme")
+    os.makedirs(scan_dir)
+    observed_job_ids = []
+
+    def pause_requested(job_id):
+        observed_job_ids.append(job_id)
+        return False
+
+    def fake_scan(*_args, pause_check=None, counts=None, **_kwargs):
+        assert pause_check is not None
+        assert pause_check() is False
+        if counts is not None:
+            counts["indexed"] = 0
+
+    monkeypatch.setattr(runner, "pause_requested", pause_requested)
+    monkeypatch.setattr(scanner, "scan", fake_scan)
+
+    response = client.post("/api/jobs/scan", json={"root": scan_dir})
+    assert response.status_code == 200
+    job_id = response.get_json()["job_id"]
+    job = wait_for_job_via_client(client, job_id)
+
+    assert job["status"] == "completed"
+    assert job_id in observed_job_ids
+
+
 def test_job_scan_invalid_root(app_and_db):
     """POST /api/jobs/scan with invalid root returns 400."""
     app, _ = app_and_db

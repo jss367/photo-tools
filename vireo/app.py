@@ -22146,6 +22146,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             def cancel_check():
                 return runner.is_cancelled(job["id"])
 
+            def pause_check():
+                return runner.pause_requested(job["id"])
+
             vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
 
             # Per-root failures are caught and recorded rather than
@@ -22196,6 +22199,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         vireo_dir=vireo_dir,
                         thumb_cache_dir=app.config["THUMB_CACHE_DIR"],
                         cancel_check=cancel_check,
+                        pause_check=pause_check,
                         repair_missing_metadata=repair_missing_metadata,
                         counts=root_counts,
                     )

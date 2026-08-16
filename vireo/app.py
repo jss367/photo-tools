@@ -9850,7 +9850,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         ).fetchone() is not None
         if already_tagged:
             return jsonify({"ok": True, "keyword_id": kid})
-        db.tag_photo(photo_id, kid)
+        # source='manual': a person clicked Add. Stamping the association
+        # itself keeps authorship recoverable after _prune_edit_history()
+        # drops the keyword_add entry recorded just below.
+        db.tag_photo(photo_id, kid, source='manual')
         _queue_keyword_add(photo_id, name)
         db.record_edit('keyword_add', f'Added keyword "{name}"', str(kid),
                        [{'photo_id': photo_id, 'old_value': '', 'new_value': str(kid)}])
@@ -11203,7 +11206,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         added_ids = [pid for pid in photo_ids if pid not in already_tagged]
 
         for pid in added_ids:
-            db.tag_photo(pid, kid)
+            # See api_add_keyword: an explicit user action stamps durable
+            # provenance so pruned edit history cannot orphan authorship.
+            db.tag_photo(pid, kid, source='manual')
             _queue_keyword_add(pid, name)
         items = [{'photo_id': pid, 'old_value': '', 'new_value': str(kid)} for pid in added_ids]
         if items:

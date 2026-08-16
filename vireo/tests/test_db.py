@@ -14427,6 +14427,146 @@ def test_wildlife_discard_provenance_survives_history_pruning(tmp_path, monkeypa
     ).fetchone() is not None
 
 
+def test_manual_keyword_add_stamps_durable_provenance(tmp_path):
+    """A hand-added keyword records authorship on the association row.
+
+    ``edit_history`` is the only other record that a person added a keyword,
+    and ``_prune_edit_history`` trims it to ``max_edit_history`` rows, so
+    authorship read out of it can vanish while the tag survives. A re-tag
+    without a source must not downgrade an existing stamp.
+    """
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    kid = db.add_keyword("House Sparrow", is_species=True)
+
+    db.tag_photo(p1, kid)
+    assert db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, kid),
+    ).fetchone()["source"] is None
+
+    db.tag_photo(p1, kid, source="manual")
+    assert db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, kid),
+    ).fetchone()["source"] == "manual"
+
+    db.tag_photo(p1, kid)
+    assert db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, kid),
+    ).fetchone()["source"] == "manual", (
+        "A provenance-free re-tag must not erase recorded authorship."
+    )
+
+
+def test_retire_builtin_wildlife_latches_manual_provenance_against_pruning(tmp_path):
+    """Authorship is latched on the association, not re-read from history.
+
+    The migration legitimately re-runs across sessions: an offline sidecar
+    leaves the completion marker unset, so every startup re-evaluates the
+    remaining candidates. Meanwhile ``_prune_edit_history`` keeps trimming
+    ``edit_history`` to ``max_edit_history`` rows, so the ``keyword_add``
+    record proving a Wildlife tag was user-authored can disappear between
+    runs. Re-deriving provenance each run would read the same association as
+    manual on the first pass and generated on the second, deleting a tag the
+    user created. The first pass therefore stamps
+    ``photo_keywords.source = 'manual'``, which pruning cannot touch.
+    """
+    from db import Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    # p2 gets a real sidecar mtime, then loses the file — that defers the run
+    # and keeps the completion marker unset, which is what allows a second
+    # pass at all.
+    deferred_xmp = photo_dir / "p2.xmp"
+    write_sidecar(
+        str(deferred_xmp), flat_keywords=set(), hierarchical_keywords=set(),
+    )
+    deferred_mtime = deferred_xmp.stat().st_mtime
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    manual_photo = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    deferred_photo = db.add_photo(
+        folder_id=fid, filename="p2.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0, xmp_mtime=deferred_mtime,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    for pid in (manual_photo, deferred_photo):
+        db.tag_photo(pid, species_id)
+        # Legacy associations: no provenance stamp, exactly like rows written
+        # by an older Vireo before this column existed.
+        db.conn.execute(
+            "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+            (pid, wildlife_id),
+        )
+    db.record_edit(
+        "keyword_add",
+        'Added keyword "Wildlife"',
+        str(wildlife_id),
+        [{"photo_id": manual_photo, "old_value": "", "new_value": str(wildlife_id)}],
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    deferred_xmp.unlink()
+    assert db.retire_builtin_wildlife_genre() == 0
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) != "1"
+    assert db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (manual_photo, wildlife_id),
+    ).fetchone()["source"] == "manual", (
+        "The first pass must record authorship on the association itself."
+    )
+
+    # The user keeps working; edit history is pruned past the manual add.
+    db.conn.execute("DELETE FROM edit_history")
+    db.conn.commit()
+
+    # The deferred volume returns with a Wildlife-free sidecar, so the second
+    # pass completes the migration.
+    write_sidecar(
+        str(deferred_xmp), flat_keywords=set(), hierarchical_keywords=set(),
+    )
+    assert db.retire_builtin_wildlife_genre() == 1
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (deferred_photo, wildlife_id),
+    ).fetchone() is None
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (manual_photo, wildlife_id),
+    ).fetchone() is not None, (
+        "Pruned edit history must not turn a user-authored tag into a "
+        "generated one."
+    )
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (manual_photo,),
+    ).fetchone() is None
+
+
 def test_retire_builtin_wildlife_deletes_only_generated_duplicate(tmp_path):
     """Per-keyword provenance must survive case-variant duplicate genres.
 

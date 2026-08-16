@@ -725,9 +725,18 @@ class Database:
                 UNIQUE(name, parent_id)
             );
 
+            -- ``source`` is durable provenance for the association itself.
+            -- 'manual' means "a person explicitly added this; never treat it
+            -- as generated". NULL means unknown (legacy rows, scanner/XMP
+            -- imports, model output). Authorship used to be recoverable only
+            -- from ``edit_history``, which ``_prune_edit_history`` trims to
+            -- ``max_edit_history`` rows — so a hand-added tag could outlive
+            -- every trace that a human added it. Provenance belongs on the
+            -- row it describes, where nothing prunes it.
             CREATE TABLE IF NOT EXISTS photo_keywords (
                 photo_id    INTEGER REFERENCES photos(id),
                 keyword_id  INTEGER REFERENCES keywords(id),
+                source      TEXT,
                 PRIMARY KEY (photo_id, keyword_id)
             );
 
@@ -1622,6 +1631,19 @@ class Database:
         except sqlite3.OperationalError:
             self.conn.execute(
                 "ALTER TABLE collections ADD COLUMN visual_json TEXT"
+            )
+
+        # Migration: durable keyword-association provenance. Authorship used
+        # to be inferred from ``edit_history``, which ``_prune_edit_history``
+        # trims to ``max_edit_history`` rows, so evidence that a person added
+        # a keyword could disappear while the keyword itself survived — and
+        # provenance-driven cleanups would then misread it as generated.
+        # 'manual' on the association row cannot be pruned.
+        try:
+            self.conn.execute("SELECT source FROM photo_keywords LIMIT 0")
+        except sqlite3.OperationalError:
+            self.conn.execute(
+                "ALTER TABLE photo_keywords ADD COLUMN source TEXT"
             )
 
         # Migration: promote EXIF camera fields out of the exif_data JSON
@@ -3149,17 +3171,34 @@ class Database:
         user-authored and is preserved. For retired associations a flat-only
         sidecar removal is queued. Flat-only is important: a user may have a
         real hierarchy such as ``Wildlife|Birds|House Sparrow``; retiring the
-        generated flat term must not delete that hierarchy. A not-yet-synced
-        pending add proves the association was explicitly user-authored and is
-        preserved, as does a retained manual-add edit or a flat ``Wildlife``
-        term in the photo's XMP sidecar. When a same-name top-level keyword of
-        another type (e.g.
-        an ``individual`` ``Wildlife`` alongside the generated ``genre`` row)
-        still survives on the photo, the flat XMP subject represents both
-        associations, so the removal is skipped to avoid silently stripping
-        the surviving user-authored tag from the sidecar; the generated DB
-        association is still detached. The keyword row is retained so edit
-        history, manual associations, and user-created children remain valid.
+        generated flat term must not delete that hierarchy.
+
+        Provenance is *latched*, not re-derived on every pass. Each run first
+        stamps ``photo_keywords.source = 'manual'`` on any Wildlife
+        association carrying authorship evidence — a not-yet-synced pending
+        add, a retained ``keyword_add`` edit, a ``discard`` record for a
+        manual add (``/api/sync/discard`` deliberately leaves no sidecar), or
+        a flat ``Wildlife`` term in a readable XMP sidecar — commits that, and
+        only then considers deletions. The latch matters because every one of
+        those signals is transient (``pending_changes`` clears on sync,
+        ``edit_history`` is pruned to ``max_edit_history``) while this
+        migration legitimately re-runs across sessions: an offline sidecar
+        defers the completion marker, and ``force=True`` re-runs it outright.
+        Re-deriving authorship from an eroding record means the same
+        association can read as manual on one startup and generated on the
+        next; a column on the association cannot be pruned, so the first
+        run's verdict is the last word. Associations created from here on are
+        stamped at write time by ``tag_photo(..., source='manual')``, so the
+        evidence hunt only ever applies to pre-existing rows.
+
+        When a same-name top-level keyword of another type (e.g. an
+        ``individual`` ``Wildlife`` alongside the generated ``genre`` row) or
+        a preserved duplicate genre row still survives on the photo, the flat
+        XMP subject represents that survivor too, so the removal is skipped to
+        avoid silently stripping the user-authored tag from the sidecar; the
+        generated DB association is still detached. The keyword row is
+        retained so edit history, manual associations, and user-created
+        children remain valid.
 
         When a photo's sidecar was previously imported (``xmp_mtime`` is
         set) but is currently unavailable (for example, its NAS is offline),
@@ -3193,6 +3232,60 @@ class Database:
                 "SELECT MIN(id) AS id FROM workspaces"
             ).fetchone()
             fallback_workspace = fallback_row["id"] if fallback_row else None
+
+        # Latch authorship BEFORE evaluating any deletion. Each signal below
+        # lives in a table that empties or is trimmed over time
+        # (``pending_changes`` clears on sync, ``edit_history`` is pruned to
+        # ``max_edit_history``), while this migration may re-run on a later
+        # startup — a deferred offline sidecar leaves the completion marker
+        # unset, and ``force=True`` re-runs it outright. Copying the verdict
+        # onto ``photo_keywords.source`` turns eroding evidence into a durable
+        # fact at the earliest moment the migration can observe it.
+        self.conn.execute(
+            f"""UPDATE photo_keywords
+                SET source = 'manual'
+                WHERE keyword_id IN ({placeholders})
+                  AND (source IS NULL OR source <> 'manual')
+                  AND (
+                      EXISTS (
+                          SELECT 1
+                          FROM pending_changes pending_add
+                          WHERE pending_add.photo_id = photo_keywords.photo_id
+                            AND pending_add.change_type = 'keyword_add'
+                            AND pending_add.value = 'Wildlife' COLLATE NOCASE
+                      )
+                      OR EXISTS (
+                          SELECT 1
+                          FROM edit_history_items manual_item
+                          JOIN edit_history manual_edit
+                            ON manual_edit.id = manual_item.edit_id
+                          WHERE manual_item.photo_id = photo_keywords.photo_id
+                            AND manual_edit.action_type = 'keyword_add'
+                            AND manual_edit.undone = 0
+                            AND manual_item.new_value
+                                = CAST(photo_keywords.keyword_id AS TEXT)
+                      )
+                      OR EXISTS (
+                          -- ``/api/sync/discard`` deliberately leaves no
+                          -- sidecar but records the discarded add as
+                          -- ``keyword_add:<value>`` in a ``discard`` item.
+                          SELECT 1
+                          FROM edit_history_items discard_item
+                          JOIN edit_history discard_edit
+                            ON discard_edit.id = discard_item.edit_id
+                          WHERE discard_item.photo_id = photo_keywords.photo_id
+                            AND discard_edit.action_type = 'discard'
+                            AND discard_edit.undone = 0
+                            AND discard_item.old_value
+                                = 'keyword_add:Wildlife' COLLATE NOCASE
+                      )
+                  )""",
+            keyword_ids,
+        )
+        # Commit the latch on its own: preserving authorship must survive even
+        # if the retirement pass below fails partway through.
+        self.conn.commit()
+
         rows = self.conn.execute(
             f"""SELECT DISTINCT pk.photo_id, pk.keyword_id, wf.workspace_id,
                        p.filename, p.xmp_mtime, f.path AS folder_path,
@@ -3217,39 +3310,9 @@ class Database:
                 JOIN folders f ON f.id = p.folder_id
                 LEFT JOIN workspace_folders wf ON wf.folder_id = p.folder_id
                 WHERE pk.keyword_id IN ({placeholders})
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM pending_changes pending_add
-                      WHERE pending_add.photo_id = pk.photo_id
-                        AND pending_add.change_type = 'keyword_add'
-                        AND pending_add.value = 'Wildlife' COLLATE NOCASE
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM edit_history_items manual_item
-                      JOIN edit_history manual_edit
-                        ON manual_edit.id = manual_item.edit_id
-                      WHERE manual_item.photo_id = pk.photo_id
-                        AND manual_edit.action_type = 'keyword_add'
-                        AND manual_edit.undone = 0
-                        AND manual_item.new_value = CAST(pk.keyword_id AS TEXT)
-                  )
-                  AND NOT EXISTS (
-                      -- ``/api/sync/discard`` deliberately leaves no sidecar
-                      -- but records the discarded add as ``keyword_add:<value>``
-                      -- in a ``discard`` edit-history item. With a small
-                      -- ``_prune_edit_history`` limit that record can outlive
-                      -- the original ``keyword_add`` entry, so the discard
-                      -- item itself is durable evidence the tag was manual.
-                      SELECT 1
-                      FROM edit_history_items discard_item
-                      JOIN edit_history discard_edit
-                        ON discard_edit.id = discard_item.edit_id
-                      WHERE discard_item.photo_id = pk.photo_id
-                        AND discard_edit.action_type = 'discard'
-                        AND discard_edit.undone = 0
-                        AND discard_item.old_value = 'keyword_add:Wildlife' COLLATE NOCASE
-                  )
+                  -- Authorship was latched above, so one durable predicate
+                  -- replaces the pending/history/discard evidence hunt.
+                  AND (pk.source IS NULL OR pk.source <> 'manual')
                   AND EXISTS (
                       SELECT 1
                       FROM photo_keywords species_pk
@@ -3272,11 +3335,15 @@ class Database:
         # sidecar removal while their generated genre association is still
         # detached from the DB.
         photo_workspaces = {}
-        sidecar_wildlife_by_photo = {}
+        # pid -> "manual" (readable sidecar carries a flat Wildlife term),
+        # "defer" (sidecar unreadable/corrupt — decide on a later run), or
+        # "generated" (readable sidecar with no Wildlife term).
+        sidecar_verdict_by_photo = {}
+        sidecar_manual_pairs = []
         deferred_unavailable_sidecar = False
         for row in rows:
             pid = row["photo_id"]
-            if pid not in sidecar_wildlife_by_photo:
+            if pid not in sidecar_verdict_by_photo:
                 base = os.path.splitext(row["filename"])[0]
                 xmp_path = os.path.join(row["folder_path"], base + ".xmp")
                 if not os.path.exists(xmp_path):
@@ -3289,10 +3356,10 @@ class Database:
                     # generated Wildlife association still attached, even
                     # after the volume comes back online.
                     if row["xmp_mtime"] is not None:
-                        sidecar_wildlife_by_photo[pid] = True
+                        sidecar_verdict_by_photo[pid] = "defer"
                         deferred_unavailable_sidecar = True
                     else:
-                        sidecar_wildlife_by_photo[pid] = False
+                        sidecar_verdict_by_photo[pid] = "generated"
                 else:
                     # read_keywords() swallows ``ET.ParseError`` and returns
                     # an empty set for a corrupt sidecar, which is
@@ -3308,7 +3375,7 @@ class Database:
                             "Corrupt sidecar %s during Wildlife retirement; deferring",
                             xmp_path,
                         )
-                        sidecar_wildlife_by_photo[pid] = True
+                        sidecar_verdict_by_photo[pid] = "defer"
                         deferred_unavailable_sidecar = True
                     except Exception:
                         log.warning(
@@ -3316,15 +3383,19 @@ class Database:
                             xmp_path,
                             exc_info=True,
                         )
-                        sidecar_wildlife_by_photo[pid] = True
+                        sidecar_verdict_by_photo[pid] = "defer"
                         deferred_unavailable_sidecar = True
                     else:
                         try:
                             from xmp import read_keywords
 
-                            sidecar_wildlife_by_photo[pid] = any(
-                                keyword_match_key(value) == "wildlife"
-                                for value in read_keywords(xmp_path)
+                            sidecar_verdict_by_photo[pid] = (
+                                "manual"
+                                if any(
+                                    keyword_match_key(value) == "wildlife"
+                                    for value in read_keywords(xmp_path)
+                                )
+                                else "generated"
                             )
                         except Exception:
                             log.warning(
@@ -3332,9 +3403,17 @@ class Database:
                                 xmp_path,
                                 exc_info=True,
                             )
-                            sidecar_wildlife_by_photo[pid] = True
+                            sidecar_verdict_by_photo[pid] = "defer"
                             deferred_unavailable_sidecar = True
-            if sidecar_wildlife_by_photo[pid]:
+            verdict = sidecar_verdict_by_photo[pid]
+            if verdict == "manual":
+                # The sidecar itself carries the flat term, so a person put it
+                # there. Latch that verdict: a later run may not be able to
+                # reach the file (offline volume), and a sidecar rewrite must
+                # not be able to erase the provenance either.
+                sidecar_manual_pairs.append((pid, row["keyword_id"]))
+                continue
+            if verdict == "defer":
                 continue
             ws = row["workspace_id"]
             entry = photo_workspaces.setdefault(
@@ -3349,6 +3428,14 @@ class Database:
             entry["candidate_keyword_ids"].add(row["keyword_id"])
             if ws is not None:
                 entry["ws_ids"].add(ws)
+
+        if sidecar_manual_pairs:
+            self.conn.executemany(
+                "UPDATE photo_keywords SET source = 'manual' "
+                "WHERE photo_id = ? AND keyword_id = ?",
+                sidecar_manual_pairs,
+            )
+            self.conn.commit()
 
         for photo_id, entry in photo_workspaces.items():
             has_preserved_genre = (
@@ -13966,16 +14053,26 @@ class Database:
             (self._ws_id(),),
         ).fetchall()
 
-    def tag_photo(self, photo_id, keyword_id, _commit=True):
+    def tag_photo(self, photo_id, keyword_id, source=None, _commit=True):
         """Associate a keyword with a photo.
 
         Args:
+            source: Durable provenance for the association. Pass ``'manual'``
+                    from paths where a person explicitly added the keyword;
+                    the stamp lives on the row, so authorship survives
+                    ``_prune_edit_history`` discarding the ``keyword_add``
+                    entry. Scanner, XMP-import and model paths leave it NULL
+                    ("unknown"). An existing stamp is never downgraded: a
+                    re-tag without a source keeps the recorded provenance.
             _commit: If False, skip the internal commit (caller is responsible
                      for committing the transaction).
         """
         self.conn.execute(
-            "INSERT OR IGNORE INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-            (photo_id, keyword_id),
+            "INSERT INTO photo_keywords (photo_id, keyword_id, source) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(photo_id, keyword_id) DO UPDATE SET "
+            "source = COALESCE(excluded.source, photo_keywords.source)",
+            (photo_id, keyword_id, source),
         )
         if _commit:
             self.conn.commit()

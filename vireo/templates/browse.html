@@ -4337,6 +4337,20 @@ async function updatePreviewNow() {
   }
 }
 
+function commitRuleOnEnter(e) {
+  if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
+  var t = e.currentTarget || e.target;
+  if (t && t.type === 'date') {
+    // Native date pickers use Enter to commit the highlighted date;
+    // cancelling it would close the picker without applying the selection.
+    // Defer the blur so the picker's own Enter handler runs first.
+    setTimeout(function() { t.blur(); }, 0);
+    return;
+  }
+  e.preventDefault();
+  t.blur();
+}
+
 function renderRuleValueInput(r, i) {
   var p = escapeAttr(i);
   if (r.field === 'all') {
@@ -4416,15 +4430,15 @@ function renderRuleValueInput(r, i) {
       var from = Array.isArray(r.value) ? (r.value[0] || '') : '';
       var to   = Array.isArray(r.value) ? (r.value[1] || '') : '';
       return '<div style="flex:1;display:flex;gap:6px;align-items:center;">' +
-          '<input type="date" value="' + escapeAttr(from) + '" onchange="updateRule(\'' + p + '\',\'value_from\',this.value)" style="flex:1;">' +
+          '<input type="date" value="' + escapeAttr(from) + '" onchange="updateRule(\'' + p + '\',\'value_from\',this.value)" onkeydown="commitRuleOnEnter(event)" style="flex:1;">' +
           '<span style="color:var(--text-ghost);font-size:11px;">and</span>' +
-          '<input type="date" value="' + escapeAttr(to) + '" onchange="updateRule(\'' + p + '\',\'value_to\',this.value)" style="flex:1;">' +
+          '<input type="date" value="' + escapeAttr(to) + '" onchange="updateRule(\'' + p + '\',\'value_to\',this.value)" onkeydown="commitRuleOnEnter(event)" style="flex:1;">' +
         '</div>';
     }
     if (r.op === 'recent_days') {
       var n = (typeof r.value === 'number' || (typeof r.value === 'string' && r.value !== '')) ? r.value : 7;
       return '<div style="flex:1;display:flex;gap:6px;align-items:center;">' +
-          '<input type="number" min="1" value="' + escapeAttr(String(n)) + '" onchange="updateRule(\'' + p + '\',\'value\',this.value)" style="width:80px;">' +
+          '<input type="number" min="1" value="' + escapeAttr(String(n)) + '" onchange="updateRule(\'' + p + '\',\'value\',this.value)" onkeydown="commitRuleOnEnter(event)" style="width:80px;">' +
           '<span style="color:var(--text-ghost);font-size:11px;">days</span>' +
         '</div>';
     }
@@ -4433,7 +4447,9 @@ function renderRuleValueInput(r, i) {
     'noise_estimate', 'crop_complete', 'prediction_confidence'].indexOf(r.field) !== -1;
   return '<input type="' + (numeric ? 'number' : 'text') + '" value="' +
     escapeAttr(String(r.value == null ? '' : r.value)) +
-    '" onchange="updateRule(\'' + p + '\',\'value\',this.value)" placeholder="value" style="flex:1;">';
+    '" onchange="updateRule(\'' + p + '\',\'value\',this.value)"' +
+    ' onkeydown="commitRuleOnEnter(event)"' +
+    ' placeholder="value" style="flex:1;">';
 }
 
 function renderFieldOptions(selected) {

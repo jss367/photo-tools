@@ -192,3 +192,59 @@ def test_human_claude_fix_overrides_routine_round_cap():
 
     assert "Human override: true" in prompt
     assert "skip the round cap" in prompt
+
+
+def test_bots_cannot_grant_human_override_or_reset_escalation_via_activate():
+    workflow = _read(WORKFLOW)
+
+    activate_idx = workflow.find("activate:")
+    fix_comment_idx = workflow.find("fix-comment-feedback:")
+    activate_block = workflow[activate_idx:fix_comment_idx]
+
+    # The activate condition admits `chatgpt-codex-connector[bot]`, so
+    # `Human override: true` must be gated on the commenter's association
+    # rather than emitted unconditionally. Otherwise a bot's /claude-fix
+    # comment would bypass both the workflow-level and routine-level
+    # two-round caps and could drive automated repair indefinitely.
+    override_line = next(
+        line for line in activate_block.splitlines() if "Human override: true" in line
+    )
+    assert "steps.live.outputs.is_human" in override_line, (
+        f"Human override must be gated on the is_human step output; got {override_line!r}"
+    )
+
+    # The workflow-level cap (via `max-review-fix-rounds`) must also flip
+    # from disabled (0) to enabled (>=1) for non-human invokers so both
+    # cap layers apply.
+    max_rounds_line = next(
+        line for line in activate_block.splitlines() if "max-review-fix-rounds:" in line
+    )
+    assert "steps.live.outputs.is_human" in max_rounds_line, (
+        f"max-review-fix-rounds must be gated on is_human; got {max_rounds_line!r}"
+    )
+
+    # The pr-agent-needs-human escalation label must not be cleared by a
+    # bot's /claude-fix, or an already-escalated PR could be silently
+    # reset back into the automated lane. The label-clear must sit inside
+    # a shell guard checking the is_human step output (surfaced as
+    # $IS_HUMAN in the step env).
+    label_step_idx = activate_block.find("- name: Add agent label")
+    checkout_idx = activate_block.find("- uses: actions/checkout", label_step_idx)
+    label_step = activate_block[label_step_idx:checkout_idx]
+    assert "--remove-label pr-agent-needs-human" in label_step
+    assert 'IS_HUMAN: ${{ steps.live.outputs.is_human }}' in label_step
+    assert 'if [[ "$IS_HUMAN" == "true" ]]; then' in label_step
+    # The remove-label call must appear after the guard opens.
+    guard_open = label_step.find('if [[ "$IS_HUMAN" == "true" ]]; then')
+    remove_pos = label_step.find("--remove-label pr-agent-needs-human")
+    assert guard_open != -1 and remove_pos > guard_open
+
+    # The Check live PR state step must derive is_human from the commenter's
+    # author_association (OWNER/COLLABORATOR), the same trust anchor the
+    # activate `if:` uses for human maintainers.
+    check_step = activate_block.split("- name: Add agent label")[0]
+    assert 'AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}' in check_step
+    assert '"$AUTHOR_ASSOCIATION" == "OWNER"' in check_step
+    assert '"$AUTHOR_ASSOCIATION" == "COLLABORATOR"' in check_step
+    assert 'echo "is_human=true" >> "$GITHUB_OUTPUT"' in check_step
+    assert 'echo "is_human=false" >> "$GITHUB_OUTPUT"' in check_step

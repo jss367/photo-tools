@@ -65,6 +65,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.issue.number }}
+          AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}
+          ACTOR: ${{ github.actor }}
         run: |
           state=$(gh pr view "$PR" --repo "$REPO" --json state --jq '.state')
           if [[ "$state" == "OPEN" ]]; then
@@ -74,12 +76,25 @@ jobs:
             echo "PR #${PR} is ${state}; ignoring stale /claude-fix."
           fi
 
+          # The activate condition admits `chatgpt-codex-connector[bot]`, so
+          # OWNER/COLLABORATOR is the only signal that the commenter is a
+          # human maintainer. A bot's /claude-fix must not receive the
+          # round-cap override, and must not clear the pr-agent-needs-human
+          # escalation label, or the two-round guard collapses.
+          if [[ "$AUTHOR_ASSOCIATION" == "OWNER" || "$AUTHOR_ASSOCIATION" == "COLLABORATOR" ]]; then
+            echo "is_human=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_human=false" >> "$GITHUB_OUTPUT"
+            echo "/claude-fix from ${ACTOR} (${AUTHOR_ASSOCIATION}) will not receive the human override."
+          fi
+
       - name: Add agent label
         if: steps.live.outputs.open == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.issue.number }}
+          IS_HUMAN: ${{ steps.live.outputs.is_human }}
         run: |
           gh label create "$AGENT_LABEL" \
             --repo "$REPO" \
@@ -87,9 +102,13 @@ jobs:
             --description "PRs handled by the Claude PR agent" \
             || true
           gh pr edit "$PR" --repo "$REPO" --add-label "$AGENT_LABEL"
-          gh pr edit "$PR" --repo "$REPO" \
-            --remove-label pr-agent-needs-human \
-            || true
+          if [[ "$IS_HUMAN" == "true" ]]; then
+            gh pr edit "$PR" --repo "$REPO" \
+              --remove-label pr-agent-needs-human \
+              || true
+          else
+            echo "Leaving pr-agent-needs-human label (if present) intact for non-human invoker."
+          fi
 
       - uses: actions/checkout@v5
         if: steps.live.outputs.open == 'true'
@@ -107,10 +126,14 @@ jobs:
           repo: ${{ github.repository }}
           pr: ${{ github.event.issue.number }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Human /claude-fix intentionally opts out of the workflow-level
+          # cap; a bot's /claude-fix must still be subject to the cap so
+          # neither the workflow nor the routine cap can be bypassed.
+          max-review-fix-rounds: ${{ steps.live.outputs.is_human == 'true' && '0' || '2' }}
           payload: |
             Task: address-review
             PR: ${{ github.event.issue.number }}
-            Human override: true
+            ${{ steps.live.outputs.is_human == 'true' && 'Human override: true' || '' }}
             Review author: ${{ github.event.comment.user.login }}
             Review body:
             Reviewer invoked /claude-fix. Read every outstanding review

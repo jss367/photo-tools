@@ -1572,7 +1572,10 @@ was tagged, nothing is retracted.
 **A card mutation writes every member status before it decides any
 keyword effect.** This is a general rule about card mutations, not a
 patch on "Reject all", and it binds accept as much as reject. A card
-mutation runs as two phases inside one transaction, in this order:
+mutation runs as two phases inside one transaction, in this order.
+(Lettered to keep them distinct from the numbered steps of the accept
+algorithm above and from the numbered implementation phases below:
+these two are halves of one mutation, at runtime.)
 
 - **Phase A — statuses.** Write the new status of *every* row in the
   mutated set (`resolved component ∩ member_prediction_ids ∩ scope`,

@@ -549,6 +549,36 @@ Why connected components can't over-merge: an edge requires same taxon *and*
 shared photos. Two different bursts of the same species on different photos
 stay separate cards; two models' views of the same burst merge.
 
+**Within-run subject partition is authoritative on the edge.** Same-taxon
+overlap is a *cross-run* signal only: the edge is added between nodes A and B
+iff they share a taxon key, their photo memberships overlap, **and** their
+`(classifier_model, labels_fingerprint)` differ — never within a single
+classify run. When one run produces two same-taxon nodes on the same photos
+— a real Blue Tit box and a false-positive Blue Tit box on the same frame,
+placed by similarity grouping in different `group_id`s (or one grouped and
+one singleton) — that split is the classifier's own subject-partition
+decision, computed from image evidence at classify time. Re-merging those
+two nodes at Review time on `(photo, taxon)` alone would collapse two
+distinct subjects into one card and make one accept-or-reject decision
+cover them both, which is precisely the granularity loss §"Distinct
+same-taxon subjects on one photo" flags. The within-run half of the
+`(taxon_key, overlapping photos)` rule therefore only *appears* to apply;
+it is a no-op because within-run same-node identity already means one node,
+and within-run different-node identity means the run separated the subjects
+and the graph does not re-join them. Across runs (either classifier or
+labels-fingerprint differs) the run partitions are not comparable — one
+model's `group_id`s carry no information about the other's — so the
+overlap-and-same-taxon edge is the strongest cross-run signal we have and
+is used as designed. The residual **cross-run ambiguity** on a shared photo
+where both runs produce ≥2 same-taxon subjects — which of the two BioCLIP
+subjects on frame 5 does which of the two iNat21 subjects correspond to? —
+is genuinely undecidable from `(photo, taxon)` alone; that photo is dropped
+from the overlap-set for edge purposes (either side's multiplicity
+suppresses it), and the cross-run merge either succeeds through some *other*
+unambiguous frame in the same burst or fails to merge and the two remain
+separate cards. See §Edge cases, *Distinct same-taxon subjects on one
+photo*, for the concrete shape.
+
 **Payload changes.** Each prediction row gains `taxon_key`, `card_id`,
 `node_id` (the encoded node identity from "Node identity" above — the
 handle the client echoes back: as the mutation target when a filter is
@@ -1053,19 +1083,32 @@ removes a row that was a *bridge* between two components, the server's
 `card_id` describes a card the user is not looking at. See "Fallback
 dedup key" below for what the client uses instead.
 
-*Active-filter detection.* The trigger is **structural, not
-enumerated**: the client renders per-node cards whenever the row set it
-is about to render is not exactly the row set the server returned —
-in today's code, `predictions.length !== allPredictions.length` after
-the collection re-intersection at `review.html:1126-1131`, or
-`getVisibleItems` dropping any row before its dedup pass. Enumerating
-predicates has already failed twice here: once by listing only model
-and fingerprint, and once by omitting that collection re-intersection,
+*Active-filter detection.* The trigger has **two arms and either one
+alone fires it**: (a) any of the four client-applied predicates
+enumerated below is truthy against its no-filter sentinel, **or**
+(b) the row set the client is about to render is not exactly the row
+set the server returned — in today's code,
+`predictions.length !== allPredictions.length` after the collection
+re-intersection at `review.html:1126-1131`, or `getVisibleItems`
+dropping any row before its dedup pass. Neither arm subsumes the
+other and both are needed. Arm (b), the row-set arm, is closed under
+future predicates — a new filter added to `getVisibleItems` cannot
+silently escape it, which is the closure enumerating predicates has
+already failed twice here (once by listing only model and
+fingerprint, and once by omitting that collection re-intersection,
 which drops rows the server returned whenever the cached
 `collectionPhotoIds` set is narrower than the collection the server
-queried (a stale set after a collection edit). A structural test is
-closed under future predicates — a new filter added to
-`getVisibleItems` cannot silently escape it.
+queried, a stale set after a collection edit). Arm (a), the
+enumerated arm, is what catches **active-but-quiet** predicates that
+arm (b) cannot see: `currentModel === 'BioCLIP-2.5'` when the return
+happens to contain only BioCLIP rows, or `minConfidence > 0` when
+every returned row already exceeds it — the raw predicate is
+non-default, the client is filtering, but the before/after row set is
+identical. Under arm (b) alone the client would keep rendering a
+merged card and (as §"Mutation ID from the fallback view" below
+spells out, and the reviewer flagged) the mutation contract would
+then have no valid shape for it. Arm (a) closes that hole by keying
+the render on the raw predicate values, not on the observed drop.
 
 The predicates that cause a divergence today are the four
 `getVisibleItems` applies, matching `review.html:1281-1300` verbatim:
@@ -1084,8 +1127,9 @@ The predicates that cause a divergence today are the four
 were already dropped by `db.get_predictions` and never reached the
 client. It is a server-applied filter and is handled as one, above.
 
-Any single one being true — or any other client-side drop, per the
-structural test above — triggers the per-node fallback for card
+Whenever either arm fires — any single one of the four enumerated
+predicates being truthy, or any client-side drop the structural test
+detects — the client renders the per-node fallback for card
 construction. This is stricter than "model or fingerprint only" for
 good reason: a below-`minConfidence` bridge row or an already-accepted
 `status != currentTab` sibling row is exactly the kind of hidden
@@ -1164,22 +1208,42 @@ prediction_id)` for singletons — encoded as the `node_id` the server
 stamped on that row) plus the full seven-entry scope tuple from
 §3 — the four client-applied predicates and the three server-applied
 ones — and does *not* send the server's `card_id`. The mutation POST
-therefore distinguishes two request shapes: (i) **merged-card view**
-(no client-applied predicate active) — carries `card_id` with the four
-client-applied scope entries `null` and the server-applied
-`rules`/`collection_id`/`visual` still populated with whatever the GET
-sent, and the server resolves the full component *within that scoped
-row set*; (ii) **fallback view** (at least one client-applied predicate
-active) — carries `node_id` (the encoded node identity tuple,
-same base64url-of-JSON encoding as `card_id` for uniformity, decoding
-to `[classifier_model, labels_fingerprint, group_id, species_key]` for
-grouped rows or `[classifier_model, labels_fingerprint, "p" +
-prediction_id]` for singletons) plus the
-scope tuple, and the server treats the card as exactly that single
-node, resolving photos only from that node's members and mutating
-strictly the node's own rows (§3 "`node_id` request" — no cross-model
-taxon-matched sibling scan, so the mutation cannot reach any other
-visible node's rows on a shared photo).
+therefore distinguishes two request shapes, keyed on the **render
+decision** the client already made under "Active-filter detection"
+above, not on the raw predicate values: (i) **merged-card view**
+(the client rendered a merged card — neither arm of the fallback
+trigger fired) — carries `card_id` with the seven-entry scope tuple
+populated as the GET sent it, client-applied entries included at
+their **actual values** rather than forced to `null`, and the server
+resolves the full component *within that scoped row set* (an
+active-but-quiet client-applied entry — non-default sentinel but
+matching every returned row — simply removes no rows on the
+intersection, which is why it is safe to send under this shape); (ii)
+**fallback view** (the client rendered per-node cards — at least one
+arm of the trigger fired) — carries `node_id` (the encoded node
+identity tuple, same base64url-of-JSON encoding as `card_id` for
+uniformity, decoding to `[classifier_model, labels_fingerprint,
+group_id, species_key]` for grouped rows or
+`[classifier_model, labels_fingerprint, "p" + prediction_id]` for
+singletons) plus the scope tuple, and the server treats the card as
+exactly that single node, resolving photos only from that node's
+members and mutating strictly the node's own rows (§3 "`node_id`
+request" — no cross-model taxon-matched sibling scan, so the mutation
+cannot reach any other visible node's rows on a shared photo).
+Keying the shape on the render decision — instead of on "any
+client-applied predicate active," as an earlier revision had it —
+closes the mismatch the reviewer flagged: an active-but-quiet
+predicate (e.g. a `currentModel` set to the only returned model, or
+a `minConfidence` every row already exceeds) leaves the row set
+unchanged but is still active, and under a predicate-value-keyed
+contract the render would fall through arm (b)'s test and produce a
+merged card that the mutation contract had no valid shape for.
+Under the render-keyed contract, both arms of the trigger route the
+same way: the render is merged and the mutation is `card_id` (the
+enumerated arm did not fire because every enumerated predicate was
+at its no-filter sentinel, and the row-set arm did not fire because
+nothing was dropped), or the render is per-node and the mutation is
+`node_id` (either arm fired). There is no third state.
 The server resolves a `node_id` by matching those columns on stored
 rows and only then intersects the node's members with the scope tuple.
 Because node identity is intrinsic to the rows (§2, "Node identity is
@@ -1508,8 +1572,25 @@ union**, not just the clicked group's photos:
   models that classified detections from different detectors (different
   detection rows for the same photo), and it is safe for multi-species
   photos: two birds of *different* species have different taxon keys and are
-  untouched; two detections of the *same* species on one photo collapse into
-  one photo-level keyword anyway.
+  untouched. The sibling scan follows the same edge rule §2
+  ("Within-run subject partition is authoritative on the edge") uses to
+  build the component in the first place — it only broadens **across
+  runs**, i.e. rows whose `(classifier_model, labels_fingerprint)` differs
+  from the clicked row's — never within the run. Within the clicked row's
+  own run, the group-siblings loop `accept_prediction` already runs
+  (`pr.classifier_model = ?` on the clicked row's own `group_id`)
+  continues to be the only same-run reach, so the classifier's own
+  similarity-grouping decision — one real Blue Tit box in `group_id` A,
+  one false-positive Blue Tit box in `group_id` B — is preserved: the two
+  remain separately reviewable cards and one accept does not resolve the
+  other. This is why the `(photo_id, taxon_key)` sibling scan is safe as
+  a *keyword* consideration too: two same-species detections on one photo
+  collapse into one photo-level keyword regardless of which of the two
+  cards accepts it (the keyword write is idempotent per taxon, §4), so
+  the *keyword* granularity is intentionally coarser than the *review
+  status* granularity — accepting one card tags the photo, accepting the
+  other is a status-only idempotent no-op on the keyword, and rejecting
+  one leaves the other's tag in place through the liveness clause.
 - Taxon keys are computed in Python via §1's helper (the candidate set —
   the card's member rows on its union photos, in any status — is bounded
   by the card size), so no SQL-side taxonomy join is needed.
@@ -1623,14 +1704,36 @@ rejected, so they no longer count as live. One rule, no list.
 runs, so it is worth pinning down: a row in
 `predictions`/`prediction_review` on that photo, in the active
 workspace, whose §1 taxon key equals the card's and whose
-**post-Phase-A** status is not `rejected`. It is deliberately *not*
-restricted to the card's members — a same-taxon row on a different card,
-or one the mutation's scope excluded, keeps the keyword alive and must,
-which is also why "ignore every sibling" would be wrong where "evaluate
-after the writes" is right. And it is not
-`get_photos_with_equivalent_species` (`db.py:13874`), which answers the
-different question "does this photo already carry an equivalent species
-keyword" and is the accept path's idempotence check.
+**post-Phase-A** status is `pending` or `accepted`. Both `rejected`
+and `alternative` are excluded, and for the same reason: only
+top-level, still-in-play assertions can keep an accept-owned tag
+alive. `rejected` is out because the reviewer has retired it;
+`alternative` is out because it was never a card in the first place —
+it is a runner-up in some other row's top-k output that §Edge cases
+(*Alternatives*) already excludes from card building and sibling
+resolution, so it cannot be treated as an independent assertion here
+without contradicting that exclusion. Concretely: a top-k classifier
+emits an `accepted` "Blue Tit" row for photo P alongside a runner-up
+`alternative` "Blue Tit" row on the same photo; if the user later
+rejects the accepted card, an `alternative`-inclusive predicate would
+see the runner-up as a live sibling and retain the accept-owned
+keyword, so the card would badge "Rejected" while the photo still
+carried the tag — the same badge-disagrees-with-metadata failure the
+retraction rule is here to prevent, this time manufactured by the
+retraction rule counting rows the card itself does not contain. The
+liveness predicate is therefore `status IN ('pending', 'accepted')`
+and the exclusion of `alternative` is *not* a "same rule stated
+twice" with the Phase-A demotion machinery — Phase A only demotes the
+mutation's own members, and `alternative` rows are not members of any
+card. It is also deliberately *not* restricted to the card's members
+in the *other* direction — a `pending`/`accepted` same-taxon row on a
+different card, or one the mutation's scope excluded, keeps the
+keyword alive and must, which is also why "ignore every sibling"
+would be wrong where "evaluate after the writes" is right. And it is
+not `get_photos_with_equivalent_species` (`db.py:13874`), which
+answers the different question "does this photo already carry an
+equivalent species keyword" and is the accept path's idempotence
+check.
 
 **Retraction requires provenance, and provenance cannot live in the
 edit log.** Stripping a keyword is only safe if we know the *accept*
@@ -1960,7 +2063,41 @@ caeruleus*") on the Keywords page with a one-click merge.
 - **Two same-taxon groups from one model** (e.g. re-runs under different
   fingerprints): they merge into one card if their photos overlap — which is
   the correct de-duplication, and the fingerprint filter still separates
-  them when the user asks.
+  them when the user asks. (This is a cross-*run* merge — the
+  `labels_fingerprint` differs — so §2's "Within-run subject partition
+  is authoritative on the edge" rule permits it, unlike the same-run
+  case below.)
+- **Distinct same-taxon subjects on one photo.** One classify run
+  can — and routinely does — produce two nodes on the same photo that
+  both predict the same taxon: a real Blue Tit box in one `group_id`
+  and a false-positive Blue Tit box on background clutter in another
+  `group_id` (or one grouped and one singleton). Similarity grouping
+  ran over that photo's detections at classify time and *chose* the
+  split, based on image evidence the Review layer no longer has. §2's
+  edge rule ("Within-run subject partition is authoritative on the
+  edge") preserves the choice: no `(taxon_key, overlapping photos)`
+  edge is drawn between two nodes that share
+  `(classifier_model, labels_fingerprint)`, so the two subjects
+  render as two separate cards and one accept-or-reject decision does
+  not silently resolve the other. The **cross-run** case — a second
+  classifier also produces its own real-vs-false split for the same
+  photo — is genuinely ambiguous from `(photo, taxon)` alone: neither
+  side's `group_id`s carry information about the other side's subject
+  partition, so pairing them up on a single photo is a guess.
+  Ambiguous photos are dropped from the edge's overlap set (either
+  side's multiplicity suppresses them), and the cross-run merge either
+  proceeds through some *other* unambiguous frame in the same burst
+  (the far commoner case, since bursts hold many frames) or fails to
+  merge and the two cross-run cards remain separate — the more
+  conservative failure mode. Keyword *metadata* is unaffected either
+  way: a photo carries at most one keyword per taxon regardless of how
+  many same-taxon detections it holds, and the liveness clause of §3
+  ("A card mutation writes every member status before it decides any
+  keyword effect") keeps the tag on the photo as long as any
+  same-taxon card there is still `pending` or `accepted`. The
+  granularity difference is intentional: *review status* is per-card
+  (each subject decided independently), *keyword* is per-photo (one
+  Blue Tit tag either way).
 
 ## Alternatives considered
 

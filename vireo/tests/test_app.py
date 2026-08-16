@@ -619,6 +619,35 @@ def test_api_folder_workspaces_does_not_expand_restricted_exact_links(app_and_db
     ).fetchone() is None
 
 
+def test_api_folder_workspaces_infers_late_recursive_child_without_mutation(
+    app_and_db,
+):
+    """A child discovered after root linking is visible without inserting a link."""
+    app, db = app_and_db
+    root = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024'"
+    ).fetchone()
+    recursive_ws = db.create_workspace("Recursive Library")
+    db.add_workspace_folder(recursive_ws, root["id"])
+    late_child_id = db.add_folder(
+        "/photos/2024/Late Discovery", name="Late Discovery"
+    )
+    assert db.conn.execute(
+        "SELECT 1 FROM workspace_folders WHERE workspace_id = ? AND folder_id = ?",
+        (recursive_ws, late_child_id),
+    ).fetchone() is None
+
+    resp = app.test_client().get(f'/api/folders/{late_child_id}/workspaces')
+    assert resp.status_code == 200
+    assert "Recursive Library" in {
+        workspace["name"] for workspace in resp.get_json()["workspaces"]
+    }
+    assert db.conn.execute(
+        "SELECT 1 FROM workspace_folders WHERE workspace_id = ? AND folder_id = ?",
+        (recursive_ws, late_child_id),
+    ).fetchone() is None
+
+
 def test_api_keywords(app_and_db):
     """GET /api/keywords returns keyword tree."""
     app, _ = app_and_db

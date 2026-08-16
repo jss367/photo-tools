@@ -7173,18 +7173,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not folder:
             return json_error("folder not found", 404)
 
-        # Match the folder-detail endpoint's active-workspace boundary. This
-        # prevents callers from using folder IDs to enumerate workspace names
-        # for folders that the current workspace cannot see.
-        linked = db.conn.execute(
-            "SELECT 1 FROM workspace_folders WHERE workspace_id = ? AND folder_id = ?",
-            (db._active_workspace_id, folder_id),
-        ).fetchone()
-        if not linked:
+        # Match the folder-detail endpoint's active-workspace boundary while
+        # also recognizing read-only inheritance from a recursive root. This
+        # prevents callers from using hidden folder IDs to enumerate workspace
+        # names without mutating the membership table during a GET.
+        folder_workspaces = db.get_folder_workspaces(folder_id)
+        if not any(
+            workspace["id"] == db._active_workspace_id
+            for workspace in folder_workspaces
+        ):
             return json_error("folder not found", 404)
 
         workspaces = []
-        for workspace in db.get_folder_workspaces(folder_id):
+        for workspace in folder_workspaces:
             workspaces.append({
                 "id": workspace["id"],
                 "name": workspace["name"],

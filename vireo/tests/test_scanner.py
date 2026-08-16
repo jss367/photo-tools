@@ -3179,8 +3179,11 @@ def test_scan_pause_check_none_preserves_existing_behavior(tmp_path):
     assert len(photos) == 2
 
 
-def test_scan_pause_requeues_item_waiting_for_worker_result(tmp_path, monkeypatch):
-    """A pause while awaiting a popped future must not drop that photo."""
+@pytest.mark.parametrize("pause_after_result", [False, True])
+def test_scan_pause_requeues_worker_result(
+    tmp_path, monkeypatch, pause_after_result,
+):
+    """Pauses during or immediately after a worker wait release the lease."""
     import resource_ledger
     import scanner
     from db import Database
@@ -3191,6 +3194,7 @@ def test_scan_pause_requeues_item_waiting_for_worker_result(tmp_path, monkeypatc
     db = Database(str(tmp_path / "test.db"))
 
     pause_state = {"active": False, "triggered": False}
+    parking_alloc = []
 
     class PendingFuture:
         def __init__(self, function, path):
@@ -3201,6 +3205,8 @@ def test_scan_pause_requeues_item_waiting_for_worker_result(tmp_path, monkeypatc
             if not pause_state["triggered"]:
                 pause_state["triggered"] = True
                 pause_state["active"] = True
+                if pause_after_result:
+                    return self.function(self.path)
                 raise scanner.TimeoutError()
             return self.function(self.path)
 
@@ -3215,6 +3221,8 @@ def test_scan_pause_requeues_item_waiting_for_worker_result(tmp_path, monkeypatc
             return None
 
     def cancel_check():
+        if pause_state["active"]:
+            parking_alloc.append(ledger.snapshot()["cpu"]["allocated"])
         pause_state["active"] = False
         return False
 
@@ -3232,6 +3240,52 @@ def test_scan_pause_requeues_item_waiting_for_worker_result(tmp_path, monkeypatc
         resource_ledger._set_resource_ledger_for_tests(previous)
 
     assert pause_state["triggered"]
+    assert parking_alloc == [0]
+    photos = db.get_photos(per_page=100)
+    assert {os.path.basename(photo["filename"]) for photo in photos} == set(filenames)
+
+
+def test_sequential_scan_pause_after_compute_releases_lease(tmp_path, monkeypatch):
+    """The one-worker path also checks pause before yielding to its caller."""
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    filenames = ["a.jpg", "b.jpg", "c.jpg"]
+    _create_test_images(root, {'': filenames})
+    db = Database(str(tmp_path / "test.db"))
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    original_compute = scanner._compute_file_features
+    pause_state = {"active": False, "triggered": False}
+    parking_alloc = []
+
+    def compute_then_pause(path):
+        result = original_compute(path)
+        if not pause_state["triggered"]:
+            pause_state["triggered"] = True
+            pause_state["active"] = True
+        return result
+
+    def cancel_check():
+        if pause_state["active"]:
+            parking_alloc.append(ledger.snapshot()["cpu"]["allocated"])
+        pause_state["active"] = False
+        return False
+
+    monkeypatch.setattr(scanner, "_compute_file_features", compute_then_pause)
+    try:
+        scanner.scan(
+            root,
+            db,
+            cancel_check=cancel_check,
+            pause_check=lambda: pause_state["active"],
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    assert parking_alloc == [0]
     photos = db.get_photos(per_page=100)
     assert {os.path.basename(photo["filename"]) for photo in photos} == set(filenames)
 

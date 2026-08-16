@@ -2464,6 +2464,8 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                                     raise _ScanPauseRequested()
                                 _check_cancelled()
                                 result = _feature_result(done_fut)
+                                if _pause_pending():
+                                    raise _ScanPauseRequested()
                                 pending.popleft()
                                 yield done_path, result
                         while pending:
@@ -2472,6 +2474,8 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                                 raise _ScanPauseRequested()
                             _check_cancelled()
                             result = _feature_result(done_fut)
+                            if _pause_pending():
+                                raise _ScanPauseRequested()
                             pending.popleft()
                             yield done_path, result
                     except _ScanPauseRequested:
@@ -2516,8 +2520,13 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                             paused = True
                             break
                         _check_cancelled()
-                        image_path, path_str = remaining.popleft()
-                        yield image_path, _compute_file_features(path_str)
+                        image_path, path_str = remaining[0]
+                        result = _compute_file_features(path_str)
+                        if _pause_pending():
+                            paused = True
+                            break
+                        remaining.popleft()
+                        yield image_path, result
             # Lease is released here (``_claim_worker_count`` exited).
             # Park until the caller resumes (or cancels) before rebuilding
             # the pool with the remaining files. ``_check_cancelled`` is

@@ -8399,6 +8399,14 @@ class Database:
         """Set or remove color label for multiple photos in the active workspace."""
         self._photo_label_repository().set_many(photo_ids, color)
 
+    def get_color_label_descriptions(self):
+        """Return color-label descriptions for the active workspace."""
+        return self._photo_label_repository().get_descriptions()
+
+    def set_color_label_description(self, color, description):
+        """Set or clear one color-label description in the active workspace."""
+        return self._photo_label_repository().set_description(color, description)
+
     def _photo_label_repository(self):
         from repositories.photo_labels import PhotoLabelRepository
 

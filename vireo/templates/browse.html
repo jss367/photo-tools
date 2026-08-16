@@ -1752,11 +1752,11 @@ body.sidebar-resizing {
       <div class="detail-section">
         <div class="detail-section-title">Color Label <span class="batch-mixed" id="colorMixed" hidden>· Mixed</span></div>
         <div class="detail-colors" id="detailColors">
-          <button class="detail-color-btn" data-color="red" onclick="setColorLabel('red')" title="Red (6)"></button>
-          <button class="detail-color-btn" data-color="yellow" onclick="setColorLabel('yellow')" title="Yellow (7)"></button>
-          <button class="detail-color-btn" data-color="green" onclick="setColorLabel('green')" title="Green (8)"></button>
-          <button class="detail-color-btn" data-color="blue" onclick="setColorLabel('blue')" title="Blue (9)"></button>
-          <button class="detail-color-btn" data-color="purple" onclick="setColorLabel('purple')" title="Purple"></button>
+          <button class="detail-color-btn" data-color="red" data-color-label-control onclick="setColorLabel('red')" title="Red (6)" aria-label="Red label"></button>
+          <button class="detail-color-btn" data-color="yellow" data-color-label-control onclick="setColorLabel('yellow')" title="Yellow (7)" aria-label="Yellow label"></button>
+          <button class="detail-color-btn" data-color="green" data-color-label-control onclick="setColorLabel('green')" title="Green (8)" aria-label="Green label"></button>
+          <button class="detail-color-btn" data-color="blue" data-color-label-control onclick="setColorLabel('blue')" title="Blue (9)" aria-label="Blue label"></button>
+          <button class="detail-color-btn" data-color="purple" data-color-label-control onclick="setColorLabel('purple')" title="Purple" aria-label="Purple label"></button>
         </div>
       </div>
 
@@ -2589,7 +2589,19 @@ function renderCardField(field, p) {
       return '';
     case 'color_label':
       var cl = colorLabels[p.id];
-      if (cl) return '<span class="grid-card-color" data-color="' + cl + '" title="' + cl + '"></span>';
+      if (cl) {
+        var colorTitle = window.VireoColorLabels
+          ? window.VireoColorLabels.title(cl, cl.charAt(0).toUpperCase() + cl.slice(1))
+          : cl;
+        return '<span class="grid-card-color" data-color="' + cl
+          + '" data-color-label-control data-color-label-base-title="'
+          + escapeAttr(cl.charAt(0).toUpperCase() + cl.slice(1))
+          + '" data-color-label-base-aria="'
+          + escapeAttr(cl.charAt(0).toUpperCase() + cl.slice(1) + ' label')
+          + '" role="img" aria-label="'
+          + escapeAttr(cl.charAt(0).toUpperCase() + cl.slice(1) + ' label')
+          + '" title="' + escapeAttr(colorTitle) + '"></span>';
+      }
       return '';
     default:
       return '';
@@ -8660,7 +8672,11 @@ function buildPhotoContextMenu(photoIds) {
   var colorChip = function(c, icon, title) {
     return {
       label: icon,
-      title: title,
+      title: c && window.VireoColorLabels
+        ? window.VireoColorLabels.title(c, title)
+        : title,
+      color: c,
+      colorBaseTitle: title,
       onClick: function() {
         photoIds.forEach(function(id) { setColorLabelFor(id, c); });
       },

@@ -1225,6 +1225,30 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .modal-btn-cancel { background: var(--bg-tertiary); color: var(--text-secondary); }
 .modal-error { color: var(--danger); font-size: 13px; margin-top: 8px; display: none; }
 
+.color-label-description-heading {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.color-label-description-swatch {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.22);
+  flex: 0 0 auto;
+}
+.color-label-description-swatch[data-color="red"] { background: #e74c3c; }
+.color-label-description-swatch[data-color="yellow"] { background: #f1c40f; }
+.color-label-description-swatch[data-color="green"] { background: #2ecc71; }
+.color-label-description-swatch[data-color="blue"] { background: #3498db; }
+.color-label-description-swatch[data-color="purple"] { background: #9b59b6; }
+.color-label-description-count {
+  margin-top: 4px;
+  text-align: right;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
 /* ---------- Shortcuts Cheat Sheet ---------- */
 /* z-index sits above the lightbox stack (overlay 9999, close 10000, nav 10001)
    so the sheet remains visible when stacked over an active lightbox. */
@@ -1948,6 +1972,34 @@ document.addEventListener('keydown', function(e) {
 <!-- Load keymap.js before any inline <script> blocks below so window.Keymap
      (registry, dispatcher, Esc stack) is available when they run. -->
 <script src="/static/keymap.js"></script>
+
+<!-- Color Label Description Modal -->
+<div class="modal-overlay" id="colorLabelDescriptionModal"
+     onclick="if(event.target===this)VireoColorLabels.closeEditor()">
+  <div class="modal" role="dialog" aria-modal="true"
+       aria-labelledby="colorLabelDescriptionTitle">
+    <h3 class="color-label-description-heading" id="colorLabelDescriptionTitle">
+      <span class="color-label-description-swatch" id="colorLabelDescriptionSwatch"></span>
+      <span id="colorLabelDescriptionHeading">Color label description</span>
+    </h3>
+    <label class="modal-label" for="colorLabelDescriptionInput">Short description</label>
+    <input class="modal-input" id="colorLabelDescriptionInput" type="text"
+           maxlength="120" autocomplete="off"
+           placeholder="For example, Reptiles">
+    <div class="color-label-description-count" id="colorLabelDescriptionCount">0 / 120</div>
+    <div class="modal-hint">
+      Shown in color-label tooltips in this workspace. Leave blank to remove it.
+    </div>
+    <div class="modal-error" id="colorLabelDescriptionError"></div>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-cancel" type="button"
+              onclick="VireoColorLabels.closeEditor()">Cancel</button>
+      <button class="modal-btn modal-btn-primary" id="colorLabelDescriptionSave"
+              type="button" onclick="VireoColorLabels.saveEditor()">Save</button>
+    </div>
+  </div>
+</div>
+<script src="/static/vireo-color-labels.js"></script>
 <script>
 // Shared, cross-page handoff for the photo editor (/edit). State lives in
 // localStorage so it survives the full-page navigation into the editor:
@@ -2123,6 +2175,14 @@ function sendReport() {
         b.className = 'vireo-ctx-chip' + (c.active ? ' is-active' : '');
         b.textContent = c.label;
         if (c.title) b.title = c.title;
+        if (c.color) {
+          b.dataset.color = c.color;
+          b.setAttribute('data-color-label-control', '');
+          b.dataset.colorLabelBaseTitle = c.colorBaseTitle || c.color;
+          b.dataset.colorLabelBaseAria =
+            (c.colorBaseTitle || c.color) + ' label';
+          b.setAttribute('aria-label', b.dataset.colorLabelBaseAria);
+        }
         b.addEventListener('click', ev => {
           ev.stopPropagation();
           closeContextMenu();

@@ -3281,7 +3281,6 @@ class Database:
                                           = photo_keywords.photo_id
                                       AND other_pk.keyword_id
                                           <> photo_keywords.keyword_id
-                                      AND other_k.parent_id IS NULL
                                       AND other_k.name
                                           = 'Wildlife' COLLATE NOCASE
                                 )
@@ -3300,7 +3299,6 @@ class Database:
                                          = evidenced_pk.keyword_id
                                     WHERE evidenced_pk.photo_id
                                           = photo_keywords.photo_id
-                                      AND evidenced_k.parent_id IS NULL
                                       AND evidenced_k.name
                                           = 'Wildlife' COLLATE NOCASE
                                       AND (

@@ -14158,7 +14158,10 @@ def test_retire_builtin_wildlife_preserves_unsynced_manual_add(tmp_path):
     ]
 
 
-def test_retire_builtin_wildlife_scopes_pending_add_to_same_name_survivor(tmp_path):
+@pytest.mark.parametrize("nested_survivor", [False, True])
+def test_retire_builtin_wildlife_scopes_pending_add_to_same_name_survivor(
+    tmp_path, nested_survivor,
+):
     """A name-only pending add must not stamp every homonym as manual.
 
     The pending-change row does not carry a keyword ID. When a user adds an
@@ -14189,8 +14192,11 @@ def test_retire_builtin_wildlife_scopes_pending_add_to_same_name_survivor(tmp_pa
     genre_id = db.conn.execute(
         "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
     ).lastrowid
+    parent_id = db.add_keyword("Animals") if nested_survivor else None
     individual_id = db.conn.execute(
-        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'individual')"
+        """INSERT INTO keywords (name, type, parent_id)
+           VALUES ('Wildlife', 'individual', ?)""",
+        (parent_id,),
     ).lastrowid
     species_id = db.add_keyword("House Sparrow", is_species=True)
     db.tag_photo(p1, species_id)

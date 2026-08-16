@@ -293,6 +293,83 @@ def test_browse_init_focus_index_is_null_outside_scope(app_and_db):
     assert response.get_json()["focus_index"] is None
 
 
+def test_browse_init_focus_index_skips_ordered_scan_when_target_on_page(
+    app_and_db, monkeypatch
+):
+    """First-page deep links must not materialize every folder ID.
+
+    Materializing all IDs on the critical first-paint path adds
+    O(folder size) latency and memory to the common case (Codex
+    review r3792637103), so the endpoint should compute the index
+    from the fetched page whenever the target is already on it.
+    """
+    from db import Database
+
+    app, db = app_and_db
+    ordered_calls = []
+    original_get_photo_ids = Database.get_photo_ids
+
+    def spy(self, *args, **kwargs):
+        ordered_calls.append(kwargs)
+        return original_get_photo_ids(self, *args, **kwargs)
+
+    monkeypatch.setattr(Database, "get_photo_ids", spy)
+
+    target_id = db.get_photos()[0]["id"]
+    response = app.test_client().get(
+        f"/api/browse/init?focus_photo_id={target_id}&sort=date&per_page=50"
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["focus_index"] is not None
+    ids_in_order = [p["id"] for p in payload["photos"]]
+    assert payload["focus_index"] == ids_in_order.index(target_id)
+    assert ordered_calls == []
+
+
+def test_browse_init_focus_index_falls_back_when_target_off_page(
+    app_and_db, monkeypatch
+):
+    """When the target is past the fetched page, use the ordered scan."""
+    from db import Database
+
+    app, db = app_and_db
+    january = next(
+        folder for folder in db.get_folder_tree() if folder["name"] == "January"
+    )
+    baseline_id = db.get_photos(folder_id=january["id"])[0]["id"]
+    # Insert five photos earlier in the sort order so the baseline no
+    # longer fits on a per_page=1 first page.
+    for i in range(5):
+        db.add_photo(
+            folder_id=january["id"],
+            filename=f"aaa-earlier-{i:02d}.jpg",
+            extension=".jpg",
+            file_size=1000,
+            file_mtime=1,
+            timestamp=f"2023-01-0{i + 1}T00:00:00",
+        )
+
+    ordered_calls = []
+    original_get_photo_ids = Database.get_photo_ids
+
+    def spy(self, *args, **kwargs):
+        ordered_calls.append(kwargs)
+        return original_get_photo_ids(self, *args, **kwargs)
+
+    monkeypatch.setattr(Database, "get_photo_ids", spy)
+
+    response = app.test_client().get(
+        f"/api/browse/init?folder_id={january['id']}"
+        f"&focus_photo_id={baseline_id}&sort=date&per_page=1"
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["focus_index"] == 5
+    assert len(ordered_calls) == 1
+
+
 def test_dashboard_options_flags_degraded_collections(app_and_db):
     """Collections whose rules can't compile are flagged so the scope
     picker can disable them instead of 400ing /api/stats and /api/coverage."""

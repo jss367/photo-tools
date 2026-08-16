@@ -6003,21 +6003,37 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # bounded requests instead of probing serial 50-photo pages until
             # the target happens to appear.  Keep the extra ordered-id query
             # opt-in so ordinary Browse loads retain their existing cost.
+            #
+            # When the target is already in the first-page ``photos`` fetched
+            # above (the common case — Highlights and most native actions open
+            # a photo whose sorted position is on page 1), compute the index
+            # from that page directly.  Materializing every folder ID would
+            # add O(folder size) latency and memory to the critical first
+            # paint on the documented 100K- and 1M-photo libraries, even when
+            # a lookup was never necessary (Codex review r3792637103).
             focus_index = None
             if focus_photo_id is not None:
-                try:
-                    ordered_ids = db.get_photo_ids(
-                        folder_id=folder_id,
-                        collection_id=collection_id,
-                        sort=sort,
-                    )
-                except ValueError as exc:
-                    db.conn.rollback()
-                    return json_error(str(exc), 400)
-                try:
-                    focus_index = ordered_ids.index(focus_photo_id)
-                except ValueError:
-                    pass
+                local_index = None
+                for offset, row in enumerate(photos):
+                    if row["id"] == focus_photo_id:
+                        local_index = offset
+                        break
+                if local_index is not None:
+                    focus_index = (page - 1) * per_page + local_index
+                else:
+                    try:
+                        ordered_ids = db.get_photo_ids(
+                            folder_id=folder_id,
+                            collection_id=collection_id,
+                            sort=sort,
+                        )
+                    except ValueError as exc:
+                        db.conn.rollback()
+                        return json_error(str(exc), 400)
+                    try:
+                        focus_index = ordered_ids.index(focus_photo_id)
+                    except ValueError:
+                        pass
         folders = db.get_folder_tree()
         keywords = db.get_keyword_tree()
         collections = db.get_collections()

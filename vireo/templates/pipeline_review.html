@@ -4047,6 +4047,10 @@ function batchSetFlag(flag) {
   }
   var overlay = document.getElementById('grmOverlay');
   if (overlay && overlay.classList.contains('open') && grmState) {
+    if (grmState.applying) {
+      showToast('Group Review is applying changes — wait for it to finish', 'warning');
+      return Promise.resolve(false);
+    }
     var ids = _grmActionTargetIds();
     var overlapsBulkFlagWrite = ids.some(function(pid) {
       return pipelineReviewGroupFlagInFlightPhotoIds.has(pid);
@@ -4093,6 +4097,10 @@ function setPipelineReviewFlag(photoId, flag) {
   if (grmOverlay && grmOverlay.classList.contains('open') && grmState && grmState.items) {
     var inGroup = grmState.items.some(function(p) { return p.id === photoId; });
     if (inGroup) {
+      if (grmState.applying) {
+        showToast('Group Review is applying changes — wait for it to finish', 'warning');
+        return Promise.resolve(false);
+      }
       _grmMarkTouched(photoId);
       if (flag === 'flagged') {
         grmState.rejects.delete(photoId);
@@ -8364,6 +8372,20 @@ async function grmApply() {
 document.addEventListener('lightbox:photodeleted', function(e) {
   var photoId = Number(e && e.detail && e.detail.photoId);
   if (!Number.isFinite(photoId) || !pipelineResults) return;
+
+  pipelineReviewContextPhotoIds = pipelineReviewContextPhotoIds.filter(function(id) {
+    return id !== photoId;
+  });
+  if (Array.isArray(window._vireoNativeMenuPhotoIdsOverride)) {
+    window._vireoNativeMenuPhotoIdsOverride =
+      window._vireoNativeMenuPhotoIdsOverride.filter(function(id) {
+        return id !== photoId;
+      });
+    if (!window._vireoNativeMenuPhotoIdsOverride.length) {
+      window._vireoNativeMenuPhotoIdsOverride = null;
+    }
+  }
+  if (inspectPhotoId === photoId) closeInspect();
 
   pipelineResults.photos = (pipelineResults.photos || []).filter(function(photo) {
     return photo.id !== photoId;

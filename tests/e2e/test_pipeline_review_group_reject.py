@@ -1722,7 +1722,31 @@ def test_group_apply_freezes_controls_and_aborts_after_later_session_change(
         "stillOpen": True,
     }
 
-    page.evaluate("openGroupReview(0, 1)")
+    selected_id = page.evaluate(
+        """() => {
+          const selected = grmState.selected;
+          openPipelineLightbox(selected);
+          _lbApplyFlag(selected, 'flagged');
+          return selected;
+        }"""
+    )
+    page.wait_for_function("_lbFlagPendingWrites === 0")
+    late_lightbox_state = page.evaluate(
+        """pid => ({
+          picked: grmState.picks.has(pid),
+          rejected: grmState.rejects.has(pid),
+          directWrite: !!pipelineReviewDirectFlagWritesByPhoto[String(pid)],
+        })""",
+        selected_id,
+    )
+    assert late_lightbox_state == {
+        "picked": False,
+        "rejected": True,
+        "directWrite": False,
+    }
+    assert _flags(db, photo_ids) == ["none"] * 4
+
+    page.evaluate("closeLightbox(); openGroupReview(0, 1)")
     page.wait_for_function(
         "session => grmState.sessionId !== session && grmState.seeded === true",
         arg=original_session,
@@ -2040,6 +2064,10 @@ def test_lightbox_deletion_prunes_empty_encounter_from_summary(live_server, page
             bursts: [{photo_ids: [photoId]}],
           }];
           pipelineResults.summary = {total_photos: 1, encounter_count: 1, burst_count: 1};
+          pipelineReviewContextPhotoIds = [photoId];
+          window._vireoNativeMenuPhotoIdsOverride = [photoId];
+          inspectPhotoId = photoId;
+          document.getElementById('inspectOverlay').classList.add('open');
           document.dispatchEvent(new CustomEvent('lightbox:photodeleted', {
             detail: {photoId: photoId, result: {deleted: 1}},
           }));
@@ -2049,6 +2077,11 @@ def test_lightbox_deletion_prunes_empty_encounter_from_summary(live_server, page
             totalPhotos: pipelineResults.summary.total_photos,
             encounterCount: pipelineResults.summary.encounter_count,
             burstCount: pipelineResults.summary.burst_count,
+            contextIds: pipelineReviewContextPhotoIds.slice(),
+            nativeOverride: window._vireoNativeMenuPhotoIdsOverride,
+            inspectPhotoId: inspectPhotoId,
+            inspectOpen: document.getElementById('inspectOverlay').classList.contains('open'),
+            activeSelection: getActiveSelection(),
           };
         }""",
         photo_ids[0],
@@ -2059,6 +2092,11 @@ def test_lightbox_deletion_prunes_empty_encounter_from_summary(live_server, page
         "totalPhotos": 0,
         "encounterCount": 0,
         "burstCount": 0,
+        "contextIds": [],
+        "nativeOverride": None,
+        "inspectPhotoId": None,
+        "inspectOpen": False,
+        "activeSelection": [],
     }
 
 

@@ -251,6 +251,140 @@ def test_folder_tree_job_targeting_covering_root_updates_visible_badge(
     )
 
 
+def test_folder_tree_fallback_anchor_does_not_bleed_into_siblings(
+    live_server, page, tmp_path
+):
+    """A fallback anchor's status must not spread through unrelated siblings.
+
+    When a hidden local session is anchored to its nearest visible ancestor
+    (its own row was pruned because check_folder_health flipped the rebased
+    ``folders.path`` to missing), only the ancestor should carry LOCAL ISSUE
+    / SYNCING / REMOVING. Recursively applying the status through every
+    visible descendant would mislabel healthy remote siblings — the ancestor
+    still hosts other folders that aren't part of the affected subtree
+    (Codex review r3792031821).
+    """
+    db = live_server["db"]
+    source = tmp_path / "trip-with-siblings"
+    child_a = source / "kept-remote"
+    child_a.mkdir(parents=True)
+    (child_a / "a.jpg").write_bytes(b"a")
+    child_b = source / "also-remote"
+    child_b.mkdir(parents=True)
+    (child_b / "b.jpg").write_bytes(b"b")
+    workspace_id = db.create_workspace("Fallback Spread")
+    parent_id = db.add_folder(
+        str(source), name="trip-with-siblings", link_to_workspace=False
+    )
+    child_a_id = db.add_folder(
+        str(child_a), name="kept-remote", parent_id=parent_id,
+        link_to_workspace=False,
+    )
+    child_b_id = db.add_folder(
+        str(child_b), name="also-remote", parent_id=parent_id,
+        link_to_workspace=False,
+    )
+    db.add_workspace_folder(workspace_id, parent_id, is_root=True)
+    db.add_workspace_folder(workspace_id, child_a_id, is_root=False)
+    db.add_workspace_folder(workspace_id, child_b_id, is_root=False)
+
+    assert page.request.post(
+        f"{live_server['url']}/api/workspaces/{workspace_id}/activate"
+    ).ok
+    page.goto(f"{live_server['url']}/browse")
+
+    parent = page.locator(f'.tree-item[data-folder-id="{parent_id}"]')
+    parent.wait_for(state="visible")
+    parent.locator(".tree-toggle").click()
+    child_a_row = page.locator(f'.tree-item[data-folder-id="{child_a_id}"]')
+    child_b_row = page.locator(f'.tree-item[data-folder-id="{child_b_id}"]')
+    expect(child_a_row).to_be_visible()
+    expect(child_b_row).to_be_visible()
+
+    # Publish a fallback recovery entry: some hidden folder is in recovery,
+    # anchored to the visible parent (as workspace_status returns when the
+    # hidden folder's row was pruned as missing).
+    hidden_id = max(parent_id, child_a_id, child_b_id) + 100000
+    page.evaluate(
+        """([data]) => {
+          window.vireoLocalFolderData = data;
+          window.dispatchEvent(new CustomEvent(
+            'vireo:local-folder-status-changed', {detail: {data: data}}
+          ));
+        }""",
+        [{
+            "legacy_workspace_session": False,
+            "folders": [{
+                "requested_folder_id": hidden_id,
+                "root_folder_id": hidden_id,
+                "state": "recovery",
+                "recovery_kind": "sync",
+                "visible_ancestor_folder_id": parent_id,
+                "folder_name": "hidden-child",
+            }],
+            "jobs": [],
+        }],
+    )
+
+    expect(parent.locator(".folder-local-status")).to_have_text(
+        "LOCAL ISSUE", timeout=5000
+    )
+    # Siblings sharing the anchor stay untouched — no LOCAL ISSUE bleed.
+    expect(child_a_row.locator(".folder-local-status")).to_have_count(0)
+    expect(child_b_row.locator(".folder-local-status")).to_have_count(0)
+
+
+def test_folder_tree_synthesizes_row_for_top_level_missing_local_root(
+    live_server, page
+):
+    """A top-level missing local root gains a phantom tree row for its badge.
+
+    When the managed local copy of a top-level workspace root disappears,
+    ``/api/folders`` drops that row (its status flips to 'missing') and
+    ``visible_ancestor_folder_id`` is necessarily ``None`` — the fallback
+    renderer has nowhere to attach the LOCAL ISSUE badge, and without a
+    synthesized entry the recovery state vanishes exactly when the user
+    needs it. renderFolderTree has to inject a phantom top-level row using
+    the server-supplied ``folder_name`` (Codex review r3792031813).
+    """
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".tree-item[data-folder-id]").first.wait_for(state="visible")
+    existing_ids = page.evaluate(
+        "() => Array.from(document.querySelectorAll("
+        "'#folderTree .tree-item[data-folder-id]'))"
+        ".map(el => Number(el.dataset.folderId))"
+    )
+    phantom_id = (max(existing_ids) if existing_ids else 0) + 999_000
+
+    page.evaluate(
+        """([data]) => {
+          window.vireoLocalFolderData = data;
+          window.dispatchEvent(new CustomEvent(
+            'vireo:local-folder-status-changed', {detail: {data: data}}
+          ));
+        }""",
+        [{
+            "legacy_workspace_session": False,
+            "folders": [{
+                "requested_folder_id": phantom_id,
+                "root_folder_id": phantom_id,
+                "state": "recovery",
+                "recovery_kind": "stage",
+                "visible_ancestor_folder_id": None,
+                "folder_name": "unmounted-nas",
+            }],
+            "jobs": [],
+        }],
+    )
+
+    phantom_row = page.locator(f'.tree-item[data-folder-id="{phantom_id}"]')
+    expect(phantom_row).to_be_visible(timeout=5000)
+    expect(phantom_row.locator(".folder-name")).to_have_text("unmounted-nas")
+    expect(phantom_row.locator(".folder-local-status")).to_have_text(
+        "LOCAL ISSUE"
+    )
+
+
 def test_folder_tree_filter_by_folder_fires_filter(live_server, page):
     """Clicking 'Filter by this folder' sets activeFolderId to that folder."""
     url = live_server["url"]

@@ -3360,13 +3360,27 @@ async function loadFolders(opts) {
 }
 
 function renderFolderTree(folders) {
-  browseFolderRows = folders.slice();
+  var rows = folders.slice();
   var byParent = {};
-  folders.forEach(function(f) {
+  rows.forEach(function(f) {
     var pid = f.parent_id || 'root';
     if (!byParent[pid]) byParent[pid] = [];
     byParent[pid].push(f);
   });
+
+  // Ask folderLocalStatuses for any phantom top-level rows it had to
+  // synthesize because a missing local root has no visible ancestor. These
+  // rows carry the LOCAL ISSUE / SYNCING badge for a folder /api/folders no
+  // longer returns; without injecting them the badge has nowhere to
+  // render.
+  var statusResult = folderLocalStatuses(rows, byParent, {wantsSynthetic: true});
+  (statusResult.synthetic || []).forEach(function(row) {
+    if (rows.some(function(f) { return Number(f.id) === Number(row.id); })) return;
+    rows.push(row);
+    if (!byParent['root']) byParent['root'] = [];
+    byParent['root'].push(row);
+  });
+  browseFolderRows = rows;
 
   // Single post-order pass: each subtree's rollup is computed once and cached.
   // (Per-node recomputation during render would be O(n^2) on deep trees.)
@@ -3378,7 +3392,7 @@ function renderFolderTree(folders) {
     return total;
   }
   (byParent['root'] || []).forEach(computeRollup);
-  var localStatuses = folderLocalStatuses(folders, byParent);
+  var localStatuses = statusResult.statuses;
 
   function buildTree(parentId, depth) {
     var children = byParent[parentId] || [];
@@ -3409,9 +3423,12 @@ function renderFolderTree(folders) {
   document.getElementById('folderTree').innerHTML = buildTree('root', 0);
 }
 
-function folderLocalStatuses(folders, byParent) {
+function folderLocalStatuses(folders, byParent, options) {
+  var wantsSynthetic = !!(options && options.wantsSynthetic);
   var localData = window.vireoLocalFolderData;
-  if (!localData || localData.legacy_workspace_session) return {};
+  if (!localData || localData.legacy_workspace_session) {
+    return wantsSynthetic ? {statuses: {}, synthetic: []} : {};
+  }
 
   var rowsById = {};
   folders.forEach(function(folder) { rowsById[Number(folder.id)] = folder; });
@@ -3420,13 +3437,34 @@ function folderLocalStatuses(folders, byParent) {
   // visible workspace folder may be covered by a shared ancestor whose
   // root_folder_id isn't itself in this workspace's tree. Map each covering
   // root back to the visible requested_folder_id(s) so sync/discard badges
-  // update instead of freezing on LOCAL.
+  // update instead of freezing on LOCAL. Each entry carries ``fallback``
+  // so job status can inherit whether the visible id is the covering root
+  // itself (direct — spread through the subtree) or a fallback anchor
+  // standing in for a hidden session (do not spread).
   var visibleIdsByRoot = {};
+  var syntheticRoots = [];
+  var syntheticIds = {};
+
+  function recordMapping(rootId, visibleId, isFallback) {
+    if (!rootId) return;
+    if (!visibleIdsByRoot[rootId]) visibleIdsByRoot[rootId] = [];
+    for (var i = 0; i < visibleIdsByRoot[rootId].length; i++) {
+      if (visibleIdsByRoot[rootId][i].visibleId === visibleId) {
+        // A direct match on this visible id trumps a fallback mapping: a
+        // job on the covering root then propagates to the folder's own
+        // subtree instead of stopping at the fallback anchor.
+        if (!isFallback) visibleIdsByRoot[rootId][i].fallback = false;
+        return;
+      }
+    }
+    visibleIdsByRoot[rootId].push({visibleId: visibleId, fallback: isFallback});
+  }
 
   (localData.folders || []).forEach(function(item) {
     if (!item) return;
     var requestedId = Number(item.requested_folder_id || item.root_folder_id);
     var visibleId = requestedId;
+    var isFallback = false;
     if (!rowsById[visibleId]) {
       // The requested folder isn't in the tree — commonly because
       // check_folder_health flipped its rebased folders.path to 'missing'
@@ -3436,16 +3474,37 @@ function folderLocalStatuses(folders, byParent) {
       // attention. Fall back to the nearest visible ancestor so the
       // status surfaces on the enclosing folder instead.
       var ancestorId = Number(item.visible_ancestor_folder_id || 0);
-      if (!ancestorId || !rowsById[ancestorId]) return;
-      visibleId = ancestorId;
-    }
-    var rootId = Number(item.root_folder_id || requestedId);
-    if (rootId) {
-      if (!visibleIdsByRoot[rootId]) visibleIdsByRoot[rootId] = [];
-      if (visibleIdsByRoot[rootId].indexOf(visibleId) === -1) {
-        visibleIdsByRoot[rootId].push(visibleId);
+      if (ancestorId && rowsById[ancestorId]) {
+        visibleId = ancestorId;
+        isFallback = true;
+      } else {
+        // A top-level workspace root that has gone missing has no
+        // visible ancestor to attach the badge to. Without a synthesized
+        // entry the recovery state disappears entirely — the user loses
+        // the only signal that their local copy needs attention. Emit a
+        // phantom top-level row so renderFolderTree can inject a
+        // ``.tree-item`` that carries the LOCAL ISSUE / SYNCING badge
+        // (Codex review r3792031813).
+        if (!syntheticIds[requestedId]) {
+          syntheticIds[requestedId] = true;
+          var syntheticName = String(item.folder_name || '').trim() ||
+            'Missing local folder';
+          var syntheticRow = {
+            id: requestedId,
+            parent_id: null,
+            name: syntheticName,
+            photo_count: 0,
+            status: 'missing',
+            __synthetic_missing_local: true
+          };
+          syntheticRoots.push(syntheticRow);
+          rowsById[requestedId] = syntheticRow;
+        }
+        visibleId = requestedId;
       }
     }
+    var rootId = Number(item.root_folder_id || requestedId);
+    recordMapping(rootId, visibleId, isFallback);
     if (item.state === 'remote') return;
     var changes = item.changes || {};
     var changeCount = Number(changes.created || 0) +
@@ -3456,7 +3515,8 @@ function folderLocalStatuses(folders, byParent) {
         label: 'LOCAL ISSUE',
         description: item.recovery_kind === 'sync'
           ? 'Local sync needs attention'
-          : 'Local copy needs attention'
+          : 'Local copy needs attention',
+        fallback: isFallback
       };
       return;
     }
@@ -3465,7 +3525,8 @@ function folderLocalStatuses(folders, byParent) {
       label: item.state === 'staging' ? 'COPYING' : 'LOCAL',
       description: changeCount
         ? 'Working locally · ' + changeCount + ' unsynced change' + (changeCount === 1 ? '' : 's')
-        : 'Working locally'
+        : 'Working locally',
+      fallback: isFallback
     };
   });
 
@@ -3479,15 +3540,22 @@ function folderLocalStatuses(folders, byParent) {
     (job.folder_ids || []).forEach(function(rawId) {
       var id = Number(rawId);
       var targets = [];
-      if (rowsById[id]) targets.push(id);
-      (visibleIdsByRoot[id] || []).forEach(function(visibleId) {
-        if (targets.indexOf(visibleId) === -1) targets.push(visibleId);
+      if (rowsById[id]) targets.push({visibleId: id, fallback: false});
+      (visibleIdsByRoot[id] || []).forEach(function(mapping) {
+        for (var ti = 0; ti < targets.length; ti++) {
+          if (targets[ti].visibleId === mapping.visibleId) {
+            if (!mapping.fallback) targets[ti].fallback = false;
+            return;
+          }
+        }
+        targets.push({visibleId: mapping.visibleId, fallback: mapping.fallback});
       });
-      targets.forEach(function(targetId) {
-        direct[targetId] = {
+      targets.forEach(function(target) {
+        direct[target.visibleId] = {
           kind: 'updating',
           label: jobStatus[0],
-          description: jobStatus[1]
+          description: jobStatus[1],
+          fallback: target.fallback
         };
       });
     });
@@ -3496,6 +3564,11 @@ function folderLocalStatuses(folders, byParent) {
   var result = {};
   function markDescendants(folderId, status) {
     result[folderId] = status;
+    // Fallback anchors represent a hidden subtree that could not be
+    // shown. Propagating the anchor's status through unrelated visible
+    // siblings would mislabel healthy remote folders as LOCAL ISSUE /
+    // SYNCING / REMOVING (Codex review r3792031821).
+    if (status && status.fallback) return;
     (byParent[folderId] || []).forEach(function(child) {
       markDescendants(Number(child.id), status);
     });
@@ -3521,6 +3594,9 @@ function folderLocalStatuses(folders, byParent) {
       parentId = current ? current.parent_id : null;
     }
   });
+  if (wantsSynthetic) {
+    return {statuses: result, synthetic: syntheticRoots};
+  }
   return result;
 }
 
@@ -3540,7 +3616,23 @@ function refreshFolderLocalStatusIndicators() {
     if (!byParent[parentId]) byParent[parentId] = [];
     byParent[parentId].push(folder);
   });
-  var statuses = folderLocalStatuses(browseFolderRows, byParent);
+  var statusResult = folderLocalStatuses(
+    browseFolderRows, byParent, {wantsSynthetic: true}
+  );
+  // If synthesis produced a row that isn't already in browseFolderRows,
+  // the DOM has no ``.tree-item`` slot to update — a slot-only refresh
+  // would silently drop the LOCAL ISSUE badge for a newly missing local
+  // root. Fall back to a full re-render so the phantom row is injected.
+  var needsFullRender = (statusResult.synthetic || []).some(function(row) {
+    return !browseFolderRows.some(function(f) {
+      return Number(f.id) === Number(row.id);
+    });
+  });
+  if (needsFullRender) {
+    renderFolderTree(browseFolderRows.slice());
+    return;
+  }
+  var statuses = statusResult.statuses;
   document.querySelectorAll('#folderTree .tree-item[data-folder-id]').forEach(function(row) {
     var slot = row.querySelector('.folder-local-status-slot');
     if (slot) slot.innerHTML = folderLocalStatusMarkup(statuses[Number(row.dataset.folderId)]);

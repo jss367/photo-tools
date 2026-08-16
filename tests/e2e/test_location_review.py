@@ -964,6 +964,133 @@ def test_location_review_partial_assignment_survives_photodeleted_event(
     assert third_chunk_ids == list(range(1001, 1501))
 
 
+def test_location_review_partial_assignment_survives_completed_prefix_delete(
+    live_server, page,
+):
+    """A photodeleted event for an already-committed photo mustn't shift the retry offset.
+
+    If lightbox:photodeleted removes a photo from the already-committed
+    prefix of group.photo_ids, the surviving IDs slide left. If the retry
+    loop slices group.photo_ids at the stale offset, the first
+    still-unassigned photo would be skipped and the group silently marked
+    completed. Assignment must slice from an immutable snapshot instead.
+    """
+    photo_id = live_server["data"]["photos"][0]
+    photo_ids = list(range(1, 1501))
+    preview = {
+        "total": 1500,
+        "reviewable": 1500,
+        "unresolved": [],
+        "skipped": [],
+        "groups": [
+            {
+                "photo_ids": photo_ids,
+                "photos": [
+                    {
+                        "id": photo_id,
+                        "filename": "keep.jpg",
+                        "latitude": 33.255,
+                        "longitude": -116.405,
+                        "timestamp": "2026-08-04T10:17:00",
+                    },
+                ],
+                "count": 1500,
+                "center": {"lat": 33.255, "lng": -116.405},
+                "bounds": {
+                    "south": 33.255, "west": -116.405,
+                    "north": 33.255, "east": -116.405,
+                },
+                "spread_m": 0,
+                "captured_from": "2026-08-04T10:17:00",
+                "captured_to": "2026-08-04T10:17:00",
+            },
+        ],
+    }
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.route(
+        "**/api/location-review/preview",
+        lambda route: route.fulfill(json=preview),
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("1,500 photos")
+
+    page.locator("#locationReviewSearch").fill("Prefix delete location")
+    page.locator("#locationReviewCustom").click()
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetch = window.safeFetch;
+          window.__pending = [];
+          window.__requestBodies = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__originalSafeFetch(url, opts, options);
+            }
+            window.__requestBodies.push(JSON.parse(opts.body));
+            return new Promise(function(resolve, reject) {
+              window.__pending.push({resolve: resolve, reject: reject});
+            });
+          };
+          window.__settle = function(result) {
+            var pending = window.__pending.shift();
+            if (result === 'reject') pending.reject(new Error('boom'));
+            else pending.resolve({ok: true, updated: result});
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(1000)")  # first chunk commits
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle('reject')")  # second chunk fails
+
+    expect(page.locator("#locationReviewAssign")).to_contain_text(
+        "Retry 500 remaining"
+    )
+    assert page.evaluate("window.__requestBodies.length") == 2
+
+    # Simulate a photodeleted event for a photo in the already-committed
+    # prefix (ID 500 was in the first chunk, indices 0..999). Before the
+    # snapshot fix, the delete handler's filter left group.photo_ids with
+    # 1499 elements and shifted IDs 501..1500 down to indices 500..1498;
+    # retry would then slice from offset 1000, sending IDs 1002..1500 and
+    # silently skipping ID 1001.
+    page.evaluate(
+        "document.dispatchEvent(new CustomEvent('lightbox:photodeleted',"
+        " {detail: {photoId: 500}}))"
+    )
+
+    # Navigation must stay locked — partial state is still pending.
+    expect(page.locator("#locationReviewSkip")).to_be_disabled()
+    expect(page.locator("#locationReviewNext")).to_be_disabled()
+    expect(page.locator("#locationReviewPrevious")).to_be_disabled()
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(500)")
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text(
+        "All locations reviewed"
+    )
+    request_lengths = page.evaluate(
+        "window.__requestBodies.map(function(body) { return body.photo_ids.length; })"
+    )
+    assert request_lengths == [1000, 500, 500], (
+        f"Retry should resume from offset 1000 with 500 IDs, got chunks {request_lengths}"
+    )
+    third_chunk_ids = page.evaluate("window.__requestBodies[2].photo_ids")
+    assert third_chunk_ids == list(range(1001, 1501)), (
+        "Retry chunk must contain the original pending IDs (1001..1500) — "
+        "the completed-prefix delete must not shift the snapshot."
+    )
+
+
 def test_location_review_missing_google_key_links_to_settings(live_server, page):
     """The empty suggestion state explains how to enable nearby places."""
     photo_id = live_server["data"]["photos"][0]

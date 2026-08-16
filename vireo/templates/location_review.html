@@ -1481,11 +1481,24 @@ body {
     }
     var button = document.getElementById('locationReviewAssign');
     var choiceKey = candidateKey(choice);
-    var total = group.photo_ids.length;
     if (!state.assignment || state.assignment.group !== group || state.assignment.choiceKey !== choiceKey) {
-      state.assignment = {group: group, choiceKey: choiceKey, completed: 0, total: total};
+      // Snapshot photo_ids so a mid-partial lightbox:photodeleted that
+      // splices group.photo_ids cannot shift the retry offset — if a photo
+      // in the already-committed prefix were removed, the surviving IDs
+      // slide left and offset=completed would slice past what should be
+      // the next unassigned photo, silently marking the group done.
+      var snapshotIds = group.photo_ids.slice();
+      state.assignment = {
+        group: group,
+        choiceKey: choiceKey,
+        completed: 0,
+        total: snapshotIds.length,
+        photoIds: snapshotIds,
+      };
     }
     var assignment = state.assignment;
+    var total = assignment.total;
+    var photoIds = assignment.photoIds;
     state.isAssigning = true;
     setAssignmentNavigationDisabled(true);
     button.disabled = true;
@@ -1494,7 +1507,7 @@ body {
     try {
       if (choice.kind === 'google') choice = await hydrateGoogleChoice(choice);
       for (var offset = assignment.completed; offset < total; offset += 1000) {
-        var chunk = group.photo_ids.slice(offset, offset + 1000);
+        var chunk = photoIds.slice(offset, offset + 1000);
         var endpoint = '/api/batch/location';
         var body = {photo_ids: chunk};
         if (choice.kind === 'keyword') body.keyword_id = choice.keyword_id;
@@ -1513,7 +1526,7 @@ body {
         assignment.completed = offset + chunk.length;
         updateAssignmentProgress(assignment.completed, total);
       }
-      showToast('Assigned “' + choice.name + '” to ' + formatNumber(group.count) + (group.count === 1 ? ' photo' : ' photos'), 'success');
+      showToast('Assigned “' + choice.name + '” to ' + formatNumber(total) + (total === 1 ? ' photo' : ' photos'), 'success');
       state.assignment = null;
       state.isAssigning = false;
       state.groups.splice(state.currentIndex, 1);

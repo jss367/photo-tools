@@ -564,8 +564,9 @@ class Database:
         # above.
         self.ensure_default_genre_keywords()
         # Retire the old automatically-attached Wildlife genre. The migration
-        # is idempotent and keeps the keyword row itself as an orphan so old
-        # edit-history ids and user-created hierarchy children remain valid.
+        # is idempotent and preserves the keyword row so old edit-history ids,
+        # manual associations, and user-created hierarchy children remain
+        # valid.
         self.retire_builtin_wildlife_genre()
         # Idempotent, one-shot: seed species_highlights from legacy
         # photo_preferences rows with purpose='highlights' so upgraded
@@ -3142,13 +3143,15 @@ class Database:
         removal action. Wildlife-processing eligibility now lives solely in
         ``photos.wildlife_excluded``.
 
-        Direct associations are removed and a flat-only sidecar removal is
-        queued. Flat-only is important: a user may have a real hierarchy such
-        as ``Wildlife|Birds|House Sparrow``; retiring the generated flat term
-        must not delete that hierarchy. A not-yet-synced pending add is simply
-        cancelled. The keyword row is deliberately retained as an unused
-        orphan so edit-history ids and any user-created children remain valid;
-        workspace keyword queries only expose rows reachable from photos.
+        Associations are retired only from photos that also carry a taxonomy
+        or legacy-species keyword, which is the shape the old automatic rule
+        produced. A Wildlife genre on a photo without species metadata may be
+        user-authored and is preserved. For retired associations a flat-only
+        sidecar removal is queued. Flat-only is important: a user may have a
+        real hierarchy such as ``Wildlife|Birds|House Sparrow``; retiring the
+        generated flat term must not delete that hierarchy. A not-yet-synced
+        pending add is simply cancelled. The keyword row is retained so edit
+        history, manual associations, and user-created children remain valid.
         """
         if (
             not force
@@ -3180,6 +3183,15 @@ class Database:
                 JOIN photos p ON p.id = pk.photo_id
                 LEFT JOIN workspace_folders wf ON wf.folder_id = p.folder_id
                 WHERE pk.keyword_id IN ({placeholders})
+                  AND EXISTS (
+                      SELECT 1
+                      FROM photo_keywords species_pk
+                      JOIN keywords species_k
+                        ON species_k.id = species_pk.keyword_id
+                      WHERE species_pk.photo_id = pk.photo_id
+                        AND (species_k.type = 'taxonomy'
+                             OR species_k.is_species = 1)
+                  )
                 GROUP BY pk.photo_id""",
             [fallback_workspace, *keyword_ids],
         ).fetchall()
@@ -3214,10 +3226,14 @@ class Database:
                         _commit=False,
                     )
 
-        if keyword_ids:
+        retired_photo_ids = [row["photo_id"] for row in associations]
+        if retired_photo_ids:
+            photo_placeholders = ",".join("?" for _ in retired_photo_ids)
             self.conn.execute(
-                f"DELETE FROM photo_keywords WHERE keyword_id IN ({placeholders})",
-                keyword_ids,
+                f"""DELETE FROM photo_keywords
+                    WHERE keyword_id IN ({placeholders})
+                      AND photo_id IN ({photo_placeholders})""",
+                [*keyword_ids, *retired_photo_ids],
             )
         self.set_meta(
             self._RETIRED_WILDLIFE_GENRE_KEY, "1", _commit=False,

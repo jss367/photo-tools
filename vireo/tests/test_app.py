@@ -8860,6 +8860,8 @@ def test_create_app_retires_builtin_wildlife_synchronously(tmp_path, monkeypatch
     wildlife_id = db.conn.execute(
         "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
     ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(photo_id, species_id)
     db.conn.execute(
         "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
         (photo_id, wildlife_id),

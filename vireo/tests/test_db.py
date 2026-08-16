@@ -13954,6 +13954,8 @@ def test_retire_builtin_wildlife_detaches_associations_and_queues_flat_removal(t
     wildlife_id = db.conn.execute(
         "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
     ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
     db.conn.execute(
         "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
         (p1, wildlife_id),
@@ -13980,6 +13982,54 @@ def test_retire_builtin_wildlife_detaches_associations_and_queues_flat_removal(t
     ).fetchone() is not None
 
 
+def test_retire_builtin_wildlife_preserves_manual_tag_during_mixed_cleanup(tmp_path):
+    """A standalone Wildlife genre may be user-authored metadata."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    p2 = db.add_photo(
+        folder_id=fid, filename="p2.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p2, species_id)
+    db.conn.executemany(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        [(p1, wildlife_id), (p2, wildlife_id)],
+    )
+    db.queue_change(p1, "keyword_add", "Wildlife", _commit=False)
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p2, wildlife_id),
+    ).fetchone() is None
+    pending = db.conn.execute(
+        """SELECT change_type, value FROM pending_changes
+           WHERE photo_id = ?""",
+        (p1,),
+    ).fetchall()
+    assert [(row["change_type"], row["value"]) for row in pending] == [
+        ("keyword_add", "Wildlife"),
+    ]
+
+
 def test_retire_builtin_wildlife_cancels_unsynced_add(tmp_path):
     """An unsynced generated add is cancelled instead of followed by remove."""
     from db import Database
@@ -13993,6 +14043,8 @@ def test_retire_builtin_wildlife_cancels_unsynced_add(tmp_path):
     wildlife_id = db.conn.execute(
         "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
     ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
     db.conn.execute(
         "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
         (p1, wildlife_id),
@@ -14445,7 +14497,7 @@ def test_migrate_default_subject_collection_covers_all_workspaces(tmp_path):
 
 
 def test_retire_builtin_wildlife_preserves_keyword_children(tmp_path):
-    """The cleanup keeps the orphan row so user hierarchy ids stay valid."""
+    """The cleanup keeps the keyword row so user hierarchy ids stay valid."""
     from db import Database
     db = Database(str(tmp_path / "test.db"))
     ws = db.create_workspace("ws")
@@ -14458,6 +14510,8 @@ def test_retire_builtin_wildlife_preserves_keyword_children(tmp_path):
         "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
     ).lastrowid
     child_id = db.add_keyword("Birds", parent_id=wildlife_id)
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
     db.conn.execute(
         "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
         (p1, wildlife_id),

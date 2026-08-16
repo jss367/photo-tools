@@ -5629,8 +5629,12 @@ def test_import_pause_waits_for_tag_transaction_to_commit(
 
     original_tag_photo = Database.tag_photo
 
-    def pause_after_uncommitted_tag(self, tagged_photo_id, keyword_id, _commit=True):
-        original_tag_photo(self, tagged_photo_id, keyword_id, _commit=_commit)
+    def pause_after_uncommitted_tag(
+        self, tagged_photo_id, keyword_id, source=None, _commit=True,
+    ):
+        original_tag_photo(
+            self, tagged_photo_id, keyword_id, source=source, _commit=_commit,
+        )
         if not pause_requested.is_set():
             job_id = next(
                 job_id for job_id, job in runner._jobs.items()

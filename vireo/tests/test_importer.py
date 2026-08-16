@@ -161,6 +161,14 @@ def test_execute_import_populates_db(tmp_path):
         kws = db.get_photo_keywords(photos[0]['id'])
         kw_names = {k['name'] for k in kws}
         assert 'Cardinal' in kw_names
+        cardinal_source = db.conn.execute(
+            """SELECT pk.source
+               FROM photo_keywords pk
+               JOIN keywords k ON k.id = pk.keyword_id
+               WHERE pk.photo_id = ? AND k.name = 'Cardinal'""",
+            (photos[0]['id'],),
+        ).fetchone()
+        assert cardinal_source["source"] == "manual"
 
 
 def test_execute_import_skips_empty_normalized_keywords(tmp_path):

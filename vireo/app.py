@@ -334,6 +334,45 @@ def _sync_preview_flag_label(value):
     }.get(value, str(value))
 
 
+def _discard_history_items(db, changes):
+    """Build durable discard history without conflating keyword homonyms."""
+    items = []
+    for change in changes:
+        discarded_keyword_id = ""
+        if change["change_type"] == "keyword_add":
+            associations = db.conn.execute(
+                """SELECT pk.keyword_id, pk.source,
+                          EXISTS (
+                              SELECT 1
+                              FROM edit_history_items item
+                              JOIN edit_history edit ON edit.id = item.edit_id
+                              WHERE item.photo_id = pk.photo_id
+                                AND edit.action_type = 'keyword_add'
+                                AND edit.undone = 0
+                                AND item.new_value = CAST(pk.keyword_id AS TEXT)
+                          ) AS has_exact_history
+                   FROM photo_keywords pk
+                   JOIN keywords k ON k.id = pk.keyword_id
+                   WHERE pk.photo_id = ?
+                     AND k.name = ? COLLATE NOCASE""",
+                (change["photo_id"], change["value"]),
+            ).fetchall()
+            evidenced = [
+                row for row in associations
+                if row["source"] == "manual" or row["has_exact_history"]
+            ]
+            if len(associations) == 1:
+                discarded_keyword_id = str(associations[0]["keyword_id"])
+            elif len(evidenced) == 1:
+                discarded_keyword_id = str(evidenced[0]["keyword_id"])
+        items.append({
+            "photo_id": change["photo_id"],
+            "old_value": f'{change["change_type"]}:{change["value"]}',
+            "new_value": discarded_keyword_id,
+        })
+    return items
+
+
 def _sync_preview_presentation(
     change, metadata, *, assigned_location=None, write_locations=False,
     sidecar_will_exist=False, sync_flags=False, paired_keyword_rename=False,
@@ -4986,6 +5025,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     # tags or stale XMP. The method is idempotent (db_meta-gated) so
     # subsequent boots are a cheap SELECT.
     init_db.normalize_keyword_data()
+    retired_wildlife = init_db.retire_builtin_wildlife_genre()
+    if retired_wildlife:
+        log.info(
+            "Retired the built-in Wildlife genre from %d photo(s)",
+            retired_wildlife,
+        )
     repaired_location_ancestors = init_db.repair_misclassified_location_ancestors()
     if repaired_location_ancestors:
         log.info(
@@ -5153,31 +5198,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         cfg.migrate_default_strategy_to_process_id(init_db)
     init_db.create_default_collections_for_all_workspaces()
 
-    # Wildlife backfill timing:
-    # - Subsequent boots: marker is set, nothing to do, fast.
-    # - First boot after upgrade (marker unset): run species marking +
-    #   backfill SYNCHRONOUSLY before accepting requests. Otherwise a
-    #   user could remove Wildlife from a species-tagged photo during
-    #   the few-second window before the background thread completes,
-    #   and the backfill would silently re-add it (clobbering user
-    #   intent before the marker gets set).
-    # - mark_species runs in the background regardless, to catch new
-    #   species keywords added between boots. The backfill won't re-run
-    #   from the background path (marker check inside backfill).
+    # Keep taxonomy typing and duplicate-species repair fresh in the
+    # background. Wildlife classification eligibility is stored separately
+    # on photos; species marking no longer materializes a Wildlife keyword.
     import threading
 
-    from db import Database as _Database  # avoid shadowing in nested fn
-
-    _WILDLIFE_BACKFILL_DONE_KEY = _Database._WILDLIFE_BACKFILL_DONE_KEY
-
-    def _mark_species_and_maybe_backfill(db, log_label):
-        """Load taxonomy, mark species keywords, and run the one-shot
-        Wildlife backfill. Returns silently on any failure so callers
-        can choose between sync (block startup) and async (log only)."""
+    def _mark_species_and_repair(db, log_label):
+        """Load taxonomy, mark species keywords, and repair duplicates."""
         tax = _load_startup_taxonomy()
         if tax is None:
-            # No taxonomy yet — leave the marker unset so the backfill
-            # retries on a future boot once taxonomy is downloaded.
             log.debug("[%s] taxonomy not loaded; deferring species marking", log_label)
             return
         try:
@@ -5195,22 +5224,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             log.debug(
                 "[%s] species marking/repair failed", log_label, exc_info=True,
             )
-            return
-        try:
-            db.backfill_wildlife_genre()
-        except Exception:
-            log.debug("[%s] backfill_wildlife_genre failed", log_label, exc_info=True)
-
-    if init_db.get_meta(_WILDLIFE_BACKFILL_DONE_KEY) != "1":
-        # First boot after upgrade. Block startup until the one-shot
-        # backfill completes so concurrent user edits in that window
-        # can't be overwritten.
-        log.info("Wildlife backfill marker unset; running species marking "
-                 "+ backfill synchronously before serving requests")
-        _t1 = time.time()
-        _mark_species_and_maybe_backfill(init_db, "sync-startup")
-        log.info("Synchronous species marking + backfill took %.2fs",
-                 time.time() - _t1)
 
     def _mark_species():
         bg_db = None
@@ -5220,7 +5233,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             log.debug("Could not open background db for species marking", exc_info=True)
             return
         try:
-            _mark_species_and_maybe_backfill(bg_db, "background")
+            _mark_species_and_repair(bg_db, "background")
         finally:
             bg_db.close()
 
@@ -8467,6 +8480,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             photo_id, "keyword_remove", keyword_name,
             workspace_id=workspace_id, _commit=_commit,
         )
+        # A migration-generated flat removal is obsolete as soon as the user
+        # explicitly re-adds that term. Clear it across every workspace that
+        # owns the shared sidecar; otherwise "Use XMP" can filter the term
+        # out and detach this fresh association before the add is written.
+        db.clear_equivalent_flat_removals(
+            [{
+                "photo_id": photo_id,
+                "change_type": "keyword_remove_flat",
+                "value": keyword_name,
+            }],
+            _commit=_commit,
+        )
         if removed == 0:
             db.queue_change(
                 photo_id, "keyword_add", keyword_name,
@@ -9248,7 +9273,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     ).fetchone()
                     if exists is not None:
                         continue
-                    thread_db.tag_photo(photo_id, keyword_id, _commit=False)
+                    thread_db.tag_photo(
+                        photo_id, keyword_id, source="manual", _commit=False,
+                    )
                     _queue_import_keyword_add(
                         thread_db, photo_id, keyword_name, workspace_id,
                     )
@@ -9973,7 +10000,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         ).fetchone() is not None
         if already_tagged:
             return jsonify({"ok": True, "keyword_id": kid})
-        db.tag_photo(photo_id, kid)
+        # source='manual': a person clicked Add. Stamping the association
+        # itself keeps authorship recoverable after _prune_edit_history()
+        # drops the keyword_add entry recorded just below.
+        db.tag_photo(photo_id, kid, source='manual')
         _queue_keyword_add(photo_id, name)
         db.record_edit('keyword_add', f'Added keyword "{name}"', str(kid),
                        [{'photo_id': photo_id, 'old_value': '', 'new_value': str(kid)}])
@@ -10080,6 +10110,80 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "selected_count": selected_count,
             "keywords": keywords,
             "suggestions": suggestions,
+        })
+
+    @app.route("/api/selection/wildlife-state", methods=["POST"])
+    def api_selection_wildlife_state():
+        """Aggregate wildlife_excluded state across the full selection.
+
+        The browse panel may hold IDs that are not yet loaded into the
+        client-side grid (e.g. after "Select all matching"), so the counts
+        must be derived server-side or the batch include/exclude controls
+        would silently omit off-page photos and hide the buttons that
+        should still be available for them.
+
+        Any submitted IDs that are missing or outside the active workspace
+        are reported as ``missing_count`` so the panel can surface an
+        incomplete selection instead of implying the counts cover
+        everything the user picked. Without that signal the state endpoint
+        and the batch endpoint disagree on what "the selection" means and
+        the panel can show actions for a subset that then fail when
+        applied to the full list.
+        """
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        raw_ids = body.get("photo_ids", [])
+        if not isinstance(raw_ids, list):
+            return json_error("photo_ids required")
+
+        photo_ids = []
+        seen = set()
+        for raw in raw_ids:
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                return json_error("photo_ids must be integers")
+            if raw not in seen:
+                photo_ids.append(raw)
+                seen.add(raw)
+        if not photo_ids:
+            return jsonify({
+                "requested_count": 0,
+                "selected_count": 0,
+                "included_count": 0,
+                "excluded_count": 0,
+                "missing_count": 0,
+            })
+
+        ws_id = db._ws_id()
+        included = 0
+        excluded = 0
+        batch_size = 800
+        for i in range(0, len(photo_ids), batch_size):
+            chunk = photo_ids[i:i + batch_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = db.conn.execute(
+                f"""SELECT COALESCE(p.wildlife_excluded, 0) AS excluded
+                    FROM photos p
+                    WHERE p.id IN ({placeholders})
+                      AND EXISTS (
+                          SELECT 1 FROM workspace_folders wf
+                          WHERE wf.folder_id = p.folder_id
+                            AND wf.workspace_id = ?
+                      )""",
+                [*chunk, ws_id],
+            ).fetchall()
+            for row in rows:
+                if row["excluded"]:
+                    excluded += 1
+                else:
+                    included += 1
+
+        accessible = included + excluded
+        return jsonify({
+            "requested_count": len(photo_ids),
+            "selected_count": accessible,
+            "included_count": included,
+            "excluded_count": excluded,
+            "missing_count": len(photo_ids) - accessible,
         })
 
     @app.route("/api/keywords/<int:keyword_id>", methods=["PUT"])
@@ -11252,13 +11356,112 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         added_ids = [pid for pid in photo_ids if pid not in already_tagged]
 
         for pid in added_ids:
-            db.tag_photo(pid, kid)
+            # See api_add_keyword: an explicit user action stamps durable
+            # provenance so pruned edit history cannot orphan authorship.
+            db.tag_photo(pid, kid, source='manual')
             _queue_keyword_add(pid, name)
         items = [{'photo_id': pid, 'old_value': '', 'new_value': str(kid)} for pid in added_ids]
         if items:
             db.record_edit('keyword_add', f'Added "{name}" to {len(added_ids)} photos',
                            str(kid), items, is_batch=True)
         return jsonify({"ok": True, "updated": len(added_ids)})
+
+    @app.route("/api/batch/wildlife-excluded", methods=["POST"])
+    def api_batch_wildlife_excluded():
+        """Include or exclude a selection from wildlife processing.
+
+        Missing or out-of-workspace IDs are skipped rather than rejecting
+        the entire batch so the endpoint stays consistent with
+        ``/api/selection/wildlife-state``: the state endpoint aggregates
+        over the accessible subset, and this endpoint applies the change
+        to the same subset instead of failing when the panel-supplied
+        selection contains a stray ID. The count of skipped IDs is
+        returned so the caller can surface it in the same transparent way
+        as the state endpoint's ``missing_count``.
+        """
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        raw_ids = body.get("photo_ids", [])
+        excluded = body.get("excluded")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return json_error("photo_ids required")
+        if not isinstance(excluded, bool):
+            return json_error("excluded must be a boolean")
+
+        photo_ids = []
+        seen = set()
+        for raw in raw_ids:
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                return json_error("photo_ids must be integers")
+            if raw not in seen:
+                photo_ids.append(raw)
+                seen.add(raw)
+
+        ws_id = db._ws_id()
+        accessible_state = {}
+        batch_size = 800
+        for i in range(0, len(photo_ids), batch_size):
+            chunk = photo_ids[i:i + batch_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = db.conn.execute(
+                f"""SELECT p.id, COALESCE(p.wildlife_excluded, 0) AS excluded
+                    FROM photos p
+                    WHERE p.id IN ({placeholders})
+                      AND EXISTS (
+                          SELECT 1 FROM workspace_folders wf
+                          WHERE wf.folder_id = p.folder_id
+                            AND wf.workspace_id = ?
+                      )""",
+                [*chunk, ws_id],
+            ).fetchall()
+            for row in rows:
+                accessible_state[row["id"]] = int(row["excluded"])
+        accessible_ids = [pid for pid in photo_ids if pid in accessible_state]
+        skipped_count = len(photo_ids) - len(accessible_ids)
+
+        desired = 1 if excluded else 0
+        changed_ids = [
+            photo_id
+            for photo_id in accessible_ids
+            if accessible_state[photo_id] != desired
+        ]
+        items = []
+        for photo_id in changed_ids:
+            old_value = "1" if accessible_state[photo_id] else "0"
+            db.conn.execute(
+                "UPDATE photos SET wildlife_excluded = ? WHERE id = ?",
+                (desired, photo_id),
+            )
+            items.append({
+                "photo_id": photo_id,
+                "old_value": old_value,
+                "new_value": "1" if excluded else "0",
+            })
+
+        if items:
+            description = (
+                "Excluded from wildlife classification"
+                if excluded
+                else "Included in wildlife classification"
+            )
+            db.record_edit(
+                "wildlife_excluded",
+                f"{description}: {len(items)} photos",
+                "1" if excluded else "0",
+                items,
+                is_batch=True,
+                _commit=False,
+            )
+            db.conn.commit()
+            db._prune_edit_history()
+
+        return jsonify({
+            "ok": True,
+            "updated": len(changed_ids),
+            "wildlife_excluded": excluded,
+            "photo_ids": changed_ids,
+            "skipped_count": skipped_count,
+        })
 
     @app.route("/api/batch/keyword-remove", methods=["POST"])
     def api_batch_keyword_remove():
@@ -12610,17 +12813,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "DELETE FROM pending_changes WHERE workspace_id = ?",
                     (ws_id,),
                 )
+                db.clear_equivalent_flat_removals(changes, _commit=False)
                 if changes:
-                    items = [
-                        {
-                            "photo_id": change["photo_id"],
-                            "old_value": (
-                                f'{change["change_type"]}:{change["value"]}'
-                            ),
-                            "new_value": "",
-                        }
-                        for change in changes
-                    ]
+                    items = _discard_history_items(db, changes)
                     db.record_edit(
                         "discard",
                         f"Discarded {len(changes)} pending changes",
@@ -12643,21 +12838,26 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not change_ids:
             return json_error("change_ids required")
 
-        # Look up changes before deleting so we can record what was discarded
-        placeholders = ",".join("?" for _ in change_ids)
-        changes = db.conn.execute(
-            f"SELECT * FROM pending_changes WHERE id IN ({placeholders}) AND workspace_id = ?",
-            list(change_ids) + [db._ws_id()],
-        ).fetchall()
+        # Look up changes before deleting so we can record what was discarded.
+        # Keep each IN clause below SQLite's bound-parameter limit, just as
+        # clear_pending does for the subsequent delete.
+        from db import _chunks  # noqa: PLC0415
+        changes = []
+        for chunk in _chunks(change_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            changes.extend(db.conn.execute(
+                f"SELECT * FROM pending_changes "
+                f"WHERE id IN ({placeholders}) AND workspace_id = ?",
+                list(chunk) + [db._ws_id()],
+            ).fetchall())
 
-        db.clear_pending(change_ids)
+        db.clear_pending(
+            change_ids, clear_equivalent_flat_removals=True,
+        )
 
         # Record discard in history (not undoable)
         if changes:
-            items = [{'photo_id': c['photo_id'],
-                      'old_value': f'{c["change_type"]}:{c["value"]}',
-                      'new_value': ''}
-                     for c in changes]
+            items = _discard_history_items(db, changes)
             db.record_edit('discard',
                            f'Discarded {len(changes)} pending changes',
                            '', items, is_batch=len(changes) > 1)
@@ -14537,7 +14737,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             pid, old["name"], workspace_id=ws_id, _commit=False,
                         )
 
-                db.tag_photo(pid, kid, _commit=False)
+                db.tag_photo(pid, kid, source="manual", _commit=False)
                 _queue_keyword_add(pid, species, workspace_id=ws_id, _commit=False)
                 old_value = str(old_primary["id"]) if old_primary else ""
                 old_keyword_ids = [old["id"] for old in old_rows]
@@ -16446,7 +16646,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     db.update_photo_flag(pid, "flagged")
                     if pid in already_has_species:
                         continue
-                    db.tag_photo(pid, kid)
+                    db.tag_photo(pid, kid, source="manual")
                     db.queue_change(pid, "keyword_add", species)
                     added_picks.append(pid)
 
@@ -30205,7 +30405,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if stored and stored["name"]:
             label = stored["name"]
         for pid in photo_ids:
-            db.tag_photo(pid, kid)
+            db.tag_photo(pid, kid, source="manual")
             db.queue_change(pid, "keyword_add", label)
 
         items = [{'photo_id': pid, 'old_value': '', 'new_value': str(kid)} for pid in photo_ids]
@@ -32570,7 +32770,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             had_old = set(old_rows_by_photo)
 
             for pid in newly_tagged:
-                db.tag_photo(pid, kid, _commit=False)
+                db.tag_photo(pid, kid, source="manual", _commit=False)
                 _queue_keyword_add(
                     pid, species, workspace_id=ws_id, _commit=False,
                 )

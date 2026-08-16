@@ -543,6 +543,20 @@ body.sidebar-resizing {
   flex-direction: column;
   gap: 8px;
 }
+.selection-keyword-group + .selection-keyword-group { margin-top: 6px; }
+.selection-keyword-group-title {
+  margin-bottom: 6px;
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.selection-keyword-group-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
 .selection-keyword-row {
   display: flex;
   align-items: center;
@@ -1786,7 +1800,12 @@ body.sidebar-resizing {
         <div class="selection-action-hint" id="pasteEditHint"></div>
       </div>
       <div class="detail-section">
-        <div class="detail-section-title">Keywords</div>
+        <div class="detail-section-title">Wildlife Classification</div>
+        <div class="selection-empty" id="selectionWildlifeStatus"></div>
+        <div class="selection-keyword-actions" id="selectionWildlifeActions" style="margin-top:8px;"></div>
+      </div>
+      <div class="detail-section">
+        <div class="detail-section-title">Metadata</div>
         <div class="selection-keyword-list" id="selectionKeywordSuggestions"></div>
       </div>
     </div>
@@ -6178,6 +6197,7 @@ function updateSelectionPanel(ids) {
     selectionKeywordRequestSeq++;
     var list = document.getElementById('selectionKeywordSuggestions');
     if (list) list.innerHTML = '';
+    renderSelectionWildlifeState([]);
     if (wasVisible && selectedPhotoId) {
       loadDetail(selectedPhotoId);
     } else if (wasVisible) {
@@ -6203,6 +6223,7 @@ function updateSelectionPanel(ids) {
   panel.classList.remove('hidden');
   document.getElementById('selectionCount').textContent = ids.length.toLocaleString() + ' photos selected';
   updatePasteEditSection(ids);
+  renderSelectionWildlifeState(ids);
   // Keep any EXIF suggestion fetched for the anchor photo: Accept is
   // batch-aware (_locationApplyPhotoIds), so growing the selection is the
   // designed way to apply one suggestion to many photos.
@@ -6606,7 +6627,20 @@ function renderSelectionKeywordSuggestions(keywords, selectedCount) {
   selectionKeywordMissingById = {};
   selectionKeywordPresentById = {};
   selectionKeywordNameById = {};
+  var groupDefinitions = [
+    { type: 'taxonomy', label: 'Species' },
+    { type: 'location', label: 'Locations' },
+    { type: 'individual', label: 'Individuals' },
+    { type: 'genre', label: 'Genres' },
+    { type: 'general', label: 'Keywords' }
+  ];
+  var keywordsByType = {};
   keywords.forEach(function(k) {
+    var type = k.type || 'general';
+    if (!keywordsByType[type]) keywordsByType[type] = [];
+    keywordsByType[type].push(k);
+  });
+  function renderKeywordRow(k) {
     var missing = k.missing_count || 0;
     var count = k.count || 0;
     selectionKeywordMissingById[String(k.id)] = k.missing_photo_ids || [];
@@ -6619,15 +6653,125 @@ function renderSelectionKeywordSuggestions(keywords, selectedCount) {
     if (count > 0) {
       actions += '<button class="selection-keyword-remove" onclick="removeSelectionKeyword(' + k.id + ')" title="Remove this keyword from selected photos that have it">Remove from ' + count + '</button>';
     }
-    html += '<div class="selection-keyword-row">' +
+    return '<div class="selection-keyword-row">' +
       '<div style="min-width:0;">' +
         '<div class="selection-keyword-name">' + escapeHtml(k.name) + '</div>' +
         '<div class="selection-keyword-meta">On ' + count + ' of ' + selectedCount + (missing ? ', missing from ' + missing : '') + '</div>' +
       '</div>' +
       '<div class="selection-keyword-actions">' + actions + '</div>' +
-    '</div>';
+      '</div>';
+  }
+  groupDefinitions.forEach(function(group) {
+    var rows = keywordsByType[group.type] || [];
+    if (!rows.length) return;
+    html += '<div class="selection-keyword-group" data-keyword-type="' + group.type + '">' +
+      '<div class="selection-keyword-group-title">' + group.label + '</div>' +
+      '<div class="selection-keyword-group-rows">' + rows.map(renderKeywordRow).join('') + '</div>' +
+      '</div>';
   });
   list.innerHTML = html;
+}
+
+var selectionWildlifeRequestSeq = 0;
+
+async function renderSelectionWildlifeState(ids) {
+  var status = document.getElementById('selectionWildlifeStatus');
+  var actions = document.getElementById('selectionWildlifeActions');
+  if (!status || !actions) return;
+  if (!ids || !ids.length) {
+    selectionWildlifeRequestSeq++;
+    status.textContent = '';
+    actions.innerHTML = '';
+    return;
+  }
+  // Derive counts from the full selection, not from the loaded grid:
+  // "Select all matching" can include off-page photos that are absent from
+  // ``photos``, and filtering client-side would omit them from the counts
+  // and hide batch controls that should still be available.
+  var seq = ++selectionWildlifeRequestSeq;
+  var data;
+  try {
+    data = await safeFetch('/api/selection/wildlife-state', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({photo_ids: ids}),
+    }, { toast: false });
+  } catch (e) {
+    if (seq === selectionWildlifeRequestSeq) {
+      status.textContent = '';
+      actions.innerHTML = '';
+    }
+    return;
+  }
+  if (seq !== selectionWildlifeRequestSeq) return;
+  var includedCount = (data && data.included_count) || 0;
+  var excludedCount = (data && data.excluded_count) || 0;
+  var selectedCount = (data && data.selected_count) || 0;
+  var missingCount = (data && data.missing_count) || 0;
+  if (!selectedCount && !missingCount) {
+    status.textContent = '';
+    actions.innerHTML = '';
+    return;
+  }
+  var statusText;
+  if (!selectedCount) {
+    statusText = '';
+  } else if (excludedCount === 0) {
+    statusText = 'All accessible photos are included in wildlife processing.';
+  } else if (includedCount === 0) {
+    statusText = 'All accessible photos are excluded from wildlife processing.';
+  } else {
+    statusText = includedCount + ' included · ' + excludedCount + ' excluded';
+  }
+  // Surface missing IDs the same way the state endpoint reports them so
+  // the panel never implies its counts cover the full user selection when
+  // some photos are unavailable in the active workspace.
+  if (missingCount > 0) {
+    var missingText = missingCount + ' unavailable in this workspace';
+    statusText = statusText ? statusText + ' · ' + missingText : missingText;
+  }
+  status.textContent = statusText;
+  var html = '';
+  if (includedCount > 0) {
+    html += '<button class="selection-keyword-remove" onclick="setSelectionWildlifeExcluded(true)">Exclude ' + includedCount + '</button>';
+  }
+  if (excludedCount > 0) {
+    html += '<button class="selection-keyword-add" onclick="setSelectionWildlifeExcluded(false)">Include ' + excludedCount + '</button>';
+  }
+  actions.innerHTML = html;
+}
+
+async function setSelectionWildlifeExcluded(excluded) {
+  var ids = getActiveSelection();
+  if (!ids.length) return;
+  var data;
+  try {
+    data = await safeFetch('/api/batch/wildlife-excluded', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({photo_ids: ids, excluded: excluded}),
+    });
+  } catch (e) { return; }
+  var changed = new Set((data && data.photo_ids) || ids);
+  photos.forEach(function(photo) {
+    if (changed.has(photo.id)) photo.wildlife_excluded = excluded ? 1 : 0;
+  });
+  refreshGridCards(ids);
+  // The selection may have changed while the batch request was in flight.
+  // Refresh the current selection so this completion cannot supersede a
+  // newer state request with counts and actions for the old photo ids.
+  renderSelectionWildlifeState(getActiveSelection());
+  scheduleCollectionCountsRefresh();
+  refreshActiveCollectionAfterMembershipChange();
+  // The batch endpoint skips missing/out-of-workspace IDs instead of
+  // rejecting the whole selection; tell the user how many were skipped
+  // so a partial apply is never invisible.
+  var skipped = (data && data.skipped_count) || 0;
+  if (skipped > 0 && typeof showToast === 'function') {
+    showToast('Skipped ' + skipped + ' photo' + (skipped === 1 ? '' : 's') +
+              ' not accessible in this workspace.', 'warning');
+  }
+  showUndoToast();
 }
 
 async function applySelectionKeyword(keywordId) {

@@ -2013,7 +2013,7 @@ def test_multi_species_xmp_does_not_auto_accept_detection_match(tmp_path):
     )[0]
     write_sidecar(
         tmp_path / "a.xmp",
-        {"Robin", "Sparrow", "Wildlife"},
+        {"Robin", "Sparrow"},
         set(),
     )
 

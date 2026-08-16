@@ -350,6 +350,42 @@ def create_local_folder_blueprint(
             "status": job["status"],
         }
 
+    def _residency_fingerprint(db, workspace_id, selectable_root_ids):
+        # A short residency signature so the blocker poller can spot changes
+        # that leave no active job behind. Without it, a stage/sync/discard
+        # started in another tab that starts *and* finishes between two of
+        # this tab's blocker polls looks identical to "nothing happening" —
+        # both polls return no job, the signature matches, and load() never
+        # refires. Folder-tree badges then stay pinned at their pre-job
+        # state (for example LOCAL after another tab already synced and
+        # removed the copy) until the page is reloaded.
+        visible: set[int] = set()
+        for root_id in selectable_root_ids:
+            visible.add(int(root_id))
+            covering = local_root_for_folder(db, root_id)
+            if covering is not None:
+                visible.add(int(covering))
+        if not visible:
+            return ""
+        placeholders = ",".join("?" for _ in visible)
+        rows = db.conn.execute(
+            f"""SELECT root_folder_id, state, activated_at, created_at
+                FROM local_folders
+                WHERE root_folder_id IN ({placeholders})
+                ORDER BY root_folder_id""",
+            tuple(sorted(visible)),
+        ).fetchall()
+        parts = [
+            "{root}:{state}:{activated}:{created}".format(
+                root=row["root_folder_id"],
+                state=row["state"] or "",
+                activated=row["activated_at"] or "",
+                created=row["created_at"] or "",
+            )
+            for row in rows
+        ]
+        return ";".join(parts)
+
     def _blocking_status_payload(db, workspace_id):
         root_ids = _active_root_ids(db, workspace_id)
         selectable_root_ids = set(root_ids) | set(
@@ -365,6 +401,9 @@ def create_local_folder_blueprint(
                 _busy_job(db, selectable_root_ids, workspace_id)
             ),
             "folder_blocking_jobs": folder_blocking_jobs,
+            "residency_fingerprint": _residency_fingerprint(
+                db, workspace_id, selectable_root_ids
+            ),
         }
 
     @blueprint.get("/api/workspaces/active/local-folders/blocker")

@@ -1620,6 +1620,37 @@ def test_label_cluster_records_history(app_and_db):
     assert history[0]['action_type'] == 'keyword_add'
     assert 'juvenile' in history[0]['description']
     assert history[0]['item_count'] == 2
+    sources = db.conn.execute(
+        """SELECT pk.source
+           FROM photo_keywords pk
+           JOIN keywords k ON k.id = pk.keyword_id
+           WHERE pk.photo_id IN (?, ?) AND k.name = 'juvenile'
+           ORDER BY pk.photo_id""",
+        pids,
+    ).fetchall()
+    assert [row['source'] for row in sources] == ['manual', 'manual']
+
+
+def test_label_cluster_stamps_reused_wildlife_genre_manual(app_and_db):
+    """A user-applied Wildlife label durably owns the retained genre row."""
+    app, db = app_and_db
+    client = app.test_client()
+    pid = db.get_photos()[0]['id']
+    wildlife_id = db.add_keyword('Wildlife', kw_type='genre')
+
+    resp = client.post(
+        '/api/species/label-cluster',
+        json={'photo_ids': [pid], 'label': 'Wildlife'},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()['keyword_id'] == wildlife_id
+    source = db.conn.execute(
+        """SELECT source FROM photo_keywords
+           WHERE photo_id = ? AND keyword_id = ?""",
+        (pid, wildlife_id),
+    ).fetchone()['source']
+    assert source == 'manual'
 
 
 def test_label_cluster_normalizes_edge_quote_label(app_and_db):

@@ -164,7 +164,7 @@
   </div>
   <div class="control-group">
     <label for="sortSelect">Sort</label>
-    <select id="sortSelect">
+    <select id="sortSelect" data-view-preference="vireo.lifeList.sort">
       <option value="alpha">A&ndash;Z</option>
       <option value="newest">Newest lifer first</option>
       <option value="life-order">Life order (oldest first)</option>
@@ -186,7 +186,7 @@
   <div class="control-group" title="When enabled, number the visible cards in their current displayed order. Disable it to keep each species' original chronological lifer number.">
     <label for="renumberView">Life List numbering</label>
     <label class="numbering-toggle" for="renumberView">
-      <input type="checkbox" id="renumberView">
+      <input type="checkbox" id="renumberView" data-view-preference="vireo.lifeList.renumber">
       <span>Renumber for each view</span>
     </label>
   </div>
@@ -291,8 +291,6 @@
 <script>
 var currentData = null;
 var debounceTimer = null;
-var LIFE_LIST_SORT_STORAGE_KEY = 'vireo.lifeList.sort';
-var LIFE_LIST_RENUMBER_STORAGE_KEY = 'vireo.lifeList.renumber';
 var LIFE_LIST_EXPORT_COLUMNS = {
   species: [
     ['number', 'Life-list number'],
@@ -320,24 +318,12 @@ var LIFE_LIST_EXPORT_COLUMNS = {
   ],
 };
 var lifeListExportColumnSelections = {species: null, photos: null};
-var LIFE_LIST_SORTS = ['alpha', 'newest', 'life-order', 'most-photos'];
 var LIFE_LIST_PAGE_SIZE = 100;
 var lifeListLightboxSpecies = null;
 var lifeListLoadPromises = {};
 
 function restoreLifeListViewPreferences() {
-  try {
-    var savedSort = window.localStorage.getItem(LIFE_LIST_SORT_STORAGE_KEY);
-    if (LIFE_LIST_SORTS.indexOf(savedSort) !== -1) {
-      document.getElementById('sortSelect').value = savedSort;
-    }
-    document.getElementById('renumberView').checked =
-      window.localStorage.getItem(LIFE_LIST_RENUMBER_STORAGE_KEY) === '1';
-  } catch (e) {}
-}
-
-function saveLifeListViewPreference(key, value) {
-  try { window.localStorage.setItem(key, value); } catch (e) {}
+  VireoViewPreferences.restoreAll(document.getElementById('controlsBar'));
 }
 
 // All dynamic values rendered into card HTML pass through escapeAttr —
@@ -671,11 +657,9 @@ document.getElementById('speciesSearch').addEventListener('input', debounceRende
 document.getElementById('taxonomicGroupSelect').addEventListener('change', render);
 document.getElementById('identificationRankSelect').addEventListener('change', render);
 document.getElementById('sortSelect').addEventListener('change', function() {
-  saveLifeListViewPreference(LIFE_LIST_SORT_STORAGE_KEY, this.value);
   if (currentData) render();
 });
 document.getElementById('renumberView').addEventListener('change', function() {
-  saveLifeListViewPreference(LIFE_LIST_RENUMBER_STORAGE_KEY, this.checked ? '1' : '0');
   if (currentData) render();
 });
 

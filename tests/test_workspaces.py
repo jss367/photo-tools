@@ -640,16 +640,13 @@ def test_job_history_filtered_by_workspace(db_with_workspace):
 def client(tmp_path, monkeypatch):
     """Flask test client with a fresh DB.
 
-    Isolates $HOME and config paths to tmp_path so create_app's
-    ``_mark_species_and_maybe_backfill`` doesn't read the developer's real
+    Isolates $HOME and config paths to tmp_path so create_app's background
+    species-marking pass doesn't read the developer's real
     ``~/.vireo/taxonomy.json``. Without this, the lazy
     ``from taxonomy import ...`` inside that helper freezes
     ``taxonomy.TAXONOMY_JSON_PATH`` to the real path on first import; later
-    tests in ``vireo/tests/`` then load the real 554MB taxonomy via the
-    cached module, retype "Cardinal" as a species, and trigger the
-    auto-Wildlife backfill — breaking ``test_remove_keyword_from_photo`` and
-    ``test_undo_keyword_remove_clears_pending_change`` with a phantom
-    Wildlife tag.
+    tests in ``vireo/tests/`` then load the real taxonomy via the cached
+    module and unexpectedly retype "Cardinal" as a species.
     """
     import os
     import sys
@@ -1394,10 +1391,7 @@ def test_merge_duplicate_keywords_retargets_species_curation_when_source_merges_
     assert [(row["id"], row["name"]) for row in kw_rows] == [
         (survivor_id, "apapane"),
     ]
-    # The legacy photo's species tag moved onto the surviving id. The photo
-    # also carries an auto-added Wildlife genre from tag_photo's
-    # auto-Wildlife trigger (only-species-on-photo path); check membership
-    # rather than equality so that unrelated tag isn't hard-coded.
+    # The legacy photo's species tag moved onto the surviving id.
     tag_ids = {
         row["keyword_id"]
         for row in db.conn.execute(
@@ -1866,8 +1860,7 @@ def test_merge_duplicate_keywords_handles_stale_group_after_parent_merge(db):
     # Keep every child in the same species-bearing slot; this test exercises
     # stale recursive groups, not the distinct species/plain homonym boundary.
     # Location metadata carried only by the duplicate must still fold into
-    # the survivor instead of being deleted with it. (Set after tagging so
-    # the auto-Wildlife rule doesn't muddy the tag assertions.)
+    # the survivor instead of being deleted with it.
     db.conn.execute(
         "UPDATE keywords SET is_species = 1 WHERE LOWER(name) = 'heron'"
     )

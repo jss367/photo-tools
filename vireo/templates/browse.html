@@ -99,6 +99,55 @@ body.sidebar-resizing {
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
 }
+.tree-item .folder-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.folder-local-status-slot {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+.folder-local-status {
+  margin-left: 6px;
+  padding: 1px 4px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.folder-local-status.local {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.folder-local-status.mixed,
+.folder-local-status.updating {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+}
+.folder-local-status.recovery {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+.folder-local-status.updating::before {
+  content: '';
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-right: 3px;
+  border: 1px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: folder-local-spin 0.8s linear infinite;
+}
+@keyframes folder-local-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .folder-local-status.updating::before { animation: none; }
+}
 .tree-item .collection-name {
   min-width: 0;
   overflow: hidden;
@@ -490,6 +539,20 @@ body.sidebar-resizing {
   margin-bottom: 4px;
 }
 .selection-keyword-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.selection-keyword-group + .selection-keyword-group { margin-top: 6px; }
+.selection-keyword-group-title {
+  margin-bottom: 6px;
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.selection-keyword-group-rows {
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -1645,7 +1708,8 @@ body.sidebar-resizing {
     <div class="filter-bar browse-filter-shell">
       {% include '_filterbar.html' %}
       <div class="browse-view-controls">
-        <select id="sortSelect" onchange="applyFilters()" title="Sort order">
+        <select id="sortSelect" onchange="applyFilters()" title="Sort order"
+                data-view-preference="vireo.browse.sort">
           <option value="date">Capture date (oldest)</option>
           <option value="date_desc">Capture date (newest)</option>
           <option value="name">Filename (A-Z)</option>
@@ -1657,6 +1721,7 @@ body.sidebar-resizing {
         </select>
         <label style="display:flex;align-items:center;gap:4px;" title="Thumbnail size">
           <input type="range" id="thumbSizeSlider" min="120" max="400" step="20" value="220"
+                 data-view-preference="vireo.browse.thumbSize"
                  style="width:80px;accent-color:var(--accent);"
                  oninput="updateThumbSize(this.value)">
           <span style="font-size:10px;color:var(--text-faint);">&#9638;</span>
@@ -1774,6 +1839,15 @@ body.sidebar-resizing {
 
     <!-- Grid -->
     <div class="grid-container" id="gridContainer">
+      <!-- A photo deep link paints the page holding the target, not the pages
+           before it. A bare button would leave the truncated grid reading as
+           the whole folder, so the banner states how many photos are missing
+           and where the grid actually starts (CORE_PHILOSOPHY.md: no black
+           boxes). -->
+      <div id="loadPreviousPhotosBanner" style="display:none;position:sticky;top:8px;z-index:5;margin:8px auto;padding:8px 14px;max-width:640px;border:1px solid var(--border-subtle);border-radius:4px;background:var(--bg-secondary);color:var(--text-secondary);font-size:13px;text-align:center;">
+        <span id="loadPreviousPhotosText"></span>
+        <button id="loadPreviousPhotosButton" onclick="loadPreviousPhotos()" style="margin-left:10px;padding:5px 12px;border:1px solid var(--border-subtle);border-radius:3px;background:var(--bg-tertiary);color:var(--text-primary);font-size:12px;font-weight:600;cursor:pointer;">Browse from beginning</button>
+      </div>
       <div class="grid" id="grid"></div>
       <div class="scroll-sentinel" id="scrollSentinel"></div>
       <div class="empty-state" id="emptyState" style="display:none;">No photos match the current filters.</div>
@@ -1832,7 +1906,12 @@ body.sidebar-resizing {
         <div class="prediction-list" id="selectionPredictions"></div>
       </div>
       <div class="detail-section">
-        <div class="detail-section-title">Keywords</div>
+        <div class="detail-section-title">Wildlife Classification</div>
+        <div class="selection-empty" id="selectionWildlifeStatus"></div>
+        <div class="selection-keyword-actions" id="selectionWildlifeActions" style="margin-top:8px;"></div>
+      </div>
+      <div class="detail-section">
+        <div class="detail-section-title">Metadata</div>
         <div class="selection-keyword-list" id="selectionKeywordSuggestions"></div>
       </div>
     </div>
@@ -2105,6 +2184,7 @@ var currentPage = 1;
 var perPage = 50;
 var loading = false;
 var allLoaded = false;
+var earliestPage = 1;
 // True only after an authoritative response has initialized the grid, even
 // when that response contains zero photos. Health events can arrive while
 // bootstrap or a deep link is still pending; an "unaffected scope" is only
@@ -2146,7 +2226,10 @@ var colorLabels = {};    // {photo_id: color_string}
 // rendering "everything is uncoloured" for a still-loading selection.
 var colorLabelsFetched = new Set();
 var colorLabelGen = 0;   // bumped on local edits; guards against stale fetch responses
-var loadEpoch = 0;       // bumped on any grid reset; guards against stale loadPhotos responses
+// Generation counter for the grid window (photos/currentPage/earliestPage/
+// allLoaded). Never compare it directly — go through claimBrowseWindow() /
+// observeBrowseWindow() so every async path guards the same way.
+var loadEpoch = 0;
 var selectAllRequestSeq = 0; // bumped to ignore stale async select-all responses
 // rating/flag/color/date/keyword filter state now lives in VireoFilter
 // (the universal filter bar); Browse keeps only page-scope state.
@@ -2662,7 +2745,7 @@ var _cfgPromise = (async function() {
 function applyBrowseConfig(cfg) {
   if (!cfg) return;
   if (cfg.photos_per_page) perPage = cfg.photos_per_page;
-  if (cfg.browse_thumb_default) {
+  if (cfg.browse_thumb_default && VireoViewPreferences.read('vireo.browse.thumbSize') === null) {
     var slider = document.getElementById('thumbSizeSlider');
     if (slider) {
       slider.value = cfg.browse_thumb_default;
@@ -2902,7 +2985,9 @@ var SKEL_POOL = 300;
 function updateGridTail() {
   var grid = document.getElementById('grid');
   var tail = document.getElementById('gridTail');
-  var remaining = allLoaded ? 0 : totalPhotos - photos.length;
+  // Photos before the loaded window are reached with "Browse from beginning",
+  // not by scrolling down — they must not inflate the downward runway.
+  var remaining = allLoaded ? 0 : totalPhotos - loadedWindowOffset() - photos.length;
   var cards = grid.getElementsByClassName('grid-card');
   var lastCard = cards.length ? cards[cards.length - 1] : null;
   if (remaining <= 0 || !lastCard) {
@@ -3083,6 +3168,8 @@ function clearActiveSelectionAndDetail() {
 // re-fetch. Initialize here so the pre-await snapshot reads the same ``0``
 // the rest of the script sees (Codex review r3686317674).
 var folderHealthRefreshSeq = 0;
+VireoViewPreferences.restoreAll(document.querySelector('.browse-view-controls'));
+updateThumbSize(document.getElementById('thumbSizeSlider').value);
 bootstrapBrowse();
 
 async function bootstrapBrowse() {
@@ -3109,6 +3196,14 @@ async function bootstrapBrowse() {
   // finally-region guard to release the load lock the concurrent health
   // refresh's ``loadPhotos`` still owned (Codex review r3686191138).
   var bootstrapHealthSeq = folderHealthRefreshSeq;
+  // The sort <select> is in the DOM before init resolves, so the user can
+  // change it (or edit a restored filter) while /api/browse/init is pending.
+  // applyFilters() → resetAndLoad() then claims the window and starts its own
+  // loadPhotos(); this bootstrap must not paint its now-abandoned dataset over
+  // that, nor release the ``loading`` mutex the newer load holds — the same
+  // stale-window hazard the deep-link loader guards against (Codex review
+  // r3792769108).
+  var bootstrapWindowIsCurrent = claimBrowseWindow();
   // Parse URL scope params BEFORE the first await. A folder-health event that
   // fires while ``_cfgPromise`` is still pending runs
   // refreshBrowseAfterFolderHealthChange(), which calls resetAndLoad() from
@@ -3180,18 +3275,25 @@ async function bootstrapBrowse() {
     }
 
     if (!healthChangedDuringInit) {
-      // Populate everything from a single response
-      photos = data.photos || [];
-      totalPhotos = data.total || 0;
-      currentPage = 2; // next page to load
-      if (photos.length >= totalPhotos) allLoaded = true;
-
+      // The sidebar trees are scope-independent, so render them even if a
+      // newer load owns the grid — otherwise a sort change during init would
+      // leave Browse with no folder/keyword/collection lists at all.
       renderFolderTree(data.folders || []);
       renderKeywordTree(data.keywords || []);
       renderCollectionList(data.collections || []);
-      renderGrid();
-      browseDatasetReady = true;
-      updateFilterSummary();
+      if (bootstrapWindowIsCurrent()) {
+        // Populate everything from a single response
+        photos = data.photos || [];
+        totalPhotos = data.total || 0;
+        currentPage = 2; // next page to load
+        earliestPage = 1; // bootstrap always starts at the top of the dataset
+        if (photos.length >= totalPhotos) allLoaded = true;
+
+        renderGrid();
+        updatePreviousPhotosButton();
+        browseDatasetReady = true;
+        updateFilterSummary();
+      }
       loadSummary();
     }
     refreshPendingSyncBanner();
@@ -3388,8 +3490,10 @@ async function bootstrapBrowse() {
   // still holds, letting the newly-rearmed observer fire a second page-1
   // request against the same ``loadEpoch``; both responses append and the
   // grid ends up with duplicated cards and off-by-one pagination
-  // (Codex review r3685627307).
-  if (!healthChangedDuringInit) {
+  // (Codex review r3685627307). The same reasoning applies when a filter or
+  // sort change claimed the window mid-init: its loadPhotos owns ``loading``
+  // and releases it in its own finally.
+  if (!healthChangedDuringInit && bootstrapWindowIsCurrent()) {
     loading = false;
     if (bootstrapSucceeded) {
       rearmInfiniteScrollObserver();
@@ -3493,13 +3597,27 @@ async function loadFolders(opts) {
 }
 
 function renderFolderTree(folders) {
-  browseFolderRows = folders.slice();
+  var rows = folders.slice();
   var byParent = {};
-  folders.forEach(function(f) {
+  rows.forEach(function(f) {
     var pid = f.parent_id || 'root';
     if (!byParent[pid]) byParent[pid] = [];
     byParent[pid].push(f);
   });
+
+  // Ask folderLocalStatuses for any phantom top-level rows it had to
+  // synthesize because a missing local root has no visible ancestor. These
+  // rows carry the LOCAL ISSUE / SYNCING badge for a folder /api/folders no
+  // longer returns; without injecting them the badge has nowhere to
+  // render.
+  var statusResult = folderLocalStatuses(rows, byParent, {wantsSynthetic: true});
+  (statusResult.synthetic || []).forEach(function(row) {
+    if (rows.some(function(f) { return Number(f.id) === Number(row.id); })) return;
+    rows.push(row);
+    if (!byParent['root']) byParent['root'] = [];
+    byParent['root'].push(row);
+  });
+  browseFolderRows = rows;
 
   // Single post-order pass: each subtree's rollup is computed once and cached.
   // (Per-node recomputation during render would be O(n^2) on deep trees.)
@@ -3511,6 +3629,7 @@ function renderFolderTree(folders) {
     return total;
   }
   (byParent['root'] || []).forEach(computeRollup);
+  var localStatuses = statusResult.statuses;
 
   function buildTree(parentId, depth) {
     var children = byParent[parentId] || [];
@@ -3526,7 +3645,8 @@ function renderFolderTree(folders) {
         : '';
       html += '<div class="tree-item' + activeClass + '" onclick="filterByFolder(' + f.id + ')" data-folder-id="' + f.id + '">' +
         indent + toggle +
-        '<span>' + escapeHtml(f.name) + '</span>' +
+        '<span class="folder-name">' + escapeHtml(f.name) + '</span>' +
+        '<span class="folder-local-status-slot">' + folderLocalStatusMarkup(localStatuses[f.id]) + '</span>' +
         partialBadge +
         '<span class="count">' + rolledUp[f.id] + '</span>' +
       '</div>';
@@ -3539,6 +3659,269 @@ function renderFolderTree(folders) {
 
   document.getElementById('folderTree').innerHTML = buildTree('root', 0);
 }
+
+function folderLocalStatuses(folders, byParent, options) {
+  var wantsSynthetic = !!(options && options.wantsSynthetic);
+  var localData = window.vireoLocalFolderData;
+  if (!localData || localData.legacy_workspace_session) {
+    return wantsSynthetic ? {statuses: {}, synthetic: []} : {};
+  }
+
+  var rowsById = {};
+  folders.forEach(function(folder) { rowsById[Number(folder.id)] = folder; });
+  var direct = {};
+  // Job payloads report their target as the local root_folder_id, but a
+  // visible workspace folder may be covered by a shared ancestor whose
+  // root_folder_id isn't itself in this workspace's tree. Map each covering
+  // root back to the visible requested_folder_id(s) so sync/discard badges
+  // update instead of freezing on LOCAL. Each entry carries ``fallback``
+  // so job status can inherit whether the visible id is the covering root
+  // itself (direct — spread through the subtree) or a fallback anchor
+  // standing in for a hidden session (do not spread).
+  var visibleIdsByRoot = {};
+  var syntheticRoots = [];
+  var syntheticIds = {};
+
+  function recordMapping(rootId, visibleId, isFallback) {
+    if (!rootId) return;
+    if (!visibleIdsByRoot[rootId]) visibleIdsByRoot[rootId] = [];
+    for (var i = 0; i < visibleIdsByRoot[rootId].length; i++) {
+      if (visibleIdsByRoot[rootId][i].visibleId === visibleId) {
+        // A direct match on this visible id trumps a fallback mapping: a
+        // job on the covering root then propagates to the folder's own
+        // subtree instead of stopping at the fallback anchor.
+        if (!isFallback) visibleIdsByRoot[rootId][i].fallback = false;
+        return;
+      }
+    }
+    visibleIdsByRoot[rootId].push({visibleId: visibleId, fallback: isFallback});
+  }
+
+  (localData.folders || []).forEach(function(item) {
+    if (!item) return;
+    var requestedId = Number(item.requested_folder_id || item.root_folder_id);
+    var visibleId = requestedId;
+    var isFallback = false;
+    if (!rowsById[visibleId]) {
+      // The requested folder isn't in the tree — commonly because
+      // check_folder_health flipped its rebased folders.path to 'missing'
+      // when the managed local directory was unmounted or deleted, so
+      // /api/folders now excludes it. Dropping the item here loses the
+      // LOCAL ISSUE / SYNCING badge exactly when the local copy needs
+      // attention. Fall back to the nearest visible ancestor so the
+      // status surfaces on the enclosing folder instead.
+      var ancestorId = Number(item.visible_ancestor_folder_id || 0);
+      if (ancestorId && rowsById[ancestorId]) {
+        visibleId = ancestorId;
+        isFallback = true;
+      } else if (item.state === 'remote') {
+        // A purely remote workspace root that /api/folders doesn't
+        // return (unmounted, never staged) has nothing local to badge.
+        // Synthesizing a phantom here would restore every such root as
+        // a clickable zero-count folder with no local-status badge,
+        // effectively resurrecting missing remote folders in Browse
+        // (Codex review r3792082330). Skip it entirely.
+        return;
+      } else {
+        // A top-level workspace root that has gone missing has no
+        // visible ancestor to attach the badge to. Without a synthesized
+        // entry the recovery state disappears entirely — the user loses
+        // the only signal that their local copy needs attention. Emit a
+        // phantom top-level row so renderFolderTree can inject a
+        // ``.tree-item`` that carries the LOCAL ISSUE / SYNCING badge
+        // (Codex review r3792031813).
+        if (!syntheticIds[requestedId]) {
+          syntheticIds[requestedId] = true;
+          var syntheticName = String(item.folder_name || '').trim() ||
+            'Missing local folder';
+          // Seed the synthesized row with the root's real workspace photo
+          // count from workspace_status(). Hard-coding 0 made the only
+          // visible entry for a top-level missing local root read as an
+          // empty folder even when the recovery session covers hundreds of
+          // photos, which mis-cues users toward discarding it (Codex review
+          // r3792132683).
+          var syntheticCount = Number(item.workspace_photo_count || 0);
+          var syntheticRow = {
+            id: requestedId,
+            parent_id: null,
+            name: syntheticName,
+            photo_count: syntheticCount,
+            status: 'missing',
+            __synthetic_missing_local: true
+          };
+          syntheticRoots.push(syntheticRow);
+          rowsById[requestedId] = syntheticRow;
+        }
+        visibleId = requestedId;
+      }
+    }
+    var rootId = Number(item.root_folder_id || requestedId);
+    recordMapping(rootId, visibleId, isFallback);
+    if (item.state === 'remote') return;
+    var changes = item.changes || {};
+    var changeCount = Number(changes.created || 0) +
+      Number(changes.modified || 0) + Number(changes.deleted || 0);
+    if (item.state === 'recovery' || item.changes_error) {
+      direct[visibleId] = {
+        kind: 'recovery',
+        label: 'LOCAL ISSUE',
+        description: item.recovery_kind === 'sync'
+          ? 'Local sync needs attention'
+          : 'Local copy needs attention',
+        fallback: isFallback
+      };
+      return;
+    }
+    direct[visibleId] = {
+      kind: item.state === 'staging' ? 'updating' : 'local',
+      label: item.state === 'staging' ? 'COPYING' : 'LOCAL',
+      description: changeCount
+        ? 'Working locally · ' + changeCount + ' unsynced change' + (changeCount === 1 ? '' : 's')
+        : 'Working locally',
+      fallback: isFallback
+    };
+  });
+
+  (localData.jobs || []).forEach(function(job) {
+    var jobStatus = {
+      'work-locally-folder-stage': ['COPYING', 'Copying locally'],
+      'work-locally-folder-sync': ['SYNCING', 'Syncing local changes to source storage'],
+      'work-locally-folder-discard': ['REMOVING', 'Removing the local copy']
+    }[job.type];
+    if (!jobStatus) return;
+    (job.folder_ids || []).forEach(function(rawId) {
+      var id = Number(rawId);
+      var targets = [];
+      if (rowsById[id]) targets.push({visibleId: id, fallback: false});
+      (visibleIdsByRoot[id] || []).forEach(function(mapping) {
+        for (var ti = 0; ti < targets.length; ti++) {
+          if (targets[ti].visibleId === mapping.visibleId) {
+            if (!mapping.fallback) targets[ti].fallback = false;
+            return;
+          }
+        }
+        targets.push({visibleId: mapping.visibleId, fallback: mapping.fallback});
+      });
+      targets.forEach(function(target) {
+        direct[target.visibleId] = {
+          kind: 'updating',
+          label: jobStatus[0],
+          description: jobStatus[1],
+          fallback: target.fallback
+        };
+      });
+    });
+  });
+
+  var result = {};
+  function markDescendants(folderId, status) {
+    result[folderId] = status;
+    // Fallback anchors represent a hidden subtree that could not be
+    // shown. Propagating the anchor's status through unrelated visible
+    // siblings would mislabel healthy remote folders as LOCAL ISSUE /
+    // SYNCING / REMOVING (Codex review r3792031821).
+    if (status && status.fallback) return;
+    (byParent[folderId] || []).forEach(function(child) {
+      markDescendants(Number(child.id), status);
+    });
+  }
+  Object.keys(direct).forEach(function(rawId) {
+    markDescendants(Number(rawId), direct[rawId]);
+  });
+
+  Object.keys(direct).forEach(function(rawId) {
+    var current = rowsById[Number(rawId)];
+    var parentId = current ? current.parent_id : null;
+    var seen = {};
+    while (parentId != null && !seen[parentId]) {
+      seen[parentId] = true;
+      if (!direct[parentId]) {
+        result[parentId] = {
+          kind: 'mixed',
+          label: 'SOME LOCAL',
+          description: 'Contains folders that are working locally'
+        };
+      }
+      current = rowsById[Number(parentId)];
+      parentId = current ? current.parent_id : null;
+    }
+  });
+  if (wantsSynthetic) {
+    return {statuses: result, synthetic: syntheticRoots};
+  }
+  return result;
+}
+
+function folderLocalStatusMarkup(status) {
+  if (!status) return '';
+  return '<span class="folder-local-status ' + status.kind + '" role="img"' +
+    ' aria-label="' + escapeAttr(status.description) + '"' +
+    ' title="' + escapeAttr(status.description) + '">' +
+    escapeHtml(status.label) + '</span>';
+}
+
+function refreshFolderLocalStatusIndicators() {
+  // Compute statuses from real rows only. If the previously injected
+  // phantoms remain in the input, folderLocalStatuses treats them as
+  // existing rows and never re-emits them in ``synthetic``, so a still-
+  // needed phantom would look identical to a stale one left behind after
+  // a recovery discard. Rebuild the input so ``synthetic`` reliably
+  // enumerates exactly the phantoms the current local-folder state
+  // requires (Codex review r3792082333).
+  var realFolders = browseFolderRows.filter(function(f) {
+    return !f.__synthetic_missing_local;
+  });
+  var byParent = {};
+  realFolders.forEach(function(folder) {
+    var parentId = folder.parent_id || 'root';
+    if (!byParent[parentId]) byParent[parentId] = [];
+    byParent[parentId].push(folder);
+  });
+  var statusResult = folderLocalStatuses(
+    realFolders, byParent, {wantsSynthetic: true}
+  );
+  var neededPhantomIds = {};
+  (statusResult.synthetic || []).forEach(function(row) {
+    neededPhantomIds[Number(row.id)] = true;
+  });
+  var existingPhantomIds = {};
+  browseFolderRows.forEach(function(f) {
+    if (f.__synthetic_missing_local) existingPhantomIds[Number(f.id)] = true;
+  });
+  var newPhantomNeeded = Object.keys(neededPhantomIds).some(function(id) {
+    return !existingPhantomIds[id];
+  });
+  var stalePhantomPresent = Object.keys(existingPhantomIds).some(function(id) {
+    return !neededPhantomIds[id];
+  });
+  // A stale phantom's underlying folder is no longer flagged as a
+  // missing local session — a discard-recovery, for example, ends the
+  // session and the real folder returns to ``/api/folders``. Re-fetch
+  // so the restored row and photo count replace the zero-count
+  // ``status: 'missing'`` shell instead of leaving Browse with an
+  // orphaned clickable phantom (Codex review r3792082333).
+  if (stalePhantomPresent && typeof loadFolders === 'function') {
+    loadFolders();
+    return;
+  }
+  // A newly needed phantom means the DOM has no ``.tree-item`` slot to
+  // update — a slot-only refresh would silently drop the LOCAL ISSUE
+  // badge. Rebuild from real rows and let renderFolderTree re-inject
+  // the phantom.
+  if (newPhantomNeeded) {
+    renderFolderTree(realFolders);
+    return;
+  }
+  var statuses = statusResult.statuses;
+  document.querySelectorAll('#folderTree .tree-item[data-folder-id]').forEach(function(row) {
+    var slot = row.querySelector('.folder-local-status-slot');
+    if (slot) slot.innerHTML = folderLocalStatusMarkup(statuses[Number(row.dataset.folderId)]);
+  });
+}
+
+window.addEventListener('vireo:local-folder-status-changed', function() {
+  refreshFolderLocalStatusIndicators();
+});
 
 function toggleTree(e, el) {
   e.stopPropagation();
@@ -4036,6 +4419,16 @@ async function refreshBrowseAfterFolderHealthChange(detail) {
       }));
     }, 2000 * Math.pow(2, retryAttempt));
     return;
+  }
+  // Folder health can change which visible ancestor represents a hidden
+  // local session. Refresh the authoritative local-folder payload after the
+  // fresh tree has rendered so recovery badges move to the correct ancestor
+  // (or synthesize a top-level row) immediately. Encoding folder health in
+  // the 15-second blocker fingerprint either misses non-mapped ancestors or
+  // makes that lightweight polling payload grow with catalog size.
+  if (window.vireoLocalFolders &&
+      typeof window.vireoLocalFolders.load === 'function') {
+    window.vireoLocalFolders.load();
   }
   // Use the health-owned response rather than the DOM. A later unrelated
   // loadFolders() call may supersede this render while still being in flight;
@@ -4744,6 +5137,37 @@ async function saveCollection() {
 }
 
 /* ---------- Photo Loading ---------- */
+
+/* Browse's grid window is four variables that only make sense together:
+   ``photos``, ``currentPage``, ``earliestPage`` and ``allLoaded`` describe one
+   contiguous slice of one dataset. Any async path that writes them has to
+   prove, after every await, that no newer load has taken the window over in
+   the meantime — otherwise a response from an abandoned dataset paints into a
+   window that has since changed (unscoped workspace rows appended to a
+   folder-scoped grid, an ``earliestPage`` banner counting photos from a
+   dataset that is no longer on screen). ``loadEpoch`` is that generation
+   counter; these two helpers are the only supported way to use it, so every
+   guard is written the same way instead of re-deriving the comparison at each
+   call site (Codex reviews r3792693920 and r3792769108).
+
+     claimBrowseWindow()   — take ownership. Advances loadEpoch, which
+                             invalidates every load already in flight. Use
+                             when about to replace the dataset: reset, folder
+                             switch, deep link, bootstrap.
+     observeBrowseWindow() — follow the current owner without displacing it.
+                             Use when extending a window somebody else already
+                             claimed (loadPhotos appending the next page).
+
+   Both return a zero-arg predicate; call it after each await, before touching
+   window state, releasing ``loading``, or rendering. */
+function claimBrowseWindow() {
+  return observeBrowseWindow(++loadEpoch);
+}
+function observeBrowseWindow(epoch) {
+  var claimedEpoch = (epoch === undefined) ? loadEpoch : epoch;
+  return function() { return loadEpoch === claimedEpoch; };
+}
+
 async function resetAndLoad(options) {
   var preserveAnchor = !!(options && options.preserveAnchor);
   // Callers that need the current collection scope to survive a reset
@@ -4757,7 +5181,9 @@ async function resetAndLoad(options) {
   photos = [];
   currentPage = 1;
   allLoaded = false;
-  var resetLoadEpoch = ++loadEpoch;
+  earliestPage = 1;
+  updatePreviousPhotosButton();
+  var resetWindowIsCurrent = claimBrowseWindow();
   selectAllRequestSeq++;
   loading = false;
   // Dataset is about to change; any prior selection (multi-select Set or
@@ -4780,7 +5206,7 @@ async function resetAndLoad(options) {
   document.getElementById('gridContainer').scrollTop = 0;
 
   function resetRequestIsCurrent() {
-    if (resetLoadEpoch !== loadEpoch) return false;
+    if (!resetWindowIsCurrent()) return false;
     if (activeCollectionId == null) return true;
     if (dashboardCollectionScope) return true;
     // Explicitly preserved collection: the reset is still current as long as
@@ -4849,11 +5275,52 @@ function buildCurrentBrowseParams() {
   return params;
 }
 
+/* How many photos of the current dataset sit before ``photos[0]``. Normally 0
+   — Browse loads a contiguous prefix — but a ?photo_id=... deep link starts at
+   the target's page, so everything that reasons about how much of the dataset
+   is on screen (tail runway, allLoaded gate, position readout) has to add it
+   back. */
+function loadedWindowOffset() {
+  return Math.max(0, (earliestPage - 1) * perPage);
+}
+
+function updatePreviousPhotosButton() {
+  var banner = document.getElementById('loadPreviousPhotosBanner');
+  if (!banner) return;
+  var offset = loadedWindowOffset();
+  if (earliestPage <= 1 || offset <= 0) {
+    banner.style.display = 'none';
+    return;
+  }
+  var textEl = document.getElementById('loadPreviousPhotosText');
+  if (textEl) {
+    textEl.textContent = offset === 1
+      ? '1 earlier photo isn’t loaded — this grid starts at #2.'
+      : offset.toLocaleString() + ' earlier photos aren’t loaded — ' +
+        'this grid starts at #' + (offset + 1).toLocaleString() + '.';
+  }
+  banner.style.display = 'block';
+}
+
+async function loadPreviousPhotos() {
+  if (loading || earliestPage <= 1) return false;
+  // Do not prepend an offset page read from a newer database snapshot to the
+  // focused page. Ingestion/deletion between those requests can overlap or
+  // skip the boundary. Restarting at page 1 hands control back to the normal
+  // contiguous lazy loader while keeping this user-requested transition
+  // bounded to one configured-size page.
+  earliestPage = 1;
+  updatePreviousPhotosButton();
+  return resetAndLoad();
+}
+
 async function loadPhotos(options) {
   if (loading) return null;
   if (allLoaded) return true;
   loading = true;
-  var epoch = loadEpoch;
+  // Extends the window its caller (resetAndLoad / bootstrap / deep link /
+  // the intersection observer) already owns — observe, never claim.
+  var windowIsCurrent = observeBrowseWindow();
   var loadSucceeded = false;
   var showLoading = !(options && options.silent) && photos.length === 0;
   var loadingState = document.getElementById('loadingState');
@@ -4907,7 +5374,7 @@ async function loadPhotos(options) {
 
   try {
     var data = await safeFetch(url, fetchOptions);
-    if (epoch !== loadEpoch) return null;  // grid was reset mid-flight; drop stale response
+    if (!windowIsCurrent()) return null;  // grid was reset mid-flight; drop stale response
     totalPhotos = data.total;
     if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalPhotos);
     if (window.VireoFilter && VireoFilter.setVisualInfo) {
@@ -4923,7 +5390,10 @@ async function loadPhotos(options) {
     } else {
       photos = photos.concat(data.photos);
       currentPage += chunk;
-      if (photos.length >= totalPhotos) allLoaded = true;
+      // A deep-link window starts partway in, so it is exhausted when it
+      // reaches the end of the dataset — not when it holds ``totalPhotos``
+      // rows, which it never would.
+      if (loadedWindowOffset() + photos.length >= totalPhotos) allLoaded = true;
     }
 
     if (firstNewIdx === 0) renderGrid();
@@ -4938,20 +5408,20 @@ async function loadPhotos(options) {
     if (data.photos.length > 0) {
       var refreshIds = data.photos.map(function(p) { return p.id; });
       loadInatStatus(refreshIds).then(function() {
-        if (epoch === loadEpoch) refreshGridCards(refreshIds);
+        if (windowIsCurrent()) refreshGridCards(refreshIds);
       });
       fetchColorLabels(refreshIds).then(function() {
-        if (epoch === loadEpoch) refreshGridCards(refreshIds);
+        if (windowIsCurrent()) refreshGridCards(refreshIds);
       });
     }
     loadSucceeded = true;
   } catch(e) {
-    if (epoch !== loadEpoch) return null;
+    if (!windowIsCurrent()) return null;
     if (showLoading && loadingState) {
       loadingState.textContent = 'Error loading photos.';
     }
   } finally {
-    if (epoch === loadEpoch) {
+    if (windowIsCurrent()) {
       loading = false;
       if (showLoading && loadingState) loadingState.style.display = 'none';
       // Re-check the scan depth live (not a load-start snapshot): a stale
@@ -5269,6 +5739,7 @@ function reloadBrowseResults(options) {
 
 function updateScrollPosition() {
   var el = document.getElementById('filterSummary');
+  var positionOffset = loadedWindowOffset();
   if (photos.length === 0) {
     el.textContent = totalPhotos + ' photos';
     return;
@@ -5290,8 +5761,14 @@ function updateScrollPosition() {
   if (lastCard.offsetTop + lastCard.offsetHeight < scrollTop) {
     var frac = Math.min(1, (scrollTop + viewHeight / 2) / Math.max(1, container.scrollHeight));
     var skeletonCount = document.querySelectorAll('#gridTail .skel-card').length;
-    var representedPhotos = Math.min(totalPhotos, photos.length + skeletonCount);
-    var approx = Math.max(1, Math.min(representedPhotos, Math.round(frac * representedPhotos)));
+    var representedPhotos = Math.min(
+      totalPhotos - positionOffset,
+      photos.length + skeletonCount
+    );
+    var approx = positionOffset + Math.max(
+      1,
+      Math.min(representedPhotos, Math.round(frac * representedPhotos))
+    );
     el.textContent = '≈' + approx.toLocaleString() + ' of ' + totalPhotos.toLocaleString();
     return;
   }
@@ -5310,7 +5787,8 @@ function updateScrollPosition() {
       break;
     }
   }
-  el.textContent = first + '–' + last + ' of ' + totalPhotos.toLocaleString();
+  el.textContent = (positionOffset + first) + '–' +
+    (positionOffset + last) + ' of ' + totalPhotos.toLocaleString();
 }
 
 /* ---------- iNaturalist ---------- */
@@ -5568,7 +6046,7 @@ async function selectAllMatchingPhotos() {
   selectedPhotoId = null;
   selectedIndex = -1;
   var requestSeq = ++selectAllRequestSeq;
-  var requestEpoch = loadEpoch;
+  var windowIsCurrent = observeBrowseWindow();
 
 
   var url;
@@ -5596,7 +6074,7 @@ async function selectAllMatchingPhotos() {
   showToast('Selecting all matching photos...');
   try {
     var data = await safeFetch(url, fetchOpts, { toast: false });
-    if (requestSeq !== selectAllRequestSeq || requestEpoch !== loadEpoch) return;
+    if (requestSeq !== selectAllRequestSeq || !windowIsCurrent()) return;
     selectedPhotos.clear();
     (data.photo_ids || data.ids || []).forEach(function(id) { selectedPhotos.add(id); });
     renderGrid();
@@ -5856,6 +6334,7 @@ function updateSelectionPanel(ids) {
     selectionPredictionSeq++;
     var predList = document.getElementById('selectionPredictions');
     if (predList) predList.innerHTML = '';
+    renderSelectionWildlifeState([]);
     if (wasVisible && selectedPhotoId) {
       loadDetail(selectedPhotoId);
     } else if (wasVisible) {
@@ -5881,6 +6360,7 @@ function updateSelectionPanel(ids) {
   panel.classList.remove('hidden');
   document.getElementById('selectionCount').textContent = ids.length.toLocaleString() + ' photos selected';
   updatePasteEditSection(ids);
+  renderSelectionWildlifeState(ids);
   // Keep any EXIF suggestion fetched for the anchor photo: Accept is
   // batch-aware (_locationApplyPhotoIds), so growing the selection is the
   // designed way to apply one suggestion to many photos.
@@ -6859,7 +7339,20 @@ function renderSelectionKeywordSuggestions(keywords, selectedCount) {
   selectionKeywordMissingById = {};
   selectionKeywordPresentById = {};
   selectionKeywordNameById = {};
+  var groupDefinitions = [
+    { type: 'taxonomy', label: 'Species' },
+    { type: 'location', label: 'Locations' },
+    { type: 'individual', label: 'Individuals' },
+    { type: 'genre', label: 'Genres' },
+    { type: 'general', label: 'Keywords' }
+  ];
+  var keywordsByType = {};
   keywords.forEach(function(k) {
+    var type = k.type || 'general';
+    if (!keywordsByType[type]) keywordsByType[type] = [];
+    keywordsByType[type].push(k);
+  });
+  function renderKeywordRow(k) {
     var missing = k.missing_count || 0;
     var count = k.count || 0;
     selectionKeywordMissingById[String(k.id)] = k.missing_photo_ids || [];
@@ -6872,15 +7365,125 @@ function renderSelectionKeywordSuggestions(keywords, selectedCount) {
     if (count > 0) {
       actions += '<button class="selection-keyword-remove" onclick="removeSelectionKeyword(' + k.id + ')" title="Remove this keyword from selected photos that have it">Remove from ' + count + '</button>';
     }
-    html += '<div class="selection-keyword-row">' +
+    return '<div class="selection-keyword-row">' +
       '<div style="min-width:0;">' +
         '<div class="selection-keyword-name">' + escapeHtml(k.name) + '</div>' +
         '<div class="selection-keyword-meta">On ' + count + ' of ' + selectedCount + (missing ? ', missing from ' + missing : '') + '</div>' +
       '</div>' +
       '<div class="selection-keyword-actions">' + actions + '</div>' +
-    '</div>';
+      '</div>';
+  }
+  groupDefinitions.forEach(function(group) {
+    var rows = keywordsByType[group.type] || [];
+    if (!rows.length) return;
+    html += '<div class="selection-keyword-group" data-keyword-type="' + group.type + '">' +
+      '<div class="selection-keyword-group-title">' + group.label + '</div>' +
+      '<div class="selection-keyword-group-rows">' + rows.map(renderKeywordRow).join('') + '</div>' +
+      '</div>';
   });
   list.innerHTML = html;
+}
+
+var selectionWildlifeRequestSeq = 0;
+
+async function renderSelectionWildlifeState(ids) {
+  var status = document.getElementById('selectionWildlifeStatus');
+  var actions = document.getElementById('selectionWildlifeActions');
+  if (!status || !actions) return;
+  if (!ids || !ids.length) {
+    selectionWildlifeRequestSeq++;
+    status.textContent = '';
+    actions.innerHTML = '';
+    return;
+  }
+  // Derive counts from the full selection, not from the loaded grid:
+  // "Select all matching" can include off-page photos that are absent from
+  // ``photos``, and filtering client-side would omit them from the counts
+  // and hide batch controls that should still be available.
+  var seq = ++selectionWildlifeRequestSeq;
+  var data;
+  try {
+    data = await safeFetch('/api/selection/wildlife-state', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({photo_ids: ids}),
+    }, { toast: false });
+  } catch (e) {
+    if (seq === selectionWildlifeRequestSeq) {
+      status.textContent = '';
+      actions.innerHTML = '';
+    }
+    return;
+  }
+  if (seq !== selectionWildlifeRequestSeq) return;
+  var includedCount = (data && data.included_count) || 0;
+  var excludedCount = (data && data.excluded_count) || 0;
+  var selectedCount = (data && data.selected_count) || 0;
+  var missingCount = (data && data.missing_count) || 0;
+  if (!selectedCount && !missingCount) {
+    status.textContent = '';
+    actions.innerHTML = '';
+    return;
+  }
+  var statusText;
+  if (!selectedCount) {
+    statusText = '';
+  } else if (excludedCount === 0) {
+    statusText = 'All accessible photos are included in wildlife processing.';
+  } else if (includedCount === 0) {
+    statusText = 'All accessible photos are excluded from wildlife processing.';
+  } else {
+    statusText = includedCount + ' included · ' + excludedCount + ' excluded';
+  }
+  // Surface missing IDs the same way the state endpoint reports them so
+  // the panel never implies its counts cover the full user selection when
+  // some photos are unavailable in the active workspace.
+  if (missingCount > 0) {
+    var missingText = missingCount + ' unavailable in this workspace';
+    statusText = statusText ? statusText + ' · ' + missingText : missingText;
+  }
+  status.textContent = statusText;
+  var html = '';
+  if (includedCount > 0) {
+    html += '<button class="selection-keyword-remove" onclick="setSelectionWildlifeExcluded(true)">Exclude ' + includedCount + '</button>';
+  }
+  if (excludedCount > 0) {
+    html += '<button class="selection-keyword-add" onclick="setSelectionWildlifeExcluded(false)">Include ' + excludedCount + '</button>';
+  }
+  actions.innerHTML = html;
+}
+
+async function setSelectionWildlifeExcluded(excluded) {
+  var ids = getActiveSelection();
+  if (!ids.length) return;
+  var data;
+  try {
+    data = await safeFetch('/api/batch/wildlife-excluded', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({photo_ids: ids, excluded: excluded}),
+    });
+  } catch (e) { return; }
+  var changed = new Set((data && data.photo_ids) || ids);
+  photos.forEach(function(photo) {
+    if (changed.has(photo.id)) photo.wildlife_excluded = excluded ? 1 : 0;
+  });
+  refreshGridCards(ids);
+  // The selection may have changed while the batch request was in flight.
+  // Refresh the current selection so this completion cannot supersede a
+  // newer state request with counts and actions for the old photo ids.
+  renderSelectionWildlifeState(getActiveSelection());
+  scheduleCollectionCountsRefresh();
+  refreshActiveCollectionAfterMembershipChange();
+  // The batch endpoint skips missing/out-of-workspace IDs instead of
+  // rejecting the whole selection; tell the user how many were skipped
+  // so a partial apply is never invisible.
+  var skipped = (data && data.skipped_count) || 0;
+  if (skipped > 0 && typeof showToast === 'function') {
+    showToast('Skipped ' + skipped + ' photo' + (skipped === 1 ? '' : 's') +
+              ' not accessible in this workspace.', 'warning');
+  }
+  showUndoToast();
 }
 
 async function applySelectionKeyword(keywordId) {
@@ -9894,6 +10497,7 @@ async function _runPhotoDeepLink(photoId) {
   // Prevent the IntersectionObserver from triggering loadPhotos() while deep-link is loading
   loading = true;
   var deepLinkLoaded = false;
+  var isDeepLinkDatasetCurrent = null;
   try {
     applyBrowseConfig(await _cfgPromise);
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
@@ -9908,6 +10512,18 @@ async function _runPhotoDeepLink(photoId) {
       return wasSuperseded;
     }
 
+    // Take ownership of the grid window BEFORE clearing it. A sort change or
+    // folder click that happened while /api/photos/<id> was pending already
+    // ran resetAndLoad(), which advanced loadEpoch and started its own
+    // loadPhotos(). Merely snapshotting the epoch that reset installed would
+    // leave that in-flight load valid: it would land after this deep link had
+    // claimed the target folder and append its unscoped workspace rows into
+    // the folder-scoped grid (and, once earliestPage is set below, leave the
+    // "N earlier photos aren't loaded" banner counting against a dataset that
+    // is no longer on screen). Claiming discards every load started before
+    // this point (Codex review r3792769108).
+    var deepLinkWindowIsCurrent = claimBrowseWindow();
+
     // Navigate to the photo's folder
     activeFolderId = photo.folder_id;
     activeKeyword = null;
@@ -9916,6 +10532,8 @@ async function _runPhotoDeepLink(photoId) {
     photos = [];
     currentPage = 1;
     allLoaded = false;
+    earliestPage = 1;
+    updatePreviousPhotosButton();
     // Same hazard as filterByCollection: leaving selectedPhotos populated
     // across a dataset switch leaves the batch bar armed against stale ids.
     selectedPhotos.clear();
@@ -9924,14 +10542,34 @@ async function _runPhotoDeepLink(photoId) {
     closeDetail();
     document.getElementById('grid').innerHTML = '';
 
-    // Load pages until the target photo is found or all pages exhausted
-    // (bootstrapBrowse was skipped, so we also need folder/keyword trees)
+    // A folder click, sort change, or filter edit calls resetAndLoad(), which
+    // advances loadEpoch (and scope changes also advance browseScopeGen).
+    // Snapshot the scope generation alongside the window claim above so a
+    // later user selection cannot be overwritten by this deep-link response.
+    var deepLinkScopeGen = browseScopeGen;
+    var deepLinkFolderId = photo.folder_id;
+    var deepLinkSort = document.getElementById('sortSelect').value;
+    isDeepLinkDatasetCurrent = function() {
+      return deepLinkWindowIsCurrent() &&
+        browseScopeGen === deepLinkScopeGen &&
+        activeFolderId === deepLinkFolderId &&
+        document.getElementById('sortSelect').value === deepLinkSort;
+    };
+
+    // bootstrapBrowse was skipped, so load the target folder's first page and
+    // the shared folder/keyword/collection trees before locating the photo.
     var missingSnapshotVersionAtInitStart =
       typeof _missingFoldersSnapshotVersion !== 'undefined'
         ? _missingFoldersSnapshotVersion
         : null;
-    var initData = await safeFetch('/api/browse/init?folder_id=' + photo.folder_id + '&per_page=' + perPage + '&sort=' + document.getElementById('sortSelect').value, {}, { toast: false });
+    var initParams = new URLSearchParams();
+    initParams.set('folder_id', photo.folder_id);
+    initParams.set('per_page', perPage);
+    initParams.set('sort', deepLinkSort);
+    initParams.set('focus_photo_id', photoId);
+    var initData = await safeFetch('/api/browse/init?' + initParams.toString(), {}, { toast: false });
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
+    if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
     if (initData) {
       // Seed the navbar's missing-folder snapshot from init's workspace-scoped
       // view so the first /api/folders/missing observation has a baseline to
@@ -9954,6 +10592,7 @@ async function _runPhotoDeepLink(photoId) {
           'deep-link-reconcile',
           initData.folder_health_version);
         if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
+        if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
       }
       renderFolderTree(initData.folders || []);
       renderKeywordTree(initData.keywords || []);
@@ -9961,24 +10600,35 @@ async function _runPhotoDeepLink(photoId) {
       loadCollectionCounts();
       photos = initData.photos || [];
       totalPhotos = initData.total || 0;
-      currentPage = 2;
-      if (photos.length >= totalPhotos) allLoaded = true;
+      var focusPage = parseInt(initData.focus_page, 10);
+      var hasFocusPage = Number.isInteger(focusPage) && focusPage >= 1;
+      earliestPage = hasFocusPage ? focusPage : 1;
+      currentPage = hasFocusPage ? focusPage + 1 : 2;
+      if (loadedWindowOffset() + photos.length >= totalPhotos) allLoaded = true;
       renderGrid();
+      updatePreviousPhotosButton();
       browseDatasetReady = true;
       document.getElementById('loadingState').style.display = 'none';
       deepLinkLoaded = true;
     }
 
-    // Keep loading pages until we find the photo or run out. The setup guard
-    // above intentionally blocks IntersectionObserver-driven loads, but
-    // loadPhotos() also honors it; clear it before this explicit paging pass
-    // or a target beyond the first page spins in a resolved Promise loop.
-    // Same freshness guard as above — don't release ``loading`` if a health
-    // refresh took ownership while init was in flight.
+    // The focused init response normally includes the bounded page containing
+    // the target from one SQLite read snapshot. Later pages remain lazy so a
+    // deep target cannot force Browse to render every preceding card. Fall
+    // back to the old serial scan for compatibility or if the target vanished.
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
-    loading = false;
-    var el = await loadUntilPhotoRendered(photoId);
+    if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
+    var el = getGridCard(photoId);
+    if (!el) {
+      // loadPhotos() honors the setup guard, so release it before the explicit
+      // compatibility/reconciliation scan or it would return immediately.
+      loading = false;
+      el = await loadUntilPhotoRendered(photoId, function() {
+        return isDeepLinkHealthCurrent() && isDeepLinkDatasetCurrent();
+      });
+    }
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
+    if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
 
     // Update folder tree active state
     document.querySelectorAll('#folderTree .tree-item').forEach(function(el) {
@@ -10033,7 +10683,8 @@ async function _runPhotoDeepLink(photoId) {
   // ``loading`` here would let a second page-1 request race against the
   // same loadEpoch, producing duplicate cards and off-by-one pagination
   // (Codex review r3686696351).
-  if (isDeepLinkHealthCurrent()) {
+  if (isDeepLinkHealthCurrent() &&
+      (!isDeepLinkDatasetCurrent || isDeepLinkDatasetCurrent())) {
     loading = false;
     if (deepLinkLoaded) {
       rearmInfiniteScrollObserver();

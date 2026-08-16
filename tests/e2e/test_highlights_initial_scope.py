@@ -174,6 +174,7 @@ def test_highlights_best_ui_is_advanced_only(live_server, page):
         """() => {
             localStorage.setItem('vireo_advanced_mode', 'false');
             localStorage.setItem('vireo_dev_mode', 'false');
+            localStorage.setItem('vireo.highlights.sort', 'worst');
         }"""
     )
     _goto_highlights(page, live_server["url"])
@@ -188,6 +189,7 @@ def test_highlights_best_ui_is_advanced_only(live_server, page):
     assert page.locator("#sortSelect option[value='worst']").evaluate(
         "el => el.hidden && el.disabled"
     )
+    expect(page.locator("#sortSelect")).to_have_value("best")
 
     page.evaluate(
         """() => {
@@ -206,6 +208,32 @@ def test_highlights_best_ui_is_advanced_only(live_server, page):
     )
     assert page.locator("#sortSelect option[value='worst']").evaluate(
         "el => !el.hidden && !el.disabled"
+    )
+
+
+def test_highlights_sort_preference_persists_across_navigation(live_server, page):
+    db = live_server["db"]
+    data = live_server["data"]
+    _seed_quality_scores_and_species(db, data)
+
+    _goto_highlights(page, live_server["url"])
+    expect(page.locator(".highlights-card").first).to_be_visible(timeout=5000)
+
+    page.locator("#sortSelect").select_option("species_desc")
+    page.locator("#perRowSlider").fill("8")
+    expect(page.locator("section.bucket .bucket-title").first).to_contain_text(
+        "Red-tailed Hawk"
+    )
+
+    page.goto(f"{live_server['url']}/")
+    _goto_highlights(page, live_server["url"])
+    expect(page.locator(".highlights-card").first).to_be_visible(timeout=5000)
+
+    expect(page.locator("#sortSelect")).to_have_value("species_desc")
+    expect(page.locator("#perRowSlider")).to_have_value("8")
+    expect(page.locator("#perRowValue")).to_have_text("8")
+    expect(page.locator("section.bucket .bucket-title").first).to_contain_text(
+        "Red-tailed Hawk"
     )
 
 

@@ -170,7 +170,10 @@ def execute_import(
                 if not keyword_match_key(kw_name):
                     continue
                 kid = db.add_keyword(kw_name)
-                db.tag_photo(photo["id"], kid)
+                # Lightroom catalog metadata was explicitly authored outside
+                # Vireo. Keep that provenance on the association even when
+                # write_xmp=False leaves no sidecar or pending change.
+                db.tag_photo(photo["id"], kid, source="manual")
 
             # Import hierarchical keywords. Skip an entry whose chain
             # contains any segment that normalizes to `""` — the resulting
@@ -184,7 +187,7 @@ def execute_import(
                 for part in parts:
                     kid = db.add_keyword(part, parent_id=parent_id)
                     parent_id = kid
-                db.tag_photo(photo["id"], parent_id)
+                db.tag_photo(photo["id"], parent_id, source="manual")
 
             # Write XMP if requested. Build normalized keyword sets so the
             # sidecar matches what we stored/tagged in the DB above:

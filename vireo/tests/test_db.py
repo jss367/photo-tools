@@ -677,6 +677,32 @@ def test_pending_changes_queue(tmp_path):
     assert len(db.get_pending_changes()) == 0
 
 
+def test_clear_pending_chunks_large_change_sets(tmp_path):
+    """Clearing a large sync batch stays below SQLite's bind limit."""
+    from db import _SQLITE_PARAM_CHUNK_SIZE, Database
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder('/photos', name='photos')
+    pid = db.add_photo(
+        folder_id=fid, filename='a.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+    )
+    total = _SQLITE_PARAM_CHUNK_SIZE + 5
+    db.conn.executemany(
+        """INSERT INTO pending_changes
+           (photo_id, change_type, value, change_token, workspace_id)
+           VALUES (?, 'rating', '4', ?, ?)""",
+        [(pid, f"change-{idx}", ws_id) for idx in range(total)],
+    )
+    db.conn.commit()
+    change_ids = [row["id"] for row in db.get_pending_changes()]
+
+    db.clear_pending(change_ids)
+
+    assert len(db.get_pending_changes()) == 0
+
+
 def test_get_photos_keyword_search(tmp_path):
     """get_photos can filter by keyword name."""
     from db import Database
@@ -1239,7 +1265,7 @@ def test_default_needs_identification_excludes_not_wildlife(tmp_path, monkeypatc
     identified = db.add_photo(folder_id=fid, filename='identified.jpg',
                               extension='.jpg', file_size=100, file_mtime=1.0)
     db.update_photo_wildlife_excluded(not_wildlife, True)
-    genre_kid = db.add_keyword("Wildlife", kw_type="genre")
+    genre_kid = db.add_keyword("Landscape", kw_type="genre")
     db.tag_photo(identified, genre_kid)
 
     db.create_default_collections()
@@ -2436,6 +2462,39 @@ def test_merge_keyword_into_transfers_coords_with_place_id(tmp_path):
         db.close()
 
 
+def test_merge_keyword_into_preserves_manual_association_source(tmp_path):
+    """A duplicate collapse must not discard durable manual provenance."""
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    both = db.add_photo(
+        folder_id=fid, filename="both.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    source_only = db.add_photo(
+        folder_id=fid, filename="source.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    keep_id = db.add_keyword("Wildlife", kw_type="genre")
+    merge_id = db.add_keyword("wildlife duplicate", kw_type="genre")
+    db.tag_photo(both, keep_id)
+    db.tag_photo(both, merge_id, source="manual")
+    db.tag_photo(source_only, merge_id, source="manual")
+
+    db._merge_keyword_into(merge_id, keep_id)
+    db.conn.commit()
+
+    rows = db.conn.execute(
+        "SELECT photo_id, source FROM photo_keywords WHERE keyword_id = ?",
+        (keep_id,),
+    ).fetchall()
+    assert {row["photo_id"]: row["source"] for row in rows} == {
+        both: "manual",
+        source_only: "manual",
+    }
+
+
 def test_place_upsert_repairs_adjacent_location_ancestors_on_demand(
     tmp_path,
 ):
@@ -3427,7 +3486,9 @@ def test_default_genre_keywords_inserted(tmp_path):
     rows = db.conn.execute(
         "SELECT name FROM keywords WHERE type = 'genre' ORDER BY name"
     ).fetchall()
-    assert [r["name"] for r in rows] == ["Abstract", "Architecture", "Landscape", "Sunset", "Wildlife"]
+    assert [r["name"] for r in rows] == [
+        "Abstract", "Architecture", "Landscape", "Sunset",
+    ]
 
 
 def test_default_genre_keywords_idempotent(tmp_path):
@@ -3439,7 +3500,7 @@ def test_default_genre_keywords_idempotent(tmp_path):
     n = db.conn.execute(
         "SELECT COUNT(*) AS n FROM keywords WHERE type = 'genre'"
     ).fetchone()["n"]
-    assert n == 5
+    assert n == 4
 
 
 def test_all_photos_collection_returns_all_photos(tmp_path):
@@ -3529,11 +3590,10 @@ def test_get_dashboard_stats_with_data(tmp_path):
 
     stats = db.get_dashboard_stats()
 
-    # top_keywords: Robin with 2 photos. Wildlife is auto-added by the
-    # first-species rule, so it also appears with 2 photos.
+    # top_keywords: only the explicit Robin taxonomy term is stored.
     by_name = {k['name']: k['photo_count'] for k in stats['top_keywords']}
     assert by_name.get('Robin') == 2
-    assert by_name.get('Wildlife') == 2
+    assert 'Wildlife' not in by_name
 
     # photos_by_month: 2 in 2024-06, 1 in 2024-07
     months = {r['month']: r['count'] for r in stats['photos_by_month']}
@@ -5974,17 +6034,24 @@ def test_undo_last_edit_flag(tmp_path):
 
 
 def test_undo_last_edit_keyword_add(tmp_path):
-    """undo_last_edit removes keyword that was added."""
+    """Undo removes a manual add; redo restores its durable provenance."""
     db, pids = _make_db_with_photos(tmp_path)
     pid = pids[0]
     kid = db.add_keyword('Eagle')
-    db.tag_photo(pid, kid)
+    db.tag_photo(pid, kid, source="manual")
     db.record_edit('keyword_add', 'Added keyword "Eagle"', str(kid),
                    [{'photo_id': pid, 'old_value': '', 'new_value': str(kid)}])
 
     db.undo_last_edit()
     keywords = db.get_photo_keywords(pid)
     assert not any(k['name'] == 'Eagle' for k in keywords)
+
+    db.redo_last_undo()
+    source = db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (pid, kid),
+    ).fetchone()
+    assert source["source"] == "manual"
 
 
 def test_undo_last_edit_keyword_remove(tmp_path):
@@ -6001,6 +6068,11 @@ def test_undo_last_edit_keyword_remove(tmp_path):
     db.undo_last_edit()
     keywords = db.get_photo_keywords(pid)
     assert any(k['id'] == kid for k in keywords)
+    source = db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (pid, kid),
+    ).fetchone()
+    assert source["source"] == "manual"
 
 
 def test_undo_last_edit_batch(tmp_path):
@@ -8716,6 +8788,97 @@ def test_pairing_redirects_classifier_runs_so_cache_gate_still_hits(tmp_path):
         "SELECT 1 FROM classifier_runs WHERE detection_id = ?", (old_det_id,),
     ).fetchone()
     assert stale is None, "stale classifier_runs row must not survive"
+
+
+def test_get_classifier_run_key_gate_splits_accepted_and_rejected(tmp_path):
+    """Regression for Codex P2 on PR #1468: the classify preflight
+    (``count_classifier_runs``) counts every existing classifier_runs
+    row for a photo, but the runtime gate
+    (``get_classifier_run_keys(..., runtime_fingerprint=X)``) filters
+    out rows whose runtime_fingerprint no longer matches. Without
+    ``get_classifier_run_key_gate`` surfacing the rejected-by-gate rows,
+    the pipeline can't reconcile the two views and ``_classification_eta_progress``
+    prematurely collapses ``remaining_uncached`` to zero.
+    """
+    db, pids = _make_workspace_with_photos(tmp_path, [{}])
+    det_id = db.save_detections(pids[0], [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="MDV6")[0]
+
+    # Three rows on the same detection, varying only in
+    # runtime_fingerprint. One matches the expected runtime, one is the
+    # legacy sentinel (grandfathered), one is stale.
+    db.record_classifier_run(
+        det_id, "bioclip", "fp-fresh", prediction_count=1,
+        runtime_fingerprint="rt-current",
+    )
+    db.record_classifier_run(
+        det_id, "bioclip", "fp-legacy", prediction_count=1,
+        runtime_fingerprint="legacy",
+    )
+    db.record_classifier_run(
+        det_id, "bioclip", "fp-stale", prediction_count=1,
+        runtime_fingerprint="rt-old",
+    )
+
+    accepted, rejected = db.get_classifier_run_key_gate(
+        det_id, "rt-current",
+    )
+    assert accepted == {("bioclip", "fp-fresh"), ("bioclip", "fp-legacy")}
+    assert rejected == {("bioclip", "fp-stale")}, (
+        "Rows whose runtime_fingerprint the gate rejects must surface as "
+        "``rejected`` so the pipeline can decrement its cache_est projection."
+    )
+
+    # None argument short-circuits: the reclassify path bypasses the gate
+    # entirely, so returning two empty sets is the safe no-op.
+    accepted_none, rejected_none = db.get_classifier_run_key_gate(
+        det_id, None,
+    )
+    assert accepted_none == set() and rejected_none == set()
+
+
+def test_get_classifier_run_key_gate_honors_individual_review_override(tmp_path):
+    """A stale runtime_fingerprint must still be ``accepted`` when the
+    prediction carries a real (non-auto-match) review — that mirrors
+    ``get_classifier_run_keys``'s EXISTS clause and prevents the fix
+    from re-running inference on reviewed rows the operator has
+    already blessed.
+    """
+    db, pids = _make_workspace_with_photos(tmp_path, [{}])
+    ws_id = db._ws_id()
+    det_id = db.save_detections(pids[0], [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="MDV6")[0]
+
+    db.record_classifier_run(
+        det_id, "bioclip", "fp-reviewed", prediction_count=1,
+        runtime_fingerprint="rt-old",
+    )
+    db.add_prediction(
+        det_id, species="Robin", confidence=0.9,
+        model="bioclip", labels_fingerprint="fp-reviewed",
+    )
+    pred_id = db.conn.execute(
+        """SELECT id FROM predictions
+            WHERE detection_id = ? AND classifier_model = ?
+              AND labels_fingerprint = ?""",
+        (det_id, "bioclip", "fp-reviewed"),
+    ).fetchone()["id"]
+    db.set_review_status(
+        pred_id, ws_id, "accepted", individual="Robin the First",
+    )
+
+    accepted, rejected = db.get_classifier_run_key_gate(
+        det_id, "rt-current",
+    )
+    assert accepted == {("bioclip", "fp-reviewed")}, (
+        "A reviewed prediction should keep its classifier_runs row in "
+        "``accepted`` even when runtime_fingerprint has drifted."
+    )
+    assert rejected == set()
 
 
 def test_pairing_preserves_review_when_duplicate_prediction_collapses(tmp_path):
@@ -14176,9 +14339,8 @@ def test_filter_out_subject_tagged_ignores_legacy_is_species_when_taxonomy_exclu
     )
 
 
-def test_tag_photo_with_first_taxonomy_keyword_adds_wildlife_genre(tmp_path):
-    """Tagging a photo with its first taxonomy keyword auto-adds the
-    Wildlife genre keyword."""
+def test_tag_photo_with_taxonomy_keyword_does_not_add_wildlife_genre(tmp_path):
+    """A species association is complete without a redundant Wildlife tag."""
     from db import Database
     db = Database(str(tmp_path / "test.db"))
     db.set_active_workspace(db.create_workspace("ws"))
@@ -14189,7 +14351,6 @@ def test_tag_photo_with_first_taxonomy_keyword_adds_wildlife_genre(tmp_path):
 
     db.tag_photo(p1, species_kid)
 
-    # Photo should now have BOTH the species keyword AND Wildlife genre.
     rows = db.conn.execute(
         """SELECT k.name, k.type FROM photo_keywords pk
            JOIN keywords k ON k.id = pk.keyword_id
@@ -14198,144 +14359,1215 @@ def test_tag_photo_with_first_taxonomy_keyword_adds_wildlife_genre(tmp_path):
         (p1,),
     ).fetchall()
     by_name = {r["name"]: r["type"] for r in rows}
-    assert by_name == {
-        "Northern cardinal": "taxonomy",
-        "Wildlife": "genre",
+    assert by_name == {"Northern cardinal": "taxonomy"}
+
+
+def test_database_constructor_defers_wildlife_retirement_to_app_startup(
+    tmp_path, monkeypatch,
+):
+    """Background database handles must not retry unavailable sidecars."""
+    from db import Database
+
+    attempts = []
+    monkeypatch.setattr(
+        Database,
+        "retire_builtin_wildlife_genre",
+        lambda self, force=False: attempts.append(force),
+    )
+
+    Database(str(tmp_path / "test.db"))
+
+    assert attempts == []
+
+
+def test_retire_builtin_wildlife_detaches_associations_and_queues_flat_removal(tmp_path):
+    """Upgrade cleanup removes the redundant tag without touching hierarchy."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder('/photos', name='photos')
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(folder_id=fid, filename='p1.jpg', extension='.jpg', file_size=100, file_mtime=1.0)
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        (p1, wildlife_id, "generated"),
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+    assert db.retire_builtin_wildlife_genre() == 0
+
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is None
+    pending = db.conn.execute(
+        "SELECT change_type, value FROM pending_changes WHERE photo_id = ?",
+        (p1,),
+    ).fetchall()
+    assert [(row["change_type"], row["value"]) for row in pending] == [
+        ("keyword_remove_flat", "Wildlife"),
+    ]
+    assert db.conn.execute(
+        "SELECT 1 FROM keywords WHERE id = ?", (wildlife_id,),
+    ).fetchone() is not None
+
+
+def test_retire_builtin_wildlife_preserves_manual_tag_during_mixed_cleanup(tmp_path):
+    """A standalone Wildlife genre may be user-authored metadata."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    p2 = db.add_photo(
+        folder_id=fid, filename="p2.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p2, species_id)
+    db.conn.executemany(
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        [(p1, wildlife_id, None), (p2, wildlife_id, "generated")],
+    )
+    db.queue_change(p1, "keyword_add", "Wildlife", _commit=False)
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p2, wildlife_id),
+    ).fetchone() is None
+    pending = db.conn.execute(
+        """SELECT change_type, value FROM pending_changes
+           WHERE photo_id = ?""",
+        (p1,),
+    ).fetchall()
+    assert [(row["change_type"], row["value"]) for row in pending] == [
+        ("keyword_add", "Wildlife"),
+    ]
+
+
+def test_retire_builtin_wildlife_preserves_unsynced_manual_add(tmp_path):
+    """A pending add proves Wildlife was explicitly added by the user."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder('/photos', name='photos')
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(folder_id=fid, filename='p1.jpg', extension='.jpg',
+                      file_size=100, file_mtime=1.0)
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        (p1, wildlife_id, "generated"),
+    )
+    db.queue_change(p1, "keyword_add", "Wildlife", _commit=False)
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 0
+
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+    pending = db.conn.execute(
+        """SELECT change_type, value FROM pending_changes
+           WHERE photo_id = ?""",
+        (p1,),
+    ).fetchall()
+    assert [(row["change_type"], row["value"]) for row in pending] == [
+        ("keyword_add", "Wildlife"),
+    ]
+
+
+@pytest.mark.parametrize("nested_survivor", [False, True])
+def test_retire_builtin_wildlife_scopes_pending_add_to_same_name_survivor(
+    tmp_path, nested_survivor,
+):
+    """A name-only pending add must not stamp every homonym as manual.
+
+    The pending-change row does not carry a keyword ID. When a user adds an
+    individual-type Wildlife beside the generated genre, the accompanying
+    edit history identifies the individual exactly; treating the pending name
+    as provenance for the genre would preserve the generated association
+    forever. Retire the genre while leaving the unsynced survivor untouched.
+    """
+    from db import KEYWORD_SOURCE_UNKNOWN, Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    xmp_path = photo_dir / "p1.xmp"
+    write_sidecar(
+        str(xmp_path), flat_keywords=set(), hierarchical_keywords=set(),
+    )
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_path.stat().st_mtime,
+    )
+    genre_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    parent_id = db.add_keyword("Animals") if nested_survivor else None
+    individual_id = db.conn.execute(
+        """INSERT INTO keywords (name, type, parent_id)
+           VALUES ('Wildlife', 'individual', ?)""",
+        (parent_id,),
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    # The generated genre carries no authorship; the individual is the one the
+    # user actually added.
+    db.tag_photo(p1, genre_id, source=KEYWORD_SOURCE_UNKNOWN)
+    db.tag_photo(p1, individual_id)
+    db.queue_change(p1, "keyword_add", "Wildlife", _commit=False)
+    db.record_edit(
+        "keyword_add",
+        'Added keyword "Wildlife"',
+        str(individual_id),
+        [{"photo_id": p1, "old_value": "", "new_value": str(individual_id)}],
+        _commit=False,
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+    remaining = {
+        row["keyword_id"]
+        for row in db.conn.execute(
+            "SELECT keyword_id FROM photo_keywords WHERE photo_id = ?", (p1,),
+        ).fetchall()
+    }
+    assert genre_id not in remaining
+    assert individual_id in remaining
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is not None
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+
+
+def test_retire_builtin_wildlife_preserves_ambiguous_pruned_pending_add(tmp_path):
+    """Name-only provenance stays conservative after exact history is gone."""
+    from db import Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    xmp_path = photo_dir / "p1.xmp"
+    write_sidecar(
+        str(xmp_path), flat_keywords=set(), hierarchical_keywords=set(),
+    )
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_path.stat().st_mtime,
+    )
+    wildlife_ids = [
+        db.conn.execute(
+            "INSERT INTO keywords (name, type) VALUES (?, 'genre')",
+            (name,),
+        ).lastrowid
+        for name in ("Wildlife", "wildlife")
+    ]
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    for keyword_id in wildlife_ids:
+        db.tag_photo(p1, keyword_id)
+    # Legacy pending row after its exact keyword_add history was pruned.
+    db.queue_change(p1, "keyword_add", "Wildlife")
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 0
+    associations = db.conn.execute(
+        "SELECT keyword_id, source FROM photo_keywords WHERE photo_id = ?",
+        (p1,),
+    ).fetchall()
+    by_id = {row["keyword_id"]: row["source"] for row in associations}
+    assert {keyword_id: by_id[keyword_id] for keyword_id in wildlife_ids} == {
+        keyword_id: "manual" for keyword_id in wildlife_ids
+    }
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+
+
+def test_retire_builtin_wildlife_preserves_synced_manual_add_history(tmp_path):
+    """A retained keyword-add edit proves the synced tag was user-authored."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder('/photos', name='photos')
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename='p1.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.tag_photo(p1, wildlife_id)
+    db.record_edit(
+        "keyword_add",
+        'Added keyword "Wildlife"',
+        str(wildlife_id),
+        [{"photo_id": p1, "old_value": "", "new_value": str(wildlife_id)}],
+    )
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 0
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+
+
+def test_retire_builtin_wildlife_preserves_imported_xmp_term(tmp_path):
+    """A flat Wildlife sidecar term is durable evidence of user metadata."""
+    from db import Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    xmp_path = photo_dir / "p1.xmp"
+    write_sidecar(
+        str(xmp_path),
+        flat_keywords={"Wildlife"},
+        hierarchical_keywords=set(),
+    )
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_path.stat().st_mtime,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.tag_photo(p1, wildlife_id)
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 0
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+
+
+def test_retire_builtin_wildlife_preserves_legacy_import_without_sidecar(tmp_path):
+    """Unknown no-XMP associations may be catalog-imported user metadata.
+
+    Lightroom imports historically defaulted to ``write_xmp=False`` and
+    attached the existing Wildlife genre directly, leaving no sidecar,
+    pending change, edit-history record, or durable source. That legacy row
+    is indistinguishable from the retired automatic association, so deleting
+    it would risk user-authored metadata. Preserve it conservatively and latch
+    the verdict so later forced runs cannot reinterpret it.
+    """
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    # Legacy execute_import(write_xmp=False) shape: direct association with
+    # NULL source and no XMP mtime, pending change, or edit history.
+    db.tag_photo(p1, wildlife_id)
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 0
+    association = db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone()
+    assert association is not None
+    assert association["source"] == "manual"
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+
+
+def test_retire_builtin_wildlife_defers_when_sidecar_unavailable(tmp_path):
+    """An unavailable sidecar must leave the retirement marker unset for retry.
+
+    When a photo's sidecar was previously imported (``xmp_mtime`` is set)
+    but is currently offline (for example, its NAS is unreachable), the
+    migration conservatively preserves the association because it cannot
+    inspect the sidecar's provenance. If the run also stamped the global
+    completion marker anyway, every subsequent startup would return early
+    and the genuinely generated Wildlife association would remain forever
+    even after the volume comes back online. The marker must therefore be
+    left unset until every candidate photo has actually been inspected,
+    so a later startup can complete the retirement once the sidecar is
+    reachable again.
+    """
+    from db import Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    # Give this photo a sidecar so the initial import records a real mtime,
+    # then remove the sidecar to simulate the volume going offline.
+    xmp_path = photo_dir / "p1.xmp"
+    write_sidecar(
+        str(xmp_path),
+        flat_keywords=set(),
+        hierarchical_keywords=set(),
+    )
+    xmp_mtime = xmp_path.stat().st_mtime
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_mtime,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        (p1, wildlife_id),
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    # Simulate the sidecar's volume being offline during the first run.
+    xmp_path.unlink()
+    assert db.retire_builtin_wildlife_genre() == 0
+    # Association preserved and no cleanup queued because provenance
+    # could not be inspected.
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+    # Marker must stay unset so a later startup re-inspects this photo.
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) != "1"
+
+    # Bring the sidecar back with no Wildlife term — the previously-preserved
+    # association is now proven generated and must be retired on retry.
+    write_sidecar(
+        str(xmp_path),
+        flat_keywords=set(),
+        hierarchical_keywords=set(),
+    )
+    assert db.retire_builtin_wildlife_genre() == 1
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is None
+    queued = db.conn.execute(
+        """SELECT change_type, value FROM pending_changes
+           WHERE photo_id = ?""",
+        (p1,),
+    ).fetchall()
+    assert [(row["change_type"], row["value"]) for row in queued] == [
+        ("keyword_remove_flat", "Wildlife"),
+    ]
+    # Now that every candidate has been inspected the marker is stamped.
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+
+
+def test_retire_builtin_wildlife_defers_when_sidecar_is_corrupt(tmp_path):
+    """A malformed sidecar must defer retirement instead of stripping the tag.
+
+    ``read_keywords()`` swallows ``ET.ParseError`` and returns an empty set
+    for a corrupt XMP file, which is indistinguishable from a genuinely
+    empty sidecar. Without a corruption check the migration would classify
+    the association as generated, detach it from the database, queue a
+    sidecar removal, and stamp the completion marker so a later run could
+    never recover the tag. The migration must instead treat a parse failure
+    the same as an offline sidecar: preserve the association and leave the
+    marker unset so the next startup re-inspects the file.
+    """
+    from db import Database
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    xmp_path = photo_dir / "p1.xmp"
+    xmp_path.write_text("<not-valid-xml>", encoding="utf-8")
+    xmp_mtime = xmp_path.stat().st_mtime
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_mtime,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        (p1, wildlife_id),
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 0
+    # Association preserved and no sidecar removal queued, because the
+    # sidecar could not be parsed to prove the tag was auto-generated.
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+    # Marker stays unset so a later startup re-inspects this photo once the
+    # sidecar is repaired or replaced.
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) != "1"
+
+
+def test_retire_builtin_wildlife_preserves_discarded_manual_add(tmp_path):
+    """Discarded-add history is durable evidence a Wildlife tag was manual.
+
+    ``/api/sync/discard`` deliberately leaves no sidecar addition but
+    records the discarded change as a ``discard`` edit-history item whose
+    ``old_value`` is ``keyword_add:Wildlife``. With a small configurable
+    history limit that record can outlive the original ``keyword_add``
+    entry, so the migration would otherwise find no pending or retained
+    ``keyword_add`` evidence and delete the still-intentional association.
+    The discard item itself must be treated as manual-authorship evidence.
+    """
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        (p1, wildlife_id),
+    )
+    # Simulate the aftermath of a manual Wildlife add whose pending sidecar
+    # write was later discarded: the original ``keyword_add`` history entry
+    # has been pruned (small retention limit), leaving only the ``discard``
+    # record as authorship provenance.
+    db.record_edit(
+        "discard",
+        "Discarded 1 pending changes",
+        "",
+        [{"photo_id": p1, "old_value": "keyword_add:Wildlife", "new_value": ""}],
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 0
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+
+
+def test_retire_builtin_wildlife_scopes_discard_to_exact_homonym(tmp_path):
+    """Exact discard provenance must not preserve a generated namesake."""
+    from db import Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    write_sidecar(
+        str(photo_dir / "p1.xmp"),
+        flat_keywords={"Wildlife"},
+        hierarchical_keywords=set(),
+    )
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    generated_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    manual_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'individual')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.executemany(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        [(p1, generated_id), (p1, manual_id)],
+    )
+    db.record_edit(
+        "discard",
+        "Discarded 1 pending change",
+        "",
+        [{
+            "photo_id": p1,
+            "old_value": "keyword_add:Wildlife",
+            "new_value": str(manual_id),
+        }],
+    )
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, generated_id),
+    ).fetchone() is None
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, manual_id),
+    ).fetchone() is not None
+
+
+def test_wildlife_discard_provenance_survives_history_pruning(tmp_path, monkeypatch):
+    """Keep discarded-add evidence while retirement is still retryable.
+
+    An unavailable sidecar can leave the retirement marker unset across many
+    application sessions. If normal history pruning removes the only
+    ``keyword_add:Wildlife`` discard item during that interval, a later retry
+    can no longer distinguish the manual association from the old generated
+    one. Protect that evidence until the catalog-wide migration completes.
+    """
+    import config as cfg
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.tag_photo(p1, wildlife_id)
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+    discard_id = db.record_edit(
+        "discard",
+        "Discarded 1 pending changes",
+        "",
+        [{"photo_id": p1, "old_value": "keyword_add:Wildlife", "new_value": ""}],
+    )
+
+    monkeypatch.setattr(
+        cfg, "get", lambda key: 1 if key == "max_edit_history" else None,
+    )
+    db.record_edit(
+        "flag",
+        "Newer edit that would normally prune the discard",
+        "flagged",
+        [{"photo_id": p1, "old_value": "none", "new_value": "flagged"}],
+    )
+
+    assert db.conn.execute(
+        "SELECT 1 FROM edit_history WHERE id = ?", (discard_id,),
+    ).fetchone() is not None
+    assert db.retire_builtin_wildlife_genre() == 0
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+
+
+def test_manual_keyword_add_stamps_durable_provenance(tmp_path):
+    """A hand-added keyword records authorship on the association row.
+
+    ``edit_history`` is the only other record that a person added a keyword,
+    and ``_prune_edit_history`` trims it to ``max_edit_history`` rows, so
+    authorship read out of it can vanish while the tag survives. A neutral
+    re-tag (a sidecar rescan) must not downgrade an existing stamp.
+    """
+    from db import KEYWORD_SOURCE_MANUAL, KEYWORD_SOURCE_UNKNOWN, Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    kid = db.add_keyword("House Sparrow", is_species=True)
+
+    db.tag_photo(p1, kid, source=KEYWORD_SOURCE_UNKNOWN)
+    assert db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, kid),
+    ).fetchone()["source"] is None
+
+    db.tag_photo(p1, kid, source=KEYWORD_SOURCE_MANUAL)
+    assert db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, kid),
+    ).fetchone()["source"] == "manual"
+
+    db.tag_photo(p1, kid, source=KEYWORD_SOURCE_UNKNOWN)
+    assert db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, kid),
+    ).fetchone()["source"] == "manual", (
+        "A provenance-neutral re-tag must not erase recorded authorship."
+    )
+
+    # And the omitted-source path is the fail-safe one: a call site that never
+    # declares provenance produces a row retirement refuses to delete.
+    p2 = db.add_photo(
+        folder_id=fid, filename="p2.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.tag_photo(p2, kid)
+    assert db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p2, kid),
+    ).fetchone()["source"] == "manual"
+
+
+def test_retire_builtin_wildlife_latches_manual_provenance_against_pruning(tmp_path):
+    """Authorship is latched on the association, not re-read from history.
+
+    The migration legitimately re-runs across sessions: an offline sidecar
+    leaves the completion marker unset, so every startup re-evaluates the
+    remaining candidates. Meanwhile ``_prune_edit_history`` keeps trimming
+    ``edit_history`` to ``max_edit_history`` rows, so the ``keyword_add``
+    record proving a Wildlife tag was user-authored can disappear between
+    runs. Re-deriving provenance each run would read the same association as
+    manual on the first pass and generated on the second, deleting a tag the
+    user created. The first pass therefore stamps
+    ``photo_keywords.source = 'manual'``, which pruning cannot touch.
+    """
+    from db import Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    # p2 gets a real sidecar mtime, then loses the file — that defers the run
+    # and keeps the completion marker unset, which is what allows a second
+    # pass at all.
+    deferred_xmp = photo_dir / "p2.xmp"
+    write_sidecar(
+        str(deferred_xmp), flat_keywords=set(), hierarchical_keywords=set(),
+    )
+    deferred_mtime = deferred_xmp.stat().st_mtime
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    manual_photo = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    deferred_photo = db.add_photo(
+        folder_id=fid, filename="p2.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0, xmp_mtime=deferred_mtime,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    for pid in (manual_photo, deferred_photo):
+        db.tag_photo(pid, species_id)
+        # Legacy associations: no provenance stamp, exactly like rows written
+        # by an older Vireo before this column existed.
+        db.conn.execute(
+            "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+            (pid, wildlife_id),
+        )
+    db.record_edit(
+        "keyword_add",
+        'Added keyword "Wildlife"',
+        str(wildlife_id),
+        [{"photo_id": manual_photo, "old_value": "", "new_value": str(wildlife_id)}],
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    deferred_xmp.unlink()
+    assert db.retire_builtin_wildlife_genre() == 0
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) != "1"
+    assert db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (manual_photo, wildlife_id),
+    ).fetchone()["source"] == "manual", (
+        "The first pass must record authorship on the association itself."
+    )
+
+    # The user keeps working; edit history is pruned past the manual add.
+    db.conn.execute("DELETE FROM edit_history")
+    db.conn.commit()
+
+    # The deferred volume returns with a Wildlife-free sidecar, so the second
+    # pass completes the migration.
+    write_sidecar(
+        str(deferred_xmp), flat_keywords=set(), hierarchical_keywords=set(),
+    )
+    assert db.retire_builtin_wildlife_genre() == 1
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (deferred_photo, wildlife_id),
+    ).fetchone() is None
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (manual_photo, wildlife_id),
+    ).fetchone() is not None, (
+        "Pruned edit history must not turn a user-authored tag into a "
+        "generated one."
+    )
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (manual_photo,),
+    ).fetchone() is None
+
+
+def test_retire_builtin_wildlife_deletes_only_generated_duplicate(tmp_path):
+    """Per-keyword provenance must survive case-variant duplicate genres.
+
+    Older catalogs can contain both ``Wildlife`` and ``wildlife`` top-level
+    genre rows. A manual-add record for one ID must preserve that exact
+    association when the generated duplicate is retired, and the surviving
+    flat term must not be queued for sidecar removal.
+    """
+    from db import KEYWORD_SOURCE_UNKNOWN, Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    xmp_path = photo_dir / "p1.xmp"
+    write_sidecar(
+        str(xmp_path),
+        flat_keywords={"Wildlife"},
+        hierarchical_keywords=set(),
+    )
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_path.stat().st_mtime,
+    )
+    generated_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    manual_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    # The generated genre arrives the way the old auto-rule left it: an
+    # association with no recorded authorship.
+    db.tag_photo(p1, generated_id, source=KEYWORD_SOURCE_UNKNOWN)
+    db.tag_photo(p1, manual_id, source="manual")
+    db.record_edit(
+        "keyword_add",
+        'Added keyword "wildlife"',
+        str(manual_id),
+        [{"photo_id": p1, "old_value": "", "new_value": str(manual_id)}],
+    )
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+    remaining_ids = {
+        row["keyword_id"]
+        for row in db.conn.execute(
+            "SELECT keyword_id FROM photo_keywords WHERE photo_id = ?",
+            (p1,),
+        ).fetchall()
+    }
+    assert generated_id not in remaining_ids
+    assert manual_id in remaining_ids
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+
+
+def test_retire_builtin_wildlife_queues_removal_in_every_owning_workspace(tmp_path):
+    """A folder shared across workspaces must have the cleanup queued in each.
+
+    ``get_pending_changes()`` and the sync panel are per-workspace, so queueing
+    the removal in only one owning workspace hides it from the others; the
+    migration marks itself complete and the stale ``Wildlife`` term stays in
+    the sidecar for the unqueued workspaces indefinitely.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws1 = db.create_workspace("alpha")
+    ws2 = db.create_workspace("beta")
+    db.set_active_workspace(ws1)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws1, fid)
+    db.add_workspace_folder(ws2, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        (p1, wildlife_id, "generated"),
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+
+    queued_ws = {
+        row["workspace_id"]
+        for row in db.conn.execute(
+            """SELECT workspace_id FROM pending_changes
+               WHERE photo_id = ? AND change_type = 'keyword_remove_flat'
+                 AND value = 'Wildlife' COLLATE NOCASE""",
+            (p1,),
+        ).fetchall()
+    }
+    assert queued_ws == {ws1, ws2}
+
+
+def test_retire_builtin_wildlife_preserves_same_name_top_level_survivor(tmp_path):
+    """Skip the flat sidecar removal when another top-level 'Wildlife' survives.
+
+    Same-name root keywords across types are explicitly supported (a photo
+    can have an ``individual`` Wildlife alongside the generated ``genre``
+    Wildlife). Both associations map to the same flat XMP subject, so
+    queueing a ``keyword_remove_flat`` would silently strip the surviving
+    user-authored tag from the sidecar and a later XMP reconciliation
+    could detach it from the DB too. The generated genre association must
+    still be detached from the DB — only the sidecar cleanup is skipped.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_genre_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    wildlife_individual_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'individual')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.executemany(
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        [
+            (p1, wildlife_genre_id, "generated"),
+            (p1, wildlife_individual_id, "manual"),
+        ],
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_genre_id),
+    ).fetchone() is None
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_individual_id),
+    ).fetchone() is not None
+    pending = db.conn.execute(
+        """SELECT change_type, value FROM pending_changes
+           WHERE photo_id = ?""",
+        (p1,),
+    ).fetchall()
+    assert pending == [], (
+        "The flat XMP subject 'Wildlife' still represents the surviving "
+        "individual-type keyword, so no sidecar removal should be queued."
+    )
+
+
+def test_retire_builtin_wildlife_retires_genre_when_synced_survivor_owns_sidecar(tmp_path):
+    """Retire the generated genre even when a synced same-name keyword owns the flat XMP.
+
+    A photo can carry both the generated ``type='genre'`` Wildlife
+    association and a manually authored top-level ``Wildlife`` of another
+    type (for example ``type='individual'``). If the manual keyword was
+    already synced, its flat ``Wildlife`` subject sits in the sidecar.
+    Without a survivor-aware branch, the sidecar-provenance short-circuit
+    would treat that flat term as evidence the *generated* association was
+    manual, skip the photo entirely, and stamp the global completion
+    marker — leaving the stale generated association permanently attached
+    because no later run inspects the photo again. The generated genre
+    must instead be detached from the DB, while the sidecar removal stays
+    suppressed so the survivor's tag is preserved.
+    """
+    from db import Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    xmp_path = photo_dir / "p1.xmp"
+    write_sidecar(
+        str(xmp_path),
+        flat_keywords={"Wildlife"},
+        hierarchical_keywords=set(),
+    )
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_path.stat().st_mtime,
+    )
+    wildlife_genre_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    wildlife_individual_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'individual')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.executemany(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        [(p1, wildlife_genre_id), (p1, wildlife_individual_id)],
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+
+    # Generated genre association gone; survivor untouched.
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_genre_id),
+    ).fetchone() is None
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_individual_id),
+    ).fetchone() is not None
+    # No sidecar removal queued — the flat 'Wildlife' subject still
+    # represents the surviving individual-type keyword.
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+    # Every candidate was actually inspected, so the marker is stamped.
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+
+
+def test_retire_builtin_wildlife_attributes_flat_term_to_nested_survivor(tmp_path):
+    """A hierarchy leaf can own the same flat XMP subject as the genre."""
+    from db import Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    xmp_path = photo_dir / "p1.xmp"
+    write_sidecar(
+        str(xmp_path),
+        flat_keywords={"Wildlife"},
+        hierarchical_keywords={"Animals|Wildlife"},
+    )
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_path.stat().st_mtime,
+    )
+    genre_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    animals_id = db.add_keyword("Animals")
+    nested_id = db.add_keyword("Wildlife", parent_id=animals_id)
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.tag_photo(p1, genre_id, source="generated")
+    db.tag_photo(p1, nested_id, source="manual")
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+    remaining = {
+        row["keyword_id"]
+        for row in db.conn.execute(
+            "SELECT keyword_id FROM photo_keywords WHERE photo_id = ?", (p1,),
+        ).fetchall()
+    }
+    assert genre_id not in remaining
+    assert nested_id in remaining
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+
+
+def test_retire_builtin_wildlife_handles_photo_counts_over_bind_limit(tmp_path):
+    """Retirement must chunk the DELETE so a large upgraded library still opens.
+
+    ``retire_builtin_wildlife_genre`` runs synchronously during startup, so a
+    single DELETE binding every photo id exceeds ``SQLITE_MAX_VARIABLE_NUMBER``
+    (999 on legacy builds) and prevents the DB from opening. This asserts the
+    call succeeds when the retired-photo set spans more than one chunk.
+    """
+    from db import _SQLITE_PARAM_CHUNK_SIZE, Database
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+
+    total = _SQLITE_PARAM_CHUNK_SIZE + 5
+    photo_ids = []
+    for idx in range(total):
+        pid = db.add_photo(
+            folder_id=fid, filename=f"p{idx}.jpg", extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        photo_ids.append(pid)
+    db.conn.executemany(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        [(pid, species_id) for pid in photo_ids],
+    )
+    db.conn.executemany(
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        [(pid, wildlife_id, "generated") for pid in photo_ids],
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == total
+
+    remaining = db.conn.execute(
+        "SELECT COUNT(*) AS c FROM photo_keywords WHERE keyword_id = ?",
+        (wildlife_id,),
+    ).fetchone()["c"]
+    assert remaining == 0
+
+
+def test_pending_keyword_removal_keys_distinguish_flat_and_hierarchical(tmp_path):
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    db.set_active_workspace(db.create_workspace("ws"))
+    fid = db.add_folder('/photos', name='photos')
+    p1 = db.add_photo(folder_id=fid, filename='p1.jpg', extension='.jpg',
+                      file_size=100, file_mtime=1.0)
+    db.queue_change(p1, "keyword_remove_flat", "Wildlife")
+    db.queue_change(p1, "keyword_remove", "House Sparrow")
+
+    assert db.get_pending_keyword_removal_keys(p1) == {
+        "wildlife", "house sparrow",
+    }
+    assert db.get_pending_keyword_removal_keys(p1, hierarchical=True) == {
+        "house sparrow",
     }
 
 
-def test_tag_photo_second_species_does_not_re_add_wildlife(tmp_path):
-    """If a photo already has at least one taxonomy keyword, tagging a
-    second species does NOT touch the Wildlife genre keyword (so user
-    removal sticks)."""
-    from db import Database
-    db = Database(str(tmp_path / "test.db"))
-    db.set_active_workspace(db.create_workspace("ws"))
-    fid = db.add_folder('/photos', name='photos')
-    p1 = db.add_photo(folder_id=fid, filename='p1.jpg', extension='.jpg',
-                      file_size=100, file_mtime=1.0)
-    sp_a = db.add_keyword("Robin", is_species=True)
-    sp_b = db.add_keyword("Sparrow", is_species=True)
-
-    db.tag_photo(p1, sp_a)  # Wildlife auto-added
-    # User manually removes Wildlife
-    wildlife_id = db.conn.execute(
-        "SELECT id FROM keywords WHERE name = 'Wildlife' AND type = 'genre'"
-    ).fetchone()["id"]
-    db.untag_photo(p1, wildlife_id)
-
-    db.tag_photo(p1, sp_b)  # second species — should NOT re-add Wildlife
-
-    has_wildlife = db.conn.execute(
-        """SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?""",
-        (p1, wildlife_id),
-    ).fetchone() is not None
-    assert has_wildlife is False
-
-
-def test_tag_photo_with_non_taxonomy_does_not_add_wildlife(tmp_path):
-    """Tagging with a non-species keyword (location, individual, etc.)
-    does NOT add Wildlife."""
-    from db import Database
-    db = Database(str(tmp_path / "test.db"))
-    db.set_active_workspace(db.create_workspace("ws"))
-    fid = db.add_folder('/photos', name='photos')
-    p1 = db.add_photo(folder_id=fid, filename='p1.jpg', extension='.jpg',
-                      file_size=100, file_mtime=1.0)
-    loc_kid = db.add_keyword("Park", kw_type="location")
-
-    db.tag_photo(p1, loc_kid)
-
-    n = db.conn.execute(
-        "SELECT COUNT(*) AS n FROM photo_keywords pk "
-        "JOIN keywords k ON k.id = pk.keyword_id "
-        "WHERE pk.photo_id = ? AND k.name = 'Wildlife'",
-        (p1,),
-    ).fetchone()["n"]
-    assert n == 0
-
-
-def test_tag_photo_re_adds_wildlife_after_all_species_removed_and_new_added(tmp_path):
-    """Sticky removal only sticks while at least one taxonomy keyword
-    exists. Removing all species and tagging a new one re-adds Wildlife."""
-    from db import Database
-    db = Database(str(tmp_path / "test.db"))
-    db.set_active_workspace(db.create_workspace("ws"))
-    fid = db.add_folder('/photos', name='photos')
-    p1 = db.add_photo(folder_id=fid, filename='p1.jpg', extension='.jpg',
-                      file_size=100, file_mtime=1.0)
-    sp_a = db.add_keyword("Robin", is_species=True)
-    sp_b = db.add_keyword("Sparrow", is_species=True)
-    db.tag_photo(p1, sp_a)  # Wildlife added
-    wildlife_id = db.conn.execute(
-        "SELECT id FROM keywords WHERE name = 'Wildlife' AND type = 'genre'"
-    ).fetchone()["id"]
-    db.untag_photo(p1, wildlife_id)
-    # Remove the only species
-    db.untag_photo(p1, sp_a)
-
-    # Tag a new species — this is the "first species again" case
-    db.tag_photo(p1, sp_b)
-
-    has_wildlife = db.conn.execute(
-        """SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?""",
-        (p1, wildlife_id),
-    ).fetchone() is not None
-    assert has_wildlife is True
-
-
-def test_backfill_auto_wildlife_for_existing_species_tagged_photos(tmp_path):
-    """The one-shot backfill adds Wildlife to every photo with a species
-    keyword that doesn't already have Wildlife. Idempotent."""
-    from db import Database
-    db = Database(str(tmp_path / "test.db"))
-    db.set_active_workspace(db.create_workspace("ws"))
-    fid = db.add_folder('/photos', name='photos')
-    p1 = db.add_photo(folder_id=fid, filename='p1.jpg', extension='.jpg', file_size=100, file_mtime=1.0)
-    p2 = db.add_photo(folder_id=fid, filename='p2.jpg', extension='.jpg', file_size=100, file_mtime=1.0)
-    p3 = db.add_photo(folder_id=fid, filename='p3.jpg', extension='.jpg', file_size=100, file_mtime=1.0)
-    sp_a = db.add_keyword("Robin", is_species=True)
-    # Bypass tag_photo so the auto-Wildlife rule does NOT fire — this
-    # simulates a pre-existing DB.
-    db.conn.execute(
-        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-        (p1, sp_a),
-    )
-    db.conn.execute(
-        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-        (p2, sp_a),
-    )
-    db.conn.commit()
-
-    db.backfill_wildlife_genre()
-    db.backfill_wildlife_genre()  # idempotent
-
-    wildlife_id = db.conn.execute(
-        "SELECT id FROM keywords WHERE name = 'Wildlife' AND type = 'genre'"
-    ).fetchone()["id"]
-
-    # p1, p2 should have Wildlife. p3 (no species) should not.
-    def has_wildlife(pid):
-        return db.conn.execute(
-            "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
-            (pid, wildlife_id),
-        ).fetchone() is not None
-    assert has_wildlife(p1) is True
-    assert has_wildlife(p2) is True
-    assert has_wildlife(p3) is False
-
-
-def test_backfill_wildlife_genre_matches_legacy_is_species_rows(tmp_path):
-    """Regression: on upgraded DBs, species rows can carry legacy
-    ``is_species=1`` but a non-taxonomy ``type`` (e.g. NULL, 'general')
-    until the background ``mark_species_keywords`` pass retypes them.
-
-    The backfill runs at startup before that pass, so a query that joined
-    only on ``type='taxonomy'`` matched zero rows yet still wrote the
-    one-shot marker — and never re-ran. The backfill must also match
-    ``is_species=1`` so upgraded photos get Wildlife on first startup,
-    independent of background normalization timing.
-    """
+def test_tag_photo_legacy_species_does_not_add_wildlife_genre(tmp_path):
+    """Legacy is_species rows also avoid materializing a Wildlife tag."""
     from db import Database
     db = Database(str(tmp_path / "test.db"))
     db.set_active_workspace(db.create_workspace("ws"))
@@ -14343,99 +15575,6 @@ def test_backfill_wildlife_genre_matches_legacy_is_species_rows(tmp_path):
     p1 = db.add_photo(folder_id=fid, filename='p1.jpg', extension='.jpg',
                       file_size=100, file_mtime=1.0)
 
-    # Force a legacy-shaped species keyword via direct SQL: is_species=1
-    # but type='general' (the shape an upgraded DB has before the
-    # background mark_species_keywords pass converts type to 'taxonomy').
-    cur = db.conn.execute(
-        "INSERT INTO keywords (name, type, is_species) VALUES (?, 'general', 1)",
-        ("Robin",),
-    )
-    sp = cur.lastrowid
-    db.conn.execute(
-        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-        (p1, sp),
-    )
-    db.conn.commit()
-
-    db.backfill_wildlife_genre()
-
-    wildlife_id = db.conn.execute(
-        "SELECT id FROM keywords WHERE name = 'Wildlife' AND type = 'genre'"
-    ).fetchone()["id"]
-    has_wildlife = db.conn.execute(
-        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
-        (p1, wildlife_id),
-    ).fetchone() is not None
-    assert has_wildlife is True, (
-        "Backfill must match is_species=1 rows so upgraded DBs get Wildlife "
-        "added on first startup, even before mark_species_keywords retypes "
-        "legacy species keywords to type='taxonomy'."
-    )
-
-
-def test_backfill_wildlife_genre_after_mark_picks_up_plaintext_species(tmp_path):
-    """Regression: plain-text species tags on upgraded DBs start as
-    ``is_species=0`` and ``type != 'taxonomy'``; only ``mark_species_keywords``
-    can retype them via taxonomy lookup. The Wildlife backfill is one-shot via
-    ``wildlife_backfill_done`` and only matches ``type='taxonomy' OR is_species=1``,
-    so it MUST run after ``mark_species_keywords`` — otherwise it sets the
-    marker on a zero-row scan and never retries.
-    """
-    from db import Database
-    db = Database(str(tmp_path / "test.db"))
-    db.set_active_workspace(db.create_workspace("ws"))
-    fid = db.add_folder('/photos', name='photos')
-    p1 = db.add_photo(folder_id=fid, filename='p1.jpg', extension='.jpg',
-                      file_size=100, file_mtime=1.0)
-
-    # Plain-text species tag: type='general', is_species=0 — neither flag set.
-    cur = db.conn.execute(
-        "INSERT INTO keywords (name, type, is_species) VALUES (?, 'general', 0)",
-        ("Robin",),
-    )
-    sp = cur.lastrowid
-    db.conn.execute(
-        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-        (p1, sp),
-    )
-    db.conn.commit()
-
-    class FakeTaxonomy:
-        def lookup(self, name):
-            return {"taxon_id": 1} if name == "Robin" else None
-
-    # Order matches startup: mark first, then backfill.
-    db.mark_species_keywords(FakeTaxonomy())
-    db.backfill_wildlife_genre()
-
-    wildlife_id = db.conn.execute(
-        "SELECT id FROM keywords WHERE name = 'Wildlife' AND type = 'genre'"
-    ).fetchone()["id"]
-    has_wildlife = db.conn.execute(
-        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
-        (p1, wildlife_id),
-    ).fetchone() is not None
-    assert has_wildlife is True, (
-        "Plain-text species tags must be retyped by mark_species_keywords "
-        "before backfill_wildlife_genre runs, so the backfill scan sees them."
-    )
-
-
-def test_tag_photo_legacy_is_species_keyword_adds_wildlife_genre(tmp_path):
-    """Regression: auto-Wildlife must fire for legacy species rows whose
-    ``type`` hasn't been retyped to ``taxonomy`` yet (is_species=1 with
-    non-taxonomy ``type``). On upgraded databases ``mark_species_keywords``
-    runs in a background thread, so newly-tagged photos can briefly hit
-    keywords that satisfy ``is_species=1`` but not ``type='taxonomy'``."""
-    from db import Database
-    db = Database(str(tmp_path / "test.db"))
-    db.set_active_workspace(db.create_workspace("ws"))
-    fid = db.add_folder('/photos', name='photos')
-    p1 = db.add_photo(folder_id=fid, filename='p1.jpg', extension='.jpg',
-                      file_size=100, file_mtime=1.0)
-
-    # Plant a legacy-shaped species keyword: is_species=1 but type='general'
-    # (the shape an upgraded DB has before mark_species_keywords retypes it).
     cur = db.conn.execute(
         "INSERT INTO keywords (name, type, is_species) VALUES (?, 'general', 1)",
         ("Robin",),
@@ -14445,26 +15584,19 @@ def test_tag_photo_legacy_is_species_keyword_adds_wildlife_genre(tmp_path):
 
     db.tag_photo(p1, sp)
 
-    wildlife_id = db.conn.execute(
-        "SELECT id FROM keywords WHERE name = 'Wildlife' AND type = 'genre'"
-    ).fetchone()["id"]
-    has_wildlife = db.conn.execute(
-        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
-        (p1, wildlife_id),
-    ).fetchone() is not None
-    assert has_wildlife is True, (
-        "Auto-Wildlife must trigger for legacy is_species=1 rows whose type "
-        "hasn't been normalized yet — otherwise photos tagged during the "
-        "background mark_species_keywords window permanently miss Wildlife."
-    )
+    names = {
+        row["name"]
+        for row in db.conn.execute(
+            """SELECT k.name FROM photo_keywords pk
+               JOIN keywords k ON k.id = pk.keyword_id
+               WHERE pk.photo_id = ?""",
+            (p1,),
+        ).fetchall()
+    }
+    assert names == {"Robin"}
 
 
-def test_tag_photo_legacy_species_sticky_removal_holds(tmp_path):
-    """Regression complement: sticky removal must still hold across the
-    mixed (legacy + retyped) species states. After removing Wildlife, a
-    second species tag — even one that uses the legacy is_species=1 shape
-    — must NOT re-add Wildlife as long as another species keyword is
-    already attached."""
+def test_tag_photo_multiple_species_store_only_taxonomy_terms(tmp_path):
     from db import Database
     db = Database(str(tmp_path / "test.db"))
     db.set_active_workspace(db.create_workspace("ws"))
@@ -14472,11 +15604,7 @@ def test_tag_photo_legacy_species_sticky_removal_holds(tmp_path):
     p1 = db.add_photo(folder_id=fid, filename='p1.jpg', extension='.jpg',
                       file_size=100, file_mtime=1.0)
     sp_a = db.add_keyword("Robin", is_species=True)
-    db.tag_photo(p1, sp_a)  # First species — Wildlife auto-added.
-    wildlife_id = db.conn.execute(
-        "SELECT id FROM keywords WHERE name = 'Wildlife' AND type = 'genre'"
-    ).fetchone()["id"]
-    db.untag_photo(p1, wildlife_id)  # User removes Wildlife.
+    db.tag_photo(p1, sp_a)
 
     # Plant a second species with the legacy shape.
     cur = db.conn.execute(
@@ -14487,21 +15615,19 @@ def test_tag_photo_legacy_species_sticky_removal_holds(tmp_path):
     db.conn.commit()
     db.tag_photo(p1, sp_b)
 
-    has_wildlife = db.conn.execute(
-        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
-        (p1, wildlife_id),
-    ).fetchone() is not None
-    assert has_wildlife is False, (
-        "Adding a second (legacy-shaped) species must respect the user's "
-        "Wildlife removal — the count query must consider both 'taxonomy' "
-        "and is_species=1 rows so existing species are seen."
-    )
+    names = {
+        row["name"]
+        for row in db.conn.execute(
+            """SELECT k.name FROM photo_keywords pk
+               JOIN keywords k ON k.id = pk.keyword_id
+               WHERE pk.photo_id = ?""",
+            (p1,),
+        ).fetchall()
+    }
+    assert names == {"Robin", "Sparrow"}
 
 
-def test_tag_photo_no_op_re_tag_does_not_re_add_removed_wildlife(tmp_path):
-    """Regression: re-tagging an already-tagged species (a no-op INSERT OR
-    IGNORE) must NOT re-fire the auto-Wildlife rule, so user-removed
-    Wildlife stays removed."""
+def test_tag_photo_no_op_retag_keeps_single_taxonomy_association(tmp_path):
     from db import Database
     db = Database(str(tmp_path / "test.db"))
     db.set_active_workspace(db.create_workspace("ws"))
@@ -14510,34 +15636,19 @@ def test_tag_photo_no_op_re_tag_does_not_re_add_removed_wildlife(tmp_path):
                       file_size=100, file_mtime=1.0)
     sp = db.add_keyword("Robin", is_species=True)
 
-    db.tag_photo(p1, sp)  # First species tag — Wildlife auto-added.
-    wildlife_id = db.conn.execute(
-        "SELECT id FROM keywords WHERE name = 'Wildlife' AND type = 'genre'"
-    ).fetchone()["id"]
-    db.untag_photo(p1, wildlife_id)  # User removes Wildlife.
-
-    # Re-tag the same species (e.g. user clicks the keyword chip twice).
-    # INSERT OR IGNORE is a no-op; auto-Wildlife must NOT fire.
+    db.tag_photo(p1, sp)
     db.tag_photo(p1, sp)
 
-    has_wildlife = db.conn.execute(
-        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
-        (p1, wildlife_id),
-    ).fetchone() is not None
-    assert has_wildlife is False, (
-        "Re-tagging an already-attached species must not undo a user's "
-        "Wildlife removal."
-    )
+    rows = db.conn.execute(
+        "SELECT keyword_id FROM photo_keywords WHERE photo_id = ?", (p1,),
+    ).fetchall()
+    assert [row["keyword_id"] for row in rows] == [sp]
 
 
-def test_ensure_default_genre_keywords_upgrades_existing_general_wildlife(tmp_path):
-    """Regression: an upgraded DB with an existing 'Wildlife' general keyword
-    must have it promoted to type='genre' so auto-tagging finds it."""
+def test_ensure_default_genre_keywords_leaves_general_wildlife_user_term(tmp_path):
+    """Wildlife is no longer a built-in genre or a specially promoted name."""
     from db import Database
     db = Database(str(tmp_path / "test.db"))
-    # Wipe the genre defaults that __init__ seeded (simulate a DB that
-    # never went through this code path) and force-create a 'general'
-    # Wildlife row, mirroring an upgraded DB where the user hand-tagged.
     db.conn.execute("DELETE FROM keywords WHERE type = 'genre'")
     db.conn.execute(
         "INSERT INTO keywords (name, type, is_species) VALUES (?, 'general', 0)",
@@ -14550,26 +15661,16 @@ def test_ensure_default_genre_keywords_upgrades_existing_general_wildlife(tmp_pa
     row = db.conn.execute(
         "SELECT type FROM keywords WHERE name = 'Wildlife' AND parent_id IS NULL"
     ).fetchone()
-    assert row["type"] == "genre", (
-        "An existing 'general' Wildlife should be promoted to 'genre' so "
-        "auto-Wildlife and the backfill find a canonical genre row."
-    )
-    # Other defaults should also be present (the seed loop still runs).
+    assert row["type"] == "general"
     n = db.conn.execute(
         "SELECT COUNT(*) FROM keywords WHERE type = 'genre'"
     ).fetchone()[0]
-    assert n >= 5  # Wildlife + Landscape + Sunset + Architecture + Abstract
+    assert n == 4
 
 
-def test_init_normalizes_legacy_wildlife_before_seeding_genres(tmp_path):
-    """Regression: an upgraded DB where 'Wildlife' has a legacy type like
-    'descriptive' must end up with type='genre' after Database.__init__,
-    not stuck on 'general' (which the auto-Wildlife / backfill queries
-    can't find via WHERE name='Wildlife' AND type='genre')."""
+def test_init_normalizes_legacy_wildlife_without_making_it_builtin(tmp_path):
+    """A legacy descriptive term becomes ordinary general metadata."""
     from db import Database
-    # First instantiation runs the schema setup AND the seeds. Tear that
-    # down to simulate a pre-genre-feature DB: re-create the Wildlife
-    # row as 'descriptive', clear all genre rows.
     db_path = str(tmp_path / "test.db")
     db = Database(db_path)
     db.conn.execute("DELETE FROM keywords WHERE type = 'genre'")
@@ -14580,19 +15681,12 @@ def test_init_normalizes_legacy_wildlife_before_seeding_genres(tmp_path):
     db.conn.commit()
     db.conn.close()
 
-    # Re-open: __init__ runs migrate_legacy_keyword_types BEFORE
-    # ensure_default_genre_keywords, so Wildlife should be normalized to
-    # 'genre' instead of getting stuck on 'general'.
     db2 = Database(db_path)
     rows = db2.conn.execute(
         "SELECT type FROM keywords WHERE name = 'Wildlife' AND parent_id IS NULL"
     ).fetchall()
     types = {r["type"] for r in rows}
-    assert "genre" in types, (
-        f"Legacy 'descriptive' Wildlife must end up as 'genre' after "
-        f"__init__; got types={types}. The auto-Wildlife trigger and "
-        f"backfill query depend on this."
-    )
+    assert types == {"general"}
 
 
 def test_ensure_default_genre_keywords_preserves_non_general_user_types(tmp_path):
@@ -14613,15 +15707,7 @@ def test_ensure_default_genre_keywords_preserves_non_general_user_types(tmp_path
         "SELECT type FROM keywords WHERE name = 'Wildlife' ORDER BY type"
     ).fetchall()
     types = sorted(r["type"] for r in rows)
-    # The user's 'individual' row is preserved AND a canonical 'genre'
-    # row is created alongside it. Duplicates BY NAME across different
-    # types are intentional — disambiguation in add_keyword's lookup
-    # (ORDER BY (type=?) DESC) ensures kw_type-typed callers get the
-    # right row deterministically.
-    assert types == ["genre", "individual"], (
-        f"Expected both 'genre' (canonical) and 'individual' (user's) "
-        f"Wildlife rows; got types={types}"
-    )
+    assert types == ["individual"]
     # Other genre defaults still seeded
     n_other = db.conn.execute(
         """SELECT COUNT(*) FROM keywords
@@ -14795,11 +15881,8 @@ def test_ensure_default_genre_keywords_seeds_canonical_row_despite_typed_collisi
     default name even when a user has previously tagged a same-name
     keyword with a different type (e.g. 'Landscape' as 'location').
 
-    Otherwise the lightbox 'Not Wildlife' flow would call add_keyword(
-    name='Landscape', kw_type='genre'), find the existing 'location' row,
-    fail to upgrade it (only 'general' is upgraded), and tag the photo
-    with a non-genre keyword — leaving it stuck in 'Needs Identification'
-    under the default subject types.
+    Otherwise an explicitly typed genre add could bind to the existing
+    location row and leave the photo with the wrong metadata type.
     """
     from db import Database
     db = Database(str(tmp_path / "test.db"))
@@ -14852,7 +15935,7 @@ def test_ensure_default_genre_keywords_seeds_canonical_row_despite_typed_collisi
     )
 
     # Other defaults exist exactly once.
-    for name in ("Architecture", "Abstract", "Wildlife"):
+    for name in ("Architecture", "Abstract"):
         n = db.conn.execute(
             "SELECT COUNT(*) FROM keywords WHERE name = ? COLLATE NOCASE",
             (name,),
@@ -14901,54 +15984,34 @@ def test_migrate_default_subject_collection_covers_all_workspaces(tmp_path):
         ]
 
 
-def test_backfill_wildlife_genre_runs_only_once(tmp_path):
-    """Regression: backfill must be gated by a db_meta marker so subsequent
-    startups don't re-add user-removed Wildlife."""
+def test_retire_builtin_wildlife_preserves_keyword_children(tmp_path):
+    """The cleanup keeps the keyword row so user hierarchy ids stay valid."""
     from db import Database
     db = Database(str(tmp_path / "test.db"))
-    db.set_active_workspace(db.create_workspace("ws"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
     fid = db.add_folder('/photos', name='photos')
+    db.add_workspace_folder(ws, fid)
     p1 = db.add_photo(folder_id=fid, filename='p1.jpg', extension='.jpg',
                       file_size=100, file_mtime=1.0)
-    sp = db.add_keyword("Robin", is_species=True)
-    # Direct-SQL tag so auto-Wildlife doesn't fire — simulates a
-    # pre-auto-Wildlife DB where this photo had only Robin.
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    child_id = db.add_keyword("Birds", parent_id=wildlife_id)
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
     db.conn.execute(
-        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-        (p1, sp),
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        (p1, wildlife_id, "generated"),
     )
     db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
 
-    db.backfill_wildlife_genre()  # First run: adds Wildlife to p1.
-    wildlife_id = db.conn.execute(
-        "SELECT id FROM keywords WHERE name = 'Wildlife' AND type = 'genre'"
-    ).fetchone()["id"]
-    # Marker should now be set
-    assert db.get_meta("wildlife_backfill_done") == "1"
-
-    # User removes Wildlife (sticky-removal intent).
-    db.untag_photo(p1, wildlife_id)
-
-    # Subsequent backfill calls (simulating subsequent app starts) must
-    # short-circuit without re-adding Wildlife.
-    db.backfill_wildlife_genre()
-    db.backfill_wildlife_genre()
-    has_wildlife = db.conn.execute(
-        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
-        (p1, wildlife_id),
-    ).fetchone() is not None
-    assert has_wildlife is False, (
-        "Backfill must not re-add Wildlife on subsequent startups; the "
-        "user's sticky removal would be silently undone."
-    )
-
-    # Force flag exists for tests.
-    db.backfill_wildlife_genre(force=True)
-    has_wildlife = db.conn.execute(
-        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
-        (p1, wildlife_id),
-    ).fetchone() is not None
-    assert has_wildlife is True, "force=True must override the marker gate."
+    assert db.retire_builtin_wildlife_genre() == 1
+    child = db.conn.execute(
+        "SELECT parent_id FROM keywords WHERE id = ?", (child_id,),
+    ).fetchone()
+    assert child["parent_id"] == wildlife_id
 
 
 def test_keywords_has_place_id_column_and_unique_index(db):
@@ -18615,6 +19678,20 @@ def _add_one_detection(db, photo_id, detector_model="test-det", conf=0.9):
     return cur.lastrowid
 
 
+def _record_usable_classifier_run(db, detection_id, model, fingerprint):
+    """Record the run key plus the prediction runtime requires for a hit."""
+    db.record_classifier_run(
+        detection_id, model, fingerprint, prediction_count=1,
+    )
+    db.add_prediction(
+        detection_id,
+        species="Robin",
+        confidence=0.9,
+        model=model,
+        labels_fingerprint=fingerprint,
+    )
+
+
 def test_count_classifier_runs_filters_by_model_and_fingerprint(tmp_path):
     """count_classifier_runs returns the number of distinct photos in the
     given id list where every qualifying detection has a classifier_runs
@@ -18638,9 +19715,9 @@ def test_count_classifier_runs_filters_by_model_and_fingerprint(tmp_path):
     d2 = _add_one_detection(db, p2)
     d3 = _add_one_detection(db, p3)
 
-    db.record_classifier_run(d1, "BioCLIP-2.5", "fp-a", prediction_count=1)
-    db.record_classifier_run(d2, "BioCLIP-2.5", "fp-b", prediction_count=1)
-    db.record_classifier_run(d3, "iNat21", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(db, d1, "BioCLIP-2.5", "fp-a")
+    _record_usable_classifier_run(db, d2, "BioCLIP-2.5", "fp-b")
+    _record_usable_classifier_run(db, d3, "iNat21", "fp-a")
 
     # Only p1 matches (BioCLIP-2.5 + fp-a).
     assert db.count_classifier_runs(
@@ -18654,14 +19731,14 @@ def test_count_classifier_runs_filters_by_model_and_fingerprint(tmp_path):
     # the runtime would still need to infer the uncached detection, and the
     # photo would end up in ``count`` (inferred), not ``cached``.
     d2b = _add_one_detection(db, p2)
-    db.record_classifier_run(d2b, "BioCLIP-2.5", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(db, d2b, "BioCLIP-2.5", "fp-a")
     assert db.count_classifier_runs(
         [p1, p2, p3], "BioCLIP-2.5", "fp-a"
     ) == 1  # only p1 — p2 still has d2 (fp-b) with no matching run key
 
     # Once every qualifying detection on p2 has a matching run key, p2
     # counts too.
-    db.record_classifier_run(d2, "BioCLIP-2.5", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(db, d2, "BioCLIP-2.5", "fp-a")
     assert db.count_classifier_runs(
         [p1, p2, p3], "BioCLIP-2.5", "fp-a"
     ) == 2  # p1 and p2
@@ -18684,7 +19761,7 @@ def test_count_classifier_runs_chunks_large_id_lists(tmp_path):
             width=1, height=1,
         )
         did = _add_one_detection(db, pid)
-        db.record_classifier_run(did, "BioCLIP-2.5", "fp-a", prediction_count=1)
+        _record_usable_classifier_run(db, did, "BioCLIP-2.5", "fp-a")
         photo_ids.append(pid)
 
     assert db.count_classifier_runs(
@@ -18692,10 +19769,8 @@ def test_count_classifier_runs_chunks_large_id_lists(tmp_path):
     ) == 1500
 
 
-def test_count_classifier_runs_excludes_full_image_and_below_threshold(tmp_path):
-    """count_classifier_runs mirrors the runtime gate: full-image rows and
-    sub-threshold detections are excluded so prior full-image classifier
-    runs and stale low-confidence boxes don't inflate cached_estimate."""
+def test_count_classifier_runs_uses_full_image_not_below_threshold_crop(tmp_path):
+    """Preflight reuses a fallback anchor, not a sub-threshold crop."""
     from db import Database
     db = Database(str(tmp_path / "test.db"))
     fid = db.add_folder("/photos", name="photos")
@@ -18709,24 +19784,24 @@ def test_count_classifier_runs_excludes_full_image_and_below_threshold(tmp_path)
                      file_size=1, file_mtime=1.0, timestamp=None,
                      width=1, height=1)
 
-    # p1: only a full-image detection has a matching run key. Should NOT
-    # be counted (runtime gate skips full-image rows when picking primary).
+    # p1: only a full-image fallback has a matching run key. It counts even
+    # without a MegaDetector run row, matching detector-failure runtime reuse.
     d1_full = _add_one_detection(db, p1, detector_model="full-image", conf=0.9)
-    db.record_classifier_run(d1_full, "BioCLIP-2.5", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(db, d1_full, "BioCLIP-2.5", "fp-a")
 
     # p2: only a below-threshold detection has a matching run key. Should
     # NOT be counted (runtime gate filters at detector_confidence >= 0.2).
     d2_low = _add_one_detection(db, p2, conf=0.05)
-    db.record_classifier_run(d2_low, "BioCLIP-2.5", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(db, d2_low, "BioCLIP-2.5", "fp-a")
 
     # p3: a normal above-threshold non-full-image detection has a matching
     # run key. Should be counted.
     d3 = _add_one_detection(db, p3, conf=0.9)
-    db.record_classifier_run(d3, "BioCLIP-2.5", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(db, d3, "BioCLIP-2.5", "fp-a")
 
     assert db.count_classifier_runs(
         [p1, p2, p3], "BioCLIP-2.5", "fp-a",
-    ) == 1
+    ) == 2
 
 
 def test_count_classifier_runs_ignores_non_animal_detections(tmp_path):
@@ -18749,7 +19824,7 @@ def test_count_classifier_runs_ignores_non_animal_detections(tmp_path):
     # p1: one animal detection (cached) + one uncached person detection.
     # The person box gets skipped at runtime so p1 IS fully cache-served.
     d1_animal = _add_one_detection(db, p1, conf=0.9)
-    db.record_classifier_run(d1_animal, "BioCLIP-2.5", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(db, d1_animal, "BioCLIP-2.5", "fp-a")
     db.conn.execute(
         """INSERT INTO detections
              (photo_id, detector_model, box_x, box_y, box_w, box_h,
@@ -18771,11 +19846,807 @@ def test_count_classifier_runs_ignores_non_animal_detections(tmp_path):
         (p2,),
     )
     db.conn.commit()
-    db.record_classifier_run(cur.lastrowid, "BioCLIP-2.5", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(
+        db, cur.lastrowid, "BioCLIP-2.5", "fp-a",
+    )
 
     assert db.count_classifier_runs(
         [p1, p2], "BioCLIP-2.5", "fp-a",
     ) == 1
+
+
+def test_get_classifier_run_cache_hits_returns_matched_photo_ids(tmp_path):
+    """The pipeline needs the SET (not just the count) so it can scope
+    its overcount tracker to preflight-expected photos — recording a
+    fall-through miss on a photo the preflight never counted would
+    deflate the projected cache-hit rate for unrelated tails
+    (Codex #1468 P2).
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    p_cached = db.add_photo(
+        folder_id=fid, filename="cached.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_partial = db.add_photo(
+        folder_id=fid, filename="partial.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_none = db.add_photo(
+        folder_id=fid, filename="none.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+
+    d_cached = _add_one_detection(db, p_cached)
+    _record_usable_classifier_run(db, d_cached, "BioCLIP-2.5", "fp-a")
+
+    # Multi-detection: one has a run key, the other doesn't. Preflight
+    # must NOT count p_partial — the runtime will infer the uncached one.
+    d_partial_a = _add_one_detection(db, p_partial)
+    _ = _add_one_detection(db, p_partial)
+    _record_usable_classifier_run(db, d_partial_a, "BioCLIP-2.5", "fp-a")
+
+    _ = _add_one_detection(db, p_none)
+
+    hits = db.get_classifier_run_cache_hits(
+        [p_cached, p_partial, p_none], "BioCLIP-2.5", "fp-a",
+    )
+    assert hits == {p_cached}, (
+        "Only the fully-cached photo should be reported; scoping the "
+        "overcount tracker to this set is what keeps Codex #1468 P2's "
+        "unrelated-photo deflation from happening."
+    )
+
+
+def test_get_classifier_run_cache_hits_requires_usable_prediction(tmp_path):
+    """A run key without prediction rows is an inference miss at runtime."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    photo_id = db.add_photo(
+        folder_id=fid, filename="run-only.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    detection_id = _add_one_detection(db, photo_id)
+    db.record_classifier_run(
+        detection_id, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+
+    assert db.get_classifier_run_cache_hits(
+        [photo_id], "BioCLIP-2.5", "fp-a",
+    ) == set()
+
+    db.add_prediction(
+        detection_id,
+        species="Robin",
+        confidence=0.9,
+        model="BioCLIP-2.5",
+        labels_fingerprint="fp-a",
+    )
+    assert db.get_classifier_run_cache_hits(
+        [photo_id], "BioCLIP-2.5", "fp-a",
+    ) == {photo_id}
+
+
+def test_get_classifier_run_cache_hits_rejects_obsolete_runtime_fingerprint(
+    tmp_path,
+):
+    """A classifier_runs row the runtime gate rejects because its
+    ``runtime_fingerprint`` no longer matches must NOT count as a cache
+    hit at preflight either.
+
+    Regression for Codex #1468 P2 (final unresolved thread): the earlier
+    preflight required only a row + a matching prediction and left the
+    runtime-fingerprint check to observation-time reconciliation. Rows in
+    the unvisited tail never registered as misses, so
+    ``_classification_eta_progress`` trusted the inflated ``cached_est``
+    and prematurely collapsed ``remaining_uncached`` to zero after the
+    representative uncached batch. Passing the caller-computed
+    ``expected_classifier_runtime_by_detector_runtime`` map now mirrors
+    what ``get_classifier_run_key_gate`` accepts at runtime, so the
+    preflight excludes obsolete-runtime rows up front. ``'legacy'`` rows
+    remain accepted (grandfathered) and prediction_review overrides
+    still surface, matching the runtime gate.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+
+    p_stale = db.add_photo(
+        folder_id=fid, filename="stale.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_legacy = db.add_photo(
+        folder_id=fid, filename="legacy.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_current = db.add_photo(
+        folder_id=fid, filename="current.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+
+    # Every detection is tied to detector runtime ``rt-current``. Only the
+    # classifier_runs.runtime_fingerprint varies — the runtime gate accepts
+    # ``cls-current`` and the ``'legacy'`` sentinel but rejects ``cls-old``.
+    def _det_with_rt(photo_id, det_rt):
+        det_id = _add_one_detection(db, photo_id)
+        db.conn.execute(
+            "UPDATE detections SET runtime_fingerprint = ? WHERE id = ?",
+            (det_rt, det_id),
+        )
+        db.conn.commit()
+        return det_id
+
+    stale_det = _det_with_rt(p_stale, "rt-current")
+    legacy_det = _det_with_rt(p_legacy, "rt-current")
+    current_det = _det_with_rt(p_current, "rt-current")
+
+    db.record_classifier_run(
+        stale_det, "BioCLIP-2.5", "fp-a", prediction_count=1,
+        runtime_fingerprint="cls-old",
+    )
+    db.add_prediction(
+        stale_det, species="Robin", confidence=0.9,
+        model="BioCLIP-2.5", labels_fingerprint="fp-a",
+    )
+    db.record_classifier_run(
+        legacy_det, "BioCLIP-2.5", "fp-a", prediction_count=1,
+        runtime_fingerprint="legacy",
+    )
+    db.add_prediction(
+        legacy_det, species="Robin", confidence=0.9,
+        model="BioCLIP-2.5", labels_fingerprint="fp-a",
+    )
+    db.record_classifier_run(
+        current_det, "BioCLIP-2.5", "fp-a", prediction_count=1,
+        runtime_fingerprint="cls-current",
+    )
+    db.add_prediction(
+        current_det, species="Robin", confidence=0.9,
+        model="BioCLIP-2.5", labels_fingerprint="fp-a",
+    )
+
+    # Without the map, all three count (preserves prior behaviour on the
+    # reclassify path and for callers that don't wire up portable identity).
+    assert db.get_classifier_run_cache_hits(
+        [p_stale, p_legacy, p_current], "BioCLIP-2.5", "fp-a",
+    ) == {p_stale, p_legacy, p_current}
+
+    # With the map, the stale-runtime row is filtered out — matching what
+    # ``get_classifier_run_key_gate`` returns at runtime. The observation
+    # tracker no longer has to reconcile a phantom cache hit for the
+    # unvisited tail.
+    hits = db.get_classifier_run_cache_hits(
+        [p_stale, p_legacy, p_current], "BioCLIP-2.5", "fp-a",
+        expected_classifier_runtime_by_detector_runtime={
+            "rt-current": "cls-current",
+        },
+    )
+    assert hits == {p_legacy, p_current}, (
+        "Obsolete-runtime classifier_runs rows must not count as cache "
+        "hits; 'legacy' remains grandfathered. Without this filter the "
+        "preflight overcounts the tail and remaining_uncached collapses "
+        "to zero before real inference completes (Codex #1468 P2)."
+    )
+
+    # A permissive entry (expected value ``None``) preserves the pre-Codex
+    # fallback: detections whose runtime maps to ``None`` accept any
+    # classifier_runs.runtime_fingerprint. This mirrors the pipeline's
+    # ``get_classifier_run_keys`` else branch when portable identity is
+    # not available to compute an expected value.
+    permissive_hits = db.get_classifier_run_cache_hits(
+        [p_stale, p_legacy, p_current], "BioCLIP-2.5", "fp-a",
+        expected_classifier_runtime_by_detector_runtime={"rt-current": None},
+    )
+    assert permissive_hits == {p_stale, p_legacy, p_current}
+
+    # Prediction_review overrides on the stale row must still surface it,
+    # matching the runtime gate's individual-override branch.
+    ws_id = db._ws_id()
+    pred_id = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?",
+        (stale_det,),
+    ).fetchone()["id"]
+    db.set_review_status(
+        pred_id, ws_id, "accepted", individual="Robin",
+    )
+    hits_with_override = db.get_classifier_run_cache_hits(
+        [p_stale, p_legacy, p_current], "BioCLIP-2.5", "fp-a",
+        expected_classifier_runtime_by_detector_runtime={
+            "rt-current": "cls-current",
+        },
+    )
+    assert hits_with_override == {p_stale, p_legacy, p_current}, (
+        "A real prediction_review override must rescue an "
+        "obsolete-runtime row, matching get_classifier_run_key_gate's "
+        "individual-override branch."
+    )
+
+
+def test_get_classifier_run_cache_hits_uses_fresh_runtime_candidates(tmp_path):
+    """Processed photos must be scored from the detector map the runtime uses.
+
+    A stale uncached row from another detector must not hide a fully cached
+    fresh MegaDetector target and make the ETA project cached work as inference.
+    Photos the current detector pass did not process retain the DB fallback.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    p_processed = db.add_photo(
+        folder_id=fid, filename="processed.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_failed = db.add_photo(
+        folder_id=fid, filename="failed.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+
+    # The processed photo retains an uncached foreign-detector row, but its
+    # actual current-run MegaDetector target is cached.
+    _add_one_detection(
+        db, p_processed, detector_model="megadetector-v5", conf=0.9,
+    )
+    fresh_detection_id = _add_one_detection(
+        db, p_processed, detector_model="megadetector-v6", conf=0.8,
+    )
+    _record_usable_classifier_run(
+        db, fresh_detection_id, "BioCLIP-2.5", "fp-a",
+    )
+
+    # This photo represents an individual detector failure: it is absent from
+    # processed_ids, so its cached DB candidate must still count.
+    failed_fallback_id = _add_one_detection(
+        db, p_failed, detector_model="megadetector-v6", conf=0.7,
+    )
+    _record_usable_classifier_run(
+        db, failed_fallback_id, "BioCLIP-2.5", "fp-a",
+    )
+
+    assert db.get_classifier_run_cache_hits(
+        [p_processed, p_failed], "BioCLIP-2.5", "fp-a",
+    ) == {p_failed}
+
+    hits = db.get_classifier_run_cache_hits(
+        [p_processed, p_failed], "BioCLIP-2.5", "fp-a",
+        fresh_detections_by_photo={
+            p_processed: [{
+                "id": fresh_detection_id,
+                "detector_model": "megadetector-v6",
+                "confidence": 0.8,
+                "category": "animal",
+            }],
+        },
+        fresh_processed_photo_ids={p_processed},
+    )
+    assert hits == {p_processed, p_failed}
+
+
+def test_get_classifier_run_cache_hits_includes_noise_full_image_anchor(
+    tmp_path,
+):
+    """Noise and detector-failure photos reuse cached full-image runs."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    p_noise = db.add_photo(
+        folder_id=fid, filename="noise.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_person = db.add_photo(
+        folder_id=fid, filename="person.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_detector_failure = db.add_photo(
+        folder_id=fid, filename="detector-failure.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+
+    _add_one_detection(
+        db, p_noise, detector_model="megadetector-v6", conf=0.1,
+    )
+    noise_anchor = _add_one_detection(
+        db, p_noise, detector_model="full-image", conf=0,
+    )
+    db.record_detector_run(p_noise, "megadetector-v6", box_count=1)
+    _record_usable_classifier_run(db, noise_anchor, "BioCLIP-2.5", "fp-a")
+
+    db.conn.execute(
+        """INSERT INTO detections
+             (photo_id, detector_model, box_x, box_y, box_w, box_h,
+              detector_confidence, category)
+           VALUES (?, 'megadetector-v6', 0, 0, 1, 1, 0.9, 'person')""",
+        (p_person,),
+    )
+    person_anchor = _add_one_detection(
+        db, p_person, detector_model="full-image", conf=0,
+    )
+    db.record_detector_run(p_person, "megadetector-v6", box_count=1)
+    _record_usable_classifier_run(db, person_anchor, "BioCLIP-2.5", "fp-a")
+
+    # _detect_batch does not write a MegaDetector run row when inference
+    # fails, but classify can still create and later reuse this anchor.
+    failure_anchor = _add_one_detection(
+        db, p_detector_failure, detector_model="full-image", conf=0,
+    )
+    _record_usable_classifier_run(
+        db, failure_anchor, "BioCLIP-2.5", "fp-a",
+    )
+
+    hits = db.get_classifier_run_cache_hits(
+        [p_noise, p_person, p_detector_failure], "BioCLIP-2.5", "fp-a",
+    )
+    assert hits == {p_noise, p_detector_failure}
+
+
+def test_fresh_preflight_reloads_omitted_contextual_weak_candidate(tmp_path):
+    """Ordinary cache reuse omits weak rows that runtime later reloads."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    photo_id = db.add_photo(
+        folder_id=fid, filename="weak.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    weak_detection_id = _add_one_detection(
+        db, photo_id, detector_model="megadetector-v6", conf=0.15,
+    )
+    _record_usable_classifier_run(
+        db, weak_detection_id, "BioCLIP-2.5", "fp-a",
+    )
+
+    # _detect_batch's ordinary-threshold reuse path records the photo as
+    # processed but supplies an empty map entry. The classify loop then reloads
+    # this contextual-weak MDv6 row from the DB, so both preflights must agree.
+    fresh_map = {photo_id: []}
+    processed_ids = {photo_id}
+    weak_ids = {photo_id}
+
+    hits = db.get_classifier_run_cache_hits(
+        [photo_id], "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids=weak_ids,
+        weak_confidence=0.12,
+        fresh_detections_by_photo=fresh_map,
+        fresh_processed_photo_ids=processed_ids,
+    )
+    assert hits == {photo_id}
+    assert db.get_unclassifiable_photos(
+        [photo_id],
+        contextual_weak_photo_ids=weak_ids,
+        weak_confidence=0.12,
+        fresh_detections_by_photo=fresh_map,
+        fresh_processed_photo_ids=processed_ids,
+    ) == set()
+
+
+def test_get_classifier_run_cache_hits_includes_contextual_weak(tmp_path):
+    """Contextual weak photos are classified with the lowered
+    ``weak_detection_confidence`` floor; the preflight must apply the
+    same floor for these IDs or the cached weak tail is scored as pure
+    uncached work and the ETA overstates remaining time (Codex #1468 P2).
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    # Both photos carry only a weak-confidence detection. Under the
+    # normal 0.2 threshold neither has any qualifying detection, so the
+    # legacy preflight would omit both from ``cached_est``. Under the
+    # weak 0.12 floor only ``p_weak_cached`` has a matching run key.
+    p_weak_cached = db.add_photo(
+        folder_id=fid, filename="weak_cached.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_weak_uncached = db.add_photo(
+        folder_id=fid, filename="weak_uncached.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    d_weak_cached = _add_one_detection(
+        db, p_weak_cached, detector_model="megadetector-v6", conf=0.15,
+    )
+    _record_usable_classifier_run(db, d_weak_cached, "BioCLIP-2.5", "fp-a")
+    _ = _add_one_detection(
+        db, p_weak_uncached, detector_model="megadetector-v6", conf=0.15,
+    )
+
+    # Legacy path (no weak args): both photos below the normal floor,
+    # neither counted. This is the buggy behavior the fix corrects.
+    assert db.get_classifier_run_cache_hits(
+        [p_weak_cached, p_weak_uncached], "BioCLIP-2.5", "fp-a",
+    ) == set()
+
+    # With contextual weak args the cached weak photo is counted.
+    hits = db.get_classifier_run_cache_hits(
+        [p_weak_cached, p_weak_uncached],
+        "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids={p_weak_cached, p_weak_uncached},
+        weak_confidence=0.12,
+    )
+    assert hits == {p_weak_cached}
+
+
+def test_get_classifier_run_cache_hits_weak_scoped_per_photo(tmp_path):
+    """``contextual_weak_photo_ids`` must apply only to the listed IDs.
+    A regular photo without an above-threshold cached detection should
+    still be excluded even if the weak floor would have qualified it.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    p_normal_weak_only = db.add_photo(
+        folder_id=fid, filename="normal.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_weak = db.add_photo(
+        folder_id=fid, filename="weak.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    d_normal_low = _add_one_detection(
+        db, p_normal_weak_only, detector_model="megadetector-v6", conf=0.15,
+    )
+    _record_usable_classifier_run(db, d_normal_low, "BioCLIP-2.5", "fp-a")
+    d_weak = _add_one_detection(
+        db, p_weak, detector_model="megadetector-v6", conf=0.15,
+    )
+    _record_usable_classifier_run(db, d_weak, "BioCLIP-2.5", "fp-a")
+
+    # Only p_weak is in the contextual weak set; p_normal_weak_only stays
+    # gated by the ordinary detector_confidence floor.
+    hits = db.get_classifier_run_cache_hits(
+        [p_normal_weak_only, p_weak],
+        "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids={p_weak},
+        weak_confidence=0.12,
+    )
+    assert hits == {p_weak}
+
+
+def test_get_classifier_run_cache_hits_weak_matches_top_detection_only(tmp_path):
+    """Contextual-weak photos are classified via ``photo_dets[:1]`` — the
+    single top detection by (confidence DESC, id ASC). The preflight
+    must mirror that: a photo whose only cached run key sits on a
+    lower-ranked box should NOT be counted, because the runtime will
+    infer the uncached top box and neither the cache-hit nor the
+    fall-through overcount branch would record it, leaving a phantom
+    cache hit in the ETA (Codex #1468 P2).
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+
+    # p_lower_cached: two weak-threshold detections. The higher-
+    # confidence (0.18) has no run key; the lower (0.13) does. Runtime
+    # infers the top one, so preflight must NOT count this photo.
+    p_lower_cached = db.add_photo(
+        folder_id=fid, filename="lower.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    _ = _add_one_detection(
+        db, p_lower_cached, detector_model="megadetector-v6", conf=0.18,
+    )
+    d_lower = _add_one_detection(
+        db, p_lower_cached, detector_model="megadetector-v6", conf=0.13,
+    )
+    _record_usable_classifier_run(db, d_lower, "BioCLIP-2.5", "fp-a")
+
+    # p_top_cached: same shape, but the run key is on the TOP box —
+    # runtime cache-hits, preflight counts it.
+    p_top_cached = db.add_photo(
+        folder_id=fid, filename="top.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    d_top = _add_one_detection(
+        db, p_top_cached, detector_model="megadetector-v6", conf=0.18,
+    )
+    _ = _add_one_detection(
+        db, p_top_cached, detector_model="megadetector-v6", conf=0.13,
+    )
+    _record_usable_classifier_run(db, d_top, "BioCLIP-2.5", "fp-a")
+
+    hits = db.get_classifier_run_cache_hits(
+        [p_lower_cached, p_top_cached],
+        "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids={p_lower_cached, p_top_cached},
+        weak_confidence=0.12,
+    )
+    assert hits == {p_top_cached}
+
+
+def test_get_classifier_run_cache_hits_weak_ties_break_by_id(tmp_path):
+    """When two weak detections tie on confidence, the runtime picks the
+    lowest id (get_detections orders by ``confidence DESC, id ASC``).
+    The preflight must mirror that tie-break exactly.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    p = db.add_photo(
+        folder_id=fid, filename="tie.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    d_first = _add_one_detection(
+        db, p, detector_model="megadetector-v6", conf=0.15,
+    )
+    d_second = _add_one_detection(
+        db, p, detector_model="megadetector-v6", conf=0.15,
+    )
+    # Only the SECOND (higher-id) detection has a run key. The runtime
+    # picks the first (lowest id) and infers, so preflight must not
+    # count this photo.
+    _record_usable_classifier_run(db, d_second, "BioCLIP-2.5", "fp-a")
+    assert d_first < d_second
+
+    hits = db.get_classifier_run_cache_hits(
+        [p], "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids={p},
+        weak_confidence=0.12,
+    )
+    assert hits == set()
+
+    # Move the run key to the first detection — now it matches and the
+    # photo is counted.
+    db.conn.execute(
+        "UPDATE classifier_runs SET detection_id = ? WHERE detection_id = ?",
+        (d_first, d_second),
+    )
+    db.conn.execute(
+        "UPDATE predictions SET detection_id = ? WHERE detection_id = ?",
+        (d_first, d_second),
+    )
+    db.conn.commit()
+
+    hits = db.get_classifier_run_cache_hits(
+        [p], "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids={p},
+        weak_confidence=0.12,
+    )
+    assert hits == {p}
+
+
+def test_get_classifier_run_cache_hits_weak_ignores_foreign_detector(tmp_path):
+    """The runtime weak fallback restricts itself to
+    ``detector_model='megadetector-v6'``. If the preflight ranked any
+    non-full-image detector instead, a stale weak row from another
+    detector model could win the ROW_NUMBER tie-break and carry the
+    matching run key, marking the photo cached even though the runtime
+    would infer the uncached megadetector-v6 top box. Because that
+    runtime-selected detection has no run key of its own, the overcount
+    tracker cannot correct the phantom cache hit and the ETA would
+    undercount the uncached tail (Codex #1468 P2).
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    p = db.add_photo(
+        folder_id=fid, filename="foreign_top.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    # Foreign detector weak row: higher confidence, would rank #1 if the
+    # preflight considered non-megadetector rows. Carries the matching
+    # run key.
+    d_foreign = _add_one_detection(
+        db, p, detector_model="megadetector-v5", conf=0.19,
+    )
+    _record_usable_classifier_run(db, d_foreign, "BioCLIP-2.5", "fp-a")
+    # MegaDetector-v6 weak row: what the runtime actually picks. No run
+    # key — runtime will infer.
+    _ = _add_one_detection(
+        db, p, detector_model="megadetector-v6", conf=0.15,
+    )
+
+    hits = db.get_classifier_run_cache_hits(
+        [p], "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids={p},
+        weak_confidence=0.12,
+    )
+    assert hits == set()
+
+    # Sanity: once the megadetector-v6 top box has the run key too, the
+    # photo does count as cached.
+    d_v6_top = db.conn.execute(
+        "SELECT id FROM detections "
+        "WHERE photo_id = ? AND detector_model = 'megadetector-v6'",
+        (p,),
+    ).fetchone()["id"]
+    _record_usable_classifier_run(db, d_v6_top, "BioCLIP-2.5", "fp-a")
+    hits = db.get_classifier_run_cache_hits(
+        [p], "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids={p},
+        weak_confidence=0.12,
+    )
+    assert hits == {p}
+
+
+def test_get_unclassifiable_photos_keeps_noise_fallback_as_work(tmp_path):
+    """Below-threshold animal noise now receives full-image inference."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+
+    # Above threshold — classifiable, should NOT be flagged.
+    p_ok = db.add_photo(
+        folder_id=fid, filename="ok.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    _add_one_detection(db, p_ok, conf=0.5)
+
+    # Below threshold, not contextual weak — full-image fallback at runtime.
+    p_skip = db.add_photo(
+        folder_id=fid, filename="skip.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    _add_one_detection(db, p_skip, conf=0.15)
+
+    # No real detections at all — goes to full-image fallback, not the
+    # skip branch. Must NOT be flagged.
+    p_empty = db.add_photo(
+        folder_id=fid, filename="empty.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+
+    # Below threshold BUT in the contextual-weak set — the runtime lowers
+    # the floor for it, so it classifies rather than skips.
+    p_weak_rescued = db.add_photo(
+        folder_id=fid, filename="rescued.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    _add_one_detection(db, p_weak_rescued, conf=0.15)
+
+    unclassifiable = db.get_unclassifiable_photos(
+        [p_ok, p_skip, p_empty, p_weak_rescued],
+        contextual_weak_photo_ids={p_weak_rescued},
+        weak_confidence=0.12,
+    )
+    assert unclassifiable == set()
+
+
+def test_get_unclassifiable_photos_flags_confident_non_animal_boxes(tmp_path):
+    """A photo whose only above-threshold boxes are non-animal
+    (person/vehicle) has no runtime-classifiable target but IS still
+    skipped instead of receiving a wildlife full-image fallback.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+
+    p_person_only = db.add_photo(
+        folder_id=fid, filename="person.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    db.conn.execute(
+        """INSERT INTO detections
+             (photo_id, detector_model, box_x, box_y, box_w, box_h,
+              detector_confidence, category)
+           VALUES (?, ?, 0.0, 0.0, 1.0, 1.0, 0.9, 'person')""",
+        (p_person_only, "test-det"),
+    )
+    db.conn.commit()
+
+    unclassifiable = db.get_unclassifiable_photos([p_person_only])
+    assert unclassifiable == {p_person_only}
+
+
+def test_get_unclassifiable_photos_uses_fresh_detections_when_provided(tmp_path):
+    """Fresh non-animal evidence must override a stale animal DB row."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+
+    # A photo whose DB rows (both stale legacy AND fresh) sit above the
+    # floor — the fresh set contains a qualifying box, so the photo
+    # must NOT be flagged unclassifiable.
+    p_still_classifiable = db.add_photo(
+        folder_id=fid, filename="still.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    _add_one_detection(
+        db, p_still_classifiable, detector_model="megadetector-v5", conf=0.5,
+    )
+    _add_one_detection(
+        db, p_still_classifiable, detector_model="megadetector-v6", conf=0.5,
+    )
+
+    # A stale animal row makes the DB-only view classifiable, but the current
+    # detector map contains only a confident person box, so runtime skips it.
+    p_fresh_person = db.add_photo(
+        folder_id=fid, filename="fresh-person.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    _add_one_detection(
+        db, p_fresh_person, detector_model="megadetector-v5", conf=0.5,
+    )
+    db.conn.execute(
+        """INSERT INTO detections
+             (photo_id, detector_model, box_x, box_y, box_w, box_h,
+              detector_confidence, category)
+           VALUES (?, 'megadetector-v6', 0, 0, 1, 1, 0.9, 'person')""",
+        (p_fresh_person,),
+    )
+    db.conn.commit()
+
+    fresh_map = {
+        p_still_classifiable: [
+            {"confidence": 0.5, "category": "animal"},
+        ],
+        p_fresh_person: [
+            {"confidence": 0.9, "category": "person"},
+        ],
+    }
+
+    # Sanity: DB-only view returns nothing (both photos have >= floor rows).
+    assert db.get_unclassifiable_photos(
+        [p_still_classifiable, p_fresh_person],
+    ) == set()
+
+    unclassifiable = db.get_unclassifiable_photos(
+        [p_still_classifiable, p_fresh_person],
+        fresh_detections_by_photo=fresh_map,
+    )
+    assert unclassifiable == {p_fresh_person}
+
+
+def test_get_unclassifiable_photos_db_fallback_for_unprocessed_photos(tmp_path):
+    """When ``_detect_batch`` fails for a single image on a reclassify run
+    it omits that photo from both ``detections`` and ``processed_ids``,
+    and the runtime falls back to ``db.get_detections()`` for it. The
+    preflight must do the same when the retained DB row is a confident
+    non-animal skip.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+
+    # Detector completed successfully with a confident person box.
+    p_processed_person = db.add_photo(
+        folder_id=fid, filename="person.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    db.conn.execute(
+        """INSERT INTO detections
+             (photo_id, detector_model, box_x, box_y, box_w, box_h,
+              detector_confidence, category)
+           VALUES (?, 'megadetector-v6', 0, 0, 1, 1, 0.9, 'person')""",
+        (p_processed_person,),
+    )
+
+    # Detector RAISED on this photo (missing from ``processed_ids`` AND
+    # from ``fresh_detections_by_photo``). DB still holds a prior
+    # confident person row from a previous run, so runtime's DB fallback skips.
+    p_detector_failed = db.add_photo(
+        folder_id=fid, filename="failed.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    db.conn.execute(
+        """INSERT INTO detections
+             (photo_id, detector_model, box_x, box_y, box_w, box_h,
+              detector_confidence, category)
+           VALUES (?, 'megadetector-v6', 0, 0, 1, 1, 0.8, 'person')""",
+        (p_detector_failed,),
+    )
+    db.conn.commit()
+
+    fresh_map = {
+        p_processed_person: [{"confidence": 0.9, "category": "person"}],
+        # p_detector_failed intentionally absent — detector raised.
+    }
+    processed_ids = {p_processed_person}
+
+    # Without processed IDs the missing photo looks like an empty current map,
+    # so only the explicitly present person box is predicted as a skip.
+    naive = db.get_unclassifiable_photos(
+        [p_processed_person, p_detector_failed],
+        fresh_detections_by_photo=fresh_map,
+    )
+    assert naive == {p_processed_person}
+
+    # With ``fresh_processed_photo_ids``, the detector-failed photo falls
+    # back to the DB predicate and its confident person row is also a skip.
+    unclassifiable = db.get_unclassifiable_photos(
+        [p_processed_person, p_detector_failed],
+        fresh_detections_by_photo=fresh_map,
+        fresh_processed_photo_ids=processed_ids,
+    )
+    assert unclassifiable == {p_processed_person, p_detector_failed}
 
 
 def test_all_nav_ids_covers_every_page():

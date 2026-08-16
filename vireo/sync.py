@@ -4,6 +4,7 @@ import logging
 import os
 from collections import defaultdict
 
+from db import KEYWORD_SOURCE_UNKNOWN
 from keyword_normalization import keyword_match_key
 from xmp import (
     read_keywords,
@@ -295,7 +296,9 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
 
     # Clear successfully synced changes
     if synced_ids:
-        db.clear_pending(synced_ids)
+        db.clear_pending(
+            synced_ids, clear_equivalent_flat_removals=True,
+        )
 
     log.info("Sync complete: %d synced, %d failed", synced, failed)
     return {"synced": synced, "failed": failed, "failures": failures}
@@ -336,10 +339,17 @@ def sync_from_xmp(db, photo_ids):
         # abort the whole sidecar reconcile on a malformed edge-quote
         # keyword instead of ignoring it and processing the rest.
         xmp_keywords = read_keywords(xmp_path)
+        pending_removals = db.get_pending_keyword_removal_keys(photo_id)
+        pending_hierarchical_removals = db.get_pending_keyword_removal_keys(
+            photo_id, hierarchical=True,
+        )
+        pending_flat_only_removals = (
+            pending_removals - pending_hierarchical_removals
+        )
         xmp_keywords_by_key = {}
         for kw in xmp_keywords:
             key = keyword_match_key(kw)
-            if not key:
+            if not key or key in pending_removals:
                 continue
             xmp_keywords_by_key.setdefault(key, kw)
 
@@ -352,10 +362,18 @@ def sync_from_xmp(db, photo_ids):
             if kw_key in db_keywords_by_key:
                 continue
             kid = db.add_keyword(kw_name)
-            db.tag_photo(photo_id, kid)
+            # Reconciling *from* a sidecar cannot tell a hand-typed Lightroom
+            # keyword from one Vireo wrote out, so this writer stays
+            # provenance-neutral instead of claiming manual authorship.
+            db.tag_photo(photo_id, kid, source=KEYWORD_SOURCE_UNKNOWN)
 
         for kw in db_keywords:
-            if keyword_match_key(kw["name"]) not in xmp_keywords_by_key:
+            kw_key = keyword_match_key(kw["name"])
+            preserve_hierarchy = (
+                kw["parent_id"] is not None
+                and kw_key in pending_flat_only_removals
+            )
+            if kw_key not in xmp_keywords_by_key and not preserve_hierarchy:
                 db.untag_photo(photo_id, kw["id"])
 
         # Update xmp_mtime

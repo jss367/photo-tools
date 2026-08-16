@@ -224,6 +224,7 @@ POST         /api/batch/location
 POST         /api/batch/location/from-exif
 POST         /api/batch/location/text
 POST         /api/batch/rating
+POST         /api/batch/wildlife-excluded
 POST         /api/browse/mkdir
 POST         /api/browse/photo-counts
 POST         /api/capture-time/preview
@@ -366,6 +367,7 @@ POST         /api/remote-targets/test
 POST         /api/report-issue
 POST         /api/selection/keyword-suggestions
 POST         /api/selection/prediction-suggestions
+POST         /api/selection/wildlife-state
 POST         /api/settings/import
 POST         /api/setup/complete
 POST         /api/shutdown

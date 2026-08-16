@@ -16,7 +16,11 @@ from datetime import datetime
 from pathlib import Path
 
 import imagehash
-from db import commit_with_retry
+from db import (
+    KEYWORD_SOURCE_CONFLICT_SQL,
+    KEYWORD_SOURCE_UNKNOWN,
+    commit_with_retry,
+)
 from exif_orientation import orientation_swaps_axes as _orientation_swaps_axes
 from image_loader import (
     RAW_EXTENSIONS,
@@ -278,6 +282,10 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
     """Read flat and hierarchical keywords from XMP and populate the database."""
     flat_keywords = read_keywords(xmp_path_str)
     hier_keywords = read_hierarchical_keywords(xmp_path_str)
+    pending_flat_removals = db.get_pending_keyword_removal_keys(photo_id)
+    pending_hierarchical_removals = db.get_pending_keyword_removal_keys(
+        photo_id, hierarchical=True,
+    )
 
     # Build hierarchy from lr:hierarchicalSubject
     # e.g., 'Birds|Raptors|Black kite' creates Birds -> Raptors -> Black kite
@@ -289,12 +297,20 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
         parts = hier.split("|")
         if any(not keyword_match_key(part) for part in parts):
             continue
+        if any(
+            keyword_match_key(part) in pending_hierarchical_removals
+            for part in parts
+        ):
+            continue
         parent_id = None
         for part in parts:
             kid = db.add_keyword(part, parent_id=parent_id)
             parent_id = kid
-        # Tag with the leaf keyword
-        db.tag_photo(photo_id, parent_id)
+        # Tag with the leaf keyword. A sidecar term is genuinely ambiguous —
+        # the user may have typed it in Lightroom, or Vireo may have written
+        # it out itself — so this is one of the few writers that declines to
+        # claim manual authorship.
+        db.tag_photo(photo_id, parent_id, source=KEYWORD_SOURCE_UNKNOWN)
 
     # Also add any flat keywords not already covered by hierarchy. Compare
     # via the normalized match key on both sides: DB names are stored in
@@ -311,10 +327,16 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
         key = keyword_match_key(kw)
         if not key:
             continue
+        # A sidecar write can be intentionally deferred in the sync panel.
+        # Do not resurrect the DB association from the still-stale sidecar
+        # while its removal is pending.
+        if key in pending_flat_removals:
+            continue
         if key in existing_keys:
             continue
         kid = db.add_keyword(kw)
-        db.tag_photo(photo_id, kid)
+        # Same ambiguity as the hierarchical branch above.
+        db.tag_photo(photo_id, kid, source=KEYWORD_SOURCE_UNKNOWN)
         existing_keys.add(key)
 
 
@@ -527,13 +549,19 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
 
         # Transfer keywords from companion to primary
         companion_keywords = db.conn.execute(
-            "SELECT keyword_id FROM photo_keywords WHERE photo_id = ?",
+            "SELECT keyword_id, source FROM photo_keywords WHERE photo_id = ?",
             (companion["id"],),
         ).fetchall()
         for kw in companion_keywords:
+            # Move the association's provenance with it: pairing a RAW with
+            # its camera JPEG must not turn the user's hand-added keywords
+            # into "unknown" rows a retirement pass would treat as generated.
+            # The shared conflict clause keeps whichever side's claim is
+            # stronger when the primary already carries the keyword.
             db.conn.execute(
-                "INSERT OR IGNORE INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-                (primary["id"], kw["keyword_id"]),
+                "INSERT INTO photo_keywords (photo_id, keyword_id, source) "
+                "VALUES (?, ?, ?) " + KEYWORD_SOURCE_CONFLICT_SQL,
+                (primary["id"], kw["keyword_id"], kw["source"]),
             )
 
         db.conn.execute(

@@ -33,6 +33,22 @@ def _open_browse(page, live_server):
     )
 
 
+def test_browse_view_preferences_persist_across_navigation(live_server, page):
+    _open_browse(page, live_server)
+
+    page.locator("#sortSelect").select_option("name_desc")
+    page.locator("#thumbSizeSlider").fill("300")
+
+    page.goto(live_server["url"] + "/")
+    _open_browse(page, live_server)
+
+    assert page.locator("#sortSelect").input_value() == "name_desc"
+    assert page.locator("#thumbSizeSlider").input_value() == "300"
+    assert page.locator("#grid").evaluate(
+        "el => el.style.getPropertyValue('--thumb-size')"
+    ) == "300px"
+
+
 def test_collection_open_waits_for_filter_bar_initialization(live_server, page):
     """An early collection click is queued while filter fields are loading."""
     collection_id = next(

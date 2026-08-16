@@ -15,6 +15,95 @@ window.Vireo.dom = window.Vireo.dom || {
   },
 };
 
+/*
+ * Persistent presentation preferences.
+ *
+ * Stable view controls opt in with data-view-preference="vireo.page.name".
+ * Scope, search, and content-filter controls intentionally do not opt in:
+ * restoring those can silently hide content when a user returns to a page.
+ */
+var VireoViewPreferences = (function() {
+  var selector = '[data-view-preference]';
+
+  function keyFor(elementOrKey) {
+    if (typeof elementOrKey === 'string') return elementOrKey;
+    return elementOrKey && elementOrKey.getAttribute
+      ? elementOrKey.getAttribute('data-view-preference')
+      : null;
+  }
+
+  function read(elementOrKey) {
+    var key = keyFor(elementOrKey);
+    if (!key) return null;
+    try { return window.localStorage.getItem(key); } catch (e) { return null; }
+  }
+
+  function write(elementOrKey, value) {
+    var key = keyFor(elementOrKey);
+    if (!key) return;
+    try { window.localStorage.setItem(key, String(value)); } catch (e) {}
+  }
+
+  function validValue(element, value) {
+    if (value === null || value === undefined) return false;
+    if (element.tagName === 'SELECT') {
+      return Array.prototype.some.call(element.options, function(option) {
+        return option.value === value;
+      });
+    }
+    if (element.type === 'checkbox') return value === '0' || value === '1';
+    if (element.type === 'range' || element.type === 'number') {
+      var parsed = Number(value);
+      if (!Number.isFinite(parsed)) return false;
+      if (element.min !== '' && parsed < Number(element.min)) return false;
+      if (element.max !== '' && parsed > Number(element.max)) return false;
+    }
+    return true;
+  }
+
+  function restore(element) {
+    if (!element) return false;
+    var saved = read(element);
+    if (!validValue(element, saved)) return false;
+    if (element.type === 'checkbox') element.checked = saved === '1';
+    else element.value = saved;
+    return true;
+  }
+
+  function restoreAll(root) {
+    var scope = root || document;
+    if (scope.matches && scope.matches(selector)) restore(scope);
+    if (scope.querySelectorAll) scope.querySelectorAll(selector).forEach(restore);
+  }
+
+  function persist(element) {
+    if (!element || !element.matches || !element.matches(selector)) return;
+    write(element, element.type === 'checkbox' ? (element.checked ? '1' : '0') : element.value);
+  }
+
+  function onPreferenceEvent(event) {
+    persist(event.target);
+  }
+
+  // Delegation covers controls parsed after this shared script and avoids
+  // page-specific storage listeners. Range inputs save continuously; select
+  // and checkbox controls save on change.
+  document.addEventListener('input', onPreferenceEvent, true);
+  document.addEventListener('change', onPreferenceEvent, true);
+  // Restore controls already parsed (notably shared navbar controls). Pages
+  // restore their own controls before bootstrap so page-specific validation
+  // can run afterward without a second late restore undoing it.
+  restoreAll(document);
+
+  return {
+    read: read,
+    write: write,
+    restore: restore,
+    restoreAll: restoreAll,
+    persist: persist,
+  };
+})();
+
 function escapeHtml(str) {
   if (str == null) return '';
   var div = document.createElement('div');

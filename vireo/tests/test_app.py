@@ -138,6 +138,43 @@ def test_api_add_keyword_accepts_existing_keyword_id(app_and_db):
     assert "Cardinal" in names
 
 
+def test_api_add_keyword_clears_shared_flat_removals(app_and_db):
+    """A manual re-add supersedes migration cleanup in every workspace."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.conn.execute(
+        "SELECT id, folder_id FROM photos WHERE filename = 'bird3.jpg'"
+    ).fetchone()
+    wildlife_id = db.add_keyword("Wildlife", kw_type="genre")
+    ws1 = db._ws_id()
+    ws2 = db.create_workspace("keyword-readd-sibling")
+    db.add_workspace_folder(ws2, photo["folder_id"])
+    for ws_id in (ws1, ws2):
+        db.queue_change(
+            photo["id"], "keyword_remove_flat", "Wildlife",
+            workspace_id=ws_id,
+        )
+
+    resp = client.post(
+        f"/api/photos/{photo['id']}/keywords",
+        json={"keyword_id": wildlife_id},
+    )
+
+    assert resp.status_code == 200
+    assert db.conn.execute(
+        """SELECT 1 FROM pending_changes
+           WHERE photo_id = ? AND change_type = 'keyword_remove_flat'""",
+        (photo["id"],),
+    ).fetchone() is None
+    pending_add = db.conn.execute(
+        """SELECT workspace_id FROM pending_changes
+           WHERE photo_id = ? AND change_type = 'keyword_add'
+             AND value = 'Wildlife'""",
+        (photo["id"],),
+    ).fetchall()
+    assert [row["workspace_id"] for row in pending_add] == [ws1]
+
+
 def test_help_static_assets_served(app_and_db):
     """The help modal's JS, JSON, and vendored Fuse library must be served.
 
@@ -678,6 +715,17 @@ def test_logs_page(app_and_db):
 
     resp = client.get('/logs')
     assert resp.status_code == 200
+
+
+def test_jobs_page_uses_cache_aware_classification_eta(app_and_db):
+    """Classification must not estimate throughput from cache-hit progress."""
+    app, _ = app_and_db
+    resp = app.test_client().get('/jobs')
+
+    assert resp.status_code == 200
+    assert b"step.progress.eta_kind === 'classification'" in resp.data
+    assert b"newly classified" in resp.data
+    assert b"first uncached batch" in resp.data
 
 
 def test_storage_page_has_preview_cache_field(app_and_db):
@@ -8392,6 +8440,40 @@ def test_wildlife_excluded_route_does_not_add_landscape_keyword(app_and_db):
     assert all(k["name"] != "Landscape" for k in keywords)
 
 
+def test_batch_wildlife_excluded_updates_only_changed_photos_and_undoes(app_and_db):
+    app, db = app_and_db
+    photo_ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY id LIMIT 2"
+        ).fetchall()
+    ]
+    db.update_photo_wildlife_excluded(photo_ids[0], True)
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/batch/wildlife-excluded",
+        json={"photo_ids": photo_ids, "excluded": True},
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["photo_ids"] == [photo_ids[1]]
+    states = db.conn.execute(
+        "SELECT id, wildlife_excluded FROM photos WHERE id IN (?, ?) ORDER BY id",
+        photo_ids,
+    ).fetchall()
+    assert [row["wildlife_excluded"] for row in states] == [1, 1]
+
+    undo = client.post("/api/undo")
+    assert undo.status_code == 200
+    states = db.conn.execute(
+        "SELECT id, wildlife_excluded FROM photos WHERE id IN (?, ?) ORDER BY id",
+        photo_ids,
+    ).fetchall()
+    assert [row["wildlife_excluded"] for row in states] == [1, 0]
+
+
 def test_batch_keyword_route_handles_non_string_type(app_and_db):
     """Same regression for the batch endpoint."""
     app, db = app_and_db
@@ -8640,6 +8722,215 @@ def test_selection_keyword_suggestions_chunks_large_selection(app_and_db):
     assert by_name["Large Suggestion"]["count"] == 1
     assert by_name["Large Suggestion"]["missing_count"] == 999
     assert len(by_name["Large Suggestion"]["missing_photo_ids"]) == 999
+
+
+def test_selection_wildlife_state_counts_full_selection_including_off_page(app_and_db):
+    """Aggregation must reflect every submitted id, not just the loaded grid.
+
+    "Select all matching" hands the client a full id list that can exceed
+    the loaded page. The panel relies on this endpoint for its counts and
+    button visibility, so an id that is not currently rendered must still
+    contribute.
+    """
+    app, db = app_and_db
+    ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY filename"
+        ).fetchall()
+    ]
+    assert len(ids) >= 2
+    db.update_photo_wildlife_excluded(ids[0], True)
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/selection/wildlife-state",
+        json={"photo_ids": ids},
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["selected_count"] == len(ids)
+    assert data["excluded_count"] == 1
+    assert data["included_count"] == len(ids) - 1
+
+
+def test_selection_wildlife_state_ignores_photos_outside_active_workspace(app_and_db):
+    """Ids outside the active workspace must not appear in the aggregate."""
+    app, db = app_and_db
+    ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY filename"
+        ).fetchall()
+    ]
+    other_ws = db.create_workspace("other")
+    original_ws = db._active_workspace_id
+    db.set_active_workspace(other_ws)
+    stray_folder = db.add_folder("/other-only", name="other-only")
+    stray = db.add_photo(
+        folder_id=stray_folder, filename="stray.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.set_active_workspace(original_ws)
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/selection/wildlife-state",
+        json={"photo_ids": ids + [stray]},
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["selected_count"] == len(ids)
+    assert data["included_count"] == len(ids)
+    assert data["excluded_count"] == 0
+    # The out-of-workspace id must be reported as missing so the panel can
+    # surface an incomplete selection instead of implying the counts cover
+    # every submitted id.
+    assert data["missing_count"] == 1
+    assert data["requested_count"] == len(ids) + 1
+
+
+def test_selection_wildlife_state_reports_missing_photo_ids(app_and_db):
+    """Unknown ids appear in ``missing_count`` so the panel stays honest
+    about how much of the selection its counts describe.
+    """
+    app, db = app_and_db
+    ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY filename"
+        ).fetchall()
+    ]
+    unknown = max(ids) + 12345
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/selection/wildlife-state",
+        json={"photo_ids": ids + [unknown]},
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["selected_count"] == len(ids)
+    assert data["missing_count"] == 1
+    assert data["requested_count"] == len(ids) + 1
+
+
+def test_batch_wildlife_excluded_skips_missing_and_out_of_workspace(app_and_db):
+    """The batch endpoint applies to accessible photos and reports the
+    rest as ``skipped_count`` instead of rejecting the whole selection.
+
+    The panel derives its counts from the same subset via
+    ``/api/selection/wildlife-state``; rejecting a partial selection here
+    made those counts and actions disagree — the user would see an
+    Exclude button then get a 404/403 on submit.
+    """
+    app, db = app_and_db
+    ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY filename"
+        ).fetchall()
+    ]
+    other_ws = db.create_workspace("other-batch")
+    original_ws = db._active_workspace_id
+    db.set_active_workspace(other_ws)
+    stray_folder = db.add_folder("/batch-stray", name="batch-stray")
+    stray = db.add_photo(
+        folder_id=stray_folder, filename="batch-stray.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.set_active_workspace(original_ws)
+    unknown = max(ids + [stray]) + 999
+
+    client = app.test_client()
+    resp = client.post(
+        "/api/batch/wildlife-excluded",
+        json={
+            "photo_ids": ids + [stray, unknown],
+            "excluded": True,
+        },
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["ok"] is True
+    assert data["updated"] == len(ids)
+    assert sorted(data["photo_ids"]) == sorted(ids)
+    assert data["skipped_count"] == 2
+
+    # The stray photo in the other workspace and the unknown id must not
+    # have been mutated.
+    stray_state = db.conn.execute(
+        "SELECT wildlife_excluded FROM photos WHERE id = ?", (stray,)
+    ).fetchone()
+    assert stray_state["wildlife_excluded"] == 0
+    for photo_id in ids:
+        row = db.conn.execute(
+            "SELECT wildlife_excluded FROM photos WHERE id = ?", (photo_id,)
+        ).fetchone()
+        assert row["wildlife_excluded"] == 1
+
+
+def test_batch_wildlife_excluded_uses_chunked_workspace_lookup(app_and_db):
+    """"Select all matching" can submit a very large ID list. The endpoint
+    must resolve workspace membership through chunked set-based SELECTs
+    rather than one query per photo, or a library-wide toggle triggers
+    tens of thousands of redundant SQLite queries and blocks the request.
+    """
+    app, db = app_and_db
+    folder_id = db.add_folder("/bulk", name="bulk")
+    db.add_workspace_folder(db._active_workspace_id, folder_id)
+    photo_ids = [
+        db.add_photo(
+            folder_id=folder_id,
+            filename=f"bulk-{i:04d}.jpg",
+            extension=".jpg",
+            file_size=100,
+            file_mtime=1.0,
+        )
+        for i in range(1500)
+    ]
+
+    executed = []
+    real_conn = db.conn
+
+    class TrackingConn:
+        def execute(self, sql, params=()):
+            executed.append(sql)
+            return real_conn.execute(sql, params)
+
+        def executemany(self, sql, seq):
+            return real_conn.executemany(sql, seq)
+
+        def __getattr__(self, name):
+            return getattr(real_conn, name)
+
+    db.conn = TrackingConn()
+    try:
+        client = app.test_client()
+        resp = client.post(
+            "/api/batch/wildlife-excluded",
+            json={"photo_ids": photo_ids, "excluded": True},
+            content_type="application/json",
+        )
+    finally:
+        db.conn = real_conn
+
+    assert resp.status_code == 200
+    assert resp.get_json()["updated"] == len(photo_ids)
+
+    workspace_lookups = [sql for sql in executed if "workspace_folders" in sql]
+    assert len(workspace_lookups) <= 4, (
+        f"expected O(N/chunk) workspace lookups for {len(photo_ids)} photos, "
+        f"got {len(workspace_lookups)}"
+    )
 
 
 def test_batch_keyword_route_accepts_existing_keyword_id(app_and_db):
@@ -8893,14 +9184,8 @@ def test_batch_keyword_route_chunks_large_existing_keyword_lookup(app_and_db):
     assert resp.get_json()["updated"] == len(ids)
 
 
-def test_create_app_runs_wildlife_backfill_synchronously_on_first_boot(tmp_path, monkeypatch):
-    """Regression: on first boot after upgrade (wildlife_backfill_done
-    marker unset), create_app must complete the species-marking +
-    Wildlife-backfill pipeline synchronously before returning, so user
-    edits via the served HTTP API can't race with the one-shot backfill
-    overwriting their Wildlife removals."""
-    from unittest.mock import MagicMock, patch
-
+def test_create_app_retires_builtin_wildlife_synchronously(tmp_path, monkeypatch):
+    """The old generated genre is gone before the HTTP app is returned."""
     from db import Database
 
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -8916,38 +9201,42 @@ def test_create_app_runs_wildlife_backfill_synchronously_on_first_boot(tmp_path,
     thumb_dir = str(tmp_path / "thumbs")
     os.makedirs(thumb_dir)
 
-    # Pre-create the DB with the marker UNSET (simulates first boot
-    # post-upgrade).
     db = Database(db_path)
     ws_id = db.ensure_default_workspace()
     db.set_active_workspace(ws_id)
-    assert db.get_meta(Database._WILDLIFE_BACKFILL_DONE_KEY) != "1", (
-        "Pre-condition: marker should be unset before create_app"
+    folder_id = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws_id, folder_id)
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
     )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(photo_id, species_id)
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        (photo_id, wildlife_id, "generated"),
+    )
+    db.conn.execute(
+        "DELETE FROM db_meta WHERE key = ?",
+        (Database._RETIRED_WILDLIFE_GENRE_KEY,),
+    )
+    db.conn.commit()
     db.close()
 
-    # Stub taxonomy loading to return a non-None object so the sync path
-    # runs mark_species + backfill. mark_species_keywords gets a real DB
-    # call but the stub taxonomy returns None for every lookup, so no
-    # rows are actually changed — we just need it to complete without
-    # raising so the marker gets set.
-    fake_tax = MagicMock()
-    fake_tax.lookup.return_value = None
-
-    with patch("taxonomy.load_local_taxonomy", return_value=fake_tax):
-        app = create_app(
-            db_path=db_path, thumb_cache_dir=thumb_dir, api_token="test",
-        )
-        assert app is not None
-
-    # After create_app returns, the marker MUST be set — the synchronous
-    # path ran. (If it had been async, we'd be racing the background
-    # thread here and the marker might or might not be set yet.)
-    db2 = Database(db_path)
-    assert db2.get_meta(Database._WILDLIFE_BACKFILL_DONE_KEY) == "1", (
-        "Wildlife backfill marker must be set synchronously by create_app "
-        "on first boot — otherwise user edits race the backfill."
+    app = create_app(
+        db_path=db_path, thumb_cache_dir=thumb_dir, api_token="test",
     )
+    assert app is not None
+
+    db2 = Database(db_path, initialize_schema=False)
+    assert db2.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+    assert db2.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (photo_id, wildlife_id),
+    ).fetchone() is None
     db2.close()
 
 
@@ -9043,7 +9332,6 @@ def test_create_app_skips_taxonomy_when_duplicate_repair_is_impossible(
     db = Database(db_path)
     ws_id = db.ensure_default_workspace()
     db.set_active_workspace(ws_id)
-    db.set_meta(Database._WILDLIFE_BACKFILL_DONE_KEY, "1")
     db.conn.execute(
         "DELETE FROM db_meta WHERE key = ?",
         (Database._DUPLICATE_PHOTO_SPECIES_REPAIR_KEY,),
@@ -15633,6 +15921,111 @@ def test_sync_discard_reports_true_count(app_and_db):
     assert resp.status_code == 200
     assert resp.get_json()["discarded"] == 1
     assert db.get_pending_changes() == []
+
+
+def test_sync_discard_records_exact_same_name_keyword(app_and_db):
+    """Discard history identifies a manual association among homonyms."""
+    app, db = app_and_db
+    client = app.test_client()
+    pid = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()["id"]
+    generated_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    manual_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'individual')"
+    ).lastrowid
+    # Only the individual is user-authored; the genre is the generated row.
+    db.tag_photo(pid, generated_id, source=None)
+    db.tag_photo(pid, manual_id, source="manual")
+    db.queue_change(pid, "keyword_add", "Wildlife")
+    change_id = db.get_pending_changes()[0]["id"]
+
+    resp = client.post(
+        "/api/sync/discard", json={"change_ids": [change_id]},
+    )
+
+    assert resp.status_code == 200
+    item = db.conn.execute(
+        """SELECT item.old_value, item.new_value
+           FROM edit_history_items item
+           JOIN edit_history edit ON edit.id = item.edit_id
+           WHERE edit.action_type = 'discard'
+           ORDER BY item.id DESC LIMIT 1"""
+    ).fetchone()
+    assert item["old_value"] == "keyword_add:Wildlife"
+    assert item["new_value"] == str(manual_id)
+
+
+def test_sync_discard_chunks_large_change_sets(app_and_db):
+    """Selective discard keeps its history lookup below SQLite's bind limit."""
+    from db import _SQLITE_PARAM_CHUNK_SIZE
+
+    app, db = app_and_db
+    client = app.test_client()
+    pid = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()["id"]
+    total = _SQLITE_PARAM_CHUNK_SIZE + 5
+    db.conn.executemany(
+        """INSERT INTO pending_changes
+           (photo_id, change_type, value, change_token, workspace_id)
+           VALUES (?, 'rating', '4', ?, ?)""",
+        [
+            (pid, f"discard-large-{idx}", db._ws_id())
+            for idx in range(total)
+        ],
+    )
+    db.conn.commit()
+    change_ids = [row["id"] for row in db.get_pending_changes()]
+
+    resp = client.post(
+        "/api/sync/discard", json={"change_ids": change_ids},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["discarded"] == total
+    assert db.get_pending_changes() == []
+
+
+def test_sync_discard_clears_sibling_workspace_flat_removals(app_and_db):
+    """Selective and discard-all choices coordinate a shared sidecar."""
+    app, db = app_and_db
+    client = app.test_client()
+    ws1 = db._active_workspace_id
+    ws2 = db.create_workspace("discard-sibling")
+    pid = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()["id"]
+
+    def queue_in_both():
+        db.queue_change(
+            pid, "keyword_remove_flat", "Wildlife", workspace_id=ws1,
+        )
+        db.queue_change(
+            pid, "keyword_remove_flat", "Wildlife", workspace_id=ws2,
+        )
+        return db.conn.execute(
+            """SELECT id FROM pending_changes
+               WHERE photo_id = ? AND workspace_id = ?
+                 AND change_type = 'keyword_remove_flat'""",
+            (pid, ws1),
+        ).fetchone()["id"]
+
+    active_id = queue_in_both()
+    resp = client.post(
+        "/api/sync/discard", json={"change_ids": [active_id]},
+    )
+    assert resp.status_code == 200
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (pid,),
+    ).fetchone() is None
+
+    queue_in_both()
+    preview = client.get("/api/sync/preview").get_json()
+    resp = client.post(
+        "/api/sync/discard",
+        json={"discard_all": True, "revision": preview["revision"]},
+    )
+    assert resp.status_code == 200
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (pid,),
+    ).fetchone() is None
 
 
 def test_audit_resolve_validates_direction_and_photo_id(app_and_db):

@@ -54,6 +54,14 @@ All notable changes to Vireo are documented in this file.
   any user-customized thresholds are left untouched.
 
 ### Changed
+- **Wildlife classification is now explicit workflow state.** Adding a species
+  no longer creates a redundant `Wildlife` keyword. Existing generated terms
+  are retired without disturbing real keyword hierarchies, and Browse now
+  groups selected-photo metadata by meaning with dedicated bulk controls for
+  including or excluding photos from wildlife processing. Keywords you add by
+  hand now record that you added them, so a tag is never mistaken for a
+  generated one once its edit history ages out — and that record follows the
+  keyword through duplicate merges, keyword renames, and RAW/JPEG pairing.
 - **Work Locally follows folders across workspaces.** Local copies are now
   managed per top-level folder. A folder shared by several workspaces uses one
   local copy in all of them, while workspace controls can stage or finish

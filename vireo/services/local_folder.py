@@ -312,6 +312,22 @@ def workspace_local_root_ids(db, workspace_id: int) -> list[int]:
     return [int(row["root_folder_id"]) for row in rows]
 
 
+def _workspace_local_session_photo_count(
+    db, workspace_id: int, root_folder_id: int
+) -> int:
+    """Count workspace-visible photos covered by one local session."""
+    row = db.conn.execute(
+        """SELECT COUNT(*) AS photo_count
+           FROM photos p
+           JOIN workspace_folders wf
+             ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
+           JOIN local_folder_mappings lfm ON lfm.folder_id = p.folder_id
+           WHERE lfm.root_folder_id = ?""",
+        (int(workspace_id), int(root_folder_id)),
+    ).fetchone()
+    return int(row["photo_count"] or 0)
+
+
 def workspace_has_local_folders(db, workspace_id: int) -> bool:
     return bool(workspace_local_root_ids(db, workspace_id))
 
@@ -814,14 +830,24 @@ def workspace_status(db, workspace_id: int, vireo_dir: str) -> dict:
         descendant_status = folder_status(db, local_root_id, vireo_dir)
         descendant_status["requested_folder_id"] = local_root_id
         descendant_status["display_path"] = descendant_status.get("source_path") or ""
-        # Photo count belongs to the user-facing ancestor root's tally;
-        # counting it again here would double-count.
-        descendant_status["workspace_photo_count"] = 0
         descendant_status["folder_name"] = _folder_name_for(
             db, local_root_id, descendant_status["display_path"]
         )
-        descendant_status["visible_ancestor_folder_id"] = _nearest_visible_ancestor(
+        visible_ancestor_id = _nearest_visible_ancestor(
             db, local_root_id, workspace_id
+        )
+        descendant_status["visible_ancestor_folder_id"] = visible_ancestor_id
+        # Normally the user-facing ancestor owns the subtree tally, so
+        # repeating it on this session would double-count. If that ancestor
+        # is missing, however, Browse has to synthesize this descendant as
+        # the only visible recovery row. Give that row the session's exact
+        # workspace-scoped count instead of displaying a misleading zero.
+        descendant_status["workspace_photo_count"] = (
+            0
+            if visible_ancestor_id is not None
+            else _workspace_local_session_photo_count(
+                db, workspace_id, local_root_id
+            )
         )
         items.append(descendant_status)
         if descendant_status["state"] != "remote":

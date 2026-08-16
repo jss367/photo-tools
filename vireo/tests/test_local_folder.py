@@ -1822,6 +1822,58 @@ def test_workspace_status_ancestor_is_none_for_top_level_missing_root(tmp_path):
         db.close()
 
 
+def test_workspace_status_counts_unanchored_descendant_session(tmp_path):
+    """A hidden descendant session keeps its count if its ancestor vanishes.
+
+    A workspace can link a remote ancestor while sharing a descendant local
+    session. If both catalog rows go missing, Browse cannot attach the local
+    recovery state to the ancestor and instead synthesizes the descendant as
+    the only visible row. That row needs the session's workspace photo count
+    rather than the usual zero used while an ancestor owns the tally.
+    """
+    db = Database(str(tmp_path / "vireo.db"))
+    parent_ws = db.create_workspace("Parent")
+    child_ws = db.create_workspace("Child")
+    parent = tmp_path / "nas" / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    (child / "bird.jpg").write_bytes(b"original")
+    (child / "fox.jpg").write_bytes(b"original")
+    parent_id = db.add_folder(
+        str(parent), name="parent", link_to_workspace=False
+    )
+    child_id = db.add_folder(
+        str(child), name="child", parent_id=parent_id, link_to_workspace=False
+    )
+    db.add_photo(child_id, "bird.jpg", ".jpg", 1000, 1.0)
+    db.add_photo(child_id, "fox.jpg", ".jpg", 1000, 1.0)
+    db.add_workspace_folder(parent_ws, parent_id)
+    db.add_workspace_folder(child_ws, child_id)
+    try:
+        stage_folder(db, child_id, str(tmp_path / "vireo"))
+        local_path = Path(db.get_folder(child_id)["path"])
+        (local_path / "bird.jpg").unlink()
+        (local_path / "fox.jpg").unlink()
+        local_path.rmdir()
+        db.conn.execute(
+            "UPDATE folders SET status='missing' WHERE id IN (?, ?)",
+            (parent_id, child_id),
+        )
+        db.conn.commit()
+
+        status = workspace_status(db, parent_ws, str(tmp_path / "vireo"))
+        descendant = next(
+            item
+            for item in status["folders"]
+            if item["requested_folder_id"] == child_id
+        )
+        assert descendant["state"] == "recovery"
+        assert descendant["visible_ancestor_folder_id"] is None
+        assert descendant["workspace_photo_count"] == 2
+    finally:
+        db.close()
+
+
 def test_future_ancestor_link_materializes_local_descendants(tmp_path):
     """Linking an ancestor root AFTER a descendant has been staged must still
     discover the rebased descendant. Once staging moves the child's

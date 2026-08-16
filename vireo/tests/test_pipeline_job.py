@@ -16,6 +16,7 @@ from pipeline_job import (
     PipelineParams,
     _cached_classify_detections,
     _classification_eta_progress,
+    _record_unattempted_cache_hit,
     _remove_attempted_cache_overcounts,
     _stage_fraction,
     _weighted_progress,
@@ -103,6 +104,20 @@ def test_attempted_cache_overcount_is_not_still_reported_as_cached():
 
     assert removed == 1
     assert cache_hits == {20}
+
+
+def test_later_cache_hit_does_not_restore_attempted_overcount():
+    cache_hits = set()
+
+    recorded = _record_unattempted_cache_hit(
+        photo_id=10,
+        inferred_photo_ids=set(),
+        cache_overcounted_ids={10},
+        cache_hit_ids=cache_hits,
+    )
+
+    assert recorded is False
+    assert cache_hits == set()
 
 
 def test_classification_eta_excludes_fast_cache_hits_from_rate():

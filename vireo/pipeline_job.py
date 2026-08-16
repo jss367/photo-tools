@@ -1403,6 +1403,26 @@ def _remove_attempted_cache_overcounts(
     return len(attempted_overcounts)
 
 
+def _record_unattempted_cache_hit(
+    photo_id, inferred_photo_ids, cache_overcounted_ids, cache_hit_ids,
+):
+    """Record a cache-hit photo only while it remains wholly cached.
+
+    A failed inference can be flushed before a later detection on the same
+    photo reaches its cache hit.  In that ordering the photo is already an
+    observed preflight miss, so restoring it to the cache-hit bucket would
+    make the ETA treat the same photo as both cached and uncached work.
+    """
+    if (
+        photo_id in inferred_photo_ids
+        or photo_id in cache_overcounted_ids
+        or photo_id in cache_hit_ids
+    ):
+        return False
+    cache_hit_ids.add(photo_id)
+    return True
+
+
 def _classification_eta_progress(
     *, total, seen, cached_estimate, cache_hits, inference_attempts,
     classified, elapsed, cache_overcount=0,
@@ -6038,15 +6058,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                             # detection on the same photo will
                                             # promote it into ``count`` in the
                                             # flush path above.
-                                            if (
-                                                photo["id"]
-                                                not in photos_inferred_in_spec
-                                                and photo["id"]
-                                                not in photos_cached_in_spec
+                                            if _record_unattempted_cache_hit(
+                                                photo["id"],
+                                                photos_inferred_in_spec,
+                                                photos_cache_overcounted_in_spec,
+                                                photos_cached_in_spec,
                                             ):
-                                                photos_cached_in_spec.add(
-                                                    photo["id"],
-                                                )
                                                 stages["classify"]["cached"] += 1
                                             top = cached[0]
                                             folder_path = folders.get(photo["folder_id"], "")

@@ -630,7 +630,8 @@ def _sync_preview_presentation(
 # making preview preparation quadratic in the queue size. Keyed by
 # (database path, workspace_id, revision) so separate catalogs whose default
 # workspace and pending rows happen to match cannot reuse each other's photo
-# paths; bounded by count with LRU eviction.
+# paths. Only the newest revision for each catalog/workspace is retained, and
+# the remaining entries are bounded by count with LRU eviction.
 _SYNC_PREVIEW_SNAPSHOTS = OrderedDict()
 _SYNC_PREVIEW_SNAPSHOTS_LOCK = threading.Lock()
 _SYNC_PREVIEW_SNAPSHOTS_MAX = 8
@@ -752,6 +753,13 @@ def _sync_preview_get_snapshot(db, ws_id, requested_revision):
     snapshot = _sync_preview_build_snapshot(db, ws_id)
     key = (database_key, ws_id, snapshot["revision"])
     with _SYNC_PREVIEW_SNAPSHOTS_LOCK:
+        obsolete_keys = [
+            cached_key
+            for cached_key in _SYNC_PREVIEW_SNAPSHOTS
+            if cached_key[:2] == (database_key, ws_id) and cached_key != key
+        ]
+        for obsolete_key in obsolete_keys:
+            _SYNC_PREVIEW_SNAPSHOTS.pop(obsolete_key, None)
         _SYNC_PREVIEW_SNAPSHOTS[key] = snapshot
         _SYNC_PREVIEW_SNAPSHOTS.move_to_end(key)
         while len(_SYNC_PREVIEW_SNAPSHOTS) > _SYNC_PREVIEW_SNAPSHOTS_MAX:

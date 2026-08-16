@@ -542,6 +542,32 @@ def test_sync_preview_cache_isolated_by_database(app_and_db, tmp_path):
     )
 
 
+def test_sync_preview_cache_evicts_obsolete_workspace_revision(app_and_db):
+    """A changed queue replaces, rather than accumulates, its old snapshot."""
+    import app as vireo_app
+
+    _app, db = app_and_db
+    ws_id = db._ws_id()
+    database_key = os.path.abspath(db._db_path)
+    photos = db.get_photos()[:2]
+    db.queue_change(photos[0]["id"], "rating", "3")
+    first_snapshot = vireo_app._sync_preview_get_snapshot(db, ws_id, None)
+
+    db.queue_change(photos[1]["id"], "rating", "4")
+    second_snapshot = vireo_app._sync_preview_get_snapshot(db, ws_id, None)
+
+    assert second_snapshot["revision"] != first_snapshot["revision"]
+    with vireo_app._SYNC_PREVIEW_SNAPSHOTS_LOCK:
+        workspace_keys = [
+            key
+            for key in vireo_app._SYNC_PREVIEW_SNAPSHOTS
+            if key[:2] == (database_key, ws_id)
+        ]
+    assert workspace_keys == [
+        (database_key, ws_id, second_snapshot["revision"])
+    ]
+
+
 def test_sync_preview_detects_top_id_replacement(app_and_db):
     """A delete+insert that reuses the top pending_changes.id must not hit cache.
 

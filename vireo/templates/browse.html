@@ -9475,6 +9475,80 @@ document.addEventListener('contextmenu', function(e) {
 // interruptions, fall through to whatever refreshBrowseAfterFolderHealthChange
 // last rendered rather than deep-link forever (Codex review r3686778061).
 var _DEEP_LINK_MAX_RETRIES = 5;
+// The photo APIs cap a response at 500 rows.  Deep links use that full budget
+// (rounded down to a whole number of configured Browse pages) and a small
+// worker pool so a target deep in a folder does not require dozens of serial
+// round trips.  The prefix is still loaded contiguously, preserving the
+// existing grid order, scroll range, and lightbox navigation set.
+var _DEEP_LINK_MAX_BATCH_SIZE = 500;
+var _DEEP_LINK_BATCH_CONCURRENCY = 4;
+
+async function _loadDeepLinkPrefix(photoId, focusIndex, shouldContinue) {
+  if (!Number.isInteger(focusIndex) || focusIndex < photos.length) {
+    return null;
+  }
+
+  var pagesPerBatch = Math.max(1, Math.floor(_DEEP_LINK_MAX_BATCH_SIZE / perPage));
+  var batchSize = pagesPerBatch * perPage;
+  var batchCount = Math.floor(focusIndex / batchSize) + 1;
+  var batches = new Array(batchCount);
+  var nextBatch = 0;
+  var sort = document.getElementById('sortSelect').value;
+
+  async function loadBatchWorker() {
+    while (true) {
+      var batchIndex = nextBatch++;
+      if (batchIndex >= batchCount) return;
+      if (shouldContinue && !shouldContinue()) return;
+      var data = await safeFetch('/api/photos/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          rules: [],
+          sort: sort,
+          page: batchIndex + 1,
+          per_page: batchSize,
+          folder_id: activeFolderId,
+        }),
+      }, { toast: false });
+      batches[batchIndex] = data.photos || [];
+    }
+  }
+
+  var workers = [];
+  var workerCount = Math.min(_DEEP_LINK_BATCH_CONCURRENCY, batchCount);
+  for (var workerIndex = 0; workerIndex < workerCount; workerIndex++) {
+    workers.push(loadBatchWorker());
+  }
+  await Promise.all(workers);
+  if (shouldContinue && !shouldContinue()) return null;
+
+  var loadedPhotos = [];
+  batches.forEach(function(batch) {
+    loadedPhotos = loadedPhotos.concat(batch || []);
+  });
+  photos = loadedPhotos;
+  currentPage = batchCount * pagesPerBatch + 1;
+  allLoaded = photos.length >= totalPhotos;
+  renderGrid();
+  updateFilterSummary();
+
+  // loadPhotos() normally starts these non-blocking enrichments once per
+  // appended page.  Preserve that behavior without putting them back on the
+  // critical path or creating one oversized query string.
+  batches.forEach(function(batch) {
+    var refreshIds = (batch || []).map(function(p) { return p.id; });
+    if (!refreshIds.length) return;
+    loadInatStatus(refreshIds).then(function() {
+      if (!shouldContinue || shouldContinue()) refreshGridCards(refreshIds);
+    });
+    fetchColorLabels(refreshIds).then(function() {
+      if (!shouldContinue || shouldContinue()) refreshGridCards(refreshIds);
+    });
+  });
+  return getGridCard(photoId);
+}
+
 async function _runPhotoDeepLink(photoId) {
   // Snapshot the health-refresh generation BEFORE any await. If a
   // vireo:folder-health-changed event fires while this loader is awaiting
@@ -9529,13 +9603,18 @@ async function _runPhotoDeepLink(photoId) {
     closeDetail();
     document.getElementById('grid').innerHTML = '';
 
-    // Load pages until the target photo is found or all pages exhausted
-    // (bootstrapBrowse was skipped, so we also need folder/keyword trees)
+    // bootstrapBrowse was skipped, so load the target folder's first page and
+    // the shared folder/keyword/collection trees before locating the photo.
     var missingSnapshotVersionAtInitStart =
       typeof _missingFoldersSnapshotVersion !== 'undefined'
         ? _missingFoldersSnapshotVersion
         : null;
-    var initData = await safeFetch('/api/browse/init?folder_id=' + photo.folder_id + '&per_page=' + perPage + '&sort=' + document.getElementById('sortSelect').value, {}, { toast: false });
+    var initParams = new URLSearchParams();
+    initParams.set('folder_id', photo.folder_id);
+    initParams.set('per_page', perPage);
+    initParams.set('sort', document.getElementById('sortSelect').value);
+    initParams.set('focus_photo_id', photoId);
+    var initData = await safeFetch('/api/browse/init?' + initParams.toString(), {}, { toast: false });
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
     if (initData) {
       // Seed the navbar's missing-folder snapshot from init's workspace-scoped
@@ -9574,15 +9653,25 @@ async function _runPhotoDeepLink(photoId) {
       deepLinkLoaded = true;
     }
 
-    // Keep loading pages until we find the photo or run out. The setup guard
-    // above intentionally blocks IntersectionObserver-driven loads, but
-    // loadPhotos() also honors it; clear it before this explicit paging pass
-    // or a target beyond the first page spins in a resolved Promise loop.
-    // Same freshness guard as above — don't release ``loading`` if a health
-    // refresh took ownership while init was in flight.
+    // Locate the target using the server-reported sort position.  Large,
+    // bounded requests load the same contiguous prefix the old serial scan
+    // produced, but avoid one round trip and DOM append per 50 photos.
+    // Fall back to the old scan if an older server omitted focus_index or if
+    // the library changed enough between the position read and bulk fetch
+    // that the target is not in the predicted prefix.
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
-    loading = false;
-    var el = await loadUntilPhotoRendered(photoId);
+    var el = getGridCard(photoId);
+    if (!el && initData && Number.isInteger(initData.focus_index)) {
+      try {
+        el = await _loadDeepLinkPrefix(photoId, initData.focus_index, isDeepLinkHealthCurrent);
+      } catch (e) { /* serial fallback below */ }
+    }
+    if (!el && isDeepLinkHealthCurrent()) {
+      // loadPhotos() honors the setup guard, so release it before the explicit
+      // compatibility/reconciliation scan or it would return immediately.
+      loading = false;
+      el = await loadUntilPhotoRendered(photoId);
+    }
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
 
     // Update folder tree active state

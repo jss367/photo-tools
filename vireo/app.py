@@ -5915,6 +5915,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         sort = request.args.get("sort", "date")
         folder_id = request.args.get("folder_id", None, type=int)
         collection_id = request.args.get("collection_id", None, type=int)
+        focus_photo_id = request.args.get("focus_photo_id", None, type=int)
 
         # Keep the combined first-paint payload on one SQLite read snapshot.
         # Independent SELECT snapshots can straddle a background folder-health
@@ -5972,6 +5973,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if visual_first_paint:
             photos = []
             total = 0
+            focus_index = None
         else:
             try:
                 photos = db.get_photos(
@@ -5995,6 +5997,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 except ValueError as exc:
                     db.conn.rollback()
                     return json_error(str(exc), 400)
+            # Photo deep links need the target's position in the exact sort
+            # order used by this first paint.  Returning the zero-based index
+            # lets Browse fetch the contiguous prefix in a handful of large,
+            # bounded requests instead of probing serial 50-photo pages until
+            # the target happens to appear.  Keep the extra ordered-id query
+            # opt-in so ordinary Browse loads retain their existing cost.
+            focus_index = None
+            if focus_photo_id is not None:
+                try:
+                    ordered_ids = db.get_photo_ids(
+                        folder_id=folder_id,
+                        collection_id=collection_id,
+                        sort=sort,
+                    )
+                except ValueError as exc:
+                    db.conn.rollback()
+                    return json_error(str(exc), 400)
+                try:
+                    focus_index = ordered_ids.index(focus_photo_id)
+                except ValueError:
+                    pass
         folders = db.get_folder_tree()
         keywords = db.get_keyword_tree()
         collections = db.get_collections()
@@ -6054,6 +6077,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "collections": collection_dicts,
                 "missing_folder_ids": missing_folder_ids,
                 "folder_health_version": folder_health_version,
+                "focus_index": focus_index,
             }
         )
         # End the read transaction after every value in the response has been

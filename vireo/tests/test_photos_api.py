@@ -240,6 +240,59 @@ def test_browse_init_captures_missing_baseline_before_folder_tree(
     )
 
 
+def test_browse_init_reports_focus_photo_index_in_requested_sort(app_and_db):
+    """Deep links can locate a target without probing every preceding page."""
+    app, db = app_and_db
+    january = next(
+        folder for folder in db.get_folder_tree() if folder["name"] == "January"
+    )
+    target_id = db.get_photos(folder_id=january["id"])[0]["id"]
+    db.add_photo(
+        folder_id=january["id"],
+        filename="aaa-before-target.jpg",
+        extension=".jpg",
+        file_size=1000,
+        file_mtime=1,
+        timestamp="2024-01-01T00:00:00",
+    )
+    db.add_photo(
+        folder_id=january["id"],
+        filename="zzz-after-target.jpg",
+        extension=".jpg",
+        file_size=1000,
+        file_mtime=1,
+        timestamp="2025-01-01T00:00:00",
+    )
+
+    response = app.test_client().get(
+        f"/api/browse/init?folder_id={january['id']}"
+        f"&focus_photo_id={target_id}&sort=date"
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["focus_index"] == 1
+
+
+def test_browse_init_focus_index_is_null_outside_scope(app_and_db):
+    """A focus id must not leak a position from another Browse folder scope."""
+    app, db = app_and_db
+    folders = db.get_folder_tree()
+    january = next(folder for folder in folders if folder["name"] == "January")
+    outside_id = next(
+        photo["id"]
+        for photo in db.get_photos()
+        if photo["folder_id"] != january["id"]
+    )
+
+    response = app.test_client().get(
+        f"/api/browse/init?folder_id={january['id']}"
+        f"&focus_photo_id={outside_id}"
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["focus_index"] is None
+
+
 def test_dashboard_options_flags_degraded_collections(app_and_db):
     """Collections whose rules can't compile are flagged so the scope
     picker can disable them instead of 400ing /api/stats and /api/coverage."""

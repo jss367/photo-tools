@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import re
 import time
 
@@ -1151,12 +1152,22 @@ def test_browse_photo_id_deep_link_loads_target_folder_first_page(live_server, p
 
 
 def test_browse_photo_id_deep_link_loads_target_after_first_folder_page(live_server, page):
-    """Open in Browse must page within the target folder without freezing."""
+    """Open in Browse bulk-loads a deep target instead of probing each page."""
     db = live_server["db"]
     _, folder_b = live_server["data"]["folders"]
     target_id = live_server["data"]["photos"][4]  # robin2 in folder_b
+    target_queries = []
 
-    for idx in range(60):
+    def capture_target_query(request):
+        if not request.url.endswith("/api/photos/query") or request.method != "POST":
+            return
+        payload = json.loads(request.post_data or "{}")
+        if payload.get("folder_id") == folder_b:
+            target_queries.append(payload)
+
+    page.on("request", capture_target_query)
+
+    for idx in range(560):
         db.add_photo(
             folder_id=folder_b,
             filename=f"yard-before-{idx:02d}.jpg",
@@ -1171,6 +1182,9 @@ def test_browse_photo_id_deep_link_loads_target_after_first_folder_page(live_ser
     target_card = page.locator(f'.grid-card[data-id="{target_id}"]')
     expect(target_card).to_be_visible(timeout=5000)
     assert page.evaluate("window.loading") is False
+    assert sorted(
+        (query["page"], query["per_page"]) for query in target_queries
+    ) == [(1, 500), (2, 500)]
 
 
 def test_browse_lightbox_arrows_preserve_one_to_one_zoom(live_server, page):

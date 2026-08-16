@@ -477,6 +477,15 @@ with no defined rendering.
 
 - `getVisibleItems` dedups by `card_id` (fallback to `group_id` then
   prediction id for old payload shapes during rollout).
+- **Once `getVisibleItems` returns cards, every caller of it must be
+  re-read as operating on cards** — the toolbar "Accept All"
+  (`acceptAllPending`), its count in `renderButtons`, and the `A`/`S`
+  keyboard handler all currently reason in raw pending *rows*. They are
+  not incidental: a toolbar that iterates rows accepts part of a merged
+  card and leaves the rest, which is the badge-vs-rows contradiction
+  this section exists to prevent, reached without ever clicking a card.
+  §3 "Every mutation entry point, enumerated" lists each one and its
+  disposition; Phase 5 converts them all in one go.
 - **Card status and actions are aggregated across every member row**, not
   read off whichever row won the dedup sort, and the aggregate is
   **unanimity or `mixed`** — there is no fourth thing a card can be. A
@@ -1153,17 +1162,50 @@ union**, not just the clicked group's photos:
      So the accept records **each touched row's prior status** in the
      `prediction_accept` history item payload (`prediction_id` →
      `pending` | `accepted` | `rejected` | `alternative`), and undo
-     restores exactly those. The capture point already exists:
-     `_accept_for_photo` records every flip *including status-only
-     no-ops* in `affected` (`db.py:17190-17193`), so the set of rows to
-     snapshot is the set the primitive already walks; what changes is
-     that the payload stores the old status alongside the id and
-     `_apply_undo` replays it row by row instead of resetting a scope.
-     Undo becomes an exact inverse: the pre-existing accepted member
-     stays accepted, a reconciled member returns to `rejected`, the
-     pending member returns to `pending`, and the sibling alternatives
-     the accept demoted (`db.py:17141-17162`) return to `alternative`
-     because that is what the snapshot recorded. Legacy history entries
+     restores exactly those.
+
+     **The capture point is not `affected`, and this matters.** An
+     earlier revision said the snapshot could reuse the set
+     `_accept_for_photo` already walks (`affected`, `db.py:17190-17193`).
+     It cannot: `affected` is created *inside* `accept_prediction` at
+     line 17190 and only ever gains the row `_accept_for_photo` was
+     called on (`this_pred_id`). The **sibling/alternative demotion runs
+     earlier and separately** — `accept_prediction` flips every
+     pending/alternative row sharing the accepted row's
+     `(detection_id, classifier_model, labels_fingerprint)` to
+     `rejected` in its own loop at `db.py:17137-17162`, before
+     `affected` exists, and never appends to it. A row-by-row undo built
+     from `affected` alone would therefore leave exactly those siblings
+     `rejected` after undo — the blanket-reset branch it replaces
+     happened to cover them precisely *because* it reset a scope rather
+     than a row list, so switching to row-by-row without widening the
+     capture would be a regression, not a fix.
+
+     The rule, stated so it cannot be missed at implementation time:
+     **every row whose status this call writes is snapshotted before the
+     write that changes it, wherever in the call that write lives.**
+     Concretely that is two capture sites, not one:
+
+     1. `accept_prediction`'s sibling loop — read each sibling's current
+        `COALESCE(pr_rev.status, 'pending')` in the same `SELECT` that
+        already enumerates them (`db.py:17145-17158` selects `pr.id`;
+        it selects the coalesced status too) and record it *before* the
+        `INSERT … ON CONFLICT … SET status = 'rejected'` fires.
+     2. `_accept_for_photo` — the accepted row's own prior status, read
+        before `update_prediction_status(this_pred_id, "accepted")`.
+
+     Both feed one snapshot map carried on the returned result alongside
+     `affected` (a sibling demotion tags no photo, so it has no place in
+     `affected`'s tag-oriented entries and should not be forced into
+     one), and the accept API writes that map into the
+     `prediction_accept` payload. `_apply_undo` then replays it row by
+     row instead of resetting a scope. Undo becomes an exact inverse:
+     the pre-existing accepted member stays accepted, a reconciled
+     member returns to `rejected`, the pending member returns to
+     `pending`, and the sibling alternatives the accept demoted return
+     to `alternative` (or to `pending`, if that is what they were) —
+     because that is what the snapshot recorded, not because a scope
+     reset guessed. Legacy history entries
      written before this ships carry no snapshot; they keep the existing
      blanket-reset branch, selected on the payload's shape, so no
      migration or backfill is needed. The user-visible action
@@ -1229,10 +1271,12 @@ union**, not just the clicked group's photos:
   component *between* the GET and the click is treated the same way —
   found by the rebuild, excluded by the frozen membership, reported as
   `"expanded"`, and merged for real on the next load (step 1).
-- **Undo:** `_accept_for_photo` already records every status flip —
-  including status-only no-ops — in `affected`, which feeds the
-  edit-history/undo machinery. Sibling accepts go through the same
-  primitive, so their flips are recorded and undoable for free. The
+- **Undo:** every member accept goes through `_accept_for_photo`, whose
+  `affected` entries — including status-only no-ops — feed the
+  edit-history/undo machinery, and the accept additionally snapshots the
+  prior status of the rows `accept_prediction`'s sibling loop demotes,
+  which `affected` does *not* contain (see "The capture point is not
+  `affected`" in step 3). The
   `prediction_accept` history entry therefore covers *every* member row
   across the component, not just the clicked group's, and restores each
   one to **the status it held before the click** — pending members to
@@ -1282,23 +1326,78 @@ accept records when the photo already carried an equivalent species
 history item, and `_prune_edit_history` permanently deletes entries past
 `max_edit_history` (default 1000, `db.py:19542-19551`). A tag written by
 an accept and a tag merely confirmed by one become indistinguishable the
-moment their entry ages out, and `photo_keywords` itself is
-`(photo_id, keyword_id)` and nothing else (`db.py:728-732`). A bounded
+moment their entry ages out, and `photo_keywords` on `main` today is
+`(photo_id, keyword_id)` and nothing else (`db.py:728-732`) — PR #1488
+is adding the provenance column the next bullet builds on. A bounded
 log cannot back an unbounded invariant, so this design does not ask it
 to. Two rules, split by what is actually knowable:
 
-- **Prospectively — persist provenance.** `photo_keywords` gains a
-  nullable `source TEXT` column: `'accept'` written by the accept tag
-  path, `'user'` by interactive tagging and sidecar import, `NULL` for
-  every row that predates the column. Additive, no backfill, no
-  destructive migration. (This is not the `prediction_review.group_pid`
-  column §2 rejected. That one would have bought *zero* coverage because
-  the information it needed was never written anywhere; this one records
-  something the accept path knows at write time and nothing else can
-  reconstruct.) A reject then retracts exactly the rows where
-  `source = 'accept'`, the keyword is the card's canonical taxon
-  keyword, and no other live non-rejected prediction still asserts it
-  (`get_photos_with_equivalent_species`, `db.py:17195-17197`).
+- **Prospectively — persist provenance, on the column PR #1488 is
+  already adding.** `photo_keywords.source` is not this design's column
+  to invent: PR #1488 (`rethink-wildlife-tag-removal`) adds the nullable
+  `source TEXT` column right now, with the contract "`'manual'` means a
+  person explicitly added this; `NULL` means unknown (legacy rows,
+  scanner/XMP import, model output)", stamped by
+  `tag_photo(..., source='manual')` and **never downgraded** — its
+  upsert is `source = COALESCE(excluded.source, photo_keywords.source)`.
+  This design **adopts that column and that vocabulary** rather than
+  defining a parallel one. An earlier revision of this section proposed
+  `'accept'` / `'user'` / `NULL`; `'user'` is renamed to #1488's
+  `'manual'` (same meaning, one spelling), and `'accept'` is added as a
+  third value written by the accept tag path. (This is still not the
+  `prediction_review.group_pid` column §2 rejected. That one would have
+  bought *zero* coverage because the information it needed was never
+  written anywhere; this one records something the accept path knows at
+  write time and nothing else can reconstruct.) A reject then retracts
+  exactly the rows where `source = 'accept'`, the keyword is the card's
+  canonical taxon keyword, and no other live non-rejected prediction
+  still asserts it (`get_photos_with_equivalent_species`,
+  `db.py:17195-17197`).
+
+  **Provenance is a lattice, and no write may move down it.** With a
+  third value the column stops being "set-or-NULL" and
+  `COALESCE(excluded.source, photo_keywords.source)` stops being
+  sufficient: an accept re-tagging a photo the user had hand-tagged
+  would coalesce to `'accept'` and silently downgrade a `'manual'` row,
+  which is precisely what #1488's contract forbids and what would then
+  make a later reconciling reject strip a user-authored tag. So the
+  ordering `manual > accept > NULL` is stated once and enforced at every
+  write:
+
+  - `tag_photo`'s upsert becomes a **precedence-max**, not a coalesce —
+    the stored value is the greater of the existing and incoming
+    provenance. `NULL → accept` and `accept → manual` are the only
+    transitions that change a row; `manual → accept`, `accept → NULL`
+    and `manual → NULL` are no-ops. #1488's "never downgraded"
+    guarantee is the `manual` row of that table, unchanged.
+  - **Every path that moves or collapses a `photo_keywords` row folds
+    provenance the same way.** `_merge_keyword_into` uses
+    `UPDATE OR IGNORE` then `DELETE` (`db.py:13527-13533` on `main`), so
+    when a photo already carries *both* the source and destination
+    keywords the destination row survives untouched and the source row's
+    provenance is discarded. #1488 already pre-folds the one case it
+    needs (destination gets `'manual'` if the source row was `'manual'`).
+    This design **generalizes that fold to the lattice max over the two
+    rows** — needed because the case #1488 does not cover is the reverse
+    direction, a `'manual'` destination with an `'accept'` source (must
+    stay `'manual'`; already correct) and a `NULL` destination with an
+    `'accept'` source (must become `'accept'`, or the accept's own tag
+    becomes unretractable the moment a synonym merge runs). The same
+    fold applies to keyword rename/curation-merge paths and to any
+    future path that rewrites `photo_keywords.keyword_id`. A grep for
+    writes to `photo_keywords` is part of the Phase 4 checklist; a path
+    that moves a row without folding provenance is a bug, not a gap.
+  - **Retraction reads the folded value, and `manual` is never
+    retracted.** A reconciling reject strips only `source = 'accept'`.
+    A row that is `'manual'` — including one that became `'manual'` by
+    the fold above, i.e. the user's ownership survived a merge into an
+    accept-owned row — is left in place and takes the disclosure path
+    below, with the wording adjusted to say why ("kept 'Blue Tit' — you
+    added this keyword yourself"). This is strictly stronger than
+    #1488's contract, not in tension with it: #1488 promises manual
+    stamps are never downgraded; this design additionally promises that
+    a manual-stamped association is never removed by an automated
+    review action at all.
 - **Retrospectively — never strip on a guess.** A `NULL`-source row is
   left in place. The card says so instead of silently disagreeing with
   its own badge: "Rejected — kept the 'Blue Tit' keyword on 3 photos
@@ -1311,13 +1410,66 @@ to. Two rules, split by what is actually knowable:
   prediction still asserts it" case ("kept 'Blue Tit' — still predicted
   on 2 photos").
 
-Until the column exists, every row is `NULL`-source and every
-reconciling reject takes the disclosure path — correct, just chattier,
-which is the right failure direction for a metadata write.
+Until #1488 lands and Phase 4 starts writing `'accept'`, every row is
+`NULL`- or `'manual'`-source and every reconciling reject takes the
+disclosure path — correct, just chattier, which is the right failure
+direction for a metadata write. **Sequencing:** Phase 4 depends on
+#1488's column being merged. If Phase 4 would otherwise start first, it
+adds the column under the identical name, type and `'manual'` semantics
+so the two converge rather than collide; it must not introduce a second
+provenance column or a second spelling of "a person did this".
 
 **Compare.** `accept_subject_species` swaps its
 `lower(trim(species))` equality for the same taxon-key helper. Its
 detection-scoped, single-photo semantics stay unchanged.
+
+**Every mutation entry point, enumerated — routed or deliberately
+excluded.**
+
+Everything above specifies the *new* path: a card mutation carrying
+`card_id`/`node_id`, frozen membership and the full scope tuple. That is
+only half a contract. Review already has several other ways to change a
+prediction's status, and each one that keeps its own path is a hole:
+a caller that selects raw pending rows and POSTs the legacy
+per-prediction endpoint mutates *some* of a merged card's members,
+leaving a card whose badge says one thing over rows that say another —
+the same class of defect as the badge hole the `mixed` state closes,
+arriving through the side door. The rule is therefore stated
+exhaustively rather than by example: **every path that writes
+`prediction_review.status` from a Review surface is listed below, with
+its disposition, and a path that is not listed is not allowed to
+exist.** Adding one is a design change, not an implementation detail.
+
+*Routed through card mutations (Phase 5):*
+
+| entry point | code today | what changes |
+| --- | --- | --- |
+| Per-card Accept / Reject | `acceptPrediction` / `rejectPrediction` (`review.html:1576`, `1591`) | POST the card mutation with the displayed `card_id` (or `node_id` under a filter), frozen `member_prediction_ids`, and the scope tuple. This is the happy path §2/§3 specify. |
+| Toolbar **Accept All** | `acceptAllPending` (`review.html:1618-1633`) — filters `predictions` to raw `status === 'pending'` rows and POSTs `/api/predictions/<id>/accept` per row | Iterates the **displayed cards** from `getVisibleItems()`, not raw rows, and issues one card mutation per card with that card's own frozen membership and the same scope tuple. Without this, "Accept All" on a `{pending, rejected}` card accepts the pending member and leaves the rejected one rejected — i.e. it *creates* a `mixed` card out of the click that was supposed to resolve it, and it does so bypassing the reconciling-reject retraction rule above. |
+| Toolbar button label and visibility | `renderButtons` (`review.html:1258-1273`) — counts raw pending rows for "Accept All (N)" and hides the button when that count is 0 | Counts **actionable cards** (status `pending` or `mixed`, per §2's table) and labels accordingly. Counting rows would promise "Accept All (7)" over 4 cards, and — worse — would *hide* the button on a view whose only cards are `{accepted, rejected}` mixed, which are exactly the cards that need reconciling. Same rule as the badge: the number the user reads must be the number of things the click acts on. |
+| Keyboard `A` / `S` | keydown handler (`review.html:1638-1655`), currently `acceptPrediction(pending[0].id)` over `getVisibleItems()` rows | Targets the first visible **card** and issues that card's mutation. The handler already reads `getVisibleItems()` "because the toolbar hint promises *first visible card*" — after §2 that function returns cards, so this is a one-line follow-through, but it is listed because leaving it on row ids would silently half-accept the first card. |
+
+*Deliberately excluded, with the reason:*
+
+| entry point | code | why it stays on the legacy per-prediction path |
+| --- | --- | --- |
+| Alternative pick | `acceptAlternative` (`review.html:1603-1616`) | `alternative` rows are attached to a parent row and are **never card members** (§2 status table; `review.html:1491`). Picking an alternative is a within-node re-rank of one detection's candidates, not a decision about the card's taxon — and it may well change the row's taxon, at which point it belongs to a *different* card. It keeps `/api/predictions/<id>/accept`. The consequence is admitted, not hidden: this can leave the surrounding card `mixed`, which is §2 "Reachability" case (b), and the card's own Accept all / Reject all is the exit. |
+| Burst group apply | `/api/predictions/group/apply` (`review.html:3209`, `app.py:15968`) | Writes photo **flags** (pick/reject) and a species keyword for a burst; it is not a prediction-review status write, so it has no card semantics to honour. Unchanged. |
+| Context-menu rating / flag | `setReviewRating` / `setReviewFlag` | Photo metadata, not prediction status. Unchanged. |
+| Compare's accept-subject | `accept_subject_species` (`app.py:15734`) | No card exists on Compare. It gets §3's taxon-key broadening and §4's **row-keyed** canonicalization (which is why §4 is keyed on the row's taxon rather than on a card — see §3 "Ordering constraint"), but not card mutations. |
+| ID-conflicts resolution | `id_conflicts.html:1566-1567` → `/accept-subject`, `/replace-keywords` | A separate per-prediction conflict surface outside Review, with its own semantics. Unchanged; it is another `mixed`-reachability producer, same as Compare. |
+| Mark-reviewed | `/api/predictions/<id>/reviewed` (`app.py:15634`) | Sets the reviewed flag; does not flip accept/reject status. Unchanged. |
+| Pipeline group apply | `/api/pipeline/group/apply` (`pipeline_review.html`, `pipeline_rapid_review.html`) | Flags-only and never touches `predictions`, as those templates' own comments state. Unchanged. |
+
+*Server-side:* `/api/predictions/<id>/accept` and `/reject`
+(`app.py:15699`, `15779`) are **retained**, unchanged, as the primitive
+the excluded callers use and as the rollout fallback for old client
+payloads (§2's `group_id`/prediction-id dedup fallback). They stay
+scope-less and stay a pure status flip — in particular the
+reconciling-reject retraction specified above is a property of the
+**card** mutation, not of the legacy endpoint, because the legacy
+endpoint has no card and therefore no canonical taxon keyword to
+retract. Review's card UI simply stops calling them.
 
 **Ordering constraint (§3 depends on §4's canonicalized keyword write).**
 Both the Review sibling pass ("Sibling pass, taxon-matched, per photo,
@@ -1714,9 +1866,15 @@ Each phase lands as its own PR and is independently useful.
    non-existent `node_id` or that carries both `card_id` and
    `node_id` returns 400.
 4. **Keyword canonicalization** (taxon-matched keyword reuse) + the
-   "tags as …" transparency note + the additive
-   `photo_keywords.source` column (`'accept'` / `'user'` / `NULL`,
-   §3 "Retraction requires provenance"). The column lands here because
+   "tags as …" transparency note + the `'accept'` value on
+   **PR #1488's** `photo_keywords.source` column
+   (`'manual'` > `'accept'` > `NULL`, §3 "Retraction requires
+   provenance"). Depends on #1488 being merged; this phase adds the
+   third value, converts `tag_photo`'s upsert from a coalesce to a
+   precedence-max, and folds provenance in `_merge_keyword_into` and
+   every other path that rewrites `photo_keywords.keyword_id` (a grep
+   for writes to that table is part of this phase's checklist). The
+   value lands here because
    this phase already owns the accept path's keyword write, and Phase 5
    is the first thing that can retract one — every accept made from
    Phase 4 onward therefore carries provenance by the time a reconciling
@@ -1727,9 +1885,16 @@ Each phase lands as its own PR and is independently useful.
    sibling loop cannot fragment keywords across name variants — see §3
    "Ordering constraint" for the full rationale. DB tests: a
    **provenance-write fixture** — an accept that tags a photo writes
-   `source = 'accept'`, an interactive tag and a sidecar import write
-   `'user'`, and re-accepting an already-tagged photo does not downgrade
-   an existing `'user'` row to `'accept'`;
+   `source = 'accept'`, interactive tagging writes `'manual'` (a sidecar
+   import leaves `NULL`, per #1488), and re-accepting an already-tagged
+   photo does not downgrade an existing `'manual'` row to `'accept'`;
+   a **merge-fold fixture** — a photo carrying an `'accept'`-owned
+   destination keyword *and* a `'manual'`-owned duplicate keyword keeps
+   `'manual'` on the surviving row after `_merge_keyword_into`, and a
+   subsequent reconciling reject leaves that row in place and takes the
+   disclosure path instead of untagging it; the mirror case (`NULL`
+   destination, `'accept'` source) folds up to `'accept'` so the
+   accept's own tag stays retractable after a synonym merge;
    **inat-id-translation fixture** — an existing "Eurasian Blue Tit"
    keyword linked to the local *Cyanistes caeruleus* taxa row is
    reused when a newly accepted *row* resolves to the iNat id for
@@ -1762,7 +1927,14 @@ Each phase lands as its own PR and is independently useful.
    status rule, the filter-semantics fallback, and the modal's use of
    the card endpoint — §2's corollaries 2 and 4 — land here *together
    with* the mutation that can resolve a merged card, for the reason
-   given in Phase 3. Depends on Phase 4
+   given in Phase 3. It also converts **every** entry point the
+   enumeration in §3 ("Every mutation entry point, enumerated") marks as
+   routed — per-card buttons, the toolbar `acceptAllPending`, the
+   toolbar's `renderButtons` count, and the `A`/`S` keyboard handler —
+   in the same phase, because a routed path left on the legacy endpoint
+   for one release would half-accept merged cards for that release. The
+   excluded rows of that table are explicitly *not* touched here.
+   Depends on Phase 4
    being live so that the per-row keyword write resolves to the
    canonical keyword — otherwise the sibling loop across "Blue Tit" /
    "Eurasian Blue Tit" rows would tag both synonyms on the same photo,
@@ -1863,19 +2035,48 @@ Each phase lands as its own PR and is independently useful.
    assertions; a variant replays a **legacy** `prediction_accept` entry
    with no prior-status payload and asserts it still undoes through the
    old branch; the history description names the overridden count; a
+   **sibling-snapshot fixture** — a detection carrying one pending top-1
+   row and two `alternative` rows on the same
+   `(detection, classifier_model, labels_fingerprint)`: accepting an
+   alternative demotes the other two through `accept_prediction`'s
+   sibling loop (`db.py:17137-17162`), and undo restores each of them to
+   the status it held before the click, **not** to `pending` and not
+   left at `rejected` — the regression guard for building the snapshot
+   from `affected` alone, which never sees those rows (§3, "The capture
+   point is not `affected`"); a
    **reconciling-reject
    keyword fixture** — "Reject all" on a card whose accepted member
    tagged the photo with `source = 'accept'` flips the status *and*
    untags that keyword via an undoable `keyword_remove`; three negative
    variants keep the keyword and surface the disclosure instead of
-   silently disagreeing with the badge — `source = 'user'`,
+   silently disagreeing with the badge — `source = 'manual'`,
    `source IS NULL` (the pruned/legacy case: assert the keyword survives
    even after `_prune_edit_history` has deleted the original
    `prediction_accept` entry, which is the regression guard for not
    sourcing provenance from the bounded edit log), and another live
    non-rejected prediction still asserting the taxon; a
    **status-totality fixture** — all seven non-empty
-   member-status sets map to a defined badge and action set.
+   member-status sets map to a defined badge and action set; a
+   **toolbar Accept-All fixture** — a view holding one `{pending}` card
+   and one `{pending, rejected}` merged card: clicking the toolbar
+   "Accept All" leaves **every member of both cards accepted** and zero
+   `mixed` cards on reload, which the row-iterating
+   `acceptAllPending` (`review.html:1618-1633`) fails by leaving the
+   merged card's rejected member rejected; the same fixture asserts the
+   button reads "Accept All (2)" — cards, not the 3 raw pending rows —
+   and that a view whose only card is `{accepted, rejected}` still
+   *shows* the button rather than hiding it on a zero pending-row count;
+   under an active filter the same click issues one `node_id` mutation
+   per displayed node with the scope tuple, and rows the filter hid stay
+   pending; a **keyboard-shortcut fixture** — `A` on the first visible
+   merged card accepts every member of that card and only that card,
+   matching what a click on its "Accept all" button does; an
+   **excluded-path fixture** — `acceptAlternative` on a member of a
+   merged card still POSTs the legacy per-prediction endpoint, touches
+   only that detection's rows, and leaves the card rendering `mixed`
+   with both reconciling actions available (the admitted consequence of
+   the exclusion in §3's entry-point table, asserted rather than
+   discovered).
 
 ## Test plan
 

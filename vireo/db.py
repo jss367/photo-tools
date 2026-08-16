@@ -3205,6 +3205,16 @@ class Database:
                         AND pending_add.change_type = 'keyword_add'
                         AND pending_add.value = 'Wildlife' COLLATE NOCASE
                   )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM edit_history_items manual_item
+                      JOIN edit_history manual_edit
+                        ON manual_edit.id = manual_item.edit_id
+                      WHERE manual_item.photo_id = pk.photo_id
+                        AND manual_edit.action_type = 'keyword_add'
+                        AND manual_edit.undone = 0
+                        AND manual_item.new_value = CAST(pk.keyword_id AS TEXT)
+                  )
                   AND EXISTS (
                       SELECT 1
                       FROM photo_keywords species_pk
@@ -18837,11 +18847,13 @@ class Database:
         """Delete pending changes by id."""
         if not change_ids:
             return
-        placeholders = ",".join("?" for _ in change_ids)
-        self.conn.execute(
-            f"DELETE FROM pending_changes WHERE id IN ({placeholders}) AND workspace_id = ?",
-            list(change_ids) + [self._ws_id()],
-        )
+        workspace_id = self._ws_id()
+        for chunk in _chunks(change_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            self.conn.execute(
+                f"DELETE FROM pending_changes WHERE id IN ({placeholders}) AND workspace_id = ?",
+                [*chunk, workspace_id],
+            )
         self.conn.commit()
 
     def queue_flag_change_if_enabled(self, photo_id, flag, workspace_id=None, _commit=True):

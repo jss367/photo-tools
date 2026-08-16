@@ -677,6 +677,32 @@ def test_pending_changes_queue(tmp_path):
     assert len(db.get_pending_changes()) == 0
 
 
+def test_clear_pending_chunks_large_change_sets(tmp_path):
+    """Clearing a large sync batch stays below SQLite's bind limit."""
+    from db import _SQLITE_PARAM_CHUNK_SIZE, Database
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder('/photos', name='photos')
+    pid = db.add_photo(
+        folder_id=fid, filename='a.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+    )
+    total = _SQLITE_PARAM_CHUNK_SIZE + 5
+    db.conn.executemany(
+        """INSERT INTO pending_changes
+           (photo_id, change_type, value, change_token, workspace_id)
+           VALUES (?, 'rating', '4', ?, ?)""",
+        [(pid, f"change-{idx}", ws_id) for idx in range(total)],
+    )
+    db.conn.commit()
+    change_ids = [row["id"] for row in db.get_pending_changes()]
+
+    db.clear_pending(change_ids)
+
+    assert len(db.get_pending_changes()) == 0
+
+
 def test_get_photos_keyword_search(tmp_path):
     """get_photos can filter by keyword name."""
     from db import Database
@@ -14067,6 +14093,42 @@ def test_retire_builtin_wildlife_preserves_unsynced_manual_add(tmp_path):
     assert [(row["change_type"], row["value"]) for row in pending] == [
         ("keyword_add", "Wildlife"),
     ]
+
+
+def test_retire_builtin_wildlife_preserves_synced_manual_add_history(tmp_path):
+    """A retained keyword-add edit proves the synced tag was user-authored."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder('/photos', name='photos')
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename='p1.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.tag_photo(p1, wildlife_id)
+    db.record_edit(
+        "keyword_add",
+        'Added keyword "Wildlife"',
+        str(wildlife_id),
+        [{"photo_id": p1, "old_value": "", "new_value": str(wildlife_id)}],
+    )
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 0
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
 
 
 def test_retire_builtin_wildlife_queues_removal_in_every_owning_workspace(tmp_path):

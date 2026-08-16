@@ -1,7 +1,10 @@
 """Persistence for workspace-scoped photo color labels."""
 
+import json
 
 VALID_COLOR_LABELS = ("red", "yellow", "green", "blue", "purple")
+MAX_COLOR_LABEL_DESCRIPTION_LENGTH = 120
+_DESCRIPTIONS_CONFIG_KEY = "color_label_descriptions"
 
 
 class PhotoLabelRepository:
@@ -89,6 +92,77 @@ class PhotoLabelRepository:
                 [(photo_id, self.workspace_id, color) for photo_id in photo_ids],
             )
         self.conn.commit()
+
+    def get_descriptions(self):
+        """Return the active workspace's valid, non-empty color descriptions."""
+        row = self.conn.execute(
+            "SELECT config_overrides FROM workspaces WHERE id = ?",
+            (self.workspace_id,),
+        ).fetchone()
+        if not row or not row["config_overrides"]:
+            return {}
+        try:
+            overrides = json.loads(row["config_overrides"])
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        if not isinstance(overrides, dict):
+            return {}
+        raw = overrides.get(_DESCRIPTIONS_CONFIG_KEY)
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            color: description.strip()
+            for color, description in raw.items()
+            if color in VALID_COLOR_LABELS
+            and isinstance(description, str)
+            and description.strip()
+        }
+
+    def set_description(self, color, description):
+        """Set or clear one color's description in workspace config metadata."""
+        if color not in VALID_COLOR_LABELS:
+            raise ValueError(
+                f"Invalid color label: {color}. Must be one of {VALID_COLOR_LABELS}"
+            )
+        if not isinstance(description, str):
+            raise ValueError("description must be a string")
+        description = " ".join(description.split())
+        if len(description) > MAX_COLOR_LABEL_DESCRIPTION_LENGTH:
+            raise ValueError(
+                "description must be "
+                f"{MAX_COLOR_LABEL_DESCRIPTION_LENGTH} characters or fewer"
+            )
+
+        row = self.conn.execute(
+            "SELECT config_overrides FROM workspaces WHERE id = ?",
+            (self.workspace_id,),
+        ).fetchone()
+        overrides = {}
+        if row and row["config_overrides"]:
+            try:
+                parsed = json.loads(row["config_overrides"])
+                if isinstance(parsed, dict):
+                    overrides = parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        descriptions = overrides.get(_DESCRIPTIONS_CONFIG_KEY)
+        descriptions = dict(descriptions) if isinstance(descriptions, dict) else {}
+        if description:
+            descriptions[color] = description
+        else:
+            descriptions.pop(color, None)
+
+        if descriptions:
+            overrides[_DESCRIPTIONS_CONFIG_KEY] = descriptions
+        else:
+            overrides.pop(_DESCRIPTIONS_CONFIG_KEY, None)
+        self.conn.execute(
+            "UPDATE workspaces SET config_overrides = ? WHERE id = ?",
+            (json.dumps(overrides) if overrides else None, self.workspace_id),
+        )
+        self.conn.commit()
+        return description
 
     def _chunks(self, values):
         values = list(values)

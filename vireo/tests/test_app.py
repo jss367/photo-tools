@@ -552,6 +552,102 @@ def test_api_folder_get_rejects_other_workspace(app_and_db):
     assert resp.status_code == 404
 
 
+def test_api_folder_workspaces_lists_inherited_and_direct_memberships(app_and_db):
+    """GET /api/folders/<id>/workspaces includes every workspace where the
+    folder is visible, including visibility inherited from an ancestor root.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    active_ws = db.get_workspace(db._active_workspace_id)
+    root = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024'"
+    ).fetchone()
+    child = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024/January'"
+    ).fetchone()
+    inherited_ws = db.create_workspace("Inherited Photos")
+    db.add_workspace_folder(inherited_ws, root["id"])
+    direct_ws = db.create_workspace("Direct Photos")
+    db.add_workspace_folder(direct_ws, child["id"])
+
+    resp = client.get(f'/api/folders/{child["id"]}/workspaces')
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["folder"]["path"] == "/photos/2024/January"
+    by_name = {workspace["name"]: workspace for workspace in body["workspaces"]}
+    assert {active_ws["name"], "Inherited Photos", "Direct Photos"} <= set(by_name)
+    assert by_name[active_ws["name"]]["is_active"] is True
+    assert by_name["Inherited Photos"]["is_root"] is False
+    assert by_name["Direct Photos"]["is_root"] is True
+
+
+def test_api_folder_workspaces_rejects_folder_hidden_from_active_workspace(
+    app_and_db,
+):
+    """Workspace names cannot be enumerated through a hidden folder ID."""
+    app, db = app_and_db
+    active_ws = db._active_workspace_id
+    other_ws = db.create_workspace("Private Workspace")
+    db.set_active_workspace(other_ws)
+    hidden_id = db.add_folder('/private/folder', name='folder')
+    db.set_active_workspace(active_ws)
+
+    resp = app.test_client().get(f'/api/folders/{hidden_id}/workspaces')
+    assert resp.status_code == 404
+
+
+def test_api_folder_workspaces_does_not_expand_restricted_exact_links(app_and_db):
+    """Reading memberships must not turn an exact link into a recursive one."""
+    app, db = app_and_db
+    root = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024'"
+    ).fetchone()
+    child = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024/January'"
+    ).fetchone()
+    restricted_ws = db.create_workspace("Restricted Import")
+    db.add_workspace_folder_exact(restricted_ws, root["id"], is_root=False)
+
+    resp = app.test_client().get(f'/api/folders/{root["id"]}/workspaces')
+    assert resp.status_code == 200
+    assert "Restricted Import" in {
+        workspace["name"] for workspace in resp.get_json()["workspaces"]
+    }
+    assert db.conn.execute(
+        "SELECT 1 FROM workspace_folders WHERE workspace_id = ? AND folder_id = ?",
+        (restricted_ws, child["id"]),
+    ).fetchone() is None
+
+
+def test_api_folder_workspaces_infers_late_recursive_child_without_mutation(
+    app_and_db,
+):
+    """A child discovered after root linking is visible without inserting a link."""
+    app, db = app_and_db
+    root = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024'"
+    ).fetchone()
+    recursive_ws = db.create_workspace("Recursive Library")
+    db.add_workspace_folder(recursive_ws, root["id"])
+    late_child_id = db.add_folder(
+        "/photos/2024/Late Discovery", name="Late Discovery"
+    )
+    assert db.conn.execute(
+        "SELECT 1 FROM workspace_folders WHERE workspace_id = ? AND folder_id = ?",
+        (recursive_ws, late_child_id),
+    ).fetchone() is None
+
+    resp = app.test_client().get(f'/api/folders/{late_child_id}/workspaces')
+    assert resp.status_code == 200
+    assert "Recursive Library" in {
+        workspace["name"] for workspace in resp.get_json()["workspaces"]
+    }
+    assert db.conn.execute(
+        "SELECT 1 FROM workspace_folders WHERE workspace_id = ? AND folder_id = ?",
+        (recursive_ws, late_child_id),
+    ).fetchone() is None
+
+
 def test_api_keywords(app_and_db):
     """GET /api/keywords returns keyword tree."""
     app, _ = app_and_db

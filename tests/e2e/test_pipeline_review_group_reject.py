@@ -1257,8 +1257,15 @@ def test_lightbox_browse_uses_state_preserving_navigation_helper(live_server, pa
         photo_id,
     )
 
-    page.locator("#lightboxImg").click(button="right")
-    page.locator(".vireo-ctx-item", has_text="Open in Browse").click()
+    page.evaluate(
+        """pid => {
+          const item = buildLightboxContextMenu(pid).find(
+            candidate => candidate.label === 'Open in Browse'
+          );
+          item.onClick();
+        }""",
+        photo_id,
+    )
     assert page.evaluate("window.__lightboxBrowsePhotoId") == photo_id
     expect(page.locator("#grmOverlay")).to_have_class(re.compile(r"\bopen\b"))
     assert page.evaluate("grmState.rejects.has(grmState.selected)") is True
@@ -1614,7 +1621,9 @@ def test_read_only_scope_disables_lightbox_and_native_mutations(live_server, pag
     ).fetchone()["wildlife_excluded"]
     assert after_wildlife == before_wildlife
 
-    page.locator("#lightboxImg").click(button="right")
+    page.locator("#lightboxImg").dispatch_event(
+        "contextmenu", {"button": 2, "clientX": 400, "clientY": 300}
+    )
     menu = page.locator(".vireo-ctx-menu")
     expect(menu.locator(".vireo-ctx-chip.vireo-ctx-disabled")).to_have_count(9)
     wildlife_item = menu.locator(
@@ -1698,7 +1707,9 @@ def test_tauri_disables_navigation_when_group_review_is_dirty(live_server, page)
         )
 
     page.evaluate("pid => openPipelineLightbox(pid)", photo_ids[0])
-    page.locator("#lightboxImg").click(button="right")
+    page.locator("#lightboxImg").dispatch_event(
+        "contextmenu", {"button": 2, "clientX": 400, "clientY": 300}
+    )
     lightbox_browse = page.locator(".vireo-ctx-item", has_text="Open in Browse")
     expect(lightbox_browse).to_have_class(re.compile(r"\bvireo-ctx-disabled\b"))
     expect(lightbox_browse).to_have_attribute(

@@ -2057,6 +2057,37 @@ def test_move_folders_moves_pending_changes(db_with_workspace):
     assert len(db.get_pending_changes()) == 0
 
 
+def test_move_folders_bumps_source_pending_changes_version(db_with_workspace):
+    """Moving a pending_changes row between workspaces must bump BOTH
+    workspace counters, not just the destination's.
+
+    ``/api/sync/preview`` keys its snapshot cache on
+    ``pending_changes_version:<ws>``. Without a source-side bump, a
+    cached progressive preview for the source workspace keeps its
+    fingerprint and continues serving rows that have already moved
+    away instead of returning 409 (Codex review, PR #1483).
+    """
+    db, ws1, folder_id, photo_id = db_with_workspace
+    db.queue_change(photo_id, "rating", "5")
+    ws2 = db.create_workspace("Target")
+
+    def version(ws):
+        row = db.conn.execute(
+            "SELECT value FROM db_meta WHERE key = ?",
+            (f"pending_changes_version:{ws}",),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    before_src = version(ws1)
+    before_dst = version(ws2)
+
+    result = db.move_folders_to_workspace(ws1, ws2, [folder_id])
+    assert result["pending_changes_moved"] == 1
+
+    assert version(ws1) > before_src
+    assert version(ws2) > before_dst
+
+
 def test_move_folders_moves_photo_preferences(db_with_workspace):
     """Representative choices and ordered highlights follow moved photos."""
     db, ws1, folder_id, photo_id = db_with_workspace

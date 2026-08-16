@@ -1226,6 +1226,59 @@ class Database:
                 SET value = CAST(value AS INTEGER) + 1
                 WHERE key = 'folder_health_version';
             END;
+
+            -- Per-workspace monotonic write counter for `pending_changes`.
+            -- The sync-preview cache in app.py keys its snapshot on this
+            -- version to detect row replacements — `pending_changes.id` is
+            -- a plain INTEGER PRIMARY KEY (no AUTOINCREMENT), so SQLite
+            -- will reuse the highest deleted id on the next INSERT. A
+            -- cheap COUNT/MAX/SUM aggregate can stay identical across
+            -- such a delete+insert even though `change_token`, `value`,
+            -- `change_type`, or `photo_id` differ; this counter changes
+            -- for every row write and closes that stale-hit window.
+            CREATE TRIGGER IF NOT EXISTS trg_pending_changes_version_insert
+            AFTER INSERT ON pending_changes
+            BEGIN
+                INSERT OR IGNORE INTO db_meta(key, value)
+                    VALUES ('pending_changes_version:' || NEW.workspace_id, '0');
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'pending_changes_version:' || NEW.workspace_id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_pending_changes_version_delete
+            AFTER DELETE ON pending_changes
+            BEGIN
+                INSERT OR IGNORE INTO db_meta(key, value)
+                    VALUES ('pending_changes_version:' || OLD.workspace_id, '0');
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'pending_changes_version:' || OLD.workspace_id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_pending_changes_version_update
+            AFTER UPDATE ON pending_changes
+            BEGIN
+                INSERT OR IGNORE INTO db_meta(key, value)
+                    VALUES ('pending_changes_version:' || NEW.workspace_id, '0');
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'pending_changes_version:' || NEW.workspace_id;
+            END;
+            -- When move_folders_to_workspace() reassigns a pending_changes
+            -- row from one workspace to another, the update trigger above
+            -- only bumps the destination workspace's counter. Without this
+            -- second trigger, a cached progressive preview for the source
+            -- workspace keeps its fingerprint and continues serving the
+            -- rows that have already moved away instead of returning 409.
+            CREATE TRIGGER IF NOT EXISTS trg_pending_changes_version_update_source_ws
+            AFTER UPDATE OF workspace_id ON pending_changes
+            WHEN OLD.workspace_id IS NOT NEW.workspace_id
+            BEGIN
+                INSERT OR IGNORE INTO db_meta(key, value)
+                    VALUES ('pending_changes_version:' || OLD.workspace_id, '0');
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'pending_changes_version:' || OLD.workspace_id;
+            END;
         """
         )
         cur = self.conn.cursor()
@@ -2686,6 +2739,49 @@ class Database:
                WHERE wf.workspace_id = ?
                ORDER BY f.path""",
             (workspace_id,),
+        ).fetchall()
+
+    def get_folder_workspaces(self, folder_id):
+        """Return every workspace in which ``folder_id`` is visible.
+
+        Include direct links plus read-only inheritance from recursive roots.
+        Do not materialize the inferred descendant row: some import and repair
+        paths create deliberately restricted exact non-root links that must not
+        expand merely because the user inspected a folder's memberships.
+        """
+        return self.conn.execute(
+            """SELECT w.id, w.name,
+                      MAX(CASE
+                            WHEN wf.folder_id = target.id AND wf.is_root = 1
+                            THEN 1 ELSE 0
+                          END) AS is_root
+               FROM workspaces w
+               JOIN workspace_folders wf ON wf.workspace_id = w.id
+               JOIN folders root ON root.id = wf.folder_id
+               JOIN folders target ON target.id = ?
+               LEFT JOIN local_folder_mappings target_lfm
+                 ON target_lfm.folder_id = target.id
+               WHERE wf.folder_id = target.id
+                  OR (
+                    wf.is_root = 1
+                    AND (
+                      REPLACE(target.path, '\\', '/') = REPLACE(root.path, '\\', '/')
+                      OR substr(
+                           REPLACE(target.path, '\\', '/'),
+                           1,
+                           length(RTRIM(REPLACE(root.path, '\\', '/'), '/') || '/')
+                         ) = RTRIM(REPLACE(root.path, '\\', '/'), '/') || '/'
+                      OR REPLACE(target_lfm.source_path, '\\', '/') = REPLACE(root.path, '\\', '/')
+                      OR substr(
+                           REPLACE(target_lfm.source_path, '\\', '/'),
+                           1,
+                           length(RTRIM(REPLACE(root.path, '\\', '/'), '/') || '/')
+                         ) = RTRIM(REPLACE(root.path, '\\', '/'), '/') || '/'
+                    )
+                  )
+               GROUP BY w.id, w.name, w.pinned_at
+               ORDER BY (w.pinned_at IS NULL), LOWER(w.name), w.id""",
+            (folder_id,),
         ).fetchall()
 
     def get_workspace_folder_roots(self, workspace_id):
@@ -6212,6 +6308,7 @@ class Database:
                       JOIN workspace_folders wf
                         ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
                      WHERE d.detector_model != 'full-image'
+                       AND d.category = 'animal'
                        AND d.detector_confidence >= ?{scope_sql}
                 )
                 SELECT COUNT(*) AS primary_dets,
@@ -6288,6 +6385,7 @@ class Database:
                       JOIN workspace_folders wf
                         ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
                      WHERE d.detector_model != 'full-image'
+                       AND d.category = 'animal'
                        AND d.detector_confidence >= ?{scope_sql}
                 )
                 SELECT COUNT(*) AS pending
@@ -6372,6 +6470,7 @@ class Database:
                       JOIN workspace_folders wf
                         ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
                      WHERE d.detector_model != 'full-image'
+                       AND d.category = 'animal'
                        AND d.detector_confidence >= ?{scope_sql}
                 )
                 SELECT COUNT(*) AS n
@@ -6396,13 +6495,17 @@ class Database:
 
     def count_full_image_fallback_photos(
         self, photo_ids=None, detector_model="megadetector-v6",
+        min_conf=0,
     ):
         """Count photos eligible for full-image fallback classification.
 
-        These are photos in the active workspace where the detector has
-        successfully run and found no boxes. Photos with any real detector row,
-        including below-threshold noise, are excluded to match the pipeline's
-        current runtime fallback gate.
+        These are photos in the active workspace where the detector has run
+        and produced no box the classifier could act on: either
+        ``box_count = 0`` or every non-full-image row is below ``min_conf``
+        (raw noise). Callers that want to mirror the runtime fallback gate
+        pass the workspace's ``detector_confidence``; the default of ``0``
+        preserves the pre-noise-fallback semantics where any real row
+        disqualified the photo.
         """
         ws = self._ws_id()
         scope_sql, scope_params = self._scope_clause(photo_ids)
@@ -6411,24 +6514,36 @@ class Database:
                   FROM photos p
                   JOIN workspace_folders wf
                     ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
-                  JOIN detector_runs dr
+                 JOIN detector_runs dr
                     ON dr.photo_id = p.id
                    AND dr.detector_model = ?
-                   AND dr.box_count = 0
-                 WHERE NOT EXISTS (
+                 WHERE (dr.box_count = 0 OR EXISTS (
+                         SELECT 1 FROM detections consistent
+                          WHERE consistent.photo_id = p.id
+                            AND consistent.detector_model = dr.detector_model
+                       ))
+                   AND NOT EXISTS (
                          SELECT 1 FROM detections d
                           WHERE d.photo_id = p.id
                             AND d.detector_model != 'full-image'
+                            AND d.detector_confidence >= ?
                        ){scope_sql}""",
-            (ws, detector_model, *scope_params),
+            (ws, detector_model, min_conf, *scope_params),
         ).fetchone()
         return row["n"] or 0
 
     def count_full_image_classify_pending_pairs(
         self, classifier_model, labels_fingerprint,
         photo_ids=None, detector_model="megadetector-v6",
+        min_conf=0,
     ):
-        """Count fallback photos lacking a classifier run for (model, fp)."""
+        """Count fallback photos lacking a classifier run for (model, fp).
+
+        ``min_conf`` mirrors the runtime fallback gate: a photo qualifies
+        when no non-full-image detection row is at or above the threshold,
+        so a MegaDetector run that produced only noise (< ``min_conf``)
+        counts alongside truly empty ``box_count = 0`` runs.
+        """
         ws = self._ws_id()
         scope_sql, scope_params = self._scope_clause(photo_ids)
         row = self.conn.execute(
@@ -6446,12 +6561,17 @@ class Database:
                       JOIN detector_runs dr
                         ON dr.photo_id = p.id
                        AND dr.detector_model = ?
-                       AND dr.box_count = 0
                       LEFT JOIN full_anchor fa ON fa.photo_id = p.id
-                     WHERE NOT EXISTS (
+                     WHERE (dr.box_count = 0 OR EXISTS (
+                             SELECT 1 FROM detections consistent
+                              WHERE consistent.photo_id = p.id
+                                AND consistent.detector_model = dr.detector_model
+                           ))
+                       AND NOT EXISTS (
                              SELECT 1 FROM detections d
                               WHERE d.photo_id = p.id
                                 AND d.detector_model != 'full-image'
+                                AND d.detector_confidence >= ?
                            ){scope_sql}
                   )
                 SELECT COUNT(*) AS pending
@@ -6463,7 +6583,7 @@ class Database:
                  WHERE f.detection_id IS NULL
                     OR cr.detection_id IS NULL""",
             (
-                ws, detector_model, *scope_params,
+                ws, detector_model, min_conf, *scope_params,
                 classifier_model, labels_fingerprint,
             ),
         ).fetchone()
@@ -6472,8 +6592,14 @@ class Database:
     def count_full_image_classify_stale(
         self, classifier_model, labels_fingerprint,
         photo_ids=None, detector_model="megadetector-v6",
+        min_conf=0,
     ):
-        """Count fallback anchors with stale runs and no current run."""
+        """Count fallback anchors with stale runs and no current run.
+
+        ``min_conf`` mirrors ``count_full_image_fallback_photos`` so
+        photos whose only detections are noise (< ``min_conf``) join the
+        stale-anchor scope alongside the ``box_count = 0`` cases.
+        """
         ws = self._ws_id()
         scope_sql, scope_params = self._scope_clause(photo_ids)
         row = self.conn.execute(
@@ -6491,12 +6617,17 @@ class Database:
                       JOIN detector_runs dr
                         ON dr.photo_id = p.id
                        AND dr.detector_model = ?
-                       AND dr.box_count = 0
                       JOIN full_anchor fa ON fa.photo_id = p.id
-                     WHERE NOT EXISTS (
+                     WHERE (dr.box_count = 0 OR EXISTS (
+                             SELECT 1 FROM detections consistent
+                              WHERE consistent.photo_id = p.id
+                                AND consistent.detector_model = dr.detector_model
+                           ))
+                       AND NOT EXISTS (
                              SELECT 1 FROM detections d
                               WHERE d.photo_id = p.id
                                 AND d.detector_model != 'full-image'
+                                AND d.detector_confidence >= ?
                            ){scope_sql}
                   )
                 SELECT COUNT(*) AS n
@@ -6514,7 +6645,7 @@ class Database:
                             AND cr_cur.labels_fingerprint = ?
                        )""",
             (
-                ws, detector_model, *scope_params,
+                ws, detector_model, min_conf, *scope_params,
                 classifier_model, labels_fingerprint,
                 classifier_model, labels_fingerprint,
             ),
@@ -8398,6 +8529,14 @@ class Database:
     def batch_set_color_label(self, photo_ids, color):
         """Set or remove color label for multiple photos in the active workspace."""
         self._photo_label_repository().set_many(photo_ids, color)
+
+    def get_color_label_descriptions(self):
+        """Return color-label descriptions for the active workspace."""
+        return self._photo_label_repository().get_descriptions()
+
+    def set_color_label_description(self, color, description):
+        """Set or clear one color-label description in the active workspace."""
+        return self._photo_label_repository().set_description(color, description)
 
     def _photo_label_repository(self):
         from repositories.photo_labels import PhotoLabelRepository

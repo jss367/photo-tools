@@ -12290,6 +12290,67 @@ def test_color_label_workspace_scoped(tmp_path):
     assert db.get_color_label(pid) == 'red'
 
 
+def test_color_label_descriptions_are_workspace_scoped(tmp_path):
+    """Each workspace can give the same color a different meaning."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws1 = db._active_workspace_id
+    db.set_color_label_description("red", "Reptiles")
+
+    ws2 = db.create_workspace("Second")
+    db.set_active_workspace(ws2)
+    assert db.get_color_label_descriptions() == {}
+    db.set_color_label_description("red", "Needs review")
+    assert db.get_color_label_descriptions() == {"red": "Needs review"}
+
+    db.set_active_workspace(ws1)
+    assert db.get_color_label_descriptions() == {"red": "Reptiles"}
+
+
+def test_color_label_description_preserves_other_workspace_config(tmp_path):
+    """Description edits must not clobber unrelated workspace overrides."""
+    import json
+
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db._active_workspace_id
+    db.update_workspace(
+        ws_id,
+        config_overrides={"detector_confidence": 0.15, "active_labels": ["birds.txt"]},
+    )
+
+    db.set_color_label_description("blue", "Waterbirds")
+    overrides = json.loads(db.get_workspace(ws_id)["config_overrides"])
+    assert overrides == {
+        "detector_confidence": 0.15,
+        "active_labels": ["birds.txt"],
+        "color_label_descriptions": {"blue": "Waterbirds"},
+    }
+
+    db.set_color_label_description("blue", "")
+    overrides = json.loads(db.get_workspace(ws_id)["config_overrides"])
+    assert overrides == {
+        "detector_confidence": 0.15,
+        "active_labels": ["birds.txt"],
+    }
+
+
+def test_color_label_description_validation(tmp_path):
+    """Descriptions are short, single-line text for a known label color."""
+    import pytest
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+
+    assert db.set_color_label_description("green", "  Confirmed\n wildlife  ") == "Confirmed wildlife"
+    assert db.get_color_label_descriptions() == {"green": "Confirmed wildlife"}
+    with pytest.raises(ValueError, match="120 characters or fewer"):
+        db.set_color_label_description("green", "x" * 121)
+    with pytest.raises(ValueError, match="Invalid color label"):
+        db.set_color_label_description("orange", "Mammals")
+    with pytest.raises(ValueError, match="must be a string"):
+        db.set_color_label_description("green", None)
+
+
 def test_batch_set_color_label(tmp_path):
     """batch_set_color_label sets label on multiple photos."""
     from db import Database

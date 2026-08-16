@@ -4,6 +4,7 @@
   var data = null;
   var activeJob = null;
   var actionInFlight = false;
+  var loadGeneration = 0;
   var pendingStageItems = [];
   var stagePreflightGeneration = 0;
   var stagePreflightTimer = null;
@@ -156,9 +157,17 @@
 
   function blockerSignature(payload) {
     if (!payload) return '';
+    // ``residency_fingerprint`` is a short server-side digest of the
+    // ``local_folders`` rows visible to this workspace (state, activated_at,
+    // created_at per covering root). Including it here means a
+    // stage/sync/discard started and finished in another tab between two
+    // polls — both of which see no active job — still trips the signature
+    // and re-runs load(), so the folder-tree badge doesn't sit at its
+    // pre-job state until reload.
     return JSON.stringify({
       blocking_job: payload.blocking_job || null,
-      folder_blocking_jobs: payload.folder_blocking_jobs || {}
+      folder_blocking_jobs: payload.folder_blocking_jobs || {},
+      residency_fingerprint: payload.residency_fingerprint || ''
     });
   }
 
@@ -609,6 +618,29 @@
     container.innerHTML = html;
   }
 
+  function publishFolderStatus() {
+    window.vireoLocalFolderData = data;
+    try {
+      window.dispatchEvent(new CustomEvent('vireo:local-folder-status-changed', {
+        detail: {data: data}
+      }));
+    } catch (_error) {}
+  }
+
+  function trackStartedJob(result, type) {
+    if (!data || data.legacy_workspace_session || !result || !result.job_id) return;
+    var jobs = (data.jobs || []).filter(function(job) {
+      return job.id !== result.job_id;
+    });
+    jobs.push({
+      id: result.job_id,
+      type: type,
+      folder_ids: (result.folder_ids || []).map(Number)
+    });
+    data.jobs = jobs;
+    publishFolderStatus();
+  }
+
   function watchJob(jobId) {
     if (activeJob && activeJob.id === jobId) return;
     if (activeJob && activeJob.source) activeJob.source.close();
@@ -640,10 +672,23 @@
   }
 
   async function load() {
+    var generation = ++loadGeneration;
     try {
-      data = await Vireo.api.json('/api/workspaces/active/local-folders', {}, {toast: false});
+      var nextData = await Vireo.api.json(
+        '/api/workspaces/active/local-folders', {}, {toast: false}
+      );
+      if (nextData.legacy_workspace_session) {
+        nextData.legacy = await Vireo.api.json(
+          '/api/workspaces/active/local-workspace', {}, {toast: false}
+        );
+      }
+      // Multiple callers can overlap (notably rapid folder-health events).
+      // Only the newest request may publish or trigger job/UI side effects;
+      // otherwise an older, slower response can restore obsolete ancestry
+      // and recovery badges after the current tree has rendered.
+      if (generation !== loadGeneration) return null;
+      data = nextData;
       if (data.legacy_workspace_session) {
-        data.legacy = await Vireo.api.json('/api/workspaces/active/local-workspace', {}, {toast: false});
         if (data.legacy.job) watchJob(data.legacy.job.id);
       } else if (data.jobs && data.jobs.length) {
         watchJob(data.jobs[0].id);
@@ -662,13 +707,14 @@
           }
         });
       }
-      window.vireoLocalFolderData = data;
+      publishFolderStatus();
       render();
       if (typeof loadWsFolders === 'function') loadWsFolders();
       updateStageDialogBlocker();
       scheduleBlockingJobRefresh();
       return data;
     } catch (error) {
+      if (generation !== loadGeneration) return null;
       var container = document.getElementById('localWorkspaceContent');
       if (container) container.innerHTML = '<span style="color:var(--danger);font-size:13px;">' + escapeHtml(error.message || 'Failed to read local folder status') + '</span>';
       return null;
@@ -705,6 +751,7 @@
       if (modal) modal.classList.remove('open');
       pendingStageItems = [];
       watchJob(result.job_id);
+      trackStartedJob(result, 'work-locally-folder-stage');
     } catch (requestError) {
       if (error) error.textContent = requestError.message || 'Could not start the local copy.';
     } finally {
@@ -758,6 +805,7 @@
         })
       });
       watchJob(result.job_id);
+      trackStartedJob(result, 'work-locally-folder-sync');
     } catch (_error) {
       await load();
     } finally {
@@ -795,6 +843,7 @@
         })
       });
       watchJob(result.job_id);
+      trackStartedJob(result, 'work-locally-folder-discard');
     } catch (_error) {
       await load();
     } finally {

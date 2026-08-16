@@ -638,3 +638,134 @@ def test_encounter_reject_respects_active_label_filter(live_server, page):
         "Cleared rejects from 2 photos in encounter"
     )
     assert _flags(db, photo_ids) == ["none"] * 4
+
+
+def test_photo_context_menu_exposes_review_and_organization_actions(
+    live_server, page
+):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    page.locator(".photo-card[data-photo-id]").first.click(button="right")
+
+    menu = page.locator(".vireo-ctx-menu")
+    expect(menu).to_be_visible()
+    menu_text = menu.inner_text()
+    for label in (
+        "Add to Collection",
+        "Add Keyword",
+        "Open in Lightbox",
+        "Open in Browse",
+        "Find Similar",
+        "Copy Path",
+        "Edit Photo",
+        "Open in Editor",
+        "Develop in darktable",
+    ):
+        assert label in menu_text
+    expect(menu.locator('.vireo-ctx-chip[title="Rate 4"]')).to_have_count(1)
+    expect(menu.locator('.vireo-ctx-chip[title="Flag as pick"]')).to_have_count(1)
+    expect(menu.locator('.vireo-ctx-chip[title="Reject"]')).to_have_count(1)
+    expect(menu.locator('.vireo-ctx-chip[title="Clear flag"]')).to_have_count(1)
+
+
+def test_photo_context_menu_adds_photo_to_existing_collection(live_server, page):
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+    collection_id = db.add_collection(
+        "Process Review Picks",
+        json.dumps([{"field": "photo_ids", "value": []}]),
+    )
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    card = page.locator(".photo-card[data-photo-id]").first
+    photo_id = int(card.get_attribute("data-photo-id"))
+    card.click(button="right")
+    page.locator(".vireo-ctx-item", has_text="Add to Collection").click()
+
+    modal = page.locator("#pipelineCollectionModal")
+    expect(modal).to_have_class(re.compile(r"\bopen\b"))
+    modal.locator(".pipeline-collection-choice", has_text="Process Review Picks").click()
+    modal.locator(".modal-btn-primary", has_text="Add").click()
+    expect(modal).not_to_have_class(re.compile(r"\bopen\b"))
+
+    members = db.get_collection_photos(collection_id, per_page=100)
+    assert [member["id"] for member in members] == [photo_id]
+
+
+def test_photo_context_menu_updates_rating_and_adds_keyword(live_server, page):
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    card = page.locator(".photo-card[data-photo-id]").first
+    photo_id = int(card.get_attribute("data-photo-id"))
+    card.click(button="right")
+    page.locator('.vireo-ctx-chip[title="Rate 4"]').click()
+
+    rating = db.conn.execute(
+        "SELECT rating FROM photos WHERE id = ?", (photo_id,)
+    ).fetchone()["rating"]
+    assert rating == 4
+
+    card.click(button="right")
+    page.locator(".vireo-ctx-item", has_text="Add Keyword").click()
+    modal = page.locator("#pipelineKeywordModal")
+    expect(modal).to_have_class(re.compile(r"\bopen\b"))
+    modal.locator("#pipelineKeywordInput").fill("Process Review Shortlist")
+    modal.locator(".modal-btn-primary", has_text="Add").click()
+    expect(modal).not_to_have_class(re.compile(r"\bopen\b"))
+
+    assert "Process Review Shortlist" in {
+        keyword["name"] for keyword in db.get_photo_keywords(photo_id)
+    }
+
+
+def test_group_context_menu_preserves_selection_for_collection_action(
+    live_server, page
+):
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+    collection_id = db.add_collection(
+        "Burst Shortlist",
+        json.dumps([{"field": "photo_ids", "value": []}]),
+    )
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate("openGroupReview(0, 0)")
+    cards = page.locator("#grmOverlay .grm-card[data-photo-id]")
+    expect(cards).to_have_count(2)
+    selected_ids = [
+        int(cards.nth(0).get_attribute("data-photo-id")),
+        int(cards.nth(1).get_attribute("data-photo-id")),
+    ]
+    # The modal opens with the first card selected. Add the second without
+    # toggling the first one off through grmSelect's click-again behavior.
+    page.evaluate("id => grmSelect(id, 'toggle')", selected_ids[1])
+    cards.nth(1).click(button="right")
+
+    menu = page.locator(".vireo-ctx-menu")
+    for label in (
+        "Move to Picks",
+        "Move to Candidates",
+        "Move to Rejects",
+        "Remove from Group",
+    ):
+        expect(menu.locator(".vireo-ctx-item", has_text=label)).to_be_visible()
+    menu.locator(".vireo-ctx-item", has_text="Add to Collection").click()
+
+    modal = page.locator("#pipelineCollectionModal")
+    expect(modal.locator("#pipelineCollectionTitle")).to_have_text(
+        "Add 2 photos to Collection"
+    )
+    modal.locator(".pipeline-collection-choice", has_text="Burst Shortlist").click()
+    modal.locator(".modal-btn-primary", has_text="Add").click()
+    expect(modal).not_to_have_class(re.compile(r"\bopen\b"))
+
+    members = db.get_collection_photos(collection_id, per_page=100)
+    assert {member["id"] for member in members} == set(selected_ids)

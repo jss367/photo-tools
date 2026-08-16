@@ -1091,6 +1091,141 @@ def test_location_review_partial_assignment_survives_completed_prefix_delete(
     )
 
 
+def test_location_review_partial_assignment_drops_deleted_pending_ids(
+    live_server, page,
+):
+    """Deleting a photo in the retry suffix must not leave its ID in the snapshot.
+
+    Both batch-location endpoints validate every photo_id up front and 404
+    on any that no longer exists. If a lightbox:photodeleted event removes
+    a photo from the still-unassigned suffix while a partial batch waits
+    for retry, the immutable snapshot would keep that ID and every retry
+    would 404 — permanently jamming the group. The reconciled snapshot
+    must drop the deleted ID and its progress counters.
+    """
+    photo_id = live_server["data"]["photos"][0]
+    photo_ids = list(range(1, 1501))
+    preview = {
+        "total": 1500,
+        "reviewable": 1500,
+        "unresolved": [],
+        "skipped": [],
+        "groups": [
+            {
+                "photo_ids": photo_ids,
+                "photos": [
+                    {
+                        "id": photo_id,
+                        "filename": "keep.jpg",
+                        "latitude": 33.255,
+                        "longitude": -116.405,
+                        "timestamp": "2026-08-04T10:17:00",
+                    },
+                ],
+                "count": 1500,
+                "center": {"lat": 33.255, "lng": -116.405},
+                "bounds": {
+                    "south": 33.255, "west": -116.405,
+                    "north": 33.255, "east": -116.405,
+                },
+                "spread_m": 0,
+                "captured_from": "2026-08-04T10:17:00",
+                "captured_to": "2026-08-04T10:17:00",
+            },
+        ],
+    }
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.route(
+        "**/api/location-review/preview",
+        lambda route: route.fulfill(json=preview),
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("1,500 photos")
+
+    page.locator("#locationReviewSearch").fill("Suffix delete location")
+    page.locator("#locationReviewCustom").click()
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetch = window.safeFetch;
+          window.__pending = [];
+          window.__requestBodies = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__originalSafeFetch(url, opts, options);
+            }
+            window.__requestBodies.push(JSON.parse(opts.body));
+            return new Promise(function(resolve, reject) {
+              window.__pending.push({resolve: resolve, reject: reject});
+            });
+          };
+          window.__settle = function(result) {
+            var pending = window.__pending.shift();
+            if (result === 'reject') pending.reject(new Error('boom'));
+            else pending.resolve({ok: true, updated: result});
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(1000)")  # first chunk commits
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle('reject')")  # second chunk fails
+
+    expect(page.locator("#locationReviewAssign")).to_contain_text(
+        "Retry 500 remaining"
+    )
+    assert page.evaluate("window.__requestBodies.length") == 2
+
+    # Simulate a photodeleted event for a photo in the still-unassigned
+    # suffix (ID 1200 was in the pending chunk 1001..1500). Without the
+    # snapshot reconciliation, the retry snapshot would still contain
+    # 1200 and every retry would 404 on the missing photo, leaving the
+    # user stuck behind a locked toolbar.
+    page.evaluate(
+        "document.dispatchEvent(new CustomEvent('lightbox:photodeleted',"
+        " {detail: {photoId: 1200}}))"
+    )
+
+    # Progress and retry button reflect the reconciled remainder (500 - 1).
+    expect(page.locator("#locationReviewAssign")).to_contain_text(
+        "Retry 499 remaining"
+    )
+    expect(page.locator("#locationReviewAssignmentStatus")).to_have_text(
+        "1,000 of 1,499 assigned · 499 remaining"
+    )
+    # Navigation must stay locked — partial state is still pending.
+    expect(page.locator("#locationReviewSkip")).to_be_disabled()
+    expect(page.locator("#locationReviewNext")).to_be_disabled()
+    expect(page.locator("#locationReviewPrevious")).to_be_disabled()
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(499)")
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text(
+        "All locations reviewed"
+    )
+    request_lengths = page.evaluate(
+        "window.__requestBodies.map(function(body) { return body.photo_ids.length; })"
+    )
+    assert request_lengths == [1000, 500, 499], (
+        f"Retry must skip the deleted pending ID, got chunks {request_lengths}"
+    )
+    third_chunk_ids = page.evaluate("window.__requestBodies[2].photo_ids")
+    expected_third = [pid for pid in range(1001, 1501) if pid != 1200]
+    assert third_chunk_ids == expected_third, (
+        "Retry chunk must exclude the deleted pending ID — the snapshot must "
+        "reconcile with lightbox:photodeleted."
+    )
+
+
 def test_location_review_missing_google_key_links_to_settings(live_server, page):
     """The empty suggestion state explains how to enable nearby places."""
     photo_id = live_server["data"]["photos"][0]

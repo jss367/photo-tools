@@ -47,9 +47,23 @@ def acquire_gpu():
 
 
 class _GpuLockContext:
+    def __init__(self, cancel_check=None):
+        self._cancel_check = cancel_check
+
     def __enter__(self):
-        _GPU_SEMAPHORE.acquire()
-        return self
+        from resource_ledger import (
+            ResourceWaitCancelled,
+            resolve_resource_cancel_check,
+        )
+
+        cancel_check = resolve_resource_cancel_check(self._cancel_check)
+        while True:
+            if cancel_check is not None and cancel_check():
+                raise ResourceWaitCancelled(
+                    "Cancelled while waiting for GPU inference resources"
+                )
+            if _GPU_SEMAPHORE.acquire(timeout=0.2):
+                return self
 
     def __exit__(self, exc_type, exc, tb):
         _GPU_SEMAPHORE.release()
@@ -101,13 +115,13 @@ def acquire_inference_resources(session, *, cancel_check=None):
             outputs = session.run(None, feeds)
     """
     if _session_uses_gpu(session):
-        return _GpuLockContext()
+        return _GpuLockContext(cancel_check)
     try:
         providers = set(session.get_providers())
     except Exception:
-        return _GpuLockContext()
+        return _GpuLockContext(cancel_check)
     if providers != {"CPUExecutionProvider"}:
-        return _GpuLockContext()
+        return _GpuLockContext(cancel_check)
 
     from onnx_runtime import session_cpu_threads
     from resource_ledger import (

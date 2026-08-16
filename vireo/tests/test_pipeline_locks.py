@@ -121,6 +121,43 @@ def test_acquire_inference_resources_wakes_on_bound_cancel_check():
         resource_ledger._set_resource_ledger_for_tests(previous)
 
 
+def test_gpu_inference_wait_wakes_on_bound_cancel_check():
+    """Queued accelerator work observes the same bound job probe as CPU."""
+    from pipeline_locks import acquire_inference_resources
+    from resource_ledger import (
+        ResourceWaitCancelled,
+        bind_resource_cancel_check,
+    )
+
+    sess = _FakeSession(["CUDAExecutionProvider", "CPUExecutionProvider"])
+    holder = acquire_gpu()
+    holder.__enter__()
+    cancelled_flag = threading.Event()
+    finished = threading.Event()
+    outcome = []
+    try:
+        def waiter():
+            with bind_resource_cancel_check(cancelled_flag.is_set):
+                try:
+                    with acquire_inference_resources(sess):
+                        pass
+                except ResourceWaitCancelled:
+                    outcome.append("cancelled")
+                finally:
+                    finished.set()
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        time.sleep(0.05)
+        cancelled_flag.set()
+        assert finished.wait(timeout=1.0), "GPU waiter never observed cancel"
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+        assert outcome == ["cancelled"]
+    finally:
+        holder.__exit__(None, None, None)
+
+
 def test_acquire_gpu_if_session_uses_it_defaults_to_lock_when_providers_missing():
     """A session that doesn't expose get_providers (or raises) must
     conservatively take the lock — same behavior as before this check existed.

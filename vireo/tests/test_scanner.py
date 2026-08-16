@@ -3290,6 +3290,70 @@ def test_sequential_scan_pause_after_compute_releases_lease(tmp_path, monkeypatc
     assert {os.path.basename(photo["filename"]) for photo in photos} == set(filenames)
 
 
+def test_scan_consumer_pause_resumes_generator_before_parking(
+    tmp_path, monkeypatch,
+):
+    """A pause after yield must resume the generator to drop its CPU lease."""
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    filenames = [f"{letter}.jpg" for letter in "abcdefghi"]
+    _create_test_images(root, {'': filenames})
+    db = Database(str(tmp_path / "test.db"))
+    pause_state = {"active": False, "triggered": False}
+    parking_alloc = []
+
+    class ReadyFuture:
+        def __init__(self, function, path):
+            self.function = function
+            self.path = path
+
+        def result(self, timeout=None):
+            return self.function(self.path)
+
+    class FakeProcessPool:
+        def __init__(self, *args, **kwargs):
+            self._processes = {}
+
+        def submit(self, function, path):
+            return ReadyFuture(function, path)
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            return None
+
+    def progress_callback(current, _total):
+        if current == 1 and not pause_state["triggered"]:
+            pause_state["triggered"] = True
+            pause_state["active"] = True
+
+    def cancel_check():
+        if pause_state["active"]:
+            parking_alloc.append(ledger.snapshot()["cpu"]["allocated"])
+        pause_state["active"] = False
+        return False
+
+    monkeypatch.setattr(scanner, "ProcessPoolExecutor", FakeProcessPool)
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        scanner.scan(
+            root,
+            db,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+            pause_check=lambda: pause_state["active"],
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    assert pause_state["triggered"]
+    assert parking_alloc == [0]
+    photos = db.get_photos(per_page=100)
+    assert {os.path.basename(photo["filename"]) for photo in photos} == set(filenames)
+
+
 # -- scan resilience: retry on locked DB, mark folder partial on abort --
 
 

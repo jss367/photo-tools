@@ -77,6 +77,46 @@ def test_cpu_and_lane_claim_waits_without_partial_allocation():
     assert not thread.is_alive()
 
 
+def test_cpu_reserve_applies_across_concurrent_flexible_claims():
+    """Separate scanner-like requests cannot spend the same reserve."""
+    ledger = ResourceLedger(cpu_capacity=12)
+    scan_request = ResourceRequest(
+        cpu=CpuRequest(1, 8, 8),
+        cpu_reserve=8,
+        label="scanner hashing",
+    )
+    first_scan = ledger.acquire(scan_request)
+    assert first_scan.cpu_permits == 4
+
+    second_waiting = threading.Event()
+    second_acquired = threading.Event()
+
+    def acquire_second_scan():
+        with ledger.acquire(
+            scan_request,
+            on_wait=lambda _request: second_waiting.set(),
+        ):
+            second_acquired.set()
+
+    thread = threading.Thread(target=acquire_second_scan)
+    thread.start()
+    try:
+        assert second_waiting.wait(timeout=1.0)
+        with ledger.acquire(ResourceRequest(
+            cpu=CpuRequest(8, 8, 8),
+            lanes=("cpu_ml",),
+        )) as inference:
+            assert inference.cpu_permits == 8
+            assert ledger.snapshot()["cpu"]["allocated"] == 12
+        assert not second_acquired.wait(timeout=0.1)
+    finally:
+        first_scan.release()
+
+    assert second_acquired.wait(timeout=1.0)
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
+
+
 def test_owner_wait_timing_uses_injected_clock():
     now = [10.0]
     ledger = ResourceLedger(cpu_capacity=1, clock=lambda: now[0])

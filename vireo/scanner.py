@@ -252,12 +252,7 @@ def _claim_worker_count(files_to_process, cancel_check=None):
     ledger = get_resource_ledger()
     inference_threads = cpu_inference_request(ledger.cpu_capacity).preferred
     spare_after_inference = ledger.cpu_capacity - inference_threads
-    if spare_after_inference > 0:
-        # Leave the exact ONNX grant available whenever the machine is large
-        # enough for hashing and inference to coexist. Without this reserve,
-        # a flexible scanner grant (for example 5 of 12 permits) can block an
-        # 8-thread inference or construction claim for the full hash phase.
-        desired = min(desired, spare_after_inference)
+    cpu_reserve = inference_threads if spare_after_inference > 0 else 0
     request = ResourceRequest(
         cpu=cpu_phase_request(
             ledger.cpu_capacity,
@@ -265,6 +260,10 @@ def _claim_worker_count(files_to_process, cancel_check=None):
             preferred=desired,
             maximum=desired,
         ),
+        # The ledger applies this reserve to the aggregate allocation, so two
+        # concurrent flexible scans cannot each consume the same nominal
+        # spare capacity and collectively block an exact inference claim.
+        cpu_reserve=cpu_reserve,
         label="scanner hashing",
     )
     with ledger.acquire(request, cancel_check=cancel_check) as lease:
@@ -2535,11 +2534,14 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             # if the pause turns into a cancellation.
             if paused:
                 _check_cancelled()
+        # The final result is consumed while this generator is suspended.
+        # Check once more only after the last lease has unwound so a pause or
+        # cancellation arriving during that consumer work cannot strand the
+        # pool and its CPU permits.
+        _check_cancelled()
 
     try:
         for image_path, (phash, file_hash) in _iter_features():
-            _check_cancelled()
-
             # File stats — first touch of the path in this loop. A file
             # deleted/renamed between discovery and here must skip, not
             # abort the scan and flag every folder in scope 'partial'.

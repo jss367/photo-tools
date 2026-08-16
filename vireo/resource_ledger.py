@@ -61,8 +61,17 @@ class ResourceRequest:
     cpu: CpuRequest | None = None
     lanes: tuple[str, ...] = ()
     label: str = "background work"
+    cpu_reserve: int = 0
 
     def __post_init__(self):
+        if isinstance(self.cpu_reserve, bool) or not isinstance(
+            self.cpu_reserve, int,
+        ):
+            raise TypeError("CPU reserve must be an integer")
+        if self.cpu_reserve < 0:
+            raise ValueError("CPU reserve must be nonnegative")
+        if self.cpu is None and self.cpu_reserve:
+            raise ValueError("CPU reserve requires a CPU request")
         normalized = tuple(sorted(set(self.lanes)))
         if any(not lane for lane in normalized):
             raise ValueError("Resource lane names must be non-empty")
@@ -154,6 +163,15 @@ def cpu_inference_request(capacity):
     )
 
 
+def resolve_resource_cancel_check(cancel_check=None):
+    """Return an explicit cancellation probe or the current bound probe."""
+    return (
+        cancel_check
+        if cancel_check is not None
+        else _RESOURCE_CANCEL_CHECK.get()
+    )
+
+
 class ResourceLease:
     """An idempotently releasable allocation returned by ``ResourceLedger``."""
 
@@ -220,6 +238,16 @@ class ResourceLedger:
                 f"CPU request minimum {request.cpu.minimum} exceeds capacity "
                 f"{self.cpu_capacity}"
             )
+        if (
+            request.cpu is not None
+            and request.cpu_reserve
+            and request.cpu.minimum > self.cpu_capacity - request.cpu_reserve
+        ):
+            raise ValueError(
+                f"CPU request minimum {request.cpu.minimum} cannot preserve "
+                f"reserve {request.cpu_reserve} within capacity "
+                f"{self.cpu_capacity}"
+            )
         unknown = [lane for lane in request.lanes if lane not in self._lane_capacities]
         if unknown:
             raise ValueError(f"Unknown resource lane(s): {', '.join(unknown)}")
@@ -227,8 +255,11 @@ class ResourceLedger:
     def _available_cpu(self):
         return self.cpu_capacity - self._cpu_allocated
 
+    def _grantable_cpu(self, request):
+        return max(0, self._available_cpu() - request.cpu_reserve)
+
     def _can_grant(self, request):
-        if request.cpu is not None and self._available_cpu() < request.cpu.minimum:
+        if request.cpu is not None and self._grantable_cpu(request) < request.cpu.minimum:
             return False
         return all(
             self._lane_allocated[lane] < self._lane_capacities[lane]
@@ -291,8 +322,7 @@ class ResourceLedger:
             raise TypeError("request must be a ResourceRequest")
         self._validate_request(request)
         owner_id = owner_id if owner_id is not None else _RESOURCE_OWNER.get()
-        if cancel_check is None:
-            cancel_check = _RESOURCE_CANCEL_CHECK.get()
+        cancel_check = resolve_resource_cancel_check(cancel_check)
         wait_started = None
         announce_wait = False
 
@@ -322,7 +352,7 @@ class ResourceLedger:
                         raise
             with self._condition:
                 if self._can_grant(request):
-                    available = self._available_cpu()
+                    available = self._grantable_cpu(request)
                     cpu_permits = 0
                     if request.cpu is not None:
                         cpu_permits = min(request.cpu.preferred, available)

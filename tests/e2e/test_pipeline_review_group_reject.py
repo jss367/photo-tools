@@ -687,6 +687,29 @@ def test_lightbox_navigation_follows_visible_filtered_cards(live_server, page):
     page.keyboard.press("ArrowRight")
     assert page.evaluate("_lightboxCurrentId") == visible_ids[1]
 
+    page.evaluate("closeLightbox()")
+    page.evaluate(
+        "pid => setTimeout(function() { openPipelinePhotoEditor(pid); }, 0)",
+        visible_ids[0],
+    )
+    page.wait_for_url(f"**/edit/{visible_ids[0]}")
+    assert page.evaluate("window.vireoEditNav.getList()") == visible_ids
+
+
+def test_native_photo_command_opens_pipeline_lightbox(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    photo_id = photo_ids[0]
+    page.evaluate(
+        "pid => { pipelineReviewContextPhotoIds = [pid]; nativeMenuOpenLightbox(); }",
+        photo_id,
+    )
+    expect(page.locator("#lightboxOverlay")).to_have_class(re.compile(r"\bactive\b"))
+    assert page.evaluate("_lightboxCurrentId") == photo_id
+
 
 def test_photo_context_menu_adds_photo_to_existing_collection(live_server, page):
     db = live_server["db"]

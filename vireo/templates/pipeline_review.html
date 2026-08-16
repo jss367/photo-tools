@@ -7402,9 +7402,9 @@ async function copyPhotoPaths(photoIds) {
   }
 }
 
-function openPipelineLightbox(photoId) {
+function pipelineReviewVisiblePhotoList(photoId) {
   var photo = findPhotoInResults(photoId);
-  if (!photo || typeof openLightbox !== 'function') return;
+  if (!photo) return [];
   var groupOverlay = document.getElementById('grmOverlay');
   var groupCard = groupOverlay && groupOverlay.classList.contains('open')
     ? groupOverlay.querySelector('.grm-card[data-photo-id="' + photoId + '"]')
@@ -7427,14 +7427,19 @@ function openPipelineLightbox(photoId) {
     });
   }
   if (!seen[photoId]) list = [photo];
+  return list;
+}
+
+function openPipelineLightbox(photoId) {
+  var photo = findPhotoInResults(photoId);
+  if (!photo || typeof openLightbox !== 'function') return;
+  var list = pipelineReviewVisiblePhotoList(photoId);
   openLightbox(photoId, photo.filename || '', list);
 }
 
 function openPipelinePhotoEditor(photoId) {
   if (window.vireoEditNav) {
-    var list = pipelineResults && Array.isArray(pipelineResults.photos)
-      ? pipelineResults.photos
-      : [photoId];
+    var list = pipelineReviewVisiblePhotoList(photoId);
     window.vireoEditNav.setList(list, photoId);
     window.vireoEditNav.setLastPhoto(photoId);
   }

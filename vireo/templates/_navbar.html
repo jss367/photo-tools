@@ -9988,6 +9988,10 @@ function nativeMenuOpenLightbox() {
   if (typeof openBrowseShortcutPhoto === 'function' && openBrowseShortcutPhoto(false)) return;
   var ids = nativeMenuRequirePhotos('Open in Lightbox');
   if (!ids) return;
+  if (typeof window.openPipelineLightbox === 'function') {
+    window.openPipelineLightbox(ids[0]);
+    return;
+  }
   if (typeof openLightbox === 'function' && typeof photos !== 'undefined') {
     var p = photos.find(function(x) { return x.id === ids[0]; });
     if (p) {

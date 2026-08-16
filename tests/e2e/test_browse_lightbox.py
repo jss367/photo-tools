@@ -493,6 +493,90 @@ def test_browse_lightbox_filename_can_be_selected_without_resetting_zoom(
     ) is True
 
 
+def test_browse_lightbox_zoom_hud_controls_logarithmic_zoom(live_server, page):
+    """The compact zoom HUD exposes fit, 1:1, steps, and a logarithmic slider."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" '
+        'viewBox="0 0 1600 1200"><rect width="1600" height="1200" fill="#274"/></svg>'
+    )
+    page.route(
+        re.compile(r"/photos/\d+/(full|original|preview)"),
+        lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
+    )
+    page.set_viewport_size({"width": 1000, "height": 800})
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+
+    overlay = page.locator("#lightboxOverlay")
+    badge = page.locator("#lightboxZoomBadge")
+    popover = page.locator("#lightboxZoomPopover")
+    slider = page.locator("#lightboxZoomSlider")
+    expect(overlay).to_have_class("lightbox-overlay active")
+    page.wait_for_function(
+        """() => {
+            const img = document.getElementById('lightboxImg');
+            return img && img.complete && img.naturalWidth === 1600 &&
+                !window._lbVisualTransitionPending;
+        }"""
+    )
+
+    # Make the scale deterministic: max zoom is four times native, so a
+    # logarithmic slider midpoint maps sqrt(16) to the native zoom of 4.
+    page.evaluate(
+        """() => {
+            window._lbCancelOriginalPreload();
+            window._lbScheduleSourceSwap = function() {};
+            window._lbNativeZoom = 4;
+            window._lbSetZoom(1, null, null);
+        }"""
+    )
+    expect(badge).to_be_visible()
+    expect(badge).to_have_text("Fit")
+    expect(badge).to_have_attribute("aria-expanded", "false")
+
+    badge.click()
+    expect(popover).to_have_class("lightbox-zoom-popover open")
+    expect(badge).to_have_attribute("aria-expanded", "true")
+    expect(slider).to_have_attribute("aria-valuetext", "Fit")
+    expect(page.locator("#lightboxZoomNativeStop")).to_be_visible()
+
+    slider.evaluate(
+        """el => {
+            el.value = '500';
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+        }"""
+    )
+    assert abs(page.evaluate("window._lbZoom") - 4) < 0.01
+    expect(badge).to_have_text("100%")
+    expect(slider).to_have_attribute("aria-valuetext", "100%")
+
+    page.locator("#lightboxZoomIn").click()
+    assert abs(page.evaluate("window._lbZoom") - 5) < 0.01
+    expect(badge).to_have_text("125%")
+
+    page.locator(".lb-zoom-stop-fit").click()
+    assert abs(page.evaluate("window._lbZoom") - 1) < 0.01
+    expect(badge).to_have_text("Fit")
+
+    # The labelled 1:1 stop uses the guarded high-resolution path rather than
+    # merely enlarging a softer tier. Mark that tier current for this UI test.
+    page.evaluate(
+        """() => {
+            window._lbNativeZoom = 4;
+            window._lbCurrentSrcKey = window._lbPickSourceKey(window._lbNativeZoom);
+            window._lbSetZoom(2, null, null);
+            document.getElementById('lightboxZoomNativeStop').click();
+        }"""
+    )
+    assert abs(page.evaluate("window._lbZoom") - 4) < 0.01
+    expect(badge).to_have_text("100%")
+    expect(overlay).to_have_class("lightbox-overlay active")
+
+    page.evaluate("window.closeLightbox()")
+    expect(popover).to_have_class("lightbox-zoom-popover")
+    expect(badge).to_have_attribute("aria-expanded", "false")
+
+
 def test_browse_lightbox_reserves_space_for_bottom_controls(live_server, page):
     """The fitted image stays above the toolbar and expands when it is hidden."""
     svg = (

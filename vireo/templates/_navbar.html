@@ -7757,7 +7757,13 @@ function setLightboxZoomToOneToOne(e) {
   var anchorY = e && e.clientY ? e.clientY : rect.top + rect.height / 2;
   if (_lbNativeZoom) {
     var desiredSource = _lbPickSourceKey(_lbNativeZoom);
-    if (desiredSource !== _lbCurrentSrcKey) {
+    // Compare source ranks (not exact key equality) so an already-sharper
+    // current tier — e.g. /original loaded during a previous 1:1 view when
+    // the picked tier for _lbNativeZoom is /2560 — satisfies 1:1 immediately.
+    // The exact-key check would otherwise enter the deferred path, leave the
+    // badge at 'Loading 1:1' while a lower tier is fetched, and could strand
+    // _lbPending1To1 if that fetch failed.
+    if (_lbSrcRank(_lbCurrentSrcKey) < _lbSrcRank(desiredSource)) {
       _lbPending1To1 = true;
       _lbPending1To1Anchor = { x: anchorX, y: anchorY };
       _lbScheduleSourceSwap(_lbNativeZoom);

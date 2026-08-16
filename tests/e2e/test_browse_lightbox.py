@@ -743,6 +743,63 @@ def test_browse_lightbox_hide_chrome_also_hides_zoom_popover(live_server, page):
     expect(badge).to_have_attribute("aria-expanded", "false")
 
 
+def test_browse_lightbox_one_to_one_reuses_sharper_current_source(live_server, page):
+    """1:1 must apply synchronously when the current source is already sharp enough."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" '
+        'viewBox="0 0 1600 1200"><rect width="1600" height="1200" fill="#274"/></svg>'
+    )
+    page.route(
+        re.compile(r"/photos/\d+/(full|original|preview)"),
+        lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
+    )
+    page.set_viewport_size({"width": 1000, "height": 800})
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+
+    expect(page.locator("#lightboxOverlay")).to_have_class("lightbox-overlay active")
+    page.wait_for_function(
+        """() => {
+            const img = document.getElementById('lightboxImg');
+            return img && img.complete && img.naturalWidth === 1600 &&
+                !window._lbVisualTransitionPending;
+        }"""
+    )
+
+    # Simulate the case Codex flagged: /original is already loaded (e.g. from a
+    # previous 1:1 view) but _lbPickSourceKey(_lbNativeZoom) would pick a
+    # lower-rank tier. The exact-key comparison would enter the deferred path
+    # (badge stuck at 'Loading 1:1'); a rank comparison sees the current
+    # source is already sharp enough and applies zoom synchronously.
+    result = page.evaluate(
+        """() => {
+            window._lbCancelOriginalPreload();
+            window._lbScheduleSourceSwap = function() {};
+            window._lbNativeZoom = 1.5;
+            window._lbCurrentSrcKey = 'original';
+            window._lbSetZoom(1, null, null);
+            window._lbPending1To1 = false;
+            window._lbPending1To1Anchor = null;
+            // Sanity: the picked source key for this zoom must be lower rank
+            // than 'original' or the test would trivially pass.
+            const picked = window._lbPickSourceKey(window._lbNativeZoom);
+            const pickedRank = window._lbSrcRank(picked);
+            const currentRank = window._lbSrcRank(window._lbCurrentSrcKey);
+            window.setLightboxZoomToOneToOne();
+            return {
+                pickedLowerThanCurrent: pickedRank < currentRank,
+                zoom: window._lbZoom,
+                pending: window._lbPending1To1,
+                badge: document.getElementById('lightboxZoomBadge').textContent,
+            };
+        }"""
+    )
+    assert result["pickedLowerThanCurrent"] is True
+    assert abs(result["zoom"] - 1.5) < 0.01
+    assert result["pending"] is False
+    assert result["badge"] != "Loading 1:1"
+
+
 def test_browse_lightbox_reserves_space_for_bottom_controls(live_server, page):
     """The fitted image stays above the toolbar and expands when it is hidden."""
     svg = (

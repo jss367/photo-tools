@@ -1635,6 +1635,7 @@ def test_read_only_scope_disables_lightbox_and_native_mutations(live_server, pag
 
     for selector in (
         "#lightboxNotWildlife",
+        "#lightboxInat",
         "#lightboxAdjustBtn",
         "#lightboxDeleteBtn",
     ):
@@ -1648,9 +1649,12 @@ def test_read_only_scope_disables_lightbox_and_native_mutations(live_server, pag
             deleteResult: lightboxDelete(),
             wildlifeResult: await lightboxToggleWildlifeExcluded(),
             nativeWildlifeResult: await nativeMenuSetWildlifeExcluded(true),
+            inatResult: await submitToInat(_lightboxCurrentId),
+            inatSubmitResult: await inatDoSubmit(),
             adjustmentResult: onLightboxAdjustmentInput(adjustment),
             cropResult: await openCropEditor(),
             deleteOpen: document.getElementById('deleteModal').classList.contains('open'),
+            inatOpen: document.getElementById('inatModal').classList.contains('open'),
             adjustmentTimer: _lbAdjustSaveTimer,
           };
         }"""
@@ -1660,9 +1664,12 @@ def test_read_only_scope_disables_lightbox_and_native_mutations(live_server, pag
         "deleteResult": False,
         "wildlifeResult": False,
         "nativeWildlifeResult": False,
+        "inatResult": False,
+        "inatSubmitResult": False,
         "adjustmentResult": False,
         "cropResult": False,
         "deleteOpen": False,
+        "inatOpen": False,
         "adjustmentTimer": None,
     }
     after_wildlife = db.conn.execute(

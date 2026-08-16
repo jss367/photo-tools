@@ -3932,6 +3932,7 @@ function _lbGuardReadOnly() {
 function _lbApplyReadOnlyState() {
   var controls = [
     ['lightboxNotWildlife', 'Exclude from wildlife detection and classification'],
+    ['lightboxInat', 'Submit to iNaturalist'],
     ['lightboxAdjustBtn', 'Quick non-destructive adjustments'],
     ['lightboxDeleteBtn', 'Delete photo'],
   ];
@@ -8943,6 +8944,7 @@ function copyInatQuickUploadUrl(idx) {
 }
 
 async function submitToInat(photoId) {
+  if (_lbGuardReadOnly()) return false;
   try {
     var data = await safeFetch('/api/inat/prepare/' + photoId, {}, { toast: false });
     if (data.error) { alert(data.error); return; }
@@ -8961,6 +8963,7 @@ async function submitToInat(photoId) {
 }
 
 async function submitToInatBatch(photoIds) {
+  if (_lbGuardReadOnly()) return false;
   // Prepare all photos
   inatQueue = [];
   var quickQueue = [];
@@ -9154,6 +9157,7 @@ function closeInatModal() {
 }
 
 async function inatDoSubmit() {
+  if (_lbGuardReadOnly()) return false;
   var btn = document.getElementById('inatSubmitBtn');
   btn.disabled = true;
   btn.textContent = 'Submitting...';

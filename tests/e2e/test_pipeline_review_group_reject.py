@@ -725,6 +725,60 @@ def test_collection_load_failure_clears_native_selection_override(live_server, p
     assert state == {"override": None, "modalIds": [], "modalOpen": False}
 
 
+def test_new_collection_submission_is_single_flight_and_retryable(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    state = page.evaluate(
+        """async ids => {
+          const originalSafeFetch = window.safeFetch;
+          let createCalls = 0;
+          let addCalls = 0;
+          let releaseCreate;
+          const createGate = new Promise(resolve => { releaseCreate = resolve; });
+          window.safeFetch = async function(url, options) {
+            if (url === '/api/collections' && options && options.method === 'POST') {
+              createCalls += 1;
+              await createGate;
+              return {id: 9876};
+            }
+            if (url === '/api/collections/9876/add-photos') {
+              addCalls += 1;
+              if (addCalls === 1) throw new Error('temporary add failure');
+              return {ok: true};
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          pipelineReviewModalPhotoIds = ids.slice(0, 2);
+          document.getElementById('pipelineCollectionNewName').value = 'Retry Picks';
+          document.getElementById('pipelineCollectionModal').classList.add('open');
+          try {
+            const first = confirmPipelineCollection();
+            const duplicate = confirmPipelineCollection();
+            const disabledWhilePending = document.getElementById('pipelineCollectionSubmitBtn').disabled;
+            releaseCreate();
+            const firstResults = await Promise.all([first, duplicate]);
+            const retainedId = pipelineReviewCreatedCollection && pipelineReviewCreatedCollection.id;
+            const retryResult = await confirmPipelineCollection();
+            return {createCalls, addCalls, disabledWhilePending, firstResults, retainedId, retryResult};
+          } finally {
+            window.safeFetch = originalSafeFetch;
+          }
+        }""",
+        photo_ids,
+    )
+    assert state == {
+        "createCalls": 1,
+        "addCalls": 2,
+        "disabledWhilePending": True,
+        "firstResults": [False, False],
+        "retainedId": 9876,
+        "retryResult": True,
+    }
+
+
 def test_photo_context_menu_updates_rating_and_adds_keyword(live_server, page):
     db = live_server["db"]
     photo_ids = live_server["data"]["photos"][:4]
@@ -867,6 +921,33 @@ def test_lightbox_browse_uses_state_preserving_navigation_helper(live_server, pa
     assert page.evaluate("window.__lightboxBrowsePhotoId") == photo_id
     expect(page.locator("#grmOverlay")).to_have_class(re.compile(r"\bopen\b"))
     assert page.evaluate("grmState.rejects.has(grmState.selected)") is True
+
+
+def test_similar_photos_overlay_suppresses_group_shortcuts(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    page.evaluate("findSimilar(grmState.selected)")
+    expect(page.locator("#similarOverlay")).to_have_class(re.compile(r"\bactive\b"))
+
+    page.keyboard.press("p")
+    page.keyboard.press("x")
+    page.keyboard.press("Space")
+    page.keyboard.press("Delete")
+    page.keyboard.press("Backspace")
+    zones = page.evaluate(
+        "() => ({"
+        "picks: Array.from(grmState.picks),"
+        "rejects: Array.from(grmState.rejects),"
+        "removed: Array.from(grmState.removed),"
+        "touched: Array.from(grmState.touched || []),"
+        "})"
+    )
+    assert zones == {"picks": [], "rejects": [], "removed": [], "touched": []}
 
 
 def test_lightbox_flag_over_group_review_updates_pending_zones(live_server, page):

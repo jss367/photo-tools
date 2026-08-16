@@ -1900,7 +1900,8 @@ input[type="range"]::-moz-range-thumb {
            placeholder="Or type a name to create a new collection"
            onkeydown="if(event.key==='Enter')confirmPipelineCollection()">
     <div class="modal-actions">
-      <button class="modal-btn modal-btn-primary" onclick="confirmPipelineCollection()">Add</button>
+      <button class="modal-btn modal-btn-primary" id="pipelineCollectionSubmitBtn"
+              onclick="confirmPipelineCollection()">Add</button>
       <button class="modal-btn modal-btn-cancel" onclick="hidePipelineCollectionModal()">Cancel</button>
     </div>
   </div>
@@ -7267,6 +7268,11 @@ document.addEventListener('keydown', function(e) {
   // would otherwise fall through here and silently mutate the hidden selection.
   var lb = document.getElementById('lightboxOverlay');
   if (lb && lb.classList.contains('active')) return;
+  // Find Similar can also stack above Group Review. Its overlay owns the
+  // keyboard until it closes; otherwise P/X/Space/Delete mutate the hidden
+  // burst selection underneath it.
+  var similar = document.getElementById('similarOverlay');
+  if (similar && similar.classList.contains('active')) return;
   // A context-menu action can open an organization dialog above Group
   // Review. That dialog owns Escape and all review shortcuts until it closes.
   if (document.querySelector('#pipelineKeywordModal.open, #pipelineCollectionModal.open')) return;
@@ -7305,6 +7311,8 @@ var pipelineReviewContextPhotoIds = [];
 var pipelineReviewModalPhotoIds = [];
 var pipelineReviewCollections = [];
 var pipelineReviewSelectedCollectionId = null;
+var pipelineReviewCollectionSubmitPromise = null;
+var pipelineReviewCreatedCollection = null;
 
 function pipelineReviewUniquePhotoIds(photoIds) {
   var seen = {};
@@ -7456,6 +7464,7 @@ async function addToCollection(photoIds) {
   if (!ids.length) return;
   pipelineReviewModalPhotoIds = ids;
   pipelineReviewSelectedCollectionId = null;
+  pipelineReviewCreatedCollection = null;
   var collections;
   try {
     collections = await safeFetch('/api/collections', {}, {toast: false});
@@ -7486,6 +7495,7 @@ async function addToCollection(photoIds) {
 
 function pickPipelineCollection(collectionId) {
   pipelineReviewSelectedCollectionId = collectionId;
+  pipelineReviewCreatedCollection = null;
   document.getElementById('pipelineCollectionNewName').value = '';
   document.querySelectorAll('.pipeline-collection-choice').forEach(function(el) {
     el.style.background = parseInt(el.dataset.id, 10) === collectionId ? 'var(--bg-tertiary)' : 'transparent';
@@ -7496,46 +7506,66 @@ function hidePipelineCollectionModal() {
   document.getElementById('pipelineCollectionModal').classList.remove('open');
   pipelineReviewModalPhotoIds = [];
   pipelineReviewSelectedCollectionId = null;
+  pipelineReviewCreatedCollection = null;
   window._vireoNativeMenuPhotoIdsOverride = null;
 }
 
-async function confirmPipelineCollection() {
+function setPipelineCollectionSubmitting(submitting) {
+  var btn = document.getElementById('pipelineCollectionSubmitBtn');
+  if (btn) btn.disabled = submitting;
+}
+
+function confirmPipelineCollection() {
+  if (pipelineReviewCollectionSubmitPromise) return pipelineReviewCollectionSubmitPromise;
   var ids = pipelineReviewModalPhotoIds.slice();
   var newName = document.getElementById('pipelineCollectionNewName').value.trim();
   var collectionId = pipelineReviewSelectedCollectionId;
   var collectionName = '';
-  if (!ids.length || (!newName && collectionId == null)) return;
+  if (!ids.length || (!newName && collectionId == null)) return Promise.resolve(false);
 
-  if (newName) {
+  setPipelineCollectionSubmitting(true);
+  pipelineReviewCollectionSubmitPromise = (async function() {
+    if (newName) {
+      if (pipelineReviewCreatedCollection && pipelineReviewCreatedCollection.name === newName) {
+        collectionId = pipelineReviewCreatedCollection.id;
+      } else {
+        try {
+          var created = await safeFetch('/api/collections', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              name: newName,
+              rules: [{field: 'photo_ids', value: []}],
+            }),
+          });
+          collectionId = created.id;
+          pipelineReviewCreatedCollection = {id: collectionId, name: newName};
+        } catch(e) { return false; }
+      }
+      collectionName = newName;
+    } else {
+      var match = pipelineReviewCollections.find(function(collection) {
+        return collection.id === collectionId;
+      });
+      collectionName = match ? match.name : 'collection';
+    }
+
     try {
-      var created = await safeFetch('/api/collections', {
+      await safeFetch('/api/collections/' + collectionId + '/add-photos', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          name: newName,
-          rules: [{field: 'photo_ids', value: []}],
-        }),
+        body: JSON.stringify({photo_ids: ids}),
       });
-      collectionId = created.id;
-      collectionName = newName;
-    } catch(e) { return; }
-  } else {
-    var match = pipelineReviewCollections.find(function(collection) {
-      return collection.id === collectionId;
-    });
-    collectionName = match ? match.name : 'collection';
-  }
-
-  try {
-    await safeFetch('/api/collections/' + collectionId + '/add-photos', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({photo_ids: ids}),
-    });
-  } catch(e) { return; }
-  hidePipelineCollectionModal();
-  showToast('Added ' + ids.length + ' photo' + (ids.length === 1 ? '' : 's') +
-    ' to "' + collectionName + '"', 'success');
+    } catch(e) { return false; }
+    hidePipelineCollectionModal();
+    showToast('Added ' + ids.length + ' photo' + (ids.length === 1 ? '' : 's') +
+      ' to "' + collectionName + '"', 'success');
+    return true;
+  })().finally(function() {
+    pipelineReviewCollectionSubmitPromise = null;
+    setPipelineCollectionSubmitting(false);
+  });
+  return pipelineReviewCollectionSubmitPromise;
 }
 
 function batchAddKeyword(photoIds) {

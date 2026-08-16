@@ -217,6 +217,8 @@ def test_merge_gate_requires_live_head_and_resolved_current_threads():
     assert 'if [[ "$newer_feedback" -gt 0 ]]' in action
     assert "PR_AGENT_TITLE_$(openssl rand -hex 16)" in action
     assert 'while grep -Fqx "$title_delimiter"' in action
+    assert "printf '%s\\n' \"${title}\"" in action
+    assert 'echo "${title}"' not in action
     assert "title<<PR_AGENT_TITLE" not in action
 
 

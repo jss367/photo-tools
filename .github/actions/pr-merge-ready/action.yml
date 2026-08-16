@@ -73,7 +73,7 @@ runs:
         {
           echo "head_sha=${head_sha}"
           echo "title<<${title_delimiter}"
-          echo "${title}"
+          printf '%s\n' "${title}"
           echo "${title_delimiter}"
         } >> "$GITHUB_OUTPUT"
 

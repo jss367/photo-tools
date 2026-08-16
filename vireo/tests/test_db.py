@@ -14068,7 +14068,7 @@ def test_retire_builtin_wildlife_handles_photo_counts_over_bind_limit(tmp_path):
     (999 on legacy builds) and prevents the DB from opening. This asserts the
     call succeeds when the retired-photo set spans more than one chunk.
     """
-    from db import Database, _SQLITE_PARAM_CHUNK_SIZE
+    from db import _SQLITE_PARAM_CHUNK_SIZE, Database
     db = Database(str(tmp_path / "test.db"))
     ws = db.create_workspace("ws")
     db.set_active_workspace(ws)

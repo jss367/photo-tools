@@ -156,3 +156,39 @@ def test_routine_contract_is_bounded_quiet_and_resolves_addressed_threads():
     assert "Do not blanket-resolve threads" in prompt
     assert "<!-- pr-agent-generated -->" in prompt
     assert "separate top-level success summary" in prompt
+
+
+def test_synchronize_disables_auto_merge_so_authorization_binds_to_head():
+    workflow = _read(WORKFLOW)
+
+    # `gh pr merge --auto --match-head-commit` checks the SHA at arm time,
+    # not at eventual merge time. A commit pushed after auto-merge is armed
+    # would otherwise merge without a fresh `/merge <new-sha>` or approval.
+    # Guard this by disabling auto-merge on every synchronize event so the
+    # next merge requires re-authorization against the new head.
+    assert "pull_request:\n    types: [synchronize]" in workflow
+    assert "disable-automerge-on-head-change:" in workflow
+    assert "github.event.action == 'synchronize'" in workflow
+    assert "gh pr merge \"$PR\" --repo \"$REPO\" --disable-auto" in workflow
+
+
+def test_human_claude_fix_overrides_routine_round_cap():
+    workflow = _read(WORKFLOW)
+    prompt = _read(ROUTINE_PROMPT)
+
+    # The activate job (fired by a human `/claude-fix`) intentionally leaves
+    # `max-review-fix-rounds` at zero so the workflow-level cap does not
+    # apply, but the routine also caps at two prior rounds and would
+    # otherwise silently no-op the documented human override. Pass a
+    # payload flag from activate and honor it in the routine prompt.
+    activate_idx = workflow.find("activate:")
+    fix_comment_idx = workflow.find("fix-comment-feedback:")
+    assert activate_idx != -1 and fix_comment_idx > activate_idx
+    activate_block = workflow[activate_idx:fix_comment_idx]
+    assert "Human override: true" in activate_block
+
+    # And no other firing path should mark itself as a human override.
+    assert workflow.count("Human override: true") == 1
+
+    assert "Human override: true" in prompt
+    assert "skip the round cap" in prompt

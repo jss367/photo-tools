@@ -25,6 +25,12 @@ fields. Supported tasks:
 | `fix-ci`               | `PR`, `Workflow run`, `Expected head`                    |
 | `resolve-conflicts`    | `PRs` (comma-separated list)            |
 
+Optional fields on `address-review`:
+
+- `Human override: true` — a human explicitly invoked `/claude-fix`; the
+  round cap below is skipped for this invocation so the documented override
+  actually performs repair even after prior automated rounds.
+
 If the payload does not match one of these shapes, stop. Do not guess and do
 not create a comment that could feed malformed routine output back into the
 workflow.
@@ -102,10 +108,13 @@ These three share one flow:
    gh label create claude-agent --color 5319e7 --description "PRs handled by the Claude PR agent" || true
    gh pr edit "$PR" --add-label claude-agent
    ```
-4. Count prior automated review-fix rounds on this PR from commits containing
-   `[pr-agent-review-fix:$PR]`. If two such rounds already exist, stop changing
-   code. Leave one human-escalation comment only if an equivalent marked
-   escalation comment does not already exist.
+4. If the payload includes `Human override: true`, skip the round cap in this
+   step: a human explicitly invoked `/claude-fix` and is asking for another
+   round, so proceed to editing. Otherwise, count prior automated review-fix
+   rounds on this PR from commits containing `[pr-agent-review-fix:$PR]`. If
+   two such rounds already exist, stop changing code. Leave one
+   human-escalation comment only if an equivalent marked escalation comment
+   does not already exist.
 5. Triage before editing. Automatically address P0/P1 findings and small,
    localized P2 findings. Escalate instead of editing when a finding requires
    an architectural choice, touches a new subsystem, contradicts an earlier

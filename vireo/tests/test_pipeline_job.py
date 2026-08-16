@@ -18611,3 +18611,77 @@ def test_known_mount_roots_round_trip_through_db_meta(tmp_path):
     # a run that saw no live mounts must not blank the record).
     _pj._record_known_mount_roots(db, {"/mnt/nas": False, "/mnt/photos": False})
     assert _pj._load_known_mount_roots(db) == {"/mnt/nas", "/mnt/photos"}
+
+
+def test_pipeline_classifier_factory_uses_non_parking_cancel_probe():
+    """Regression: the ``_construct_classifier`` factory inside
+    ``run_pipeline_job`` runs while ``ModelCache._Entry.load_lock`` is
+    held. ``Classifier._compute_embeddings_with_progress`` calls the
+    factory-supplied ``cancel_check`` between labels; if that closure
+    invokes the parking ``_should_abort`` (which parks on pause via
+    ``_pause_checkpoint``), a Pause arriving during label-embedding
+    setup would keep an unpaused peer requesting the same cache key
+    blocked until Resume. The factory must use
+    ``_should_abort_without_pause`` — same pattern the classify job
+    factory uses (test_classify_factory_cancel_check_uses_pure_cancel_probe
+    in test_classify_job.py) and the ``model_cache.py`` factory-context
+    fix in commit ``5aee48c``. Pause is still honored at the next outer
+    checkpoint after the factory returns and the load lock releases.
+    """
+    import ast
+    import inspect
+
+    import pipeline_job
+
+    source = inspect.getsource(pipeline_job.run_pipeline_job)
+    tree = ast.parse(source)
+
+    def _find_construct_classifier(node):
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.FunctionDef)
+                and child.name == "_construct_classifier"
+            ):
+                return child
+        return None
+
+    construct_fn = _find_construct_classifier(tree)
+    assert construct_fn is not None, (
+        "_construct_classifier factory not found inside "
+        "run_pipeline_job — test needs update if this refactored"
+    )
+
+    inner_cancel_check = None
+    for child in ast.walk(construct_fn):
+        if (
+            isinstance(child, ast.FunctionDef)
+            and child.name == "cancel_check"
+        ):
+            inner_cancel_check = child
+            break
+    assert inner_cancel_check is not None, (
+        "cancel_check closure not found inside _construct_classifier"
+    )
+
+    body_src = ast.unparse(inner_cancel_check)
+    assert "_should_abort_without_pause" in body_src, (
+        "_construct_classifier's inner cancel_check must call "
+        "_should_abort_without_pause (the non-parking probe), not "
+        "_should_abort. Codex thread review#4945197220 on "
+        "model_cache.py:237: the factory runs while entry.load_lock is "
+        "held and Classifier._compute_embeddings_with_progress invokes "
+        "cancel_check between labels; parking there strands every "
+        "unpaused peer waiting for the same cache key until Resume."
+    )
+    # And it must not fall back to the parking probe. Guard against a
+    # regression that adds an ``or _should_abort(...)`` branch.
+    calls = [
+        node for node in ast.walk(inner_cancel_check)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_should_abort"
+    ]
+    assert not calls, (
+        "_construct_classifier's inner cancel_check must not call the "
+        "parking _should_abort — use _should_abort_without_pause"
+    )

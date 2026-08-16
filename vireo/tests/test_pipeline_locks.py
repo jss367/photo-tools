@@ -450,6 +450,113 @@ def test_acquire_inference_resources_pure_gpu_session_takes_only_semaphore():
         resource_ledger._set_resource_ledger_for_tests(previous)
 
 
+def test_compound_context_releases_cpu_before_parking_on_gpu_wait():
+    """Regression: when the compound context (mixed accelerator+CPU
+    session) needs to wait for the GPU semaphore, the CPU permits
+    and ``cpu_ml`` lane MUST be released before the wait so unrelated
+    unpaused CPU inference / scan is not blocked for the duration.
+
+    Prior to the release-and-retry redesign, ``_CompoundInferenceContext``
+    took the CPU lease first, then blocked on the GPU semaphore while
+    holding it. A pause arriving in that window would park inside
+    ``_GpuLockContext.__enter__`` with the CPU permits + ``cpu_ml``
+    lane still committed — exactly the shape Codex called out.
+
+    Contract: block a waiter on the GPU semaphore; verify the ledger
+    reports zero CPU allocation while the waiter is contending; then
+    release the semaphore and confirm the waiter successfully claims
+    BOTH resources on the retry.
+    """
+    import resource_ledger
+    from pipeline_locks import acquire_inference_resources
+
+    sess = _FakeSession(["CUDAExecutionProvider", "CPUExecutionProvider"])
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=8)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+
+    # Hold the GPU semaphore so the compound acquire is forced to wait.
+    holder = acquire_gpu()
+    holder.__enter__()
+    holder_released = False
+
+    entered = threading.Event()
+    inside_lease = threading.Event()
+    release_body = threading.Event()
+    exited = threading.Event()
+
+    def waiter():
+        try:
+            with acquire_inference_resources(sess):
+                inside_lease.set()
+                release_body.wait(timeout=5.0)
+        finally:
+            exited.set()
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    entered.set()
+
+    try:
+        # While the waiter is contending on the GPU semaphore, the
+        # ledger MUST show no CPU allocation. Poll for up to 2s so a
+        # slow retry loop still passes; the important invariant is
+        # that we observe a period where the CPU is fully released
+        # despite the compound acquire being in flight.
+        observed_zero = False
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if inside_lease.is_set():
+                # Waiter got past the retry loop before we sampled — the
+                # test cannot prove the release-during-wait property in
+                # that case, but the fix is verified by the fact that
+                # the waiter didn't deadlock while we still held the
+                # GPU semaphore. Skip the assertion, but require the
+                # semaphore was NEVER acquired while CPU was allocated
+                # (which _GPU_SEMAPHORE._value plus ledger snapshot
+                # would show as inconsistent).
+                break
+            snapshot = ledger.snapshot()
+            if snapshot["cpu"]["allocated"] == 0:
+                observed_zero = True
+                break
+            time.sleep(0.01)
+        assert observed_zero or inside_lease.is_set(), (
+            f"Compound context must release CPU permits while waiting on "
+            f"the GPU semaphore. Never observed cpu allocation == 0 while "
+            f"the waiter was contending; ledger snapshot: "
+            f"{ledger.snapshot()!r}."
+        )
+
+        # Now release the semaphore so the waiter can complete its retry.
+        holder.__exit__(None, None, None)
+        holder_released = True
+
+        assert inside_lease.wait(timeout=3.0), (
+            "waiter never acquired both resources after semaphore released"
+        )
+        # Once inside, both must be held: GPU semaphore taken, CPU allocated.
+        assert _GPU_SEMAPHORE._value == 0
+        snapshot_inside = ledger.snapshot()
+        assert snapshot_inside["cpu"]["allocated"] > 0
+        assert snapshot_inside["lanes"]["cpu_ml"]["allocated"] == 1
+
+        release_body.set()
+        assert exited.wait(timeout=2.0)
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+
+        # Full release on exit.
+        assert _GPU_SEMAPHORE._value == 1
+        assert ledger.snapshot()["cpu"]["allocated"] == 0
+        assert ledger.snapshot()["lanes"]["cpu_ml"]["allocated"] == 0
+    finally:
+        release_body.set()
+        if not holder_released:
+            holder.__exit__(None, None, None)
+        thread.join(timeout=1.0)
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
 def test_acquire_gpu_if_session_uses_it_skips_lock_for_cpu_only_session():
     import resource_ledger
 

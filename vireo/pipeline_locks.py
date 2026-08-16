@@ -154,9 +154,29 @@ class _CompoundInferenceContext:
     process-wide CPU budget: the whole point of the ledger is to make
     that impossible.
 
-    Acquires in ledger-first, semaphore-last order so the "GPU
-    semaphore is innermost" invariant documented at the top of this
-    module is preserved. Releases in reverse.
+    Acquires in a release-and-retry loop rather than a static
+    ledger-first / semaphore-last order:
+
+    1. Take the CPU lease (may park on Pause; we hold no other
+       resource here so that is fine).
+    2. Try a non-blocking acquire of the GPU semaphore. If it
+       succeeds, both are held atomically.
+    3. If the GPU semaphore is contended: RELEASE the CPU lease,
+       wait for the semaphore with parking allowed, release it
+       immediately, then loop back to step 1.
+
+    Step 3 is what stops this compound context from re-introducing
+    the exact pause-park bug ``_GpuLockContext.__enter__`` was fixed
+    for: if we held the CPU permits + ``cpu_ml`` lane through a
+    parking GPU wait, an unpaused CPU inference or scan would be
+    blocked for the whole pause even though this participant is
+    doing no work. Releasing the CPU lease around any wait that can
+    park keeps unpaused peers unblocked.
+
+    Preserves the "GPU semaphore is innermost" invariant documented
+    at the top of this module: on success, the CPU lease is held
+    first, then the GPU semaphore is acquired without any additional
+    wait. ``__exit__`` releases in reverse (GPU first, then CPU).
     """
 
     def __init__(self, ledger, request, cancel_check):
@@ -164,34 +184,41 @@ class _CompoundInferenceContext:
         self._request = request
         self._cancel_check = cancel_check
         self._cpu_lease = None
-        self._gpu_ctx = None
+        self._gpu_held = False
 
     def __enter__(self):
-        cpu_lease = self._ledger.acquire(
-            self._request, cancel_check=self._cancel_check,
-        )
-        cpu_lease.__enter__()
-        self._cpu_lease = cpu_lease
-        try:
-            gpu_ctx = _GpuLockContext(self._cancel_check)
-            gpu_ctx.__enter__()
-            self._gpu_ctx = gpu_ctx
-        except BaseException:
-            # GPU acquire failed (cancel-race, etc.) — release the CPU
-            # lease we already committed to before propagating so the
-            # ledger doesn't leak permits.
-            self._cpu_lease.__exit__(None, None, None)
-            self._cpu_lease = None
-            raise
-        return self
+        while True:
+            cpu_lease = self._ledger.acquire(
+                self._request, cancel_check=self._cancel_check,
+            )
+            cpu_lease.__enter__()
+            # Non-blocking GPU acquire. On success both are held and
+            # we return without ever having parked while holding both.
+            if _GPU_SEMAPHORE.acquire(blocking=False):
+                self._cpu_lease = cpu_lease
+                self._gpu_held = True
+                return self
+            # GPU is contended. Release the CPU lease so any unpaused
+            # CPU inference / scan is not blocked while this
+            # participant waits (and possibly parks) for the GPU.
+            cpu_lease.__exit__(None, None, None)
+            # Wait for the GPU semaphore via ``_GpuLockContext`` so
+            # this wait feeds the same live/persisted per-job
+            # diagnostics and honours the pause-park release semantics
+            # already built into it. Release immediately; the next
+            # loop iteration atomically re-acquires CPU + GPU.
+            with _GpuLockContext(self._cancel_check):
+                pass
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            if self._gpu_ctx is not None:
-                self._gpu_ctx.__exit__(exc_type, exc, tb)
+            if self._gpu_held:
+                _GPU_SEMAPHORE.release()
+                self._gpu_held = False
         finally:
             if self._cpu_lease is not None:
                 self._cpu_lease.__exit__(exc_type, exc, tb)
+                self._cpu_lease = None
 
 
 def _build_cpu_request(session, label):

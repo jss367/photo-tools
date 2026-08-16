@@ -5629,12 +5629,11 @@ def test_import_pause_waits_for_tag_transaction_to_commit(
 
     original_tag_photo = Database.tag_photo
 
-    def pause_after_uncommitted_tag(
-        self, tagged_photo_id, keyword_id, source=None, _commit=True,
-    ):
-        original_tag_photo(
-            self, tagged_photo_id, keyword_id, source=source, _commit=_commit,
-        )
+    # Forward *args/**kwargs rather than restating tag_photo's signature: this
+    # stub is about pause timing, and a hardcoded `source=None` default here
+    # would quietly re-introduce the provenance hole in the tested path.
+    def pause_after_uncommitted_tag(self, *args, **kwargs):
+        original_tag_photo(self, *args, **kwargs)
         if not pause_requested.is_set():
             job_id = next(
                 job_id for job_id, job in runner._jobs.items()

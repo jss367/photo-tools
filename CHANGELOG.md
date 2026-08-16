@@ -56,7 +56,8 @@ All notable changes to Vireo are documented in this file.
   groups selected-photo metadata by meaning with dedicated bulk controls for
   including or excluding photos from wildlife processing. Keywords you add by
   hand now record that you added them, so a tag is never mistaken for a
-  generated one once its edit history ages out.
+  generated one once its edit history ages out — and that record follows the
+  keyword through duplicate merges, keyword renames, and RAW/JPEG pairing.
 - **Work Locally follows folders across workspaces.** Local copies are now
   managed per top-level folder. A folder shared by several workspaces uses one
   local copy in all of them, while workspace controls can stage or finish

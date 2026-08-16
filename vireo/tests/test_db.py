@@ -14167,7 +14167,7 @@ def test_retire_builtin_wildlife_scopes_pending_add_to_same_name_survivor(tmp_pa
     as provenance for the genre would preserve the generated association
     forever. Retire the genre while leaving the unsynced survivor untouched.
     """
-    from db import Database
+    from db import KEYWORD_SOURCE_UNKNOWN, Database
     from xmp import write_sidecar
 
     photo_dir = tmp_path / "photos"
@@ -14194,7 +14194,9 @@ def test_retire_builtin_wildlife_scopes_pending_add_to_same_name_survivor(tmp_pa
     ).lastrowid
     species_id = db.add_keyword("House Sparrow", is_species=True)
     db.tag_photo(p1, species_id)
-    db.tag_photo(p1, genre_id)
+    # The generated genre carries no authorship; the individual is the one the
+    # user actually added.
+    db.tag_photo(p1, genre_id, source=KEYWORD_SOURCE_UNKNOWN)
     db.tag_photo(p1, individual_id)
     db.queue_change(p1, "keyword_add", "Wildlife", _commit=False)
     db.record_edit(
@@ -14707,10 +14709,10 @@ def test_manual_keyword_add_stamps_durable_provenance(tmp_path):
 
     ``edit_history`` is the only other record that a person added a keyword,
     and ``_prune_edit_history`` trims it to ``max_edit_history`` rows, so
-    authorship read out of it can vanish while the tag survives. A re-tag
-    without a source must not downgrade an existing stamp.
+    authorship read out of it can vanish while the tag survives. A neutral
+    re-tag (a sidecar rescan) must not downgrade an existing stamp.
     """
-    from db import Database
+    from db import KEYWORD_SOURCE_MANUAL, KEYWORD_SOURCE_UNKNOWN, Database
 
     db = Database(str(tmp_path / "test.db"))
     ws = db.create_workspace("ws")
@@ -14723,25 +14725,37 @@ def test_manual_keyword_add_stamps_durable_provenance(tmp_path):
     )
     kid = db.add_keyword("House Sparrow", is_species=True)
 
-    db.tag_photo(p1, kid)
+    db.tag_photo(p1, kid, source=KEYWORD_SOURCE_UNKNOWN)
     assert db.conn.execute(
         "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
         (p1, kid),
     ).fetchone()["source"] is None
 
-    db.tag_photo(p1, kid, source="manual")
+    db.tag_photo(p1, kid, source=KEYWORD_SOURCE_MANUAL)
     assert db.conn.execute(
         "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
         (p1, kid),
     ).fetchone()["source"] == "manual"
 
-    db.tag_photo(p1, kid)
+    db.tag_photo(p1, kid, source=KEYWORD_SOURCE_UNKNOWN)
     assert db.conn.execute(
         "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
         (p1, kid),
     ).fetchone()["source"] == "manual", (
-        "A provenance-free re-tag must not erase recorded authorship."
+        "A provenance-neutral re-tag must not erase recorded authorship."
     )
+
+    # And the omitted-source path is the fail-safe one: a call site that never
+    # declares provenance produces a row retirement refuses to delete.
+    p2 = db.add_photo(
+        folder_id=fid, filename="p2.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.tag_photo(p2, kid)
+    assert db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p2, kid),
+    ).fetchone()["source"] == "manual"
 
 
 def test_retire_builtin_wildlife_latches_manual_provenance_against_pruning(tmp_path):
@@ -14850,7 +14864,7 @@ def test_retire_builtin_wildlife_deletes_only_generated_duplicate(tmp_path):
     association when the generated duplicate is retired, and the surviving
     flat term must not be queued for sidecar removal.
     """
-    from db import Database
+    from db import KEYWORD_SOURCE_UNKNOWN, Database
     from xmp import write_sidecar
 
     photo_dir = tmp_path / "photos"
@@ -14879,7 +14893,9 @@ def test_retire_builtin_wildlife_deletes_only_generated_duplicate(tmp_path):
     ).lastrowid
     species_id = db.add_keyword("House Sparrow", is_species=True)
     db.tag_photo(p1, species_id)
-    db.tag_photo(p1, generated_id)
+    # The generated genre arrives the way the old auto-rule left it: an
+    # association with no recorded authorship.
+    db.tag_photo(p1, generated_id, source=KEYWORD_SOURCE_UNKNOWN)
     db.tag_photo(p1, manual_id, source="manual")
     db.record_edit(
         "keyword_add",

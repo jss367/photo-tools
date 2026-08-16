@@ -4,6 +4,7 @@ import logging
 import os
 from collections import defaultdict
 
+from db import KEYWORD_SOURCE_UNKNOWN
 from keyword_normalization import keyword_match_key
 from xmp import (
     read_keywords,
@@ -361,7 +362,10 @@ def sync_from_xmp(db, photo_ids):
             if kw_key in db_keywords_by_key:
                 continue
             kid = db.add_keyword(kw_name)
-            db.tag_photo(photo_id, kid)
+            # Reconciling *from* a sidecar cannot tell a hand-typed Lightroom
+            # keyword from one Vireo wrote out, so this writer stays
+            # provenance-neutral instead of claiming manual authorship.
+            db.tag_photo(photo_id, kid, source=KEYWORD_SOURCE_UNKNOWN)
 
         for kw in db_keywords:
             kw_key = keyword_match_key(kw["name"])

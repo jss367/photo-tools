@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 import imagehash
-from db import commit_with_retry
+from db import KEYWORD_SOURCE_UNKNOWN, commit_with_retry
 from exif_orientation import orientation_swaps_axes as _orientation_swaps_axes
 from image_loader import (
     RAW_EXTENSIONS,
@@ -302,8 +302,11 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
         for part in parts:
             kid = db.add_keyword(part, parent_id=parent_id)
             parent_id = kid
-        # Tag with the leaf keyword
-        db.tag_photo(photo_id, parent_id)
+        # Tag with the leaf keyword. A sidecar term is genuinely ambiguous —
+        # the user may have typed it in Lightroom, or Vireo may have written
+        # it out itself — so this is one of the few writers that declines to
+        # claim manual authorship.
+        db.tag_photo(photo_id, parent_id, source=KEYWORD_SOURCE_UNKNOWN)
 
     # Also add any flat keywords not already covered by hierarchy. Compare
     # via the normalized match key on both sides: DB names are stored in
@@ -328,7 +331,8 @@ def _import_keywords_for_photo(db, photo_id, xmp_path_str):
         if key in existing_keys:
             continue
         kid = db.add_keyword(kw)
-        db.tag_photo(photo_id, kid)
+        # Same ambiguity as the hierarchical branch above.
+        db.tag_photo(photo_id, kid, source=KEYWORD_SOURCE_UNKNOWN)
         existing_keys.add(key)
 
 
@@ -541,13 +545,19 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
 
         # Transfer keywords from companion to primary
         companion_keywords = db.conn.execute(
-            "SELECT keyword_id FROM photo_keywords WHERE photo_id = ?",
+            "SELECT keyword_id, source FROM photo_keywords WHERE photo_id = ?",
             (companion["id"],),
         ).fetchall()
         for kw in companion_keywords:
+            # Move the association's provenance with it: pairing a RAW with
+            # its camera JPEG must not turn the user's hand-added keywords
+            # into "unknown" rows a retirement pass would treat as generated.
             db.conn.execute(
-                "INSERT OR IGNORE INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-                (primary["id"], kw["keyword_id"]),
+                "INSERT INTO photo_keywords (photo_id, keyword_id, source) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(photo_id, keyword_id) DO UPDATE SET "
+                "source = COALESCE(excluded.source, photo_keywords.source)",
+                (primary["id"], kw["keyword_id"], kw["source"]),
             )
 
         db.conn.execute(

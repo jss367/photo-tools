@@ -15790,7 +15790,8 @@ def test_sync_discard_records_exact_same_name_keyword(app_and_db):
     manual_id = db.conn.execute(
         "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'individual')"
     ).lastrowid
-    db.tag_photo(pid, generated_id)
+    # Only the individual is user-authored; the genre is the generated row.
+    db.tag_photo(pid, generated_id, source=None)
     db.tag_photo(pid, manual_id, source="manual")
     db.queue_change(pid, "keyword_add", "Wildlife")
     change_id = db.get_pending_changes()[0]["id"]

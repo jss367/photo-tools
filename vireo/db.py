@@ -19,6 +19,25 @@ _UNSET = object()  # sentinel for "not provided" vs explicit None
 
 AUTO_MATCH_REVIEW_MARKER = "__vireo_auto_match__"
 
+# Durable provenance values for ``photo_keywords.source``.
+#
+# ``KEYWORD_SOURCE_MANUAL`` means "a person explicitly asked for this
+# association"; nothing that prunes generated metadata may delete it.
+# ``KEYWORD_SOURCE_UNKNOWN`` (NULL) means "we genuinely cannot tell" — the
+# only writers allowed to use it are the sidecar readers (scanner, XMP
+# reconcile), where a term may equally have come from the user's Lightroom
+# catalog or from a keyword Vireo itself wrote out.
+#
+# ``tag_photo`` defaults to MANUAL on purpose. The failure mode of a
+# mis-stamped association is asymmetric: guessing "manual" for a generated
+# tag leaves a stale keyword the user can delete, while guessing "unknown"
+# for a hand-added tag lets retirement passes erase user metadata silently
+# and unrecoverably. So the default is the fail-safe value and every
+# provenance-neutral writer has to say so explicitly. See
+# ``test_keyword_provenance_contract.py``, which pins that inventory.
+KEYWORD_SOURCE_MANUAL = "manual"
+KEYWORD_SOURCE_UNKNOWN = None
+
 _SQLITE_PARAM_CHUNK_SIZE = 800
 _MISSING_PHOTOS_PROGRESS_INTERVAL = 200
 
@@ -6022,10 +6041,26 @@ class Database:
                     (merge.new_rating, winner_id),
                 )
             for kw_id in merge.keyword_ids_to_add:
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO photo_keywords (photo_id, keyword_id) "
-                    "VALUES (?, ?)",
-                    (winner_id, kw_id),
+                # Carry the losers' durable provenance onto the winner. A
+                # hand-added keyword must not decay to "unknown" just because
+                # a duplicate merge moved it to another photo row — that is
+                # exactly the state retirement passes read as "generated".
+                # MAX() ignores NULLs, so any manual loser wins.
+                merged_source = KEYWORD_SOURCE_UNKNOWN
+                for chunk in _chunks(loser_ids):
+                    loser_placeholders = ",".join("?" * len(chunk))
+                    row = self.conn.execute(
+                        f"""SELECT MAX(source) AS source
+                            FROM photo_keywords
+                            WHERE keyword_id = ?
+                              AND photo_id IN ({loser_placeholders})""",
+                        (kw_id, *chunk),
+                    ).fetchone()
+                    if row and row["source"] == KEYWORD_SOURCE_MANUAL:
+                        merged_source = KEYWORD_SOURCE_MANUAL
+                        break
+                self.tag_photo(
+                    winner_id, kw_id, source=merged_source, _commit=False,
                 )
             # TODO: pending-edit copy for duplicate merge — see plan Task 7.
             # Skipped because pending_changes is workspace-scoped and its
@@ -11467,10 +11502,12 @@ class Database:
                 "AND keyword_id IN (SELECT id FROM keywords WHERE type='location')",
                 (photo_id,),
             )
-            self.conn.execute(
-                "INSERT OR IGNORE INTO photo_keywords (photo_id, keyword_id) "
-                "VALUES (?, ?)",
-                (photo_id, leaf_keyword_id),
+            # Every caller of this method is a person assigning a place
+            # (map click, text entry, batch apply, EXIF-derived confirm), so
+            # the association is user-authored.
+            self.tag_photo(
+                photo_id, leaf_keyword_id,
+                source=KEYWORD_SOURCE_MANUAL, _commit=False,
             )
 
     def clear_photo_location(self, photo_id):
@@ -11631,10 +11668,17 @@ class Database:
                                     f"canonical row's subtree even after "
                                     f"disambiguation"
                                 ) from inner_err
-                    # Re-point photo_keywords from old → canonical.
+                    # Re-point photo_keywords from old → canonical, carrying
+                    # each association's durable provenance with it. On a
+                    # conflict the canonical row keeps whichever side is
+                    # 'manual' rather than silently dropping the stamp.
                     self.conn.execute(
-                        "INSERT OR IGNORE INTO photo_keywords (photo_id, keyword_id) "
-                        "SELECT photo_id, ? FROM photo_keywords WHERE keyword_id = ?",
+                        """INSERT INTO photo_keywords (photo_id, keyword_id, source)
+                           SELECT photo_id, ?, source
+                           FROM photo_keywords WHERE keyword_id = ?
+                           ON CONFLICT(photo_id, keyword_id) DO UPDATE SET
+                             source = COALESCE(excluded.source,
+                                               photo_keywords.source)""",
                         (canonical_id, keyword_id),
                     )
                     self.conn.execute(
@@ -14186,17 +14230,26 @@ class Database:
             (self._ws_id(),),
         ).fetchall()
 
-    def tag_photo(self, photo_id, keyword_id, source=None, _commit=True):
+    def tag_photo(
+        self, photo_id, keyword_id, source=KEYWORD_SOURCE_MANUAL, _commit=True,
+    ):
         """Associate a keyword with a photo.
 
         Args:
-            source: Durable provenance for the association. Pass ``'manual'``
-                    from paths where a person explicitly added the keyword;
-                    the stamp lives on the row, so authorship survives
-                    ``_prune_edit_history`` discarding the ``keyword_add``
-                    entry. Scanner and XMP-reconciliation paths leave it NULL
-                    ("unknown"). An existing stamp is never downgraded: a
-                    re-tag without a source keeps the recorded provenance.
+            source: Durable provenance for the association. The stamp lives on
+                    the row, so authorship survives ``_prune_edit_history``
+                    discarding the ``keyword_add`` entry.
+
+                    Defaults to ``KEYWORD_SOURCE_MANUAL`` because that is the
+                    fail-safe answer: a call site that forgets to declare
+                    provenance leaves an association that retirement passes
+                    refuse to delete, rather than one they silently erase.
+                    Only the sidecar readers (scanner, XMP reconcile) may pass
+                    ``KEYWORD_SOURCE_UNKNOWN``, and they must do it
+                    explicitly — the contract test enumerates them.
+
+                    An existing stamp is never downgraded: re-tagging with
+                    ``KEYWORD_SOURCE_UNKNOWN`` keeps a recorded ``'manual'``.
             _commit: If False, skip the internal commit (caller is responsible
                      for committing the transaction).
         """

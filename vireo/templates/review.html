@@ -1174,6 +1174,13 @@ async function loadPredictions() {
   }
 }
 
+// Undo/redo lives in the shared navbar. The database changes there, but this
+// page otherwise keeps rendering the status snapshot fetched on initial load.
+// Refetch after a history change so cards, tabs, and counts match the database.
+document.addEventListener('vireo:edit-history-changed', function() {
+  loadPredictions();
+});
+
 /* ---------- Render ---------- */
 function renderAll() {
   renderModelFilter();

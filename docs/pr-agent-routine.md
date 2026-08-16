@@ -182,10 +182,12 @@ PR number from
 SHA) so unrelated PRs sharing a default-branch commit do not cancel each
 other's CI-repair. Merge jobs (`merge-on-approval`, `merge-on-command`,
 `merge-after-tests`)
-get their own `pr-agent-merge-<PR>` group with
+get their own `pr-agent-merge-<PR>-<head>` group with
 `cancel-in-progress: false` so an in-flight `/merge` or approval-driven
 merge run is never cancelled by an ignored generated comment or a
-later approval event. `/merge <sha>` comments are also excluded from
+later approval event. Approval and merge-command authorization happens in
+live-head preflight jobs before this shared lane, so unauthorized or stale
+events cannot replace a valid pending merge retry. `/merge <sha>` comments are also excluded from
 `fix-comment-feedback` so the routine cannot push a new head — and
 invalidate the human's SHA-bound merge authorization — in parallel with
 the merge job. The `fix-comments` and `codex-review` jobs gate the

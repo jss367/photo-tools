@@ -56,8 +56,21 @@ def test_concurrency_is_scoped_per_task_and_never_workflow_wide():
 
     # Merge jobs get their own per-PR group so they don't race with —
     # or get cancelled by — the review-fix lane.
-    assert "group: pr-agent-merge-${{ github.event.pull_request.number }}" in workflow
-    assert "group: pr-agent-merge-${{ github.event.issue.number }}" in workflow
+    assert (
+        "group: pr-agent-merge-${{ github.event.pull_request.number }}-${{ github.event.review.commit_id }}"
+    ) in workflow
+    assert (
+        "group: pr-agent-merge-${{ github.event.issue.number }}-"
+        "${{ needs.authorize_merge_command.outputs.approved_head }}"
+    ) in workflow
+    assert (
+        "group: pr-agent-merge-${{ github.event.workflow_run.pull_requests[0].number "
+        "|| 'none' }}-${{ github.event.workflow_run.head_sha }}"
+    ) in workflow
+    assert "needs: authorize_approval" in workflow
+    assert "if: needs.authorize_approval.outputs.authorized == 'true'" in workflow
+    assert "needs: authorize_merge_command" in workflow
+    assert "if: needs.authorize_merge_command.outputs.authorized == 'true'" in workflow
 
     # fix-ci derives the PR number from `workflow_run.pull_requests[0]`
     # so unrelated PRs sharing a default-branch SHA don't cancel each
@@ -146,7 +159,9 @@ def test_only_humans_can_authorize_a_head_bound_merge():
     assert "merge-on-reaction:" not in workflow
     assert "startsWith(github.event.comment.body, '/merge ')" in workflow
     assert "approved-head: ${{ github.event.review.commit_id }}" in workflow
-    assert "approved-head: ${{ steps.command.outputs.approved_head }}" in workflow
+    assert "approved-head: ${{ needs.authorize_merge_command.outputs.approved_head }}" in workflow
+    assert 'live_head" != "$REVIEW_HEAD' in workflow
+    assert 'live_head" != "$approved_head"*' in workflow
 
 
 def test_merge_gate_requires_live_head_and_resolved_current_threads():
@@ -266,3 +281,11 @@ def test_conflicted_unlabelled_prs_are_bootstrapped_safely():
     assert "Task: reconcile-pr-auto" in workflow
     assert "expected-head: ${{ matrix.target.head }}" in workflow
     assert 'max-review-fix-rounds: "2"' in workflow
+    conflict_start = workflow.index("  reconcile-conflicts:")
+    approval_start = workflow.index("  authorize_approval:")
+    conflict_block = workflow[conflict_start:approval_start]
+    assert "id: routine" in conflict_block
+    assert "if: steps.routine.outputs.fired == 'true'" in conflict_block
+    assert conflict_block.index("uses: ./.github/actions/fire-routine") < conflict_block.index(
+        '--add-label "$AGENT_LABEL"'
+    )

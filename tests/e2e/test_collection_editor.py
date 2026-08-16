@@ -34,3 +34,39 @@ def test_enter_during_ime_composition_does_not_commit_rule(live_server, page):
     )
 
     expect(value_input).to_be_focused()
+
+
+def test_enter_commits_timestamp_between_date_input(live_server, page):
+    """Enter in a Date/between rule input blurs the field, leaving the editor open."""
+    page.goto(live_server["url"] + "/browse")
+    page.get_by_role("button", name="+ New Collection").click()
+
+    modal = page.locator("#collectionModal")
+    field_select = modal.locator("#ruleRows select").first
+    field_select.select_option("timestamp")
+
+    date_input = modal.locator("#ruleRows input[type='date']").first
+    expect(date_input).to_be_visible()
+    date_input.focus()
+    date_input.press("Enter")
+
+    expect(date_input).not_to_be_focused()
+    expect(modal).to_have_class("modal-overlay open")
+
+
+def test_enter_commits_timestamp_recent_days_input(live_server, page):
+    """Enter in a Date/recent_days rule input blurs the field, leaving the editor open."""
+    page.goto(live_server["url"] + "/browse")
+    page.get_by_role("button", name="+ New Collection").click()
+
+    modal = page.locator("#collectionModal")
+    modal.locator("#ruleRows select").first.select_option("timestamp")
+    modal.locator("#ruleRows select").nth(1).select_option("recent_days")
+
+    number_input = modal.locator("#ruleRows input[type='number']")
+    expect(number_input).to_be_visible()
+    number_input.fill("14")
+    number_input.press("Enter")
+
+    expect(number_input).not_to_be_focused()
+    expect(modal).to_have_class("modal-overlay open")

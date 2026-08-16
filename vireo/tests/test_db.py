@@ -14722,6 +14722,77 @@ def test_retire_builtin_wildlife_preserves_same_name_top_level_survivor(tmp_path
     )
 
 
+def test_retire_builtin_wildlife_retires_genre_when_synced_survivor_owns_sidecar(tmp_path):
+    """Retire the generated genre even when a synced same-name keyword owns the flat XMP.
+
+    A photo can carry both the generated ``type='genre'`` Wildlife
+    association and a manually authored top-level ``Wildlife`` of another
+    type (for example ``type='individual'``). If the manual keyword was
+    already synced, its flat ``Wildlife`` subject sits in the sidecar.
+    Without a survivor-aware branch, the sidecar-provenance short-circuit
+    would treat that flat term as evidence the *generated* association was
+    manual, skip the photo entirely, and stamp the global completion
+    marker — leaving the stale generated association permanently attached
+    because no later run inspects the photo again. The generated genre
+    must instead be detached from the DB, while the sidecar removal stays
+    suppressed so the survivor's tag is preserved.
+    """
+    from db import Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    xmp_path = photo_dir / "p1.xmp"
+    write_sidecar(
+        str(xmp_path),
+        flat_keywords={"Wildlife"},
+        hierarchical_keywords=set(),
+    )
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_path.stat().st_mtime,
+    )
+    wildlife_genre_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    wildlife_individual_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'individual')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.executemany(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        [(p1, wildlife_genre_id), (p1, wildlife_individual_id)],
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+
+    # Generated genre association gone; survivor untouched.
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_genre_id),
+    ).fetchone() is None
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_individual_id),
+    ).fetchone() is not None
+    # No sidecar removal queued — the flat 'Wildlife' subject still
+    # represents the surviving individual-type keyword.
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+    # Every candidate was actually inspected, so the marker is stamped.
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+
+
 def test_retire_builtin_wildlife_handles_photo_counts_over_bind_limit(tmp_path):
     """Retirement must chunk the DELETE so a large upgraded library still opens.
 

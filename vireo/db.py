@@ -3343,6 +3343,7 @@ class Database:
         deferred_unavailable_sidecar = False
         for row in rows:
             pid = row["photo_id"]
+            survivor = bool(row["has_same_name_survivor"])
             if pid not in sidecar_verdict_by_photo:
                 base = os.path.splitext(row["filename"])[0]
                 xmp_path = os.path.join(row["folder_path"], base + ".xmp")
@@ -3406,11 +3407,24 @@ class Database:
                             sidecar_verdict_by_photo[pid] = "defer"
                             deferred_unavailable_sidecar = True
             verdict = sidecar_verdict_by_photo[pid]
-            if verdict == "manual":
+            if verdict == "manual" and not survivor:
                 # The sidecar itself carries the flat term, so a person put it
                 # there. Latch that verdict: a later run may not be able to
                 # reach the file (offline volume), and a sidecar rewrite must
                 # not be able to erase the provenance either.
+                #
+                # ``survivor`` shortcuts this branch. When another top-level
+                # ``Wildlife`` keyword of a different type (for example
+                # ``type='individual'``) already lives on the photo, the flat
+                # ``Wildlife`` subject in the sidecar is attributable to that
+                # surviving keyword rather than to the generated ``genre``
+                # association. Latching ``source='manual'`` on the genre from
+                # that shared subject — or skipping the photo entirely — would
+                # preserve the generated association forever, and the global
+                # completion marker would then stamp so no later run could
+                # recover it. Fall through so the genre is detached from the
+                # DB below; ``entry["survivor"]`` still suppresses the flat
+                # XMP removal so the survivor's sidecar term stays intact.
                 sidecar_manual_pairs.append((pid, row["keyword_id"]))
                 continue
             if verdict == "defer":

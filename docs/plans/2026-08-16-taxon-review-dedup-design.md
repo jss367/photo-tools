@@ -200,46 +200,82 @@ instead of `group_id`, so per-model detail remains available for rendering.
   is what the card endpoint composes.
 
 **Card ID encoding.** `card_id` is treated as opaque bytes on the wire.
-For `name:`-keyed cards the folded label is embedded in the id, and folded
-labels come from arbitrary user-supplied label files that may contain `/`,
-`?`, `#`, `%`, or other URL-significant characters. A Flask
-`<card_id>` path converter does not match a decoded slash even when the
-client uses `encodeURIComponent`, so the merged-card modal for a label
-like `hawk/owl` would 404. Two-part rule to avoid that:
+For `name:`-keyed cards the folded label is embedded in the id, and
+folded labels come from arbitrary user-supplied label files that may
+contain `/`, `?`, `#`, `%`, or other URL-significant characters — and
+may also contain the delimiter characters (`|`, `:`) that appear inside
+taxon keys and node keys themselves. Two-part rule:
 
 1. The card endpoint takes the id as a **query parameter**
    (`/api/predictions/card?id=<card_id>`), not as a path segment, so any
-   byte survives the round trip once percent-encoded.
+   byte survives the round trip once percent-encoded. A Flask
+   `<card_id>` path converter does not match a decoded slash even when
+   the client uses `encodeURIComponent`, so a path-segment id for a
+   label like `hawk/owl` would 404; the query parameter avoids that.
 2. The server-emitted `card_id` string is base64url-encoded (RFC 4648
-   §5, unpadded — alphabet `[A-Za-z0-9_-]`) over the raw
-   `<taxon_key>|<smallest_member_key>` bytes. This makes ids safe to
-   embed anywhere (DOM attributes, path segments if some future route
-   wants them, log lines) without further escaping, keeps them opaque to
-   the client, and gives a stable string that the server can decode back
-   to `(taxon_key, member_key)` when looking up the component. Where the
-   client persists an id (e.g. in URL hash for deep links), it stores the
-   already-encoded form verbatim.
+   §5, unpadded — alphabet `[A-Za-z0-9_-]`) over a **structured**
+   payload, not a delimiter-joined string. Concretely, the payload is
+   the UTF-8 encoding of `json.dumps([taxon_key, smallest_member_key],
+   separators=(",", ":"), ensure_ascii=False)`. JSON string escaping
+   makes any byte inside either field unambiguous — including `|`, `:`,
+   `"`, `\`, `/`, and control chars — so the server can decode with
+   `json.loads` and recover exactly `(taxon_key, member_key)` regardless
+   of what the user's label file contains or what a classifier model
+   name looks like. Base64url over the JSON keeps the id safe to embed
+   anywhere (DOM attributes, path segments if some future route wants
+   them, log lines) without further escaping, and keeps it opaque to
+   the client. Where the client persists an id (e.g. in URL hash for
+   deep links), it stores the already-encoded form verbatim.
+   *Alternative implementation, same guarantee:* an opaque digest (e.g.
+   SHA-256 of the canonical JSON) with a server-side lookup table from
+   digest → `(taxon_key, member_key)`; equivalent correctness, one extra
+   table lookup per card open. Rejected as unnecessary — the structured
+   base64url form is round-trip decodable without state.
 
-**Filter semantics.** When the model filter (`currentModel !== 'all'`) or
-the labels-fingerprint filter (`currentLabelsFingerprint !== 'all'`) is
-active, cards are built from the matching rows only — merging becomes an
-intra-filter no-op and the page shows exactly what that model/fingerprint
-said. This keeps "filter by model" and "filter by label set" honest (a
-merged card has no single model or fingerprint) and costs nothing: the
-server already receives the filter context, or the client can group the
-filtered subset by `(taxon_key, group_id)`. Simplest implementation:
-server computes `card_id` per row from the *full* row set; the client,
-whenever **either** the model filter or the labels-fingerprint filter is
-active, falls back to `(taxon_key, group_id)` dedup over the filtered
-rows and never invokes the merged-card endpoint from that view. This
-matters for both correctness and privacy of the filter: if server-computed
-components stitched groups A and C together only through a group B whose
+**Filter semantics.** When the model filter or the labels-fingerprint
+filter is active, cards are built from the matching rows only — merging
+becomes an intra-filter no-op and the page shows exactly what that
+model/fingerprint said. This keeps "filter by model" and "filter by
+label set" honest (a merged card has no single model or fingerprint) and
+costs nothing: the server already receives the filter context, or the
+client can group the filtered subset by node identity.
+
+*Active-filter detection.* The existing Review client stores
+`currentModel` as a string (default `'all'`) and `currentLabelsFingerprint`
+as either a fingerprint string or `null` (default `null`, meaning "no
+filter"), and today it treats truthiness as "active" for the fingerprint
+side. The design uses those same sentinels: a filter is active when
+`currentModel && currentModel !== 'all'` or when
+`currentLabelsFingerprint` is truthy (i.e., non-null and non-empty). No
+sentinel change; the fallback branch runs only when the user has
+actually chosen a filter. (If the client is later refactored to use
+`'all'` as the labels-fingerprint no-filter sentinel, both checks
+collapse to `!== 'all'`; the design does not require that change.)
+
+*Fallback dedup key.* Server computes `card_id` per row from the *full*
+row set; the client, whenever a filter is active, ignores `card_id` and
+dedups over the filtered rows by the row's **node identity** — the same
+tuple the server uses when building the merge graph (§2, "Node
+identity"): `(classifier_model, labels_fingerprint, group_id)` for
+grouped rows, and `(classifier_model, labels_fingerprint,
+"p" + prediction_id)` for singletons. Using node identity — not
+`(taxon_key, group_id)` — is essential: (a) singleton rows all carry
+`group_id = NULL`, so `(taxon_key, group_id)` would collapse every
+ungrouped prediction of the same taxon on unrelated photos into one
+displayed row; (b) node identity is exactly the granularity the server's
+component graph is nodes-on, and the granularity the merged-card
+endpoint does *not* expose across filter boundaries, so the fallback is a strict
+subset of what the unfiltered view would show. The merged-card endpoint
+is never invoked from a filtered view.
+
+*Why the fallback matters for privacy.* If server-computed components
+stitched groups A and C together only through a group B whose
 fingerprint the user has just filtered out, opening the "A+C card" from
 the filtered view would otherwise re-expose B's hidden rows through the
-`/api/predictions/card/<card_id>` union. Falling back to per-group cards
-in filtered views eliminates that exposure entirely. When the user clears
-the filter, the full server components (and the merged card endpoint)
-apply again.
+`/api/predictions/card?id=<card_id>` union. Falling back to per-node
+cards in filtered views eliminates that exposure entirely. When the user
+clears the filter, the full server components (and the merged card
+endpoint) apply again.
 
 ### 3. Cross-model accept and reject
 
@@ -251,21 +287,37 @@ and, if grouped, its group siblings — restricted to `pr.classifier_model =
 ?`. The taxon-keyed accept operates on the **entire card component's photo
 union**, not just the clicked group's photos:
 
-1. **Resolve the card.** Given the clicked prediction, look up its
-   `card_id` (accept API accepts a `card_id`; where the client still sends a
-   `prediction_id`/`group_id`, the server maps it to the containing card
-   using the same graph as `/api/predictions`, so a stale or narrower client
-   can't downgrade the accept scope). The card exposes both `taxon_key` and
-   the **union photo set** across every group/singleton in its component.
-2. **Enumerate photos from the component.** The candidate photo set is the
-   union of every member group's/singleton's photos — not the clicked
-   group's photos. This is what fixes the transitive case: if the card is
-   {A: photos 1-2, B: photos 2-3, C: photos 3-4}, accept iterates photos
-   {1, 2, 3, 4}, not {1, 2}.
-3. **Sibling pass, taxon-matched, per photo.** For each photo in the union,
-   find pending predictions on that photo whose taxon key matches the card's
-   `taxon_key`, from **any** classifier model, restricted per model to its
-   latest `labels_fingerprint` (reuse the latest-fingerprint subquery from
+1. **Resolve the card, with the same filter scope the client rendered.**
+   The mutation POST carries the `card_id` **plus** whichever of `rules`,
+   `collection_id`, `model` (from `currentModel`), and `labels_fingerprint`
+   (from `currentLabelsFingerprint`) were in force on the GET that produced
+   the displayed card — the client already threads `rules`/`collection_id`
+   into `/api/predictions` (`review.html:1091-1111`); the mutation is
+   extended to carry the same tuple (`review.html:1576-1581` and the reject
+   path) verbatim. The server re-runs the same card-building graph over the
+   same scoped row set the GET used, then intersects the resolved
+   component with the returned rows so mutation membership can never exceed
+   the displayed membership. Where the client sends only a
+   `prediction_id`/`group_id` (older payloads, deep-link buttons), the
+   server treats the scope as "unfiltered" and resolves the full-workspace
+   card; a stale-but-scoped POST is therefore safe (narrower than what the
+   user sees), and a stale-and-unscoped POST is a legacy behavior that
+   simply matches today's semantics.
+2. **Enumerate photos from the resolved (filtered) component.** The
+   candidate photo set is the union of every member group's/singleton's
+   photos *within the resolved card* — not the clicked group's photos, and
+   not the unfiltered full-workspace component. This fixes the transitive
+   case: if the displayed card is {A: photos 1-2, B: photos 2-3, C:
+   photos 3-4}, accept iterates photos {1, 2, 3, 4}. It also enforces the
+   filter's promise: a hidden group D that a collection filter excluded
+   from the GET is excluded from the mutation too, even if its taxon and
+   photos would otherwise have joined the component.
+3. **Sibling pass, taxon-matched, per photo, within the resolved scope.**
+   For each photo in the union, find pending predictions on that photo
+   whose taxon key matches the card's `taxon_key`, from **any** classifier
+   model that was in scope for the GET (i.e., predictions the user's
+   filter would have surfaced), restricted per model to its latest
+   `labels_fingerprint` (reuse the latest-fingerprint subquery from
    `accept_subject_species`), and accept each via the existing
    `_accept_for_photo` primitive.
 
@@ -296,7 +348,10 @@ union**, not just the clicked group's photos:
 **Reject.** Mirror logic: rejecting a card rejects all member predictions
 (all models) across the same union photo set and card taxon. Today reject
 is per prediction/group; it gains the same sibling pass, scoped to the
-same component-wide photo union so transitive cards resolve completely.
+same component-wide photo union so transitive cards resolve completely,
+and it carries the same `rules`/`collection_id`/`model`/`labels_fingerprint`
+scope tuple as accept so that a rejection issued from a filtered view
+never touches rows the user could not see.
 
 **Compare.** `accept_subject_species` swaps its
 `lower(trim(species))` equality for the same taxon-key helper. Its
@@ -394,19 +449,34 @@ Each phase lands as its own PR and is independently useful.
    same raw `group_id` for disjoint photo sets) stays as two separate
    nodes and does not merge into one card; **cross-fingerprint hidden-row
    fixture** (groups A and C at fingerprint X, group B at fingerprint Y
-   bridging them by shared photos) — with the fingerprint filter set to
-   X, the client dedups A and C into per-group cards and the merged-card
-   endpoint is not called; with the filter cleared, A+B+C become one card
-   as expected; **URL-hostile card-id fixture** (a `name:`-keyed card
-   derived from a custom label containing `/`, `?`, and `#`) round-trips
-   through the base64url-encoded id and the card endpoint's query
-   parameter without a 404.
+   bridging them by shared photos, plus a singleton S with the same
+   taxon on an unrelated photo) — with the fingerprint filter set to X,
+   the client dedups the filtered rows by node identity and shows A, C,
+   and S as three separate cards (the singleton is not collapsed into
+   A/C), and the merged-card endpoint is not called; with the filter
+   cleared, A+B+C become one card and S stays separate (no photo
+   overlap) as expected; **singleton-collapse-bug fixture** (three
+   singleton predictions of the same taxon on three unrelated photos,
+   any filter active) — the fallback preserves all three as distinct
+   rows and does not collapse them into one; **URL-hostile card-id fixture** — a `name:`-keyed card
+   derived from a custom label whose folded form contains `/`, `?`, `#`,
+   `|`, and `:` (all of which appear inside the raw taxon/member key
+   syntax) round-trips through the JSON-structured base64url-encoded id
+   and the card endpoint's query parameter without a 404, and the server
+   decodes back to the exact `(taxon_key, member_key)` pair.
 4. **Cross-model accept/reject** + undo coverage. DB tests: accepting the
    merged card flips both models' rows; undo restores both; reject mirrors;
    Compare's `accept_subject_species` matches across name variants;
    **transitive-component accept fixture** — accepting the A-B-C card flips
    every pending row on photos 1-4 for the matching taxon and leaves other
-   taxa untouched; undo restores every flipped row (including C's).
+   taxa untouched; undo restores every flipped row (including C's);
+   **scoped-mutation fixture** — with a collection filter that excludes
+   group D (same taxon, overlapping photos), the accept POST carries the
+   collection scope and D's rows stay pending; without the filter, D
+   merges and is accepted; a stale POST that omits the scope tuple resolves
+   the full-workspace card (documented legacy behavior); a POST that carries
+   a scope narrower than the server's full component cannot exceed the
+   displayed membership.
 5. **Keyword canonicalization** (taxon-matched keyword reuse) + the
    "tags as …" transparency note.
 

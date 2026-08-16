@@ -1495,13 +1495,33 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
         # preservation pass in 4be1fa9b / ccd44bc4. ``JobRunner`` still
         # owns hard shutdown via its own deadline. The pause probe is
         # kept, so a user Pause still unwinds the scan pool cleanly.
+        #
+        # ``cancel_check`` is set to a parking callback rather than
+        # ``None`` so the job actually transitions to ``paused`` when a
+        # user pauses mid-scan. ``pause_check`` alone is non-blocking:
+        # scanner releases its pool and then polls ``pause_check``
+        # every 50 ms, leaving the job stuck in ``pausing``. The
+        # parking callback invokes ``wait_if_paused(publish_paused=True)``
+        # to park AND publish the paused status, then returns ``False``
+        # unconditionally — the parking side-effect matters, the
+        # ``cancelled`` return value must be ignored to keep the
+        # preservation contract intact.
         from resource_ledger import bind_resource_cancel_check
         scan_pause_check = None
+        scan_park_only_check = None
         if runner is not None and job is not None:
             job_id = job["id"]
 
             def scan_pause_check():
                 return runner.pause_requested(job_id)
+
+            def scan_park_only_check():
+                # Park via wait_if_paused so the job publishes ``paused``
+                # while the scanner is safely at its pause checkpoint.
+                # Discard the cancellation return value — the preservation
+                # contract requires this scan to run to completion.
+                runner.wait_if_paused(job_id, publish_paused=True)
+                return False
         with bind_resource_cancel_check(None):
             scan(
                 destination, db,
@@ -1510,6 +1530,7 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
                 vireo_dir=params.vireo_dir,
                 thumb_cache_dir=params.thumb_cache_dir,
                 skip_working_copies=True,
+                cancel_check=scan_park_only_check,
                 pause_check=scan_pause_check,
             )
     except Exception as e:  # scan failure fails the whole batch

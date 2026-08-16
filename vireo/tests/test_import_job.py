@@ -47,6 +47,105 @@ class FakeRunner:
         return job_id in self.cancelled_ids
 
 
+def test_catalog_scan_preservation_pause_publishes_paused_without_cancelling(
+    tmp_path,
+):
+    """Regression: the per-batch catalog scan (preservation contract:
+    runs to completion even after Stop so landed files reach a valid
+    catalog state) must supply a parking cancel_check to the scanner
+    so a user Pause transitions the job to ``paused`` — supplying
+    only the non-blocking ``pause_check`` leaves the scanner polling
+    every 50 ms and the job stuck in ``pausing``.
+
+    The parking callback invokes ``wait_if_paused(publish_paused=True)``
+    for its side-effect (park + publish paused) but discards the
+    cancellation return value — the preservation contract requires
+    this scan to run to completion even when Stop is already
+    requested.
+    """
+    from unittest.mock import MagicMock
+
+    from import_job import _ImportBatchState, _ImportRunState, _LandedFile
+    _catalog_scan_and_prescan = __import__(
+        "import_job",
+    )._catalog_scan_and_prescan
+
+    scan_calls = {"cancel_check": None, "pause_check": None, "n": 0}
+
+    def fake_scan(destination, db, **kwargs):
+        scan_calls["n"] += 1
+        scan_calls["cancel_check"] = kwargs.get("cancel_check")
+        scan_calls["pause_check"] = kwargs.get("pause_check")
+
+    class ParkingRunner(FakeRunner):
+        """wait_if_paused records the call AND returns True (cancel)."""
+
+        def __init__(self):
+            super().__init__()
+            self.wait_if_paused_calls = []
+
+        def wait_if_paused(self, job_id, *, publish_paused=False):
+            self.wait_if_paused_calls.append(
+                {"job_id": job_id, "publish_paused": publish_paused},
+            )
+            # Simulate the cancel-through-pause path — parking succeeded
+            # AND the job is cancelled. The preservation contract
+            # requires the parking callback to ignore this and let the
+            # scan complete.
+            return True
+
+    runner = ParkingRunner()
+    job = _make_job()
+    dest_folder = str(tmp_path / "dest")
+    os.makedirs(dest_folder, exist_ok=True)
+    (Path(dest_folder) / "landed.jpg").write_bytes(b"stub")
+
+    batch_st = _ImportBatchState(rel="rel", dest_folder=dest_folder)
+    batch_st.landed.append(_LandedFile(
+        source_path="",
+        dest_path=str(Path(dest_folder) / "landed.jpg"),
+        origin="copied",
+        verified_hash=None,
+        src_size=0,
+        src_mtime_ns=0,
+    ))
+    state = _ImportRunState("local")
+    params = MagicMock(vireo_dir=None, thumb_cache_dir=None)
+
+    _catalog_scan_and_prescan(
+        state, batch_st, MagicMock(), params, fake_scan,
+        str(tmp_path), "rel", attests_bytes=False,
+        runner=runner, job=job,
+    )
+
+    assert scan_calls["n"] == 1, "fake scan must run exactly once"
+    cancel_cb = scan_calls["cancel_check"]
+    assert cancel_cb is not None, (
+        "Preservation scan must supply a parking cancel_check — "
+        "``pause_check`` alone leaves the job stuck in ``pausing``."
+    )
+
+    # Invoke the parking callback the way scanner._check_cancelled
+    # would after releasing the pool. It must park via wait_if_paused
+    # WITH publish_paused=True, and return False (ignoring the
+    # cancellation return value from wait_if_paused).
+    result = cancel_cb()
+    assert result is False, (
+        "Parking callback must return False even when wait_if_paused "
+        "reports cancellation — the preservation contract requires the "
+        "scan to run to completion. Got %r." % (result,)
+    )
+    assert len(runner.wait_if_paused_calls) == 1, (
+        f"Parking callback must call wait_if_paused exactly once, got "
+        f"{runner.wait_if_paused_calls!r}"
+    )
+    assert runner.wait_if_paused_calls[0]["publish_paused"] is True, (
+        "wait_if_paused must be called with publish_paused=True so the "
+        "job transitions from 'pausing' to 'paused' while parked."
+    )
+    assert runner.wait_if_paused_calls[0]["job_id"] == job["id"]
+
+
 def _make_job(job_id="import-test-1"):
     return {
         "id": job_id,

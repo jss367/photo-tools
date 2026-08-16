@@ -439,24 +439,127 @@ Four corollaries, each binding on one site:
    accept/reject POST (§3, step 1). Neither may delegate to a route
    that cannot enforce the scope.
 4. **A card's status, badge and actions are an aggregate over all its
-   members**, never whichever row won the dedup sort — the first bullet
-   under "Client changes".
+   members**, never whichever row won the dedup sort — and **an action
+   the card offers applies to every one of those members**, whatever
+   each member's current status. These are two halves of one clause,
+   because "described by all of its members" constrains both what the
+   card may claim and what its buttons must do. A single status
+   truthfully describes all members only when the members **agree**, so
+   the aggregate is unanimity or `mixed`, and `mixed` is never terminal;
+   and a button labelled with the card's own name has to leave the card
+   in the state it named, so an action that reconciles only *some*
+   members is not a card action at all. Spelled out in the first bullet
+   under "Client changes" and in §3 step 3.
 
 Corollaries 1-3 are the row axis, corollary 4 is the status axis, and
 the card axis is §3's rule that a `node_id` mutation runs no sibling
 expansion. Where a passage below appears to disagree with the
 invariant, the invariant wins.
 
+Note what corollary 4's second half rules out. An earlier revision
+aggregated status correctly but left the accept path flipping only
+`pending` members, which is the status-axis version of the same
+sampling error: a card holding an accepted and a rejected member is
+described by neither word, and a card whose accept leaves a rejected
+member behind has told the user "accepted" about rows that are not.
+Both are closed below, and they have to be closed together — an
+explicit `mixed` state without reconciling actions is a card the user
+can see but cannot resolve, and reconciling actions without an explicit
+`mixed` state leave the pre-existing mixed rows (§2 "Reachability")
+with no defined rendering.
+
 **Client changes (`review.html`).**
 
 - `getVisibleItems` dedups by `card_id` (fallback to `group_id` then
   prediction id for old payload shapes during rollout).
 - **Card status and actions are aggregated across every member row**, not
-  read off whichever row won the dedup sort. Rule: the badge shows
-  *pending* — with accept/reject actions rendered — whenever *any* member
-  is pending; *accepted* (no action, undo hook only) only when every
-  member is accepted; *rejected* only when every member is rejected. The
-  aggregate is computed from the full pre-dedup row bucket for the
+  read off whichever row won the dedup sort, and the aggregate is
+  **unanimity or `mixed`** — there is no fourth thing a card can be. A
+  member row's own status is exactly one of `pending`, `accepted`,
+  `rejected` (`alternative` rows are attached to a parent row as
+  alternatives and are never card members — "Edge cases";
+  `review.html:1491`), so the member-status *set* is one of seven
+  non-empty subsets and the aggregate is a total function on them:
+
+  | member statuses | card status | badge | actions |
+  | --- | --- | --- | --- |
+  | `{pending}` | pending | "Pending" | Accept · Reject |
+  | `{accepted}` | accepted | "Accepted as X" (disabled, `review.html:1454`) | undo hook only |
+  | `{rejected}` | rejected | "Rejected" (disabled, `review.html:1456`) | none (reject is non-undoable — below) |
+  | `{pending, accepted}` | mixed | "Mixed — 1 pending · 1 accepted" | Accept all · Reject all |
+  | `{pending, rejected}` | mixed | "Mixed — 1 pending · 1 rejected" | Accept all · Reject all |
+  | `{accepted, rejected}` | mixed | "Mixed — 1 accepted · 1 rejected" | Accept all · Reject all |
+  | `{pending, accepted, rejected}` | mixed | "Mixed — n pending · n accepted · n rejected" | Accept all · Reject all |
+
+  The three unanimous rows are the states the design already had. The
+  four `mixed` rows are the ones an earlier revision left unspecified:
+  its rule ("pending if any member is pending, accepted only if all,
+  rejected only if all") is a *partial* function — it silently mapped
+  `{pending, accepted}` and `{pending, rejected}` onto the plain
+  "Pending" badge, and `{accepted, rejected}` onto nothing at all.
+
+  **Why `mixed` is its own state, and not "just call it pending".**
+  Mapping `{pending, accepted}` to a bare "Pending" badge gets the
+  *actions* right (the card is still actionable) and the *description*
+  wrong: the card is telling the user "nothing here has been decided"
+  while one of its members has already been auto-accepted and tagged the
+  photo. That is the same class of claim as a rollup reporting
+  "completed" when one of its items failed — a status that reads as
+  clean over members that are not. `CORE_PHILOSOPHY.md` ("Show the user
+  what's happening / No black boxes") governs, and the repo convention
+  for rollups is that a mixed outcome reports as the *worse* outcome
+  rather than glossed as success. Applied here: a card is **resolved
+  only if every member is resolved the same way**, and anything else is
+  reported as unresolved *and named as mixed*, with the per-status
+  member counts in the badge so the breakdown is legible without
+  opening the card. The model chips already show one chip per model
+  (next bullet); each chip carries its own member's status, so the user
+  can see *which* model said what before choosing.
+
+  **The actions are "Accept all" / "Reject all", and they reconcile.**
+  On a `mixed` card both actions are rendered and each one sets **every**
+  member to the chosen status — including members already terminal in
+  the other direction (§3 step 3). The labels say `all` because the
+  click is destructive to at least one prior decision, and the badge
+  above them states which decisions exist. This is the only exit from
+  `mixed`, and it must exist: `prediction_reject` is in `_NON_UNDOABLE`
+  (`db.py:18756`), so a rejection cannot be walked back through edit
+  history, and a `mixed` card without reconciling actions would be a
+  permanent dead end holding two contradictory model decisions — exactly
+  the "leave the two model decisions permanently contradictory" outcome
+  this rule exists to prevent.
+
+  **Reachability (why the state is real, and cannot be designed away by
+  changing the mutation alone).** `mixed` is reachable *before any card
+  is ever clicked*, so an explicit rendering is mandatory regardless of
+  what accept does: (a) the merge is new, but the rows are not — a
+  catalog can already hold an accepted BioCLIP row and a rejected iNat21
+  row on the same burst, decided separately when they were separate
+  cards, and the first `all`-tab load after this ships merges them;
+  (b) Compare's `accept_subject_species` and `prediction_reviewed` path
+  resolve individual rows outside Review entirely; (c) a `node_id`
+  mutation deliberately touches only its own node (§3 step 3), so
+  resolving two visible sibling nodes in opposite directions under a
+  filter and then clearing the filter produces a mixed merged card by
+  design; and (d) undo of an accept restores rows to `alternative` /
+  top-row-`pending` per `(detection, model, fingerprint)` scope
+  (`db.py:18925-18952`), which can leave a component's members
+  disagreeing. Making card actions total (§3 step 3) removes the one
+  path that the *card* itself created; it does not remove (a)-(d).
+
+  **Which tab a `mixed` card appears under.** The status tabs filter
+  *rows*, not cards (`review.html:1298-1300`), and a non-`all` tab is a
+  client-applied predicate, so it triggers the per-node fallback
+  (corollary 2): under the "pending" tab the user sees per-node cards
+  built from the pending rows only, and the aggregate is computed over
+  exactly those visible rows — honest, because the tab itself names the
+  status being shown. `mixed` is therefore an `all`-tab rendering, which
+  is precisely the view where the merge happens and where the
+  contradiction is visible. "Members", throughout this bullet, means the
+  rows the card was built from under the scope invariant — never rows
+  the user could not see.
+
+  The aggregate is computed from the full pre-dedup row bucket for the
   `card_id` (or `node_id` under a filter — §2 "Mutation ID from the
   fallback view"), not from the surviving representative. Deriving
   badge/actions from a representative row is the exact motivating bug:
@@ -465,19 +568,31 @@ invariant, the invariant wins.
   merged card's sort-winning row can be the accepted BioCLIP row and the
   card would render as Accepted with no visible action — silently
   collapsing the pending duplicate that the user needs to see and
-  resolve. The aggregate rule forces the card to surface the pending
-  action whenever any duplicate survives, and the accept path (§3) then
-  flips every pending member to accepted in one click. Symmetric for
-  reject. The rule also makes card status robust to sort-order changes
-  (confidence order vs. capture-time order vs. id order): the aggregate
-  is a set predicate over member statuses, so no ordering choice can
-  flip a mixed card between "actionable" and "already resolved". *Test
-  fixture (Phase 3):* a **mixed-status card fixture** — one card
-  containing an accepted BioCLIP row and a pending iNat21 row on the
-  same photo set renders as pending with accept/reject visible under
-  every representative-row sort order tried (species-string asc,
-  confidence desc, prediction-id asc); accepting resolves both members
-  (§3 sibling pass); the card then renders as accepted with no action.
+  resolve. The aggregate rule forces the card to surface the action
+  whenever any duplicate survives — as `mixed`, since the members
+  disagree — and the accept path (§3) then flips every member to
+  accepted in one click. Symmetric for reject. The rule also makes card
+  status robust to sort-order changes (confidence order vs.
+  capture-time order vs. id order): the aggregate is a set predicate
+  over member statuses, so no ordering choice can flip a card between
+  "actionable" and "already resolved". *Test fixtures (Phase 3):* a
+  **mixed-status card fixture** — one card containing an accepted
+  BioCLIP row and a pending iNat21 row on the same photo set renders as
+  `mixed` ("Mixed — 1 pending · 1 accepted") with Accept all / Reject
+  all visible, under every representative-row sort order tried
+  (species-string asc, confidence desc, prediction-id asc); accepting
+  resolves both members (§3 sibling pass); the card then renders as
+  accepted with no action. A **mixed-terminal card fixture** — an
+  accepted BioCLIP row and a **rejected** iNat21 row, no pending member,
+  constructed without clicking anything (the pre-existing-rows case):
+  the card renders as `mixed` ("Mixed — 1 accepted · 1 rejected") with
+  both actions enabled, is *not* rendered as accepted, rejected, or
+  pending, and is not reported anywhere as resolved; "Accept all" leaves
+  every member accepted and the card unanimous; the symmetric variant
+  asserts "Reject all". A **status-totality fixture** enumerates all
+  seven member-status sets against the table above and asserts every one
+  maps to a defined badge and action set — the guard that keeps the
+  aggregate a total function if the status vocabulary ever grows.
 - The card shows: union photo count; one chip per model with that model's
   consensus confidence and vote counts (e.g.
   `BioCLIP-2.5 92% · iNat21 88%`); the display name (§4).
@@ -881,21 +996,64 @@ union**, not just the clicked group's photos:
    promises for `node_id` resolution ("the server treats the card as
    exactly that single node … without any component expansion"):
    - **`card_id` request (unfiltered view).** For each photo in the
-     resolved component's union, find pending predictions on that photo
-     whose taxon key matches the card's `taxon_key`, from **any**
-     classifier model that was in scope for the GET (i.e., predictions
-     the user's filter would have surfaced), restricted per model to its
-     latest `labels_fingerprint` (reuse the latest-fingerprint subquery
-     from `accept_subject_species`), and accept each via the existing
+     resolved component's union, find predictions on that photo whose
+     taxon key matches the card's `taxon_key`, from **any** classifier
+     model that was in scope for the GET (i.e., predictions the user's
+     filter would have surfaced), restricted per model to its latest
+     `labels_fingerprint` (reuse the latest-fingerprint subquery from
+     `accept_subject_species`), and accept each via the existing
      `_accept_for_photo` primitive. This is what closes the
      BioCLIP-vs-iNat21 duplicate on the motivating case and carries
      acceptance across A→B→C in a transitive component.
+
+     **The scan is not restricted to `pending` rows** — that is
+     corollary 4's second half. An earlier revision filtered the sibling
+     scan to `status = 'pending'`, which meant accepting a card holding
+     a rejected member left that member rejected and produced a card
+     whose badge said "accepted" over a row that was not: the card
+     entered `mixed` as a *result of its own accept*. Dropping the
+     status predicate does not widen the mutation, because the status
+     predicate was never what bounded it — the bound is the resolved
+     component intersected with the scoped row set (step 1) and its
+     photo union (step 2). Every row the scan now additionally reaches
+     is already a member of the card the user clicked: for a `card_id`
+     request, any same-taxon row on a card photo is by construction an
+     edge into the component (§2, card axis), so "taxon-matched rows on
+     the card's photos" and "the card's members" are the same set. The
+     scan enumerates members; it never extends the card. The user is
+     told before clicking: a card with a member in the opposite terminal
+     state renders as `mixed` with the breakdown in the badge and its
+     buttons labelled "Accept all" / "Reject all" (§2, "Client
+     changes"), so the reconciliation is stated, not silent.
+
+     *Undo semantics after a reconciling accept.* Undo of
+     `prediction_accept` does not restore each row's *prior* status: it
+     flips every `accepted`/`rejected` row in the touched
+     `(detection, classifier_model, labels_fingerprint)` scope to
+     `alternative` and promotes the top-confidence row back to `pending`
+     (`db.py:18925-18952`). So undoing an accept that reconciled a
+     rejected member returns the card to unanimously **pending**, not to
+     its former mixed state. That is the right outcome and worth stating
+     rather than discovering: undo returns the card to "undecided",
+     which is a defined, unanimous, fully actionable state, whereas
+     resurrecting the contradiction would restore a state the user's
+     click existed to eliminate. The one thing it is not is a
+     bit-for-bit inverse, so the history description for a reconciling
+     accept names the count it overrode (e.g. "Accepted 3 predictions
+     (1 previously rejected)"). No change to the undo machinery is
+     needed. `prediction_reject` remains non-undoable
+     (`_NON_UNDOABLE`, `db.py:18756`) — unchanged by this design, and
+     the reason "Reject all" is offered on a `mixed` card at all: it is
+     the only way to revise an accept-vs-reject contradiction from
+     Review.
    - **`node_id` request (filtered view, per-node fallback).** The
      mutation touches **only the named node's own rows** — no cross-model
      sibling scan, no expansion onto other visible nodes, even for a
      photo the node shares with a visible sibling node that has the same
      taxon. Concretely: `_accept_for_photo` is called exactly on the
-     node's own `(photo_id, prediction_id)` set, and the cross-model
+     node's own `(photo_id, prediction_id)` set — **all** of it,
+     whatever each row's current status, so a single node whose own rows
+     disagree also reconciles in one click — and the cross-model
      taxon-matched sibling scan of the `card_id` branch is skipped. The
      visual contract of the per-node fallback is "each card is its own
      click" — the client rendered visible nodes A and B as separate
@@ -928,8 +1086,8 @@ union**, not just the clicked group's photos:
   untouched; two detections of the *same* species on one photo collapse into
   one photo-level keyword anyway.
 - Taxon keys are computed in Python via §1's helper (the candidate set —
-  pending predictions on the card's union photos — is bounded by the card
-  size), so no SQL-side taxonomy join is needed.
+  the card's member rows on its union photos, in any status — is bounded
+  by the card size), so no SQL-side taxonomy join is needed.
 - **No need to iterate to closure.** The card component is fully materialized
   before the accept fires (§2 already builds it via connected components
   over `(same taxon_key, overlapping photos)`). Iterating photo-by-photo
@@ -943,10 +1101,16 @@ union**, not just the clicked group's photos:
   edit-history/undo machinery. Sibling accepts go through the same
   primitive, so their flips are recorded and undoable for free. The
   `prediction_accept` history entry therefore restores *every* member row
-  across the component to pending on undo, not just the clicked group's.
+  across the component to pending on undo, not just the clicked group's —
+  including a member the accept reconciled out of `rejected`, which
+  returns to `pending` rather than to `rejected` ("Undo semantics after a
+  reconciling accept", step 3).
 
 **Reject.** Mirror logic: rejecting a card rejects all member predictions
-(all models) across the same union photo set and card taxon. Today reject
+(all models) across the same union photo set and card taxon — including
+members already `accepted`, symmetrically with accept's reconciliation
+above, so that "Reject all" on a `mixed` card leaves the card unanimous
+and the card's badge never outruns its rows. Today reject
 is per prediction/group; it gains the same sibling pass, scoped to the
 same component-wide photo union so transitive cards resolve completely,
 and it carries the same full scope tuple as accept
@@ -954,6 +1118,31 @@ and it carries the same full scope tuple as accept
 so that a rejection issued from a filtered view never touches rows the
 user could not see, including rows on photos outside the active
 visual clause's match set.
+
+*Rejecting a previously-accepted member has to retract that accept's
+tag.* Reject is a pure status flip today (`api_reject_prediction`,
+`app.py:15780-15827`) — it writes no keyword and removes none, which is
+correct while reject only ever applies to pending rows. Once "Reject
+all" can overrule an accepted member, a status-only flip would leave the
+card badged "Rejected" while the photo still carries the species keyword
+that accept wrote — a card saying one thing and the photo's metadata
+another, which is the same no-black-boxes violation as the badge hole
+this section closes. So a reject that flips an `accepted` member also
+untags that member's taxon keyword on that member's photos, reusing the
+path undo already uses for the same retraction: `untag_photo` +
+`remove_pending_changes(photo_id, 'keyword_add', name)`, guarded by the
+same `no_tag` test (`db.py:18849-18866`) so a keyword the photo carried
+independently of the accept is never stripped, and by
+`get_photos_with_equivalent_species` (`db.py:17195-17197`) so a keyword
+another live, non-rejected prediction still asserts is kept. Where a
+guard keeps the keyword, the card says so ("kept 'Blue Tit' — still
+predicted on 2 photos") rather than silently disagreeing with its own
+badge. The retraction is recorded as an ordinary **`keyword_remove`**
+history entry, separate from the non-undoable `prediction_reject` status
+entry, so the destructive half of a reconciling reject is undoable
+through the existing machinery even though the status flip is not.
+Rejecting a pending member is unchanged: nothing was tagged, nothing is
+retracted.
 
 **Compare.** `accept_subject_species` swaps its
 `lower(trim(species))` equality for the same taxon-key helper. Its
@@ -1076,7 +1265,16 @@ caeruleus*") on the Keywords page with a one-click merge.
 - **Taxonomy not loaded / offline:** every key degrades to `name:`;
   Review behaves exactly as it does today. Deterministic, no errors.
 - **Alternatives** (`status="alternative"` rows): not review cards; excluded
-  from card building and untouched by sibling resolution.
+  from card building and untouched by sibling resolution. They are
+  therefore never card *members* either, which is what keeps the card
+  status aggregate a total function over `{pending, accepted, rejected}`
+  (§2, "Client changes").
+- **Mixed member outcomes** (one member accepted, another rejected): a
+  real, pre-existing state — separately decided rows merge into one card
+  the first time the `all` tab builds it. The card renders as `mixed`
+  with the per-status member counts and both "Accept all" / "Reject all"
+  actions; it is never reported as resolved. §2 "Client changes" has the
+  full status table and §3 step 3 the reconciling mutation.
 - **Workspace scoping:** all card building and sibling resolution joins
   through `prediction_review` for the active workspace, as accept does now.
 - **`api_lookup` latency:** never on the request path. The Review GET
@@ -1390,22 +1588,43 @@ Each phase lands as its own PR and is independently useful.
    colliding bucket holding two species whose *first* node's rows are
    entirely hidden by `min_confidence` (and, in a second variant, by
    the status tab): the `node_id` the client minted for the surviving
-   node still resolves on the POST and mutates exactly that node; a
-   **mixed-status card fixture** — an accepted BioCLIP-2.5 row and a
+   node still resolves on the POST and mutates exactly that node —
+   guarding against the 400-on-a-valid-click that a positional
+   `subset_index` plus a filter-scoped partition rebuild would have
+   produced, and therefore the regression guard for keying node identity
+   on intrinsic row columns rather than on anything the query scope can
+   move (§2, "Node identity is a pure function of immutable row
+   columns"); a **mixed-status card fixture** — an accepted BioCLIP-2.5 row and a
    pending iNat21 row share one card (same taxon, overlapping photos);
    under every representative-row sort order tried (species-string asc,
    confidence desc, prediction-id asc) the aggregate rule renders the
-   card as *pending* with accept/reject visible; accepting resolves
+   card as *mixed* ("Mixed — 1 pending · 1 accepted") with Accept all /
+   Reject all visible; accepting resolves
    both members via the `card_id` sibling pass; the card then renders
    as *accepted* with only the undo hook (no accept/reject action),
    guarding §2 "Client changes" against the representative-row
-   regression that would silently collapse the pending duplicate.
-   This is the 400-on-a-valid-click that a positional `subset_index`
-   plus a filter-scoped partition rebuild would have produced, and the
-   fixture is the regression guard for keying node identity on
-   intrinsic row columns rather than on anything the query scope can
-   move (§2, "Node identity is a pure function of immutable row
-   columns").
+   regression that would silently collapse the pending duplicate; a
+   **mixed-terminal card fixture** — one accepted and one **rejected**
+   same-taxon member, no pending member, built directly in the DB so no
+   card click created it: the card renders `mixed` with both actions,
+   is absent from every "resolved" count, and "Accept all" leaves all
+   members accepted (symmetric variant for "Reject all"); a
+   **reconciling-accept fixture** — a card with one pending and one
+   rejected member, accepted via `card_id`: **both** end accepted, so
+   the mutation cannot itself produce a mixed card, which the
+   `pending`-only sibling scan of the earlier revision failed; a
+   **reconciling-accept undo fixture** — undoing that accept returns
+   every member to `pending` (not the previously-rejected member to
+   `rejected`), matching `db.py:18925-18952`, and the history
+   description names the overridden count; a **reconciling-reject
+   keyword fixture** — "Reject all" on a card with an accepted member
+   flips the status *and* untags that accept's species keyword via an
+   undoable `keyword_remove`, while a variant where the photo carries
+   the keyword independently (`no_tag` accept) or where another live
+   non-rejected prediction still asserts the taxon keeps the keyword and
+   surfaces the "kept" note instead of silently disagreeing with the
+   badge; a **status-totality fixture** — all seven non-empty
+   member-status sets map to a defined badge and action set.
 
 ## Test plan
 

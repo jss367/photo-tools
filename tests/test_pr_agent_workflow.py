@@ -44,6 +44,7 @@ def test_review_events_are_collapsed_and_generated_feedback_is_ignored():
     )
     assert "issue_comment:\n    types: [created, edited]" in workflow
     assert "pull_request_review:\n    types: [submitted, edited, dismissed]" in workflow
+    assert "(github.event.review.state != 'approved' || github.event.action == 'edited')" in workflow
 
 
 def test_concurrency_is_scoped_per_task_and_never_workflow_wide():
@@ -200,8 +201,11 @@ def test_merge_gate_requires_live_head_and_resolved_current_threads():
     assert '"$test_status" != "completed"' in action
     assert '"$test_conclusion" != "success"' in action
     assert "select(.updated_at >= $authorized_at)" in action
-    assert "select(.updatedAt >= $authorized_at)" in action
+    assert ".updatedAt >= $authorized_at" in action
     assert "reviews(first:100" in action
+    assert "nodes { submittedAt updatedAt state body authorAssociation author { login } }" in action
+    assert '.state == "APPROVED"' in action
+    assert ".updatedAt > .submittedAt" in action
     assert '.author.login == "chatgpt-codex-connector"' not in action
     assert '.state == "COMMENTED" or .state == "CHANGES_REQUESTED"' in action
     assert 'select((.body // "") | test("[^[:space:]]"))' in action

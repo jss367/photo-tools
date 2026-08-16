@@ -173,7 +173,7 @@ runs:
               repository(owner:\$owner, name:\$name) {
                 pullRequest(number:\$pr) {
                   reviews(first:100${after}) {
-                    nodes { updatedAt state body authorAssociation author { login } }
+                    nodes { submittedAt updatedAt state body authorAssociation author { login } }
                     pageInfo { hasNextPage endCursor }
                   }
                 }
@@ -182,8 +182,13 @@ runs:
 
           page_review_feedback=$(jq --arg authorized_at "$AUTHORIZED_AT" '
             [ .data.repository.pullRequest.reviews.nodes[]
-              | select(.updatedAt >= $authorized_at)
-              | select(.state == "COMMENTED" or .state == "CHANGES_REQUESTED")
+              | select(
+                  ((.state == "COMMENTED" or .state == "CHANGES_REQUESTED")
+                    and .updatedAt >= $authorized_at)
+                  or (.state == "APPROVED"
+                    and .updatedAt > .submittedAt
+                    and .updatedAt >= $authorized_at)
+                )
               | select(
                   .authorAssociation == "OWNER"
                   or .authorAssociation == "COLLABORATOR"

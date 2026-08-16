@@ -1568,13 +1568,11 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
         participant = getattr(pause_context, "participant", None)
         if participant is None:
             return _cancellation_requested()
-        if pause_gate._pause_requested():
-            # A resource waiter that parks for a user-requested pause is no
-            # longer contending. Keep the logical wait open for diagnostics,
-            # but stop its elapsed clock until the participant resumes.
-            with suspend_resource_wait_timing():
-                cancelled = pause_gate.checkpoint(participant)
-        else:
+        # checkpoint() performs its own pause test. Suspend around the whole
+        # call so a pause arriving between two separate probes cannot park a
+        # resource waiter while its contention clock is still running. When
+        # there is no pause, this excludes only the negligible probe itself.
+        with suspend_resource_wait_timing():
             cancelled = pause_gate.checkpoint(participant)
         if cancelled:
             abort.set()

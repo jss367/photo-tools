@@ -111,6 +111,38 @@ def _write_rtmpose_config(model_dir):
     }))
 
 
+def test_load_session_uses_cancellable_cache_coordination(tmp_path, monkeypatch):
+    import contextlib
+
+    import keypoints as kp
+
+    model_name = "rtmpose-animal"
+    model_dir = tmp_path / model_name
+    model_dir.mkdir()
+    (model_dir / "model.onnx").write_bytes(b"fake")
+    fake_session = MagicMock()
+    observed = []
+
+    @contextlib.contextmanager
+    def cache_guard(lock, *, label):
+        observed.append((lock, label))
+        with lock:
+            yield
+
+    monkeypatch.setattr(kp, "MODELS_DIR", str(tmp_path))
+    monkeypatch.setattr(kp, "_sessions", {})
+    monkeypatch.setattr(kp, "_locks", {})
+    monkeypatch.setattr(
+        kp.onnx_runtime, "acquire_session_cache_lock", cache_guard,
+    )
+    monkeypatch.setattr(
+        kp.onnx_runtime, "create_session", lambda *_args, **_kwargs: fake_session,
+    )
+
+    assert kp._load_session(model_name) is fake_session
+    assert observed == [(kp._locks[model_name], f"{model_name} keypoint session cache")]
+
+
 def test_detect_keypoints_returns_named_keypoints_in_image_space(tmp_path, monkeypatch):
     """Eye coord lands correctly after crop + resize + pad + reverse transform."""
     import keypoints as kp

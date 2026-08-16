@@ -91,7 +91,7 @@ def ensure_keypoint_weights(model_name, progress_callback=None):
     lock = _download_locks.setdefault(model_name, threading.Lock())
     with onnx_runtime.acquire_session_cache_lock(
         lock,
-        label=f"{model_name} keypoint session cache",
+        label=f"{model_name} keypoint download",
     ):
         if os.path.isfile(onnx_path) and os.path.isfile(config_path):
             return onnx_path
@@ -209,7 +209,10 @@ def _load_session(model_name):
     if model_name in _sessions:
         return _sessions[model_name]
     lock = _locks.setdefault(model_name, threading.Lock())
-    with lock:
+    with onnx_runtime.acquire_session_cache_lock(
+        lock,
+        label=f"{model_name} keypoint session cache",
+    ):
         if model_name in _sessions:
             return _sessions[model_name]
         onnx_path = os.path.join(_model_dir(model_name), "model.onnx")

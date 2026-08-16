@@ -933,7 +933,18 @@ async function loadCollectionFilter() {
   } catch(e) {}
 }
 
+// Bumped by every switchCollection() invocation; late-returning
+// /api/collections/<id>/photos responses whose epoch is no longer current
+// are dropped before they can mutate collectionPhotoIds. Without this,
+// two rapid switchCollection() calls (e.g. from back-to-back
+// vireo:edit-history-changed events) whose fetches complete out of order
+// can leave collectionPhotoIds holding the OLDER call's membership snapshot
+// — loadPredictions() then intersects the newest server response against
+// stale collection state and the Review grid stays wrong.
+var _switchCollectionEpoch = 0;
+
 async function switchCollection(val) {
+  var mySwitchEpoch = ++_switchCollectionEpoch;
   currentCollection = val;
   // Gate mutation entry points immediately: currentCollection has already
   // changed, but the /api/collections/<id>/photos fetch below may take a
@@ -951,8 +962,10 @@ async function switchCollection(val) {
     // narrows a stale ``allPredictions`` while the new fetch is in flight.
     try {
       var data = await safeFetch('/api/collections/' + val + '/photos?per_page=999999', {}, { toast: false });
+      if (mySwitchEpoch !== _switchCollectionEpoch) return;  // superseded — drop
       collectionPhotoIds = new Set(data.photos.map(function(p) { return p.id; }));
     } catch(e) {
+      if (mySwitchEpoch !== _switchCollectionEpoch) return;  // superseded — drop
       // The old catch fell back to allPredictions.slice(), which silently
       // widened the review scope to every prediction — the opposite of what
       // the user asked for. Keep the scope empty and surface the failure

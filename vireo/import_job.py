@@ -1532,6 +1532,16 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
                 skip_working_copies=True,
                 cancel_check=scan_park_only_check,
                 pause_check=scan_pause_check,
+                # Preservation contract: this scan runs to completion
+                # regardless of cancel. Passing an always-False pure
+                # cancel probe lets the scanner use ``_check_cancelled_no_park``
+                # inside ``_claim_worker_count`` — without it a Pause
+                # arriving in the race window between the pause probe
+                # and the parking ``scan_park_only_check`` would park
+                # ``wait_if_paused`` while the hashing pool and CPU
+                # permits are still held, blocking unrelated work
+                # until Resume.
+                cancel_only_check=lambda: False,
             )
     except Exception as e:  # scan failure fails the whole batch
         # Each entry was already booked into copied or

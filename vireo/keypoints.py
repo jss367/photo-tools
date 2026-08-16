@@ -221,8 +221,16 @@ def _load_session(model_name):
                 f"Keypoint model {model_name!r} not found at {onnx_path}. "
                 "Call ensure_keypoint_weights() first."
             )
+        # Pure cancel probe: ``create_session``'s ledger.acquire runs
+        # while ``lock`` is still held; the pause-aware probe would
+        # park ``wait_if_paused`` under the cache lock and block every
+        # unpaused peer waiting on the same keypoint model until
+        # Resume.
+        from resource_ledger import resolve_resource_pure_cancel_check
         _sessions[model_name] = onnx_runtime.create_session(
-            onnx_path, providers=["CPUExecutionProvider"],
+            onnx_path,
+            providers=["CPUExecutionProvider"],
+            cancel_check=resolve_resource_pure_cancel_check(),
         )
     return _sessions[model_name]
 

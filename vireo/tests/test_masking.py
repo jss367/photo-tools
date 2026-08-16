@@ -396,7 +396,9 @@ def test_sam2_sessions_reloads_for_different_variant(tmp_path):
     mock_new_dec = MagicMock()
     call_count = [0]
 
-    def mock_create_session(path):
+    def mock_create_session(path, **_kwargs):
+        # Accept **kwargs so masking's pure-cancel probe wiring
+        # (cancel_check=...) doesn't trip the mock's signature.
         result = mock_new_enc if call_count[0] == 0 else mock_new_dec
         call_count[0] += 1
         return result

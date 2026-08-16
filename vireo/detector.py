@@ -132,8 +132,17 @@ def _get_session():
                 )
 
             from onnx_runtime import create_session
+            from resource_ledger import resolve_resource_pure_cancel_check
 
-            _session = create_session(MEGADETECTOR_ONNX_PATH)
+            # Pure cancel probe: ``create_session``'s ledger.acquire
+            # runs while ``_lock`` is still held; the pause-aware probe
+            # would park ``wait_if_paused`` under the cache lock and
+            # block every unpaused peer waiting on MegaDetector until
+            # Resume.
+            _session = create_session(
+                MEGADETECTOR_ONNX_PATH,
+                cancel_check=resolve_resource_pure_cancel_check(),
+            )
             log.info("MegaDetector ONNX model loaded")
 
     return _session

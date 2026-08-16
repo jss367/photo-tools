@@ -223,8 +223,18 @@ def _get_sam2_sessions(variant="sam2-small"):
             )
 
         log.info("Loading SAM2 ONNX (%s)...", variant)
-        enc_sess = onnx_runtime.create_session(encoder_path)
-        dec_sess = onnx_runtime.create_session(decoder_path)
+        # Pure cancel probe: ``create_session``'s ledger.acquire runs
+        # while ``_sam2_session_lock`` is still held; the pause-aware
+        # probe would park ``wait_if_paused`` under the cache lock and
+        # block every unpaused peer waiting on SAM2 until Resume.
+        from resource_ledger import resolve_resource_pure_cancel_check
+        pure_probe = resolve_resource_pure_cancel_check()
+        enc_sess = onnx_runtime.create_session(
+            encoder_path, cancel_check=pure_probe,
+        )
+        dec_sess = onnx_runtime.create_session(
+            decoder_path, cancel_check=pure_probe,
+        )
 
         _encoder_session = enc_sess
         _decoder_session = dec_sess

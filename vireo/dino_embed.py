@@ -297,7 +297,19 @@ def _get_dinov2_session(variant="vit-b14"):
             )
 
         log.info("Loading DINOv2 ONNX (%s)...", variant)
-        sess = onnx_runtime.create_session(model_path)
+        # Pass the PURE cancel probe (never parks on pause) so
+        # ``ledger.acquire`` inside ``create_session`` cannot park
+        # ``wait_if_paused`` while ``_dinov2_session_lock`` is still
+        # held — an unpaused peer requesting the same model would
+        # otherwise block until Resume. Falls back to the pause-aware
+        # probe when no pure probe is bound (see
+        # ``resolve_resource_pure_cancel_check``), matching the
+        # pre-fix behavior for callers that haven't wired the pure
+        # probe yet.
+        from resource_ledger import resolve_resource_pure_cancel_check
+        sess = onnx_runtime.create_session(
+            model_path, cancel_check=resolve_resource_pure_cancel_check(),
+        )
 
         _session = sess
         _variant_loaded = variant

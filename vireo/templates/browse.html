@@ -9527,9 +9527,29 @@ async function _loadDeepLinkPrefix(photoId, focusIndex, shouldContinue) {
   batches.forEach(function(batch) {
     loadedPhotos = loadedPhotos.concat(batch || []);
   });
-  photos = loadedPhotos;
+  // Parallel offset-paged batches can duplicate a boundary row when
+  // ingestion inserts a photo earlier in the sort order between two
+  // batches: the duplicate double-renders in the grid and pushes the
+  // target beyond the fetched prefix. Because ``totalPhotos`` still
+  // reflects the pre-init snapshot, the raw ``length >= totalPhotos``
+  // check would then set ``allLoaded`` and short-circuit the serial
+  // fallback below, so the deep link would silently fail to render or
+  // highlight the target. Dedupe by id and treat any duplicate as
+  // evidence the snapshot is stale — leave ``allLoaded`` false so
+  // ``loadUntilPhotoRendered`` can extend past the affected range
+  // (Codex review r3792671672).
+  var seenIds = new Set();
+  var dedupedPhotos = [];
+  var duplicatesFound = false;
+  loadedPhotos.forEach(function(p) {
+    if (!p || p.id == null) return;
+    if (seenIds.has(p.id)) { duplicatesFound = true; return; }
+    seenIds.add(p.id);
+    dedupedPhotos.push(p);
+  });
+  photos = dedupedPhotos;
   currentPage = batchCount * pagesPerBatch + 1;
-  allLoaded = photos.length >= totalPhotos;
+  allLoaded = !duplicatesFound && photos.length >= totalPhotos;
   renderGrid();
   updateFilterSummary();
 

@@ -338,7 +338,10 @@ def test_quick_rating_filter_and_chip_semantics(live_server, page):
     _open_browse(page, live_server)
     assert _total(page) == 5
 
-    page.click(".vf-filters-btn")
+    # Quick filters are available immediately, without opening the rule
+    # builder popover.
+    assert page.locator(".vf-quick-inline").is_visible()
+    assert page.locator('.vf-quick-rating .vf-star[data-rating="4"]').is_visible()
     page.click('.vf-quick-rating .vf-star[data-rating="4"]')
     _wait_total(page, 1)
     chips = page.evaluate("document.querySelector('.vf-chips').textContent")
@@ -350,7 +353,7 @@ def test_quick_rating_filter_and_chip_semantics(live_server, page):
 
 def test_quick_flags_multi_select_combines(live_server, page):
     _open_browse(page, live_server)
-    page.click(".vf-filters-btn")
+    assert page.locator('.vf-quick-flags [data-flag="flagged"]').is_visible()
     page.click('.vf-quick-flags [data-flag="flagged"]')
     page.wait_for_timeout(300)
     page.click('.vf-quick-flags [data-flag="none"]')
@@ -363,14 +366,13 @@ def test_quick_flags_multi_select_combines(live_server, page):
 def test_quick_search_is_single_replaceable_clause(live_server, page):
     _open_browse(page, live_server)
     search = page.locator(".vf-search input")
-    search.fill("hawk")
-    search.press("Enter")
+    # Partial text filters live; no Enter or suggestion click is required.
+    search.fill("haw")
     _wait_total(page, 3)
-    search.fill("robin")
-    search.press("Enter")
+    search.fill("rob")
     _wait_total(page, 2)
     chips = page.evaluate("document.querySelector('.vf-chips').textContent")
-    assert "robin" in chips and "hawk" not in chips
+    assert "rob" in chips and "haw" not in chips
 
 
 def test_pause_resume_with_backslash(live_server, page):

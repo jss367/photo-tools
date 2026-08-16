@@ -4661,13 +4661,51 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         # mirror it exactly here to avoid pre-creating
                         # anchors the fallback would refuse to use.
                         try:
-                            _det_conf = thread_db.get_effective_config(
+                            _effective_cfg = thread_db.get_effective_config(
                                 cfg.load()
-                            ).get("detector_confidence", 0.2)
+                            )
+                            _det_conf = _effective_cfg.get(
+                                "detector_confidence", 0.2,
+                            )
                         except Exception:
+                            _effective_cfg = {}
                             _det_conf = 0.2
 
+                        _pipeline_cfg = _effective_cfg.get("pipeline", {})
+                        _weak_enabled = _pipeline_cfg.get(
+                            "weak_detection_rescue_enabled", True,
+                        )
+                        _weak_conf = _pipeline_cfg.get(
+                            "weak_detection_confidence", 0.12,
+                        )
+                        _contextual_weak_ids = set()
+                        if (
+                            _weak_enabled
+                            and _weak_conf < _det_conf
+                            and photos
+                        ):
+                            from weak_detections import (
+                                contextual_weak_photo_ids,
+                            )
+
+                            _raw_mdv6 = thread_db.get_detections_for_photos(
+                                [p["id"] for p in photos],
+                                min_conf=_weak_conf,
+                                detector_model="megadetector-v6",
+                            )
+                            _contextual_weak_ids = contextual_weak_photo_ids(
+                                photos,
+                                _raw_mdv6,
+                                detector_confidence=_det_conf,
+                                weak_confidence=_weak_conf,
+                                max_gap=_pipeline_cfg.get(
+                                    "burst_time_gap", 3.0,
+                                ),
+                            )
+
                         def _needs_full_image_anchor(pid):
+                            if pid in _contextual_weak_ids:
+                                return False
                             dets = this_run_detections.get(pid) or []
                             if not dets:
                                 return True
@@ -4991,30 +5029,25 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     and weak_detection_confidence < detector_confidence
                     and photos
                 ):
-                    from weak_detections import contextual_weak_runs
+                    from weak_detections import contextual_weak_photo_ids
 
                     raw_mdv6_detections = thread_db.get_detections_for_photos(
                         [p["id"] for p in photos],
                         min_conf=weak_detection_confidence,
                         detector_model="megadetector-v6",
                     )
-                    weak_runs = contextual_weak_runs(
+                    contextual_weak_ids = contextual_weak_photo_ids(
                         photos,
                         raw_mdv6_detections,
                         detector_confidence=detector_confidence,
                         weak_confidence=weak_detection_confidence,
                         max_gap=pipeline_cfg.get("burst_time_gap", 3.0),
                     )
-                    contextual_weak_ids = {
-                        photo_id
-                        for run in weak_runs
-                        for photo_id in run["photo_ids"]
-                    }
                     if contextual_weak_ids:
                         log.info(
-                            "Classification: rescuing %d weak-detection "
-                            "photo(s) across %d bracketed sequence(s)",
-                            len(contextual_weak_ids), len(weak_runs),
+                            "Classification: rescuing %d contextual "
+                            "weak-detection photo(s)",
+                            len(contextual_weak_ids),
                         )
 
                 total_predictions_stored = 0

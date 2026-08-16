@@ -6212,6 +6212,7 @@ class Database:
                       JOIN workspace_folders wf
                         ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
                      WHERE d.detector_model != 'full-image'
+                       AND d.category = 'animal'
                        AND d.detector_confidence >= ?{scope_sql}
                 )
                 SELECT COUNT(*) AS primary_dets,
@@ -6288,6 +6289,7 @@ class Database:
                       JOIN workspace_folders wf
                         ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
                      WHERE d.detector_model != 'full-image'
+                       AND d.category = 'animal'
                        AND d.detector_confidence >= ?{scope_sql}
                 )
                 SELECT COUNT(*) AS pending
@@ -6372,6 +6374,7 @@ class Database:
                       JOIN workspace_folders wf
                         ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
                      WHERE d.detector_model != 'full-image'
+                       AND d.category = 'animal'
                        AND d.detector_confidence >= ?{scope_sql}
                 )
                 SELECT COUNT(*) AS n

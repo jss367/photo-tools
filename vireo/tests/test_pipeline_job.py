@@ -3854,6 +3854,9 @@ def test_pipeline_classifies_bracketed_weak_detection_without_lowering_threshold
 
     assert ("bird1.jpg", 0.18) in captured
     assert [name for name, _ in captured].count("bird1.jpg") == 1
+    assert db.get_detections(
+        photo_ids[1], detector_model="full-image", min_conf=0,
+    ) == []
 
 
 def test_pipeline_reclassify_purges_stale_detection_rows(tmp_path, monkeypatch):

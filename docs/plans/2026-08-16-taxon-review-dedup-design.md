@@ -34,6 +34,12 @@ predictions by **taxon**, not by label string.
   classifier models produced it or which common-name variant each used.
 - Accepting or rejecting that card resolves **all** agreeing model rows — no
   hidden pending duplicates.
+- A card, its detail view and its actions never cover more than the user
+  could see, and the card's status never hides a member's — §2's *scope
+  invariant*. Where a filter forces this against the goal above (agreeing
+  rows the user cannot see, or agreeing rows shown as two separate
+  cards), this one wins and the merge is deferred to the unfiltered
+  view.
 - Both models' outputs stay visible on the merged card (model, confidence,
   votes) — per CORE_PHILOSOPHY, the merge must not hide what each model said.
 - Works retroactively on existing prediction rows with no destructive
@@ -140,7 +146,7 @@ Today the client dedups by `group_id`, which cannot see cross-model
 duplicates. Move card identity to the server, where the taxonomy is
 available, and where the accept path needs the same key anyway.
 
-`api_predictions` (app.py:15196) computes for each returned prediction:
+`api_predictions` (app.py:15278) computes for each returned prediction:
 
 - `taxon_key` — from §1, serialized as e.g. `"taxon:13094"` or
   `"name:blue tit"`.
@@ -398,6 +404,49 @@ handle the client echoes back when a filter is active), and
 all rows (it already receives every group member) and dedups by `card_id`
 instead of `group_id`, so per-model detail remains available for rendering.
 
+**Scope invariant — one rule, four sites.** Merging gives four
+different surfaces the chance to cover more than the user was looking
+at: the card the grid renders, the detail view that card opens, the
+mutation it fires, and — on the status axis — what the card *says*
+about its own members. They are one rule, stated once here and applied
+below rather than patched per site:
+
+> A card, the detail view it opens, and the mutation it fires are
+> defined over **exactly the row set the user could see when they
+> clicked** and over **exactly the one card they clicked**, and the
+> card is described by **all** of its members — never a superset of the
+> first two, never a sample of the last.
+
+Four corollaries, each binding on one site:
+
+1. **The server builds cards over the rows it returns.** The merge
+   graph is built over the rows `/api/predictions` actually returns —
+   after `collection_id` (which restricts the candidate `photo_ids`,
+   `app.py:15306-15311`), after `rules`, and after the visual clause
+   that `_apply_visual_to_rules` folds into `rules` before the query
+   runs (`app.py:15300-15302`) — never over the whole workspace. A row
+   those filters removed is absent from the graph input, so it cannot
+   bridge two components, and `card_id` is a truthful card identity
+   under the server-applied scope by construction. (Client-applied
+   predicates are a different matter — corollary 2.)
+2. **The client renders merged cards only while it displays exactly
+   that row set.** Any client-side step that drops a returned row sends
+   it to per-node cards and `node_id` handles — see "Filter semantics"
+   and "Active-filter detection" below.
+3. **Every server entry point that re-expands a handle takes the same
+   scope and rebuilds its own row set.** That is both
+   `GET /api/predictions/card` ("Card detail endpoint" below) and the
+   accept/reject POST (§3, step 1). Neither may delegate to a route
+   that cannot enforce the scope.
+4. **A card's status, badge and actions are an aggregate over all its
+   members**, never whichever row won the dedup sort — the first bullet
+   under "Client changes".
+
+Corollaries 1-3 are the row axis, corollary 4 is the status axis, and
+the card axis is §3's rule that a `node_id` mutation runs no sibling
+expansion. Where a passage below appears to disagree with the
+invariant, the invariant wins.
+
 **Client changes (`review.html`).**
 
 - `getVisibleItems` dedups by `card_id` (fallback to `group_id` then
@@ -432,11 +481,47 @@ instead of `group_id`, so per-model detail remains available for rendering.
 - The card shows: union photo count; one chip per model with that model's
   consensus confidence and vote counts (e.g.
   `BioCLIP-2.5 92% · iNat21 88%`); the display name (§4).
-- The group review modal opens with the union membership. New endpoint
-  `GET /api/predictions/card?id=<card_id>` returns the union of member
-  groups with per-photo, per-model rows — the existing
-  `/api/predictions/group/<group_id>` machinery stays for compatibility and
-  is what the card endpoint composes.
+- The group review modal opens with the union membership, through the
+  scoped card endpoint below.
+
+**Card detail endpoint.** New endpoint
+`GET /api/predictions/card?id=<card_id>&rules=…&collection_id=…&visual=…`
+returns the union of member groups with per-photo, per-model rows. It
+carries the **server-applied** scope, and it rebuilds the scoped row set
+itself rather than composing `/api/predictions/group/<group_id>`.
+
+Both halves are load-bearing, and neither is covered by the per-node
+fallback. That fallback triggers on the five *client-applied*
+predicates; `rules` and `collection_id` are not among them, because the
+server enforces them on the GET rather than the client hiding rows after
+the fact. So a Review view with an active collection or universal-filter
+rule — and no client-applied predicate — is a **merged-card view**: it
+dedups by `card_id` and opens this endpoint. An `id`-only URL gives the
+endpoint no way to know which scope produced the card, so it would
+rebuild the component over the whole workspace and hand back member
+groups, rows and photos the Review GET excluded — under an active
+collection, photos outside the collection entirely. That is the same
+"the card covers more than the user could see" failure the mutation
+scope tuple closes on the POST side (§3), left open on the GET side.
+
+Composing `/api/predictions/group/<group_id>` cannot fix it either:
+that route is `db.get_group_predictions(group_id)` and nothing else
+(`app.py:15830-15837`) — it resolves a group's full membership from the
+`group_id` alone, with no scope parameter to enforce and no rules
+evaluation, so any scope the card endpoint accepted would be discarded
+one layer down. The card endpoint therefore runs the
+same resolution `/api/predictions` runs — `collection_id` →
+`get_collection_photos` → `photo_ids`, `rules`, and
+`_apply_visual_to_rules` — over its own query, then returns the
+component containing the anchor within that row set. The group route
+stays for its existing non-merged callers; the card endpoint does not
+build on it.
+
+`visual` travels on this URL too even though a non-null visual clause
+also trips the client-side fallback (so the endpoint should not be
+reachable while one is active). That is deliberate belt-and-braces: the
+endpoint's contract is "rebuild exactly the scoped row set", and it
+should not depend on a client-side rule to stay honest.
 
 **Card ID encoding.** `card_id` is treated as opaque bytes on the wire.
 Node keys carry model and fingerprint strings *and* the folded
@@ -537,29 +622,54 @@ returns 400 as before. Cache resolution does not delete rows; it just
 changes what taxon they resolve to, so the `name:`→`taxon:` case
 never triggers this failure.
 
-**Filter semantics.** When **any** filter that removes rows is active —
-server-applied *or* client-applied, the full five-predicate list below,
-not just model and fingerprint — cards are built from the matching rows
-only, per node identity. Merging becomes an intra-filter no-op and the
-page shows exactly what the visible rows said. This keeps every filter
-honest (a merged card has no single model, no single fingerprint, no
-single confidence, and no single status) and costs nothing: the server
-already receives the server-side filter context, and the client groups
-the visible rows by the node identity the server stamped on each row.
+**Filter semantics.** No filter may ever widen a card, but the two
+kinds of filter achieve that differently, and conflating them is what
+leaves the card endpoint unscoped:
 
-The rule is deliberately "any row-hiding predicate", not "the filters
-that happen to be server-side". A `card_id` computed from the *full*
-row set is only a truthful card identity for a view that shows the
-full row set. The moment a predicate — a confidence slider, a status
-tab, a visual clause — removes a row that was a *bridge* between two
-components, the server's `card_id` describes a card the user is not
-looking at. See "Fallback dedup key" below for what the client uses
-instead.
+- **Server-applied** — `rules`, `collection_id`, and the `visual`
+  clause `_apply_visual_to_rules` folds into `rules`. These shrink the
+  *graph input* (corollary 1): the excluded rows never reach card
+  building, so `card_id` stays a truthful identity and merging still
+  happens correctly *within* the filtered row set. They do **not**
+  trigger the per-node fallback — a collection-scoped Review is still a
+  merged-card view. What they require instead is that every server
+  entry point which re-expands a handle receives them: the mutation
+  POST (§3, step 1) and the card detail GET ("Card detail endpoint"
+  above), or the re-expansion silently rebuilds a wider component than
+  the grid showed.
+- **Client-applied** — the five predicates listed below, which hide
+  rows *after* the server returned them. The server cannot fold these
+  into the graph input, so the client stops trusting `card_id` and
+  builds cards from the matching rows only, per node identity. Merging
+  becomes an intra-filter no-op and the page shows exactly what the
+  visible rows said.
 
-*Active-filter detection.* The fallback runs whenever *any* of the
-five predicates `getVisibleItems` and the filter bar apply would hide
-rows the server returned — not just the model and fingerprint filters.
-Concretely (matching `review.html:1091-1096, 1281-1300` verbatim):
+The client-side half keeps every filter honest (a merged card has no
+single model, no single fingerprint, no single confidence, and no
+single status) and costs nothing: the client groups the visible rows by
+the node identity the server stamped on each row. The moment such a
+predicate — a confidence slider, a status tab, a visual clause —
+removes a row that was a *bridge* between two components, the server's
+`card_id` describes a card the user is not looking at. See "Fallback
+dedup key" below for what the client uses instead.
+
+*Active-filter detection.* The trigger is **structural, not
+enumerated**: the client renders per-node cards whenever the row set it
+is about to render is not exactly the row set the server returned —
+in today's code, `predictions.length !== allPredictions.length` after
+the collection re-intersection at `review.html:1126-1131`, or
+`getVisibleItems` dropping any row before its dedup pass. Enumerating
+predicates has already failed twice here: once by listing only model
+and fingerprint, and once by omitting that collection re-intersection,
+which drops rows the server returned whenever the cached
+`collectionPhotoIds` set is narrower than the collection the server
+queried (a stale set after a collection edit). A structural test is
+closed under future predicates — a new filter added to
+`getVisibleItems` cannot silently escape it.
+
+The predicates that cause a divergence today are the five
+`getVisibleItems` and the filter bar apply, matching
+`review.html:1091-1096, 1281-1300` verbatim:
 
 - `minConfidence > 0` — hides rows whose `confidence` is below the
   slider value.
@@ -570,13 +680,14 @@ Concretely (matching `review.html:1091-1096, 1281-1300` verbatim):
 - `currentTab && currentTab !== 'all'` — hides rows whose `status`
   differs from the selected tab (`pending` / `accepted` / `rejected`).
 - `VireoFilter.getVisual()` non-null — a visual-search clause that the
-  server resolves via `_apply_visual_to_rules` (`db.py:8272`) into a
+  server resolves via `_apply_visual_to_rules` (`app.py:5703`) into a
   matched photo-id set; the client sends this payload as a **separate**
   `visual=<json>` parameter from `rules` on the GET
   (`review.html:1091-1096`), and rows on photos outside that matched
   set are hidden from the Review grid.
 
-Any single one being true triggers the per-node fallback for card
+Any single one being true — or any other client-side drop, per the
+structural test above — triggers the per-node fallback for card
 construction. This is stricter than "model or fingerprint only" for
 good reason: a below-`minConfidence` bridge row, an already-accepted
 `status != currentTab` sibling row, or a same-taxon row on a photo
@@ -590,7 +701,11 @@ card on the client, the *display* would still show a merged card whose
 members the mutation then refuses to touch, and the user would see a
 click that "does nothing" to visible siblings while silently mutating
 hidden ones. So the fallback trigger and the mutation scope tuple stay
-symmetric: same five predicates on both sides, always.
+symmetric on the client-applied predicates, always. The server-applied
+three (`rules`, `collection_id`, `visual`) are symmetric in the other
+direction: they never suppress merging, and they travel on *every*
+server call that re-expands a handle — the mutation POST and the card
+detail GET alike.
 
 No sentinel change is required — the existing `currentModel` default
 (`'all'`), `currentLabelsFingerprint` default (`null`), `minConfidence`
@@ -601,8 +716,10 @@ refactored to use `'all'` as the labels-fingerprint no-filter sentinel
 too, the fingerprint check collapses to `!== 'all'`; the design does
 not require that change.)
 
-*Fallback dedup key.* Server computes `card_id` per row from the *full*
-row set; the client, whenever a filter is active, ignores `card_id`
+*Fallback dedup key.* The server computes `card_id` per row over the row
+set it returns — the server-applied scope already folded in (corollary
+1) — and the client, whenever a client-applied predicate fires, ignores
+`card_id`
 entirely — both for deduping the displayed row set and for the
 subsequent mutation — and instead uses the row's **node identity** — the
 same tuple the server uses when building the merge graph (§2, "Node
@@ -627,7 +744,10 @@ displayed row; (b) node identity is exactly the granularity the server's
 component graph is nodes-on, and the granularity the merged-card
 endpoint does *not* expose across filter boundaries, so the fallback is a strict
 subset of what the unfiltered view would show. The merged-card endpoint
-is never invoked from a filtered view.
+is never invoked from a client-filtered view; when it *is* invoked — a
+view whose only active filters are server-applied — it carries `rules`,
+`collection_id` and `visual` so its union is rebuilt over exactly the
+rows the grid was built from (corollary 3, "Card detail endpoint").
 
 *Mutation ID from the fallback view.* Every row the server returns
 still carries the full-component `card_id`. In a filtered view that
@@ -714,7 +834,7 @@ union**, not just the clicked group's photos:
    parameter, distinct from `rules`; the mutation is extended to carry
    the full tuple (`review.html:1576-1581` and the reject path)
    verbatim, `visual` included, so the server can call the same
-   `_apply_visual_to_rules` (`db.py:8272`) resolver on the mutation path
+   `_apply_visual_to_rules` (`app.py:5703`) resolver on the mutation path
    and reproduce the exact matched-photo-id set the GET used. Note the
    three hidden failure modes this closes: (a) a below-`minConfidence`
    sibling row that bridges two groups would otherwise stitch the
@@ -1025,8 +1145,9 @@ Each phase lands as its own PR and is independently useful.
    are recorded with a retry timestamp, (c) `/api/predictions` never calls
    `api_lookup` directly.
 3. **Server-side cards**: `taxon_key`/`card_id`/`display_name` in
-   `/api/predictions`, card endpoint, `review.html` dedup + merged-card
-   rendering + filter semantics. API tests: the Blue Tit fixture (two
+   `/api/predictions`, the scope-carrying card endpoint, `review.html`
+   dedup + merged-card rendering + aggregate card status + filter
+   semantics — all four corollaries of §2's scope invariant land here. API tests: the Blue Tit fixture (two
    models, same taxon, 8-vs-7 overlap) yields one `card_id`; different taxa
    don't merge; model filter yields per-model cards; **transitive overlap
    fixture** (three groups A/B/C forming an A-B-C chain, same taxon) yields
@@ -1111,6 +1232,24 @@ Each phase lands as its own PR and is independently useful.
    value, A and F render as two separate cards, V is not rendered,
    and the merged-card endpoint is not called; with the visual
    clause cleared, A+V+F become one card;
+   **collection-scoped card-endpoint fixture** — a collection filter
+   excludes group D (same taxon, photos overlapping visible group A)
+   while **no** client-applied predicate is active, so the view stays a
+   merged-card view and the client opens the card endpoint: the Review
+   GET emits A alone, and
+   `GET /api/predictions/card?id=…&collection_id=…` returns A's
+   membership only, with D's rows and D's out-of-collection photos
+   absent. The same fixture against an endpoint that omits
+   `collection_id`/`rules`/`visual` — or that composes
+   `/api/predictions/group/<group_id>` — returns D and fails; that is
+   the regression guard for corollary 3. A `rules`-only variant
+   (universal-filter rule, no collection) asserts the same; a
+   **client-collection-divergence fixture** — a stale
+   `collectionPhotoIds` set drops a row the server returned
+   (`review.html:1126-1131`) with no enumerated predicate active: the
+   structural active-filter test fires on
+   `predictions.length !== allPredictions.length`, the client falls
+   back to per-node cards, and the card endpoint is not called;
    **singleton-collapse-bug fixture** (three singleton predictions of
    the same taxon on three unrelated photos, any filter active) — the
    fallback preserves all three as distinct rows and does not collapse

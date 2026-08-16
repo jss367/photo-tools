@@ -385,6 +385,55 @@ def test_folder_tree_synthesizes_row_for_top_level_missing_local_root(
     )
 
 
+def test_folder_tree_synthesized_row_shows_workspace_photo_count(
+    live_server, page
+):
+    """A phantom top-level row displays the root's real workspace photo count.
+
+    When a top-level local root goes missing, the synthesized tree row is
+    the only entry the user sees for that recovery session. Hard-coding its
+    ``photo_count`` to zero makes the folder read as empty even when the
+    recovery covers hundreds of photos, mis-cuing users toward discarding
+    it. ``workspace_status()`` already reports each root's accurate
+    ``workspace_photo_count`` — seed the phantom from it instead (Codex
+    review r3792132683).
+    """
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".tree-item[data-folder-id]").first.wait_for(state="visible")
+    existing_ids = page.evaluate(
+        "() => Array.from(document.querySelectorAll("
+        "'#folderTree .tree-item[data-folder-id]'))"
+        ".map(el => Number(el.dataset.folderId))"
+    )
+    phantom_id = (max(existing_ids) if existing_ids else 0) + 996_000
+
+    page.evaluate(
+        """([data]) => {
+          window.vireoLocalFolderData = data;
+          window.dispatchEvent(new CustomEvent(
+            'vireo:local-folder-status-changed', {detail: {data: data}}
+          ));
+        }""",
+        [{
+            "legacy_workspace_session": False,
+            "folders": [{
+                "requested_folder_id": phantom_id,
+                "root_folder_id": phantom_id,
+                "state": "recovery",
+                "recovery_kind": "stage",
+                "visible_ancestor_folder_id": None,
+                "folder_name": "photos-nas",
+                "workspace_photo_count": 137,
+            }],
+            "jobs": [],
+        }],
+    )
+
+    phantom_row = page.locator(f'.tree-item[data-folder-id="{phantom_id}"]')
+    expect(phantom_row).to_be_visible(timeout=5000)
+    expect(phantom_row.locator(".count")).to_have_text("137")
+
+
 def test_folder_tree_does_not_synthesize_remote_only_roots(live_server, page):
     """A purely remote missing root must not appear as a phantom tree row.
 

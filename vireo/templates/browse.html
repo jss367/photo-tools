@@ -3497,11 +3497,18 @@ function folderLocalStatuses(folders, byParent, options) {
           syntheticIds[requestedId] = true;
           var syntheticName = String(item.folder_name || '').trim() ||
             'Missing local folder';
+          // Seed the synthesized row with the root's real workspace photo
+          // count from workspace_status(). Hard-coding 0 made the only
+          // visible entry for a top-level missing local root read as an
+          // empty folder even when the recovery session covers hundreds of
+          // photos, which mis-cues users toward discarding it (Codex review
+          // r3792132683).
+          var syntheticCount = Number(item.workspace_photo_count || 0);
           var syntheticRow = {
             id: requestedId,
             parent_id: null,
             name: syntheticName,
-            photo_count: 0,
+            photo_count: syntheticCount,
             status: 'missing',
             __synthetic_missing_local: true
           };

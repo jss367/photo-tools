@@ -18,14 +18,56 @@ from resource_ledger import (
 
 
 def test_automatic_capacity_reserves_interactive_cores():
-    assert resource_ledger.automatic_cpu_capacity(physical_cores=16) == 12
-    assert resource_ledger.automatic_cpu_capacity(physical_cores=8) == 6
+    # ``usable_cores=None`` bypasses the process-affinity clamp so this
+    # exercises the reserve math on the raw host topology — otherwise a
+    # 2-vCPU CI runner would clamp the input to 2 and derive capacity 1,
+    # measuring the runner's constraint instead of the reserve formula.
+    assert resource_ledger.automatic_cpu_capacity(
+        physical_cores=16, usable_cores=None,
+    ) == 12
+    assert resource_ledger.automatic_cpu_capacity(
+        physical_cores=8, usable_cores=None,
+    ) == 6
 
 
 def test_automatic_capacity_survives_unavailable_core_counts(monkeypatch):
     monkeypatch.setattr(resource_ledger, "detect_physical_core_count", lambda: None)
     monkeypatch.setattr(resource_ledger.os, "cpu_count", lambda: None)
-    assert resource_ledger.automatic_cpu_capacity() == 1
+    assert resource_ledger.automatic_cpu_capacity(usable_cores=None) == 1
+
+
+def test_automatic_capacity_clamps_to_process_affinity():
+    """A process constrained via ``taskset`` / systemd / container cpuset
+    / cgroup CPU quota must derive its capacity from the CPUs it can
+    actually schedule on, not from the host's full topology. Otherwise
+    a 32-core host running Vireo under ``taskset -c 0,1`` would create
+    dozens of scanner workers and ONNX threads for a 2-CPU sandbox and
+    defeat both the process-wide budget and the interactive reserve.
+    """
+    # Simulate a 16-core host with the process pinned to 4 usable CPUs.
+    # Without the clamp this would return 12 (16-core reserve math);
+    # with the clamp it must derive from 4 → reserve 2 → capacity 2.
+    assert resource_ledger.automatic_cpu_capacity(
+        physical_cores=16, usable_cores=4,
+    ) == 2
+
+    # Larger usable_cores than physical_cores is a no-op: the smaller
+    # bound wins, so a container with a generous quota on a small host
+    # still respects the host topology.
+    assert resource_ledger.automatic_cpu_capacity(
+        physical_cores=8, usable_cores=32, logical_cores=8,
+    ) == 6
+
+
+def test_process_usable_cpu_count_returns_positive_int():
+    """The helper must return a positive integer or ``None`` — never a
+    zero, negative value, or arbitrary object. Callers gate on
+    truthiness before clamping, so a zero would be equivalent to
+    'unknown' anyway, but a nonsense value would silently corrupt the
+    derived capacity.
+    """
+    result = resource_ledger.process_usable_cpu_count()
+    assert result is None or (isinstance(result, int) and result >= 1)
 
 
 @pytest.mark.parametrize("value", [True, False, 1.5, "2", None])

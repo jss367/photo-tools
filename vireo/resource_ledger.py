@@ -165,13 +165,64 @@ def detect_physical_core_count():
     return None
 
 
-def automatic_cpu_capacity(physical_cores=None, logical_cores=None):
-    """Apply Vireo's interactive reserve and return a positive capacity."""
+def process_usable_cpu_count():
+    """Return the CPU count actually usable by this process, or ``None``.
+
+    ``/proc/cpuinfo`` describes the host's full topology regardless of any
+    per-process restriction, and plain ``os.cpu_count()`` is likewise
+    host-wide. Deployments that constrain the process — ``taskset``,
+    systemd ``CPUAffinity=``, a container cpuset, or a cgroup CPU quota —
+    would otherwise be handed a capacity based on cores the process
+    cannot actually schedule on, which oversubscribes the assigned CPUs
+    and defeats both the process-wide budget and the interactive
+    reserve.
+
+    Prefer ``os.process_cpu_count`` (Python 3.13+) because it honours
+    both scheduling affinity AND cgroup CPU quota on Linux. Fall back to
+    ``os.sched_getaffinity`` on older Linux (affinity only — a cgroup
+    quota below the affinity set would still oversubscribe, but this is
+    strictly better than not clamping at all). Returns ``None`` when no
+    process-scoped signal is available (Darwin/Windows on old Python),
+    in which case callers should fall back to the host counts.
+    """
+    process_cpu_count = getattr(os, "process_cpu_count", None)
+    if process_cpu_count is not None:
+        try:
+            return process_cpu_count()
+        except OSError:
+            pass
+    sched_getaffinity = getattr(os, "sched_getaffinity", None)
+    if sched_getaffinity is not None:
+        try:
+            return len(sched_getaffinity(0))
+        except OSError:
+            pass
+    return None
+
+
+_USABLE_CORES_UNSET = object()
+
+
+def automatic_cpu_capacity(
+    physical_cores=None, logical_cores=None, usable_cores=_USABLE_CORES_UNSET,
+):
+    """Apply Vireo's interactive reserve and return a positive capacity.
+
+    The detected physical/logical core counts describe the host
+    topology, not what this process is actually allowed to schedule on.
+    Clamp the effective core count by ``process_usable_cpu_count`` when
+    available so a ``taskset`` / systemd / container-cpuset / cgroup-
+    quota deployment doesn't derive a budget from cores it can't touch.
+    """
     if physical_cores is None:
         physical_cores = detect_physical_core_count()
     if logical_cores is None:
         logical_cores = os.cpu_count()
     cores = max(1, physical_cores or logical_cores or 1)
+    if usable_cores is _USABLE_CORES_UNSET:
+        usable_cores = process_usable_cpu_count()
+    if usable_cores:
+        cores = max(1, min(cores, usable_cores))
     reserve = max(2, math.ceil(cores * 0.20))
     return max(1, cores - reserve)
 

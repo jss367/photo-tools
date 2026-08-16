@@ -4424,7 +4424,7 @@ function renderRuleValueInput(r, i) {
   return '<input type="' + (numeric ? 'number' : 'text') + '" value="' +
     escapeAttr(String(r.value == null ? '' : r.value)) +
     '" onchange="updateRule(\'' + p + '\',\'value\',this.value)"' +
-    ' onkeydown="if(event.key===\'Enter\'){event.preventDefault();this.blur();}"' +
+    ' onkeydown="if(event.key===\'Enter\'&&!event.isComposing&&event.keyCode!==229){event.preventDefault();this.blur();}"' +
     ' placeholder="value" style="flex:1;">';
 }
 

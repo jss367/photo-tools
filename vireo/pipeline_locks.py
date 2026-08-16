@@ -75,20 +75,33 @@ class _GpuLockContext:
                         "Cancelled while waiting for GPU inference resources"
                     )
                 if _GPU_SEMAPHORE.acquire(timeout=0.2):
-                    # A release during the 0.2s acquire window can succeed
-                    # after the pre-acquire probe returned false but while
-                    # cancellation (or the interactive text-search
-                    # deadline) has now fired. Without this recheck the
-                    # caller would proceed into ``session.run`` holding
-                    # the semaphore despite the pending cancel. Release
-                    # and raise so the cancel wins the race.
-                    if cancel_check is not None and cancel_check():
-                        _GPU_SEMAPHORE.release()
+                    if cancel_check is None:
+                        return self
+                    # ``cancel_check`` may PARK — the pipeline bound
+                    # probe is ``pipeline_job._pause_checkpoint``, which
+                    # blocks until Resume when Pause is pending. Release
+                    # the semaphore BEFORE that call so the paused
+                    # participant does not retain the process-wide GPU
+                    # slot for the duration of the pause and block
+                    # unrelated unpaused GPU jobs.
+                    #
+                    # On probe = True (cancel, or cancel-through-pause):
+                    #   raise; semaphore is already released.
+                    # On probe = False (no cancel, or paused-then-
+                    #   resumed): commit ownership via a non-blocking
+                    #   reacquire. If it succeeds we own the slot
+                    #   honestly. If another waiter grabbed the slot
+                    #   while we were parked, fall through to another
+                    #   polling iteration.
+                    _GPU_SEMAPHORE.release()
+                    if cancel_check():
                         raise ResourceWaitCancelled(
                             "Cancelled while waiting for GPU inference "
                             "resources",
                         )
-                    return self
+                    if _GPU_SEMAPHORE.acquire(blocking=False):
+                        return self
+                    continue
 
     def __exit__(self, exc_type, exc, tb):
         _GPU_SEMAPHORE.release()

@@ -34,7 +34,36 @@ def acquire_session_cache_lock(lock, *, label="ONNX session cache"):
     cancel_check = resolve_resource_cancel_check()
     if cancel_check is not None and cancel_check():
         raise ResourceWaitCancelled(f"Cancelled while waiting for {label}")
+
+    def _post_acquire_recheck():
+        """Return True to keep the lock; release + raise otherwise.
+
+        The probe itself may raise (a bound pipeline probe can surface
+        an unrelated internal error). Either way — cancel returned True,
+        or the probe raised — the lock we just acquired must be released
+        so a cancelled/errored caller doesn't hold the cache mutex for
+        the duration of its unwind.
+        """
+        if cancel_check is None:
+            return True
+        try:
+            cancelled = cancel_check()
+        except BaseException:
+            lock.release()
+            raise
+        if cancelled:
+            lock.release()
+            raise ResourceWaitCancelled(
+                f"Cancelled while waiting for {label}",
+            )
+        return True
+
     if lock.acquire(blocking=False):
+        # Symmetry with the timed-acquire branch below: a probe that
+        # raises must not leak the lock. The pre-acquire probe (above)
+        # only guards ENTRY; the same probe running after we own the
+        # lock is the release-safe path.
+        _post_acquire_recheck()
         try:
             yield
         finally:
@@ -58,12 +87,11 @@ def acquire_session_cache_lock(lock, *, label="ONNX session cache"):
                 # download when the previous holder exited with only
                 # one file on disk. Release and raise so the cancel
                 # wins the race, matching the GPU-lease recheck in
-                # ``pipeline_locks._GpuLockContext``.
-                if cancel_check is not None and cancel_check():
-                    lock.release()
-                    raise ResourceWaitCancelled(
-                        f"Cancelled while waiting for {label}",
-                    )
+                # ``pipeline_locks._GpuLockContext``. ``_post_acquire_recheck``
+                # also releases the lock if the probe itself raises,
+                # keeping a bug in a bound probe from leaking the cache
+                # mutex.
+                _post_acquire_recheck()
                 break
     try:
         yield

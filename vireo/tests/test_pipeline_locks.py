@@ -147,6 +147,110 @@ def test_session_cache_lock_acquire_race_with_cancel_releases_and_raises():
         resource_ledger._set_resource_ledger_for_tests(previous)
 
 
+def test_session_cache_lock_releases_on_post_acquire_probe_raise():
+    """Regression: the post-acquire probe inside
+    ``acquire_session_cache_lock`` may itself raise — a bound
+    pipeline probe can surface an unrelated internal error. Without
+    a release-on-raise guard, the cache mutex would leak: every
+    subsequent caller waiting on the same session cache would then
+    block until the process died, even though the probe's exception
+    would propagate out and unwind normally.
+
+    Verifies both branches: the non-blocking acquire (uncontended)
+    AND the timed acquire (contended). The bug historically lived
+    only in the timed branch, but the fix wraps both so a probe bug
+    can never leak the lock regardless of contention state.
+    """
+    import onnx_runtime
+    import resource_ledger
+
+    class _ProbeBoom(RuntimeError):
+        pass
+
+    # --- uncontended (non-blocking acquire) path ---
+    lock_a = threading.Lock()
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    call_count_a = {"n": 0}
+
+    def raising_probe_a():
+        call_count_a["n"] += 1
+        # Call #1 is the entry probe (line 35). Call #2 is the
+        # post-acquire recheck on the non-blocking branch (line 66)
+        # — that's the one whose raise must not leak the lock.
+        if call_count_a["n"] >= 2:
+            raise _ProbeBoom("uncontended post-acquire probe raised")
+        return False
+
+    try:
+        with resource_ledger.bind_resource_cancel_check(raising_probe_a):
+            with pytest.raises(_ProbeBoom):
+                with onnx_runtime.acquire_session_cache_lock(lock_a):
+                    pytest.fail(
+                        "body should not run — probe raised inside the "
+                        "context manager entry",
+                    )
+        assert lock_a.acquire(blocking=False), (
+            "Lock leaked when non-blocking-branch post-acquire probe raised"
+        )
+        lock_a.release()
+
+        # --- contended (timed acquire) path ---
+        lock_b = threading.Lock()
+        lock_b.acquire()
+        holder_released = False
+        outcome = []
+        call_count_b = {"n": 0}
+        raise_now = threading.Event()
+
+        def raising_probe_b():
+            call_count_b["n"] += 1
+            # Call #1: entry probe (line 35).
+            # Call #2+: loop probe (line 77) — return False until the
+            #           holder is released and the post-acquire probe
+            #           fires. Then raise from THAT probe call so the
+            #           timed acquire has already succeeded and the
+            #           lock is held.
+            if raise_now.is_set() and call_count_b["n"] >= 3:
+                raise _ProbeBoom("contended post-acquire probe raised")
+            return False
+
+        def waiter():
+            with resource_ledger.bind_resource_cancel_check(raising_probe_b):
+                try:
+                    with onnx_runtime.acquire_session_cache_lock(lock_b):
+                        outcome.append("acquired")
+                except _ProbeBoom:
+                    outcome.append("boom")
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        try:
+            _wait_until(lambda: call_count_b["n"] >= 2, timeout=2.0)
+            # Arm the raise, then release the holder so the waiter's
+            # timed acquire succeeds and its post-acquire probe fires.
+            raise_now.set()
+            lock_b.release()
+            holder_released = True
+
+            thread.join(timeout=3.0)
+            assert not thread.is_alive(), "waiter did not finish"
+            assert outcome == ["boom"], (
+                f"Expected the probe's RuntimeError to propagate; got "
+                f"{outcome!r}"
+            )
+            assert lock_b.acquire(blocking=False), (
+                "Lock leaked when timed-branch post-acquire probe raised"
+            )
+            lock_b.release()
+        finally:
+            if not holder_released:
+                lock_b.release()
+            thread.join(timeout=1.0)
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
 def test_acquire_gpu_if_session_uses_it_takes_lock_for_cuda_session():
     sess = _FakeSession(["CUDAExecutionProvider", "CPUExecutionProvider"])
     before = _GPU_SEMAPHORE._value
@@ -406,6 +510,87 @@ def test_gpu_acquire_race_with_cancel_releases_semaphore_and_raises():
         # before joining, the waiter thread may still be blocked in
         # ``acquire``: release once more so the module-level semaphore
         # doesn't leak across tests.
+        if not holder_released:
+            _GPU_SEMAPHORE.release()
+        thread.join(timeout=1.0)
+
+
+def test_gpu_semaphore_released_before_pause_park_during_post_acquire():
+    """Regression: when the pipeline's bound ``_pause_checkpoint`` parks
+    inside the ``_GpuLockContext`` post-acquire probe, the semaphore
+    must be RELEASED before the park so unpaused GPU jobs can proceed.
+    Prior fix (``51e7cc21``) only released on cancel; a pure pause
+    that returned False (no cancel) would keep the semaphore held for
+    the entire pause duration.
+
+    Simulates the pause-park scenario with a probe that (1) records
+    that the semaphore was released BEFORE the probe was called and
+    (2) returns False, forcing the loop to reacquire. Without the
+    fix, the probe would see the semaphore still held; with the
+    fix, the semaphore counter must be back to 1 at probe time.
+    """
+    from pipeline_locks import _GpuLockContext
+    _GPU_SEMAPHORE.acquire()  # occupy so waiter enters polling loop
+    holder_released = False
+    outcome = []
+    call_count = {"n": 0}
+    semaphore_value_seen_by_probe = []
+
+    def counting_probe():
+        call_count["n"] += 1
+        # Call #1: pre-acquire entry probe → False (not cancelled).
+        # Call #2: pre-timed-acquire loop probe → False (not
+        # cancelled).
+        # Call #3+: POST-acquire probe → must observe the semaphore
+        # was released BEFORE this call fired (value back to 1),
+        # then simulate a pure pause by returning False. The loop
+        # will reacquire after we release the holder.
+        if call_count["n"] >= 3:
+            semaphore_value_seen_by_probe.append(_GPU_SEMAPHORE._value)
+        return False
+
+    def waiter():
+        try:
+            with _GpuLockContext(cancel_check=counting_probe):
+                outcome.append("acquired")
+        except Exception as exc:  # pragma: no cover - diagnostic
+            outcome.append(f"raised:{exc.__class__.__name__}")
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    try:
+        # Wait until the waiter has passed the pre-acquire probes and
+        # entered its blocking timed acquire (call_count == 2).
+        _wait_until(lambda: call_count["n"] >= 2, timeout=2.0)
+        # Release the holder so the timed acquire succeeds.
+        _GPU_SEMAPHORE.release()
+        holder_released = True
+        # Wait for the waiter to finish acquiring (should proceed
+        # after post-acquire probe returns False and reacquires).
+        thread.join(timeout=3.0)
+        assert not thread.is_alive(), "waiter did not finish"
+        assert outcome == ["acquired"], (
+            f"Expected acquired outcome after pure-pause probe, got "
+            f"{outcome!r}"
+        )
+        # The post-acquire probe must have seen the semaphore already
+        # RELEASED (value=1). If the fix regressed the value would
+        # have been 0 at probe time.
+        assert semaphore_value_seen_by_probe, (
+            "Post-acquire probe was never called — cannot verify "
+            "release-before-park semantics"
+        )
+        assert all(v == 1 for v in semaphore_value_seen_by_probe), (
+            f"Semaphore must be released BEFORE the post-acquire "
+            f"probe (value=1). Probe saw values "
+            f"{semaphore_value_seen_by_probe!r} — a paused participant "
+            f"would retain the process-wide GPU slot for the whole "
+            f"pause and block unrelated unpaused GPU jobs."
+        )
+        # Final: semaphore is back to 1 because the with-block
+        # released via __exit__.
+        assert _GPU_SEMAPHORE._value == 1
+    finally:
         if not holder_released:
             _GPU_SEMAPHORE.release()
         thread.join(timeout=1.0)

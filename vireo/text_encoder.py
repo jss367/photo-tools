@@ -136,16 +136,33 @@ def encode_text(query, model_str, pretrained_str=None):
     Returns:
         numpy float32 array -- normalized text embedding vector
     """
-    deadline = time.monotonic() + _INTERACTIVE_RESOURCE_WAIT_SECONDS
+    # Two deadlines rather than one: cold-load construction can
+    # legitimately exceed the interactive budget (downloading /
+    # deserializing a multi-hundred-megabyte ONNX graph). Sharing one
+    # deadline would let a slow cold load consume the entire budget
+    # and reject the already-loaded session at ``session.run`` — the
+    # first search after startup fails even though its construction
+    # lease landed immediately. Reset the deadline AFTER cold
+    # construction so ``acquire_inference_resources`` measures only
+    # actual inference contention against the interactive budget.
+    load_deadline = time.monotonic() + _INTERACTIVE_RESOURCE_WAIT_SECONDS
 
-    def cancel_check():
-        return time.monotonic() >= deadline
+    def load_cancel_check():
+        return time.monotonic() >= load_deadline
 
     session, input_name, tokenizer = _get_text_session(
         model_str,
         pretrained_str,
-        cancel_check=cancel_check,
+        cancel_check=load_cancel_check,
     )
+
+    # Reset the deadline for inference: the cold-load already spent
+    # its share, so start a fresh 5s budget for the actual encoder
+    # forward pass and any waiting on the ``cpu_ml`` lane.
+    infer_deadline = time.monotonic() + _INTERACTIVE_RESOURCE_WAIT_SECONDS
+
+    def infer_cancel_check():
+        return time.monotonic() >= infer_deadline
 
     # Tokenize the query
     encoding = tokenizer.encode(query)
@@ -157,7 +174,7 @@ def encode_text(query, model_str, pretrained_str=None):
     from pipeline_locks import acquire_inference_resources
     with acquire_inference_resources(
         session,
-        cancel_check=cancel_check,
+        cancel_check=infer_cancel_check,
     ):
         txt_features = session.run(None, {input_name: tokens})[0]
     txt_features = txt_features.astype(np.float32)

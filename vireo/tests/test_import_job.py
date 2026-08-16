@@ -65,10 +65,12 @@ def test_catalog_scan_preservation_pause_publishes_paused_without_cancelling(
     """
     from unittest.mock import MagicMock
 
-    from import_job import _ImportBatchState, _ImportRunState, _LandedFile
-    _catalog_scan_and_prescan = __import__(
-        "import_job",
-    )._catalog_scan_and_prescan
+    from import_job import (
+        _catalog_scan_and_prescan,
+        _ImportBatchState,
+        _ImportRunState,
+        _LandedFile,
+    )
 
     scan_calls = {"cancel_check": None, "pause_check": None, "n": 0}
 

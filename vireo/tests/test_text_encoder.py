@@ -90,7 +90,14 @@ def test_encode_text_zero_vector(monkeypatch):
 
 
 def test_encode_text_bounds_interactive_resource_wait(monkeypatch):
-    """Interactive text search passes a deadline-aware cancel probe."""
+    """Interactive text search passes deadline-aware cancel probes.
+
+    Two independent probes: one for the cold-load lookup, another for
+    the inference lease. Sharing one deadline would let a slow cold
+    load consume the entire budget and reject the already-loaded
+    session at ``session.run`` — the first search after startup would
+    fail even though its construction lease landed immediately.
+    """
     import contextlib
 
     import pipeline_locks
@@ -113,11 +120,16 @@ def test_encode_text_bounds_interactive_resource_wait(monkeypatch):
     now = [10.0]
     monkeypatch.setattr(text_encoder.time, "monotonic", lambda: now[0])
     observed = []
+    inference_probes = []
 
     @contextlib.contextmanager
     def capture_lease(_session, *, cancel_check=None):
         assert cancel_check is not None
-        assert cancel_check is session_lookup_probes[0]
+        inference_probes.append(cancel_check)
+        # Inference probe must be a fresh deadline, not the same
+        # probe object the cold-load received — otherwise a slow
+        # cold-load would already have expired the inference deadline.
+        assert cancel_check is not session_lookup_probes[0]
         observed.append(cancel_check())
         now[0] += text_encoder._INTERACTIVE_RESOURCE_WAIT_SECONDS
         observed.append(cancel_check())
@@ -129,7 +141,73 @@ def test_encode_text_bounds_interactive_resource_wait(monkeypatch):
 
     text_encoder.encode_text("bird", model_str="ViT-B-16")
     assert len(session_lookup_probes) == 1
+    assert len(inference_probes) == 1
     assert observed == [False, True]
+
+
+def test_encode_text_inference_deadline_resets_after_slow_cold_load(monkeypatch):
+    """Regression: a cold-load construction that consumes the full
+    interactive budget must NOT cause the inference lease to reject
+    the already-loaded session — the deadlines are independent.
+
+    Without the reset, a first search after startup where the ONNX
+    session took 5+ seconds to construct would fail at
+    ``acquire_inference_resources`` with the deadline already expired,
+    while an immediate retry from the cached session succeeds. The
+    fix starts a fresh 5s budget for the inference wait so we
+    measure only actual resource contention, not total setup time.
+    """
+    import contextlib
+
+    import pipeline_locks
+    import text_encoder
+
+    fake_features = np.ones((1, 512), dtype=np.float32)
+    fake_session = _make_fake_text_session(fake_features)
+    fake_tokenizer = _make_fake_tokenizer()
+
+    now = [10.0]
+    monkeypatch.setattr(text_encoder.time, "monotonic", lambda: now[0])
+
+    def get_text_session(*_args, cancel_check=None, **_kwargs):
+        # Simulate a slow cold-load: advance the clock by the full
+        # interactive budget while inside the load path.
+        now[0] += text_encoder._INTERACTIVE_RESOURCE_WAIT_SECONDS + 1.0
+        # If the load probe had already fired at this point, callers
+        # would have raised. The assertion here proves the load probe
+        # itself expired mid-load — but only the load path saw it.
+        assert cancel_check() is True, (
+            "load probe must have expired after the full budget was "
+            "consumed by cold construction"
+        )
+        return fake_session, "input_ids", fake_tokenizer
+
+    monkeypatch.setattr(
+        text_encoder, "_get_text_session", get_text_session,
+    )
+
+    infer_probe_at_start = []
+
+    @contextlib.contextmanager
+    def capture_lease(_session, *, cancel_check=None):
+        # The inference deadline must have been RESET after the cold
+        # load. If it shared the load deadline it would already be
+        # expired at this call. Assert it starts fresh (returns False).
+        infer_probe_at_start.append(cancel_check())
+        yield
+
+    monkeypatch.setattr(
+        pipeline_locks, "acquire_inference_resources", capture_lease,
+    )
+
+    text_encoder.encode_text("bird", model_str="ViT-B-16")
+
+    assert infer_probe_at_start == [False], (
+        f"Inference deadline must reset after cold construction; got "
+        f"initial probe result {infer_probe_at_start!r}. A stale "
+        f"deadline would report True immediately and reject the "
+        f"already-loaded session."
+    )
 
 
 def test_encode_text_caching(monkeypatch, tmp_path):

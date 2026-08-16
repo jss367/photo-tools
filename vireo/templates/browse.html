@@ -1721,7 +1721,15 @@ body.sidebar-resizing {
 
     <!-- Grid -->
     <div class="grid-container" id="gridContainer">
-      <button id="loadPreviousPhotosButton" onclick="loadPreviousPhotos()" style="display:none;position:sticky;top:8px;z-index:5;margin:8px auto;padding:7px 14px;border:1px solid var(--border-subtle);border-radius:4px;background:var(--bg-secondary);color:var(--text-secondary);cursor:pointer;">Browse from beginning</button>
+      <!-- A photo deep link paints the page holding the target, not the pages
+           before it. A bare button would leave the truncated grid reading as
+           the whole folder, so the banner states how many photos are missing
+           and where the grid actually starts (CORE_PHILOSOPHY.md: no black
+           boxes). -->
+      <div id="loadPreviousPhotosBanner" style="display:none;position:sticky;top:8px;z-index:5;margin:8px auto;padding:8px 14px;max-width:640px;border:1px solid var(--border-subtle);border-radius:4px;background:var(--bg-secondary);color:var(--text-secondary);font-size:13px;text-align:center;">
+        <span id="loadPreviousPhotosText"></span>
+        <button id="loadPreviousPhotosButton" onclick="loadPreviousPhotos()" style="margin-left:10px;padding:5px 12px;border:1px solid var(--border-subtle);border-radius:3px;background:var(--bg-tertiary);color:var(--text-primary);font-size:12px;font-weight:600;cursor:pointer;">Browse from beginning</button>
+      </div>
       <div class="grid" id="grid"></div>
       <div class="scroll-sentinel" id="scrollSentinel"></div>
       <div class="empty-state" id="emptyState" style="display:none;">No photos match the current filters.</div>
@@ -2824,7 +2832,9 @@ var SKEL_POOL = 300;
 function updateGridTail() {
   var grid = document.getElementById('grid');
   var tail = document.getElementById('gridTail');
-  var remaining = allLoaded ? 0 : totalPhotos - photos.length;
+  // Photos before the loaded window are reached with "Browse from beginning",
+  // not by scrolling down — they must not inflate the downward runway.
+  var remaining = allLoaded ? 0 : totalPhotos - loadedWindowOffset() - photos.length;
   var cards = grid.getElementsByClassName('grid-card');
   var lastCard = cards.length ? cards[cards.length - 1] : null;
   if (remaining <= 0 || !lastCard) {
@@ -5062,10 +5072,31 @@ function buildCurrentBrowseParams() {
   return params;
 }
 
+/* How many photos of the current dataset sit before ``photos[0]``. Normally 0
+   — Browse loads a contiguous prefix — but a ?photo_id=... deep link starts at
+   the target's page, so everything that reasons about how much of the dataset
+   is on screen (tail runway, allLoaded gate, position readout) has to add it
+   back. */
+function loadedWindowOffset() {
+  return Math.max(0, (earliestPage - 1) * perPage);
+}
+
 function updatePreviousPhotosButton() {
-  var btn = document.getElementById('loadPreviousPhotosButton');
-  if (!btn) return;
-  btn.style.display = earliestPage > 1 ? 'block' : 'none';
+  var banner = document.getElementById('loadPreviousPhotosBanner');
+  if (!banner) return;
+  var offset = loadedWindowOffset();
+  if (earliestPage <= 1 || offset <= 0) {
+    banner.style.display = 'none';
+    return;
+  }
+  var textEl = document.getElementById('loadPreviousPhotosText');
+  if (textEl) {
+    textEl.textContent = offset === 1
+      ? '1 earlier photo isn’t loaded — this grid starts at #2.'
+      : offset.toLocaleString() + ' earlier photos aren’t loaded — ' +
+        'this grid starts at #' + (offset + 1).toLocaleString() + '.';
+  }
+  banner.style.display = 'block';
 }
 
 async function loadPreviousPhotos() {
@@ -5154,7 +5185,10 @@ async function loadPhotos(options) {
     } else {
       photos = photos.concat(data.photos);
       currentPage += chunk;
-      if (photos.length >= totalPhotos) allLoaded = true;
+      // A deep-link window starts partway in, so it is exhausted when it
+      // reaches the end of the dataset — not when it holds ``totalPhotos``
+      // rows, which it never would.
+      if (loadedWindowOffset() + photos.length >= totalPhotos) allLoaded = true;
     }
 
     if (firstNewIdx === 0) renderGrid();
@@ -5500,7 +5534,7 @@ function reloadBrowseResults(options) {
 
 function updateScrollPosition() {
   var el = document.getElementById('filterSummary');
-  var positionOffset = Math.max(0, (earliestPage - 1) * perPage);
+  var positionOffset = loadedWindowOffset();
   if (photos.length === 0) {
     el.textContent = totalPhotos + ' photos';
     return;
@@ -9625,10 +9659,7 @@ async function _runPhotoDeepLink(photoId) {
       var hasFocusPage = Number.isInteger(focusPage) && focusPage >= 1;
       earliestPage = hasFocusPage ? focusPage : 1;
       currentPage = hasFocusPage ? focusPage + 1 : 2;
-      var loadedThrough = hasFocusPage
-        ? (focusPage - 1) * perPage + photos.length
-        : photos.length;
-      if (loadedThrough >= totalPhotos) allLoaded = true;
+      if (loadedWindowOffset() + photos.length >= totalPhotos) allLoaded = true;
       renderGrid();
       updatePreviousPhotosButton();
       browseDatasetReady = true;

@@ -1196,7 +1196,23 @@ def test_browse_photo_id_deep_link_loads_target_after_first_folder_page(live_ser
     )
     visible_range = re.match(r"(\d+)–(\d+) of", position_summary)
     assert visible_range is not None
-    assert int(visible_range.group(1)) >= (initial_page - 1) * paging["perPage"] + 1
+    offset = (initial_page - 1) * paging["perPage"]
+    assert int(visible_range.group(1)) >= offset + 1
+
+    # The truncated window must announce itself rather than pass the target's
+    # page off as the whole folder, and the unloaded photos sit *before* the
+    # window — they must not be counted into the downward skeleton runway.
+    expect(page.locator("#loadPreviousPhotosBanner")).to_be_visible()
+    expect(page.locator("#loadPreviousPhotosText")).to_contain_text(
+        f"{offset:,} earlier photos"
+    )
+    expect(page.locator("#loadPreviousPhotosText")).to_contain_text(f"#{offset + 1:,}")
+    assert page.evaluate("loadedWindowOffset()") == offset
+    skeletons = page.evaluate("document.querySelectorAll('#gridTail .skel-card').length")
+    assert skeletons <= max(
+        0, page.evaluate("totalPhotos") - offset - len(initial_ids)
+    )
+
     page.locator("#loadPreviousPhotosButton").click()
     page.wait_for_function("earliestPage === 1 && browseDatasetReady", timeout=5000)
     restarted_ids = page.evaluate("photos.map(function(p) { return p.id; })")
@@ -1204,6 +1220,8 @@ def test_browse_photo_id_deep_link_loads_target_after_first_folder_page(live_ser
     assert restarted_ids != initial_ids
     assert len(restarted_ids) == len(set(restarted_ids))
     assert target_queries[-1]["page"] == 1
+    # Back to a contiguous prefix: nothing is missing, so nothing is claimed.
+    expect(page.locator("#loadPreviousPhotosBanner")).to_be_hidden()
 
 
 def test_browse_lightbox_arrows_preserve_one_to_one_zoom(live_server, page):

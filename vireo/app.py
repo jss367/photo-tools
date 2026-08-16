@@ -628,7 +628,9 @@ def _sync_preview_presentation(
 # request the same pending-changes revision many times in a row; without a
 # cache each request re-scans the full queue and re-hashes every change,
 # making preview preparation quadratic in the queue size. Keyed by
-# (workspace_id, revision); bounded by count with LRU eviction.
+# (database path, workspace_id, revision) so separate catalogs whose default
+# workspace and pending rows happen to match cannot reuse each other's photo
+# paths; bounded by count with LRU eviction.
 _SYNC_PREVIEW_SNAPSHOTS = OrderedDict()
 _SYNC_PREVIEW_SNAPSHOTS_LOCK = threading.Lock()
 _SYNC_PREVIEW_SNAPSHOTS_MAX = 8
@@ -734,8 +736,9 @@ def _sync_preview_get_snapshot(db, ws_id, requested_revision):
     stored. On miss (or when the queue has shifted) the full snapshot is
     rebuilt and cached under its computed revision.
     """
+    database_key = os.path.abspath(db._db_path)
     if requested_revision:
-        key = (ws_id, requested_revision)
+        key = (database_key, ws_id, requested_revision)
         with _SYNC_PREVIEW_SNAPSHOTS_LOCK:
             snapshot = _SYNC_PREVIEW_SNAPSHOTS.get(key)
             if snapshot is not None:
@@ -747,7 +750,7 @@ def _sync_preview_get_snapshot(db, ws_id, requested_revision):
                 _SYNC_PREVIEW_SNAPSHOTS.pop(key, None)
 
     snapshot = _sync_preview_build_snapshot(db, ws_id)
-    key = (ws_id, snapshot["revision"])
+    key = (database_key, ws_id, snapshot["revision"])
     with _SYNC_PREVIEW_SNAPSHOTS_LOCK:
         _SYNC_PREVIEW_SNAPSHOTS[key] = snapshot
         _SYNC_PREVIEW_SNAPSHOTS.move_to_end(key)

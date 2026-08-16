@@ -497,6 +497,51 @@ def test_sync_preview_reuses_snapshot_across_page_requests(app_and_db):
     assert call_count["n"] == 0
 
 
+def test_sync_preview_cache_isolated_by_database(app_and_db, tmp_path):
+    """Matching workspace revisions from separate catalogs never cross-read.
+
+    Workspace IDs and pending-change IDs restart in every catalog. A cache
+    keyed only by ``(workspace_id, revision)`` can therefore return filenames
+    and folders from another database in the same process.
+    """
+    import app as vireo_app
+    from db import Database
+
+    _app, first_db = app_and_db
+    first_photo = first_db.get_photos()[0]
+    first_db.queue_change(first_photo["id"], "rating", "3")
+    first_snapshot = vireo_app._sync_preview_get_snapshot(
+        first_db, first_db._ws_id(), None,
+    )
+
+    second_db = Database(str(tmp_path / "second-catalog.db"))
+    try:
+        second_ws = second_db.ensure_default_workspace()
+        second_db.set_active_workspace(second_ws)
+        second_folder = second_db.add_folder(
+            str(tmp_path / "second-photos"), name="second-photos",
+        )
+        second_db.add_workspace_folder(second_ws, second_folder)
+        second_photo = second_db.add_photo(
+            folder_id=second_folder,
+            filename="second.jpg",
+            extension=".jpg",
+            file_size=10,
+            file_mtime=1.0,
+        )
+        second_db.queue_change(second_photo, "rating", "3")
+        second_snapshot = vireo_app._sync_preview_get_snapshot(
+            second_db, second_ws, first_snapshot["revision"],
+        )
+    finally:
+        second_db.close()
+
+    assert second_snapshot["all_photos"][0]["filename"] == "second.jpg"
+    assert second_snapshot["all_photos"][0]["folder"] == str(
+        tmp_path / "second-photos"
+    )
+
+
 def test_sync_preview_detects_top_id_replacement(app_and_db):
     """A delete+insert that reuses the top pending_changes.id must not hit cache.
 

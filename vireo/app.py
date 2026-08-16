@@ -635,23 +635,37 @@ _SYNC_PREVIEW_SNAPSHOTS_MAX = 8
 
 
 def _sync_preview_pending_fingerprint(db, ws_id):
-    """Cheap SUM/COUNT/MAX aggregate to detect INSERT/DELETE on pending_changes.
+    """Return the per-workspace monotonic write generation for pending_changes.
 
-    Value-only UPDATEs (see ``db.py`` line ~12942) slip past this check;
-    a stale snapshot is caught at apply time by the revision compared
-    against the sync operation, so we accept the small mismatch window
-    to avoid re-scanning the whole queue on every page request.
+    A dedicated ``db_meta`` counter — ``pending_changes_version:<ws>`` —
+    is bumped by INSERT/UPDATE/DELETE triggers on ``pending_changes``
+    (see ``db.py`` next to the ``folder_health_version`` triggers).
+    Reading it is a single-row lookup and, crucially, it changes for
+    every row write including a delete of the top id followed by an
+    INSERT that reuses it — ``pending_changes.id`` is a plain
+    ``INTEGER PRIMARY KEY`` without ``AUTOINCREMENT``, so SQLite will
+    do exactly that on the next INSERT after the highest row is
+    deleted. A cheaper COUNT/MAX/SUM aggregate would stay identical
+    across such a replacement even though ``change_token``, ``value``,
+    ``change_type``, or ``photo_id`` differ, and the cached snapshot
+    would then be served to a client that had never seen the new row.
     """
     row = db.conn.execute(
-        "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0) "
-        "FROM pending_changes WHERE workspace_id = ?",
-        (ws_id,),
+        "SELECT value FROM db_meta WHERE key = ?",
+        (f"pending_changes_version:{ws_id}",),
     ).fetchone()
-    return (row[0], row[1], row[2])
+    return int(row[0]) if row else 0
 
 
 def _sync_preview_build_snapshot(db, ws_id):
     """Load pending changes, group by photo, and compute the revision hash."""
+    # Read the version counter BEFORE the row scan. If a concurrent write
+    # commits between the two reads, the stored fingerprint is one behind
+    # the actual queue state, and the next cache lookup will see a
+    # mismatched (larger) counter and rebuild. Reading the counter after
+    # the rows would risk stamping stale rows with a post-write version
+    # and serving them from cache.
+    fingerprint = _sync_preview_pending_fingerprint(db, ws_id)
     changes = db.conn.execute(
         """
         SELECT pc.*, p.filename, p.folder_id, f.path AS folder_path
@@ -666,9 +680,6 @@ def _sync_preview_build_snapshot(db, ws_id):
 
     revision_hash = hashlib.sha256()
     change_type_counts = {}
-    fp_count = 0
-    fp_max_id = 0
-    fp_sum_id = 0
     by_photo = {}
     for change in changes:
         revision_hash.update(
@@ -682,11 +693,7 @@ def _sync_preview_build_snapshot(db, ws_id):
         change_type_counts[change_type] = (
             change_type_counts.get(change_type, 0) + 1
         )
-        fp_count += 1
         cid = change["id"]
-        if cid > fp_max_id:
-            fp_max_id = cid
-        fp_sum_id += cid
         pid = change["photo_id"]
         photo = by_photo.get(pid)
         if photo is None:
@@ -714,7 +721,7 @@ def _sync_preview_build_snapshot(db, ws_id):
         "all_photos": list(by_photo.values()),
         "total_changes": len(changes),
         "change_type_counts": change_type_counts,
-        "fingerprint": (fp_count, fp_max_id, fp_sum_id),
+        "fingerprint": fingerprint,
     }
 
 

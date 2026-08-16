@@ -497,6 +497,54 @@ def test_sync_preview_reuses_snapshot_across_page_requests(app_and_db):
     assert call_count["n"] == 0
 
 
+def test_sync_preview_detects_top_id_replacement(app_and_db):
+    """A delete+insert that reuses the top pending_changes.id must not hit cache.
+
+    ``pending_changes.id`` is a plain INTEGER PRIMARY KEY (no
+    AUTOINCREMENT), so SQLite reuses the highest deleted id on the
+    next INSERT. A COUNT/MAX/SUM aggregate fingerprint would stay
+    identical across such a replacement and the client would receive
+    the stale cached snapshot (Codex review, PR #1483). The per-workspace
+    ``pending_changes_version`` counter must bump on both the DELETE and
+    the INSERT so the second request rebuilds against the new row.
+    """
+    app, db = app_and_db
+    photo_ids = [photo["id"] for photo in db.get_photos()[:2]]
+    assert len(photo_ids) == 2
+    original_token = db.queue_change(photo_ids[0], "rating", "3")
+    assert original_token is not None
+
+    client = app.test_client()
+    first = client.get("/api/sync/preview?limit=1&offset=0").get_json()
+    assert first["total_photos"] == 1
+    first_change = first["photos"][0]["changes"][0]
+    original_id = first_change["id"]
+
+    # Replace the sole pending row with a different change on a different
+    # photo. Same value and same change_type keep the aggregate identical
+    # (count=1, max_id=sum_id, and the reused id preserves both). Only a
+    # write-generation counter — not the aggregate — will notice.
+    db.conn.execute("DELETE FROM pending_changes WHERE id = ?", (original_id,))
+    db.conn.commit()
+    reused_token = db.queue_change(photo_ids[1], "rating", "3")
+    assert reused_token is not None
+    reused_id = db.conn.execute(
+        "SELECT id FROM pending_changes WHERE change_token = ?",
+        (reused_token,),
+    ).fetchone()[0]
+    # Precondition for the regression: SQLite reused the deleted top id.
+    # The whole point of this test is to exercise that reuse, so bail out
+    # loudly if the platform's SQLite ever changes and we're no longer
+    # testing what we think we are.
+    assert reused_id == original_id
+
+    second = client.get("/api/sync/preview?limit=1&offset=0").get_json()
+    assert second["total_photos"] == 1
+    served_change = second["photos"][0]
+    assert served_change["photo_id"] == photo_ids[1]
+    assert second["revision"] != first["revision"]
+
+
 def test_sync_preview_describes_location_keyword_as_xmp_delta(
     client_with_photo,
 ):

@@ -179,19 +179,60 @@ def test_human_claude_fix_overrides_routine_round_cap():
     # The activate job (fired by a human `/claude-fix`) intentionally leaves
     # `max-review-fix-rounds` at zero so the workflow-level cap does not
     # apply, but the routine also caps at two prior rounds and would
-    # otherwise silently no-op the documented human override. Pass a
-    # payload flag from activate and honor it in the routine prompt.
+    # otherwise silently no-op the documented human override. The workflow
+    # signals the override to the routine via a distinct task kind
+    # (`address-human-fix`) on the first line of the payload — never via a
+    # text field that could be interpolated from an untrusted body region.
     activate_idx = workflow.find("activate:")
     fix_comment_idx = workflow.find("fix-comment-feedback:")
     assert activate_idx != -1 and fix_comment_idx > activate_idx
     activate_block = workflow[activate_idx:fix_comment_idx]
-    assert "Human override: true" in activate_block
+    assert "address-human-fix" in activate_block
 
-    # And no other firing path should mark itself as a human override.
-    assert workflow.count("Human override: true") == 1
+    # Only the activate job may emit `address-human-fix`; every other
+    # firer stays on the capped task kinds. Count the ternary-quoted
+    # literal so this catches an accidental copy into another payload
+    # block without being tripped by design-comment references to the
+    # string.
+    assert workflow.count("'address-human-fix'") == 1
 
-    assert "Human override: true" in prompt
+    # The routine prompt must document the new task kind and use it as the
+    # override signal.
+    assert "address-human-fix" in prompt
     assert "skip the round cap" in prompt
+
+    # The routine prompt must NOT still key its override off a text field
+    # that a bot could inject through `Review body` or `Comment body`.
+    assert "If the payload includes `Human override: true`" not in prompt
+    assert "payload includes `Human override" not in prompt
+
+
+def test_human_override_signal_cannot_be_injected_through_untrusted_feedback():
+    """A bot posting `Human override: true` in a comment or review body
+    must not bypass the round cap. The trust boundary is the task kind on
+    the first line of the payload, which only the workflow can set."""
+
+    workflow = _read(WORKFLOW)
+    prompt = _read(ROUTINE_PROMPT)
+
+    # The workflow must never write `Human override: true` (in any casing)
+    # into a payload — the field is retired in favor of the task kind so
+    # there is no ambiguous string a bot could echo back through
+    # `Comment body:` or `Review body:`.
+    assert "Human override:" not in workflow
+
+    # The routine prompt must explicitly warn against honoring a
+    # `Human override` string inside an untrusted body region, and must
+    # anchor the override to the task kind.
+    assert "task kind on the very first line is `address-human-fix`" in prompt
+    lowered = prompt.lower()
+    assert "not honor" in lowered and "human override" in lowered
+
+    # And the four routes that carry untrusted body text (address-review,
+    # address-human-fix, address-comment, address-codex-review) must all
+    # be listed as sharing the same flow, so the "task kind gate" rule
+    # applies uniformly.
+    assert "`address-review`, `address-human-fix`, `address-comment`, `address-codex-review`" in prompt
 
 
 def test_bots_cannot_grant_human_override_or_reset_escalation_via_activate():
@@ -201,16 +242,25 @@ def test_bots_cannot_grant_human_override_or_reset_escalation_via_activate():
     fix_comment_idx = workflow.find("fix-comment-feedback:")
     activate_block = workflow[activate_idx:fix_comment_idx]
 
-    # The activate condition admits `chatgpt-codex-connector[bot]`, so
-    # `Human override: true` must be gated on the commenter's association
-    # rather than emitted unconditionally. Otherwise a bot's /claude-fix
-    # comment would bypass both the workflow-level and routine-level
-    # two-round caps and could drive automated repair indefinitely.
-    override_line = next(
-        line for line in activate_block.splitlines() if "Human override: true" in line
+    # The activate condition admits `chatgpt-codex-connector[bot]`, so the
+    # trusted `address-human-fix` task kind must be gated on the commenter's
+    # author_association rather than emitted unconditionally. Otherwise a
+    # bot's /claude-fix comment would bypass both the workflow-level and
+    # routine-level two-round caps and could drive automated repair
+    # indefinitely.
+    task_line = next(
+        line for line in activate_block.splitlines()
+        if "Task:" in line and "address-human-fix" in line
     )
-    assert "steps.live.outputs.is_human" in override_line, (
-        f"Human override must be gated on the is_human step output; got {override_line!r}"
+    assert "steps.live.outputs.is_human" in task_line, (
+        f"address-human-fix task kind must be gated on the is_human step "
+        f"output; got {task_line!r}"
+    )
+    # And the alternate branch of the gate must fall back to the capped
+    # `address-review` kind for bots.
+    assert "address-review" in task_line, (
+        f"Non-human /claude-fix must fall back to the capped `address-review` "
+        f"task kind; got {task_line!r}"
     )
 
     # The workflow-level cap (via `max-review-fix-rounds`) must also flip

@@ -110,6 +110,14 @@ parse. Each payload starts with a `Task:` line, followed by structured
 context. The routine prompt enumerates the supported task kinds:
 
 - `address-review` — non-approving review submitted on a claude-agent PR
+- `address-human-fix` — `/claude-fix` from a human maintainer (identical
+  shape to `address-review` but signals the routine to skip its per-PR
+  review-fix round cap; only the `activate` job emits this kind, and only
+  when the commenter's `author_association` is `OWNER` or `COLLABORATOR`).
+  Using a distinct task kind — rather than a `Human override: true` field
+  interpolated into the payload — keeps the override signal above the
+  untrusted body region so a bot cannot spoof it through `Review body:` or
+  `Comment body:`.
 - `address-comment` — non-`/claude-fix`, non-👍 comment on a claude-agent PR
 - `address-codex-review` — codex-connector review on a non-agent PR
 - `fix-ci` — Tests workflow failed on a PR

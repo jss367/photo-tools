@@ -130,10 +130,18 @@ jobs:
           # cap; a bot's /claude-fix must still be subject to the cap so
           # neither the workflow nor the routine cap can be bypassed.
           max-review-fix-rounds: ${{ steps.live.outputs.is_human == 'true' && '0' || '2' }}
+          # The task kind itself carries the human-override trust signal.
+          # `address-human-fix` is emitted only by this activate job when the
+          # commenter's author_association proves they are a maintainer, and
+          # the routine reads the task kind from the first `Task:` line —
+          # which sits above the untrusted body region and cannot be
+          # synthesized inside a comment or review body. Every other firer
+          # (fix-comment-feedback, fix-comments, codex-review) uses one of
+          # `address-review`, `address-comment`, or `address-codex-review`
+          # and remains subject to the routine's per-PR round cap.
           payload: |
-            Task: address-review
+            Task: ${{ steps.live.outputs.is_human == 'true' && 'address-human-fix' || 'address-review' }}
             PR: ${{ github.event.issue.number }}
-            ${{ steps.live.outputs.is_human == 'true' && 'Human override: true' || '' }}
             Review author: ${{ github.event.comment.user.login }}
             Review body:
             Reviewer invoked /claude-fix. Read every outstanding review

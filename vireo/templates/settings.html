@@ -872,6 +872,16 @@
         <button onclick="toggleGoogleMapsKeyVisibility()" style="background:var(--bg-tertiary);color:var(--text-dim);border:1px solid var(--border-secondary);border-radius:4px;padding:6px 10px;font-size:11px;cursor:pointer;">Show</button>
       </div>
     </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        Prefer English place names
+        <small>Ask Google Maps for English names and addresses when available. Official proper names may remain in their local language.</small>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <input type="checkbox" id="cfgGoogleMapsPreferEnglish" checked
+               onchange="saveConfig()" style="accent-color:var(--accent);">
+      </div>
+    </div>
   </div>
 
   <!-- External Editors -->
@@ -2344,6 +2354,7 @@ async function loadConfig() {
     document.getElementById('cfgInatToken').value = cfg.inat_token || '';
     if (cfg.inat_token) validateInatToken();
     document.getElementById('cfgGoogleMapsApiKey').value = cfg.google_maps_api_key || '';
+    document.getElementById('cfgGoogleMapsPreferEnglish').checked = cfg.google_maps_prefer_english !== false;
     document.getElementById('cfgKeywordCase').value = cfg.keyword_case || 'auto';
     document.getElementById('cfgMaxEditHistory').value = cfg.max_edit_history != null ? cfg.max_edit_history : 1000;
     // Load editor list. Synthesize from the legacy single string if the user
@@ -2573,6 +2584,7 @@ async function _saveConfigNow() {
           hf_token: hfToken,
           inat_token: document.getElementById('cfgInatToken').value.trim(),
           google_maps_api_key: document.getElementById('cfgGoogleMapsApiKey').value.trim(),
+          google_maps_prefer_english: document.getElementById('cfgGoogleMapsPreferEnglish').checked,
           external_editors: collectExternalEditors(),
           remote_targets: collectRemoteTargets(),
           // Always clear the legacy single-editor field when we save the new

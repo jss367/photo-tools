@@ -11,6 +11,7 @@ import io
 import json
 import urllib.error
 import urllib.parse
+from pathlib import Path
 
 import pytest
 
@@ -146,7 +147,9 @@ def test_place_details_parses_response(monkeypatch):
     url = captured[0]
     assert "place_id=ChIJ4zGFAZpYwokRGUGph3Mf37k" in url
     assert "key=FAKE_KEY" in url
-    fields = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["fields"][0]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    assert query["language"] == ["en"]
+    fields = query["fields"][0]
     assert "type" in fields.split(",")
     assert "types" not in fields.split(",")
 
@@ -220,6 +223,55 @@ def test_reverse_geocode_parses_response(monkeypatch):
         "latlng=40.7127753,-74.0059728" in url
     )
     assert "key=FAKE_KEY" in url
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    assert query["language"] == ["en"]
+
+
+@pytest.mark.parametrize(
+    "template_name",
+    ["browse.html", "keywords.html", "location_review.html"],
+)
+def test_google_maps_javascript_loaders_honor_english_preference(template_name):
+    """All browser Places flows should conditionally request English."""
+    template = Path(__file__).parent.parent / "templates" / template_name
+    source = template.read_text(encoding="utf-8")
+
+    assert "google_maps_prefer_english" in source
+    assert "&language=en" in source
+
+
+def test_place_details_omits_language_when_disabled(monkeypatch):
+    """The local-name preference leaves Google's language parameter unset."""
+    from vireo import places
+
+    captured = []
+    monkeypatch.setattr(
+        "vireo.places.urllib.request.urlopen",
+        _make_fake_urlopen({"status": "ZERO_RESULTS"}, captured),
+    )
+
+    assert places.place_details("somewhere", "FAKE_KEY", language=None) is None
+    query = urllib.parse.parse_qs(
+        urllib.parse.urlparse(captured[0]).query,
+    )
+    assert "language" not in query
+
+
+def test_reverse_geocode_omits_language_when_disabled(monkeypatch):
+    """Reverse geocoding also supports Google's default localization."""
+    from vireo import places
+
+    captured = []
+    monkeypatch.setattr(
+        "vireo.places.urllib.request.urlopen",
+        _make_fake_urlopen({"status": "ZERO_RESULTS"}, captured),
+    )
+
+    assert places.reverse_geocode(1.0, 2.0, "FAKE_KEY", language=None) is None
+    query = urllib.parse.parse_qs(
+        urllib.parse.urlparse(captured[0]).query,
+    )
+    assert "language" not in query
 
 
 def test_reverse_geocode_returns_none_on_zero_results(monkeypatch):

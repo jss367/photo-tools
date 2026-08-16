@@ -1421,6 +1421,18 @@ body.sidebar-resizing {
   max-height: 80vh;
   overflow-y: auto;
 }
+#batchKeywordModal .modal {
+  /* The autocomplete list is absolutely positioned below the input. The
+     generic modal scroll container clips that list to the modal's short
+     content box, which makes batch keyword matches appear to be missing.
+     This modal has bounded, fixed-height content, so let its picker escape
+     the box just like the single-photo keyword picker does. */
+  overflow: visible;
+}
+#collectionModal .modal {
+  width: 680px;
+  max-width: calc(100vw - 32px);
+}
 .modal h3 { font-size: 16px; margin-bottom: 16px; }
 .modal-input {
   width: 100%;
@@ -1955,6 +1967,7 @@ body.sidebar-resizing {
    Empty string when no key is configured; the Location section then
    degrades to free-text-only (no autocomplete, no script injection). */
 window.GOOGLE_MAPS_API_KEY = '';
+window.GOOGLE_MAPS_PREFER_ENGLISH = true;
 
 /* ---------- State ---------- */
 var photos = [];
@@ -2493,6 +2506,7 @@ var _cfgPromise = (async function() {
     _shortcuts = Object.assign({}, _BROWSE_SC_DEFAULTS, saved);
     window._vireoShortcuts = cfg.keyboard_shortcuts || {};
     window.GOOGLE_MAPS_API_KEY = cfg.google_maps_api_key || '';
+    window.GOOGLE_MAPS_PREFER_ENGLISH = cfg.google_maps_prefer_english !== false;
     return cfg;
   } catch(e) {
     _shortcuts = Object.assign({}, _BROWSE_SC_DEFAULTS);
@@ -4323,6 +4337,20 @@ async function updatePreviewNow() {
   }
 }
 
+function commitRuleOnEnter(e) {
+  if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
+  var t = e.currentTarget || e.target;
+  if (t && t.type === 'date') {
+    // Native date pickers use Enter to commit the highlighted date;
+    // cancelling it would close the picker without applying the selection.
+    // Defer the blur so the picker's own Enter handler runs first.
+    setTimeout(function() { t.blur(); }, 0);
+    return;
+  }
+  e.preventDefault();
+  t.blur();
+}
+
 function renderRuleValueInput(r, i) {
   var p = escapeAttr(i);
   if (r.field === 'all') {
@@ -4402,15 +4430,15 @@ function renderRuleValueInput(r, i) {
       var from = Array.isArray(r.value) ? (r.value[0] || '') : '';
       var to   = Array.isArray(r.value) ? (r.value[1] || '') : '';
       return '<div style="flex:1;display:flex;gap:6px;align-items:center;">' +
-          '<input type="date" value="' + escapeAttr(from) + '" onchange="updateRule(\'' + p + '\',\'value_from\',this.value)" style="flex:1;">' +
+          '<input type="date" value="' + escapeAttr(from) + '" onchange="updateRule(\'' + p + '\',\'value_from\',this.value)" onkeydown="commitRuleOnEnter(event)" style="flex:1;">' +
           '<span style="color:var(--text-ghost);font-size:11px;">and</span>' +
-          '<input type="date" value="' + escapeAttr(to) + '" onchange="updateRule(\'' + p + '\',\'value_to\',this.value)" style="flex:1;">' +
+          '<input type="date" value="' + escapeAttr(to) + '" onchange="updateRule(\'' + p + '\',\'value_to\',this.value)" onkeydown="commitRuleOnEnter(event)" style="flex:1;">' +
         '</div>';
     }
     if (r.op === 'recent_days') {
       var n = (typeof r.value === 'number' || (typeof r.value === 'string' && r.value !== '')) ? r.value : 7;
       return '<div style="flex:1;display:flex;gap:6px;align-items:center;">' +
-          '<input type="number" min="1" value="' + escapeAttr(String(n)) + '" onchange="updateRule(\'' + p + '\',\'value\',this.value)" style="width:80px;">' +
+          '<input type="number" min="1" value="' + escapeAttr(String(n)) + '" onchange="updateRule(\'' + p + '\',\'value\',this.value)" onkeydown="commitRuleOnEnter(event)" style="width:80px;">' +
           '<span style="color:var(--text-ghost);font-size:11px;">days</span>' +
         '</div>';
     }
@@ -4419,7 +4447,9 @@ function renderRuleValueInput(r, i) {
     'noise_estimate', 'crop_complete', 'prediction_confidence'].indexOf(r.field) !== -1;
   return '<input type="' + (numeric ? 'number' : 'text') + '" value="' +
     escapeAttr(String(r.value == null ? '' : r.value)) +
-    '" onchange="updateRule(\'' + p + '\',\'value\',this.value)" placeholder="value" style="flex:1;">';
+    '" onchange="updateRule(\'' + p + '\',\'value\',this.value)"' +
+    ' onkeydown="commitRuleOnEnter(event)"' +
+    ' placeholder="value" style="flex:1;">';
 }
 
 function renderFieldOptions(selected) {
@@ -7617,7 +7647,9 @@ function loadGoogleMapsJs() {
     var s = document.createElement('script');
     s.src = 'https://maps.googleapis.com/maps/api/js?key=' +
       encodeURIComponent(apiKey) +
-      '&libraries=places&loading=async&callback=_gmapsCallback';
+      '&libraries=places' +
+      (window.GOOGLE_MAPS_PREFER_ENGLISH ? '&language=en' : '') +
+      '&loading=async&callback=_gmapsCallback';
     s.async = true;
     s.onerror = function() { reject(new Error('gmaps_load_failed')); };
     document.head.appendChild(s);

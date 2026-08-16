@@ -6038,25 +6038,29 @@ class Database:
                     "UPDATE photos SET rating = ? WHERE id = ?",
                     (merge.new_rating, winner_id),
                 )
-            for kw_id in merge.keyword_ids_to_add:
-                # Carry the losers' durable provenance onto the winner. A
-                # hand-added keyword must not decay to "unknown" just because
-                # a duplicate merge moved it to another photo row — that is
-                # exactly the state retirement passes read as "generated".
-                # MAX() ignores NULLs, so any manual loser wins.
-                merged_source = KEYWORD_SOURCE_UNKNOWN
-                for chunk in _chunks(loser_ids):
-                    loser_placeholders = ",".join("?" * len(chunk))
-                    row = self.conn.execute(
-                        f"""SELECT MAX(source) AS source
-                            FROM photo_keywords
-                            WHERE keyword_id = ?
-                              AND photo_id IN ({loser_placeholders})""",
-                        (kw_id, *chunk),
-                    ).fetchone()
-                    if row and row["source"] == KEYWORD_SOURCE_MANUAL:
-                        merged_source = KEYWORD_SOURCE_MANUAL
-                        break
+            # Carry every loser's durable provenance onto the winner,
+            # including keyword IDs the winner already has. merge_metadata()
+            # omits overlaps from keyword_ids_to_add, but a manual loser must
+            # still upgrade an unknown winner association.
+            loser_keyword_sources = {}
+            for chunk in _chunks(loser_ids):
+                loser_placeholders = ",".join("?" * len(chunk))
+                rows = self.conn.execute(
+                    f"""SELECT keyword_id, MAX(source) AS source
+                        FROM photo_keywords
+                        WHERE photo_id IN ({loser_placeholders})
+                        GROUP BY keyword_id""",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    previous = loser_keyword_sources.get(row["keyword_id"])
+                    loser_keyword_sources[row["keyword_id"]] = (
+                        KEYWORD_SOURCE_MANUAL
+                        if previous == KEYWORD_SOURCE_MANUAL
+                        or row["source"] == KEYWORD_SOURCE_MANUAL
+                        else KEYWORD_SOURCE_UNKNOWN
+                    )
+            for kw_id, merged_source in loser_keyword_sources.items():
                 self.tag_photo(
                     winner_id, kw_id, source=merged_source, _commit=False,
                 )

@@ -253,8 +253,11 @@ def test_duplicate_merge_carries_manual_provenance_to_the_winner(prov_db):
     )
     hand_added = prov_db.add_keyword("Backlit", kw_type="general")
     scanned = prov_db.add_keyword("Imported", kw_type="general")
+    shared = prov_db.add_keyword("Shared", kw_type="general")
+    prov_db.tag_photo(winner, shared, source=KEYWORD_SOURCE_UNKNOWN)
     prov_db.tag_photo(loser, hand_added)
     prov_db.tag_photo(loser, scanned, source=KEYWORD_SOURCE_UNKNOWN)
+    prov_db.tag_photo(loser, shared)
 
     prov_db._apply_winner_loser_merge(winner, [loser])
 
@@ -270,6 +273,10 @@ def test_duplicate_merge_carries_manual_provenance_to_the_winner(prov_db):
         "unattributed association that retirement reads as generated."
     )
     assert stamps[scanned] is None
+    assert stamps[shared] == "manual", (
+        "A manual loser must upgrade an overlapping unknown association on "
+        "the winner, even though the keyword does not need to be added."
+    )
 
 
 def test_setting_a_photo_location_records_manual_provenance(prov_db):

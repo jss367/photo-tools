@@ -870,6 +870,117 @@ def test_new_collection_submission_is_single_flight_and_retryable(live_server, p
     }
 
 
+def test_collection_submission_blocks_close_and_reopen(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    state = page.evaluate(
+        """async ids => {
+          const originalSafeFetch = window.safeFetch;
+          let release;
+          window.safeFetch = function(url) {
+            if (url === '/api/collections/321/add-photos') {
+              return new Promise(resolve => { release = resolve; });
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          pipelineReviewModalPhotoIds = [ids[0]];
+          pipelineReviewSelectedCollectionId = 321;
+          pipelineReviewCollections = [{id: 321, name: 'Existing Picks'}];
+          document.getElementById('pipelineCollectionModal').classList.add('open');
+          try {
+            const submission = confirmPipelineCollection();
+            const closeResult = hidePipelineCollectionModal();
+            const reopenResult = await addToCollection([ids[1]]);
+            const pending = {
+              closeResult,
+              reopenResult,
+              open: document.getElementById('pipelineCollectionModal').classList.contains('open'),
+              ids: pipelineReviewModalPhotoIds.slice(),
+              cancelDisabled: document.getElementById('pipelineCollectionCancelBtn').disabled,
+            };
+            release({ok: true});
+            const submitResult = await submission;
+            return {
+              pending,
+              submitResult,
+              openAfter: document.getElementById('pipelineCollectionModal').classList.contains('open'),
+            };
+          } finally {
+            window.safeFetch = originalSafeFetch;
+          }
+        }""",
+        photo_ids,
+    )
+    assert state == {
+        "pending": {
+            "closeResult": False,
+            "reopenResult": False,
+            "open": True,
+            "ids": [photo_ids[0]],
+            "cancelDisabled": True,
+        },
+        "submitResult": True,
+        "openAfter": False,
+    }
+
+
+def test_keyword_submission_blocks_close_and_reopen(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    state = page.evaluate(
+        """async ids => {
+          const originalSafeFetch = window.safeFetch;
+          let release;
+          window.safeFetch = function(url) {
+            if (url === '/api/batch/keyword') {
+              return new Promise(resolve => { release = resolve; });
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          pipelineReviewModalPhotoIds = [ids[0]];
+          document.getElementById('pipelineKeywordInput').value = 'First Keyword';
+          document.getElementById('pipelineKeywordModal').classList.add('open');
+          try {
+            const submission = confirmPipelineKeyword();
+            const closeResult = hidePipelineKeywordModal();
+            const reopenResult = batchAddKeyword([ids[1]]);
+            const pending = {
+              closeResult,
+              reopenResult,
+              open: document.getElementById('pipelineKeywordModal').classList.contains('open'),
+              ids: pipelineReviewModalPhotoIds.slice(),
+              cancelDisabled: document.getElementById('pipelineKeywordCancelBtn').disabled,
+            };
+            release({ok: true});
+            const submitResult = await submission;
+            return {
+              pending,
+              submitResult,
+              openAfter: document.getElementById('pipelineKeywordModal').classList.contains('open'),
+            };
+          } finally {
+            window.safeFetch = originalSafeFetch;
+          }
+        }""",
+        photo_ids,
+    )
+    assert state == {
+        "pending": {
+            "closeResult": False,
+            "reopenResult": False,
+            "open": True,
+            "ids": [photo_ids[0]],
+            "cancelDisabled": True,
+        },
+        "submitResult": True,
+        "openAfter": False,
+    }
+
+
 def test_photo_context_menu_updates_rating_and_adds_keyword(live_server, page):
     db = live_server["db"]
     photo_ids = live_server["data"]["photos"][:4]

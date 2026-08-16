@@ -1885,8 +1885,10 @@ input[type="range"]::-moz-range-thumb {
     <input class="modal-input" id="pipelineKeywordInput" placeholder="Keyword name"
            autocomplete="off" onkeydown="if(event.key==='Enter')confirmPipelineKeyword()">
     <div class="modal-actions">
-      <button class="modal-btn modal-btn-primary" onclick="confirmPipelineKeyword()">Add</button>
-      <button class="modal-btn modal-btn-cancel" onclick="hidePipelineKeywordModal()">Cancel</button>
+      <button class="modal-btn modal-btn-primary" id="pipelineKeywordSubmitBtn"
+              onclick="confirmPipelineKeyword()">Add</button>
+      <button class="modal-btn modal-btn-cancel" id="pipelineKeywordCancelBtn"
+              onclick="hidePipelineKeywordModal()">Cancel</button>
     </div>
   </div>
 </div>
@@ -1902,7 +1904,8 @@ input[type="range"]::-moz-range-thumb {
     <div class="modal-actions">
       <button class="modal-btn modal-btn-primary" id="pipelineCollectionSubmitBtn"
               onclick="confirmPipelineCollection()">Add</button>
-      <button class="modal-btn modal-btn-cancel" onclick="hidePipelineCollectionModal()">Cancel</button>
+      <button class="modal-btn modal-btn-cancel" id="pipelineCollectionCancelBtn"
+              onclick="hidePipelineCollectionModal()">Cancel</button>
     </div>
   </div>
 </div>
@@ -7314,6 +7317,7 @@ var pipelineReviewSelectedCollectionId = null;
 var pipelineReviewCollectionSubmitPromise = null;
 var pipelineReviewCreatedCollection = null;
 var pipelineReviewCollectionLoadSeq = 0;
+var pipelineReviewKeywordSubmitPromise = null;
 
 function pipelineReviewUniquePhotoIds(photoIds) {
   var seen = {};
@@ -7485,6 +7489,7 @@ function pipelineCollectionAcceptsManualPhotos(collection) {
 }
 
 async function addToCollection(photoIds) {
+  if (pipelineReviewCollectionSubmitPromise) return false;
   var ids = pipelineReviewUniquePhotoIds(photoIds || getActiveSelection());
   if (!ids.length) return;
   var loadSeq = ++pipelineReviewCollectionLoadSeq;
@@ -7534,17 +7539,23 @@ function pickPipelineCollection(collectionId) {
   });
 }
 
-function hidePipelineCollectionModal() {
+function hidePipelineCollectionModal(force) {
+  if (pipelineReviewCollectionSubmitPromise && force !== true) return false;
   document.getElementById('pipelineCollectionModal').classList.remove('open');
   pipelineReviewModalPhotoIds = [];
   pipelineReviewSelectedCollectionId = null;
   pipelineReviewCreatedCollection = null;
   window._vireoNativeMenuPhotoIdsOverride = null;
+  return true;
 }
 
 function setPipelineCollectionSubmitting(submitting) {
   var btn = document.getElementById('pipelineCollectionSubmitBtn');
   if (btn) btn.disabled = submitting;
+  var cancel = document.getElementById('pipelineCollectionCancelBtn');
+  if (cancel) cancel.disabled = submitting;
+  var input = document.getElementById('pipelineCollectionNewName');
+  if (input) input.disabled = submitting;
 }
 
 function confirmPipelineCollection() {
@@ -7589,7 +7600,7 @@ function confirmPipelineCollection() {
         body: JSON.stringify({photo_ids: ids}),
       });
     } catch(e) { return false; }
-    hidePipelineCollectionModal();
+    hidePipelineCollectionModal(true);
     showToast('Added ' + ids.length + ' photo' + (ids.length === 1 ? '' : 's') +
       ' to "' + collectionName + '"', 'success');
     return true;
@@ -7601,6 +7612,7 @@ function confirmPipelineCollection() {
 }
 
 function batchAddKeyword(photoIds) {
+  if (pipelineReviewKeywordSubmitPromise) return false;
   var ids = pipelineReviewUniquePhotoIds(photoIds || getActiveSelection());
   if (!ids.length) return;
   pipelineReviewModalPhotoIds = ids;
@@ -7611,10 +7623,21 @@ function batchAddKeyword(photoIds) {
   setTimeout(function() { document.getElementById('pipelineKeywordInput').focus(); }, 50);
 }
 
-function hidePipelineKeywordModal() {
+function hidePipelineKeywordModal(force) {
+  if (pipelineReviewKeywordSubmitPromise && force !== true) return false;
   document.getElementById('pipelineKeywordModal').classList.remove('open');
   pipelineReviewModalPhotoIds = [];
   window._vireoNativeMenuPhotoIdsOverride = null;
+  return true;
+}
+
+function setPipelineKeywordSubmitting(submitting) {
+  var submit = document.getElementById('pipelineKeywordSubmitBtn');
+  if (submit) submit.disabled = submitting;
+  var cancel = document.getElementById('pipelineKeywordCancelBtn');
+  if (cancel) cancel.disabled = submitting;
+  var input = document.getElementById('pipelineKeywordInput');
+  if (input) input.disabled = submitting;
 }
 
 document.addEventListener('keydown', function(e) {
@@ -7630,20 +7653,28 @@ document.addEventListener('keydown', function(e) {
   }
 });
 
-async function confirmPipelineKeyword() {
+function confirmPipelineKeyword() {
+  if (pipelineReviewKeywordSubmitPromise) return pipelineReviewKeywordSubmitPromise;
   var ids = pipelineReviewModalPhotoIds.slice();
   var name = document.getElementById('pipelineKeywordInput').value.trim();
-  if (!ids.length || !name) return;
-  try {
-    await safeFetch('/api/batch/keyword', {
+  if (!ids.length || !name) return Promise.resolve(false);
+  setPipelineKeywordSubmitting(true);
+  pipelineReviewKeywordSubmitPromise = safeFetch('/api/batch/keyword', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({photo_ids: ids, name: name}),
+    }).then(function() {
+      hidePipelineKeywordModal(true);
+      showToast('Added "' + name + '" to ' + ids.length + ' photo' +
+        (ids.length === 1 ? '' : 's'), 'success');
+      return true;
+    }).catch(function() {
+      return false;
+    }).finally(function() {
+      pipelineReviewKeywordSubmitPromise = null;
+      setPipelineKeywordSubmitting(false);
     });
-  } catch(e) { return; }
-  hidePipelineKeywordModal();
-  showToast('Added "' + name + '" to ' + ids.length + ' photo' +
-    (ids.length === 1 ? '' : 's'), 'success');
+  return pipelineReviewKeywordSubmitPromise;
 }
 
 function buildPipelinePhotoContextMenu(photoIds, clickedPhotoId, inGroupReview) {

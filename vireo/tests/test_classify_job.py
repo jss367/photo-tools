@@ -435,6 +435,56 @@ def test_detect_batch_marks_processed_before_quality_scoring(tmp_path):
     assert 7 in detection_map
 
 
+def test_detect_batch_propagates_resource_wait_cancelled(tmp_path):
+    """Regression: ``ResourceWaitCancelled`` from a MegaDetector
+    inference-lease wait must escape ``_detect_batch``, not be
+    swallowed by the ``except (ImportError, RuntimeError)`` arm
+    (``ResourceWaitCancelled`` subclasses ``RuntimeError``).
+
+    Codex P1: on the reclassify path the caller has already called
+    ``db.clear_detections(photo["id"])`` for this photo before
+    invoking ``_detect_batch``. If the cancel is silently swallowed
+    here, the classify recovery rebuilds predictions using the
+    full-image fallback and lands a committed catalog change even
+    though the user pressed Stop.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from classify_job import _detect_batch
+    from resource_ledger import ResourceWaitCancelled
+
+    runner = FakeRunner()
+    job = _make_job()
+
+    photos = [{"id": 7, "filename": "bird.jpg", "folder_id": 10}]
+    folders = {10: str(tmp_path)}
+
+    img = Image.new("RGB", (100, 100), color="red")
+    img.save(str(tmp_path / "bird.jpg"))
+
+    def raising_detect(*_args, **_kwargs):
+        raise ResourceWaitCancelled(
+            "Cancelled while waiting for GPU inference resources",
+        )
+
+    mock_db = MagicMock()
+
+    with (
+        patch("classify_job.detect_animals", side_effect=raising_detect),
+        patch("classify_job.get_primary_detection", return_value=None),
+        pytest.raises(ResourceWaitCancelled),
+    ):
+        _detect_batch(
+            photos=photos,
+            folders=folders,
+            runner=runner,
+            job=job,
+            reclassify=True,
+            db=mock_db,
+            already_detected_ids=set(),
+        )
+
+
 def test_detect_batch_does_not_pass_threshold_to_detector(tmp_path, monkeypatch):
     """detect_animals is called with just the image path — the workspace
     threshold is NOT applied at write time.

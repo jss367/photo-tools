@@ -34,6 +34,7 @@ except ImportError:
 from db import AUTO_MATCH_REVIEW_MARKER, Database, commit_with_retry
 from keyword_normalization import _ASCII_LOWER_TABLE, normalize_keyword_display
 from models import get_active_model, get_models
+from resource_ledger import ResourceWaitCancelled
 
 
 def _folded_species_key(species):
@@ -882,6 +883,18 @@ def _detect_batch(photos, folders, runner, job, reclassify, db,
 
             processed_ids.add(photo["id"])
 
+    except ResourceWaitCancelled:
+        # Cooperative cancellation during a MegaDetector inference-lease
+        # wait — the reclassify Stop path. Must propagate: the caller
+        # already called ``clear_detections(photo["id"])`` for this
+        # photo on the reclassify path (classify_job.py:1073), so if
+        # this cancel were swallowed under the broad ``RuntimeError``
+        # arm below, the classify recovery would then rebuild
+        # predictions using the full-image fallback and land a
+        # committed catalog change even though the user pressed Stop.
+        # ``ResourceWaitCancelled`` subclasses ``RuntimeError``, so
+        # this narrow arm MUST precede the broad one.
+        raise
     except (ImportError, RuntimeError) as e:
         # Detection unavailable (missing weights/backend) — non-fatal, the
         # caller degrades to full-image classification. Previously silenced

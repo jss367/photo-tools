@@ -1912,7 +1912,13 @@ def test_read_only_scope_blocks_collection_and_keyword_writes(live_server, page)
     page.evaluate("hidePipelineKeywordModal(true); hidePipelineCollectionModal(true)")
     page.locator(f'.photo-card[data-photo-id="{photo_id}"]').click(button="right")
     menu = page.locator(".vireo-ctx-menu")
-    for label in ("Add to Collection", "Add Keyword", "Edit Photo"):
+    for label in (
+        "Add to Collection",
+        "Add Keyword",
+        "Edit Photo",
+        "Open in Editor",
+        "Develop in darktable",
+    ):
         item = menu.locator(".vireo-ctx-item", has_text=label)
         expect(item).to_have_class(re.compile(r"\bvireo-ctx-disabled\b"))
         expect(item).to_have_attribute("title", "Switch to Latest review to make changes")
@@ -1954,6 +1960,28 @@ def test_read_only_scope_blocks_collection_and_keyword_writes(live_server, page)
     }
     assert page.url == original_url
 
+    external_edits = page.evaluate(
+        """async pid => {
+          const originalSafeFetch = window.safeFetch;
+          const calls = [];
+          window.safeFetch = function(url) {
+            calls.push(url);
+            return Promise.resolve({available: false, opened: 1});
+          };
+          try {
+            return {
+              editor: await openInEditor([pid]),
+              develop: await developPhotos([pid]),
+              calls: calls,
+            };
+          } finally {
+            window.safeFetch = originalSafeFetch;
+          }
+        }""",
+        photo_id,
+    )
+    assert external_edits == {"editor": False, "develop": False, "calls": []}
+
 
 def test_read_only_scope_disables_lightbox_and_native_mutations(live_server, page):
     db = live_server["db"]
@@ -1979,6 +2007,7 @@ def test_read_only_scope_disables_lightbox_and_native_mutations(live_server, pag
         "#lightboxInat",
         "#lightboxAdjustBtn",
         "#lightboxDeleteBtn",
+        "#lightboxEditPhoto",
     ):
         expect(page.locator(selector)).to_be_disabled()
 
@@ -1994,6 +2023,7 @@ def test_read_only_scope_disables_lightbox_and_native_mutations(live_server, pag
             inatSubmitResult: await inatDoSubmit(),
             adjustmentResult: onLightboxAdjustmentInput(adjustment),
             cropResult: await openCropEditor(),
+            editResult: document.getElementById('lightboxEditPhoto').onclick(),
             deleteOpen: document.getElementById('deleteModal').classList.contains('open'),
             inatOpen: document.getElementById('inatModal').classList.contains('open'),
             adjustmentTimer: _lbAdjustSaveTimer,
@@ -2009,6 +2039,7 @@ def test_read_only_scope_disables_lightbox_and_native_mutations(live_server, pag
         "inatSubmitResult": False,
         "adjustmentResult": False,
         "cropResult": False,
+        "editResult": False,
         "deleteOpen": False,
         "inatOpen": False,
         "adjustmentTimer": None,
@@ -2027,6 +2058,9 @@ def test_read_only_scope_disables_lightbox_and_native_mutations(live_server, pag
         ".vireo-ctx-item", has_text="Wildlife classification"
     )
     expect(wildlife_item).to_have_class(re.compile(r"\bvireo-ctx-disabled\b"))
+    expect(menu.locator(".vireo-ctx-item", has_text="Open in Editor")).to_have_class(
+        re.compile(r"\bvireo-ctx-disabled\b")
+    )
 
 
 def test_lightbox_deletion_updates_process_and_open_group_state(live_server, page):

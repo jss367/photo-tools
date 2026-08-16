@@ -4367,6 +4367,12 @@ function notifyReadOnlyScopedView() {
   );
 }
 
+window.getPhotoExternalEditDisabledHint = function() {
+  return isScopedReviewView()
+    ? 'Switch to Latest review to make changes'
+    : null;
+};
+
 function setReviewScopeStatus(text, isError) {
   var el = document.getElementById('reviewScopeStatus');
   if (!el) return;
@@ -7970,7 +7976,9 @@ function buildPipelinePhotoContextMenu(photoIds, clickedPhotoId, inGroupReview) 
     items = items.concat(window.buildOpenInEditorMenuItems(photoIds));
   }
   if (typeof window.developPhotos === 'function') {
-    items.push({label: 'Develop in darktable', onClick: function() { window.developPhotos(photoIds); }});
+    items.push({label: 'Develop in darktable', disabled: !!scopedWriteHint,
+      disabledHint: scopedWriteHint,
+      onClick: function() { window.developPhotos(photoIds); }});
   }
   if (inGroupReview && grmState && grmState.allowRemove !== false) {
     items.push({separator: true});

@@ -3953,9 +3953,11 @@ function _lbApplyReadOnlyState() {
   if (_lbReadOnly && panel) panel.classList.remove('open');
   var editButton = document.getElementById('lightboxEditPhoto');
   if (editButton) {
-    var editHint = typeof window.getLightboxBrowseDisabledHint === 'function'
-      ? window.getLightboxBrowseDisabledHint(_lightboxCurrentId, true)
-      : null;
+    var editHint = _lbReadOnly
+      ? _lbReadOnlyMessage
+      : (typeof window.getLightboxBrowseDisabledHint === 'function'
+        ? window.getLightboxBrowseDisabledHint(_lightboxCurrentId, true)
+        : null);
     editButton.disabled = !!editHint;
     editButton.title = editHint || 'Edit photo';
   }
@@ -7756,6 +7758,7 @@ function openLightbox(photoId, filename, photoList, options) {
   if (editPhotoBtn) {
     editPhotoBtn.onclick = function(e) {
       if (e) e.stopPropagation();
+      if (_lbGuardReadOnly()) return false;
       var editHint = typeof window.getLightboxBrowseDisabledHint === 'function'
         ? window.getLightboxBrowseDisabledHint(photoId, true)
         : null;
@@ -10880,8 +10883,23 @@ window.invalidateEditorsCache = function() {
   _externalEditorsLoading = null;
 };
 
+function photoExternalEditDisabledHint() {
+  if (_lbReadOnly && typeof nativeMenuLightboxOpen === 'function' &&
+      nativeMenuLightboxOpen()) {
+    return _lbReadOnlyMessage;
+  }
+  return typeof window.getPhotoExternalEditDisabledHint === 'function'
+    ? window.getPhotoExternalEditDisabledHint()
+    : null;
+}
+
 async function openInEditor(photoIds, editorIndex) {
   if (!photoIds || !photoIds.length) return;
+  var disabledHint = photoExternalEditDisabledHint();
+  if (disabledHint) {
+    showToast(disabledHint, 'warning');
+    return false;
+  }
   var body = { photo_ids: photoIds };
   if (typeof editorIndex === 'number') body.editor_index = editorIndex;
   try {
@@ -10902,16 +10920,21 @@ async function openInEditor(photoIds, editorIndex) {
 // inline without a nested submenu.
 window.buildOpenInEditorMenuItems = function(photoIds) {
   var editors = window.getExternalEditorsSync();
+  var disabledHint = photoExternalEditDisabledHint();
   if (editors.length > 1) {
     return editors.map(function(ed, idx) {
       return {
         label: 'Open in ' + ed.name,
+        disabled: !!disabledHint,
+        disabledHint: disabledHint || undefined,
         onClick: function() { window.openInEditor(photoIds, idx); },
       };
     });
   }
   return [{
     label: 'Open in Editor',
+    disabled: !!disabledHint,
+    disabledHint: disabledHint || undefined,
     onClick: function() { window.openInEditor(photoIds); },
   }];
 };
@@ -10935,6 +10958,11 @@ window.buildOpenInEditorMenuItems = function(photoIds) {
  */
 async function developPhotos(photoIds) {
   if (!photoIds || !photoIds.length) return;
+  var disabledHint = photoExternalEditDisabledHint();
+  if (disabledHint) {
+    showToast(disabledHint, 'warning');
+    return false;
+  }
   try {
     var status = await safeFetch('/api/darktable/status', {}, { toast: false });
     if (!status.available) {

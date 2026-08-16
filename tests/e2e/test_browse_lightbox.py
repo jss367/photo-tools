@@ -625,6 +625,76 @@ def test_browse_lightbox_zoom_hud_fit_stop_reaches_exact_native(live_server, pag
     expect(page.locator("#lightboxZoomBadge")).to_have_text("100%")
 
 
+def test_browse_lightbox_zoom_toggle_returns_to_fit_near_native(live_server, page):
+    """The `z` toggle must return to exact fit even when the HUD combines Fit and 1:1."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" '
+        'viewBox="0 0 1600 1200"><rect width="1600" height="1200" fill="#274"/></svg>'
+    )
+    page.route(
+        re.compile(r"/photos/\d+/(full|original|preview)"),
+        lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
+    )
+    page.set_viewport_size({"width": 1000, "height": 800})
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+
+    expect(page.locator("#lightboxOverlay")).to_have_class("lightbox-overlay active")
+    page.wait_for_function(
+        """() => {
+            const img = document.getElementById('lightboxImg');
+            return img && img.complete && img.naturalWidth === 1600 &&
+                !window._lbVisualTransitionPending;
+        }"""
+    )
+
+    # Native zoom in the combined-stop range: the HUD collapses the standalone
+    # 1:1 stop into the Fit label, so setLightboxZoomToFit() routes back to
+    # 1:1. The `z` toggle must not inherit that routing.
+    zoomed = page.evaluate(
+        """() => {
+            window._lbCancelOriginalPreload();
+            window._lbScheduleSourceSwap = function() {};
+            window._lbNativeZoom = 1.05;
+            window._lbCurrentSrcKey = window._lbPickSourceKey(window._lbNativeZoom);
+            window._lbSetZoom(window._lbNativeZoom, null, null);
+            return {
+                zoom: window._lbZoom,
+                combined: window._lbNativeCoincidesWithFit(),
+            };
+        }"""
+    )
+    assert abs(zoomed["zoom"] - 1.05) < 0.01
+    assert zoomed["combined"] is True
+
+    page.evaluate("() => window.toggleLightboxZoom()")
+    fit_state = page.evaluate(
+        """() => ({
+            zoom: window._lbZoom,
+            pending: window._lbPending1To1,
+        })"""
+    )
+    assert abs(fit_state["zoom"] - 1.0) < 0.001
+    assert fit_state["pending"] is False
+
+    # A pending 1:1 upgrade in the same range must also be cancellable via z.
+    page.evaluate(
+        """() => {
+            window._lbPending1To1 = true;
+            window._lbPending1To1Anchor = { x: 0, y: 0 };
+        }"""
+    )
+    page.evaluate("() => window.toggleLightboxZoom()")
+    cancelled = page.evaluate(
+        """() => ({
+            zoom: window._lbZoom,
+            pending: window._lbPending1To1,
+        })"""
+    )
+    assert abs(cancelled["zoom"] - 1.0) < 0.001
+    assert cancelled["pending"] is False
+
+
 def test_browse_lightbox_reserves_space_for_bottom_controls(live_server, page):
     """The fitted image stays above the toolbar and expands when it is hidden."""
     svg = (

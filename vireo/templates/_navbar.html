@@ -7781,7 +7781,14 @@ function toggleLightboxZoom(e) {
   // A deferred 1:1 leaves _lbZoom at fit while the sharp source loads, so treat
   // that pending state as zoomed and allow a second toggle to cancel it.
   if (_lbZoom > 1.001 || _lbPending1To1) {
-    setLightboxZoomToFit();
+    // Drive the zoom-out branch to exact fit directly rather than through
+    // setLightboxZoomToFit(): in the near-fit native range where the HUD
+    // combines the Fit and 1:1 labels, that helper redirects back to 1:1
+    // and the toggle can neither return to fit nor cancel a pending 1:1
+    // source upgrade. _lbSetZoom clears _lbPending1To1 for us.
+    if (_lbVisualTransitionPending) return;
+    _lbClearPendingViewportRestore();
+    _lbSetZoom(1.0, null, null);
   } else {
     setLightboxZoomToOneToOne(e);
   }

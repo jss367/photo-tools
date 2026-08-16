@@ -894,6 +894,15 @@ def test_lightbox_provisional_group_flag_does_not_poison_confirmed_cache(
     }
     assert _flags(db, photo_ids) == ["none"] * 4
 
+    # A later group shortcut supersedes the lightbox choice. Reopening the
+    # lightbox must show the current pending zone, not the earlier cached one.
+    page.evaluate("closeLightbox(); grmMovePick()")
+    page.evaluate("pid => openPipelineLightbox(pid)", photo_id)
+    expect(page.locator("#lightboxFlagStatus")).to_have_text("Flagged")
+    page.evaluate("closeLightbox(); grmMoveCandidate()")
+    page.evaluate("pid => openPipelineLightbox(pid)", photo_id)
+    expect(page.locator("#lightboxFlagStatus")).to_have_text("No flag")
+
     # Discard the group without Apply. The main grid must still reflect the
     # confirmed database/cache value rather than the abandoned pending zone.
     page.evaluate("closeLightbox(); closeGroupReview(); renderResults()")
@@ -901,3 +910,49 @@ def test_lightbox_provisional_group_flag_does_not_poison_confirmed_cache(
         page.locator(f'.photo-card[data-photo-id="{photo_id}"] .flag-rejected')
     ).to_have_count(0)
     assert _flags(db, photo_ids) == ["none"] * 4
+
+
+def test_read_only_scope_lightbox_flag_does_not_mutate_cache(live_server, page):
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    photo_id = photo_ids[0]
+    page.evaluate("reviewScopeMode = 'workspace'")
+    page.evaluate("pid => openPipelineLightbox(pid)", photo_id)
+    page.evaluate("pid => _lbApplyFlag(pid, 'rejected')", photo_id)
+    page.wait_for_function("_lbFlagPendingWrites === 0")
+
+    state = page.evaluate(
+        "pid => ({"
+        "confirmed: _lbConfirmedFlagFor(pid),"
+        "cached: pipelineResults.photos.find(p => p.id === pid).flag,"
+        "status: document.getElementById('lightboxFlagStatus').textContent,"
+        "})",
+        photo_id,
+    )
+    assert state == {"confirmed": "none", "cached": "none", "status": "No flag"}
+    assert _flags(db, photo_ids) == ["none"] * 4
+
+
+def test_tauri_disables_navigation_when_group_review_is_dirty(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    page.evaluate("window.__TAURI_INTERNALS__ = {}; grmMoveReject()")
+
+    card = page.locator("#grmOverlay .grm-card[data-photo-id]").first
+    card.click(button="right")
+    menu = page.locator(".vireo-ctx-menu")
+    for label in ("Open in Browse", "Edit Photo"):
+        item = menu.locator(".vireo-ctx-item", has_text=label)
+        expect(item).to_have_class(re.compile(r"\bvireo-ctx-disabled\b"))
+        expect(item).to_have_attribute(
+            "title", "Apply or close Group Review before leaving this page"
+        )

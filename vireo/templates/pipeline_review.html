@@ -4043,7 +4043,10 @@ function setPipelineReviewFlag(photoId, flag) {
   if (!photoId) return Promise.resolve();
   if (isScopedReviewView()) {
     notifyReadOnlyScopedView();
-    return Promise.resolve();
+    // The shared lightbox treats undefined as a successful write. Return an
+    // explicit failure so it restores the confirmed chip and does not mutate
+    // the shared photo cache for this read-only view.
+    return Promise.resolve(false);
   }
   // When the shared lightbox (or any other caller) writes a flag while Group
   // Review is open and this photo is a group member, route the change through
@@ -5711,6 +5714,17 @@ function grmSyncZoneCards() {
   document.getElementById('grmCount').textContent =
     zones.picks.length + ' picks, ' + zones.rejects.length + ' rejects, ' +
     zones.candidates.length + ' unsorted';
+  // A lightbox flag action stages the same pending zone state. Keep its
+  // provisional display synchronized when a later P/X/Space/context-menu
+  // move changes that state before Apply.
+  if (grmState.touched && typeof window.setLightboxProvisionalFlag === 'function') {
+    grmState.touched.forEach(function(photoId) {
+      var flag = grmState.picks.has(photoId)
+        ? 'flagged'
+        : (grmState.rejects.has(photoId) ? 'rejected' : 'none');
+      window.setLightboxProvisionalFlag(photoId, flag);
+    });
+  }
   grmUpdateKeywordSummary(grmKeywordStats(_grmKeywordSummaryMembers()));
   grmSyncSelectionClasses();
   grmRefreshResetAllVisibility();
@@ -7406,6 +7420,12 @@ function openPipelinePhotoEditor(photoId) {
   }
 }
 
+function grmHasPendingUserEdits() {
+  if (!grmState || !grmState.seeded) return false;
+  var diff = grmComputeDiff();
+  return grmFlagsDirty(diff) || diff.speciesChanged || !!grmState.speciesFieldTouched;
+}
+
 function pipelineCollectionAcceptsManualPhotos(collection) {
   if (typeof collection.can_add_photos === 'boolean') return collection.can_add_photos;
   try {
@@ -7546,6 +7566,14 @@ function buildPipelinePhotoContextMenu(photoIds, clickedPhotoId, inGroupReview) 
   photoIds = pipelineReviewUniquePhotoIds(photoIds);
   var one = photoIds.length === 1;
   var singleHint = one ? undefined : 'Select a single photo';
+  var tauriNavigationBlocked = !!(
+    inGroupReview &&
+    typeof isTauri === 'function' && isTauri() &&
+    grmHasPendingUserEdits()
+  );
+  var navigationHint = tauriNavigationBlocked
+    ? 'Apply or close Group Review before leaving this page'
+    : singleHint;
   var rateChip = function(n) {
     return {
       label: n === 0 ? '\u2606' : String(n),
@@ -7590,7 +7618,7 @@ function buildPipelinePhotoContextMenu(photoIds, clickedPhotoId, inGroupReview) 
   items.push({separator: true});
   items.push({label: 'Open in Lightbox', disabled: !one, disabledHint: singleHint,
     onClick: function() { openPipelineLightbox(clickedPhotoId); }});
-  items.push({label: 'Open in Browse', disabled: !one, disabledHint: singleHint,
+  items.push({label: 'Open in Browse', disabled: !one || tauriNavigationBlocked, disabledHint: navigationHint,
     onClick: function() { window.openInBrowse(clickedPhotoId); }});
   if (typeof window.findSimilar === 'function') {
     items.push({label: 'Find Similar', disabled: !one, disabledHint: singleHint,
@@ -7608,7 +7636,7 @@ function buildPipelinePhotoContextMenu(photoIds, clickedPhotoId, inGroupReview) 
     items = items.concat(window.buildSpeciesRepresentativeMenuItems(photoIds, {showFetchFallback: true}));
   }
   items.push({separator: true});
-  items.push({label: 'Edit Photo', disabled: !one, disabledHint: singleHint,
+  items.push({label: 'Edit Photo', disabled: !one || tauriNavigationBlocked, disabledHint: navigationHint,
     onClick: function() { openPipelinePhotoEditor(clickedPhotoId); }});
   if (typeof window.buildOpenInEditorMenuItems === 'function') {
     items = items.concat(window.buildOpenInEditorMenuItems(photoIds));

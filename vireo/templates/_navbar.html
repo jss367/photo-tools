@@ -6023,6 +6023,15 @@ function _lbDisplayedFlagFor(photoId) {
   return _lbConfirmedFlagFor(photoId);
 }
 
+window.setLightboxProvisionalFlag = function(photoId, flag) {
+  var normalized = _lbNormalizeFlag(flag);
+  if (photoId == null || !normalized) return;
+  _lbProvisionalFlags[String(photoId)] = normalized;
+  if (_lightboxCurrentId === parseInt(photoId, 10)) {
+    _lbSetFlagStatus(normalized);
+  }
+};
+
 // A page that stages flag edits can clear its lightbox-only provisional
 // display when the staging session ends. Forget the confirmed memo too so
 // the page's now-authoritative photo list (persisted on Apply, unchanged on
@@ -6107,7 +6116,7 @@ function _lbApplyFlag(photoId, flag) {
     else delete _lbFlagPendingByPhoto[photoId];
 
     if (provisional) {
-      _lbProvisionalFlags[String(photoId)] = normalized;
+      window.setLightboxProvisionalFlag(photoId, normalized);
       if (_lightboxCurrentId === photoId && (_lbFlagEditSeq === seq || _lbFlagPendingWrites === 0)) {
         _lbSetFlagStatus(_lbDisplayedFlagFor(photoId));
       }

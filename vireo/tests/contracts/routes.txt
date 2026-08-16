@@ -54,6 +54,7 @@ GET          /api/filters/fields
 GET          /api/filters/values
 GET          /api/folders
 GET          /api/folders/<int:folder_id>
+GET          /api/folders/<int:folder_id>/workspaces
 GET          /api/folders/missing
 GET          /api/health
 GET          /api/highlights

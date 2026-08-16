@@ -2741,6 +2741,49 @@ class Database:
             (workspace_id,),
         ).fetchall()
 
+    def get_folder_workspaces(self, folder_id):
+        """Return every workspace in which ``folder_id`` is visible.
+
+        Include direct links plus read-only inheritance from recursive roots.
+        Do not materialize the inferred descendant row: some import and repair
+        paths create deliberately restricted exact non-root links that must not
+        expand merely because the user inspected a folder's memberships.
+        """
+        return self.conn.execute(
+            """SELECT w.id, w.name,
+                      MAX(CASE
+                            WHEN wf.folder_id = target.id AND wf.is_root = 1
+                            THEN 1 ELSE 0
+                          END) AS is_root
+               FROM workspaces w
+               JOIN workspace_folders wf ON wf.workspace_id = w.id
+               JOIN folders root ON root.id = wf.folder_id
+               JOIN folders target ON target.id = ?
+               LEFT JOIN local_folder_mappings target_lfm
+                 ON target_lfm.folder_id = target.id
+               WHERE wf.folder_id = target.id
+                  OR (
+                    wf.is_root = 1
+                    AND (
+                      REPLACE(target.path, '\\', '/') = REPLACE(root.path, '\\', '/')
+                      OR substr(
+                           REPLACE(target.path, '\\', '/'),
+                           1,
+                           length(RTRIM(REPLACE(root.path, '\\', '/'), '/') || '/')
+                         ) = RTRIM(REPLACE(root.path, '\\', '/'), '/') || '/'
+                      OR REPLACE(target_lfm.source_path, '\\', '/') = REPLACE(root.path, '\\', '/')
+                      OR substr(
+                           REPLACE(target_lfm.source_path, '\\', '/'),
+                           1,
+                           length(RTRIM(REPLACE(root.path, '\\', '/'), '/') || '/')
+                         ) = RTRIM(REPLACE(root.path, '\\', '/'), '/') || '/'
+                    )
+                  )
+               GROUP BY w.id, w.name, w.pinned_at
+               ORDER BY (w.pinned_at IS NULL), LOWER(w.name), w.id""",
+            (folder_id,),
+        ).fetchall()
+
     def get_workspace_folder_roots(self, workspace_id):
         """Return user-facing workspace roots, hiding covered descendants.
 

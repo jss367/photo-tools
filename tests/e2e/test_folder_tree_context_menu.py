@@ -5,6 +5,7 @@ Menu items:
 - separator
 - Reveal in Finder/Folder
 - Copy Path
+- Show Associated Workspaces…
 - separator
 - Work Locally…
 - Move…
@@ -32,6 +33,7 @@ def test_folder_tree_right_click_opens_menu(live_server, page):
         "Filter by this folder",
         "Reveal in",
         "Copy Path",
+        "Show Associated Workspaces…",
         "Work Locally…",
         "Move…",
         "Rescan this Folder",
@@ -189,6 +191,84 @@ def test_folder_tree_copy_path_fetches_folder(live_server, page):
         lambda r: r.url.endswith(f"/api/folders/{fid}") and r.status == 200
     ):
         menu.locator(".vireo-ctx-item", has_text="Copy Path").click()
+
+
+def test_folder_tree_shows_associated_workspaces(live_server, page):
+    """The folder context menu opens a list of every linked workspace."""
+    db = live_server["db"]
+    active_workspace = db.get_workspace(db._active_workspace_id)
+    folder_id = db.get_folder_tree()[0]["id"]
+    shared_workspace_id = db.create_workspace("Shared Bird Library")
+    db.add_workspace_folder(shared_workspace_id, folder_id)
+
+    page.goto(f"{live_server['url']}/browse")
+    item = page.locator(f'.tree-item[data-folder-id="{folder_id}"]')
+    item.wait_for(state="visible")
+    item.click(button="right")
+
+    with page.expect_response(
+        lambda response: response.url.endswith(
+            f"/api/folders/{folder_id}/workspaces"
+        ) and response.status == 200
+    ):
+        page.locator(
+            ".vireo-ctx-menu .vireo-ctx-item",
+            has_text="Show Associated Workspaces…",
+        ).click()
+
+    modal = page.locator("#folderWorkspacesModal")
+    expect(modal).to_have_class("modal-overlay open")
+    expect(modal.locator("#folderWorkspacesList")).to_contain_text(
+        active_workspace["name"]
+    )
+    expect(modal.locator("#folderWorkspacesList")).to_contain_text(
+        "Shared Bird Library"
+    )
+    expect(modal.locator("#folderWorkspacesList")).to_contain_text("Current")
+
+
+def test_folder_workspace_modal_ignores_stale_response(live_server, page):
+    """A slower first request cannot overwrite a newer folder's modal."""
+    db = live_server["db"]
+    folders = db.get_folder_tree()
+    first_id = folders[0]["id"]
+    second_id = folders[1]["id"]
+    held_route = {"route": None}
+
+    def hold_first(route):
+        held_route["route"] = route
+
+    page.route(f"**/api/folders/{first_id}/workspaces", hold_first)
+    page.goto(f"{live_server['url']}/browse")
+
+    page.evaluate("fid => { showFolderWorkspaces(fid); }", first_id)
+    page.wait_for_function("() => document.querySelector('#folderWorkspacesModal').classList.contains('open')")
+
+    with page.expect_response(
+        lambda response: response.url.endswith(
+            f"/api/folders/{second_id}/workspaces"
+        ) and response.status == 200
+    ):
+        page.evaluate("fid => { showFolderWorkspaces(fid); }", second_id)
+
+    expected_path = db.get_folder(second_id)["path"]
+    expect(page.locator("#folderWorkspacesPath")).to_have_text(expected_path)
+
+    held_route["route"].fulfill(
+        status=200,
+        content_type="application/json",
+        body=(
+            '{"folder":{"id":%d,"name":"stale","path":"/stale/path"},'
+            '"workspaces":[{"id":999,"name":"Stale Workspace",'
+            '"is_active":false,"is_root":true}]}'
+        ) % first_id,
+    )
+    page.wait_for_timeout(100)
+
+    expect(page.locator("#folderWorkspacesPath")).to_have_text(expected_path)
+    expect(page.locator("#folderWorkspacesList")).not_to_contain_text(
+        "Stale Workspace"
+    )
 
 
 def test_folder_tree_right_click_does_not_trigger_filter(live_server, page):

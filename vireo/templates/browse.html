@@ -1828,6 +1828,22 @@ body.sidebar-resizing {
 
 {% include '_work_locally_stage_modal.html' %}
 
+<!-- Folder Workspace Membership Modal -->
+<div class="modal-overlay" id="folderWorkspacesModal"
+     onclick="if(event.target===this) hideFolderWorkspaces()">
+  <div class="modal" style="width:440px;max-width:calc(100vw - 32px);">
+    <h3>Associated Workspaces</h3>
+    <div id="folderWorkspacesPath"
+         style="font-family:monospace;font-size:11px;color:var(--text-dim);overflow-wrap:anywhere;margin-bottom:14px;"></div>
+    <div id="folderWorkspacesList" style="display:flex;flex-direction:column;gap:6px;">
+      <div style="color:var(--text-secondary);font-size:13px;">Loading workspaces…</div>
+    </div>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-cancel" onclick="hideFolderWorkspaces()">Close</button>
+    </div>
+  </div>
+</div>
+
 <!-- Collection Modal -->
 <div class="modal-overlay" id="collectionModal">
   <div class="modal">
@@ -8892,6 +8908,71 @@ async function copyFolderPath(fid) {
   }
 }
 
+var folderWorkspacesRequestSeq = 0;
+
+function hideFolderWorkspaces() {
+  folderWorkspacesRequestSeq += 1;
+  document.getElementById('folderWorkspacesModal').classList.remove('open');
+}
+
+async function showFolderWorkspaces(fid) {
+  var requestSeq = ++folderWorkspacesRequestSeq;
+  var modal = document.getElementById('folderWorkspacesModal');
+  var path = document.getElementById('folderWorkspacesPath');
+  var list = document.getElementById('folderWorkspacesList');
+  path.textContent = '';
+  list.textContent = '';
+  var loading = document.createElement('div');
+  loading.style.cssText = 'color:var(--text-secondary);font-size:13px;';
+  loading.textContent = 'Loading workspaces…';
+  list.appendChild(loading);
+  modal.classList.add('open');
+
+  try {
+    var data = await safeFetch('/api/folders/' + fid + '/workspaces', {}, { toast: false });
+    if (requestSeq !== folderWorkspacesRequestSeq) return;
+    path.textContent = data.folder && data.folder.path ? data.folder.path : '';
+    list.textContent = '';
+    (data.workspaces || []).forEach(function(workspace) {
+      var row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 10px;background:var(--bg-tertiary);border:1px solid var(--border-secondary);border-radius:5px;font-size:13px;';
+
+      var name = document.createElement('span');
+      name.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+      name.textContent = workspace.name;
+      name.title = workspace.name;
+      row.appendChild(name);
+
+      if (workspace.is_root) {
+        var rootBadge = document.createElement('span');
+        rootBadge.style.cssText = 'font-size:10px;color:var(--text-faint);';
+        rootBadge.textContent = 'Root';
+        row.appendChild(rootBadge);
+      }
+      if (workspace.is_active) {
+        var activeBadge = document.createElement('span');
+        activeBadge.style.cssText = 'font-size:10px;color:var(--accent);font-weight:600;';
+        activeBadge.textContent = 'Current';
+        row.appendChild(activeBadge);
+      }
+      list.appendChild(row);
+    });
+    if (!list.children.length) {
+      var empty = document.createElement('div');
+      empty.style.cssText = 'color:var(--text-secondary);font-size:13px;';
+      empty.textContent = 'This folder is not associated with any workspace.';
+      list.appendChild(empty);
+    }
+  } catch (err) {
+    if (requestSeq !== folderWorkspacesRequestSeq) return;
+    list.textContent = '';
+    var error = document.createElement('div');
+    error.style.cssText = 'color:var(--danger);font-size:13px;';
+    error.textContent = (err && err.message) || 'Could not load associated workspaces.';
+    list.appendChild(error);
+  }
+}
+
 function moveFolder(fid) {
   window.location.href = '/move?folder_id=' + encodeURIComponent(fid);
 }
@@ -8933,6 +9014,7 @@ document.addEventListener('contextmenu', function(e) {
     { separator: true },
     { label: window.VIREO_REVEAL_LABEL, onClick: function() { revealFolder(fid); } },
     { label: 'Copy Path', onClick: function() { copyFolderPath(fid); } },
+    { label: 'Show Associated Workspaces…', onClick: function() { showFolderWorkspaces(fid); } },
     { separator: true },
     { label: 'Work Locally\u2026', onClick: function() { workLocallyFolder(fid); } },
     { label: 'Move\u2026', onClick: function() { moveFolder(fid); } },

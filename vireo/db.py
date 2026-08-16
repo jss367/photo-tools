@@ -6265,6 +6265,7 @@ class Database:
                       JOIN workspace_folders wf
                         ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
                      WHERE d.detector_model != 'full-image'
+                       AND d.category = 'animal'
                        AND d.detector_confidence >= ?{scope_sql}
                 )
                 SELECT COUNT(*) AS primary_dets,
@@ -6341,6 +6342,7 @@ class Database:
                       JOIN workspace_folders wf
                         ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
                      WHERE d.detector_model != 'full-image'
+                       AND d.category = 'animal'
                        AND d.detector_confidence >= ?{scope_sql}
                 )
                 SELECT COUNT(*) AS pending
@@ -6425,6 +6427,7 @@ class Database:
                       JOIN workspace_folders wf
                         ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
                      WHERE d.detector_model != 'full-image'
+                       AND d.category = 'animal'
                        AND d.detector_confidence >= ?{scope_sql}
                 )
                 SELECT COUNT(*) AS n
@@ -6449,13 +6452,17 @@ class Database:
 
     def count_full_image_fallback_photos(
         self, photo_ids=None, detector_model="megadetector-v6",
+        min_conf=0,
     ):
         """Count photos eligible for full-image fallback classification.
 
-        These are photos in the active workspace where the detector has
-        successfully run and found no boxes. Photos with any real detector row,
-        including below-threshold noise, are excluded to match the pipeline's
-        current runtime fallback gate.
+        These are photos in the active workspace where the detector has run
+        and produced no box the classifier could act on: either
+        ``box_count = 0`` or every non-full-image row is below ``min_conf``
+        (raw noise). Callers that want to mirror the runtime fallback gate
+        pass the workspace's ``detector_confidence``; the default of ``0``
+        preserves the pre-noise-fallback semantics where any real row
+        disqualified the photo.
         """
         ws = self._ws_id()
         scope_sql, scope_params = self._scope_clause(photo_ids)
@@ -6464,24 +6471,36 @@ class Database:
                   FROM photos p
                   JOIN workspace_folders wf
                     ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
-                  JOIN detector_runs dr
+                 JOIN detector_runs dr
                     ON dr.photo_id = p.id
                    AND dr.detector_model = ?
-                   AND dr.box_count = 0
-                 WHERE NOT EXISTS (
+                 WHERE (dr.box_count = 0 OR EXISTS (
+                         SELECT 1 FROM detections consistent
+                          WHERE consistent.photo_id = p.id
+                            AND consistent.detector_model = dr.detector_model
+                       ))
+                   AND NOT EXISTS (
                          SELECT 1 FROM detections d
                           WHERE d.photo_id = p.id
                             AND d.detector_model != 'full-image'
+                            AND d.detector_confidence >= ?
                        ){scope_sql}""",
-            (ws, detector_model, *scope_params),
+            (ws, detector_model, min_conf, *scope_params),
         ).fetchone()
         return row["n"] or 0
 
     def count_full_image_classify_pending_pairs(
         self, classifier_model, labels_fingerprint,
         photo_ids=None, detector_model="megadetector-v6",
+        min_conf=0,
     ):
-        """Count fallback photos lacking a classifier run for (model, fp)."""
+        """Count fallback photos lacking a classifier run for (model, fp).
+
+        ``min_conf`` mirrors the runtime fallback gate: a photo qualifies
+        when no non-full-image detection row is at or above the threshold,
+        so a MegaDetector run that produced only noise (< ``min_conf``)
+        counts alongside truly empty ``box_count = 0`` runs.
+        """
         ws = self._ws_id()
         scope_sql, scope_params = self._scope_clause(photo_ids)
         row = self.conn.execute(
@@ -6499,12 +6518,17 @@ class Database:
                       JOIN detector_runs dr
                         ON dr.photo_id = p.id
                        AND dr.detector_model = ?
-                       AND dr.box_count = 0
                       LEFT JOIN full_anchor fa ON fa.photo_id = p.id
-                     WHERE NOT EXISTS (
+                     WHERE (dr.box_count = 0 OR EXISTS (
+                             SELECT 1 FROM detections consistent
+                              WHERE consistent.photo_id = p.id
+                                AND consistent.detector_model = dr.detector_model
+                           ))
+                       AND NOT EXISTS (
                              SELECT 1 FROM detections d
                               WHERE d.photo_id = p.id
                                 AND d.detector_model != 'full-image'
+                                AND d.detector_confidence >= ?
                            ){scope_sql}
                   )
                 SELECT COUNT(*) AS pending
@@ -6516,7 +6540,7 @@ class Database:
                  WHERE f.detection_id IS NULL
                     OR cr.detection_id IS NULL""",
             (
-                ws, detector_model, *scope_params,
+                ws, detector_model, min_conf, *scope_params,
                 classifier_model, labels_fingerprint,
             ),
         ).fetchone()
@@ -6525,8 +6549,14 @@ class Database:
     def count_full_image_classify_stale(
         self, classifier_model, labels_fingerprint,
         photo_ids=None, detector_model="megadetector-v6",
+        min_conf=0,
     ):
-        """Count fallback anchors with stale runs and no current run."""
+        """Count fallback anchors with stale runs and no current run.
+
+        ``min_conf`` mirrors ``count_full_image_fallback_photos`` so
+        photos whose only detections are noise (< ``min_conf``) join the
+        stale-anchor scope alongside the ``box_count = 0`` cases.
+        """
         ws = self._ws_id()
         scope_sql, scope_params = self._scope_clause(photo_ids)
         row = self.conn.execute(
@@ -6544,12 +6574,17 @@ class Database:
                       JOIN detector_runs dr
                         ON dr.photo_id = p.id
                        AND dr.detector_model = ?
-                       AND dr.box_count = 0
                       JOIN full_anchor fa ON fa.photo_id = p.id
-                     WHERE NOT EXISTS (
+                     WHERE (dr.box_count = 0 OR EXISTS (
+                             SELECT 1 FROM detections consistent
+                              WHERE consistent.photo_id = p.id
+                                AND consistent.detector_model = dr.detector_model
+                           ))
+                       AND NOT EXISTS (
                              SELECT 1 FROM detections d
                               WHERE d.photo_id = p.id
                                 AND d.detector_model != 'full-image'
+                                AND d.detector_confidence >= ?
                            ){scope_sql}
                   )
                 SELECT COUNT(*) AS n
@@ -6567,7 +6602,7 @@ class Database:
                             AND cr_cur.labels_fingerprint = ?
                        )""",
             (
-                ws, detector_model, *scope_params,
+                ws, detector_model, min_conf, *scope_params,
                 classifier_model, labels_fingerprint,
                 classifier_model, labels_fingerprint,
             ),

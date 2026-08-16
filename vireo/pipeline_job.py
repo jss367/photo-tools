@@ -4631,6 +4631,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # already sitting in the local store.
                 if not params.reclassify:
                     try:
+                        import config as cfg
                         from computation_cache import (
                             CacheFormatError,
                             full_image_runtime_fingerprint,
@@ -4646,10 +4647,94 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         # being deferred by the runtime-fingerprint
                         # gate.
                         full_runtime = full_image_runtime_fingerprint()
+                        # Also broaden the anchor set to include photos
+                        # whose only detections are noise (< detector_
+                        # confidence) so cached full-image classifiers
+                        # attach on this materialize instead of forcing
+                        # the classify stage's lazy per-photo anchor
+                        # creation — which happens AFTER materialize and
+                        # re-runs inference for an answer already sitting
+                        # in the local store. The runtime fallback at
+                        # ``classify_stage`` fires under the same
+                        # predicate (no usable animal box at the strict
+                        # threshold, no confident non-animal box), so
+                        # mirror it exactly here to avoid pre-creating
+                        # anchors the fallback would refuse to use.
+                        try:
+                            _effective_cfg = thread_db.get_effective_config(
+                                cfg.load()
+                            )
+                            _det_conf = _effective_cfg.get(
+                                "detector_confidence", 0.2,
+                            )
+                        except Exception:
+                            _effective_cfg = {}
+                            _det_conf = 0.2
+
+                        _pipeline_cfg = _effective_cfg.get("pipeline", {})
+                        _weak_enabled = _pipeline_cfg.get(
+                            "weak_detection_rescue_enabled", True,
+                        )
+                        _weak_conf = _pipeline_cfg.get(
+                            "weak_detection_confidence", 0.12,
+                        )
+                        _contextual_weak_ids = set()
+                        if (
+                            _weak_enabled
+                            and _weak_conf < _det_conf
+                            and photos
+                        ):
+                            from weak_detections import (
+                                contextual_weak_photo_ids,
+                            )
+
+                            _raw_mdv6 = thread_db.get_detections_for_photos(
+                                [p["id"] for p in photos],
+                                min_conf=_weak_conf,
+                                detector_model="megadetector-v6",
+                            )
+                            _contextual_weak_ids = contextual_weak_photo_ids(
+                                photos,
+                                _raw_mdv6,
+                                detector_confidence=_det_conf,
+                                weak_confidence=_weak_conf,
+                                max_gap=_pipeline_cfg.get(
+                                    "burst_time_gap", 3.0,
+                                ),
+                            )
+
+                        def _needs_full_image_anchor(pid):
+                            if pid in _contextual_weak_ids:
+                                return False
+                            dets = this_run_detections.get(pid) or []
+                            if not dets:
+                                return True
+                            has_usable_animal = any(
+                                d.get("detector_model") != "full-image"
+                                and d.get("category", "animal") == "animal"
+                                and d.get(
+                                    "confidence",
+                                    d.get("detector_confidence", 0),
+                                ) >= _det_conf
+                                for d in dets
+                            )
+                            if has_usable_animal:
+                                return False
+                            confident_non_animal = any(
+                                d.get("detector_model") != "full-image"
+                                and d.get("category", "animal") != "animal"
+                                and d.get(
+                                    "confidence",
+                                    d.get("detector_confidence", 0),
+                                ) >= _det_conf
+                                for d in dets
+                            )
+                            return not confident_non_animal
+
                         empty_scene_ids = [
                             photo["id"] for photo in photos
                             if photo["id"] in processed_ids
-                            and not this_run_detections.get(photo["id"])
+                            and _needs_full_image_anchor(photo["id"])
                         ]
                         for photo_id in empty_scene_ids:
                             identity = thread_db.conn.execute(
@@ -4944,30 +5029,25 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     and weak_detection_confidence < detector_confidence
                     and photos
                 ):
-                    from weak_detections import contextual_weak_runs
+                    from weak_detections import contextual_weak_photo_ids
 
                     raw_mdv6_detections = thread_db.get_detections_for_photos(
                         [p["id"] for p in photos],
                         min_conf=weak_detection_confidence,
                         detector_model="megadetector-v6",
                     )
-                    weak_runs = contextual_weak_runs(
+                    contextual_weak_ids = contextual_weak_photo_ids(
                         photos,
                         raw_mdv6_detections,
                         detector_confidence=detector_confidence,
                         weak_confidence=weak_detection_confidence,
                         max_gap=pipeline_cfg.get("burst_time_gap", 3.0),
                     )
-                    contextual_weak_ids = {
-                        photo_id
-                        for run in weak_runs
-                        for photo_id in run["photo_ids"]
-                    }
                     if contextual_weak_ids:
                         log.info(
-                            "Classification: rescuing %d weak-detection "
-                            "photo(s) across %d bracketed sequence(s)",
-                            len(contextual_weak_ids), len(weak_runs),
+                            "Classification: rescuing %d contextual "
+                            "weak-detection photo(s)",
+                            len(contextual_weak_ids),
                         )
 
                 total_predictions_stored = 0
@@ -5545,18 +5625,47 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 photo_dets = photo_dets[:1]
                             detections_to_classify = photo_dets
                             if not detections_to_classify:
-                                # Distinguish "no eligible detection at the
-                                # workspace threshold" from "MegaDetector found
-                                # nothing at all." Weak raw detections keep the
-                                # existing behavior for now; true no-detection
-                                # photos get full-image classification.
-                                raw_real_dets = [
-                                    d for d in thread_db.get_detections(
-                                        photo["id"], min_conf=0,
+                                # No animal box is usable at either the
+                                # ordinary threshold or the contextual
+                                # weak-rescue floor. Treat this the same as a
+                                # true no-detection photo and give the
+                                # classifier a full-image attempt. Raw
+                                # detector output is retained for
+                                # diagnostics/cache reuse, but a 1% noise box
+                                # must not suppress classification of an
+                                # otherwise visible subject.
+                                #
+                                # Exception: MegaDetector emitted a confident
+                                # non-animal (person/vehicle) box at or above
+                                # ``detector_confidence``. Sending the entire
+                                # human/vehicle frame to the wildlife
+                                # classifier would persist a spurious species
+                                # prediction. Skip the fallback in that case
+                                # and leave the photo without a classifier
+                                # run, matching the old raw-detection guard's
+                                # intent while still rescuing sub-threshold
+                                # animal photos.
+                                confident_non_animal = False
+                                if photo["id"] in cached_detections:
+                                    confident_non_animal = any(
+                                        d.get("detector_model") != "full-image"
+                                        and d.get("category", "animal") != "animal"
+                                        and d.get(
+                                            "confidence",
+                                            d.get("detector_confidence", 0),
+                                        ) >= detector_confidence
+                                        for d in cached_detections[photo["id"]]
                                     )
-                                    if d["detector_model"] != "full-image"
-                                ]
-                                if raw_real_dets:
+                                else:
+                                    confident_non_animal = any(
+                                        d["detector_model"] != "full-image"
+                                        and d["category"] != "animal"
+                                        for d in thread_db.get_detections(
+                                            photo["id"],
+                                            min_conf=detector_confidence,
+                                        )
+                                    )
+                                if confident_non_animal:
                                     continue
 
                                 existing_full = thread_db.get_detections(

@@ -68,7 +68,7 @@
     align-items: center;
     flex-wrap: wrap;
   }
-  .setting-group { display: flex; align-items: center; gap: 8px; }
+  .setting-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .setting-group label { font-size: 13px; color: var(--text-muted); white-space: nowrap; }
   .setting-group input[type=range] {
     width: 180px;
@@ -81,6 +81,14 @@
     color: var(--text-primary, #E0F0F0);
     font-variant-numeric: tabular-nums;
   }
+  .review-photo-size-control {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 12px;
+  }
+  .setting-group .review-photo-size-control input[type=range] { width: 110px; }
+  .setting-group .review-photo-size-control .value { min-width: 42px; }
 
   /* ---------- Category Tabs ---------- */
   .tabs {
@@ -785,6 +793,12 @@
             onclick="toggleReviewDetectionBoxes()"
             title="Toggle bounding-box overlays on review cards"
             style="margin-left:12px;cursor:pointer;">Show Boxes</button>
+    <label class="review-photo-size-control" for="thumbSizeSlider">
+      Photo size:
+      <input type="range" id="thumbSizeSlider" min="200" max="600" step="20" value="400"
+             oninput="updateThumbSize(this.value)">
+      <span class="value" id="thumbSizeVal">400px</span>
+    </label>
     <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted,#888);margin-left:12px;">
       Min confidence:
       <input type="range" id="confFilter" min="0" max="90" step="5" value="0"
@@ -825,6 +839,7 @@ var availableModels = [];
 var collectionPhotoIds = null;  // null = no filter
 var thumbSize = 400;
 var mode = 'review';
+var REVIEW_THUMB_SIZE_STORAGE_KEY = 'vireo.review.thumbSize';
 
 function _reviewStoredBool(key, fallback) {
   try {
@@ -1021,6 +1036,7 @@ function _predictionEpochStale(epoch) {
 }
 
 /* ---------- Bootstrap ---------- */
+restoreThumbSize();
 applyReviewQueryParams();
 loadPredictions();
 loadCollectionFilter();
@@ -1363,7 +1379,7 @@ function renderGrid() {
     return;
   }
   empty.style.display = 'none';
-  grid.style.setProperty('--card-width', thumbSize + 20 + 'px');
+  grid.style.setProperty('--card-width', thumbSize + 'px');
 
   grid.innerHTML = items.map(function(p) { return renderPredictionCard(p); }).join('');
 }
@@ -1976,10 +1992,27 @@ document.addEventListener('contextmenu', function(e) {
 });
 
 /* ---------- Settings ---------- */
-function updateThumbSize(val) {
-  thumbSize = parseInt(val, 10);
-  document.getElementById('thumbSizeVal').textContent = val + 'px';
-  renderGrid();
+function updateThumbSize(val, persist) {
+  var parsed = parseInt(val, 10);
+  if (isNaN(parsed)) parsed = 400;
+  thumbSize = Math.max(200, Math.min(600, parsed));
+
+  var slider = document.getElementById('thumbSizeSlider');
+  if (slider) slider.value = String(thumbSize);
+  var value = document.getElementById('thumbSizeVal');
+  if (value) value.textContent = thumbSize + 'px';
+  var grid = document.getElementById('grid');
+  if (grid) grid.style.setProperty('--card-width', thumbSize + 'px');
+
+  if (persist !== false) {
+    try { localStorage.setItem(REVIEW_THUMB_SIZE_STORAGE_KEY, String(thumbSize)); } catch (e) {}
+  }
+}
+
+function restoreThumbSize() {
+  var stored = null;
+  try { stored = localStorage.getItem(REVIEW_THUMB_SIZE_STORAGE_KEY); } catch (e) {}
+  updateThumbSize(stored === null ? 400 : stored, false);
 }
 
 /* ==================== Group Review Modal ==================== */

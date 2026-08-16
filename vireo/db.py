@@ -3194,8 +3194,14 @@ class Database:
             ).fetchone()
             fallback_workspace = fallback_row["id"] if fallback_row else None
         rows = self.conn.execute(
-            f"""SELECT DISTINCT pk.photo_id, wf.workspace_id,
+            f"""SELECT DISTINCT pk.photo_id, pk.keyword_id, wf.workspace_id,
                        p.filename, p.xmp_mtime, f.path AS folder_path,
+                       (
+                           SELECT COUNT(*)
+                           FROM photo_keywords all_genre_pk
+                           WHERE all_genre_pk.photo_id = pk.photo_id
+                             AND all_genre_pk.keyword_id IN ({placeholders})
+                       ) AS wildlife_genre_count,
                        EXISTS (
                            SELECT 1
                            FROM photo_keywords survivor_pk
@@ -3253,7 +3259,7 @@ class Database:
                         AND (species_k.type = 'taxonomy'
                              OR species_k.is_species = 1)
                   )""",
-            [*keyword_ids, *keyword_ids],
+            [*keyword_ids, *keyword_ids, *keyword_ids],
         ).fetchall()
 
         # Group owning workspaces per photo. get_pending_changes() and the
@@ -3333,13 +3339,23 @@ class Database:
             ws = row["workspace_id"]
             entry = photo_workspaces.setdefault(
                 pid,
-                {"ws_ids": set(), "survivor": bool(row["has_same_name_survivor"])},
+                {
+                    "ws_ids": set(),
+                    "candidate_keyword_ids": set(),
+                    "wildlife_genre_count": int(row["wildlife_genre_count"]),
+                    "survivor": bool(row["has_same_name_survivor"]),
+                },
             )
+            entry["candidate_keyword_ids"].add(row["keyword_id"])
             if ws is not None:
                 entry["ws_ids"].add(ws)
 
         for photo_id, entry in photo_workspaces.items():
-            if entry["survivor"]:
+            has_preserved_genre = (
+                len(entry["candidate_keyword_ids"])
+                < entry["wildlife_genre_count"]
+            )
+            if entry["survivor"] or has_preserved_genre:
                 # Another top-level 'Wildlife' keyword (e.g. type='individual')
                 # still owns the flat XMP subject. Removing it would strip the
                 # surviving user-authored tag from the sidecar, and a later
@@ -3371,18 +3387,21 @@ class Database:
                     )
 
         retired_photo_ids = list(photo_workspaces.keys())
-        if retired_photo_ids:
-            # Chunk to stay under SQLITE_MAX_VARIABLE_NUMBER (999 on legacy
-            # builds); this runs synchronously on startup so a large upgraded
-            # library must not overflow the single-statement bind limit.
-            for chunk in _chunks(retired_photo_ids):
-                photo_placeholders = ",".join("?" for _ in chunk)
-                self.conn.execute(
-                    f"""DELETE FROM photo_keywords
-                        WHERE keyword_id IN ({placeholders})
-                          AND photo_id IN ({photo_placeholders})""",
-                    [*keyword_ids, *chunk],
-                )
+        retired_associations = [
+            (photo_id, keyword_id)
+            for photo_id, entry in photo_workspaces.items()
+            for keyword_id in entry["candidate_keyword_ids"]
+        ]
+        if retired_associations:
+            # Delete the exact candidate associations. A catalog can contain
+            # case-variant duplicate genre rows (``Wildlife``/``wildlife``),
+            # and provenance is evaluated per keyword ID; deleting every
+            # matching genre from a candidate photo would erase a duplicate
+            # association that the manual-history predicates preserved.
+            self.conn.executemany(
+                "DELETE FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+                retired_associations,
+            )
         # Only stamp the completion marker if every candidate photo was
         # actually inspected. When a previously-imported sidecar is offline
         # we cannot tell whether its Wildlife association is generated or
@@ -19822,11 +19841,31 @@ class Database:
         """Delete oldest entries beyond the configured max (excludes undone entries awaiting redo)."""
         import config as cfg
         max_entries = cfg.get('max_edit_history') or 1000
+        preserve_wildlife_discard = (
+            self.get_meta(self._RETIRED_WILDLIFE_GENRE_KEY) != "1"
+        )
+        protected_clause = ""
+        if preserve_wildlife_discard:
+            # A discarded manual keyword add deliberately leaves no pending
+            # change or sidecar term. Until Wildlife retirement completes,
+            # its discard item is therefore the only durable authorship
+            # evidence and must not disappear under a small history limit.
+            protected_clause = """
+              AND NOT EXISTS (
+                  SELECT 1 FROM edit_history_items protected_item
+                  WHERE protected_item.edit_id = edit_history.id
+                    AND edit_history.action_type = 'discard'
+                    AND protected_item.old_value = 'keyword_add:Wildlife' COLLATE NOCASE
+              )"""
         self.conn.execute(
-            """DELETE FROM edit_history WHERE workspace_id = ? AND undone = 0 AND id NOT IN (
-                 SELECT id FROM edit_history WHERE workspace_id = ? AND undone = 0
-                 ORDER BY created_at DESC, id DESC LIMIT ?
-               )""",
+            f"""DELETE FROM edit_history
+                WHERE workspace_id = ? AND undone = 0
+                  AND id NOT IN (
+                      SELECT id FROM edit_history
+                      WHERE workspace_id = ? AND undone = 0
+                      ORDER BY created_at DESC, id DESC LIMIT ?
+                  )
+                  {protected_clause}""",
             (self._ws_id(), self._ws_id(), max_entries),
         )
         self.conn.commit()

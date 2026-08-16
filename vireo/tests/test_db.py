@@ -14372,6 +14372,113 @@ def test_retire_builtin_wildlife_preserves_discarded_manual_add(tmp_path):
     ).fetchone() is None
 
 
+def test_wildlife_discard_provenance_survives_history_pruning(tmp_path, monkeypatch):
+    """Keep discarded-add evidence while retirement is still retryable.
+
+    An unavailable sidecar can leave the retirement marker unset across many
+    application sessions. If normal history pruning removes the only
+    ``keyword_add:Wildlife`` discard item during that interval, a later retry
+    can no longer distinguish the manual association from the old generated
+    one. Protect that evidence until the catalog-wide migration completes.
+    """
+    import config as cfg
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.tag_photo(p1, wildlife_id)
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+    discard_id = db.record_edit(
+        "discard",
+        "Discarded 1 pending changes",
+        "",
+        [{"photo_id": p1, "old_value": "keyword_add:Wildlife", "new_value": ""}],
+    )
+
+    monkeypatch.setattr(
+        cfg, "get", lambda key: 1 if key == "max_edit_history" else None,
+    )
+    db.record_edit(
+        "flag",
+        "Newer edit that would normally prune the discard",
+        "flagged",
+        [{"photo_id": p1, "old_value": "none", "new_value": "flagged"}],
+    )
+
+    assert db.conn.execute(
+        "SELECT 1 FROM edit_history WHERE id = ?", (discard_id,),
+    ).fetchone() is not None
+    assert db.retire_builtin_wildlife_genre() == 0
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+
+
+def test_retire_builtin_wildlife_deletes_only_generated_duplicate(tmp_path):
+    """Per-keyword provenance must survive case-variant duplicate genres.
+
+    Older catalogs can contain both ``Wildlife`` and ``wildlife`` top-level
+    genre rows. A manual-add record for one ID must preserve that exact
+    association when the generated duplicate is retired, and the surviving
+    flat term must not be queued for sidecar removal.
+    """
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    generated_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    manual_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.tag_photo(p1, generated_id)
+    db.tag_photo(p1, manual_id)
+    db.record_edit(
+        "keyword_add",
+        'Added keyword "wildlife"',
+        str(manual_id),
+        [{"photo_id": p1, "old_value": "", "new_value": str(manual_id)}],
+    )
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+    remaining_ids = {
+        row["keyword_id"]
+        for row in db.conn.execute(
+            "SELECT keyword_id FROM photo_keywords WHERE photo_id = ?",
+            (p1,),
+        ).fetchall()
+    }
+    assert generated_id not in remaining_ids
+    assert manual_id in remaining_ids
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+
+
 def test_retire_builtin_wildlife_queues_removal_in_every_owning_workspace(tmp_path):
     """A folder shared across workspaces must have the cleanup queued in each.
 

@@ -624,7 +624,11 @@ Four corollaries, each binding on one site:
    act on more than the membership the card had when it was rendered —
    "when they clicked" is part of the invariant, so a component that
    grew between the GET and the click (taxonomy cache resolution, a new
-   classify run) is *found* by the rebuild but not *acted on*.
+   classify run) is *found* by the rebuild but not *acted on*. Nor may
+   the mutation act on **less**: a card that split under the user cannot
+   satisfy the click at all, so the mutation refuses it outright and
+   says so rather than resolving whichever members are left (§2,
+   "Shrinkage is a stale click, not a smaller click").
 4. **A card's status, badge and actions are an aggregate over all its
    members**, never whichever row won the dedup sort — and **an action
    the card offers applies to every one of those members**, whatever
@@ -858,6 +862,13 @@ cache resolved between the grid render and the click — is the same
 the modal is where the user decides whether to accept. Absent
 `member_prediction_ids`, the endpoint returns the whole scoped component
 (the legacy shape) and flags `"expanded"` so the client can say so.
+It intersects the same way in the *other* direction too — frozen
+members the current component or scope no longer covers — but it does
+**not** inherit the mutation's 409 there: the read returns the
+survivors with `"departed"`, `departed_prediction_ids` and
+`current_cards`, and the modal disables its action buttons. §2,
+"Shrinkage is a stale click, not a smaller click", states why the read
+and the write diverge on exactly this point.
 
 **Why the membership is not on the URL.** An earlier revision put it
 there (`&rows=<prediction_id>,…`), and that does not survive contact
@@ -998,12 +1009,13 @@ POST the server:
    server *finds* the card and enumerates each member's rows; the
    frozen membership is what the card actually *was* when the user
    clicked. Only their intersection is mutated — and before mutating,
-   the server requires the frozen membership to be a **subset** of the
-   resolved component; a frozen row that landed elsewhere means the
-   card the user clicked no longer exists as one card, and step 5
-   returns a stale-card response instead of writing a partial. See
-   "Shrinkage is a stale click, not a smaller click" below for the
-   split-component case that motivates the check.
+   the server requires the frozen membership to be a **subset** of
+   `resolved component ∩ scope`; a frozen row that landed elsewhere, or
+   that the re-applied scope now excludes, means the card the user
+   clicked no longer exists as one card, and step 5 returns 409
+   `card_changed` instead of writing a partial. See "Shrinkage is a
+   stale click, not a smaller click" below for the split-component case
+   that motivates the check and for what the user is told.
 
 The intended cache-transition sequence is: GET emits a `name:blue tit`
 card with anchor `A`, `card_id` = base64url(JSON([`A`])), and
@@ -1059,17 +1071,116 @@ anchor's component?
   keyword effect" below), arriving through a different route. "Accept
   all" cannot mean "accept the survivors of a card the user never saw".
 
-Step 5's subset check is exactly this bright line. When a frozen row
-is missing from the resolved component the server returns a stale-card
-response — same 400 shape as the anchor-gone case, with a body that
-names the current decomposition for those rows so the client reloads
-and re-renders. The user then sees the card as it now is (typically
-two smaller cards, one per current taxon key) and clicks against a
-display that matches the row set. Growth is silently excluded and
-reported (`"expanded": N`) because the excluded rows were never part
-of the click; shrinkage is refused because the missing rows *were*.
-The two directions are not symmetric, and treating them as such is
-what let the split case escape.
+Step 5's subset check is exactly this bright line, and it is stated
+over the *mutated* set rather than the component alone, because a
+frozen row can leave by either route:
+
+> **Completeness precondition.** Every id in `member_prediction_ids`
+> must appear in `resolved component ∩ scope`.
+
+The component half catches the split above. The scope half catches the
+other way a frozen member departs, which has nothing to do with
+taxonomy: a member whose status changed under an active status tab, or
+whose photo left the selected collection, between the GET and the POST.
+`∩ scope` drops it just as quietly, and the user's "Accept all" would
+narrow just as invisibly. From the user's side the two are one event —
+the card they clicked is no longer the card the server can act on — so
+they get one rule and one response.
+
+The precondition is evaluated **before the transaction opens** and
+before any Phase-A write ("A card mutation writes every member status
+before it decides any keyword effect" below). On failure the server
+writes nothing at all and returns **409**:
+
+```json
+{
+  "error": "card_changed",
+  "departed_prediction_ids": [1235, 1236],
+  "member_count": 8,
+  "departed_count": 2,
+  "current_cards": [
+    {"card_id": "…", "prediction_ids": [1234, 1237]},
+    {"card_id": "…", "prediction_ids": [1235, 1236]}
+  ]
+}
+```
+
+**409, not the 400 the anchor-gone case uses**, and the distinction is
+load-bearing rather than pedantic. 400 means the handle names rows the
+server cannot resolve: the click is unrecoverable and a reload is the
+only move. 409 means the handle resolved perfectly and the *card*
+moved: the rows are all still there, the body can name the current
+decomposition, and the client has something specific to say. Reusing
+the 400 shape would force the client to distinguish the two by
+inspecting the body anyway, and would make "the anchor is gone" and
+"your card split in two" indistinguishable in logs and in fixtures.
+Growth is excluded and reported (`"expanded": N`) because the excluded
+rows were never part of the click; shrinkage is refused because the
+missing rows *were*. The two directions are not symmetric, and treating
+them as such is what let the split case escape.
+
+**Why refuse rather than act on the survivors and report the losses.**
+The nearer repo precedent points the other way and is worth stating
+before departing from it: PR #1489 chose skip-and-report for a batch of
+per-row accepts, naming the count it would really act on rather than
+failing the batch, so that one moved row could not strand thirty-four
+honest ones. That is the right call there and the wrong one here,
+because the unit differs. #1489's unit is a row, and each surviving
+row's accept is, on its own, exactly the action the user asked for. A
+card is not a bag of independent rows — it is a single claim ("these
+members all assert *Cyanistes caeruleus* over these photos") and the
+click is a single decision about that claim. When members depart, the
+claim itself has changed; in the conflict case the server has *just
+decided it can no longer assert that taxon for one of the labels*. So
+accepting the survivors is not a smaller version of the user's
+decision, it is a different decision they were never shown — and this
+design has already ruled, four times over (corollary 4, the `mixed`
+badge, the toolbar's card-count label, the reconciling reject), that a
+card action resolving only some members is not a card action at all.
+Retrying is cheap here in a way it is not in #1489: one reload and one
+click on a card that now says what it is, against re-deriving which
+thirty-four of thirty-eight rows already landed.
+
+**What the user sees.** Silently narrowing is the failure; silently
+*refusing* is the same failure wearing the other hat, so the refusal is
+never the whole answer. The card is left exactly as it was — still
+pending or still `mixed`, both actions still enabled, nothing marked
+resolved, no keyword written — and gains an inline notice built from
+the 409 body: *"This card changed while it was open — 2 of its 8
+predictions now belong to a different species card. Nothing was
+changed."* with a **Reload Review** action beside it. Naming the counts
+is the point; "something changed, please try again" is `CORE_PHILOSOPHY.md`'s
+black box in politer wording. After the reload the rows sit on the two
+cards `current_cards` named, each saying what it now claims, and each
+can be accepted for that.
+
+**The batch does not abort.** Toolbar "Accept All" issues one card
+mutation per displayed card (§3, "Every mutation entry point,
+enumerated"), so a 409 is *that card's* outcome and not the run's: the
+remaining cards are still submitted. This is where #1489's
+skip-and-report shape is right, because at the rollup level the items
+genuinely are independent, and failing the run would strand the honest
+cards for the sake of one stale one. The rollup then reports under the
+repo convention that a mixed outcome takes the **worse** outcome:
+"Accepted 12 of 13 cards — 1 card changed and was skipped; nothing was
+changed on it. Reload Review." It is not reported as a completed
+"Accept All", and each skipped card keeps its own inline notice and its
+own enabled actions. Rejecting at the card level and skipping at the
+rollup level is one rule applied at two granularities, not two rules: a
+card is the unit of the promise, a run is a bag of independent
+promises.
+
+**The read discloses; only the write refuses.** `POST
+/api/predictions/card` intersects with the frozen membership exactly as
+the mutation does ("Card detail endpoint", §2) and so observes the same
+departure — but it must **not** inherit the 409. A detail view that
+refuses leaves the user staring at nothing while the grid still shows
+the card, and a read protects nobody by declining to render. It returns
+the surviving members plus `"departed": <n>`, `departed_prediction_ids`
+and the same `current_cards` decomposition, and the modal renders the
+card-changed notice with its Accept / Reject buttons **disabled** —
+they would 409 anyway, and a button that cannot fire is its own small
+black box.
 
 The one shrink this cannot even reach step 5 through is when the
 anchor node's rows are gone entirely (bucket rewrite, deletion) —
@@ -1397,9 +1508,18 @@ union**, not just the clicked group's photos:
    component are no longer the same component, and "Accept all" on the
    card the user saw is not the same call as "Accept all" on the anchor's
    surviving half. The mutation is only run when the intersection equals
-   `member_prediction_ids ∩ scope`; the split-component case is refused
-   with a stale-card response (see §2, "Shrinkage is a stale click, not
-   a smaller click").
+   `member_prediction_ids` **in full** — not `member_prediction_ids ∩
+   scope`, which would let a scope departure narrow the click as
+   silently as a split does; anything less is refused with a 409
+   `card_changed` (see §2, "Shrinkage is a stale click, not a smaller
+   click"). The two guards do different jobs and both are needed: the
+   intersection is what makes a tampered or replayed membership
+   harmless, and the completeness check is what keeps an *honest*
+   membership from turning "Accept all" into "accept some". On every
+   mutation that does proceed the mutated set is therefore exactly
+   `member_prediction_ids` — the formula above is the definition, and
+   the precondition is what collapses it to the row set the user was
+   looking at.
 
    **Freezing rows, not nodes.** An earlier revision froze
    `member_node_ids`. Node identity is immutable, but a node's *row set*
@@ -1713,8 +1833,10 @@ these two are halves of one mutation, at runtime.)
 
 - **Phase A — statuses.** Write the new status of *every* row in the
   mutated set (`resolved component ∩ member_prediction_ids ∩ scope`,
-  step 1), reconciling flips included. No keyword is written or removed
-  and no keyword-related predicate is evaluated.
+  step 1 — equal to `member_prediction_ids` on any request that got
+  this far, since step 1's completeness precondition already 409'd the
+  ones where it was not), reconciling flips included. No keyword is
+  written or removed and no keyword-related predicate is evaluated.
 - **Phase B — keyword effects.** Only after the last Phase-A write:
   evaluate the retraction predicate, perform the untag or tag, and
   compute the disclosure counts — all against the post-Phase-A state.
@@ -1931,7 +2053,7 @@ correctness requirement, not a round-trip optimization.
 | entry point | code today | what changes |
 | --- | --- | --- |
 | Per-card Accept / Reject | `acceptPrediction` / `rejectPrediction` (`review.html:1576`, `1591`) | POST the card mutation with the displayed `card_id` (or `node_id` under a filter), frozen `member_prediction_ids`, and the scope tuple. This is the happy path §2/§3 specify. |
-| Toolbar **Accept All** | `acceptAllPending` (`review.html:1618-1633`) — filters `predictions` to raw `status === 'pending'` rows and POSTs `/api/predictions/<id>/accept` per row | Iterates the **displayed cards** from `getVisibleItems()`, not raw rows, and issues one card mutation per card with that card's own frozen membership and the same scope tuple. Without this, "Accept All" on a `{pending, rejected}` card accepts the pending member and leaves the rejected one rejected — i.e. it *creates* a `mixed` card out of the click that was supposed to resolve it, and it does so bypassing the reconciling-reject retraction rule above. |
+| Toolbar **Accept All** | `acceptAllPending` (`review.html:1618-1633`) — filters `predictions` to raw `status === 'pending'` rows and POSTs `/api/predictions/<id>/accept` per row | Iterates the **displayed cards** from `getVisibleItems()`, not raw rows, and issues one card mutation per card with that card's own frozen membership and the same scope tuple. Without this, "Accept All" on a `{pending, rejected}` card accepts the pending member and leaves the rejected one rejected — i.e. it *creates* a `mixed` card out of the click that was supposed to resolve it, and it does so bypassing the reconciling-reject retraction rule above. A card whose mutation comes back **409 `card_changed`** (§2) is skipped, not retried and not fatal to the run: the loop continues, that card keeps its own inline notice, and the run's summary reports the worse outcome — "Accepted 12 of 13 cards — 1 card changed and was skipped; nothing was changed on it" — rather than a plain completion. |
 | Toolbar button label and visibility | `renderButtons` (`review.html:1258-1273`) — counts raw pending rows for "Accept All (N)" and hides the button when that count is 0 | Counts **actionable cards** (status `pending` or `mixed`, per §2's table) and labels accordingly. Counting rows would promise "Accept All (7)" over 4 cards, and — worse — would *hide* the button on a view whose only cards are `{accepted, rejected}` mixed, which are exactly the cards that need reconciling. Same rule as the badge: the number the user reads must be the number of things the click acts on. |
 | Keyboard `A` / `S` | keydown handler (`review.html:1638-1655`), currently `acceptPrediction(pending[0].id)` over `getVisibleItems()` rows | Targets the first visible **card** and issues that card's mutation. The handler already reads `getVisibleItems()` "because the toolbar hint promises *first visible card*" — after §2 that function returns cards, so this is a one-line follow-through, but it is listed because leaving it on row ids would silently half-accept the first card. |
 
@@ -2474,18 +2596,40 @@ Each phase lands as its own PR and is independently useful.
    `name:blue tit` for the whole request; the anchor's alternate label
    `L2` still resolves to `taxon:13094`, so the anchor rebuilds under
    `L2` into a smaller `taxon:13094` component that does *not* include
-   the `L1`-only frozen members. The POST returns the stale-card
-   response with the current decomposition for the missing rows, no
-   status flip is written for any member (Phase A is not entered), and
-   the client-side reload re-renders the card as two smaller cards
-   under their new taxon keys. Two negative variants: a build that
-   drops the subset check and silently applies the shrunken
-   intersection leaves the `L1`-only members `pending` and fails
-   (badge-disagrees-with-metadata on the split boundary); and a build
-   that treats the split as a 400 anchor-gone response fails the
-   fixture's assertion that the response body names the current
-   decomposition (the anchor's rows *are* still there, so the client
-   needs the new key, not just a reload prompt). A
+   the `L1`-only frozen members. The POST returns **409
+   `card_changed`** with `departed_prediction_ids` naming exactly the
+   `L1`-only rows, `departed_count` matching, and `current_cards`
+   carrying the current decomposition; no status flip is written for
+   any member, no keyword is touched and no history entry is created
+   (Phase A is not entered); and the client-side reload re-renders the
+   card as two smaller cards under their new taxon keys. Three negative
+   variants: a build that drops the subset check and silently applies
+   the shrunken intersection leaves the `L1`-only members `pending` and
+   fails (badge-disagrees-with-metadata on the split boundary); a build
+   that treats the split as a 400 anchor-gone response fails, since the
+   anchor's rows *are* still there and 400 tells the client the click
+   was unrecoverable when it was not; and a build that returns the 409
+   but renders no card-level notice fails, because a click that is
+   refused without explanation is the same black box as one that
+   silently narrows. A **scope-departure variant** reaches the identical
+   409 with no taxonomy movement at all: a frozen member's status
+   changes out of the active status tab (second variant: its photo
+   leaves the selected collection) between the GET and the POST, so
+   `∩ scope` drops it — the guard for stating the precondition over
+   `resolved component ∩ scope` rather than over the component alone. A
+   **card-split batch fixture** — toolbar "Accept All" over three
+   cards, one of which splits this way: the other two accept fully, the
+   split one is left untouched and actionable, and the run reports the
+   worse outcome ("Accepted 2 of 3 cards — 1 card changed and was
+   skipped") rather than a completed Accept All; a build that aborts the
+   whole run on the first 409 fails, and so does one that reports
+   "Accept All complete". A **card-split read fixture** — the same
+   split against `POST /api/predictions/card` returns **200** with the
+   surviving members, `"departed"`, `departed_prediction_ids` and
+   `current_cards` populated, and the modal's actions rendered disabled;
+   a build that 409s the read fails (a read that refuses shows the user
+   nothing while the grid still shows the card), and so does one that
+   returns the survivors with no `departed` disclosure. A
    **row-vs-node freeze fixture** — no taxonomy transition at all:
    between the GET and the POST a photo of a *frozen* node joins the
    selected collection (and, in a second variant, a row of that node
@@ -2598,6 +2742,13 @@ Each phase lands as its own PR and is independently useful.
    toolbar's `renderButtons` count, and the `A`/`S` keyboard handler —
    in the same phase, because a routed path left on the legacy endpoint
    for one release would half-accept merged cards for that release. The
+   409 `card_changed` handling lands with them — the card-level inline
+   notice naming the departed count, the disabled modal actions on a
+   `departed` detail read, and the toolbar rollup's worse-outcome
+   summary (§2, "Shrinkage is a stale click, not a smaller click"). It
+   is not a follow-up: shipping the server precondition without the
+   notice converts a silent partial accept into a silently *ignored*
+   click, which is the same failure wearing the other hat. The
    excluded rows of that table are explicitly *not* touched here.
    Depends on Phase 4
    being live so that the per-row keyword write resolves to the

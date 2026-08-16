@@ -1152,7 +1152,7 @@ def test_browse_photo_id_deep_link_loads_target_folder_first_page(live_server, p
 
 
 def test_browse_photo_id_deep_link_loads_target_after_first_folder_page(live_server, page):
-    """Open in Browse returns a deep target in one snapshot-consistent init."""
+    """Open in Browse returns a bounded deep target page in one init."""
     db = live_server["db"]
     _, folder_b = live_server["data"]["folders"]
     target_id = live_server["data"]["photos"][4]  # robin2 in folder_b

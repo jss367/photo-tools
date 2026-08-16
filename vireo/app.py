@@ -6000,7 +6000,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     return json_error(str(exc), 400)
             # Photo deep links need the target's position in the exact sort
             # order used by this first paint. Returning the zero-based index
-            # and its contiguous prefix from this read snapshot avoids probing
+            # and its bounded page from this read snapshot avoids probing
             # serial 50-photo pages until the target happens to appear. Keep
             # the extra ordered-id query opt-in so ordinary Browse loads retain
             # their existing cost.
@@ -6036,22 +6036,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         focus_index = ordered_ids.index(focus_photo_id)
                     except ValueError:
                         pass
-                # Keep every row through the target on the same SQLite read
-                # snapshot as the position and total above. Splitting this
-                # prefix across parallel offset requests lets concurrent
-                # ingestion/deletion create overlaps, gaps, and stale totals.
-                # A single transaction-consistent response also removes the
-                # serial round-trip cost that made deep links slow while
-                # preserving the contiguous grid/lightbox navigation set.
+                # Return only the bounded page containing the target from the
+                # same SQLite read snapshot as its position and total. Sending
+                # every preceding row can freeze Browse for a focus deep in a
+                # million-photo folder; independent parallel offset requests,
+                # meanwhile, allow ingestion/deletion to create overlaps,
+                # gaps, and stale totals. One target page avoids both failure
+                # modes, and ordinary lazy paging resumes after it.
                 if focus_index is not None:
                     focus_page = focus_index // per_page + 1
-                    if page != 1 or focus_page > 1:
+                    if focus_page != page:
                         try:
                             photos = db.get_photos(
                                 folder_id=folder_id,
                                 collection_id=collection_id,
-                                page=1,
-                                per_page=focus_page * per_page,
+                                page=focus_page,
+                                per_page=per_page,
                                 sort=sort,
                             )
                         except ValueError as exc:

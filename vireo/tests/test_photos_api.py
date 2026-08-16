@@ -374,8 +374,7 @@ def test_browse_init_focus_index_falls_back_when_target_off_page(
     payload = response.get_json()
     assert payload["focus_index"] == 5
     assert payload["focus_page"] == 6
-    assert len(payload["photos"]) == 6
-    assert payload["photos"][-1]["id"] == baseline_id
+    assert [photo["id"] for photo in payload["photos"]] == [baseline_id]
     assert len(ordered_calls) == 1
 
 
@@ -395,8 +394,8 @@ def test_browse_init_clamps_nonpositive_page_for_focus_index(app_and_db):
     assert payload["focus_page"] == 1
 
 
-def test_browse_init_focus_on_later_requested_page_returns_prefix(app_and_db):
-    """Focused init always starts its contiguous result at the first row."""
+def test_browse_init_focus_on_later_requested_page_returns_target_page(app_and_db):
+    """Focused init remains bounded to the page containing the target."""
     app, db = app_and_db
     ordered_ids = [photo["id"] for photo in db.get_photos(sort="date")]
     assert len(ordered_ids) >= 2
@@ -410,7 +409,7 @@ def test_browse_init_focus_on_later_requested_page_returns_prefix(app_and_db):
     payload = response.get_json()
     assert payload["focus_index"] == 1
     assert payload["focus_page"] == 2
-    assert [photo["id"] for photo in payload["photos"]] == ordered_ids[:2]
+    assert [photo["id"] for photo in payload["photos"]] == [ordered_ids[1]]
 
 
 def test_dashboard_options_flags_degraded_collections(app_and_db):

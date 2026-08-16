@@ -9590,19 +9590,22 @@ async function _runPhotoDeepLink(photoId) {
       photos = initData.photos || [];
       totalPhotos = initData.total || 0;
       var focusPage = parseInt(initData.focus_page, 10);
-      currentPage = (Number.isInteger(focusPage) && focusPage >= 1)
-        ? focusPage + 1
-        : 2;
-      if (photos.length >= totalPhotos) allLoaded = true;
+      var hasFocusPage = Number.isInteger(focusPage) && focusPage >= 1;
+      currentPage = hasFocusPage ? focusPage + 1 : 2;
+      var loadedThrough = hasFocusPage
+        ? (focusPage - 1) * perPage + photos.length
+        : photos.length;
+      if (loadedThrough >= totalPhotos) allLoaded = true;
       renderGrid();
       browseDatasetReady = true;
       document.getElementById('loadingState').style.display = 'none';
       deepLinkLoaded = true;
     }
 
-    // The focused init response normally includes the full contiguous prefix
-    // through the target from one SQLite read snapshot. Fall back to the old
-    // serial scan for compatibility or if the target disappeared meanwhile.
+    // The focused init response normally includes the bounded page containing
+    // the target from one SQLite read snapshot. Later pages remain lazy so a
+    // deep target cannot force Browse to render every preceding card. Fall
+    // back to the old serial scan for compatibility or if the target vanished.
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
     if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
     var el = getGridCard(photoId);

@@ -82,7 +82,7 @@ def test_browse_lightbox_close_selects_current_photo(live_server, page):
     )
     page.locator("#lightboxNext").click()
     page.wait_for_function(
-        "photoId => window._lightboxCurrentId === photoId", arg=second_id
+        "photoId => window._lightboxCommittedId === photoId", arg=second_id
     )
 
     page.locator(".lightbox-close").click()

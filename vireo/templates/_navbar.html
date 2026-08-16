@@ -3684,6 +3684,13 @@ async function createWorkspace() {
 <script>
 var _lightboxPhotoList = [];  // list of {id, filename} for arrow navigation
 var _lightboxCurrentId = null;
+// `_lightboxCurrentId` advances immediately when navigation targets a new
+// photo; the visible bitmap is deliberately held on the previous frame until
+// the replacement finishes decoding. `_lightboxCommittedId` tracks that
+// visible identity — the photo the user is actually looking at — and is what
+// `lightbox:closed` reports so a close mid-navigation reconciles Browse to
+// the photo that was on screen, not the one that was still loading.
+var _lightboxCommittedId = null;
 
 var _lbZoom = 1.0;          // current zoom (1.0 = fit)
 var _lbPanX = 0;            // pan translation in CSS pixels
@@ -7163,6 +7170,7 @@ function openLightbox(photoId, filename, photoList, options) {
     }
     if (!visibleIdentityCommitted) {
       visibleIdentityCommitted = true;
+      _lightboxCommittedId = photoId;
       try {
         document.dispatchEvent(new CustomEvent('lightbox:photochanged', {
           detail: { photoId: photoId }
@@ -7751,6 +7759,13 @@ function toggleLightboxZoom(e) {
 
 function closeLightbox(e) {
   if (e && e.target && e.target.tagName === 'IMG') return;
+  // Use the last committed (visible) identity, not `_lightboxCurrentId` —
+  // that advances immediately at the start of navigation while the outgoing
+  // bitmap is still on screen, so it names a photo the user never actually
+  // viewed if the incoming /full is still loading when the user closes.
+  var closedPhotoId = _lightboxCommittedId != null
+    ? _lightboxCommittedId
+    : _lightboxCurrentId;
   _lbFlushPendingAdjustmentSave();
   if (_lightboxCurrentId != null) _lbSaveViewportState(_lightboxCurrentId);
   var wasOpen = !!window._lbEscToken;
@@ -7780,7 +7795,12 @@ function closeLightbox(e) {
   document.getElementById('lightboxImg').src = '';
   document.getElementById('lightboxZoomBadge').style.display = 'none';
   _lightboxCurrentId = null;
-  try { document.dispatchEvent(new CustomEvent('lightbox:closed')); } catch(_) {}
+  _lightboxCommittedId = null;
+  try {
+    document.dispatchEvent(new CustomEvent('lightbox:closed', {
+      detail: { photoId: closedPhotoId }
+    }));
+  } catch(_) {}
   _lbSetFlagStatus(undefined);
   var detContainer = document.getElementById('lightboxDetections');
   if (detContainer) detContainer.innerHTML = '';
@@ -8355,6 +8375,20 @@ function lightboxDelete() {
       return;
     }
 
+    // Update the browse grid before touching lightbox state. Otherwise
+    // Browse's `lightbox:closed` handler still finds the deleted row in
+    // `photos` and re-selects it (loading stale detail state that this
+    // block would then null out — leaving the sidebar blank).
+    if (typeof photos !== 'undefined' && typeof renderGrid === 'function') {
+      photos = photos.filter(function(x) { return x.id !== currentId; });
+      selectedPhotos.delete(currentId);
+      if (selectedPhotoId === currentId) selectedPhotoId = null;
+      renderGrid();
+      if (typeof refreshBrowseSidebarCounts === 'function') {
+        refreshBrowseSidebarCounts();
+      }
+    }
+
     // Remove from lightbox photo list
     var idx = _lightboxPhotoList.findIndex(function(x) { return x.id === currentId; });
     _lightboxPhotoList.splice(idx, 1);
@@ -8365,17 +8399,6 @@ function lightboxDelete() {
       var nextIdx = Math.min(idx, _lightboxPhotoList.length - 1);
       var next = _lightboxPhotoList[nextIdx];
       openLightbox(next.id, next.filename, _lightboxPhotoList);
-    }
-
-    // Also update browse grid if we're on the browse page
-    if (typeof photos !== 'undefined' && typeof renderGrid === 'function') {
-      photos = photos.filter(function(x) { return x.id !== currentId; });
-      selectedPhotos.delete(currentId);
-      if (selectedPhotoId === currentId) selectedPhotoId = null;
-      renderGrid();
-      if (typeof refreshBrowseSidebarCounts === 'function') {
-        refreshBrowseSidebarCounts();
-      }
     }
 
     try {

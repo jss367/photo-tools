@@ -8530,6 +8530,31 @@ function scrollToCard(idx) {
   if (cards[idx]) cards[idx].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
+// Lightbox navigation has its own current-photo state. Reconcile that state
+// with Browse only when the overlay closes so returning to the grid focuses
+// the photo the user finished on, without reloading the detail panel on every
+// Previous/Next step while the lightbox is still open.
+document.addEventListener('lightbox:closed', function(event) {
+  var photoId = event && event.detail ? event.detail.photoId : null;
+  // Viewing shortcuts can open the lightbox without collapsing an existing
+  // batch. Preserve that batch instead of replacing it with the viewed photo.
+  if (photoId == null || selectedPhotos.size > 0) return;
+  var idx = photos.findIndex(function(photo) { return photo.id === photoId; });
+  if (idx < 0) return;
+  // Skip `selectPhoto` when the focused photo is already the one being
+  // returned to: it calls `loadDetail`, which refetches and rerenders the
+  // detail panel and would silently discard an unsubmitted `#locationInput`
+  // draft (its blur handler only hides suggestions, it does not save). Only
+  // reload details when lightbox navigation actually changed the photo.
+  if (selectedPhotoId === photoId) {
+    if (selectedIndex !== idx) selectedIndex = idx;
+    scrollToCard(idx);
+    return;
+  }
+  selectPhoto({ shiftKey: false, metaKey: false, ctrlKey: false }, photoId, idx);
+  scrollToCard(idx);
+});
+
 function developSelected() {
   var ids = getActiveSelection();
   if (!ids.length) return;

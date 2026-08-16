@@ -1658,7 +1658,7 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   flex: 0 0 auto; padding: 2px 6px; border-radius: 4px;
   cursor: pointer; line-height: 1;
 }
-.vireo-ctx-chip:hover { background: var(--bg-tertiary); }
+.vireo-ctx-chip:hover:not(.vireo-ctx-disabled) { background: var(--bg-tertiary); }
 .vireo-ctx-chip.is-active { background: var(--accent); color: white; }
 
 /* ---------- Openable tabs ---------- */
@@ -2120,14 +2120,18 @@ function sendReport() {
       row.className = 'vireo-ctx-chips';
       item.chips.forEach(c => {
         const b = document.createElement('span');
-        b.className = 'vireo-ctx-chip' + (c.active ? ' is-active' : '');
+        b.className = 'vireo-ctx-chip' + (c.active ? ' is-active' : '') +
+          (c.disabled ? ' vireo-ctx-disabled' : '');
         b.textContent = c.label;
-        if (c.title) b.title = c.title;
-        b.addEventListener('click', ev => {
-          ev.stopPropagation();
-          closeContextMenu();
-          try { c.onClick && c.onClick(); } catch(err){ console.error(err); }
-        });
+        if (c.disabled && c.disabledHint) b.title = c.disabledHint;
+        else if (c.title) b.title = c.title;
+        if (!c.disabled) {
+          b.addEventListener('click', ev => {
+            ev.stopPropagation();
+            closeContextMenu();
+            try { c.onClick && c.onClick(); } catch(err){ console.error(err); }
+          });
+        }
         row.appendChild(b);
       });
       return row;
@@ -3552,7 +3556,7 @@ async function createWorkspace() {
     <button class="lb-action-btn lb-action-accent" id="lightboxEditPhoto" onclick="">
       Edit Photo
     </button>
-    <button class="lb-action-btn lb-action-danger" onclick="lightboxDelete()" title="Delete photo">Delete</button>
+    <button class="lb-action-btn lb-action-danger" id="lightboxDeleteBtn" onclick="lightboxDelete()" title="Delete photo">Delete</button>
     </div>
   </div>
   <div class="lightbox-adjust-panel" id="lightboxAdjustPanel" onclick="event.stopPropagation();">
@@ -3693,6 +3697,8 @@ async function createWorkspace() {
 <script>
 var _lightboxPhotoList = [];  // list of {id, filename} for arrow navigation
 var _lightboxCurrentId = null;
+var _lbReadOnly = false;
+var _lbReadOnlyMessage = 'This lightbox is read-only';
 
 var _lbZoom = 1.0;          // current zoom (1.0 = fit)
 var _lbPanX = 0;            // pan translation in CSS pixels
@@ -3733,6 +3739,28 @@ var _lbEditRecipeWriteSeq = 0;
 var _lbEditRecipeWriteSeqByPhoto = {};
 var _lbPhotoDataByPhoto = {};
 var _lbRenderVersionByPhoto = {};
+
+function _lbGuardReadOnly() {
+  if (!_lbReadOnly) return false;
+  if (typeof showToast === 'function') showToast(_lbReadOnlyMessage, 'warning');
+  return true;
+}
+
+function _lbApplyReadOnlyState() {
+  var controls = [
+    ['lightboxNotWildlife', 'Exclude from wildlife detection and classification'],
+    ['lightboxAdjustBtn', 'Quick non-destructive adjustments'],
+    ['lightboxDeleteBtn', 'Delete photo'],
+  ];
+  controls.forEach(function(entry) {
+    var button = document.getElementById(entry[0]);
+    if (!button) return;
+    button.disabled = _lbReadOnly;
+    button.title = _lbReadOnly ? _lbReadOnlyMessage : entry[1];
+  });
+  var panel = document.getElementById('lightboxAdjustPanel');
+  if (_lbReadOnly && panel) panel.classList.remove('open');
+}
 
 function _lbSetPhotoTransitionPending(pending) {
   ['lightboxActions', 'lightboxAdjustPanel', 'syncLightboxPanel'].forEach(function(id) {
@@ -3788,6 +3816,8 @@ function _lbRenderLifeListPanel(photoId) {
     } else {
       btn.textContent = 'Set Representative';
     }
+    btn.disabled = _lbReadOnly;
+    if (_lbReadOnly) btn.title = _lbReadOnlyMessage;
     btn.addEventListener('click', function(event) {
       event.stopPropagation();
       setLifeListPhoto(entry.species, photoId, btn);
@@ -3799,6 +3829,7 @@ function _lbRenderLifeListPanel(photoId) {
 }
 
 async function setLifeListPhoto(species, photoId, button) {
+  if (_lbGuardReadOnly()) return false;
   if (!species || !photoId) return;
   if (button) button.disabled = true;
   try {
@@ -4950,6 +4981,7 @@ function _lbSetAdjustmentControl(id, value) {
 }
 
 function _lbSetAdjustmentControlsDisabled(disabled) {
+  disabled = !!disabled || _lbReadOnly;
   [
     'lbAdjExposure',
     'lbAdjHighlights',
@@ -5529,6 +5561,7 @@ function _lbStartAdjustmentRecipeSave(photoId, recipe, inputSeq) {
 }
 
 function _lbSaveAdjustmentRecipe(values) {
+  if (_lbGuardReadOnly()) return false;
   if (!_lightboxCurrentId || !_lbEditRecipeLoaded) return;
   var photoId = _lightboxCurrentId;
   var key = String(photoId);
@@ -5577,6 +5610,7 @@ function _lbWaitForAdjustmentSaveIdle(photoId) {
 }
 
 function onLightboxAdjustmentInput(input) {
+  if (_lbGuardReadOnly()) return false;
   if (!_lbEditRecipeLoaded) {
     _lbSetAdjustmentStatus('Loading recipe...');
     _lbRenderAdjustmentControls();
@@ -5598,6 +5632,7 @@ function onLightboxAdjustmentInput(input) {
 }
 
 function resetLightboxAdjustments() {
+  if (_lbGuardReadOnly()) return false;
   if (!_lbEditRecipeLoaded) {
     _lbSetAdjustmentStatus('Loading recipe...');
     return;
@@ -5624,6 +5659,7 @@ function resetLightboxAdjustments() {
 }
 
 function toggleLightboxAdjustPanel() {
+  if (_lbGuardReadOnly()) return false;
   var panel = document.getElementById('lightboxAdjustPanel');
   var btn = document.getElementById('lightboxAdjustBtn');
   if (!panel) return;
@@ -6904,6 +6940,7 @@ function _cropInitEvents() {
 }
 
 async function openCropEditor() {
+  if (_lbGuardReadOnly()) return false;
   if (!_lightboxCurrentId) return;
   _cropInitEvents();
   var requestedPhotoId = _lightboxCurrentId;
@@ -6992,6 +7029,7 @@ function cropSetAspect(aspect) {
 }
 
 async function saveCropEditor() {
+  if (_lbGuardReadOnly()) return false;
   if (!_cropPhotoId || !_cropRecipe) return;
   var pid = _cropPhotoId;
   var session = _cropSessionSeq;
@@ -7115,10 +7153,19 @@ function openLightbox(photoId, filename, photoList, options) {
     String(_lightboxCurrentId) === String(photoId)
   );
   options = options || {};
+  var nextReadOnly = Object.prototype.hasOwnProperty.call(options, 'readOnly')
+    ? !!options.readOnly
+    : (alreadyOpen && _lbReadOnly);
+  var nextReadOnlyMessage = Object.prototype.hasOwnProperty.call(options, 'readOnlyMessage')
+    ? options.readOnlyMessage
+    : _lbReadOnlyMessage;
   _lbCancelOriginalPreload();
   var fallbackViewportState = options.fallbackViewportState || null;
   var eyeTrackAnchor = options.eyeTrackAnchor || null;
   _lbFlushPendingAdjustmentSave();
+  _lbReadOnly = nextReadOnly;
+  _lbReadOnlyMessage = nextReadOnlyMessage || 'This lightbox is read-only';
+  _lbApplyReadOnlyState();
   if (alreadyOpen && _lightboxCurrentId != null) {
     _lbSaveViewportState(_lightboxCurrentId);
   }
@@ -7850,6 +7897,9 @@ function closeLightbox(e) {
   document.getElementById('lightboxImg').src = '';
   document.getElementById('lightboxZoomBadge').style.display = 'none';
   _lightboxCurrentId = null;
+  _lbReadOnly = false;
+  _lbReadOnlyMessage = 'This lightbox is read-only';
+  _lbApplyReadOnlyState();
   try { document.dispatchEvent(new CustomEvent('lightbox:closed')); } catch(_) {}
   _lbSetFlagStatus(undefined);
   var detContainer = document.getElementById('lightboxDetections');
@@ -7874,11 +7924,14 @@ function closeLightbox(e) {
  */
 function buildLightboxContextMenu(pid) {
   var has = function(name) { return typeof window[name] === 'function'; };
+  var readOnlyHint = _lbReadOnly ? _lbReadOnlyMessage : null;
 
   var rateChip = function(n) {
     return {
       label: n === 0 ? '\u2606' : String(n),
       title: n === 0 ? 'No rating' : 'Rate ' + n,
+      disabled: !!readOnlyHint,
+      disabledHint: readOnlyHint || undefined,
       onClick: function() {
         if (has('setRatingFor')) window.setRatingFor(pid, n);
         else if (has('setReviewRating')) window.setReviewRating(pid, n);
@@ -7888,20 +7941,26 @@ function buildLightboxContextMenu(pid) {
   var colorChip = function(c, icon, title) {
     return {
       label: icon, title: title,
+      disabled: !!readOnlyHint,
+      disabledHint: readOnlyHint || undefined,
       onClick: function() { if (has('setColorLabelFor')) window.setColorLabelFor(pid, c); },
     };
   };
   var flagChip = function(f, icon, title) {
     return {
       label: icon, title: title,
+      disabled: !!readOnlyHint,
+      disabledHint: readOnlyHint || undefined,
       onClick: function() {
         _lbApplyFlag(pid, f);
       },
     };
   };
-  var toggleItem = function(label, visible, onClick) {
+  var toggleItem = function(label, visible, onClick, disabledHint) {
     return {
       label: label + ': ' + (visible ? 'On' : 'Off'),
+      disabled: !!disabledHint,
+      disabledHint: disabledHint || undefined,
       onClick: onClick,
     };
   };
@@ -7930,7 +7989,8 @@ function buildLightboxContextMenu(pid) {
   items.push(toggleItem('Track eye', _lbTrackEyeEnabled, toggleLightboxTrackEye));
   items.push(toggleItem('Filename and counter', _lbInfoVisible, toggleLightboxInfo));
   items.push(toggleItem('Lightbox controls', _lbChromeVisible, toggleLightboxChrome));
-  items.push(toggleItem('Wildlife classification', !_lbCurrentWildlifeExcluded, lightboxToggleWildlifeExcluded));
+  items.push(toggleItem('Wildlife classification', !_lbCurrentWildlifeExcluded,
+    lightboxToggleWildlifeExcluded, readOnlyHint));
   items.push({ separator: true });
   var browseDisabledHint = typeof window.getLightboxBrowseDisabledHint === 'function'
     ? window.getLightboxBrowseDisabledHint(pid)
@@ -7940,13 +8000,13 @@ function buildLightboxContextMenu(pid) {
     onClick: function() {
       window.openInBrowse(pid);
     } });
-  if (typeof window.buildSpeciesHighlightMenuItems === 'function') {
+  if (!_lbReadOnly && typeof window.buildSpeciesHighlightMenuItems === 'function') {
     items = items.concat(window.buildSpeciesHighlightMenuItems([pid], {
       photoById: _lbPhotoDataByPhoto,
       showFetchFallback: true,
     }));
   }
-  if (typeof window.buildSpeciesRepresentativeMenuItems === 'function') {
+  if (!_lbReadOnly && typeof window.buildSpeciesRepresentativeMenuItems === 'function') {
     items = items.concat(window.buildSpeciesRepresentativeMenuItems([pid], {
       photoById: _lbPhotoDataByPhoto,
     }));
@@ -8382,11 +8442,13 @@ async function confirmDelete() {
 
 async function lightboxToggleWildlifeExcluded() {
   if (!_lightboxCurrentId) return;
+  if (_lbGuardReadOnly()) return false;
   var currentId = _lightboxCurrentId;
   var excluded = !_lbCurrentWildlifeExcluded;
   try {
     if (typeof window.setWildlifeExcludedFor === 'function') {
-      await window.setWildlifeExcludedFor(currentId, excluded);
+      var updated = await window.setWildlifeExcludedFor(currentId, excluded);
+      if (updated === false) return false;
     } else {
       await safeFetch('/api/photos/' + currentId + '/wildlife_excluded', {
         method: 'POST',
@@ -8408,6 +8470,7 @@ async function lightboxToggleWildlifeExcluded() {
 }
 
 function lightboxDelete() {
+  if (_lbGuardReadOnly()) return false;
   var overlay = document.getElementById('lightboxOverlay');
   if (
     _lbVisualTransitionPending ||
@@ -10108,7 +10171,7 @@ async function nativeMenuSetWildlifeExcluded(excluded) {
   var ids = nativeMenuPhotoIdsForWrite();
   if (!ids) return;
   var usePageHelper = typeof window.setWildlifeExcludedFor === 'function';
-  await Promise.all(ids.map(function(id) {
+  var results = await Promise.all(ids.map(function(id) {
     if (usePageHelper) {
       return window.setWildlifeExcludedFor(id, excluded);
     }
@@ -10118,6 +10181,9 @@ async function nativeMenuSetWildlifeExcluded(excluded) {
       body: JSON.stringify({excluded: excluded}),
     }, {toast: false});
   }));
+  if (usePageHelper && results.some(function(result) { return result === false; })) {
+    return false;
+  }
   if (!usePageHelper) nativeMenuRefreshWildlifeExcludedState(ids, excluded);
   if (typeof _lightboxCurrentId !== 'undefined' && ids.indexOf(_lightboxCurrentId) !== -1) {
     _lbCurrentWildlifeExcluded = excluded;

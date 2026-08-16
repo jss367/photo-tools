@@ -1558,6 +1558,125 @@ def test_read_only_scope_blocks_collection_and_keyword_writes(live_server, page)
     }
 
 
+def test_read_only_scope_disables_lightbox_and_native_mutations(live_server, page):
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    photo_id = photo_ids[0]
+    before_wildlife = db.conn.execute(
+        "SELECT wildlife_excluded FROM photos WHERE id = ?", (photo_id,)
+    ).fetchone()["wildlife_excluded"]
+    page.evaluate(
+        "pid => { reviewScopeMode = 'workspace'; openPipelineLightbox(pid); }",
+        photo_id,
+    )
+    expect(page.locator("#lightboxOverlay")).to_have_class(
+        re.compile(r"\bactive\b")
+    )
+
+    for selector in (
+        "#lightboxNotWildlife",
+        "#lightboxAdjustBtn",
+        "#lightboxDeleteBtn",
+    ):
+        expect(page.locator(selector)).to_be_disabled()
+
+    state = page.evaluate(
+        """async () => {
+          const adjustment = document.getElementById('lbAdjExposure');
+          return {
+            readOnly: _lbReadOnly,
+            deleteResult: lightboxDelete(),
+            wildlifeResult: await lightboxToggleWildlifeExcluded(),
+            nativeWildlifeResult: await nativeMenuSetWildlifeExcluded(true),
+            adjustmentResult: onLightboxAdjustmentInput(adjustment),
+            cropResult: await openCropEditor(),
+            deleteOpen: document.getElementById('deleteModal').classList.contains('open'),
+            adjustmentTimer: _lbAdjustSaveTimer,
+          };
+        }"""
+    )
+    assert state == {
+        "readOnly": True,
+        "deleteResult": False,
+        "wildlifeResult": False,
+        "nativeWildlifeResult": False,
+        "adjustmentResult": False,
+        "cropResult": False,
+        "deleteOpen": False,
+        "adjustmentTimer": None,
+    }
+    after_wildlife = db.conn.execute(
+        "SELECT wildlife_excluded FROM photos WHERE id = ?", (photo_id,)
+    ).fetchone()["wildlife_excluded"]
+    assert after_wildlife == before_wildlife
+
+    page.locator("#lightboxImg").click(button="right")
+    menu = page.locator(".vireo-ctx-menu")
+    expect(menu.locator(".vireo-ctx-chip.vireo-ctx-disabled")).to_have_count(9)
+    wildlife_item = menu.locator(
+        ".vireo-ctx-item", has_text="Wildlife classification"
+    )
+    expect(wildlife_item).to_have_class(re.compile(r"\bvireo-ctx-disabled\b"))
+
+
+def test_lightbox_deletion_updates_process_and_open_group_state(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    deleted_id = page.evaluate("grmState.selected")
+    page.evaluate("grmMoveReject()")
+    assert page.evaluate("grmHasPendingUserEdits()") is True
+
+    state = page.evaluate(
+        """photoId => {
+          document.dispatchEvent(new CustomEvent('lightbox:photodeleted', {
+            detail: {photoId: photoId, result: {deleted: 1}},
+          }));
+          const encounterIds = pipelineResults.encounters.flatMap(
+            encounter => encounter.photo_ids || []
+          );
+          const burstIds = pipelineResults.encounters.flatMap(
+            encounter => (encounter.bursts || []).flatMap(
+              burst => burst.photo_ids || burst || []
+            )
+          );
+          return {
+            photoIds: pipelineResults.photos.map(photo => photo.id),
+            encounterIds: encounterIds,
+            burstIds: burstIds,
+            groupIds: grmState.items.map(photo => photo.id),
+            rejectedIds: Array.from(grmState.rejects),
+            selectedIds: Array.from(grmState.selectedIds),
+            selected: grmState.selected,
+            rejectDiff: grmComputeDiff().rejectNew,
+          };
+        }""",
+        deleted_id,
+    )
+
+    for key in (
+        "photoIds",
+        "encounterIds",
+        "burstIds",
+        "groupIds",
+        "rejectedIds",
+        "selectedIds",
+    ):
+        assert deleted_id not in state[key]
+    assert state["selected"] != deleted_id
+    assert state["rejectDiff"] == 0
+    expect(page.locator(f'.photo-card[data-photo-id="{deleted_id}"]')).to_have_count(0)
+    expect(page.locator(f'.grm-card[data-photo-id="{deleted_id}"]')).to_have_count(0)
+
+
 def test_tauri_disables_navigation_when_group_review_is_dirty(live_server, page):
     photo_ids = live_server["data"]["photos"][:4]
     _write_grouped_pipeline_cache(live_server, photo_ids)

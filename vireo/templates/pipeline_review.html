@@ -7476,8 +7476,33 @@ function openPipelineLightbox(photoId) {
   var photo = findPhotoInResults(photoId);
   if (!photo || typeof openLightbox !== 'function') return;
   var list = pipelineReviewVisiblePhotoList(photoId);
-  openLightbox(photoId, photo.filename || '', list);
+  var readOnly = isScopedReviewView();
+  openLightbox(photoId, photo.filename || '', list, {
+    readOnly: readOnly,
+    readOnlyMessage: readOnly
+      ? (reviewScopeMode === 'collection' ? 'Collection' : 'Workspace') +
+        ' scope is view-only. Switch to Latest review to make changes.'
+      : undefined,
+  });
 }
+
+async function setWildlifeExcludedFor(photoId, excluded) {
+  if (isScopedReviewView()) {
+    notifyReadOnlyScopedView();
+    return false;
+  }
+  try {
+    await safeFetch('/api/photos/' + photoId + '/wildlife_excluded', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({excluded: !!excluded}),
+    }, {toast: false});
+  } catch (e) { return false; }
+  var photo = findPhotoInResults(photoId);
+  if (photo) photo.wildlife_excluded = excluded ? 1 : 0;
+  return true;
+}
+window.setWildlifeExcludedFor = setWildlifeExcludedFor;
 
 function openPipelinePhotoEditor(photoId) {
   if (window.vireoEditNav) {
@@ -8246,6 +8271,62 @@ async function grmApply() {
     }
   }
 }
+
+// The shared lightbox owns deletion, but Process Review owns additional
+// encounter and Group Review state. Remove the completed deletion from every
+// local structure before rendering or applying staged changes again.
+document.addEventListener('lightbox:photodeleted', function(e) {
+  var photoId = Number(e && e.detail && e.detail.photoId);
+  if (!Number.isFinite(photoId) || !pipelineResults) return;
+
+  pipelineResults.photos = (pipelineResults.photos || []).filter(function(photo) {
+    return photo.id !== photoId;
+  });
+  (pipelineResults.encounters || []).forEach(function(encounter) {
+    encounter.photo_ids = (encounter.photo_ids || []).filter(function(id) {
+      return id !== photoId;
+    });
+    encounter.photo_count = encounter.photo_ids.length;
+    (encounter.bursts || []).forEach(function(burst) {
+      var ids = burst.photo_ids || burst;
+      if (!Array.isArray(ids)) return;
+      var filtered = ids.filter(function(id) { return id !== photoId; });
+      if (burst.photo_ids) burst.photo_ids = filtered;
+      else {
+        burst.splice(0, burst.length);
+        Array.prototype.push.apply(burst, filtered);
+      }
+    });
+  });
+
+  if (grmState && Array.isArray(grmState.items)) {
+    grmState.items = grmState.items.filter(function(photo) { return photo.id !== photoId; });
+    ['picks', 'rejects', 'removed', 'selectedIds', 'touched'].forEach(function(name) {
+      if (grmState[name] && typeof grmState[name].delete === 'function') {
+        grmState[name].delete(photoId);
+      }
+    });
+    ['dbState', 'selectedSubjectByPhoto'].forEach(function(name) {
+      if (grmState[name]) delete grmState[name][String(photoId)];
+    });
+    if (grmState.selected === photoId) {
+      grmState.selected = grmState.items.length ? grmState.items[0].id : null;
+      grmState.selectionAnchor = grmState.selected;
+      if (grmState.selected != null && grmState.selectedIds) {
+        grmState.selectedIds.add(grmState.selected);
+      }
+    }
+  }
+
+  renderResults();
+  updateSummaryBar(refreshLocalSummaryCounts());
+  refreshLatestScopeSnapshotIfCurrent();
+  var groupOverlay = document.getElementById('grmOverlay');
+  if (groupOverlay && groupOverlay.classList.contains('open')) {
+    if (grmState.items.length) renderGroupModal();
+    else closeGroupReview();
+  }
+});
 
 // setLifeListPhoto (card context menu / shared lightbox action) only emits a
 // lifelist:changed event and updates its own caches. Without this listener the

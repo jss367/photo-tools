@@ -1226,6 +1226,126 @@ def test_location_review_partial_assignment_drops_deleted_pending_ids(
     )
 
 
+def test_location_review_partial_assignment_advances_when_deletion_drains_suffix(
+    live_server, page,
+):
+    """A deletion that empties the retry suffix must advance the group.
+
+    When a partial batch fails and the remaining unassigned photos are
+    then deleted through the lightbox, reconciliation drops those IDs
+    from the snapshot and the pending remainder becomes zero. Those
+    photos that were already committed are saved on the server, so the
+    group is effectively done — re-rendering it as a fresh, unreviewed
+    group would let the user double-assign the already-saved photos
+    under a different name. The queue must advance past the group and
+    the progress counter must reflect the completed assignment.
+    """
+    photo_id = live_server["data"]["photos"][0]
+    photo_ids = list(range(1, 1002))
+    preview = {
+        "total": 1001,
+        "reviewable": 1001,
+        "unresolved": [],
+        "skipped": [],
+        "groups": [
+            {
+                "photo_ids": photo_ids,
+                "photos": [
+                    {
+                        "id": photo_id,
+                        "filename": "keep.jpg",
+                        "latitude": 33.255,
+                        "longitude": -116.405,
+                        "timestamp": "2026-08-04T10:17:00",
+                    },
+                ],
+                "count": 1001,
+                "center": {"lat": 33.255, "lng": -116.405},
+                "bounds": {
+                    "south": 33.255, "west": -116.405,
+                    "north": 33.255, "east": -116.405,
+                },
+                "spread_m": 0,
+                "captured_from": "2026-08-04T10:17:00",
+                "captured_to": "2026-08-04T10:17:00",
+            },
+        ],
+    }
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.route(
+        "**/api/location-review/preview",
+        lambda route: route.fulfill(json=preview),
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("1,001 photos")
+
+    page.locator("#locationReviewSearch").fill("Drained suffix location")
+    page.locator("#locationReviewCustom").click()
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetch = window.safeFetch;
+          window.__pending = [];
+          window.__requestBodies = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__originalSafeFetch(url, opts, options);
+            }
+            window.__requestBodies.push(JSON.parse(opts.body));
+            return new Promise(function(resolve, reject) {
+              window.__pending.push({resolve: resolve, reject: reject});
+            });
+          };
+          window.__settle = function(result) {
+            var pending = window.__pending.shift();
+            if (result === 'reject') pending.reject(new Error('boom'));
+            else pending.resolve({ok: true, updated: result});
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(1000)")  # first chunk (1..1000) commits
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle('reject')")  # second chunk [1001] fails
+
+    expect(page.locator("#locationReviewAssign")).to_contain_text(
+        "Retry 1 remaining"
+    )
+    assert page.evaluate("window.__requestBodies.length") == 2
+
+    # Delete the sole remaining pending photo through the lightbox. After
+    # reconciliation, photoIds == processedIds so pendingRemaining is 0.
+    # Committed photos still sit in group.photos (via the surviving
+    # sample), so the buggy code would keep the group in the queue and
+    # re-render it as an unreviewed group.
+    page.evaluate(
+        "document.dispatchEvent(new CustomEvent('lightbox:photodeleted',"
+        " {detail: {photoId: 1001}}))"
+    )
+
+    # The group must be spliced out of the queue and the empty-state
+    # panel shown — the committed photos are saved and must not be
+    # available for a second assignment.
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text(
+        "All locations reviewed"
+    )
+    # The completed group must count toward the top-level progress.
+    expect(page.locator("#locationReviewProgressText")).to_have_text(
+        "1 of 1 assigned"
+    )
+    # And no further batch requests should have been issued — the retry
+    # button no longer exists once the empty state is shown.
+    assert page.evaluate("window.__requestBodies.length") == 2
+
+
 def test_location_review_missing_google_key_links_to_settings(live_server, page):
     """The empty suggestion state explains how to enable nearby places."""
     photo_id = live_server["data"]["photos"][0]

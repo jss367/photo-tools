@@ -2,13 +2,18 @@
 
 Status: validated by interactive prototype (`docs/plans/2026-07-19-photo-filter-prototype/`, PR #1319, merged 2026-07-19).
 
+Amended 2026-08-16 (PR #1465): quick search applies live as you type
+(150 ms debounce, Enter no longer required), and the quick filters
+(rating/flag/color) moved out of the popover to sit always-visible under
+the search box; the popover now holds only the rule builder.
+
 ## Goal
 
 One holistic filter pattern applied identically to every photo-listing surface
-(Browse, Map, Review, Duplicates, and future pages): a quick-search box, a row
-of readable filter chips with a locked page-scope chip, and a popover holding
-quick filters (rating/flag/color), a rule builder over all metadata, and
-optional nested AND/OR/NONE logic. CLIP visual search is a first-class,
+(Browse, Map, Review, Duplicates, and future pages): a live quick-search box,
+an always-visible row of quick filters (rating/flag/color), a row of readable
+filter chips with a locked page-scope chip, and a popover holding a rule
+builder over all metadata and optional nested AND/OR/NONE logic. CLIP visual search is a first-class,
 visually distinct clause with honest error states.
 
 ## Core decision: build on the smart-collection rule engine

@@ -1990,7 +1990,7 @@ document.addEventListener('keydown', function(e) {
     <div class="modal-hint">
       Shown in color-label tooltips in this workspace. Leave blank to remove it.
     </div>
-    <div class="modal-error" id="colorLabelDescriptionError"></div>
+    <div class="modal-error" id="colorLabelDescriptionError" role="alert"></div>
     <div class="modal-actions">
       <button class="modal-btn modal-btn-cancel" type="button"
               onclick="VireoColorLabels.closeEditor()">Cancel</button>
@@ -7877,7 +7877,12 @@ function buildLightboxContextMenu(pid) {
   };
   var colorChip = function(c, icon, title) {
     return {
-      label: icon, title: title,
+      label: icon,
+      title: c && window.VireoColorLabels
+        ? window.VireoColorLabels.title(c, title)
+        : title,
+      color: c,
+      colorBaseTitle: title,
       onClick: function() { if (has('setColorLabelFor')) window.setColorLabelFor(pid, c); },
     };
   };
@@ -7906,6 +7911,7 @@ function buildLightboxContextMenu(pid) {
       colorChip('yellow', '\u25CF', 'Yellow'),
       colorChip('green', '\u25CF', 'Green'),
       colorChip('blue', '\u25CF', 'Blue'),
+      colorChip('purple', '\u25CF', 'Purple'),
     ] });
   }
   items.push({ chips: [
@@ -10880,6 +10886,9 @@ function formatDuration(seconds) {
           _historySessionCount = Math.max(0, _historySessionCount - 1);
           document.getElementById('historyBadge').textContent = _historySessionCount || '';
           loadEditHistory();
+          document.dispatchEvent(new CustomEvent('vireo:edit-history-changed', {
+            detail: { operation: 'undo', result: data }
+          }));
         }
       })
       .catch(function() { if (btn) btn.disabled = false; });
@@ -10895,6 +10904,9 @@ function formatDuration(seconds) {
           _historySessionCount++;
           document.getElementById('historyBadge').textContent = _historySessionCount || '';
           loadEditHistory();
+          document.dispatchEvent(new CustomEvent('vireo:edit-history-changed', {
+            detail: { operation: 'redo', result: data }
+          }));
         }
       })
       .catch(function() { if (btn) btn.disabled = false; });

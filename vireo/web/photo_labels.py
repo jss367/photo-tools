@@ -32,8 +32,8 @@ def create_photo_labels_blueprint(get_db, json_error, settings_write_lock=None):
     def set_description(color):
         if color not in VALID_COLOR_LABELS:
             return json_error(f"color must be one of {VALID_COLOR_LABELS}")
-        body = request.get_json(silent=True) or {}
-        if "description" not in body:
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or "description" not in body:
             return json_error("description required")
         try:
             lock = settings_write_lock or nullcontext()

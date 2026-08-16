@@ -29,7 +29,6 @@ def test_right_click_color_adds_workspace_description(live_server, page):
     expect(red).to_have_attribute("aria-label", "Red label: Reptiles")
 
     # The same workspace meaning follows the color into other color-label UI.
-    page.locator(".vf-filters-btn").click()
     quick_red = page.locator('.vf-quick-colors [data-color="red"]')
     expect(quick_red).to_have_attribute(
         "title", "Red label — Reptiles · Right-click to edit"
@@ -50,7 +49,6 @@ def test_color_description_can_be_removed_and_right_click_does_not_filter(
     )
     page.goto(f"{live_server['url']}/browse")
     page.locator(".grid-card").first.wait_for(state="visible")
-    page.locator(".vf-filters-btn").click()
     blue = page.locator('.vf-quick-colors [data-color="blue"]')
     expect(blue).to_have_attribute(
         "title", "Blue label — Waterbirds · Right-click to edit"

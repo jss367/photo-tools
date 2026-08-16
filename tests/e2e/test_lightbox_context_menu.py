@@ -71,6 +71,31 @@ def test_lightbox_right_click_opens_menu(live_server, page):
     assert menu.locator(".vireo-ctx-chip").count() > 5
 
 
+def test_lightbox_color_description_opens_editor(live_server, page):
+    """Lightbox color chips show descriptions and open the shared editor."""
+    url = live_server["url"]
+    response = page.request.put(
+        f"{url}/api/color-label-descriptions/blue",
+        data={"description": "Waterbirds"},
+    )
+    assert response.ok
+
+    _open_lightbox(page, url)
+    _fire_contextmenu_on_lightbox(page)
+
+    blue = page.locator('.vireo-ctx-chip[data-color="blue"]')
+    expect(blue).to_have_attribute(
+        "title", "Blue — Waterbirds · Right-click to edit"
+    )
+    expect(page.locator('.vireo-ctx-chip[data-color="purple"]')).to_be_visible()
+
+    blue.click(button="right")
+    expect(page.locator("#colorLabelDescriptionModal")).to_have_class(
+        "modal-overlay open"
+    )
+    expect(page.locator("#colorLabelDescriptionInput")).to_have_value("Waterbirds")
+
+
 def test_lightbox_menu_sets_species_representative(live_server, page):
     """The shared lightbox menu can set the current photo as representative."""
     url = live_server["url"]

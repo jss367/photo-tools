@@ -30,6 +30,7 @@ DEFAULTS = {
     "inat_token": "",
     "hf_token": "",
     "google_maps_api_key": "",
+    "google_maps_prefer_english": True,
     "scan_roots": [],
     "scan_workers": 0,
     "setup_complete": False,

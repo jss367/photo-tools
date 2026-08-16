@@ -700,6 +700,8 @@
 
   // -- Link-to-Google-place flow ---------------------------------------------
 
+  window.GOOGLE_MAPS_PREFER_ENGLISH = true;
+
   // Cached promise for the Google Maps JS loader (memoized).
   let _gmapsLoadPromise = null;
   function loadGoogleMapsJs() {
@@ -714,7 +716,9 @@
       const s = document.createElement('script');
       s.src = 'https://maps.googleapis.com/maps/api/js?key=' +
         encodeURIComponent(apiKey) +
-        '&libraries=places&loading=async&callback=_gmapsCallback';
+        '&libraries=places' +
+        (window.GOOGLE_MAPS_PREFER_ENGLISH ? '&language=en' : '') +
+        '&loading=async&callback=_gmapsCallback';
       s.async = true;
       s.onerror = function() { reject(new Error('gmaps_load_failed')); };
       document.head.appendChild(s);
@@ -730,9 +734,11 @@
       const r = await fetch('/api/config');
       const cfg = await r.json();
       window.GOOGLE_MAPS_API_KEY = cfg.google_maps_api_key || '';
+      window.GOOGLE_MAPS_PREFER_ENGLISH = cfg.google_maps_prefer_english !== false;
       return cfg;
     } catch(e) {
       window.GOOGLE_MAPS_API_KEY = '';
+      window.GOOGLE_MAPS_PREFER_ENGLISH = true;
       return null;
     }
   })();

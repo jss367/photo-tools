@@ -1428,6 +1428,12 @@ def test_google_maps_api_key_default_is_empty(tmp_path, monkeypatch):
     assert cfg.load().get("google_maps_api_key") == ""
 
 
+def test_google_maps_english_names_default_is_enabled(tmp_path, monkeypatch):
+    import config as cfg
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    assert cfg.load().get("google_maps_prefer_english") is True
+
+
 def test_open_in_browser_default_is_false(tmp_path, monkeypatch):
     """open_in_browser defaults to False so the Tauri wrapper keeps its
     classic in-window behavior unless the user opts in."""

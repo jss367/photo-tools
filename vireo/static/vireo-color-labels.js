@@ -14,6 +14,10 @@
     return color.charAt(0).toUpperCase() + color.slice(1);
   }
 
+  function isValid(color) {
+    return COLORS.includes(color);
+  }
+
   function request(url, options) {
     if (window.Vireo && window.Vireo.api) {
       return window.Vireo.api.json(url, options, { toast: false });
@@ -156,6 +160,7 @@
 
   window.VireoColorLabels = {
     ensureLoaded: ensureLoaded,
+    isValid: isValid,
     description: description,
     title: title,
     refreshControls: refreshControls,

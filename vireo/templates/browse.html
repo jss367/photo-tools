@@ -8525,6 +8525,16 @@ document.addEventListener('lightbox:closed', function(event) {
   if (photoId == null || selectedPhotos.size > 0) return;
   var idx = photos.findIndex(function(photo) { return photo.id === photoId; });
   if (idx < 0) return;
+  // Skip `selectPhoto` when the focused photo is already the one being
+  // returned to: it calls `loadDetail`, which refetches and rerenders the
+  // detail panel and would silently discard an unsubmitted `#locationInput`
+  // draft (its blur handler only hides suggestions, it does not save). Only
+  // reload details when lightbox navigation actually changed the photo.
+  if (selectedPhotoId === photoId) {
+    if (selectedIndex !== idx) selectedIndex = idx;
+    scrollToCard(idx);
+    return;
+  }
   selectPhoto({ shiftKey: false, metaKey: false, ctrlKey: false }, photoId, idx);
   scrollToCard(idx);
 });

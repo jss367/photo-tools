@@ -226,6 +226,68 @@ def test_browse_lightbox_delete_only_photo_does_not_reselect_it(
     assert page.evaluate("window.photos.length") == initial_count - 1
 
 
+def test_browse_lightbox_close_skips_reload_when_photo_unchanged(
+    live_server, page,
+):
+    """Closing without navigating must not refetch the already-selected photo.
+
+    The `lightbox:closed` reconciliation used to call `selectPhoto` for the
+    returned photo unconditionally, which runs `loadDetail` and rerenders
+    the detail panel — silently discarding an unsubmitted `#locationInput`
+    draft (blur only hides suggestions; it does not save). Codex P2 on PR
+    #1486. Skip the reload when `selectedPhotoId` already matches.
+    """
+    page.route(
+        "**/photos/*/full",
+        lambda route: route.fulfill(
+            body=base64.b64decode(_PNG_1X1), content_type="image/png"
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+
+    first_card = page.locator(".grid-card").first
+    first_card.wait_for(state="visible")
+    first_id = int(first_card.get_attribute("data-id"))
+
+    # Focus the first photo via a normal click, which runs `loadDetail` once.
+    first_card.click()
+    page.wait_for_function(
+        "photoId => selectedPhotoId === photoId", arg=first_id
+    )
+
+    observed = page.evaluate(
+        """([id, filename]) => {
+            const calls = [];
+            const original = window.loadDetail;
+            window.loadDetail = function(photoId) {
+                calls.push(photoId);
+                return original.apply(this, arguments);
+            };
+            try {
+                openLightbox(id, filename, [{id: id, filename: filename}]);
+            } catch (err) {
+                window.loadDetail = original;
+                throw err;
+            }
+            // Committed identity is set synchronously inside openLightbox once
+            // the image commits; capture whatever is committed at close time.
+            closeLightbox();
+            window.loadDetail = original;
+            return { calls, selectedPhotoId, selectedIndex };
+        }""",
+        [first_id, first_card.get_attribute("data-filename")],
+    )
+
+    expect(page.locator("#lightboxOverlay")).not_to_have_class(
+        "lightbox-overlay active"
+    )
+    assert observed["selectedPhotoId"] == first_id
+    assert observed["selectedIndex"] == 0
+    # The pre-existing focus must survive the close: no fresh loadDetail on
+    # `lightbox:closed` for the already-selected photo.
+    assert observed["calls"] == []
+
+
 def test_lightbox_track_eye_keeps_eye_at_same_screen_position(
     live_server, page, tmp_path,
 ):

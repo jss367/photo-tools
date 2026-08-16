@@ -3708,6 +3708,7 @@ var _lbFlagPendingWrites = 0;
 var _lbFlagPendingByPhoto = {};  // count of in-flight flag writes PER photo; lightbox:flagchanged is emitted once a photo's count hits 0 so listeners see its settled flag, not a guessed per-write one
 var _lbConfirmedFlags = {};   // last server-confirmed flag per photo, isolated from optimistic page helpers
 var _lbProvisionalFlags = {}; // page-owned staged flags (for example Group Review before Apply)
+var _lbProvisionalFlagSeq = {}; // edit sequence that produced each staged flag
 var _lbViewportByPhotoId = {};  // per-session lightbox viewport cache keyed by photo id
 var _lbPendingViewportState = null;
 var _lbPendingEyeTrack = null; // destination alignment waiting for image metadata/layout
@@ -6023,10 +6024,15 @@ function _lbDisplayedFlagFor(photoId) {
   return _lbConfirmedFlagFor(photoId);
 }
 
-window.setLightboxProvisionalFlag = function(photoId, flag) {
+window.setLightboxProvisionalFlag = function(photoId, flag, editSeq) {
   var normalized = _lbNormalizeFlag(flag);
   if (photoId == null || !normalized) return;
-  _lbProvisionalFlags[String(photoId)] = normalized;
+  var key = String(photoId);
+  var seq = Number.isInteger(editSeq) ? editSeq : (_lbFlagEditSeq + 1);
+  if (seq < (_lbProvisionalFlagSeq[key] || 0)) return;
+  _lbFlagEditSeq = Math.max(_lbFlagEditSeq, seq);
+  _lbProvisionalFlags[key] = normalized;
+  _lbProvisionalFlagSeq[key] = seq;
   if (_lightboxCurrentId === parseInt(photoId, 10)) {
     _lbSetFlagStatus(normalized);
   }
@@ -6039,6 +6045,7 @@ window.setLightboxProvisionalFlag = function(photoId, flag) {
 window.clearLightboxProvisionalFlags = function(photoIds) {
   (photoIds || []).forEach(function(photoId) {
     delete _lbProvisionalFlags[String(photoId)];
+    delete _lbProvisionalFlagSeq[String(photoId)];
     _lbForgetConfirmedFlag(photoId);
   });
   if (_lightboxCurrentId != null && (photoIds || []).some(function(photoId) {
@@ -6116,17 +6123,21 @@ function _lbApplyFlag(photoId, flag) {
     else delete _lbFlagPendingByPhoto[photoId];
 
     if (provisional) {
-      window.setLightboxProvisionalFlag(photoId, normalized);
+      window.setLightboxProvisionalFlag(photoId, normalized, seq);
       if (_lightboxCurrentId === photoId && (_lbFlagEditSeq === seq || _lbFlagPendingWrites === 0)) {
         _lbSetFlagStatus(_lbDisplayedFlagFor(photoId));
       }
     } else if (landed) {
-      delete _lbProvisionalFlags[String(photoId)];
+      var provisionalSeq = _lbProvisionalFlagSeq[String(photoId)] || 0;
+      if (provisionalSeq <= seq) {
+        delete _lbProvisionalFlags[String(photoId)];
+        delete _lbProvisionalFlagSeq[String(photoId)];
+      }
       // Cache the confirmed flag even if the user has navigated away, so the
       // quiescence emit below reflects what actually landed for this photo.
       _lbCacheFlag(photoId, normalized);
       if (_lightboxCurrentId === photoId && (_lbFlagEditSeq === seq || _lbFlagPendingWrites === 0)) {
-        _lbSetFlagStatus(normalized);
+        _lbSetFlagStatus(_lbDisplayedFlagFor(photoId));
       }
     } else if (_lightboxCurrentId === photoId && _lbFlagEditSeq === seq) {
       // Write failed: the prior confirmed flag stands; restore the chip to it.

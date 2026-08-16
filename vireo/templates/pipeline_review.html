@@ -7405,9 +7405,28 @@ async function copyPhotoPaths(photoIds) {
 function openPipelineLightbox(photoId) {
   var photo = findPhotoInResults(photoId);
   if (!photo || typeof openLightbox !== 'function') return;
-  var list = pipelineResults && Array.isArray(pipelineResults.photos)
-    ? pipelineResults.photos
-    : [photo];
+  var groupOverlay = document.getElementById('grmOverlay');
+  var groupCard = groupOverlay && groupOverlay.classList.contains('open')
+    ? groupOverlay.querySelector('.grm-card[data-photo-id="' + photoId + '"]')
+    : null;
+  var root = groupCard ? groupOverlay : document.getElementById('encountersContainer');
+  var selector = groupCard ? '.grm-card[data-photo-id]' : '.photo-card[data-photo-id]';
+  var seen = {};
+  var list = [];
+  if (root) {
+    root.querySelectorAll(selector).forEach(function(card) {
+      // Collapsed encounters remain in the DOM but are not part of the visible
+      // review sequence. Group Review cards are all visible in its overlay.
+      if (!groupCard && card.offsetParent === null) return;
+      var id = parseInt(card.dataset.photoId, 10);
+      if (!id || seen[id]) return;
+      var item = findPhotoInResults(id);
+      if (!item) return;
+      seen[id] = true;
+      list.push(item);
+    });
+  }
+  if (!seen[photoId]) list = [photo];
   openLightbox(photoId, photo.filename || '', list);
 }
 

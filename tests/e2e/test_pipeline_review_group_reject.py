@@ -670,6 +670,24 @@ def test_photo_context_menu_exposes_review_and_organization_actions(
     expect(menu.locator('.vireo-ctx-chip[title="Clear flag"]')).to_have_count(1)
 
 
+def test_lightbox_navigation_follows_visible_filtered_cards(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_mixed_label_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    page.locator('.filter-btn[data-filter="REVIEW"]').click()
+    cards = page.locator("#encountersContainer .photo-card[data-photo-id]")
+    expect(cards).to_have_count(2)
+    visible_ids = [
+        int(cards.nth(i).get_attribute("data-photo-id")) for i in range(cards.count())
+    ]
+
+    page.evaluate("pid => openPipelineLightbox(pid)", visible_ids[0])
+    assert page.evaluate("_lightboxPhotoList.map(photo => photo.id)") == visible_ids
+    page.keyboard.press("ArrowRight")
+    assert page.evaluate("_lightboxCurrentId") == visible_ids[1]
+
+
 def test_photo_context_menu_adds_photo_to_existing_collection(live_server, page):
     db = live_server["db"]
     photo_ids = live_server["data"]["photos"][:4]
@@ -1047,6 +1065,54 @@ def test_lightbox_provisional_group_flag_does_not_poison_confirmed_cache(
         page.locator(f'.photo-card[data-photo-id="{photo_id}"] .flag-rejected')
     ).to_have_count(0)
     assert _flags(db, photo_ids) == ["none"] * 4
+
+
+def test_older_persisted_flag_does_not_clear_newer_group_provisional_flag(
+    live_server, page
+):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    photo_id = photo_ids[0]
+    page.evaluate(
+        """pid => {
+          window.__originalSetFlagFor = window.setFlagFor;
+          window.setFlagFor = function() {
+            return new Promise(resolve => { window.__resolvePersistedFlag = resolve; });
+          };
+          openPipelineLightbox(pid);
+          _lbApplyFlag(pid, 'flagged');
+          closeLightbox();
+        }""",
+        photo_id,
+    )
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    page.evaluate("grmMoveReject()")
+    assert page.evaluate(
+        "pid => _lbProvisionalFlags[String(pid)]", photo_id
+    ) == "rejected"
+
+    try:
+        page.evaluate("window.__resolvePersistedFlag(true)")
+        page.wait_for_function("_lbFlagPendingWrites === 0")
+        state = page.evaluate(
+            "pid => ({"
+            "confirmed: _lbConfirmedFlagFor(pid),"
+            "provisional: _lbProvisionalFlags[String(pid)],"
+            "})",
+            photo_id,
+        )
+        assert state == {
+            "confirmed": "flagged",
+            "provisional": "rejected",
+        }
+        page.evaluate("pid => openPipelineLightbox(pid)", photo_id)
+        expect(page.locator("#lightboxFlagStatus")).to_have_text("Rejected")
+    finally:
+        page.evaluate("window.setFlagFor = window.__originalSetFlagFor")
 
 
 def test_read_only_scope_lightbox_flag_does_not_mutate_cache(live_server, page):

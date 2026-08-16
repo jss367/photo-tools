@@ -588,7 +588,7 @@ Four corollaries, each binding on one site:
    and "Active-filter detection" below.
 3. **Every server entry point that re-expands a handle takes the same
    scope and the card's frozen membership, and rebuilds its own row
-   set.** That is both `GET /api/predictions/card` ("Card detail
+   set.** That is both `POST /api/predictions/card` ("Card detail
    endpoint" below) and the accept/reject POST (§3, step 1). Neither may
    delegate to a route that cannot enforce the scope, and neither may
    act on more than the membership the card had when it was rendered —
@@ -764,11 +764,31 @@ with no defined rendering.
 - The group review modal opens with the union membership, through the
   scoped card endpoint below.
 
-**Card detail endpoint.** New endpoint
-`GET /api/predictions/card?id=<card_id>&rules=…&collection_id=…&visual=…`
-returns the union of member groups with per-photo, per-model rows. It
-carries the **server-applied** scope, and it rebuilds the scoped row set
-itself rather than composing `/api/predictions/group/<group_id>`.
+**Card detail endpoint.** New endpoint `POST /api/predictions/card`,
+with a JSON body:
+
+```json
+{
+  "id": "<card_id>",
+  "member_prediction_ids": [1234, 1235, 1236],
+  "rules": [],
+  "collection_id": null,
+  "visual": null
+}
+```
+
+It returns the union of member groups with per-photo, per-model rows. It
+carries the **server-applied** scope and the card's frozen membership,
+and it rebuilds the scoped row set itself rather than composing
+`/api/predictions/group/<group_id>`.
+
+*The endpoint is a read; the POST is transport, not semantics.* It
+writes nothing, is safe to retry, and takes a body only because its
+payload has no bound ("Why the membership is not on the URL" below).
+Said explicitly so nobody later "corrects" it back to a GET. Losing HTTP
+caching costs nothing here: the response depends on the taxonomy cache
+and on live row statuses, both of which move under it, so it was never
+cacheable.
 
 Both halves are load-bearing, and neither is covered by the per-node
 fallback. That fallback triggers on the four *client-applied*
@@ -798,17 +818,54 @@ component containing the anchor within that row set. The group route
 stays for its existing non-merged callers; the card endpoint does not
 build on it.
 
-The endpoint takes the card's frozen membership on the same URL
-(`&rows=<prediction_id>,…`) and intersects with it exactly as the mutation
+The endpoint takes the card's frozen membership in the same body
+(`member_prediction_ids` — the identical field name and shape the
+mutation POST carries) and intersects with it exactly as the mutation
 does (§3 step 1). A detail view is not destructive, but a card that
 opens onto a group the user never saw in it — because the taxonomy
 cache resolved between the grid render and the click — is the same
 "covers more than the user could see" failure one surface earlier, and
 the modal is where the user decides whether to accept. Absent
-`rows`, the endpoint returns the whole scoped component (the legacy
-shape) and flags `"expanded"` so the client can say so.
+`member_prediction_ids`, the endpoint returns the whole scoped component
+(the legacy shape) and flags `"expanded"` so the client can say so.
 
-`visual` is **not** optional on this URL, and it is not belt-and-braces.
+**Why the membership is not on the URL.** An earlier revision put it
+there (`&rows=<prediction_id>,…`), and that does not survive contact
+with a real catalog. Membership is frozen at *row* granularity
+("Freezing rows, not nodes", §3 step 1) and is unbounded by
+construction: a burst holds one row per photo, the same-taxon-plus-
+overlap edge chains bursts transitively, and two classifier models
+double the row count over the same photos — so a component spanning a
+few thousand photos serializes tens of kilobytes of ids, well past the
+~8 KB request-line and header limits Werkzeug and every common reverse
+proxy enforce. The failure lands as a 414/400 on exactly the largest
+cards, which are the ones most worth opening, and it lands *after* the
+card rendered fine — the user sees a card and cannot open it. `rules`
+and `visual` are JSON blobs drawing on the same budget, so the URL was
+the wrong place for this payload even before membership joined it.
+
+Moving the whole payload into a body removes the bound and makes the
+detail read and the mutation POST the *same shape minus the action*.
+That symmetry is a correctness property rather than tidiness: corollary
+3 and §3 step 1 both require that every re-expanding call carry the
+identical scope tuple, and one shared client helper that builds both
+payloads leaves one place to forget it instead of two.
+
+*Two alternatives rejected.* A **server-issued snapshot token** — the
+Review GET stores each card's membership and returns a short handle the
+client echoes back — keeps the freeze guarantee intact, but the GET
+builds *every* card on the page, so it would persist a membership record
+per card per refresh (hundreds to thousands per load, on the page the
+user reloads most) purely so that the occasional modal open can name
+one. It also adds a TTL, a GC path, and a new "snapshot expired" failure
+on a click that previously always worked. Server state buys nothing here
+that a request body does not. A **membership digest** (count plus hash,
+which does fit in a URL) cannot do the job at all: the rule is that
+growth discovered at re-expansion is *excluded*, not merely detected
+(§3 step 1), and an intersection cannot be computed from a hash.
+
+`visual` is **not** optional in this payload, and it is not
+belt-and-braces.
 A visual clause is server-applied like `rules` and `collection_id`
 (`_apply_visual_to_rules` folds it into `rules` before the query,
 `app.py:15300-15315`; the client sends the clause and does not remove
@@ -827,12 +884,15 @@ URL-significant characters — and may contain the delimiter characters
 (`|`, `:`) that appear inside taxon keys and node keys themselves.
 Two-part rule:
 
-1. The card endpoint takes the id as a **query parameter**
-   (`/api/predictions/card?id=<card_id>`), not as a path segment, so any
-   byte survives the round trip once percent-encoded. A Flask
-   `<card_id>` path converter does not match a decoded slash even when
-   the client uses `encodeURIComponent`, so a path-segment id for a
-   label like `hawk/owl` would 404; the query parameter avoids that.
+1. The id never travels in a URL path segment or query string on the
+   request path: both callers — the card detail read and the mutation —
+   carry it as a JSON field in the request body ("Card detail endpoint"
+   above). That retires the Flask routing hazard outright instead of
+   working around it: a `<card_id>` path converter does not match a
+   decoded slash even when the client uses `encodeURIComponent`, so a
+   path-segment id for a label like `hawk/owl` would 404. The id still
+   appears in places that are not request bodies — the URL hash for deep
+   links, DOM attributes, log lines — which is what rule 2 exists for.
 2. The server-emitted `card_id` string is base64url-encoded (RFC 4648
    §5, unpadded — alphabet `[A-Za-z0-9_-]`) over a **structured**
    payload, not a delimiter-joined string. Concretely, the payload is
@@ -963,7 +1023,7 @@ leaves the card endpoint unscoped:
   visually-scoped Review is still a merged-card view. What they require
   instead is that every server
   entry point which re-expands a handle receives them: the mutation
-  POST (§3, step 1) and the card detail GET ("Card detail endpoint"
+  POST (§3, step 1) and the card detail call ("Card detail endpoint"
   above), or the re-expansion silently rebuilds a wider component than
   the grid showed.
 - **Client-applied** — the four predicates listed below, which hide
@@ -1031,8 +1091,8 @@ good reason: a below-`minConfidence` bridge row or an already-accepted
 `status != currentTab` sibling row is exactly the kind of hidden
 bridge that lets the server-computed full-component `card_id` stitch
 two visible groups into one displayed card — and lets
-`/api/predictions/card?id=<card_id>` re-expose the hidden bridge rows
-on open. Forwarding the same predicates into the mutation POST (§3)
+the card detail call (`POST /api/predictions/card`) re-expose the
+hidden bridge rows on open. Forwarding the same predicates into the mutation POST (§3)
 is necessary but not sufficient: without also rebuilding the displayed
 card on the client, the *display* would still show a merged card whose
 members the mutation then refuses to touch, and the user would see a
@@ -1042,7 +1102,7 @@ symmetric on the client-applied predicates, always. The server-applied
 three (`rules`, `collection_id`, `visual`) are symmetric in the other
 direction: they never suppress merging, and they travel on *every*
 server call that re-expands a handle — the mutation POST and the card
-detail GET alike.
+detail call alike, in the same payload field on both.
 
 No sentinel change is required — the existing `currentModel` default
 (`'all'`), `currentLabelsFingerprint` default (`null`), `minConfidence`
@@ -1141,7 +1201,7 @@ current filter hides — a group at another fingerprint, a
 below-`minConfidence` row, a `status != currentTab` sibling, or a
 row from another classifier model — opening the "A+C card" from the
 filtered view would otherwise re-expose B's hidden rows through the
-`/api/predictions/card?id=<card_id>` union. Falling back to per-node
+`POST /api/predictions/card` union. Falling back to per-node
 cards *and* per-node `node_id` mutation handles in filtered views
 eliminates that exposure entirely: the union endpoint is never called,
 and every mutation names exactly one visible node under the same scope
@@ -1509,6 +1569,66 @@ destructive half of a reconciling reject is undoable even though the
 status flip is not. Rejecting a pending member is unchanged: nothing
 was tagged, nothing is retracted.
 
+**A card mutation writes every member status before it decides any
+keyword effect.** This is a general rule about card mutations, not a
+patch on "Reject all", and it binds accept as much as reject. A card
+mutation runs as two phases inside one transaction, in this order:
+
+- **Phase A — statuses.** Write the new status of *every* row in the
+  mutated set (`resolved component ∩ member_prediction_ids ∩ scope`,
+  step 1), reconciling flips included. No keyword is written or removed
+  and no keyword-related predicate is evaluated.
+- **Phase B — keyword effects.** Only after the last Phase-A write:
+  evaluate the retraction predicate, perform the untag or tag, and
+  compute the disclosure counts — all against the post-Phase-A state.
+
+Without the split, a row-at-a-time loop evaluates each keyword decision
+against a state the same click is about to invalidate. The concrete
+failure: "Reject all" on an `{accepted, pending}` card whose two members
+assert the same taxon on the same photo. Process the accepted row first
+and the liveness clause below sees the still-`pending` sibling as
+another live assertion, so it keeps the accept-owned keyword; the
+pending row is then rejected and retracts nothing, because that row
+never tagged anything. The card ends unanimously rejected with the
+keyword still on the photo — exactly the badge-disagrees-with-metadata
+failure the retraction rule exists to prevent, manufactured by the
+retraction rule's own guard. The predicate is not wrong; *when it is
+asked* is wrong.
+
+Accept is not exempt, only accidentally safe today. Its keyword write is
+idempotent per taxon (§4) and its `already_has_species` check
+(`db.py:17195-17197`) reads keywords rather than statuses, so no
+interleaving bites right now. That is a property of the current effect
+set, not of the mutation's structure: any keyword effect added on the
+accept side — a replace-style accept that strips a superseded taxon's
+keyword is the obvious candidate — reinstates the interleaving
+immediately. Stating the phase order for card mutations in general makes
+that impossible rather than merely unlikely.
+
+*Why not simply exclude the current action's members from the liveness
+check.* That is the narrower repair the symptom also admits, and it
+fixes one predicate by hand. Phase B holds several state-reading steps —
+the retraction guard, the disclosure's "still predicted on 2 photos"
+count, the "kept because another live prediction still asserts it"
+wording — and each would need its own exclusion list, correctly
+maintained, forever, including the next one somebody adds. The ordering
+rule makes all of them right at once, and the exclusion behaviour falls
+out of it as a consequence: after Phase A the mutated members *are*
+rejected, so they no longer count as live. One rule, no list.
+
+*What "another live assertion" means, precisely.* Phase B is where it
+runs, so it is worth pinning down: a row in
+`predictions`/`prediction_review` on that photo, in the active
+workspace, whose §1 taxon key equals the card's and whose
+**post-Phase-A** status is not `rejected`. It is deliberately *not*
+restricted to the card's members — a same-taxon row on a different card,
+or one the mutation's scope excluded, keeps the keyword alive and must,
+which is also why "ignore every sibling" would be wrong where "evaluate
+after the writes" is right. And it is not
+`get_photos_with_equivalent_species` (`db.py:13874`), which answers the
+different question "does this photo already carry an equivalent species
+keyword" and is the accept path's idempotence check.
+
 **Retraction requires provenance, and provenance cannot live in the
 edit log.** Stripping a keyword is only safe if we know the *accept*
 put it there; a photo can carry "Blue Tit" because the user typed it,
@@ -1544,8 +1664,10 @@ to. Two rules, split by what is actually knowable:
   write time and nothing else can reconstruct.) A reject then retracts
   exactly the rows where `source = 'accept'`, the keyword is the card's
   canonical taxon keyword, and no other live non-rejected prediction
-  still asserts it (`get_photos_with_equivalent_species`,
-  `db.py:17195-17197`).
+  still asserts it — the predicate defined under "A card mutation writes
+  every member status before it decides any keyword effect" above, and
+  evaluated in Phase B, i.e. after every member's status has been
+  written.
 
   **Provenance is a lattice, and no write may move down it.** With a
   third value the column stops being "set-or-NULL" and
@@ -1632,6 +1754,18 @@ exhaustively rather than by example: **every path that writes
 `prediction_review.status` from a Review surface is listed below, with
 its disposition, and a path that is not listed is not allowed to
 exist.** Adding one is a design change, not an implementation detail.
+
+A second closure clause governs *how* a routed path calls, not only
+whether it is listed: **a routed entry point issues one card mutation
+per card, and never decomposes a card into per-member requests.** A
+client loop that POSTs each member separately would satisfy the table
+and still break the two-phase rule above, because every request would
+run its own Phase B against a state the next request changes — the
+"Reject all" keyword leak, reassembled on the client out of individually
+correct calls. That is why the toolbar row below iterates *cards* and
+issues one mutation each rather than iterating members, and why the
+keyboard handler targets a card rather than a row; the batching is a
+correctness requirement, not a round-trip optimization.
 
 *Routed through card mutations (Phase 5):*
 
@@ -1922,8 +2056,13 @@ Each phase lands as its own PR and is independently useful.
    takes a label and a *set*: a label whose rows carry one scientific
    name plus several `NULL`s resolves off the populated one; two
    scientific names resolving to the same `taxon_id` resolve to it; two
-   resolving to **different** `taxon_id`s skip the rung and fall through
-   to the label ladder rather than picking a winner; the canonical
+   resolving to **different** `taxon_id`s **abandon the ladder entirely**
+   and return `('name', L)` on the canonical folded spelling — rungs 2
+   and 3 are *not* consulted, asserted under a label whose common-name
+   lookup **does** resolve and with a populated alternate-name cache
+   entry, so an implementation that merely skips rung 1 returns some
+   `taxon:` key here and fails (§1, "Conflicts fall to the name key, not
+   to the next rung"); the canonical
    spelling fed to `Taxonomy.lookup` is the same for `Say's Phoebe`,
    `Say’s Phoebe` and `Say's phoebe`; and the function is
    order-independent — shuffling the input rows cannot change the key.
@@ -2079,7 +2218,8 @@ Each phase lands as its own PR and is independently useful.
    while **no** client-applied predicate is active, so the view stays a
    merged-card view and the client opens the card endpoint: the Review
    GET emits A alone, and
-   `GET /api/predictions/card?id=…&collection_id=…` returns A's
+   a card-detail POST whose body carries A's `card_id` and the
+   `collection_id` returns A's
    membership only, with D's rows and D's out-of-collection photos
    absent. The same fixture against an endpoint that omits
    `collection_id`/`rules`/`visual` — or that composes
@@ -2099,9 +2239,17 @@ Each phase lands as its own PR and is independently useful.
    card derived from a custom label whose folded form contains `/`,
    `?`, `#`, `|`, and `:` (all of which appear inside the raw
    taxon/member key syntax) round-trips through the JSON-structured
-   base64url-encoded id and the card endpoint's query parameter
-   without a 404, and the server decodes back to the exact
-   `smallest_member_key`; a **cache-transition card-id fixture** —
+   base64url-encoded id in the card endpoint's **request body**, and the
+   server decodes back to the exact `smallest_member_key`; the same id
+   also survives a round trip through the URL hash a deep link stores it
+   in, which is the surface rule 2's encoding still has to cover now
+   that no request path carries the id; a
+   **card-payload-size fixture** — a transitive component of 2,000
+   member rows opens through the card endpoint successfully, the
+   regression guard for serializing membership into a URL (the
+   `&rows=…` shape this replaced would exceed the request-line limit and
+   fail on exactly the largest cards); a **cache-transition card-id
+   fixture** —
    a `name:blue tit` card is emitted with
    `card_id = base64url(JSON([A]))` where `A` is the anchor node
    key, the background resolver then persists `blue tit` →
@@ -2137,8 +2285,9 @@ Each phase lands as its own PR and is independently useful.
    scope tuple mutates nothing extra, since membership can only
    intersect; a
    **card-detail frozen-membership fixture** — the same transition
-   against `GET /api/predictions/card?id=…&rows=…` returns the clicked
-   card's members only, and the `rows`-omitted call returns the grown
+   against a card-detail POST whose body carries `id` plus
+   `member_prediction_ids` returns the clicked card's members only, and
+   the call that omits `member_prediction_ids` returns the grown
    component with `"expanded"` set; a
    **cache-transition-anchor-deleted fixture** — the same setup
    but with the anchor's rows deleted between the GET and the POST
@@ -2364,6 +2513,25 @@ Each phase lands as its own PR and is independently useful.
    `prediction_accept` entry, which is the regression guard for not
    sourcing provenance from the bounded edit log), and another live
    non-rejected prediction still asserting the taxon; a
+   **two-phase-ordering fixture** — "Reject all" on an
+   `{accepted, pending}` card whose two members assert the **same taxon
+   on the same photo**, the accepted one having tagged it
+   `source = 'accept'`: both rows end `rejected` *and* the keyword is
+   removed via an undoable `keyword_remove`. A row-at-a-time
+   implementation that evaluates the retraction guard right after the
+   first flip sees the still-pending sibling as a live assertion, keeps
+   the keyword, and fails — this is the regression guard for §3, "A card
+   mutation writes every member status before it decides any keyword
+   effect". Its mirror is the load-bearing half and rules out the
+   over-broad repair: a third same-taxon row on that photo which the
+   mutation does **not** touch (excluded by the scope tuple, or absent
+   from `member_prediction_ids`) stays pending, and the keyword must be
+   **kept**, with the "still predicted on 1 photo" disclosure — so the
+   rule is "evaluate after the writes", not "ignore every sibling". A
+   third variant asserts the client-side half of the closure clause:
+   "Reject all" issues **one** card mutation, and a build that
+   decomposes the card into one request per member reproduces the leak
+   and fails; a
    **status-totality fixture** — all seven non-empty
    member-status sets map to a defined badge and action set; a
    **toolbar Accept-All fixture** — a view holding one `{pending}` card

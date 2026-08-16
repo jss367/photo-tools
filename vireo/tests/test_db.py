@@ -14115,6 +14115,63 @@ def test_retire_builtin_wildlife_queues_removal_in_every_owning_workspace(tmp_pa
     assert queued_ws == {ws1, ws2}
 
 
+def test_retire_builtin_wildlife_preserves_same_name_top_level_survivor(tmp_path):
+    """Skip the flat sidecar removal when another top-level 'Wildlife' survives.
+
+    Same-name root keywords across types are explicitly supported (a photo
+    can have an ``individual`` Wildlife alongside the generated ``genre``
+    Wildlife). Both associations map to the same flat XMP subject, so
+    queueing a ``keyword_remove_flat`` would silently strip the surviving
+    user-authored tag from the sidecar and a later XMP reconciliation
+    could detach it from the DB too. The generated genre association must
+    still be detached from the DB — only the sidecar cleanup is skipped.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_genre_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    wildlife_individual_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'individual')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.executemany(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        [(p1, wildlife_genre_id), (p1, wildlife_individual_id)],
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_genre_id),
+    ).fetchone() is None
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_individual_id),
+    ).fetchone() is not None
+    pending = db.conn.execute(
+        """SELECT change_type, value FROM pending_changes
+           WHERE photo_id = ?""",
+        (p1,),
+    ).fetchall()
+    assert pending == [], (
+        "The flat XMP subject 'Wildlife' still represents the surviving "
+        "individual-type keyword, so no sidecar removal should be queued."
+    )
+
+
 def test_retire_builtin_wildlife_handles_photo_counts_over_bind_limit(tmp_path):
     """Retirement must chunk the DELETE so a large upgraded library still opens.
 

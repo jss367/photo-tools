@@ -3151,8 +3151,13 @@ class Database:
         real hierarchy such as ``Wildlife|Birds|House Sparrow``; retiring the
         generated flat term must not delete that hierarchy. A not-yet-synced
         pending add proves the association was explicitly user-authored and is
-        preserved. The keyword row is retained so edit history, manual
-        associations, and user-created children remain valid.
+        preserved. When a same-name top-level keyword of another type (e.g.
+        an ``individual`` ``Wildlife`` alongside the generated ``genre`` row)
+        still survives on the photo, the flat XMP subject represents both
+        associations, so the removal is skipped to avoid silently stripping
+        the surviving user-authored tag from the sidecar; the generated DB
+        association is still detached. The keyword row is retained so edit
+        history, manual associations, and user-created children remain valid.
         """
         if (
             not force
@@ -3178,7 +3183,17 @@ class Database:
             ).fetchone()
             fallback_workspace = fallback_row["id"] if fallback_row else None
         rows = self.conn.execute(
-            f"""SELECT DISTINCT pk.photo_id, wf.workspace_id
+            f"""SELECT DISTINCT pk.photo_id, wf.workspace_id,
+                       EXISTS (
+                           SELECT 1
+                           FROM photo_keywords survivor_pk
+                           JOIN keywords survivor_k
+                             ON survivor_k.id = survivor_pk.keyword_id
+                           WHERE survivor_pk.photo_id = pk.photo_id
+                             AND survivor_k.parent_id IS NULL
+                             AND survivor_k.name = 'Wildlife' COLLATE NOCASE
+                             AND survivor_k.id NOT IN ({placeholders})
+                       ) AS has_same_name_survivor
                 FROM photo_keywords pk
                 JOIN photos p ON p.id = pk.photo_id
                 LEFT JOIN workspace_folders wf ON wf.folder_id = p.folder_id
@@ -3199,23 +3214,38 @@ class Database:
                         AND (species_k.type = 'taxonomy'
                              OR species_k.is_species = 1)
                   )""",
-            keyword_ids,
+            [*keyword_ids, *keyword_ids],
         ).fetchall()
 
         # Group owning workspaces per photo. get_pending_changes() and the
         # sync panel are per-workspace, so if a photo's folder belongs to
         # multiple workspaces the sidecar cleanup must be queued in each
         # of them or the stale term stays in XMP for the unqueued owners
-        # even after the migration marks itself complete.
+        # even after the migration marks itself complete. Also carry the
+        # per-photo "same-name survivor" flag so photos whose flat subject
+        # is still needed by another top-level Wildlife keyword skip the
+        # sidecar removal while their generated genre association is still
+        # detached from the DB.
         photo_workspaces = {}
         for row in rows:
             pid = row["photo_id"]
             ws = row["workspace_id"]
-            bucket = photo_workspaces.setdefault(pid, set())
+            entry = photo_workspaces.setdefault(
+                pid,
+                {"ws_ids": set(), "survivor": bool(row["has_same_name_survivor"])},
+            )
             if ws is not None:
-                bucket.add(ws)
+                entry["ws_ids"].add(ws)
 
-        for photo_id, ws_ids in photo_workspaces.items():
+        for photo_id, entry in photo_workspaces.items():
+            if entry["survivor"]:
+                # Another top-level 'Wildlife' keyword (e.g. type='individual')
+                # still owns the flat XMP subject. Removing it would strip the
+                # surviving user-authored tag from the sidecar, and a later
+                # XMP reconciliation could detach it from the DB. Leave the
+                # sidecar alone and only detach the generated genre row below.
+                continue
+            ws_ids = entry["ws_ids"]
             target_ws_ids = (
                 ws_ids
                 if ws_ids

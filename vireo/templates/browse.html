@@ -3416,16 +3416,30 @@ function folderLocalStatuses(folders, byParent) {
   var rowsById = {};
   folders.forEach(function(folder) { rowsById[Number(folder.id)] = folder; });
   var direct = {};
+  // Job payloads report their target as the local root_folder_id, but a
+  // visible workspace folder may be covered by a shared ancestor whose
+  // root_folder_id isn't itself in this workspace's tree. Map each covering
+  // root back to the visible requested_folder_id(s) so sync/discard badges
+  // update instead of freezing on LOCAL.
+  var visibleIdsByRoot = {};
 
   (localData.folders || []).forEach(function(item) {
-    if (!item || item.state === 'remote') return;
-    var id = Number(item.requested_folder_id || item.root_folder_id);
-    if (!rowsById[id]) return;
+    if (!item) return;
+    var visibleId = Number(item.requested_folder_id || item.root_folder_id);
+    if (!rowsById[visibleId]) return;
+    var rootId = Number(item.root_folder_id || item.requested_folder_id);
+    if (rootId) {
+      if (!visibleIdsByRoot[rootId]) visibleIdsByRoot[rootId] = [];
+      if (visibleIdsByRoot[rootId].indexOf(visibleId) === -1) {
+        visibleIdsByRoot[rootId].push(visibleId);
+      }
+    }
+    if (item.state === 'remote') return;
     var changes = item.changes || {};
     var changeCount = Number(changes.created || 0) +
       Number(changes.modified || 0) + Number(changes.deleted || 0);
     if (item.state === 'recovery' || item.changes_error) {
-      direct[id] = {
+      direct[visibleId] = {
         kind: 'recovery',
         label: 'LOCAL ISSUE',
         description: item.recovery_kind === 'sync'
@@ -3434,7 +3448,7 @@ function folderLocalStatuses(folders, byParent) {
       };
       return;
     }
-    direct[id] = {
+    direct[visibleId] = {
       kind: item.state === 'staging' ? 'updating' : 'local',
       label: item.state === 'staging' ? 'COPYING' : 'LOCAL',
       description: changeCount
@@ -3452,12 +3466,18 @@ function folderLocalStatuses(folders, byParent) {
     if (!jobStatus) return;
     (job.folder_ids || []).forEach(function(rawId) {
       var id = Number(rawId);
-      if (!rowsById[id]) return;
-      direct[id] = {
-        kind: 'updating',
-        label: jobStatus[0],
-        description: jobStatus[1]
-      };
+      var targets = [];
+      if (rowsById[id]) targets.push(id);
+      (visibleIdsByRoot[id] || []).forEach(function(visibleId) {
+        if (targets.indexOf(visibleId) === -1) targets.push(visibleId);
+      });
+      targets.forEach(function(targetId) {
+        direct[targetId] = {
+          kind: 'updating',
+          label: jobStatus[0],
+          description: jobStatus[1]
+        };
+      });
     });
   });
 

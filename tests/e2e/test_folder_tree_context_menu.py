@@ -192,6 +192,65 @@ def test_folder_tree_updates_local_operation_and_recovery_badges(live_server, pa
     expect(badge).to_have_attribute("aria-label", "Local sync needs attention")
 
 
+def test_folder_tree_job_targeting_covering_root_updates_visible_badge(
+    live_server, page
+):
+    """Job targeting a shared ancestor's root_folder_id updates the visible child.
+
+    workspace_status() identifies the visible folder by requested_folder_id,
+    but sync/discard jobs report the covering root_folder_id — which is the
+    ancestor and isn't necessarily in this workspace's tree. The badge on the
+    visible child still has to swap from LOCAL to the job status.
+    """
+    page.goto(f"{live_server['url']}/browse")
+    item = page.locator(".tree-item[data-folder-id]").first
+    item.wait_for(state="visible")
+    folder_id = int(item.get_attribute("data-folder-id"))
+    # Choose an ancestor id that is *not* itself in the visible folder tree.
+    ancestor_id = folder_id + 100000
+
+    def publish(payload):
+        page.evaluate(
+            """([data]) => {
+              window.vireoLocalFolderData = data;
+              window.dispatchEvent(new CustomEvent(
+                'vireo:local-folder-status-changed', {detail: {data: data}}
+              ));
+            }""",
+            [payload],
+        )
+
+    publish({
+        "legacy_workspace_session": False,
+        "folders": [{
+            "requested_folder_id": folder_id,
+            "root_folder_id": ancestor_id,
+            "state": "local",
+        }],
+        "jobs": [],
+    })
+    badge = item.locator(".folder-local-status")
+    expect(badge).to_have_text("LOCAL")
+
+    publish({
+        "legacy_workspace_session": False,
+        "folders": [{
+            "requested_folder_id": folder_id,
+            "root_folder_id": ancestor_id,
+            "state": "local",
+        }],
+        "jobs": [{
+            "id": "sync-job",
+            "type": "work-locally-folder-sync",
+            "folder_ids": [ancestor_id],
+        }],
+    })
+    expect(badge).to_have_text("SYNCING")
+    expect(badge).to_have_attribute(
+        "aria-label", "Syncing local changes to source storage"
+    )
+
+
 def test_folder_tree_filter_by_folder_fires_filter(live_server, page):
     """Clicking 'Filter by this folder' sets activeFolderId to that folder."""
     url = live_server["url"]

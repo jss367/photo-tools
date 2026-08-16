@@ -440,6 +440,83 @@ def test_add_keyword_input_suggests_existing_keyword(live_server, page):
     expect(page.locator("#detailKeywords")).to_contain_text("Alan's Hummingbird")
 
 
+def test_multiselect_keyword_picker_shows_and_applies_suggestion(live_server, page):
+    """Batch keyword autocomplete must escape the modal and tag every photo."""
+    db = live_server["db"]
+    selected_ids = live_server["data"]["photos"][:3]
+    keyword_names = [
+        "Batch suggestion Alder",
+        "Batch suggestion Birch",
+        "Batch suggestion Cedar",
+        "Batch suggestion Dogwood",
+    ]
+    for name in keyword_names:
+        keyword_id = db.add_keyword(name)
+        db.tag_photo(live_server["data"]["photos"][-1], keyword_id)
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.wait_for(state="visible")
+    page.evaluate(
+        """
+        photoIds => {
+          selectedPhotos.clear();
+          photoIds.forEach(id => selectedPhotos.add(id));
+          selectedPhotoId = null;
+          renderGrid();
+          updateBatchBar();
+        }
+        """,
+        selected_ids,
+    )
+
+    page.locator("#batchBar button", has_text="+ Keyword").click()
+    page.locator("#batchKeywordInput").fill("Batch suggestion")
+
+    suggestions = page.locator(
+        "#batchKeywordSuggestions .keyword-suggestion-option"
+    )
+    expect(suggestions).to_have_count(4)
+    last_suggestion = suggestions.filter(has_text=keyword_names[-1])
+    expect(last_suggestion).to_be_visible()
+
+    # The short batch modal used to clip the absolutely positioned list near
+    # its action buttons. Verify the final match is actually paintable and
+    # clickable, not merely present in the DOM outside the clipping box.
+    assert last_suggestion.evaluate(
+        """
+        option => {
+          const rect = option.getBoundingClientRect();
+          const hit = document.elementFromPoint(
+            rect.left + rect.width / 2,
+            rect.top + rect.height / 2
+          );
+          return hit === option || option.contains(hit);
+        }
+        """
+    )
+
+    with page.expect_response(
+        lambda r: "/api/batch/keyword" in r.url
+        and r.request.method == "POST"
+        and r.status == 200
+    ):
+        last_suggestion.click()
+
+    page.wait_for_function(
+        """
+        async ({photoIds, keywordName}) => {
+          const details = await Promise.all(
+            photoIds.map(id => fetch('/api/photos/' + id).then(r => r.json()))
+          );
+          return details.every(photo =>
+            (photo.keywords || []).some(keyword => keyword.name === keywordName)
+          );
+        }
+        """,
+        arg={"photoIds": selected_ids, "keywordName": keyword_names[-1]},
+    )
+
+
 def test_species_badge_tracks_detail_keyword_edits_without_reload(live_server, page):
     """The grid's taxonomy badge must stay in sync with detail keyword edits."""
     db = live_server["db"]

@@ -355,6 +355,26 @@ def workspace_ids_for_folder_tree(db, root_folder_id: int) -> list[int]:
     return sorted(workspace_ids)
 
 
+def workspace_summaries_for_ids(db, workspace_ids: list[int]) -> list[dict]:
+    """Return lightweight workspace details in the same order as the IDs."""
+    if not workspace_ids:
+        return []
+    placeholders = ",".join("?" for _workspace_id in workspace_ids)
+    rows = db.conn.execute(
+        f"SELECT id, name FROM workspaces WHERE id IN ({placeholders})",
+        tuple(workspace_ids),
+    ).fetchall()
+    workspaces_by_id = {
+        int(row["id"]): {"id": int(row["id"]), "name": row["name"]}
+        for row in rows
+    }
+    return [
+        workspaces_by_id[workspace_id]
+        for workspace_id in workspace_ids
+        if workspace_id in workspaces_by_id
+    ]
+
+
 def _load_manifest(vireo_dir: str, root_folder_id: int) -> dict | None:
     path = manifest_path(vireo_dir, root_folder_id)
     try:
@@ -724,6 +744,7 @@ def folder_status(db, root_folder_id: int, vireo_dir: str) -> dict:
     if covering is None:
         row = db.conn.execute("SELECT path FROM folders WHERE id=?", (root_folder_id,)).fetchone()
         source_path = row["path"] if row else None
+        workspace_ids = workspace_ids_for_folder_tree(db, root_folder_id)
         return {
             "state": "remote",
             "folder_id": root_folder_id,
@@ -738,13 +759,14 @@ def folder_status(db, root_folder_id: int, vireo_dir: str) -> dict:
                 if source_path
                 else None
             ),
-            "workspace_ids": workspace_ids_for_folder_tree(db, root_folder_id),
+            "workspace_ids": workspace_ids,
         }
     root_folder_id = covering
     state_row = folder_state(db, root_folder_id)
     root = _root_mapping(db, root_folder_id)
     if state_row is None or root is None:
         raise LocalWorkspaceError("Local folder state is incomplete")
+    workspace_ids = affected_workspace_ids(db, root_folder_id)
     result = {
         "state": state_row["state"],
         "folder_id": root_folder_id,
@@ -752,7 +774,7 @@ def folder_status(db, root_folder_id: int, vireo_dir: str) -> dict:
         "source_path": root["source_path"],
         "local_path": root["local_path"],
         "created_at": state_row.get("created_at"),
-        "workspace_ids": affected_workspace_ids(db, root_folder_id),
+        "workspace_ids": workspace_ids,
     }
     manifest = None
     manifest_error = None
@@ -818,6 +840,11 @@ def workspace_status(db, workspace_id: int, vireo_dir: str) -> dict:
             seen_sessions.add(descendant_status["root_folder_id"])
     local_count = sum(1 for item in items if item["state"] != "remote")
     state = "remote" if local_count == 0 else "active" if local_count == len(items) else "mixed"
+    linked_workspace_ids = sorted({
+        workspace_id
+        for item in items
+        for workspace_id in item.get("workspace_ids", [])
+    })
     return {
         "state": state,
         "workspace_id": int(workspace_id),
@@ -825,6 +852,7 @@ def workspace_status(db, workspace_id: int, vireo_dir: str) -> dict:
         "local_folder_count": local_count,
         "session_count": len(seen_sessions),
         "folders": items,
+        "linked_workspaces": workspace_summaries_for_ids(db, linked_workspace_ids),
     }
 
 

@@ -521,9 +521,19 @@ jobs:
       github.event_name == 'pull_request'
       && github.event.action == 'synchronize'
       && github.event.pull_request.state == 'open'
+    # Own concurrency group, distinct from `pr-agent-merge-<PR>`. GitHub
+    # Actions keeps at most one pending job per group, and a newer job in
+    # the same group displaces the pending one even when
+    # `cancel-in-progress: false`. Sharing the merge group let an
+    # authorized-at-workflow-level merge event (an approval, or a
+    # `/merge <sha>` comment that later fails its step-level `HUMAN_MERGE_ACTORS`
+    # check) silently replace this pending disarm, so the safeguard could
+    # be cancelled entirely and leave auto-merge armed against a stale head.
+    # `cancel-in-progress: true` is safe because `gh pr merge --disable-auto`
+    # is idempotent and the last push's disarm is what matters.
     concurrency:
-      group: pr-agent-merge-${{ github.event.pull_request.number }}
-      cancel-in-progress: false
+      group: pr-agent-disable-merge-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     permissions:
       contents: read

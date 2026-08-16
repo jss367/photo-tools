@@ -53,6 +53,14 @@ def test_concurrency_is_scoped_per_task_and_never_workflow_wide():
     assert "group: pr-agent-merge-${{ github.event.pull_request.number }}" in workflow
     assert "group: pr-agent-merge-${{ github.event.issue.number }}" in workflow
 
+    # `disable-automerge-on-head-change` is deliberately NOT in the merge
+    # group: GitHub Actions keeps only one pending job per group even with
+    # `cancel-in-progress: false`, so a shared group would let an
+    # authorized-at-workflow-level merge event silently displace this
+    # pending disarm and leave auto-merge armed against a stale head. Keep
+    # it in its own per-PR group.
+    assert "group: pr-agent-disable-merge-${{ github.event.pull_request.number }}" in workflow
+
     # fix-ci derives the PR number from `workflow_run.pull_requests[0]`
     # so unrelated PRs sharing a default-branch SHA don't cancel each
     # other's CI-repair runs.
@@ -74,6 +82,7 @@ def test_concurrency_is_scoped_per_task_and_never_workflow_wide():
         review_group_pr,
         "group: pr-agent-ci-fix-",
         "group: pr-agent-resolve-conflicts",
+        "group: pr-agent-disable-merge-",
     )
     for group_prefix in collapse_groups:
         idx = workflow.find(group_prefix)
@@ -156,6 +165,39 @@ def test_routine_contract_is_bounded_quiet_and_resolves_addressed_threads():
     assert "Do not blanket-resolve threads" in prompt
     assert "<!-- pr-agent-generated -->" in prompt
     assert "separate top-level success summary" in prompt
+
+
+def test_disable_automerge_handler_cannot_be_displaced_by_merge_lane():
+    workflow = _read(WORKFLOW)
+
+    # GitHub Actions keeps only one pending job per concurrency group; a
+    # newer arrival replaces the pending one even when `cancel-in-progress`
+    # is false. If `disable-automerge-on-head-change` shared the
+    # `pr-agent-merge-<PR>` group with the merge-arming jobs, a subsequent
+    # merge event (an approval, or a `/merge <sha>` comment that passes the
+    # workflow-level `author_association` gate but later fails the
+    # step-level `HUMAN_MERGE_ACTORS` check) would silently replace the
+    # pending disarm off the merge group's single pending slot — cancelling
+    # the safeguard entirely and leaving auto-merge armed against a stale
+    # head. The disarm must therefore live in its own per-PR group.
+    disarm_idx = workflow.find("disable-automerge-on-head-change:")
+    merge_approval_idx = workflow.find("\n  merge-on-approval:")
+    assert disarm_idx != -1 and merge_approval_idx > disarm_idx
+    disarm_block = workflow[disarm_idx:merge_approval_idx]
+
+    assert (
+        "group: pr-agent-disable-merge-${{ github.event.pull_request.number }}"
+        in disarm_block
+    )
+    # And the shared merge group must NOT be reused inside the disarm block,
+    # or the displacement race would reopen.
+    assert (
+        "group: pr-agent-merge-${{ github.event.pull_request.number }}"
+        not in disarm_block
+    )
+    # Idempotent disarm — `cancel-in-progress: true` collapses two nearby
+    # pushes into a single disarm run without leaving stale queued work.
+    assert "cancel-in-progress: true" in disarm_block
 
 
 def test_synchronize_disables_auto_merge_so_authorization_binds_to_head():

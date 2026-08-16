@@ -4,6 +4,7 @@ This module contains the background work function for the /api/jobs/classify
 endpoint. The route handler in app.py parses the request and delegates here.
 """
 
+import contextlib
 import json
 import logging
 import math
@@ -3384,23 +3385,39 @@ def run_classify_job(
         top_k = effective_cfg.get("top_k_predictions", 5)
 
         runner.update_step(job["id"], "classify", status="running")
-        raw_results, failed, skipped_existing = _classify_photos(
-            photos=photos,
-            folders=folders,
-            detection_map=detection_map,
-            existing_preds=existing_preds,
-            clf=clf,
-            model_type=model_type,
-            model_name=model_name,
-            runner=runner,
-            job=job,
-            db=thread_db,
-            top_k=top_k,
-            vireo_dir=vireo_dir,
-            labels_fingerprint=fp,
-            reclassify=params.reclassify,
-            finish_cleared_only=finish_cleared_only,
+        # ``finish_cleared_only`` runs after Cancel deliberately: detection
+        # already cascaded away the old predictions, so this pass rebuilds
+        # them to avoid leaving the processed subset empty. The bound
+        # cancellation probe is already True here, and CPU inference now
+        # consults it, so leaving the binding in place would make every
+        # ``_flush_batch`` raise ``ResourceWaitCancelled`` and drop the
+        # replacement predictions. Suspend the binding for this preservation
+        # pass so inference completes; the JobRunner still owns any hard
+        # shutdown signal via the runner-side deadline.
+        from resource_ledger import bind_resource_cancel_check
+        cancel_binding = (
+            bind_resource_cancel_check(None)
+            if finish_cleared_only
+            else contextlib.nullcontext()
         )
+        with cancel_binding:
+            raw_results, failed, skipped_existing = _classify_photos(
+                photos=photos,
+                folders=folders,
+                detection_map=detection_map,
+                existing_preds=existing_preds,
+                clf=clf,
+                model_type=model_type,
+                model_name=model_name,
+                runner=runner,
+                job=job,
+                db=thread_db,
+                top_k=top_k,
+                vireo_dir=vireo_dir,
+                labels_fingerprint=fp,
+                reclassify=params.reclassify,
+                finish_cleared_only=finish_cleared_only,
+            )
         classified_count = len(raw_results) - skipped_existing
         parts = [f"{classified_count} classified"]
         if skipped_existing:

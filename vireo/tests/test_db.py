@@ -18969,6 +18969,66 @@ def test_get_unclassifiable_photos_uses_fresh_detections_when_provided(tmp_path)
     assert unclassifiable == {p_fresh_all_low}
 
 
+def test_get_unclassifiable_photos_db_fallback_for_unprocessed_photos(tmp_path):
+    """When ``_detect_batch`` fails for a single image on a reclassify run
+    it omits that photo from both ``detections`` and ``processed_ids``,
+    and the runtime falls back to ``db.get_detections()`` for it. The
+    preflight must do the same or a below-floor entry in the fresh map
+    (i.e. "no fresh animal, but only because the detector never ran")
+    would flag the photo unclassifiable and the ETA would prematurely
+    subtract inference work the runtime will actually do (Codex #1468 P2).
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+
+    # Detector completed successfully; fresh rows are all below the floor
+    # → runtime will skip via ``raw_real_dets`` continue, so still flag
+    # unclassifiable.
+    p_processed_low = db.add_photo(
+        folder_id=fid, filename="low.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    _add_one_detection(
+        db, p_processed_low, detector_model="megadetector-v6", conf=0.1,
+    )
+
+    # Detector RAISED on this photo (missing from ``processed_ids`` AND
+    # from ``fresh_detections_by_photo``). DB still holds a prior
+    # above-floor row from a previous run, so the runtime's DB fallback
+    # WILL infer this photo — the preflight must not flag it.
+    p_detector_failed = db.add_photo(
+        folder_id=fid, filename="failed.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    _add_one_detection(
+        db, p_detector_failed, detector_model="megadetector-v6", conf=0.5,
+    )
+
+    fresh_map = {
+        p_processed_low: [{"confidence": 0.1, "category": "animal"}],
+        # p_detector_failed intentionally absent — detector raised.
+    }
+    processed_ids = {p_processed_low}
+
+    # Without ``fresh_processed_photo_ids``, the old behavior flags both
+    # (p_detector_failed looks like "no fresh animal above floor").
+    naive = db.get_unclassifiable_photos(
+        [p_processed_low, p_detector_failed],
+        fresh_detections_by_photo=fresh_map,
+    )
+    assert p_detector_failed in naive
+
+    # With ``fresh_processed_photo_ids``, the detector-failed photo falls
+    # back to the DB predicate — DB has a >= floor row, so it's excluded.
+    unclassifiable = db.get_unclassifiable_photos(
+        [p_processed_low, p_detector_failed],
+        fresh_detections_by_photo=fresh_map,
+        fresh_processed_photo_ids=processed_ids,
+    )
+    assert unclassifiable == {p_processed_low}
+
+
 def test_all_nav_ids_covers_every_page():
     from db import ALL_NAV_IDS
     expected = {

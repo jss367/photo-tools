@@ -18058,6 +18058,7 @@ class Database:
         contextual_weak_photo_ids=None,
         weak_confidence=None,
         fresh_detections_by_photo=None,
+        fresh_processed_photo_ids=None,
     ):
         """Return the SET of photo IDs the classify runtime skips at the
         ``raw_real_dets`` continue branch.
@@ -18088,6 +18089,22 @@ class Database:
         Each detection dict must expose ``confidence`` (or
         ``detector_confidence``) and ``category`` (defaulting to
         ``"animal"`` when absent, matching ``_detect_batch``'s output).
+
+        ``fresh_processed_photo_ids`` is the ``detect_state["processed_ids"]``
+        set — the photos ``_detect_batch`` actually completed. When a
+        MegaDetector pass raises for a single image, ``_detect_batch``
+        leaves that photo out of both ``detections`` and
+        ``processed_ids`` and the runtime's per-photo classify body
+        falls back to ``db.get_detections()`` (see
+        ``pipeline_job.py`` ``photo_dets`` else branch). Treating a
+        missing entry in ``fresh_detections_by_photo`` as "no fresh
+        animal above the floor" would mark such a photo unclassifiable
+        even though runtime will infer, subtracting real work from the
+        ETA's ``remaining_uncached`` and reporting "finishing…"
+        prematurely. When both this set and ``fresh_detections_by_photo``
+        are provided, photos NOT in the processed set defer to the DB
+        predicate for that photo, matching what the runtime actually
+        sees (Codex #1468 P2).
         """
         if not photo_ids:
             return set()
@@ -18115,6 +18132,30 @@ class Database:
                     continue
             return False
 
+        def _db_unclassifiable(pool, floor, out):
+            for i in range(0, len(pool), CHUNK):
+                chunk = pool[i:i + CHUNK]
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" * len(chunk))
+                rows = self.conn.execute(
+                    f"""SELECT DISTINCT d.photo_id
+                          FROM detections d
+                         WHERE d.detector_model != 'full-image'
+                           AND d.photo_id IN ({placeholders})
+                           AND NOT EXISTS (
+                                 SELECT 1 FROM detections d2
+                                  WHERE d2.photo_id = d.photo_id
+                                    AND d2.detector_model
+                                        != 'full-image'
+                                    AND d2.category = 'animal'
+                                    AND d2.detector_confidence >= ?
+                               )""",
+                    [*chunk, floor],
+                ).fetchall()
+                for r in rows:
+                    out.add(r["photo_id"])
+
         unclassifiable: set = set()
         normal_ids = [pid for pid in photo_ids if pid not in weak_photo_ids]
         weak_ids = [pid for pid in photo_ids if pid in weak_photo_ids]
@@ -18128,28 +18169,7 @@ class Database:
             for pool, floor in (
                 (normal_ids, min_conf), (weak_ids, weak_conf),
             ):
-                for i in range(0, len(pool), CHUNK):
-                    chunk = pool[i:i + CHUNK]
-                    if not chunk:
-                        continue
-                    placeholders = ",".join("?" * len(chunk))
-                    rows = self.conn.execute(
-                        f"""SELECT DISTINCT d.photo_id
-                              FROM detections d
-                             WHERE d.detector_model != 'full-image'
-                               AND d.photo_id IN ({placeholders})
-                               AND NOT EXISTS (
-                                     SELECT 1 FROM detections d2
-                                      WHERE d2.photo_id = d.photo_id
-                                        AND d2.detector_model
-                                            != 'full-image'
-                                        AND d2.category = 'animal'
-                                        AND d2.detector_confidence >= ?
-                                   )""",
-                        [*chunk, floor],
-                    ).fetchall()
-                    for r in rows:
-                        unclassifiable.add(r["photo_id"])
+                _db_unclassifiable(pool, floor, unclassifiable)
             return unclassifiable
 
         # Reclassify path: the "photo has an animal detection >= floor?"
@@ -18158,9 +18178,25 @@ class Database:
         # still reads the DB — that mirrors the runtime's ``raw_real_dets``
         # branch, which also reads the DB and would enter the skip path
         # even if a pre-run row is the only real detection recorded.
+        #
+        # Photos absent from ``fresh_processed_photo_ids`` are ones the
+        # detector failed on this run; runtime falls back to DB rows for
+        # them, so evaluate them against the DB predicate too (otherwise
+        # the missing entry looks like "no fresh animal" and we'd
+        # misclassify them as unclassifiable — Codex #1468 P2).
+        processed = (
+            set(fresh_processed_photo_ids)
+            if fresh_processed_photo_ids is not None else None
+        )
         for pool, floor in ((normal_ids, min_conf), (weak_ids, weak_conf)):
-            for i in range(0, len(pool), CHUNK):
-                chunk = pool[i:i + CHUNK]
+            if processed is None:
+                fresh_pool = pool
+                db_pool: list = []
+            else:
+                fresh_pool = [pid for pid in pool if pid in processed]
+                db_pool = [pid for pid in pool if pid not in processed]
+            for i in range(0, len(fresh_pool), CHUNK):
+                chunk = fresh_pool[i:i + CHUNK]
                 if not chunk:
                     continue
                 placeholders = ",".join("?" * len(chunk))
@@ -18175,6 +18211,8 @@ class Database:
                     pid = r["photo_id"]
                     if not _fresh_has_animal_above(pid, floor):
                         unclassifiable.add(pid)
+            if db_pool:
+                _db_unclassifiable(db_pool, floor, unclassifiable)
         return unclassifiable
 
     def get_labels_fingerprints(self):

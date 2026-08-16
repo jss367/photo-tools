@@ -1374,15 +1374,19 @@ def _classification_eta_progress(
     subtract cache hits that are still expected later in the collection.
 
     ``elapsed`` must be inference-active seconds only — the wall time
-    accumulated inside ``_flush_batch`` — not the wall time since the
-    per-spec start. Passing walltime here still lets the cache-traversal
-    prefix bleed into the denominator: on a spec that spends thirty seconds
+    spent preparing images (open/decode/crop/resize) plus the wall time
+    inside ``_flush_batch`` — not the wall time since the per-spec
+    start. Passing walltime here would let the cache-traversal prefix
+    bleed into the denominator: on a spec that spends thirty seconds
     walking a cached prefix before ever hitting inference, ``elapsed``
     would be ~30s while ``inference_attempts`` is still zero, and by the
     time the first inference lands the effective rate is derated by that
-    entire prefix. The runtime tracks a ``inference_seconds`` accumulator
-    that only ticks around ``_flush_batch`` calls and passes it here
-    (Codex #1468 P2).
+    entire prefix. The runtime tracks an ``inference_seconds`` accumulator
+    that only ticks around ``_prepare_image`` calls for photos entering
+    the batch and around ``_flush_batch`` itself, and passes it here.
+    Excluding ``_prepare_image`` cost would understate the ETA on
+    RAW/JPEG-heavy or slow-storage runs where preparation dominates
+    per-photo latency (Codex #1468 P2).
 
     ``cache_overcount`` is the count of photos where the preflight assumed
     a cache hit (a classifier_runs row existed) but runtime found no cached
@@ -5441,6 +5445,20 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 and detect_state.get("ran")
                                 else None
                             ),
+                            # ``processed_ids`` is what ``_detect_batch``
+                            # actually completed this run. Photos absent
+                            # from it are ones the detector raised on and
+                            # runtime will DB-fallback for (see
+                            # ``photo_dets`` else branch below), so they
+                            # must be evaluated against DB rows here too
+                            # instead of treated as "no fresh animal"
+                            # (Codex #1468 P2).
+                            fresh_processed_photo_ids=(
+                                detect_state["processed_ids"]
+                                if params.reclassify
+                                and detect_state.get("ran")
+                                else None
+                            ),
                         )
                     )
                     if not params.reclassify:
@@ -6089,9 +6107,26 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                                 photo["id"],
                                             )
 
+                                # Track image preparation time separately from
+                                # the offline pause loop below so it can be
+                                # folded into ``inference_seconds`` only when
+                                # the photo actually enters the inference
+                                # batch. Cache-hit and image-decode-fail paths
+                                # exit the loop above without contributing to
+                                # ``inference_attempts``, so their prep time
+                                # (if any) must not count toward the rate;
+                                # a photo whose retries eventually succeed
+                                # DOES count, so accumulate across every
+                                # ``_prepare_image`` call for this detection
+                                # (Codex #1468 P2).
+                                _det_prep_seconds = 0.0
+                                _prep_started = time.time()
                                 img, folder_path, image_path = _prepare_image(
                                     photo, folders,
                                     None if full_image_fallback else detection,
+                                )
+                                _det_prep_seconds += max(
+                                    time.time() - _prep_started, 0.0,
                                 )
                                 # Before blaming the photo, check whether the
                                 # source itself vanished. A dropped share
@@ -6191,12 +6226,16 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     # fails, the loop re-probes and either
                                     # pauses again (bounded), degrades to
                                     # folder-scope, or gives up.
+                                    _prep_started = time.time()
                                     img, folder_path, image_path = (
                                         _prepare_image(
                                             photo, folders,
                                             None if full_image_fallback
                                             else detection,
                                         )
+                                    )
+                                    _det_prep_seconds += max(
+                                        time.time() - _prep_started, 0.0,
                                     )
                                     if img is not None:
                                         # Successful recovery: refund the
@@ -6224,6 +6263,15 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     break
                                 if img is None:
                                     continue
+                                # This detection is about to enter the flush
+                                # batch — attribute its full preparation cost
+                                # to the rate denominator so ``_prepare_image``
+                                # time (open + decode + crop + resize) shows
+                                # up alongside ``_flush_batch`` time. Without
+                                # this, RAW/JPEG-heavy or slow-storage runs
+                                # publish a rate that only reflects GPU work
+                                # and understate the ETA (Codex #1468 P2).
+                                inference_seconds += _det_prep_seconds
                                 inference_batch.append({
                                     "photo": photo,
                                     "detection_id": detection["id"],

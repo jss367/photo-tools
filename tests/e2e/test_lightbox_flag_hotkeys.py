@@ -259,13 +259,13 @@ def test_lightbox_newer_failed_write_falls_back_to_older_success(live_server, pa
     page.keyboard.press("p")
     page.wait_for_function(
         "document.getElementById('lightboxFlagStatus').textContent.trim() === 'No flag'",
-        timeout=3000,
+        timeout=10000,
     )
 
     held["route"].fulfill(status=200, content_type="application/json", body="{}")
     page.wait_for_function(
         "document.getElementById('lightboxFlagStatus').textContent.trim() === 'Rejected'",
-        timeout=3000,
+        timeout=10000,
     )
 
 

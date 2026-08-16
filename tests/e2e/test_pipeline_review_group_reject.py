@@ -754,7 +754,7 @@ def test_collection_load_failure_clears_native_selection_override(live_server, p
             await addToCollection();
             return {
               override: window._vireoNativeMenuPhotoIdsOverride,
-              modalIds: pipelineReviewModalPhotoIds.slice(),
+              modalIds: pipelineReviewCollectionPhotoIds.slice(),
               modalOpen: document.getElementById('pipelineCollectionModal').classList.contains('open'),
             };
           } finally {
@@ -790,7 +790,7 @@ def test_latest_collection_load_owns_modal_selection(live_server, page):
             const firstResult = await first;
             const afterFirst = {
               open: document.getElementById('pipelineCollectionModal').classList.contains('open'),
-              ids: pipelineReviewModalPhotoIds.slice(),
+              ids: pipelineReviewCollectionPhotoIds.slice(),
             };
             resolvers[1]([]);
             const secondResult = await second;
@@ -798,7 +798,7 @@ def test_latest_collection_load_owns_modal_selection(live_server, page):
               firstResult,
               secondResult,
               afterFirst,
-              finalIds: pipelineReviewModalPhotoIds.slice(),
+              finalIds: pipelineReviewCollectionPhotoIds.slice(),
               title: document.getElementById('pipelineCollectionTitle').textContent,
             };
           } finally {
@@ -842,7 +842,7 @@ def test_new_collection_submission_is_single_flight_and_retryable(live_server, p
             }
             return originalSafeFetch.apply(this, arguments);
           };
-          pipelineReviewModalPhotoIds = ids.slice(0, 2);
+          pipelineReviewCollectionPhotoIds = ids.slice(0, 2);
           document.getElementById('pipelineCollectionNewName').value = 'Retry Picks';
           document.getElementById('pipelineCollectionModal').classList.add('open');
           try {
@@ -885,7 +885,7 @@ def test_collection_submission_blocks_close_and_reopen(live_server, page):
             }
             return originalSafeFetch.apply(this, arguments);
           };
-          pipelineReviewModalPhotoIds = [ids[0]];
+          pipelineReviewCollectionPhotoIds = [ids[0]];
           pipelineReviewSelectedCollectionId = 321;
           pipelineReviewCollections = [{id: 321, name: 'Existing Picks'}];
           document.getElementById('pipelineCollectionModal').classList.add('open');
@@ -897,7 +897,7 @@ def test_collection_submission_blocks_close_and_reopen(live_server, page):
               closeResult,
               reopenResult,
               open: document.getElementById('pipelineCollectionModal').classList.contains('open'),
-              ids: pipelineReviewModalPhotoIds.slice(),
+              ids: pipelineReviewCollectionPhotoIds.slice(),
               cancelDisabled: document.getElementById('pipelineCollectionCancelBtn').disabled,
             };
             release({ok: true});
@@ -941,7 +941,7 @@ def test_keyword_submission_blocks_close_and_reopen(live_server, page):
             }
             return originalSafeFetch.apply(this, arguments);
           };
-          pipelineReviewModalPhotoIds = [ids[0]];
+          pipelineReviewKeywordPhotoIds = [ids[0]];
           document.getElementById('pipelineKeywordInput').value = 'First Keyword';
           document.getElementById('pipelineKeywordModal').classList.add('open');
           try {
@@ -952,7 +952,7 @@ def test_keyword_submission_blocks_close_and_reopen(live_server, page):
               closeResult,
               reopenResult,
               open: document.getElementById('pipelineKeywordModal').classList.contains('open'),
-              ids: pipelineReviewModalPhotoIds.slice(),
+              ids: pipelineReviewKeywordPhotoIds.slice(),
               cancelDisabled: document.getElementById('pipelineKeywordCancelBtn').disabled,
             };
             release({ok: true});
@@ -978,6 +978,117 @@ def test_keyword_submission_blocks_close_and_reopen(live_server, page):
         },
         "submitResult": True,
         "openAfter": False,
+    }
+
+
+def test_collection_and_keyword_dialogs_have_separate_selections(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    state = page.evaluate(
+        """async ids => {
+          const originalSafeFetch = window.safeFetch;
+          let releaseCollectionAdd;
+          let releaseKeyword;
+          let addCallIds = null;
+          let keywordCallIds = null;
+          window.safeFetch = function(url, options) {
+            if (url === '/api/collections') {
+              return Promise.resolve([{id: 555, name: 'Reviewer Picks',
+                rules: [{field: 'photo_ids', value: []}]}]);
+            }
+            if (url === '/api/collections/555/add-photos') {
+              addCallIds = JSON.parse(options.body).photo_ids.slice();
+              return new Promise(resolve => { releaseCollectionAdd = resolve; });
+            }
+            if (url === '/api/batch/keyword') {
+              keywordCallIds = JSON.parse(options.body).photo_ids.slice();
+              return new Promise(resolve => { releaseKeyword = resolve; });
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            // Open Add to Collection for the first selection and pick a
+            // collection so the dialog is fully configured.
+            const collectionOpen = await addToCollection([ids[0], ids[1]]);
+            pickPipelineCollection(555);
+            const afterCollectionOpen = {
+              collectionIds: pipelineReviewCollectionPhotoIds.slice(),
+              keywordIds: pipelineReviewKeywordPhotoIds.slice(),
+            };
+
+            // Open Add Keyword for a different selection while the collection
+            // dialog is still open. This must not overwrite the collection
+            // dialog's captured photo IDs.
+            batchAddKeyword([ids[2], ids[3]]);
+            const afterKeywordOpen = {
+              collectionIds: pipelineReviewCollectionPhotoIds.slice(),
+              keywordIds: pipelineReviewKeywordPhotoIds.slice(),
+              collectionOpen:
+                document.getElementById('pipelineCollectionModal').classList.contains('open'),
+              keywordOpen:
+                document.getElementById('pipelineKeywordModal').classList.contains('open'),
+            };
+
+            // Closing the keyword dialog must not clear the collection dialog's
+            // captured IDs.
+            hidePipelineKeywordModal();
+            const afterKeywordClose = {
+              collectionIds: pipelineReviewCollectionPhotoIds.slice(),
+              keywordIds: pipelineReviewKeywordPhotoIds.slice(),
+              collectionOpen:
+                document.getElementById('pipelineCollectionModal').classList.contains('open'),
+            };
+
+            // Reopen the keyword dialog with yet another selection and confirm
+            // both dialogs. Each request must carry its own captured IDs.
+            batchAddKeyword([ids[3]]);
+            document.getElementById('pipelineKeywordInput').value = 'Standalone';
+            const submitKeyword = confirmPipelineKeyword();
+            const submitCollection = confirmPipelineCollection();
+            releaseCollectionAdd({ok: true});
+            releaseKeyword({ok: true});
+            const [collectionResult, keywordResult] =
+              await Promise.all([submitCollection, submitKeyword]);
+            return {
+              collectionOpen,
+              afterCollectionOpen,
+              afterKeywordOpen,
+              afterKeywordClose,
+              addCallIds,
+              keywordCallIds,
+              collectionResult,
+              keywordResult,
+            };
+          } finally {
+            window.safeFetch = originalSafeFetch;
+          }
+        }""",
+        photo_ids,
+    )
+    assert state == {
+        "collectionOpen": True,
+        "afterCollectionOpen": {
+            "collectionIds": photo_ids[:2],
+            "keywordIds": [],
+        },
+        "afterKeywordOpen": {
+            "collectionIds": photo_ids[:2],
+            "keywordIds": photo_ids[2:4],
+            "collectionOpen": True,
+            "keywordOpen": True,
+        },
+        "afterKeywordClose": {
+            "collectionIds": photo_ids[:2],
+            "keywordIds": [],
+            "collectionOpen": True,
+        },
+        "addCallIds": photo_ids[:2],
+        "keywordCallIds": [photo_ids[3]],
+        "collectionResult": True,
+        "keywordResult": True,
     }
 
 

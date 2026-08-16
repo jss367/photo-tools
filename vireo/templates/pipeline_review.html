@@ -7311,13 +7311,24 @@ document.addEventListener('keydown', function(e) {
 });
 
 var pipelineReviewContextPhotoIds = [];
-var pipelineReviewModalPhotoIds = [];
+// Each organization dialog owns its own captured selection so opening one
+// cannot silently overwrite the photos the other is about to submit, and
+// closing one cannot clear the selection the other is still using.
+var pipelineReviewCollectionPhotoIds = [];
+var pipelineReviewKeywordPhotoIds = [];
 var pipelineReviewCollections = [];
 var pipelineReviewSelectedCollectionId = null;
 var pipelineReviewCollectionSubmitPromise = null;
 var pipelineReviewCreatedCollection = null;
 var pipelineReviewCollectionLoadSeq = 0;
 var pipelineReviewKeywordSubmitPromise = null;
+
+function pipelineReviewAnyOrganizationModalOpen() {
+  var collection = document.getElementById('pipelineCollectionModal');
+  var keyword = document.getElementById('pipelineKeywordModal');
+  return !!((collection && collection.classList.contains('open')) ||
+    (keyword && keyword.classList.contains('open')));
+}
 
 function pipelineReviewUniquePhotoIds(photoIds) {
   var seen = {};
@@ -7500,16 +7511,19 @@ async function addToCollection(photoIds) {
     if (loadSeq !== pipelineReviewCollectionLoadSeq) return false;
     // The native Photo menu pins its selection while this asynchronous modal
     // opens. If loading fails before there is a modal to close, release that
-    // override here so later native actions use the current page selection.
-    pipelineReviewModalPhotoIds = [];
-    window._vireoNativeMenuPhotoIdsOverride = null;
+    // override here so later native actions use the current page selection —
+    // but only when no other organization dialog is still relying on it.
+    pipelineReviewCollectionPhotoIds = [];
+    if (!pipelineReviewAnyOrganizationModalOpen()) {
+      window._vireoNativeMenuPhotoIdsOverride = null;
+    }
     return false;
   }
   // A newer invocation owns the shared modal state. Ignore this stale
   // response rather than opening a dialog that mixes its title/list with the
   // newer invocation's selected photo IDs.
   if (loadSeq !== pipelineReviewCollectionLoadSeq) return false;
-  pipelineReviewModalPhotoIds = ids;
+  pipelineReviewCollectionPhotoIds = ids;
   pipelineReviewSelectedCollectionId = null;
   pipelineReviewCreatedCollection = null;
   pipelineReviewCollections = (collections || []).filter(pipelineCollectionAcceptsManualPhotos);
@@ -7542,10 +7556,14 @@ function pickPipelineCollection(collectionId) {
 function hidePipelineCollectionModal(force) {
   if (pipelineReviewCollectionSubmitPromise && force !== true) return false;
   document.getElementById('pipelineCollectionModal').classList.remove('open');
-  pipelineReviewModalPhotoIds = [];
+  pipelineReviewCollectionPhotoIds = [];
   pipelineReviewSelectedCollectionId = null;
   pipelineReviewCreatedCollection = null;
-  window._vireoNativeMenuPhotoIdsOverride = null;
+  // Preserve the native selection override while the keyword dialog is still
+  // open, so its own confirmation reads the pinned photo IDs.
+  if (!pipelineReviewAnyOrganizationModalOpen()) {
+    window._vireoNativeMenuPhotoIdsOverride = null;
+  }
   return true;
 }
 
@@ -7560,7 +7578,7 @@ function setPipelineCollectionSubmitting(submitting) {
 
 function confirmPipelineCollection() {
   if (pipelineReviewCollectionSubmitPromise) return pipelineReviewCollectionSubmitPromise;
-  var ids = pipelineReviewModalPhotoIds.slice();
+  var ids = pipelineReviewCollectionPhotoIds.slice();
   var newName = document.getElementById('pipelineCollectionNewName').value.trim();
   var collectionId = pipelineReviewSelectedCollectionId;
   var collectionName = '';
@@ -7615,7 +7633,7 @@ function batchAddKeyword(photoIds) {
   if (pipelineReviewKeywordSubmitPromise) return false;
   var ids = pipelineReviewUniquePhotoIds(photoIds || getActiveSelection());
   if (!ids.length) return;
-  pipelineReviewModalPhotoIds = ids;
+  pipelineReviewKeywordPhotoIds = ids;
   document.getElementById('pipelineKeywordTitle').textContent =
     'Add Keyword to ' + ids.length + ' Photo' + (ids.length === 1 ? '' : 's');
   document.getElementById('pipelineKeywordInput').value = '';
@@ -7626,8 +7644,12 @@ function batchAddKeyword(photoIds) {
 function hidePipelineKeywordModal(force) {
   if (pipelineReviewKeywordSubmitPromise && force !== true) return false;
   document.getElementById('pipelineKeywordModal').classList.remove('open');
-  pipelineReviewModalPhotoIds = [];
-  window._vireoNativeMenuPhotoIdsOverride = null;
+  pipelineReviewKeywordPhotoIds = [];
+  // Preserve the native selection override while the collection dialog is
+  // still open, so its own confirmation reads the pinned photo IDs.
+  if (!pipelineReviewAnyOrganizationModalOpen()) {
+    window._vireoNativeMenuPhotoIdsOverride = null;
+  }
   return true;
 }
 
@@ -7655,7 +7677,7 @@ document.addEventListener('keydown', function(e) {
 
 function confirmPipelineKeyword() {
   if (pipelineReviewKeywordSubmitPromise) return pipelineReviewKeywordSubmitPromise;
-  var ids = pipelineReviewModalPhotoIds.slice();
+  var ids = pipelineReviewKeywordPhotoIds.slice();
   var name = document.getElementById('pipelineKeywordInput').value.trim();
   if (!ids.length || !name) return Promise.resolve(false);
   setPipelineKeywordSubmitting(true);

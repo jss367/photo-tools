@@ -552,6 +552,50 @@ def test_api_folder_get_rejects_other_workspace(app_and_db):
     assert resp.status_code == 404
 
 
+def test_api_folder_workspaces_lists_inherited_and_direct_memberships(app_and_db):
+    """GET /api/folders/<id>/workspaces includes every workspace where the
+    folder is visible, including visibility inherited from an ancestor root.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    active_ws = db.get_workspace(db._active_workspace_id)
+    root = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024'"
+    ).fetchone()
+    child = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024/January'"
+    ).fetchone()
+    inherited_ws = db.create_workspace("Inherited Photos")
+    db.add_workspace_folder(inherited_ws, root["id"])
+    direct_ws = db.create_workspace("Direct Photos")
+    db.add_workspace_folder(direct_ws, child["id"])
+
+    resp = client.get(f'/api/folders/{child["id"]}/workspaces')
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["folder"]["path"] == "/photos/2024/January"
+    by_name = {workspace["name"]: workspace for workspace in body["workspaces"]}
+    assert {active_ws["name"], "Inherited Photos", "Direct Photos"} <= set(by_name)
+    assert by_name[active_ws["name"]]["is_active"] is True
+    assert by_name["Inherited Photos"]["is_root"] is False
+    assert by_name["Direct Photos"]["is_root"] is True
+
+
+def test_api_folder_workspaces_rejects_folder_hidden_from_active_workspace(
+    app_and_db,
+):
+    """Workspace names cannot be enumerated through a hidden folder ID."""
+    app, db = app_and_db
+    active_ws = db._active_workspace_id
+    other_ws = db.create_workspace("Private Workspace")
+    db.set_active_workspace(other_ws)
+    hidden_id = db.add_folder('/private/folder', name='folder')
+    db.set_active_workspace(active_ws)
+
+    resp = app.test_client().get(f'/api/folders/{hidden_id}/workspaces')
+    assert resp.status_code == 404
+
+
 def test_api_keywords(app_and_db):
     """GET /api/keywords returns keyword tree."""
     app, _ = app_and_db

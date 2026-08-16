@@ -7165,6 +7165,42 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "path": folder["path"],
         })
 
+    @app.route("/api/folders/<int:folder_id>/workspaces", methods=["GET"])
+    def api_folder_workspaces(folder_id):
+        """List workspaces in which a Browse-visible folder appears."""
+        db = _get_db()
+        folder = db.get_folder(folder_id)
+        if not folder:
+            return json_error("folder not found", 404)
+
+        # Match the folder-detail endpoint's active-workspace boundary. This
+        # prevents callers from using folder IDs to enumerate workspace names
+        # for folders that the current workspace cannot see.
+        db._materialize_workspace_descendants(db._active_workspace_id)
+        linked = db.conn.execute(
+            "SELECT 1 FROM workspace_folders WHERE workspace_id = ? AND folder_id = ?",
+            (db._active_workspace_id, folder_id),
+        ).fetchone()
+        if not linked:
+            return json_error("folder not found", 404)
+
+        workspaces = []
+        for workspace in db.get_folder_workspaces(folder_id):
+            workspaces.append({
+                "id": workspace["id"],
+                "name": workspace["name"],
+                "is_active": workspace["id"] == db._active_workspace_id,
+                "is_root": bool(workspace["is_root"]),
+            })
+        return jsonify({
+            "folder": {
+                "id": folder["id"],
+                "name": folder["name"],
+                "path": folder["path"],
+            },
+            "workspaces": workspaces,
+        })
+
     @app.route("/api/folders/<int:folder_id>/relocate", methods=["POST"])
     def api_folder_relocate(folder_id):
         db = _get_db()

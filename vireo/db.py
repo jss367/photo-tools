@@ -2688,6 +2688,24 @@ class Database:
             (workspace_id,),
         ).fetchall()
 
+    def get_folder_workspaces(self, folder_id):
+        """Return every workspace in which ``folder_id`` is visible.
+
+        Workspace roots are recursive. Materialize newly discovered
+        descendants before reading the reverse mapping so a folder inherited
+        from an ancestor root is reported just like a directly linked root.
+        """
+        for workspace in self.get_workspaces():
+            self._materialize_workspace_descendants(workspace["id"])
+        return self.conn.execute(
+            """SELECT w.id, w.name, wf.is_root
+               FROM workspaces w
+               JOIN workspace_folders wf ON wf.workspace_id = w.id
+               WHERE wf.folder_id = ?
+               ORDER BY (w.pinned_at IS NULL), LOWER(w.name), w.id""",
+            (folder_id,),
+        ).fetchall()
+
     def get_workspace_folder_roots(self, workspace_id):
         """Return user-facing workspace roots, hiding covered descendants.
 

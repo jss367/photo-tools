@@ -100,9 +100,6 @@ jobs:
             --description "PRs handled by the Claude PR agent" \
             || true
           gh pr edit "$PR" --repo "$REPO" --add-label "$AGENT_LABEL"
-          gh pr edit "$PR" --repo "$REPO" \
-            --remove-label pr-agent-needs-human \
-            || true
 
       - uses: actions/checkout@v5
         if: steps.live.outputs.open == 'true'
@@ -111,6 +108,7 @@ jobs:
           persist-credentials: false
 
       - name: Fire routine
+        id: routine
         if: steps.live.outputs.open == 'true'
         uses: ./.github/actions/fire-routine
         with:
@@ -124,6 +122,17 @@ jobs:
           payload: |
             Task: reconcile-pr
             PR: ${{ github.event.issue.number }}
+
+      - name: Clear escalation after accepted reconciliation
+        if: steps.routine.outputs.fired == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.issue.number }}
+        run: |
+          gh pr edit "$PR" --repo "$REPO" \
+            --remove-label pr-agent-needs-human \
+            || true
 
   # Route regular trusted comments on agent PRs back to the routine.
   # `/merge <sha>` is a merge command handled by the `merge-on-command`
@@ -164,6 +173,7 @@ jobs:
           repo: ${{ github.repository }}
           pr: ${{ github.event.issue.number }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          max-review-fix-rounds: "2"
           payload: |
             Task: address-comment
             PR: ${{ github.event.issue.number }}

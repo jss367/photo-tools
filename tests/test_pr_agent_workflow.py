@@ -128,7 +128,9 @@ def test_merge_command_does_not_double_fire_the_review_fix_routine():
     # `merge-on-command`. If `fix-comment-feedback` also fired on it, the
     # routine could push a new head and invalidate the human's SHA-bound
     # merge authorization before the synchronous merge check.
-    assert "!startsWith(github.event.comment.body, '/merge ')" in workflow
+    assert "!startsWith(github.event.comment.body, '/merge ')" not in workflow
+    assert 'elif [[ "$COMMENT_BODY" =~ ^/merge[[:space:]]+' in workflow
+    assert "Exact /merge command is handled by the merge-authorization lane." in workflow
 
 
 def test_ci_fix_binds_to_failing_run_head_not_live_pr_head():

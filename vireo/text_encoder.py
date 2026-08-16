@@ -35,7 +35,7 @@ _CONTEXT_LENGTH = 77
 _INTERACTIVE_RESOURCE_WAIT_SECONDS = 5.0
 
 
-def _get_text_session(model_str, pretrained_str=None):
+def _get_text_session(model_str, pretrained_str=None, *, cancel_check=None):
     """Lazily load and cache a text encoder ONNX session + tokenizer.
 
     Args:
@@ -89,7 +89,9 @@ def _get_text_session(model_str, pretrained_str=None):
                     "Download the model from the Models page in Settings."
                 )
 
-        session = onnx_runtime.create_session(text_encoder_path)
+        session = onnx_runtime.create_session(
+            text_encoder_path, cancel_check=cancel_check,
+        )
         input_name = session.get_inputs()[0].name
         tokenizer = Tokenizer.from_file(tokenizer_path)
 
@@ -115,7 +117,16 @@ def encode_text(query, model_str, pretrained_str=None):
     Returns:
         numpy float32 array -- normalized text embedding vector
     """
-    session, input_name, tokenizer = _get_text_session(model_str, pretrained_str)
+    deadline = time.monotonic() + _INTERACTIVE_RESOURCE_WAIT_SECONDS
+
+    def cancel_check():
+        return time.monotonic() >= deadline
+
+    session, input_name, tokenizer = _get_text_session(
+        model_str,
+        pretrained_str,
+        cancel_check=cancel_check,
+    )
 
     # Tokenize the query
     encoding = tokenizer.encode(query)
@@ -125,10 +136,9 @@ def encode_text(query, model_str, pretrained_str=None):
 
     # Run text encoder
     from pipeline_locks import acquire_inference_resources
-    deadline = time.monotonic() + _INTERACTIVE_RESOURCE_WAIT_SECONDS
     with acquire_inference_resources(
         session,
-        cancel_check=lambda: time.monotonic() >= deadline,
+        cancel_check=cancel_check,
     ):
         txt_features = session.run(None, {input_name: tokens})[0]
     txt_features = txt_features.astype(np.float32)

@@ -224,7 +224,7 @@ def session_cpu_threads(session, default=None):
     return threads if threads is not None else default
 
 
-def create_session(model_path, providers=None):
+def create_session(model_path, providers=None, *, cancel_check=None):
     """Create an ONNX Runtime InferenceSession with best available provider.
 
     Args:
@@ -285,7 +285,7 @@ def create_session(model_path, providers=None):
         lanes=("model_construction",),
         label="ONNX model construction",
     )
-    with ledger.acquire(request):
+    with ledger.acquire(request, cancel_check=cancel_check):
         session_options = ort.SessionOptions()
         session_options.intra_op_num_threads = session_thread_count
         # Keep inter-op parallelism at one so ONNX cannot multiply the CPU

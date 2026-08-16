@@ -46,7 +46,7 @@ def test_encode_text_returns_normalized_vector(monkeypatch):
     monkeypatch.setattr("text_encoder._session_cache", {})
     monkeypatch.setattr(
         "text_encoder._get_text_session",
-        lambda model_str, pretrained_str=None: (
+        lambda model_str, pretrained_str=None, **_kwargs: (
             fake_session,
             "input_ids",
             fake_tokenizer,
@@ -73,7 +73,7 @@ def test_encode_text_zero_vector(monkeypatch):
     monkeypatch.setattr("text_encoder._session_cache", {})
     monkeypatch.setattr(
         "text_encoder._get_text_session",
-        lambda model_str, pretrained_str=None: (
+        lambda model_str, pretrained_str=None, **_kwargs: (
             fake_session,
             "input_ids",
             fake_tokenizer,
@@ -99,10 +99,16 @@ def test_encode_text_bounds_interactive_resource_wait(monkeypatch):
     fake_features = np.ones((1, 512), dtype=np.float32)
     fake_session = _make_fake_text_session(fake_features)
     fake_tokenizer = _make_fake_tokenizer()
+    session_lookup_probes = []
+
+    def get_text_session(*_args, cancel_check=None, **_kwargs):
+        session_lookup_probes.append(cancel_check)
+        return fake_session, "input_ids", fake_tokenizer
+
     monkeypatch.setattr(
         text_encoder,
         "_get_text_session",
-        lambda *_args: (fake_session, "input_ids", fake_tokenizer),
+        get_text_session,
     )
     now = [10.0]
     monkeypatch.setattr(text_encoder.time, "monotonic", lambda: now[0])
@@ -111,6 +117,7 @@ def test_encode_text_bounds_interactive_resource_wait(monkeypatch):
     @contextlib.contextmanager
     def capture_lease(_session, *, cancel_check=None):
         assert cancel_check is not None
+        assert cancel_check is session_lookup_probes[0]
         observed.append(cancel_check())
         now[0] += text_encoder._INTERACTIVE_RESOURCE_WAIT_SECONDS
         observed.append(cancel_check())
@@ -121,6 +128,7 @@ def test_encode_text_bounds_interactive_resource_wait(monkeypatch):
     )
 
     text_encoder.encode_text("bird", model_str="ViT-B-16")
+    assert len(session_lookup_probes) == 1
     assert observed == [False, True]
 
 
@@ -148,19 +156,25 @@ def test_encode_text_caching(monkeypatch, tmp_path):
     mock_tokenizers.Tokenizer = MagicMock()
     mock_tokenizers.Tokenizer.from_file = MagicMock(return_value=fake_tokenizer)
 
+    def cancel_check():
+        return False
+
     with (
         patch("text_encoder._MODELS_ROOT", str(tmp_path)),
         patch(
             "text_encoder.onnx_runtime.create_session",
             return_value=fake_session,
-        ),
+        ) as create_session,
         patch.dict("sys.modules", {"tokenizers": mock_tokenizers}),
     ):
-        result1 = _get_text_session("ViT-B-16")
-        result2 = _get_text_session("ViT-B-16")
+        result1 = _get_text_session("ViT-B-16", cancel_check=cancel_check)
+        result2 = _get_text_session("ViT-B-16", cancel_check=cancel_check)
 
     # Same object returned (cached)
     assert result1 is result2
+    create_session.assert_called_once_with(
+        str(model_dir / "text_encoder.onnx"), cancel_check=cancel_check,
+    )
 
 
 def test_unknown_model_raises(monkeypatch):

@@ -1,5 +1,6 @@
 """Tests for ONNX Runtime utility module."""
 import numpy as np
+import pytest
 
 
 def test_get_providers_returns_list():
@@ -148,6 +149,37 @@ def test_create_session_configures_threads_from_cpu_grant(tmp_path):
     assert session_cpu_threads(session) == 3
     assert ledger.snapshot()["cpu"]["allocated"] == 0
     assert ledger.snapshot()["lanes"]["model_construction"]["allocated"] == 0
+
+
+def test_create_session_honors_construction_cancel_probe(tmp_path):
+    """Cold interactive loads can cancel while waiting for their CPU grant."""
+    from unittest.mock import patch
+
+    import resource_ledger
+    from resource_ledger import ResourceWaitCancelled
+
+    from vireo.onnx_runtime import create_session
+
+    model_file = tmp_path / "model.onnx"
+    model_file.write_bytes(b"fake")
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=1)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    holder = ledger.acquire(resource_ledger.ResourceRequest(
+        cpu=resource_ledger.CpuRequest(1, 1, 1),
+    ))
+    try:
+        with patch(
+            "vireo.onnx_runtime.get_providers",
+            return_value=["CPUExecutionProvider"],
+        ), patch("onnxruntime.InferenceSession") as create_ort_session:
+            with pytest.raises(ResourceWaitCancelled):
+                create_session(
+                    str(model_file), cancel_check=lambda: True,
+                )
+            create_ort_session.assert_not_called()
+    finally:
+        holder.release()
+        resource_ledger._set_resource_ledger_for_tests(previous)
 
 
 def test_create_session_waits_for_full_inference_budget(tmp_path):

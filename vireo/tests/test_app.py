@@ -16635,6 +16635,47 @@ def test_batch_accept_records_single_undo_entry(app_and_db):
         assert "Bald Eagle" not in names
 
 
+def test_batch_accept_chunks_oversized_id_payloads(app_and_db):
+    """The raised cap must not hand SQLite a 25,000-variable IN clause.
+
+    ``_parse_prediction_ids`` accepts far more ids than the 999-variable limit
+    older SQLite builds enforce, so both its photo lookup and the
+    already-accepted probe have to go through ``_SQL_PARAM_CHUNK`` like every
+    other wide IN query in this module. A payload wider than one chunk is the
+    regression guard.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_count = 340
+    pred_ids = []
+    for i in range(photo_count):
+        photo_id, det_id = _seed_prediction_photo(
+            db, f"chunk-{i}.jpg", "Bald Eagle", 0.9, model="bioclip",
+        )
+        for extra_model in ("speciesnet", "merlin"):
+            db.add_prediction(
+                det_id, "Bald Eagle", 0.9, extra_model,
+                labels_fingerprint="fp1",
+            )
+        pred_ids.extend(
+            row["id"] for row in db.get_predictions(photo_ids=[photo_id])
+        )
+    assert len(pred_ids) > 1000, "fixture must exceed one param chunk"
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert resp.get_json()["accepted"] == photo_count
+
+    # And the idempotency probe re-reads the same oversized list.
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert resp.get_json()["already_accepted"] == len(pred_ids)
+
+
 def test_batch_accept_rejects_foreign_prediction(app_and_db):
     """Predictions outside the active workspace must not be acceptable."""
     app, db = app_and_db
@@ -16661,6 +16702,24 @@ def test_browse_page_has_prediction_panels(app_and_db):
     # otherwise imply "not classified" for a photo that was classified.
     assert "Not yet classified" in html
     assert "No species above threshold" in html
+
+
+def test_browse_names_the_status_only_share_of_an_accept(app_and_db):
+    """"Accept on 38" covers photos that already carry the keyword, and for
+    those it writes no tag — it only clears the pending prediction out of
+    Review. One count standing for two different outcomes is exactly what
+    CORE_PHILOSOPHY.md's transparency rule forbids, so the panel has to say
+    which is which. ``acceptable_keyworded_count`` exists for this; without a
+    consumer it is a field the backend computes and nobody reads.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    assert "acceptable_keyworded_count" in html, (
+        "the backend reports how many of the Accept targets are status-only "
+        "but the panel never shows it"
+    )
+    assert "accepting only clears" in html
 
 
 def test_browse_reject_predictions_refreshes_collections(app_and_db):

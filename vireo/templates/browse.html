@@ -6630,6 +6630,19 @@ function renderSelectionPredictions(predictions, selectedCount, meta) {
     } else if (!acceptablePhotoCount) {
       why = 'Already keyworded on every photo that predicts it';
     }
+    // "Accept on 38" now covers photos that already carry the keyword — for
+    // those, accepting only clears the still-pending prediction out of Review
+    // and writes no tag. One number must not silently mean two outcomes, so
+    // the split is named. `acceptable_keyworded_count` is the backend's own
+    // intersection, so the panel never recomputes it and drifts.
+    var keywordedInAccept = p.acceptable_keyworded_count || 0;
+    if (acceptablePhotoCount && keywordedInAccept) {
+      var alreadyNote = keywordedInAccept +
+        (keywordedInAccept === 1 ? ' already carries' : ' already carry') +
+        ' the keyword — accepting only clears ' +
+        (keywordedInAccept === 1 ? 'it' : 'them') + ' from Review';
+      why = why ? why + ' · ' + alreadyNote : alreadyNote;
+    }
 
     html += '<div class="prediction-row' + (ambiguousPhotos.length ? ' ambiguous' : '') + '">' +
       '<div style="min-width:0;">' +

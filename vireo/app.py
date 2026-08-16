@@ -16409,15 +16409,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # "previous" status is a fiction — undoing it would knock a
         # long-accepted prediction back to pending while keeping the keyword.
         ws = db._ws_id()
-        placeholders = ",".join("?" for _ in pred_ids)
-        already_accepted = {
-            row["prediction_id"] for row in db.conn.execute(
-                f"""SELECT prediction_id FROM prediction_review
-                    WHERE workspace_id = ? AND status = 'accepted'
-                      AND prediction_id IN ({placeholders})""",
-                (ws, *pred_ids),
+        # Chunked: ``_parse_prediction_ids`` now admits up to 25,000 ids, far
+        # past the 999-variable limit older SQLite builds enforce. Every other
+        # IN-clause query in this module goes through ``_chunked`` for the same
+        # reason (see ``_SQL_PARAM_CHUNK``).
+        already_accepted = set()
+        for chunk in _chunked(pred_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            already_accepted.update(
+                row["prediction_id"] for row in db.conn.execute(
+                    f"""SELECT prediction_id FROM prediction_review
+                        WHERE workspace_id = ? AND status = 'accepted'
+                          AND prediction_id IN ({placeholders})""",
+                    (ws, *chunk),
+                )
             )
-        }
         pred_ids = [pid for pid in pred_ids if pid not in already_accepted]
 
         replace_species = bool(body.get("replace_species"))
@@ -16516,22 +16522,32 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if len(pred_ids) > 25000:
             return None, None, json_error("too many prediction_ids", 400)
 
-        placeholders = ",".join("?" for _ in pred_ids)
-        photo_by_pred = {
-            row["id"]: row["photo_id"] for row in db.conn.execute(
-                f"""SELECT pr.id, d.photo_id
-                    FROM predictions pr
-                    JOIN detections d ON d.id = pr.detection_id
-                    WHERE pr.id IN ({placeholders})""",
-                pred_ids,
-            ).fetchall()
-        }
+        # Chunked for the same reason the cap was raised: a 25,000-id payload
+        # is legal now, and a single IN clause that wide exceeds the
+        # 999-variable limit older SQLite builds enforce. ``_SQL_PARAM_CHUNK``
+        # is the module-wide convention for exactly this.
+        photo_by_pred = {}
+        for chunk in _chunked(pred_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            photo_by_pred.update({
+                row["id"]: row["photo_id"] for row in db.conn.execute(
+                    f"""SELECT pr.id, d.photo_id
+                        FROM predictions pr
+                        JOIN detections d ON d.id = pr.detection_id
+                        WHERE pr.id IN ({placeholders})""",
+                    chunk,
+                ).fetchall()
+            })
         for pid in pred_ids:
             if pid not in photo_by_pred:
                 return None, None, json_error(f"Prediction {pid} not found", 404)
-            if not db._photo_in_workspace(photo_by_pred[pid]):
+        # One workspace query per distinct photo, not per prediction id: with
+        # 25,000 ids allowed, several rows on one photo must not cost several
+        # round trips each.
+        for photo_id in dict.fromkeys(photo_by_pred.values()):
+            if not db._photo_in_workspace(photo_id):
                 return None, None, json_error(
-                    f"Photo {photo_by_pred[pid]} does not belong to the "
+                    f"Photo {photo_id} does not belong to the "
                     "active workspace", 403,
                 )
         return pred_ids, photo_by_pred, None

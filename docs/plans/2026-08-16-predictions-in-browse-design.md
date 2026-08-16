@@ -67,9 +67,66 @@ carries its own prediction row. Each entry returns:
 - `keyworded_count` — of those, how many already carry the keyword
 - `missing_photo_ids` — predicted but not yet keyworded
 - `prediction_ids` — the prediction rows for those photos
+- `acceptable_prediction_ids` / `acceptable_photo_count` — the unambiguous
+  rows an Accept button may act on
+- `acceptable_keyworded_count` — how many of those photos already carry the
+  keyword, so accepting them writes no tag
 - `ambiguous_prediction_ids` — the subset with alternatives or a
   `disagreement`/`refinement` category
 - confidence range (min/max), not a single number
+
+### "Already keyworded" is not "resolved"
+
+A pending prediction on a photo that already carries the species (the user
+tagged it by hand after classification) needs no keyword — but it is still
+`pending`, so Review keeps queueing it. Dropping it from the panel reported
+it as done and left it unresolvable from Browse forever.
+
+`accept_prediction` handles exactly this as a status-only accept
+(`changed_tag=false`): the review status flips, the existing tag is neither
+removed nor re-added, and the edit stays undoable. Those rows are therefore
+included in `acceptable_prediction_ids`.
+
+That makes one button cover two outcomes, so the row names the split:
+`acceptable_keyworded_count` drives a "3 already carry the keyword —
+accepting only clears them from Review" note beside "Accept on 38". A count
+that silently means both "gets a keyword" and "only leaves Review" is the
+overloaded counter the transparency rule forbids.
+
+Ambiguity still outranks it: a keyworded photo whose prediction has an
+alternative or a disagreement goes to `ambiguous_*` and routes to Review.
+
+### Burst consensus and the displayed species
+
+`accept_prediction` substitutes a burst's consensus species (from
+`prediction_review.individual`) whenever a row carries a `group_id`, so any
+panel labelling rows from `pr.species` must show that consensus instead —
+`/api/predictions` exposes it as `consensus_species` and both the detail
+panel and the selection aggregator group by it.
+
+Belt and braces: the data cannot currently diverge either.
+`_store_grouped_predictions` sets `group_reviewable` — and therefore
+`group_id`, `individual` and the vote counts — **only** when every frame in
+the burst folds to one species key (`classify_job.py`, `group_species`), so a
+burst whose frames disagree is stored with `group_id = NULL` on every member
+and each row accepts as its own species.
+`test_mixed_burst_never_groups_so_displayed_species_is_accepted_species` and
+`test_grouped_burst_consensus_equals_each_row_species` lock that invariant,
+so the display fix stays a defence rather than the only thing standing
+between the user and a mislabelled Accept.
+
+### One size limit, two endpoints
+
+The selection endpoint caps at 1,000 photos; `batch-accept` caps at 25,000
+prediction ids because one photo can emit several rows for one species
+(several detections, or several classifier models). A flat 1,000-id cap on
+the write rejected Accept buttons the panel had just advertised — 501 photos
+× 2 models = 1,002 ids = a guaranteed 400.
+
+Both the id lookup and the already-accepted probe chunk through
+`_SQL_PARAM_CHUNK`: a 25,000-wide `IN` clause exceeds the 999-variable limit
+older SQLite builds enforce. The workspace check runs once per distinct
+photo rather than once per id.
 
 ### Accept is not a tag
 

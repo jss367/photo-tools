@@ -14004,8 +14004,25 @@ class Database:
                     "UPDATE edit_history_items SET old_value = ? WHERE id = ?",
                     (json.dumps(data, sort_keys=True), row["id"]),
                 )
+        # Preserve durable authorship before collapsing association conflicts.
+        # UPDATE OR IGNORE below leaves the destination row untouched when a
+        # photo already carries both keywords; without this fold, deleting the
+        # source would also delete its only ``source='manual'`` stamp.
+        self.conn.execute(
+            """UPDATE photo_keywords AS dst_pk
+               SET source = 'manual'
+               WHERE dst_pk.keyword_id = ?
+                 AND EXISTS (
+                     SELECT 1 FROM photo_keywords src_pk
+                     WHERE src_pk.photo_id = dst_pk.photo_id
+                       AND src_pk.keyword_id = ?
+                       AND src_pk.source = 'manual'
+                 )""",
+            (dst_id, src_id),
+        )
         # Move photo associations (ignore if already exists for dst_id),
-        # then drop the leftovers.
+        # then drop the leftovers. Non-conflicting rows carry their source
+        # column through the UPDATE unchanged.
         self.conn.execute(
             "UPDATE OR IGNORE photo_keywords SET keyword_id = ? WHERE keyword_id = ?",
             (dst_id, src_id),

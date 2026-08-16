@@ -2462,6 +2462,39 @@ def test_merge_keyword_into_transfers_coords_with_place_id(tmp_path):
         db.close()
 
 
+def test_merge_keyword_into_preserves_manual_association_source(tmp_path):
+    """A duplicate collapse must not discard durable manual provenance."""
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    both = db.add_photo(
+        folder_id=fid, filename="both.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    source_only = db.add_photo(
+        folder_id=fid, filename="source.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    keep_id = db.add_keyword("Wildlife", kw_type="genre")
+    merge_id = db.add_keyword("wildlife duplicate", kw_type="genre")
+    db.tag_photo(both, keep_id)
+    db.tag_photo(both, merge_id, source="manual")
+    db.tag_photo(source_only, merge_id, source="manual")
+
+    db._merge_keyword_into(merge_id, keep_id)
+    db.conn.commit()
+
+    rows = db.conn.execute(
+        "SELECT photo_id, source FROM photo_keywords WHERE keyword_id = ?",
+        (keep_id,),
+    ).fetchall()
+    assert {row["photo_id"]: row["source"] for row in rows} == {
+        both: "manual",
+        source_only: "manual",
+    }
+
+
 def test_place_upsert_repairs_adjacent_location_ancestors_on_demand(
     tmp_path,
 ):

@@ -2415,7 +2415,10 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                     time.sleep(0.05)
                 continue
             with _claim_worker_count(
-                [ip for ip, _ in remaining], cancel_check=_check_cancelled,
+                [ip for ip, _ in remaining],
+                cancel_check=(
+                    _check_cancelled if cancel_check is not None else None
+                ),
             ) as workers:
                 if status_callback:
                     _emit_status(

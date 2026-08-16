@@ -3061,6 +3061,58 @@ def test_scanner_reserves_capacity_for_exact_inference_claim(monkeypatch):
         resource_ledger._set_resource_ledger_for_tests(previous)
 
 
+def test_scan_worker_wait_uses_bound_cancel_probe_without_explicit_callback(
+    tmp_path,
+):
+    """Job-bound cancellation must interrupt a standalone scanner wait."""
+    import threading
+
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    _create_test_images(
+        root,
+        {'': [f"{index}.jpg" for index in range(9)]},
+    )
+    db = Database(str(tmp_path / "test.db"))
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    holder = ledger.acquire(resource_ledger.ResourceRequest(
+        cpu=resource_ledger.CpuRequest(2, 2, 2),
+    ))
+    cancelled = threading.Event()
+    finished = threading.Event()
+    outcome = []
+
+    def run_scan():
+        with resource_ledger.bind_resource_cancel_check(cancelled.is_set):
+            try:
+                scanner.scan(root, db)
+            except resource_ledger.ResourceWaitCancelled:
+                outcome.append("cancelled")
+            finally:
+                finished.set()
+
+    thread = threading.Thread(target=run_scan)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while ledger.snapshot()["waiters"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ledger.snapshot()["waiters"] == 1
+        cancelled.set()
+        assert finished.wait(timeout=1.0)
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+        assert outcome == ["cancelled"]
+    finally:
+        holder.release()
+        thread.join(timeout=1.0)
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
 def test_concurrent_scanners_preserve_inference_reserve(monkeypatch):
     """The scanner path wires ``cpu_reserve`` so two scans can't drain it.
 

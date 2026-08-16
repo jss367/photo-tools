@@ -62,6 +62,41 @@ def test_browse_lightbox_arrows_navigate(live_server, page):
     expect(counter).to_contain_text(first_filename)
 
 
+def test_browse_lightbox_close_selects_current_photo(live_server, page):
+    """Closing after lightbox navigation focuses the last-viewed grid photo."""
+    page.route(
+        "**/photos/*/full",
+        lambda route: route.fulfill(
+            body=base64.b64decode(_PNG_1X1), content_type="image/png"
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+
+    cards = page.locator(".grid-card")
+    cards.nth(1).wait_for(state="visible")
+    second_id = int(cards.nth(1).get_attribute("data-id"))
+
+    cards.first.dblclick()
+    expect(page.locator("#lightboxOverlay")).to_have_class(
+        "lightbox-overlay active"
+    )
+    page.locator("#lightboxNext").click()
+    page.wait_for_function(
+        "photoId => window._lightboxCurrentId === photoId", arg=second_id
+    )
+
+    page.locator(".lightbox-close").click()
+
+    expect(page.locator("#lightboxOverlay")).not_to_have_class(
+        "lightbox-overlay active"
+    )
+    assert page.evaluate("selectedPhotoId") == second_id
+    assert page.evaluate("selectedIndex") == 1
+    assert page.evaluate("selectedPhotos.size") == 0
+    expect(cards.nth(1)).to_have_class(re.compile(r"\bselected\b"))
+    expect(cards.first).not_to_have_class(re.compile(r"\bselected\b"))
+
+
 def test_lightbox_track_eye_keeps_eye_at_same_screen_position(
     live_server, page, tmp_path,
 ):

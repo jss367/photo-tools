@@ -7751,6 +7751,7 @@ function toggleLightboxZoom(e) {
 
 function closeLightbox(e) {
   if (e && e.target && e.target.tagName === 'IMG') return;
+  var closedPhotoId = _lightboxCurrentId;
   _lbFlushPendingAdjustmentSave();
   if (_lightboxCurrentId != null) _lbSaveViewportState(_lightboxCurrentId);
   var wasOpen = !!window._lbEscToken;
@@ -7780,7 +7781,11 @@ function closeLightbox(e) {
   document.getElementById('lightboxImg').src = '';
   document.getElementById('lightboxZoomBadge').style.display = 'none';
   _lightboxCurrentId = null;
-  try { document.dispatchEvent(new CustomEvent('lightbox:closed')); } catch(_) {}
+  try {
+    document.dispatchEvent(new CustomEvent('lightbox:closed', {
+      detail: { photoId: closedPhotoId }
+    }));
+  } catch(_) {}
   _lbSetFlagStatus(undefined);
   var detContainer = document.getElementById('lightboxDetections');
   if (detContainer) detContainer.innerHTML = '';

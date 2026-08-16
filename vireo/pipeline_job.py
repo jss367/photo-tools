@@ -1362,7 +1362,7 @@ _CLASSIFICATION_ETA_MIN_ATTEMPTS = 16
 
 def _classification_eta_progress(
     *, total, seen, cached_estimate, cache_hits, inference_attempts,
-    classified, elapsed,
+    classified, elapsed, cache_overcount=0,
 ):
     """Return step-progress fields for a cache-aware classification ETA.
 
@@ -1371,6 +1371,14 @@ def _classification_eta_progress(
     and sent through the model.  Estimate only from photos that actually
     entered an inference batch, while using the preflight cache count to
     subtract cache hits that are still expected later in the collection.
+
+    ``cache_overcount`` is the count of photos where the preflight assumed
+    a cache hit (a classifier_runs row existed) but runtime found no cached
+    predictions and fell through to fresh inference. Subtracting it from
+    ``cached_estimate`` keeps ``remaining_uncached`` from collapsing to zero
+    on collections dominated by run-key-without-predictions rows, where the
+    preflight overcounts because it can't see the empty-predictions case
+    (e.g. a prior pass wrote ``category == 'match'`` with no predictions).
 
     The first classifier call is deliberately flushed as a one-photo batch
     for cancellation responsiveness and includes model warm-up.  Wait for a
@@ -1383,13 +1391,32 @@ def _classification_eta_progress(
     inference_attempts = max(int(inference_attempts or 0), 0)
     classified = max(int(classified or 0), 0)
     elapsed = max(float(elapsed or 0), 0.0)
+    cache_overcount = max(int(cache_overcount or 0), 0)
 
+    # Project future cache hits from the observed success rate of preflight
+    # cache predictions. ``cache_hits + cache_overcount`` is the count of
+    # preflight-expected cache attempts we've observed; ``cache_hits`` is
+    # the subset where the runtime cache-hit predicate actually fired.
+    # Scaling ``cached_estimate`` by this rate corrects the preflight for
+    # the run-key-without-predictions case without waiting for the whole
+    # collection to be visited — a collection dominated by these rows
+    # converges to zero projected cache hits within a single batch.
+    observed_cache_attempts = cache_hits + cache_overcount
+    if observed_cache_attempts > 0:
+        hit_success_rate = cache_hits / observed_cache_attempts
+    else:
+        # No preflight-expected cache observations yet — trust preflight
+        # so early ETAs don't collapse before any evidence has arrived.
+        hit_success_rate = 1.0
+    corrected_cached_estimate = int(cached_estimate * hit_success_rate)
     remaining_photos = max(total - seen, 0)
-    expected_future_cache_hits = max(cached_estimate - cache_hits, 0)
+    expected_future_cache_hits = max(
+        corrected_cached_estimate - cache_hits, 0,
+    )
     remaining_uncached = max(
         remaining_photos - expected_future_cache_hits, 0,
     )
-    expected_uncached = max(total - cached_estimate, 0)
+    expected_uncached = max(total - corrected_cached_estimate, 0)
     min_attempts = min(
         _CLASSIFICATION_ETA_MIN_ATTEMPTS,
         max(expected_uncached, 1),
@@ -5318,9 +5345,15 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # Pre-flight cache estimate. One indexed query so the UI
                     # can display "~M cached, ~K to classify" before the first
                     # inference runs and ETAs are honest from the start. The
-                    # estimate may overcount if a run-key exists but no cached
-                    # predictions do (see lines ~2000-2004); the live `cached`
-                    # counter reflects actual skips.
+                    # estimate may overcount if a run key exists but no cached
+                    # predictions do (e.g. a prior pass wrote
+                    # ``category == 'match'`` with no predictions); the live
+                    # ``cached`` counter reflects actual skips, and
+                    # ``photos_cache_overcounted_in_spec`` (populated in the
+                    # fall-through branch below) lets ``_classification_eta_progress``
+                    # reconcile the estimate from observed misses so
+                    # ``remaining_uncached`` doesn't collapse to zero on
+                    # collections dominated by these rows.
                     #
                     # Skipped on reclassify runs because the cache gate below
                     # is bypassed and every photo is re-inferred. In a
@@ -5377,6 +5410,17 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # ones. ETA throughput is about completed model work, not
                     # only predictions that happened to persist successfully.
                     photos_attempted_in_spec: set = set()
+                    # Preflight's ``cached_est`` counts any photo whose
+                    # qualifying detections all have classifier_runs rows,
+                    # but the runtime cache-hit predicate additionally
+                    # requires actual predictions to exist. When we hit the
+                    # fall-through case (run key present, predictions
+                    # missing — see the classify loop below) the photo will
+                    # end up in ``photos_inferred_in_spec``, so subtract it
+                    # from the preflight estimate in the ETA calculation
+                    # instead of leaving a phantom future cache hit that
+                    # collapses ``remaining_uncached`` to zero.
+                    photos_cache_overcounted_in_spec: set = set()
                     # Per-spec tracking of photos whose per-photo iteration
                     # was actually entered in THIS spec. Used by the
                     # reclassify clear below so it never wipes predictions
@@ -5815,6 +5859,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         # so the prediction was intentionally not
                                         # written). Fall through to re-classify
                                         # instead of stranding the detection.
+                                        # Reconcile the preflight's cache
+                                        # estimate: it counted this photo based
+                                        # solely on the run key existing, but
+                                        # runtime will actually infer.
+                                        photos_cache_overcounted_in_spec.add(
+                                            photo["id"],
+                                        )
 
                                 img, folder_path, image_path = _prepare_image(
                                     photo, folders,
@@ -6003,6 +6054,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     ),
                                     classified=len(photos_inferred_in_spec),
                                     elapsed=elapsed,
+                                    cache_overcount=len(
+                                        photos_cache_overcounted_in_spec
+                                    ),
                                 ),
                             },
                         )

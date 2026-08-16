@@ -117,6 +117,60 @@ def test_classification_eta_subtracts_expected_future_cache_hits():
     assert fields["eta_seconds"] == 180
 
 
+def test_classification_eta_reconciles_overcounted_cache_estimate():
+    """The preflight counts a photo as cached whenever every qualifying
+    detection has a classifier_runs row, but the runtime cache-hit
+    predicate additionally requires cached predictions to exist. On a
+    collection dominated by run-key-without-predictions rows, the
+    preflight overcounts; without reconciliation ``remaining_uncached``
+    collapses to zero after the first inference batch and the UI would
+    report "finishing…" while most photos still need inference.
+    """
+    # 100 photos: preflight said all 100 are cached, but every single one
+    # falls through at runtime (run key present, predictions missing).
+    # After 20 photos we have 20 observed overcounts and 20 inferred; the
+    # remaining 80 photos are ALL uncached work.
+    fields = _classification_eta_progress(
+        total=100,
+        seen=20,
+        cached_estimate=100,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=120,
+        cache_overcount=20,
+    )
+
+    assert fields["remaining_uncached"] == 80
+    assert fields["eta_state"] == "ready"
+    assert fields["eta_rate_per_min"] == 10.0
+    assert fields["eta_seconds"] == 480
+
+
+def test_classification_eta_overcount_floors_at_observed_cache_hits():
+    """``cache_overcount`` must never push corrected cached_estimate
+    below the cache hits we've already observed — otherwise a burst of
+    overcounts on later photos could retroactively erase legitimate
+    cache hits from the projection.
+    """
+    fields = _classification_eta_progress(
+        total=100,
+        seen=40,
+        cached_estimate=50,
+        cache_hits=30,
+        inference_attempts=10,
+        classified=10,
+        elapsed=60,
+        # Absurdly large overcount that would drive corrected estimate
+        # negative if not floored.
+        cache_overcount=1000,
+    )
+
+    # remaining_photos = 60; corrected_cached_estimate floors at
+    # cache_hits (30) so future expected hits = 0.
+    assert fields["remaining_uncached"] == 60
+
+
 def test_pipeline_params_has_skip_classify():
     """PipelineParams should support skip_classify flag."""
     params = PipelineParams(collection_id=1, skip_classify=True)

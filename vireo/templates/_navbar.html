@@ -2189,14 +2189,23 @@ function sendReport() {
     var url = '/browse?photo_id=' + photoId;
     if (typeof isTauri === 'function' && isTauri()) {
       window.location.href = url;
+      return true;
     } else {
       var opened = window.open('about:blank', '_blank');
       if (!opened) {
+        var blockedHint = typeof window.getLightboxBrowseDisabledHint === 'function'
+          ? window.getLightboxBrowseDisabledHint(photoId, true)
+          : null;
+        if (blockedHint) {
+          if (typeof showToast === 'function') showToast(blockedHint, 'warning');
+          return false;
+        }
         window.location.href = url;
-        return;
+        return true;
       }
       try { opened.opener = null; } catch (e) {}
       opened.location = url;
+      return true;
     }
   };
 })();

@@ -7506,10 +7506,12 @@ function grmHasPendingUserEdits() {
   return grmFlagsDirty(diff) || diff.speciesChanged || !!grmState.speciesFieldTouched;
 }
 
-window.getLightboxBrowseDisabledHint = function() {
+window.getLightboxBrowseDisabledHint = function(photoId, willNavigateInPlace) {
   var overlay = document.getElementById('grmOverlay');
   var groupOpen = overlay && overlay.classList.contains('open');
-  if (groupOpen && typeof isTauri === 'function' && isTauri() && grmHasPendingUserEdits()) {
+  var sameWindowNavigation = !!willNavigateInPlace ||
+    (typeof isTauri === 'function' && isTauri());
+  if (groupOpen && sameWindowNavigation && grmHasPendingUserEdits()) {
     return 'Apply or close Group Review before leaving this page';
   }
   return null;
@@ -7527,6 +7529,10 @@ function pipelineCollectionAcceptsManualPhotos(collection) {
 
 async function addToCollection(photoIds) {
   if (pipelineReviewCollectionSubmitPromise) return false;
+  if (isScopedReviewView()) {
+    notifyReadOnlyScopedView();
+    return false;
+  }
   var ids = pipelineReviewUniquePhotoIds(photoIds || getActiveSelection());
   if (!ids.length) return;
   var loadSeq = ++pipelineReviewCollectionLoadSeq;
@@ -7606,6 +7612,10 @@ function setPipelineCollectionSubmitting(submitting) {
 
 function confirmPipelineCollection() {
   if (pipelineReviewCollectionSubmitPromise) return pipelineReviewCollectionSubmitPromise;
+  if (isScopedReviewView()) {
+    notifyReadOnlyScopedView();
+    return Promise.resolve(false);
+  }
   var ids = pipelineReviewCollectionPhotoIds.slice();
   var newName = document.getElementById('pipelineCollectionNewName').value.trim();
   var collectionId = pipelineReviewSelectedCollectionId;
@@ -7659,6 +7669,10 @@ function confirmPipelineCollection() {
 
 function batchAddKeyword(photoIds) {
   if (pipelineReviewKeywordSubmitPromise) return false;
+  if (isScopedReviewView()) {
+    notifyReadOnlyScopedView();
+    return false;
+  }
   var ids = pipelineReviewUniquePhotoIds(photoIds || getActiveSelection());
   if (!ids.length) return;
   pipelineReviewKeywordPhotoIds = ids;
@@ -7719,6 +7733,10 @@ document.addEventListener('keydown', function(e) {
 
 function confirmPipelineKeyword() {
   if (pipelineReviewKeywordSubmitPromise) return pipelineReviewKeywordSubmitPromise;
+  if (isScopedReviewView()) {
+    notifyReadOnlyScopedView();
+    return Promise.resolve(false);
+  }
   var ids = pipelineReviewKeywordPhotoIds.slice();
   var name = document.getElementById('pipelineKeywordInput').value.trim();
   if (!ids.length || !name) return Promise.resolve(false);
@@ -7745,6 +7763,9 @@ function buildPipelinePhotoContextMenu(photoIds, clickedPhotoId, inGroupReview) 
   photoIds = pipelineReviewUniquePhotoIds(photoIds);
   var one = photoIds.length === 1;
   var singleHint = one ? undefined : 'Select a single photo';
+  var scopedWriteHint = isScopedReviewView()
+    ? 'Switch to Latest review to make changes'
+    : undefined;
   var tauriNavigationBlocked = !!(
     inGroupReview &&
     typeof isTauri === 'function' && isTauri() &&
@@ -7792,8 +7813,12 @@ function buildPipelinePhotoContextMenu(photoIds, clickedPhotoId, inGroupReview) 
     flagChip('none', '\u25CB', 'Clear flag'),
   ]});
   items.push({separator: true});
-  items.push({label: 'Add to Collection\u2026', onClick: function() { addToCollection(photoIds); }});
-  items.push({label: 'Add Keyword\u2026', onClick: function() { batchAddKeyword(photoIds); }});
+  items.push({label: 'Add to Collection\u2026', disabled: !!scopedWriteHint,
+    disabledHint: scopedWriteHint,
+    onClick: function() { addToCollection(photoIds); }});
+  items.push({label: 'Add Keyword\u2026', disabled: !!scopedWriteHint,
+    disabledHint: scopedWriteHint,
+    onClick: function() { batchAddKeyword(photoIds); }});
   items.push({separator: true});
   items.push({label: 'Open in Lightbox', disabled: !one, disabledHint: singleHint,
     onClick: function() { openPipelineLightbox(clickedPhotoId); }});

@@ -1497,6 +1497,67 @@ def test_read_only_scope_rating_does_not_mutate_cache_or_database(live_server, p
     assert rating == before_db
 
 
+def test_read_only_scope_blocks_collection_and_keyword_writes(live_server, page):
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+    collection_id = db.add_collection(
+        "Read-only target",
+        json.dumps([{"field": "photo_ids", "value": []}]),
+    )
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    photo_id = photo_ids[0]
+
+    # Stage both dialogs in Latest, then switch scope before confirming. The
+    # confirmation-time guards must prevent either POST even though the forms
+    # already contain valid targets.
+    page.evaluate("pid => addToCollection([pid])", photo_id)
+    expect(page.locator("#pipelineCollectionModal")).to_have_class(
+        re.compile(r"\bopen\b")
+    )
+    page.evaluate("cid => pickPipelineCollection(cid)", collection_id)
+    page.evaluate("pid => batchAddKeyword([pid])", photo_id)
+    page.locator("#pipelineKeywordInput").fill("must-not-write")
+    results = page.evaluate(
+        "async () => { reviewScopeMode = 'workspace'; return Promise.all(["
+        "confirmPipelineCollection(), confirmPipelineKeyword()]); }"
+    )
+    assert results == [False, False]
+    assert db.get_collection_photos(collection_id, per_page=100) == []
+    assert "must-not-write" not in {
+        keyword["name"] for keyword in db.get_photo_keywords(photo_id)
+    }
+
+    # The action entry points are guarded as well, so native menu calls and
+    # other direct invocations cannot open writable dialogs in a scoped view.
+    page.evaluate("hidePipelineKeywordModal(true); hidePipelineCollectionModal(true)")
+    page.locator(f'.photo-card[data-photo-id="{photo_id}"]').click(button="right")
+    menu = page.locator(".vireo-ctx-menu")
+    for label in ("Add to Collection", "Add Keyword"):
+        item = menu.locator(".vireo-ctx-item", has_text=label)
+        expect(item).to_have_class(re.compile(r"\bvireo-ctx-disabled\b"))
+        expect(item).to_have_attribute("title", "Switch to Latest review to make changes")
+    page.keyboard.press("Escape")
+
+    blocked = page.evaluate(
+        "async pid => ({ collection: await addToCollection([pid]), "
+        "keyword: batchAddKeyword([pid]), "
+        "collectionOpen: document.getElementById('pipelineCollectionModal')"
+        ".classList.contains('open'), "
+        "keywordOpen: document.getElementById('pipelineKeywordModal')"
+        ".classList.contains('open') })",
+        photo_id,
+    )
+    assert blocked == {
+        "collection": False,
+        "keyword": False,
+        "collectionOpen": False,
+        "keywordOpen": False,
+    }
+
+
 def test_tauri_disables_navigation_when_group_review_is_dirty(live_server, page):
     photo_ids = live_server["data"]["photos"][:4]
     _write_grouped_pipeline_cache(live_server, photo_ids)
@@ -1524,6 +1585,29 @@ def test_tauri_disables_navigation_when_group_review_is_dirty(live_server, page)
     expect(lightbox_browse).to_have_attribute(
         "title", "Apply or close Group Review before leaving this page"
     )
+
+
+def test_popup_blocked_browse_preserves_dirty_group_review(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    page.evaluate("grmMoveReject()")
+    original_url = page.url
+
+    result = page.evaluate(
+        "pid => { const originalOpen = window.open; window.open = () => null; "
+        "try { return window.openInBrowse(pid); } finally { window.open = originalOpen; } }",
+        photo_ids[0],
+    )
+
+    assert result is False
+    assert page.url == original_url
+    assert page.evaluate("grmHasPendingUserEdits()") is True
+    expect(page.locator("#grmOverlay")).to_have_class(re.compile(r"\bopen\b"))
 
 
 def test_tauri_treats_unseeded_group_touches_as_dirty(live_server, page):

@@ -1,7 +1,8 @@
 name: Check PR merge readiness
 description: >-
   Verify live PR state, approved head, repository/base constraints, child PRs,
-  and resolution of every current review thread before enabling auto-merge.
+  resolution of every current review thread, and a successful Tests run for
+  the exact head before a synchronous merge.
 
 inputs:
   repo:
@@ -116,6 +117,25 @@ runs:
 
         if [[ "$unresolved" -gt 0 ]]; then
           echo "PR #${PR} has ${unresolved} unresolved current review thread(s)."
+          exit 0
+        fi
+
+        test_runs=$(gh run list --repo "$REPO" --workflow Tests \
+          --branch "$head_ref" --event pull_request --limit 20 \
+          --json headSha,status,conclusion,createdAt,url)
+        latest_test=$(jq -c --arg head "$head_sha" '
+          [ .[] | select(.headSha == $head) ]
+          | sort_by(.createdAt)
+          | last // empty' <<< "$test_runs")
+        if [[ -z "$latest_test" ]]; then
+          echo "PR #${PR} has no Tests run for head ${head_sha}."
+          exit 0
+        fi
+        test_status=$(jq -r '.status' <<< "$latest_test")
+        test_conclusion=$(jq -r '.conclusion' <<< "$latest_test")
+        test_url=$(jq -r '.url' <<< "$latest_test")
+        if [[ "$test_status" != "completed" || "$test_conclusion" != "success" ]]; then
+          echo "PR #${PR} Tests are ${test_status}/${test_conclusion} for ${head_sha}: ${test_url}"
           exit 0
         fi
 

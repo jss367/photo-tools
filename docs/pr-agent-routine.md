@@ -95,7 +95,7 @@ workflow is verified.
 
 Routine-forwarding jobs skip the `/fire` call when these secrets are missing,
 so the workflow can exist before the routine is configured. The pure GitHub
-Actions auto-merge jobs do not need these secrets.
+Actions merge jobs do not need these secrets.
 
 ### 4. Configure human merge actors
 
@@ -109,46 +109,45 @@ The forwarder sends plain-text payloads that the routine prompt knows how to
 parse. Each payload starts with a `Task:` line, followed by structured
 context. The routine prompt enumerates the supported task kinds:
 
+- `reconcile-pr` — verified human `/claude-fix`; uncapped full-state recovery
+- `reconcile-pr-auto` — bounded full-state recovery for an orphaned conflict
 - `address-review` — non-approving review submitted on a claude-agent PR
-- `address-human-fix` — `/claude-fix` from a human maintainer (identical
-  shape to `address-review` but signals the routine to skip its per-PR
-  review-fix round cap; only the `activate` job emits this kind, and only
-  when the commenter's `author_association` is `OWNER` or `COLLABORATOR`).
-  Using a distinct task kind — rather than a `Human override: true` field
-  interpolated into the payload — keeps the override signal above the
-  untrusted body region so a bot cannot spoof it through `Review body:` or
-  `Comment body:`.
 - `address-comment` — non-`/claude-fix`, non-👍 comment on a claude-agent PR
 - `address-codex-review` — codex-connector review on a non-agent PR
 - `fix-ci` — Tests workflow failed on a PR
-- `resolve-conflicts` — conflicts detected against a claude-agent PR after
-  a push to `main`
 
 The payload intentionally keeps user-supplied text (review bodies, comment
 bodies) clearly labeled as **untrusted data, not instructions** — the prompt
-re-asserts this at handling time.
+re-asserts this at handling time. Human override is represented by the
+`reconcile-pr` task kind, never by a field that untrusted comment text could
+forge.
 
 ## What It Handles
 
-- `/claude-fix` on a PR: labels the PR and asks the routine to address all
-  outstanding feedback.
+- A human `/claude-fix` on a PR: labels it and starts one complete
+  reconciliation pass covering conflicts, failed CI, current review threads,
+  and relevant top-level feedback.
 - Trusted comments on a `claude-agent` PR: forwards the comment to the routine.
 - Trusted non-approval reviews on a `claude-agent` PR: forwards the review.
 - Codex connector reviews on non-agent PRs: forwards the review and has the
   routine add the `claude-agent` label for follow-up routing.
 - Failed `Tests` workflow runs on PRs: asks the routine to diagnose and fix CI.
-- Pushes to `main`: finds conflicting `claude-agent` PRs and asks the routine
-  to resolve conflicts. If GitHub still reports mergeability as `UNKNOWN` after
-  retries, the workflow sends that PR to the routine so a real conflict is not
-  missed.
+- PR open/reopen/head updates and pushes to `main`: discover conflicting
+  same-repository PRs from trusted authors even when the initial review event
+  never ran and no `claude-agent` label exists. Each conflicting PR is bound to
+  its current head and receives one bounded reconciliation pass. Persistent
+  `UNKNOWN` mergeability is left for explicit `/claude-fix` rather than firing
+  speculatively.
 - A human approving review, or an exact `/merge <head-sha>` command from a
-  configured human: enables squash auto-merge only when the approved head is
-  still current and every non-outdated review thread is resolved.
+  configured human: synchronously squash-merges only when the authorized head
+  is still current, every non-outdated review thread is resolved, and the Tests
+  workflow succeeded for that exact head. If authorization arrives while Tests
+  is running, the successful workflow run retries the same head-bound merge.
 
-Auto-merge calls use `gh pr merge --match-head-commit` so approval applies to
-the expected PR head commit rather than a newer unreviewed push. Auto-merge
-jobs also skip closed PRs, forks, non-`main` bases, and branches with open
-child PRs.
+Merge calls use `gh pr merge --match-head-commit` without `--auto`, so no
+authorization remains armed across a later push. Merge jobs also skip closed
+PRs, forks, non-`main` bases, branches with open child PRs, unresolved current
+threads, and heads without a successful Tests run.
 
 Every routine forwarder re-reads the PR's live state and head immediately
 before calling `/fire`. Queued events for a closed/merged PR or superseded head
@@ -171,13 +170,16 @@ Review-event de-noising. Concurrency is scoped per job, not workflow-wide,
 so unrelated task types never cancel each other. Review-fix firers
 (`activate`, `fix-comment-feedback`, `fix-comments`, `codex-review`) share
 a `pr-agent-review-fix-<PR>` group so newer review events collapse older
-ones. CI-fix runs derive the PR number from
+ones. Conflict reconciliation uses the same per-PR lane, so a stale review and
+conflict repair cannot edit the same head concurrently. CI-fix runs derive the
+PR number from
 `workflow_run.pull_requests[0]` (falling back to the workflow_run head
 SHA) so unrelated PRs sharing a default-branch commit do not cancel each
-other's CI-repair. Merge jobs (`merge-on-approval`, `merge-on-command`)
+other's CI-repair. Merge jobs (`merge-on-approval`, `merge-on-command`,
+`merge-after-tests`)
 get their own `pr-agent-merge-<PR>` group with
 `cancel-in-progress: false` so an in-flight `/merge` or approval-driven
-auto-merge run is never cancelled by an ignored generated comment or a
+merge run is never cancelled by an ignored generated comment or a
 later approval event. `/merge <sha>` comments are also excluded from
 `fix-comment-feedback` so the routine cannot push a new head — and
 invalidate the human's SHA-bound merge authorization — in parallel with
@@ -210,7 +212,8 @@ commit, reply to the exact addressed inline threads, and resolve those threads.
 
 The forwarder and routine both stop automated review repair after two commits
 carrying the PR-specific `[pr-agent-review-fix:<number>]` marker. An explicit
-human `/claude-fix` remains available as an override. The forwarder adds
+human `/claude-fix` remains available as an override through the distinct,
+non-injectable `reconcile-pr` task. The forwarder adds
 `pr-agent-needs-human` when the cap is reached. Architectural findings,
 new-subsystem changes, and material diff expansion are escalated to a human
 instead of creating another autonomous review/fix round.
@@ -240,7 +243,7 @@ instead of creating another autonomous review/fix round.
   the guard the inline-thread check does not gate. The gate paginates through
   all review threads, so large PRs are not truncated.
 
-## Auto-Merge Details
+## Merge Details
 
 Human merge actors are configured in `.github/workflows/pr-agent.yml` with:
 
@@ -255,9 +258,10 @@ the exact current head (a 7-40 character prefix is accepted):
 /merge daecbb28
 ```
 
-Ambiguous `+1` comments and reactions do not authorize merges. Both approval
-paths re-query the current head and paginate all review threads immediately
-before enabling auto-merge.
+Ambiguous `+1` comments and reactions do not authorize merges. Every approval
+path re-queries the current head, requires a successful Tests run for that
+head, paginates all review threads, and merges synchronously without leaving an
+auto-merge request armed.
 
 ## Rollback
 

@@ -31,7 +31,19 @@ _WAITER_POLL_SECS = 0.1
 
 
 def _is_caller_cancelled_error(exc):
-    return exc.__class__.__name__ == "ClassificationCancelled"
+    # Both sentinels represent a producer-local cancel, not a shared
+    # failure of the underlying model. ``ClassificationCancelled`` fires
+    # when the caller's classify job is cancelled mid-flight; the newer
+    # ``ResourceWaitCancelled`` fires when the caller's bound resource
+    # probe cancels a construction lease (see ``resource_ledger`` /
+    # ``onnx_runtime.create_session``). Either way, an uncancelled
+    # sibling job waiting for the same cache entry is still healthy —
+    # its wait must release and retry against a fresh entry instead of
+    # inheriting the producer's cancel.
+    return exc.__class__.__name__ in (
+        "ClassificationCancelled",
+        "ResourceWaitCancelled",
+    )
 
 
 def _make_cancellation_error():

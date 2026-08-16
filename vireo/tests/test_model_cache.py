@@ -217,6 +217,68 @@ def test_cancelled_load_waiter_retries_instead_of_inheriting_cancel():
     assert values == ["ok"]
 
 
+def test_resource_wait_cancelled_load_does_not_poison_healthy_waiter():
+    """Regression: when a cold construction lease raises ``ResourceWaitCancelled``
+    (the ledger's cancel probe fired because the producer job was cancelled),
+    another uncancelled job that was already waiting for the same cache entry
+    must retry against a fresh entry rather than inherit the producer's
+    resource cancel. Without treating ``ResourceWaitCancelled`` as a
+    caller-local cancellation at the cache boundary, ``ModelCache.acquire``
+    would rethrow it verbatim and fail the healthy sibling job for no reason
+    of its own.
+    """
+    from resource_ledger import ResourceWaitCancelled
+
+    cache = ModelCache(idle_secs=60)
+    load_started = threading.Event()
+    release_cancel = threading.Event()
+    good_factory_called = threading.Event()
+    values = []
+
+    def cancelled_factory():
+        load_started.set()
+        release_cancel.wait(timeout=2.0)
+        raise ResourceWaitCancelled(
+            "Cancelled while waiting for ONNX model construction resources"
+        )
+
+    def good_factory():
+        good_factory_called.set()
+        return "ok"
+
+    def cancelled_loader():
+        with pytest.raises(ResourceWaitCancelled):
+            with cache.acquire("k", cancelled_factory):
+                pass
+
+    def waiting_loader():
+        with cache.acquire("k", good_factory) as value:
+            values.append(value)
+
+    ta = threading.Thread(target=cancelled_loader)
+    ta.start()
+    assert load_started.wait(timeout=1.0)
+
+    tb = threading.Thread(target=waiting_loader)
+    tb.start()
+    time.sleep(0.05)
+
+    release_cancel.set()
+    ta.join(timeout=2.0)
+    tb.join(timeout=2.0)
+
+    assert not ta.is_alive()
+    assert not tb.is_alive()
+    assert good_factory_called.is_set(), (
+        "The healthy waiter must retry against a fresh entry — its factory "
+        "should have run after the producer's ResourceWaitCancelled surfaced."
+    )
+    assert values == ["ok"], (
+        "The healthy waiter must have received the value from its own retry "
+        "factory, not inherited the producer's ResourceWaitCancelled."
+    )
+
+
 def test_waiter_cancel_check_unblocks_while_producer_still_loading():
     """Regression: without a waiter-local cancellation check, a waiter blocked
     on another caller's load_lock only observes its own cancellation after

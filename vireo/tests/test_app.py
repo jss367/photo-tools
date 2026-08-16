@@ -18205,3 +18205,127 @@ def test_browse_clears_stale_ambiguity_when_keywords_no_longer_conflict(app_and_
         "stored snapshot, not OR them together"
     )
     assert det_id is not None
+
+
+def test_batch_accept_leaves_earlier_accept_untouched_when_resubmitted(app_and_db):
+    """Filtering already-accepted ids must not leak their photos into a
+    sibling's grouped scope.
+
+    Codex flagged: photos A and B share one ``(group_id, model)`` bucket.
+    B was already accepted (a second panel, a raced click), so ``pred_ids``
+    drops it. If the grouped scope still names B's photo, A's accept re-
+    touches B and appends a phantom ``no_tag`` item — undo then walks that
+    item and resets B's earlier accept back to pending. The current fix
+    tracks scope by row identity built after the already-accepted filter,
+    which closes it. This test locks that in via the undo path: the second
+    batch's edit-history entry must only cover A's photo, and undoing it
+    must not touch B.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_grouped_photo(filename):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=filename, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(
+            det_id, "Bald Eagle", 0.9, "bioclip",
+            group_id="burst-skip-scope",
+        )
+        return photo_id
+
+    photo_a = _seed_grouped_photo("skip-a.jpg")
+    photo_b = _seed_grouped_photo("skip-b.jpg")
+    pred_a = _prediction_id(db, photo_a, "Bald Eagle")
+    pred_b = _prediction_id(db, photo_b, "Bald Eagle")
+
+    # Simulate the "B already accepted" starting state — one earlier batch
+    # decided B alone, so the (burst-skip-scope, bioclip) bucket already
+    # holds an accept on B.
+    first = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_b]},
+    )
+    assert first.status_code == 200, first.get_data(as_text=True)
+    edits_after_first = db.get_edit_history(limit=50)
+    b_first_status = {
+        row["photo_id"]: row["status"]
+        for row in db.get_predictions(photo_ids=[photo_a, photo_b])
+    }
+    assert b_first_status[photo_b] == "accepted"
+    assert b_first_status[photo_a] == "pending"
+
+    # Second batch: the panel refreshes and now submits BOTH ids — the
+    # already-accepted skip must not leave B in A's grouped scope.
+    second = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_a, pred_b]},
+    )
+    assert second.status_code == 200, second.get_data(as_text=True)
+    body = second.get_json()
+    assert body["accepted"] == 1
+    assert body["already_accepted"] == 1
+
+    # One new edit entry — a phantom re-accept would leave a second
+    # ``no_tag`` item on this entry that undo would happily walk.
+    edits_after_second = db.get_edit_history(limit=50)
+    assert len(edits_after_second) == len(edits_after_first) + 1
+    new_entry_id = edits_after_second[0]["id"]
+    items = db.conn.execute(
+        "SELECT photo_id FROM edit_history_items WHERE edit_id = ?",
+        (new_entry_id,),
+    ).fetchall()
+    photo_ids_in_entry = {row["photo_id"] for row in items}
+    assert photo_ids_in_entry == {photo_a}, (
+        "Photo B was already accepted and skipped from pred_ids — its "
+        "photo must not sit in A's grouped scope, or undo would reset "
+        "the earlier accept on B."
+    )
+
+    # And the load-bearing assertion: undoing the second batch must not
+    # touch B's earlier accept. A phantom no_tag item's undo would flip B
+    # back to pending/alternative even though its accept wasn't in this
+    # batch.
+    undo_resp = client.post("/api/undo")
+    assert undo_resp.status_code == 200, undo_resp.get_data(as_text=True)
+    post_undo = {
+        row["photo_id"]: row["status"]
+        for row in db.get_predictions(photo_ids=[photo_a, photo_b])
+    }
+    assert post_undo[photo_b] == "accepted", (
+        "Undoing the second batch reset B's earlier (unrelated) accept — "
+        "the phantom no_tag item leaked B into the second batch's edit "
+        "record."
+    )
+
+
+def test_browse_uses_ascii_case_fold_for_prediction_group_key(app_and_db):
+    """Grouping predictions by JS ``toLowerCase()`` merges rows the DB
+    intentionally keeps distinct.
+
+    ``keyword_match_key`` (and the ``keywords`` table's ASCII NOCASE
+    constraints) treat ``Éclair`` and ``éclair`` as separate species, so
+    accepting either lands on a different keyword id. JS's Unicode-aware
+    ``toLowerCase()`` folds the two together, so the group's Accept
+    button ends up submitting ids that resolve to two different keywords
+    — and ``/api/predictions/batch-accept`` rejects the batch with
+    ``prediction_ids must all resolve to one species``, leaving the row
+    unactionable from Browse. The single-photo prediction panel must
+    group with an ASCII-only fold to mirror the backend.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    # Helper is present.
+    assert "function asciiCaseFoldKey" in html
+    # And is what the prediction group key actually uses — no lingering
+    # ``displaySpecies.toLowerCase()`` at the grouping site.
+    assert "asciiCaseFoldKey(displaySpecies)" in html
+    assert "displaySpecies.toLowerCase()" not in html

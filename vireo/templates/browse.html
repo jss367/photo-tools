@@ -6328,6 +6328,24 @@ function formatPredictionConfidence(conf) {
   return Math.round(conf * 100) + '%';
 }
 
+// Fold only A-Z→a-z, leaving non-ASCII letters alone. Mirrors the backend's
+// keyword_match_key (vireo/keyword_normalization.py) and SQLite's ASCII
+// NOCASE. JS's Unicode-aware String.prototype.toLowerCase() folds "Éclair"
+// to "éclair", so grouping predictions by toLowerCase() merges rows that the
+// keywords table keeps as distinct species — the resulting Accept submits
+// both ids and /api/predictions/batch-accept rejects the batch because they
+// resolve to different keyword rows, leaving the row unactionable.
+function asciiCaseFoldKey(name) {
+  var s = String(name == null ? '' : name);
+  var out = '';
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i);
+    if (c >= 65 && c <= 90) out += String.fromCharCode(c + 32);
+    else out += s.charAt(i);
+  }
+  return out;
+}
+
 async function loadDetailPredictions(photoId) {
   var list = document.getElementById('detailPredictions');
   if (!list) return;
@@ -6392,7 +6410,7 @@ function renderDetailPredictions(data, photoId) {
   visible.forEach(function(p) {
     var decided = p.status === 'accepted' || p.status === 'rejected';
     var displaySpecies = p.consensus_species || p.species || 'Unknown';
-    var key = displaySpecies.toLowerCase() + '|' + (decided ? p.status : 'pending');
+    var key = asciiCaseFoldKey(displaySpecies) + '|' + (decided ? p.status : 'pending');
     var g = groupByKey[key];
     if (!g) {
       g = groupByKey[key] = {

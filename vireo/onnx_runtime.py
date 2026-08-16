@@ -7,11 +7,113 @@ image preprocessing, and common post-processing operations.
 import contextlib
 import logging
 import os
+import threading
+import weakref
+from collections import OrderedDict
 
 import numpy as np
 from PIL import Image
 
 log = logging.getLogger(__name__)
+
+_SESSION_THREADS_LOCK = threading.Lock()
+_SESSION_CPU_THREADS = weakref.WeakKeyDictionary()
+_SESSION_CPU_THREADS_FALLBACK = OrderedDict()
+_SESSION_CPU_THREADS_FALLBACK_LIMIT = 64
+
+
+@contextlib.contextmanager
+def acquire_session_cache_lock(lock, *, label="ONNX session cache"):
+    """Acquire a model-session cache lock with bound pause/cancel support.
+
+    The pre-acquire probe is pause-aware: a Pause request parks the caller
+    BEFORE any lock is taken, so no other pipeline is blocked while the
+    paused job waits for Resume. Once the lock is held, the post-acquire
+    recheck uses the pure-cancel probe instead — a Pause arriving in the
+    tiny window between lock acquisition and yield must NOT park the
+    holder inside ``wait_if_paused``, or every unpaused peer waiting on
+    the same DINO/detector/SAM/keypoint session cache would block until
+    Resume. Cancel still releases the lock and raises.
+    """
+    from resource_ledger import (
+        ResourceWaitCancelled,
+        get_resource_ledger,
+        resolve_resource_cancel_check,
+        resolve_resource_pure_cancel_check,
+    )
+
+    cancel_check = resolve_resource_cancel_check()
+    pure_cancel_check = resolve_resource_pure_cancel_check()
+    if cancel_check is not None and cancel_check():
+        raise ResourceWaitCancelled(f"Cancelled while waiting for {label}")
+
+    def _post_acquire_recheck():
+        """Return True to keep the lock; release + raise otherwise.
+
+        Uses the pure-cancel probe so a Pause pending between
+        ``lock.acquire()`` and this call does not park the holder. The
+        probe itself may raise (a bound pipeline probe can surface an
+        unrelated internal error). Either way — cancel returned True, or
+        the probe raised — the lock we just acquired must be released so
+        a cancelled/errored caller doesn't hold the cache mutex for the
+        duration of its unwind.
+        """
+        if pure_cancel_check is None:
+            return True
+        try:
+            cancelled = pure_cancel_check()
+        except BaseException:
+            lock.release()
+            raise
+        if cancelled:
+            lock.release()
+            raise ResourceWaitCancelled(
+                f"Cancelled while waiting for {label}",
+            )
+        return True
+
+    if lock.acquire(blocking=False):
+        # Symmetry with the timed-acquire branch below: a probe that
+        # raises must not leak the lock. The pre-acquire probe (above)
+        # only guards ENTRY; the same probe running after we own the
+        # lock is the release-safe path.
+        _post_acquire_recheck()
+        try:
+            yield
+        finally:
+            lock.release()
+        return
+
+    # Cache-lock contention is downstream of model construction, so expose it
+    # through the same per-job resource timing as the construction lease.
+    with get_resource_ledger().track_external_wait():
+        while True:
+            if cancel_check is not None and cancel_check():
+                raise ResourceWaitCancelled(
+                    f"Cancelled while waiting for {label}",
+                )
+            if lock.acquire(timeout=0.2):
+                # A release during the 0.2s acquire window can succeed
+                # while cancellation (or the interactive text-search
+                # deadline) has just fired. Without this recheck an
+                # already-cancelled eye-keypoint participant that woke
+                # here would kick off a fresh multi-hundred-megabyte
+                # download when the previous holder exited with only
+                # one file on disk. Release and raise so the cancel
+                # wins the race, matching the GPU-lease recheck in
+                # ``pipeline_locks._GpuLockContext``. ``_post_acquire_recheck``
+                # uses the PURE-cancel probe — a Pause arriving in this
+                # race window must NOT park the holder inside
+                # ``wait_if_paused`` or every unpaused peer waiting on
+                # the same model cache would block until Resume. It also
+                # releases the lock if the probe itself raises, keeping
+                # a bug in a bound probe from leaking the cache mutex.
+                _post_acquire_recheck()
+                break
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 # Substrings that identify onnxruntime load failures rooted in the file
@@ -167,11 +269,62 @@ def get_providers():
     return providers
 
 
-def create_session(model_path):
+def _remember_session_cpu_threads(session, threads):
+    """Associate an ONNX session with its enforceable CPU thread budget."""
+    threads = max(1, int(threads))
+    with contextlib.suppress(Exception):
+        # The Python InferenceSession wrapper normally accepts attributes.
+        # Keeping the value on the object lets top-level and package-qualified
+        # imports observe the same budget in mixed test/tooling environments.
+        session._vireo_cpu_threads = threads
+    with _SESSION_THREADS_LOCK:
+        try:
+            _SESSION_CPU_THREADS[session] = threads
+        except TypeError:
+            # Some extension-backed test doubles are not weak-referenceable.
+            # Retain the object with the value so an id reused after eviction
+            # can never inherit another session's budget. Keep this uncommon
+            # compatibility path bounded; production sessions use the weak map.
+            key = id(session)
+            _SESSION_CPU_THREADS_FALLBACK[key] = (session, threads)
+            _SESSION_CPU_THREADS_FALLBACK.move_to_end(key)
+            while (
+                len(_SESSION_CPU_THREADS_FALLBACK)
+                > _SESSION_CPU_THREADS_FALLBACK_LIMIT
+            ):
+                _SESSION_CPU_THREADS_FALLBACK.popitem(last=False)
+
+
+def session_cpu_threads(session, default=None):
+    """Return the configured CPU threads for ``session`` when known."""
+    with contextlib.suppress(Exception):
+        threads = int(session._vireo_cpu_threads)
+        if threads >= 1:
+            return threads
+    with _SESSION_THREADS_LOCK:
+        try:
+            threads = _SESSION_CPU_THREADS.get(session)
+        except TypeError:
+            threads = None
+        if threads is None:
+            key = id(session)
+            fallback = _SESSION_CPU_THREADS_FALLBACK.get(key)
+            if fallback is not None and fallback[0] is session:
+                _SESSION_CPU_THREADS_FALLBACK.move_to_end(key)
+                threads = fallback[1]
+            elif fallback is not None:
+                # Treat an id-keyed hit as advisory until identity is proven.
+                _SESSION_CPU_THREADS_FALLBACK.pop(key, None)
+    return threads if threads is not None else default
+
+
+def create_session(model_path, providers=None, *, cancel_check=None):
     """Create an ONNX Runtime InferenceSession with best available provider.
 
     Args:
         model_path: path to .onnx file
+        providers: optional explicit provider order. The default uses Vireo's
+            hardware selection; CPU-only models can force CPU execution.
 
     Returns:
         ort.InferenceSession
@@ -180,7 +333,7 @@ def create_session(model_path):
 
     import onnxruntime as ort
 
-    providers = get_providers()
+    providers = list(providers) if providers is not None else get_providers()
 
     # onnxruntime 1.24+ CoreMLExecutionProvider crashes when loading models
     # that use external data (.onnx.data sidecar files).  Fall back to the
@@ -195,8 +348,54 @@ def create_session(model_path):
                 model_path,
             )
 
-    log.info("Loading ONNX model: %s (providers: %s)", model_path, providers)
-    session = ort.InferenceSession(model_path, providers=providers)
+    from resource_ledger import (
+        ResourceRequest,
+        cpu_inference_request,
+        get_resource_ledger,
+    )
+
+    ledger = get_resource_ledger()
+    # The session's ONNX native pool is sized ONCE at construction and reused
+    # for every subsequent inference call, so its thread count must reflect
+    # the intended inference profile — not the transient construction-time
+    # grant. If we instead used ``lease.cpu_permits`` here, a construction
+    # request that landed while another CPU phase (e.g. a scan) held most of
+    # the budget would receive only its minimum grant, and the cached session
+    # would then be capped at that reduced count forever, throttling every
+    # inference call until the process restarts.
+    inference_profile = cpu_inference_request(ledger.cpu_capacity)
+    session_thread_count = inference_profile.preferred
+    # Require the construction lease to hold ``session_thread_count`` permits
+    # too. ONNX exercises its ``intra_op_num_threads`` pool during graph
+    # optimization and kernel prepacking, so a smaller construction grant
+    # would let those native threads exceed the process CPU budget for the
+    # duration of the load — precisely when the ledger is already tight.
+    # Waiting for the full inference budget is the right trade: model loads
+    # are rare and one-time, while oversubscribing the CPU during a
+    # contentious construction hurts every concurrent job.
+    cpu_request = inference_profile
+    request = ResourceRequest(
+        cpu=cpu_request,
+        lanes=("model_construction",),
+        label="ONNX model construction",
+    )
+    with ledger.acquire(request, cancel_check=cancel_check):
+        session_options = ort.SessionOptions()
+        session_options.intra_op_num_threads = session_thread_count
+        # Keep inter-op parallelism at one so ONNX cannot multiply the CPU
+        # grant by running several graph branches, each with its own intra-op
+        # pool.
+        session_options.inter_op_num_threads = 1
+        log.info(
+            "Loading ONNX model: %s (providers: %s, CPU threads: %d)",
+            model_path, providers, session_thread_count,
+        )
+        session = ort.InferenceSession(
+            model_path,
+            sess_options=session_options,
+            providers=providers,
+        )
+        _remember_session_cpu_threads(session, session_thread_count)
     actual = session.get_providers()
     log.info("ONNX session using: %s", actual)
     return session

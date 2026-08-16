@@ -22146,6 +22146,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             def cancel_check():
                 return runner.is_cancelled(job["id"])
 
+            def pause_check():
+                return runner.pause_requested(job["id"])
+
+            def cancel_only_check():
+                return runner.cancellation_requested(job["id"])
+
             vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
 
             # Per-root failures are caught and recorded rather than
@@ -22196,6 +22202,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         vireo_dir=vireo_dir,
                         thumb_cache_dir=app.config["THUMB_CACHE_DIR"],
                         cancel_check=cancel_check,
+                        pause_check=pause_check,
+                        cancel_only_check=cancel_only_check,
                         repair_missing_metadata=repair_missing_metadata,
                         counts=root_counts,
                     )
@@ -25328,6 +25336,34 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "phase": "Scanning photos",
                 })
 
+            # ``import-photos`` is a pausable job (registered as a
+            # pause participant by the runner). Without these probes
+            # the scan phase would keep hashing on its process pool
+            # and hold its CPU lease across the entire pause, ignoring
+            # the pause signal until the current source finishes.
+            # Same wiring the in-place import path picked up in
+            # 37e0e3a0 for the identical reason.
+            #
+            # ``runner.is_cancelled`` internally parks on Pause via
+            # ``wait_if_paused``. Wrap the parking call in
+            # ``suspend_resource_wait_timing`` so an hour-long pause
+            # while a scan is waiting for CPU permits does not persist
+            # as an hour of "resource contention" on the job's
+            # diagnostics. The context manager is a no-op when no
+            # ledger wait is active, so it's safe on non-pausable
+            # invocations too. Mirrors what ``_pause_checkpoint``
+            # does for pipeline participants (pipeline_job.py:1567).
+            def scan_cancel_check():
+                from resource_ledger import suspend_resource_wait_timing
+                with suspend_resource_wait_timing():
+                    return runner.is_cancelled(job["id"])
+
+            def scan_pause_check():
+                return runner.pause_requested(job["id"])
+
+            def scan_cancel_only_check():
+                return runner.cancellation_requested(job["id"])
+
             vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
             try:
                 # copy=false: scan_target is the source and restrict_dirs is
@@ -25344,6 +25380,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     vireo_dir=vireo_dir,
                     thumb_cache_dir=app.config["THUMB_CACHE_DIR"],
                     restrict_dirs=restrict_dirs,
+                    cancel_check=scan_cancel_check,
+                    pause_check=scan_pause_check,
+                    cancel_only_check=scan_cancel_only_check,
                 )
             finally:
                 # scanner.scan commits photo rows incrementally, so even a mid-scan
@@ -26681,6 +26720,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             def cancel_check():
                 return runner.is_cancelled(job["id"])
 
+            def pause_check():
+                return runner.pause_requested(job["id"])
+
+            def cancel_only_check():
+                return runner.cancellation_requested(job["id"])
+
             # Discover every source before processing any of them. Previously
             # each scan discovered its source just-in-time, so the UI called a
             # partial denominator "Overall" and then moved backward when the
@@ -26949,6 +26994,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         vireo_dir=vireo_dir,
                         thumb_cache_dir=thumb_cache_dir,
                         cancel_check=cancel_check,
+                        pause_check=pause_check,
+                        cancel_only_check=cancel_only_check,
                         # Pair companions during each scan, but defer RAW
                         # working-copy generation until every source has been
                         # cataloged. One combined pass gives the UI a truthful
@@ -28644,6 +28691,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     @app.route("/api/jobs")
     def api_jobs_list():
+        from resource_ledger import get_resource_ledger
+
         runner = app._job_runner
         db = _get_db()
         active = [_strip_heavy_for_list(j) for j in runner.list_jobs()]
@@ -28657,6 +28706,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # job runs (issue #1397). Surfacing it keeps that visible
             # rather than silent — see CORE_PHILOSOPHY "no black boxes".
             "keeping_awake": app._job_runner.sleep_blocker.active,
+            "resource_budget": get_resource_ledger().snapshot(),
             "active_workspace_id": db._active_workspace_id,
             "workspace_names": ws_names,
         })
@@ -29961,6 +30011,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
             from pipeline_locks import acquire_photo_mask
             from quality import compute_all_quality_features
+            from resource_ledger import ResourceWaitCancelled
 
             thread_db = Database(db_path)
             thread_db.set_active_workspace(active_ws)
@@ -30229,6 +30280,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     mask_file_stage = None
                     masked += 1
 
+                except ResourceWaitCancelled:
+                    # Job cancelled while waiting for the CPU inference
+                    # lease. Bail out of the loop immediately instead of
+                    # marking every remaining photo as a mask failure
+                    # (which would then reopen the source, preprocess it,
+                    # and hit the same cancellation on the next iteration).
+                    log.info(
+                        "extract-masks cancelled while waiting for inference resources",
+                    )
+                    break
                 except Exception:
                     failed += 1
                     log.warning(

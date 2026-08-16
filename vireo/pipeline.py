@@ -1930,6 +1930,8 @@ def detect_eye_keypoints_stage(
     folders = {f["id"]: f["path"] for f in db.get_folder_tree()}
     total = len(photos)
 
+    from resource_ledger import ResourceWaitCancelled
+
     aborted = False
     for i, row in enumerate(photos):
         if abort_check is not None and abort_check():
@@ -1939,6 +1941,21 @@ def detect_eye_keypoints_stage(
             _process_photo_for_eye(
                 db, row, folders, C=C, T=T, k_window=k_window,
             )
+        except ResourceWaitCancelled:
+            # The bound resource cancel probe fired while
+            # ``_process_photo_for_eye`` was waiting for its CPU lease
+            # (or its cache-lock guard). That is a cooperative
+            # cancellation, not a per-photo failure: inference never ran
+            # for this photo. Catching it as an ordinary exception below
+            # would inflate ``processed`` by one (line ~1949-1950) and
+            # — on the last photo — trigger the synthetic 100% emit
+            # before the outer loop's ``abort_check()`` for the next
+            # iteration observes the cancel. Treat it the same way an
+            # explicit ``abort_check`` hit would: mark aborted and
+            # unwind so the outer ``pipeline_job`` cancel-summary path
+            # takes over with an accurate processed count.
+            aborted = True
+            break
         except Exception:
             log.warning(
                 "Eye keypoint detection failed for photo %s", row["id"],

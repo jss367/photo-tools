@@ -1394,7 +1394,7 @@ def _duplicate_gate(state, batch_st, *, source_file, rel, checker, db,
 
 
 def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
-                              rel, attests_bytes):
+                              rel, attests_bytes, *, runner=None, job=None):
     """Run the restricted per-batch catalog scan for everything in
     ``batch_st.landed`` (fresh copies/transfers AND adoptions), capturing
     each landed path's pre-scan photo-row hash first so the caller's
@@ -1403,6 +1403,21 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
     batch_st.dest_read_cancelled:`` gate. Returns ``pre_scan_hashes``.
     On scan failure every landed entry is reclassified to failed and
     ``batch_st.landed`` is cleared.
+
+    ``runner`` and ``job``, when supplied, wire the job's PAUSE probe
+    into the per-batch ``scan()`` call so a Pause on a pausable import
+    (``/api/jobs/import-photos``) unwinds the scanner's process pool
+    and drops its CPU lease at the pause checkpoint instead of holding
+    permits until the batch finishes.
+
+    Deliberately does NOT wire a cancel probe: the caller's contract
+    (run_import_job comment at ~lines 4422-4425) is that this scan is
+    the preservation catalog for what already landed on disk, and it
+    must run to completion even after Stop so those files reach a
+    valid catalog state. Passing a cancel_check that already-fired
+    would let ``scan()`` raise ``ScanCancelled`` and the surrounding
+    handler would reclassify every landed entry as failed even though
+    the bytes remain on disk uncataloged.
     """
     # ``landed`` covers collision-loop adoptions too (origin
     # "skipped_duplicate"), so their photo rows get created by the
@@ -1462,14 +1477,72 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
         # the row. ``restrict_files`` already narrows these batches
         # to a handful of paths, so incremental buys nothing here
         # anyway. See PR #1398 review.
-        scan(
-            destination, db,
-            restrict_dirs=[batch_st.dest_folder],
-            restrict_files=landed_paths,
-            vireo_dir=params.vireo_dir,
-            thumb_cache_dir=params.thumb_cache_dir,
-            skip_working_copies=True,
-        )
+        # Deliberately no cancel_check: the caller's contract is that
+        # this scan runs to completion even after Stop so already-landed
+        # files reach a valid catalog state (run_import_job comment at
+        # ~lines 4422-4425). Passing an already-fired probe would let
+        # ``scan()`` raise ``ScanCancelled``, and the surrounding
+        # handler would reclassify every landed entry as failed while
+        # the bytes remain on disk uncataloged.
+        #
+        # Simply omitting ``cancel_check`` is not enough: ``JobRunner``
+        # binds ``cancellation_requested`` as the process-wide resource
+        # cancel probe, so scanner's ``_claim_worker_count`` still
+        # resolves that probe through ``ResourceLedger.acquire`` and
+        # raises ``ResourceWaitCancelled`` even when permits are
+        # immediately available. Suppress the binding just for this
+        # scan by re-binding to ``None`` — same shape as classify_job's
+        # preservation pass in 4be1fa9b / ccd44bc4. ``JobRunner`` still
+        # owns hard shutdown via its own deadline. The pause probe is
+        # kept, so a user Pause still unwinds the scan pool cleanly.
+        #
+        # ``cancel_check`` is set to a parking callback rather than
+        # ``None`` so the job actually transitions to ``paused`` when a
+        # user pauses mid-scan. ``pause_check`` alone is non-blocking:
+        # scanner releases its pool and then polls ``pause_check``
+        # every 50 ms, leaving the job stuck in ``pausing``. The
+        # parking callback invokes ``wait_if_paused(publish_paused=True)``
+        # to park AND publish the paused status, then returns ``False``
+        # unconditionally — the parking side-effect matters, the
+        # ``cancelled`` return value must be ignored to keep the
+        # preservation contract intact.
+        from resource_ledger import bind_resource_cancel_check
+        scan_pause_check = None
+        scan_park_only_check = None
+        if runner is not None and job is not None:
+            job_id = job["id"]
+
+            def scan_pause_check():
+                return runner.pause_requested(job_id)
+
+            def scan_park_only_check():
+                # Park via wait_if_paused so the job publishes ``paused``
+                # while the scanner is safely at its pause checkpoint.
+                # Discard the cancellation return value — the preservation
+                # contract requires this scan to run to completion.
+                runner.wait_if_paused(job_id, publish_paused=True)
+                return False
+        with bind_resource_cancel_check(None):
+            scan(
+                destination, db,
+                restrict_dirs=[batch_st.dest_folder],
+                restrict_files=landed_paths,
+                vireo_dir=params.vireo_dir,
+                thumb_cache_dir=params.thumb_cache_dir,
+                skip_working_copies=True,
+                cancel_check=scan_park_only_check,
+                pause_check=scan_pause_check,
+                # Preservation contract: this scan runs to completion
+                # regardless of cancel. Passing an always-False pure
+                # cancel probe lets the scanner use ``_check_cancelled_no_park``
+                # inside ``_claim_worker_count`` — without it a Pause
+                # arriving in the race window between the pause probe
+                # and the parking ``scan_park_only_check`` would park
+                # ``wait_if_paused`` while the hashing pool and CPU
+                # permits are still held, blocking unrelated work
+                # until Resume.
+                cancel_only_check=lambda: False,
+            )
     except Exception as e:  # scan failure fails the whole batch
         # Each entry was already booked into copied or
         # skipped_duplicate — reclassify (roll back origin, add
@@ -4411,7 +4484,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         if batch_st.landed and not batch_st.dest_read_cancelled:
             pre_scan_hashes = _catalog_scan_and_prescan(
                 state, batch_st, db, params, scan, destination, rel,
-                attests_bytes,
+                attests_bytes, runner=runner, job=job,
             )
 
             # RAW rows whose derived caches need invalidation because a

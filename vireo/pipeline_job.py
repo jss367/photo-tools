@@ -54,6 +54,13 @@ from render_source import (
 from render_source import (
     working_copy_path_if_satisfies as _working_copy_path_if_satisfies,
 )
+from resource_ledger import (
+    ResourceWaitCancelled,
+    bind_resource_cancel_check,
+    bind_resource_owner,
+    bind_resource_pure_cancel_check,
+    suspend_resource_wait_timing,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1562,7 +1569,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
         participant = getattr(pause_context, "participant", None)
         if participant is None:
             return _cancellation_requested()
-        cancelled = pause_gate.checkpoint(participant)
+        # checkpoint() performs its own pause test. Suspend around the whole
+        # call so a pause arriving between two separate probes cannot park a
+        # resource waiter while its contention clock is still running. When
+        # there is no pause, this excludes only the negligible probe itself.
+        with suspend_resource_wait_timing():
+            cancelled = pause_gate.checkpoint(participant)
         if cancelled:
             abort.set()
         return cancelled
@@ -1585,13 +1597,44 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             abort_event.set()
         return globals()["_should_abort"](abort_event)
 
+    def _pause_or_cancel_pending():
+        """Non-parking pause/cancel probe for ledger waits held under a lock.
+
+        The bound ``_pause_checkpoint`` probe parks on pause, so a resource
+        wait launched from a critical section (e.g. inside
+        ``acquire_photo_mask``) would keep that lock held for the entire
+        pause. Swap this probe in around such critical sections and the
+        ledger raises ``ResourceWaitCancelled`` instead, unwinding out of
+        the lock so the outer stage can park at a safe boundary.
+        """
+        probe = getattr(runner, "pause_requested", None)
+        if probe is not None and probe(job["id"]):
+            return True
+        return _cancellation_requested()
+
     def _run_pause_participant(participant, work_fn, *, pre_registered=False):
         if not pre_registered:
             pause_gate.register(participant)
         pause_context.participant = participant
         try:
-            _pause_checkpoint()
-            return work_fn()
+            # Context variables do not propagate into Python threads. Bind
+            # each pipeline participant explicitly so scanner/model waits are
+            # attributed to the parent job's diagnostics, and so ledger waits
+            # (including CPU inference on the ``cpu_ml`` lane) wake promptly
+            # on cancellation or park promptly on pause instead of blocking
+            # until the current holder releases. The pure-cancel probe is
+            # bound alongside the pause-aware one so ``acquire_session_cache_lock``
+            # can release on cancel without parking the lock holder inside
+            # ``wait_if_paused`` — that would keep every unpaused peer
+            # waiting on the same DINO/detector/SAM/keypoint model until
+            # Resume.
+            with (
+                bind_resource_owner(job["id"]),
+                bind_resource_cancel_check(_pause_checkpoint),
+                bind_resource_pure_cancel_check(_cancellation_requested),
+            ):
+                _pause_checkpoint()
+                return work_fn()
         finally:
             pause_context.participant = None
             pause_gate.unregister(participant)
@@ -1955,6 +1998,17 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 def cancel_check():
                     return _should_abort(abort) or _cancellation_requested()
 
+                def scan_pause_check():
+                    # Non-blocking pause probe for scanner.scan. When the
+                    # pipeline is about to pause, this returns True *before*
+                    # ``cancel_check`` parks — giving the scanner a chance to
+                    # terminate its worker processes and release its CPU
+                    # permits back to the ledger, so replacement scans,
+                    # model loads, and CPU inference aren't starved for the
+                    # duration of the pause.
+                    probe = getattr(runner, "pause_requested", None)
+                    return bool(probe and probe(job["id"]))
+
                 # Accumulator so multi-folder scans (repair loop, scan-in-place
                 # with sources=[...]) don't rewind the overall progress at each
                 # folder boundary. scan() reports (current, total) local to the
@@ -2073,6 +2127,8 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 vireo_dir=effective_vireo_dir,
                                 thumb_cache_dir=effective_thumb_cache_dir,
                                 cancel_check=cancel_check,
+                                pause_check=scan_pause_check,
+                                cancel_only_check=_cancellation_requested,
                                 register_restrict_dirs_as_roots=False,
                                 allow_photo_inserts=False,
                             )
@@ -2948,6 +3004,8 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         thumb_cache_dir=effective_thumb_cache_dir,
                         permission_error_callback=_on_denied,
                         cancel_check=cancel_check,
+                        pause_check=scan_pause_check,
+                        cancel_only_check=_cancellation_requested,
                     )
                 else:
                     # Scan-in-place: scan each source folder independently.
@@ -3017,6 +3075,8 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 thumb_cache_dir=effective_thumb_cache_dir,
                                 permission_error_callback=_on_denied,
                                 cancel_check=cancel_check,
+                                pause_check=scan_pause_check,
+                                cancel_only_check=_cancellation_requested,
                             )
                         finally:
                             advance_scan_acc()
@@ -4004,8 +4064,25 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     class ClassificationCancelled(RuntimeError):
                         pass
 
+                # Non-parking cancel probe: this factory runs under
+                # ``ModelCache.entry.load_lock`` (see ``model_cache.acquire``),
+                # and ``Classifier._compute_embeddings_with_progress`` invokes
+                # this callback between labels while custom-label embeddings
+                # are being computed. A parking probe here would call
+                # ``_pause_checkpoint`` and block on ``wait_if_paused`` while
+                # the shared load_lock is still held, so any unpaused peer
+                # waiting on the same cache entry would stay blocked until
+                # Resume (Codex discussion_r3791005913 — sibling of the
+                # resource-probe rebinding in ``model_cache.py``, which only
+                # covers the bound resource cancel probe, not this explicit
+                # captured callback). Cancel still fires; pause is honored at
+                # the next outer ``_pause_checkpoint`` after ``load_lock`` is
+                # released.
                 def cancel_check():
-                    return _should_abort(abort) or _cancellation_requested()
+                    return (
+                        _should_abort_without_pause(abort)
+                        or _cancellation_requested()
+                    )
 
                 if model_type == "timm":
                     if cancel_check():
@@ -6821,7 +6898,14 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     _weights_ensured[0] = True
 
                 processed = 0
-                for i, entry in enumerate(photos_to_process):
+                # ``while`` (not ``for``) so a pause that arrives mid-photo
+                # can unwind the per-photo mask lock and retry the SAME
+                # index after resume without holding the lock across the
+                # entire pause. See the pause-unwind branch of the
+                # ``except ResourceWaitCancelled`` handler below.
+                i = 0
+                while i < len(photos_to_process):
+                    entry = photos_to_process[i]
                     if _should_abort(abort):
                         break
 
@@ -6858,7 +6942,18 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         # so the cross-variant collision in (2) is covered.
                         # Workspace isn't part of the key because photos are
                         # global in Vireo.
-                        with acquire_photo_mask(photo_id):
+                        #
+                        # ``bind_resource_cancel_check(_pause_or_cancel_pending)``
+                        # swaps the outer parking pause probe for a
+                        # non-parking one for the duration of this lock:
+                        # a pause requested while the SAM/DINOv2 inference
+                        # lease is contended raises ``ResourceWaitCancelled``
+                        # here instead of parking beneath the photo lock.
+                        # An unrelated unpaused pipeline reaching the same
+                        # photo would otherwise block for the entire pause.
+                        with bind_resource_cancel_check(
+                            _pause_or_cancel_pending,
+                        ), acquire_photo_mask(photo_id):
                             # Cache hit: a row already exists for (photo, variant)
                             # AND its stored prompt + detector still match the
                             # current primary detection AND the file is on disk.
@@ -6911,6 +7006,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                             == dinov2_variant):
                                         masked += 1
                                         processed = i + 1
+                                        i += 1
                                         continue
 
                             # Past the cache check, so this photo genuinely
@@ -6936,6 +7032,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     },
                                     error_count=em_failed + em_unreadable,
                                 )
+                                i += 1
                                 continue
 
                             # First true cache miss: ensure SAM2 + DINOv2 weights
@@ -6974,8 +7071,10 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         photo["folder_id"],
                                     )
                                     processed = i + 1
+                                    i += 1
                                     continue
                                 processed = i + 1
+                                i += 1
                                 continue
                             if _should_abort_without_pause(abort):
                                 break
@@ -6990,6 +7089,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             if mask is None:
                                 skipped += 1
                                 processed = i + 1
+                                i += 1
                                 continue
                             if _should_abort_without_pause(abort):
                                 break
@@ -7090,6 +7190,20 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             mask_file_stage.finish()
                             mask_file_stage = None
                             masked += 1
+                    except ResourceWaitCancelled:
+                        # The bound non-parking probe raised this because a
+                        # pause OR cancellation is pending. The per-photo
+                        # mask lock has already been released by exiting
+                        # the ``with`` above. If cancellation is what fired,
+                        # propagate to end the stage; otherwise park at a
+                        # safe outer boundary (no locks held) and retry the
+                        # same photo after resume — do NOT advance ``i``.
+                        if _cancellation_requested():
+                            raise
+                        _pause_checkpoint()
+                        if _cancellation_requested():
+                            raise
+                        continue
                     except Exception:
                         em_failed += 1
                         log.warning("Mask extraction failed for photo %s", photo_id, exc_info=True)
@@ -7115,6 +7229,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         "Extracting features (SAM2 + DINOv2)",
                         rate=round(processed / max(time.time() - start_time, 0.01) * 60, 1),
                     )
+                    i += 1
 
                 if _should_abort(abort):
                     # Distinguish a user cancel from a clean completion: pin a
@@ -7249,6 +7364,38 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         "total": em_total_candidates,
                         "subthreshold": photos_subthreshold_only,
                     }
+            except ResourceWaitCancelled:
+                # A cancelled resource wait is a cooperative stage cancel,
+                # not a mask-processing failure. Mirror the normal abort
+                # finalizer above because this exception exits the per-photo
+                # loop before that branch is reached.
+                abort.set()
+                stages["extract_masks"]["status"] = "completed"
+                runner.update_step(
+                    job["id"], "extract_masks", status="completed",
+                    progress={"current": processed, "total": total},
+                    summary=(
+                        f"Cancelled ({processed} of {total} processed)"
+                        if total else "Cancelled"
+                    ),
+                    error_count=(
+                        em_failed + em_unreadable
+                        + em_preflight_unreadable
+                    ),
+                )
+                result["stages"]["extract_masks"] = {
+                    "masked": masked + em_preflight_masked,
+                    "skipped": skipped,
+                    "failed": em_failed,
+                    "unreadable": (
+                        em_unreadable + em_preflight_unreadable
+                    ),
+                    "total": (
+                        total + em_preflight_unreadable
+                        + em_preflight_masked
+                    ),
+                    "cancelled": True,
+                }
             except Exception as e:
                 errors.append(f"[extract_masks] Fatal: {e}")
                 log.exception("Pipeline extract-masks stage failed")
@@ -7512,6 +7659,31 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 kp.ensure_keypoint_weights(
                                     kp_model, progress_callback=_dl_progress,
                                 )
+                    except ResourceWaitCancelled:
+                        # A cancel or pause that fires while another thread
+                        # holds the per-model download lock surfaces here
+                        # as ResourceWaitCancelled from
+                        # ``acquire_session_cache_lock`` — that is a
+                        # cooperative cancel, not a download failure.
+                        # Finalize the stage as cancelled the same way the
+                        # extract_masks path handles its own
+                        # ResourceWaitCancelled (line ~7293) so the job
+                        # tree does not report "failed to download
+                        # keypoint weights" for what was actually a user
+                        # cancel.
+                        abort.set()
+                        stages["eye_keypoints"]["status"] = "completed"
+                        runner.update_step(
+                            job["id"], "eye_keypoints",
+                            status="completed",
+                            summary="Cancelled",
+                        )
+                        result["stages"]["eye_keypoints"] = {
+                            "processed": 0, "total": total,
+                            "cancelled": True,
+                        }
+                        _update_stages(runner, job["id"], stages)
+                        return
                     except Exception as dl_err:
                         log.warning(
                             "Eye keypoints stage skipped — weight download "
@@ -7570,6 +7742,32 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     result["stages"]["eye_keypoints"] = {
                         "processed": processed["count"], "total": total,
                     }
+            except ResourceWaitCancelled:
+                # ``detect_eye_keypoints_stage`` catches ``ResourceWaitCancelled``
+                # per-photo in ``pipeline.py`` today, so this outer handler is
+                # currently unreachable from the per-photo inference path. Keep
+                # it as defense-in-depth: a future regression in that inner
+                # handler — or a fresh call site inside this outer ``try``
+                # (e.g. a cache-lock guard reached before the download loop) —
+                # would otherwise get caught below as ``Exception`` and be
+                # recorded as "[eye_keypoints] Fatal", inflating the failure
+                # count for what was actually a cooperative cancel. Mirror the
+                # ``extract_masks`` handler at line ~7293 so the summary lines
+                # up with the other stages' cancel outcomes.
+                abort.set()
+                stages["eye_keypoints"]["status"] = "completed"
+                summary = (
+                    f"Cancelled ({processed['count']} of {total} processed)"
+                    if total else "Cancelled"
+                )
+                runner.update_step(
+                    job["id"], "eye_keypoints",
+                    status="completed", summary=summary,
+                )
+                result["stages"]["eye_keypoints"] = {
+                    "processed": processed["count"], "total": total,
+                    "cancelled": True,
+                }
             except Exception as e:
                 errors.append(f"[eye_keypoints] Fatal: {e}")
                 log.exception("Pipeline eye-keypoints stage failed")

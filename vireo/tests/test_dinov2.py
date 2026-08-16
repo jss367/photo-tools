@@ -197,6 +197,62 @@ def test_concurrent_first_load_creates_only_one_session(tmp_path):
     dino_embed._variant_loaded = None
 
 
+def test_get_session_passes_pure_cancel_probe_to_create_session(tmp_path):
+    """Regression: ``create_session`` inside ``_get_dinov2_session``
+    runs while ``_dinov2_session_lock`` is still held via
+    ``acquire_session_cache_lock``. Without the pure cancel probe,
+    the pause-aware probe would run inside ``ledger.acquire`` and
+    park ``wait_if_paused`` while the session-cache lock is retained
+    — blocking every unpaused peer waiting on DINOv2 until Resume.
+
+    Assert: ``create_session`` is called with the pure probe (a
+    non-parking callable). The default of
+    ``resolve_resource_pure_cancel_check`` when no pure probe is
+    bound is to fall back to the pause-aware probe (or None if
+    neither is bound), so this test binds a pure probe explicitly
+    and asserts it was forwarded.
+    """
+    import dino_embed
+    import resource_ledger
+
+    dino_embed._session = None
+    dino_embed._variant_loaded = None
+
+    model_dir = tmp_path / ".vireo" / "models" / "dinov2-vit-b14"
+    model_dir.mkdir(parents=True)
+    model_path = model_dir / "model.onnx"
+    model_path.write_bytes(b"fake")
+
+    def sentinel_probe():
+        return False
+
+    captured = {"cancel_check": "unset"}
+
+    def capturing_create(_path, **kwargs):
+        captured["cancel_check"] = kwargs.get("cancel_check", "unset")
+        return MagicMock()
+
+    try:
+        with patch("os.path.expanduser", return_value=str(tmp_path)), patch(
+            "dino_embed.onnx_runtime.create_session",
+            side_effect=capturing_create,
+        ):
+            with resource_ledger.bind_resource_pure_cancel_check(
+                sentinel_probe,
+            ):
+                dino_embed._get_dinov2_session("vit-b14")
+
+        assert captured["cancel_check"] is sentinel_probe, (
+            f"``_get_dinov2_session`` must forward the bound pure cancel "
+            f"probe to ``create_session`` so ``ledger.acquire`` cannot "
+            f"park under the retained ``_dinov2_session_lock``. Got "
+            f"cancel_check={captured['cancel_check']!r}."
+        )
+    finally:
+        dino_embed._session = None
+        dino_embed._variant_loaded = None
+
+
 # -- Preprocessing --
 
 

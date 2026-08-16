@@ -172,9 +172,167 @@ def test_concurrent_acquire_from_multiple_threads_only_loads_once():
     assert values == ["loaded", "loaded"]
 
 
-def test_cancelled_load_waiter_retries_instead_of_inheriting_cancel():
-    from classifier import ClassificationCancelled
+def test_contended_cold_load_wait_records_owner_timing():
+    """Regression: when two jobs cold-load the same key concurrently,
+    the second thread waits on the producer's ``load_lock`` — which can
+    take minutes for a BioCLIP / SAM2 / DINOv2 cold construction, and
+    even longer if the producer is itself blocked on the ONNX
+    construction lease. Prior to this fix that wait bypassed the
+    resource ledger entirely: the waiter's ``owner_timing`` still
+    reported zero waits even though the job was resource-blocked for
+    the whole load, so the per-job live and persisted resource-wait
+    diagnostics under-reported reality. This asserts the contended
+    wait shows up as an external wait in ``owner_timing``.
 
+    Uncontended fast path is covered by
+    ``test_uncontended_load_does_not_record_owner_timing`` — an
+    unconditional wrap would also inflate wait_count on every cache
+    hit (per-photo detection/masking runs), so the uncontended branch
+    must NOT touch the ledger.
+    """
+    import resource_ledger
+
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        cache = ModelCache(idle_secs=60)
+        load_started = threading.Event()
+        release_load = threading.Event()
+
+        def slow_factory():
+            load_started.set()
+            release_load.wait(timeout=2.0)
+            return "loaded"
+
+        producer_done = threading.Event()
+
+        def producer():
+            try:
+                with cache.acquire("k", slow_factory):
+                    pass
+            finally:
+                producer_done.set()
+
+        waiter_done = threading.Event()
+
+        def waiter():
+            with resource_ledger.bind_resource_owner("waiter-job"):
+                try:
+                    with cache.acquire(
+                        "k",
+                        lambda: pytest.fail(
+                            "waiter must not run the factory — producer's "
+                            "value is what it should receive",
+                        ),
+                    ) as value:
+                        assert value == "loaded"
+                finally:
+                    waiter_done.set()
+
+        tp = threading.Thread(target=producer)
+        tp.start()
+        assert load_started.wait(timeout=1.0)
+
+        tw = threading.Thread(target=waiter)
+        tw.start()
+        # Give the waiter time to attempt the non-blocking acquire, fail,
+        # and enter the tracked-wait branch (blocking acquire on
+        # load_lock). Then release the producer so the waiter unblocks.
+        time.sleep(0.15)
+        release_load.set()
+
+        assert producer_done.wait(timeout=2.0)
+        assert waiter_done.wait(timeout=2.0)
+        tp.join(timeout=1.0)
+        tw.join(timeout=1.0)
+        assert not tp.is_alive()
+        assert not tw.is_alive()
+
+        # The waiter's contended wait must show up in owner_timing.
+        # Under the pre-fix behavior wait_count is 0 and wait_seconds is
+        # 0.0 because the load_lock.acquire() call bypassed the ledger.
+        waiter_timing = ledger.owner_timing("waiter-job")
+        assert waiter_timing["wait_count"] >= 1, (
+            f"Contended ModelCache wait must record at least one wait; got "
+            f"wait_count={waiter_timing['wait_count']}. Without this the "
+            f"per-job resource-wait diagnostics under-report the time the "
+            f"waiter spent blocked on the producer's factory."
+        )
+        assert waiter_timing["wait_seconds"] > 0.0, (
+            f"Contended ModelCache wait must record positive wait_seconds; "
+            f"got {waiter_timing['wait_seconds']}. A minute-long BioCLIP "
+            f"cold load would otherwise show zero blocked time on the "
+            f"waiter's job."
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
+def test_uncontended_load_does_not_record_owner_timing():
+    """The uncontended fast path (nobody else holds ``load_lock``) must
+    NOT touch the resource ledger: an unconditional wrap would inflate
+    ``wait_count`` on every cache HIT — per-photo detection/masking
+    runs would then show hundreds of zero-duration waits per job, which
+    is meaningless noise in the diagnostics panel.
+
+    The pattern mirrors ``onnx_runtime.acquire_session_cache_lock``,
+    which also gates its ledger interaction on non-blocking acquire
+    failing first.
+    """
+    import resource_ledger
+
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        cache = ModelCache(idle_secs=60)
+
+        with resource_ledger.bind_resource_owner("owner-job"):
+            # First (miss) acquire is uncontended.
+            with cache.acquire("k", lambda: "v"):
+                pass
+            # Subsequent hits: still uncontended (nobody else is inside).
+            for _ in range(3):
+                with cache.acquire("k", lambda: "v"):
+                    pass
+
+        timing = ledger.owner_timing("owner-job")
+        assert timing["wait_count"] == 0, (
+            f"Uncontended ModelCache acquires must NOT record any wait; "
+            f"got wait_count={timing['wait_count']}. An unconditional "
+            f"track_external_wait wrap would flood diagnostics with "
+            f"zero-duration entries on every cache hit."
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
+def _cancellation_exception_classes():
+    """Return every exception class ModelCache must treat as caller-local.
+
+    Both a ``ClassificationCancelled`` (job-level abort) and a
+    ``ResourceWaitCancelled`` (ledger probe fired for the producer only)
+    must NOT poison a sibling waiter — that waiter should retry against a
+    fresh entry. Parameterizing over both classes keeps one test body
+    and prevents the two identical shapes from drifting.
+    """
+    from classifier import ClassificationCancelled
+    from resource_ledger import ResourceWaitCancelled
+
+    return [ClassificationCancelled, ResourceWaitCancelled]
+
+
+@pytest.mark.parametrize("exc_class", _cancellation_exception_classes())
+def test_cancelled_load_waiter_retries_instead_of_inheriting_cancel(exc_class):
+    """A caller-local cancel from the producer must not poison an
+    uncancelled waiter: the waiter retries against a fresh entry and runs
+    its own factory rather than rethrowing the producer's exception.
+
+    Covers both cancellation shapes ModelCache must translate to a
+    caller-local retry — job-level ``ClassificationCancelled`` and the
+    ledger-level ``ResourceWaitCancelled`` raised when the producer's
+    ONNX construction lease was cancelled while a sibling job was
+    already waiting on the same cache entry.
+    """
     cache = ModelCache(idle_secs=60)
     load_started = threading.Event()
     release_cancel = threading.Event()
@@ -184,14 +342,14 @@ def test_cancelled_load_waiter_retries_instead_of_inheriting_cancel():
     def cancelled_factory():
         load_started.set()
         release_cancel.wait(timeout=2.0)
-        raise ClassificationCancelled("classification cancelled")
+        raise exc_class("producer cancelled")
 
     def good_factory():
         good_factory_called.set()
         return "ok"
 
     def cancelled_loader():
-        with pytest.raises(ClassificationCancelled):
+        with pytest.raises(exc_class):
             with cache.acquire("k", cancelled_factory):
                 pass
 
@@ -213,8 +371,14 @@ def test_cancelled_load_waiter_retries_instead_of_inheriting_cancel():
 
     assert not ta.is_alive()
     assert not tb.is_alive()
-    assert good_factory_called.is_set()
-    assert values == ["ok"]
+    assert good_factory_called.is_set(), (
+        "The healthy waiter must retry against a fresh entry — its factory "
+        f"should have run after the producer's {exc_class.__name__} surfaced."
+    )
+    assert values == ["ok"], (
+        "The healthy waiter must have received the value from its own retry "
+        f"factory, not inherited the producer's {exc_class.__name__}."
+    )
 
 
 def test_waiter_cancel_check_unblocks_while_producer_still_loading():
@@ -554,3 +718,84 @@ def test_post_load_key_exception_keeps_entry_under_original_key(caplog):
     assert cache._has_entry("k")
     assert any("post_load_key callback raised" in r.message
                for r in caplog.records)
+
+
+def test_factory_uses_pure_cancel_probe_when_bound():
+    """Factory must see the pure-cancel probe, not the pause-parking one.
+
+    Regression for Codex discussion_r3790941020 — sibling of the
+    session-cache-lock-across-pause fix in commit e3693467. Previously
+    ``factory()`` ran under the pipeline's pause-aware cancel probe;
+    that probe parks on pause via ``_pause_checkpoint`` while
+    ``entry.load_lock`` is still owned by this thread, blocking any
+    unpaused peer waiting on the same cache key for the entire pause
+    window. ModelCache.acquire now rebinds the resource cancel check to
+    the pure-cancel probe (never parks) around the factory call,
+    matching what ``acquire_session_cache_lock`` does for its post-
+    acquire recheck.
+    """
+    from resource_ledger import (
+        bind_resource_cancel_check,
+        bind_resource_pure_cancel_check,
+        resolve_resource_cancel_check,
+    )
+
+    seen = {}
+
+    def parking_probe():  # pragma: no cover - must NEVER run under factory
+        seen["parking_called"] = True
+        return False
+
+    def pure_probe():
+        seen["pure_called"] = True
+        return False
+
+    cache = ModelCache(idle_secs=60)
+
+    def factory():
+        # Whatever the factory (or ``create_session`` inside it) resolves
+        # as the current probe MUST be the pure one — parking here would
+        # keep entry.load_lock held across pause.
+        seen["probe_in_factory"] = resolve_resource_cancel_check()
+        return "value"
+
+    with (
+        bind_resource_cancel_check(parking_probe),
+        bind_resource_pure_cancel_check(pure_probe),
+    ):
+        with cache.acquire("k", factory) as v:
+            assert v == "value"
+
+    assert seen["probe_in_factory"] is pure_probe
+    assert "parking_called" not in seen
+
+
+def test_factory_falls_back_to_pause_aware_probe_when_no_pure_bound():
+    """Callers without a bound pure probe keep the existing behavior.
+
+    Not every entry point sets up a pipeline participant (tests, standalone
+    scripts, one-shot CLIs). Those must keep whatever probe the caller
+    established rather than losing cancel semantics entirely.
+    """
+    from resource_ledger import (
+        bind_resource_cancel_check,
+        resolve_resource_cancel_check,
+    )
+
+    def parking_probe():
+        return False
+
+    cache = ModelCache(idle_secs=60)
+    seen = {}
+
+    def factory():
+        seen["probe_in_factory"] = resolve_resource_cancel_check()
+        return "value"
+
+    with bind_resource_cancel_check(parking_probe):
+        with cache.acquire("k", factory) as v:
+            assert v == "value"
+
+    # No pure probe bound → resolve_resource_pure_cancel_check falls back
+    # to the pause-aware probe, so the rebind is a no-op preserving it.
+    assert seen["probe_in_factory"] is parking_probe

@@ -13,6 +13,7 @@ import threading
 import numpy as np
 import onnx_runtime
 from PIL import Image, ImageFilter
+from resource_ledger import ResourceWaitCancelled
 
 log = logging.getLogger(__name__)
 
@@ -187,7 +188,10 @@ def _get_sam2_sessions(variant="sam2-small"):
     # otherwise race on the global session assignment, leaving the trio in an
     # inconsistent state where _sam2_variant_loaded says one thing but the
     # sessions belong to another variant.
-    with _sam2_session_lock:
+    with onnx_runtime.acquire_session_cache_lock(
+        _sam2_session_lock,
+        label="SAM2 session cache",
+    ):
         if (
             _encoder_session is not None
             and _decoder_session is not None
@@ -219,8 +223,18 @@ def _get_sam2_sessions(variant="sam2-small"):
             )
 
         log.info("Loading SAM2 ONNX (%s)...", variant)
-        enc_sess = onnx_runtime.create_session(encoder_path)
-        dec_sess = onnx_runtime.create_session(decoder_path)
+        # Pure cancel probe: ``create_session``'s ledger.acquire runs
+        # while ``_sam2_session_lock`` is still held; the pause-aware
+        # probe would park ``wait_if_paused`` under the cache lock and
+        # block every unpaused peer waiting on SAM2 until Resume.
+        from resource_ledger import resolve_resource_pure_cancel_check
+        pure_probe = resolve_resource_pure_cancel_check()
+        enc_sess = onnx_runtime.create_session(
+            encoder_path, cancel_check=pure_probe,
+        )
+        dec_sess = onnx_runtime.create_session(
+            decoder_path, cancel_check=pure_probe,
+        )
 
         _encoder_session = enc_sess
         _decoder_session = dec_sess
@@ -259,13 +273,12 @@ def generate_mask(image, detection_box, variant="sam2-small"):
             std=_IMAGENET_STD,
         )
 
-        # GPU serialisation across concurrent pipelines, scoped tightly
-        # to the encoder forward pass — preprocessing above and
-        # postprocessing/decoder setup below run without holding the
-        # semaphore so another pipeline's GPU op can interleave.
-        from pipeline_locks import acquire_gpu
+        # Provider-aware inference coordination is scoped tightly to the
+        # encoder forward pass. Preprocessing above and decoder setup below
+        # run without holding CPU or accelerator inference resources.
+        from pipeline_locks import acquire_inference_resources
         enc_input_name = encoder_session.get_inputs()[0].name
-        with acquire_gpu():
+        with acquire_inference_resources(encoder_session):
             enc_outputs = encoder_session.run(None, {enc_input_name: input_tensor})
         image_embeddings = enc_outputs[0]  # (1, C, H', W')
         # Encoder also outputs high-res FPN features for the mask decoder
@@ -316,7 +329,7 @@ def generate_mask(image, detection_box, variant="sam2-small"):
             if name in input_map:
                 decoder_inputs[name] = input_map[name]
 
-        with acquire_gpu():
+        with acquire_inference_resources(decoder_session):
             dec_outputs = decoder_session.run(None, decoder_inputs)
         # Outputs: masks (1, N, H, W) and scores (1, N)
         masks = dec_outputs[0]  # (1, N, H, W)
@@ -339,6 +352,13 @@ def generate_mask(image, detection_box, variant="sam2-small"):
             best_mask = np.array(mask_img) > 127
 
         return best_mask.astype(bool)
+    except ResourceWaitCancelled:
+        # Cooperative cancellation while waiting for the CPU inference
+        # lease is not a mask failure — swallowing it would let the
+        # extract-masks loop keep loading and preprocessing every
+        # remaining image before the next cancellation checkpoint,
+        # substantially delaying JobRunner.shutdown().
+        raise
     except Exception:
         log.warning("SAM2 mask generation failed", exc_info=True)
         return None

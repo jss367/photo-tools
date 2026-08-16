@@ -515,3 +515,32 @@ def test_detect_animals_skips_gpu_lock_for_cpu_only_session(monkeypatch, tmp_pat
     assert snapshots["during_run"] == baseline, (
         "CPU-only detector session must not take the GPU semaphore"
     )
+
+
+def test_detect_animals_propagates_resource_wait_cancellation(monkeypatch, tmp_path):
+    """Resource cancellation is not reported as an inference failure."""
+    import contextlib
+    from unittest.mock import MagicMock
+
+    import detector
+    import pipeline_locks
+    from resource_ledger import ResourceWaitCancelled
+
+    fake_session = MagicMock()
+    fake_session.get_inputs.return_value = [MagicMock(name="images")]
+    monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
+
+    @contextlib.contextmanager
+    def cancelled_lease(_session):
+        raise ResourceWaitCancelled("cancelled")
+        yield
+
+    monkeypatch.setattr(
+        pipeline_locks, "acquire_inference_resources", cancelled_lease,
+    )
+    img_path = tmp_path / "stub.jpg"
+    from PIL import Image
+    Image.new("RGB", (640, 480), color="black").save(img_path)
+
+    with pytest.raises(ResourceWaitCancelled):
+        detector.detect_animals(str(img_path))

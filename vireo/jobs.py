@@ -10,6 +10,11 @@ from datetime import datetime
 
 import power
 from job_contract import failure_event
+from resource_ledger import (
+    bind_resource_cancel_check,
+    bind_resource_owner,
+    get_resource_ledger,
+)
 
 log = logging.getLogger(__name__)
 
@@ -238,7 +243,9 @@ class JobRunner:
                 result      TEXT,
                 error_count INTEGER DEFAULT 0,
                 config      TEXT,
-                workspace_id INTEGER
+                workspace_id INTEGER,
+                resource_wait_seconds REAL DEFAULT 0,
+                resource_wait_count INTEGER DEFAULT 0
             )
             """
         )
@@ -262,6 +269,16 @@ class JobRunner:
             db.conn.execute("SELECT summary FROM job_history LIMIT 0")
         except Exception:
             db.conn.execute("ALTER TABLE job_history ADD COLUMN summary TEXT DEFAULT ''")
+        for column, definition in (
+            ("resource_wait_seconds", "REAL DEFAULT 0"),
+            ("resource_wait_count", "INTEGER DEFAULT 0"),
+        ):
+            try:
+                db.conn.execute(f"SELECT {column} FROM job_history LIMIT 0")
+            except Exception:
+                db.conn.execute(
+                    f"ALTER TABLE job_history ADD COLUMN {column} {definition}"
+                )
 
     def _startup_sweep(self, db):
         """Reconcile job_history with the fact that we just started.
@@ -637,6 +654,8 @@ class JobRunner:
             "blocks_local_transitions": bool(blocks_local_transitions),
             "runtime_warning": runtime_warning,
             "singleton_key": singleton_key,
+            "resource_wait_seconds": 0.0,
+            "resource_wait_count": 0,
             # Pre-seeded so later writes from worker threads update an
             # existing key instead of inserting a new one: key insertion
             # while a request handler iterates the same dict (jsonify of
@@ -802,7 +821,20 @@ class JobRunner:
             # the inhibitor and hold the machine awake indefinitely.
             self.sleep_blocker.acquire()
         try:
-            result = work_fn(job)
+            job_id = job["id"]
+            # Bind the job's cancellation probe so resource-ledger waits
+            # (including CPU inference acquisitions on the ``cpu_ml`` lane)
+            # wake promptly when the job is cancelled instead of blocking
+            # until the current holder releases. Without this a cancel
+            # request could not preempt a queued classify/detect/mask/embed
+            # worker, and if the current native inference stalled the
+            # cancelled worker could outlive ``JobRunner.shutdown()``.
+            def _job_cancel_probe(_job_id=job_id):
+                return self.cancellation_requested(_job_id)
+            with bind_resource_owner(job_id), bind_resource_cancel_check(
+                _job_cancel_probe,
+            ):
+                result = work_fn(job)
             # Atomically check cancellation and set final status under the
             # same lock acquisition to prevent a race where cancel_job()
             # returns True but the job still finishes as "completed".
@@ -865,6 +897,12 @@ class JobRunner:
             # until Vireo exits.
             if holds_sleep_assertion:
                 self.sleep_blocker.release()
+            resource_timing = get_resource_ledger().owner_timing(
+                job["id"], remove=True,
+            )
+            with self._lock:
+                job["resource_wait_seconds"] = resource_timing["wait_seconds"]
+                job["resource_wait_count"] = resource_timing["wait_count"]
             elapsed = time.time() - start_time
             job["finished_at"] = datetime.now().isoformat()
             job["_ended_at"] = time.time()
@@ -885,6 +923,8 @@ class JobRunner:
                     "phase": phase,
                     "result": job["result"],
                     "duration": round(elapsed, 1),
+                    "resource_wait_seconds": job["resource_wait_seconds"],
+                    "resource_wait_count": job["resource_wait_count"],
                     "errors": job["errors"],
                     "failure": failure,
                 },
@@ -945,6 +985,8 @@ class JobRunner:
             job.get("workspace_id"),
             tree_json,
             summary,
+            job.get("resource_wait_seconds", 0.0),
+            job.get("resource_wait_count", 0),
         )
 
         for attempt in range(3):
@@ -954,8 +996,9 @@ class JobRunner:
                 conn.execute(
                     """INSERT OR REPLACE INTO job_history
                        (id, type, status, started_at, finished_at, duration,
-                        result, error_count, config, workspace_id, tree, summary)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        result, error_count, config, workspace_id, tree, summary,
+                        resource_wait_seconds, resource_wait_count)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     params,
                 )
                 ws_id = job.get("workspace_id")
@@ -1051,6 +1094,8 @@ class JobRunner:
             "counts_for_badge": True,
             "pausable": False,
             "runtime_warning": ctx.get("runtime_warning"),
+            "resource_wait_seconds": 0.0,
+            "resource_wait_count": 0,
         }
 
     @staticmethod
@@ -1066,6 +1111,10 @@ class JobRunner:
         snap["progress"] = dict(job.get("progress") or {})
         snap["steps"] = [dict(s) for s in (job.get("steps") or [])]
         snap["errors"] = list(job.get("errors") or [])
+        if job.get("status") in ("running", "pausing", "paused"):
+            timing = get_resource_ledger().owner_timing(job["id"])
+            snap["resource_wait_seconds"] = timing["wait_seconds"]
+            snap["resource_wait_count"] = timing["wait_count"]
         return snap
 
     def get(self, job_id):

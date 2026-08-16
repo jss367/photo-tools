@@ -2506,6 +2506,112 @@ def test_eye_keypoint_stage_scopes_to_collection(tmp_path, monkeypatch):
     assert captured["photo_ids"] == {pid}
 
 
+def test_eye_keypoint_stage_resource_cancel_does_not_count_photo_as_processed(
+    tmp_path, monkeypatch,
+):
+    """Regression: when ``_process_photo_for_eye`` raises
+    ``ResourceWaitCancelled`` mid-stage (because the bound resource cancel
+    probe fired while the CPU lease was waiting), the photo must NOT be
+    counted as processed and the synthetic 100% completion emit must be
+    skipped. Without this, the outer pipeline_job cancel summary reads an
+    inflated ``processed`` count and, on the last photo, sees ``current==
+    total`` before its own abort_check runs — surfacing "Cancelled (N of
+    N processed)" for a run where inference never even ran on some
+    photos.
+    """
+    import keypoints as kp
+    import pipeline as pipeline_mod
+    from pipeline import detect_eye_keypoints_stage
+    from resource_ledger import ResourceWaitCancelled
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    _make_fake_weights(str(models_dir), "superanimal-quadruped")
+    _make_fake_weights(str(models_dir), "superanimal-bird")
+    monkeypatch.setattr(kp, "MODELS_DIR", str(models_dir))
+
+    db, pid = _setup_eligible_mammal_photo(tmp_path)
+
+    # Second eligible photo so we can catch the cancel between photos —
+    # a single-photo stage would exercise only the tail of the loop and
+    # miss the "next iteration's ``abort_check()`` observes the cancel"
+    # timing bug this test guards.
+    fid = db.add_folder(str(tmp_path / "other"), name="other")
+    db.add_workspace_folder(db._active_workspace_id, fid)
+    other_pid = db.add_photo(
+        fid, "mammal2.jpg", ".jpg", 1000, 2.0,
+        timestamp="2026-04-16T11:00:00", width=800, height=600,
+    )
+    db.update_photo_pipeline_features(
+        other_pid, mask_path=str(tmp_path / "mask.png"),
+    )
+    det_ids = db.save_detections(
+        other_pid,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8},
+          "confidence": 0.9}],
+        detector_model="MegaDetector",
+    )
+    db.add_prediction(
+        det_ids[0], species="Vulpes vulpes", confidence=0.9,
+        model="bioclip-2.5", category="match",
+        taxonomy={"class": "Mammalia", "scientific_name": "Vulpes vulpes"},
+    )
+
+    calls = {"n": 0}
+
+    def _raise_resource_cancel(*a, **kw):
+        calls["n"] += 1
+        raise ResourceWaitCancelled(
+            "Cancelled while waiting for cpu inference resources",
+        )
+
+    monkeypatch.setattr(
+        pipeline_mod, "_process_photo_for_eye", _raise_resource_cancel,
+    )
+
+    progress_events = []
+
+    def _progress(phase, current, total):
+        progress_events.append((phase, current, total))
+
+    detect_eye_keypoints_stage(
+        db,
+        config={"eye_detect_enabled": True},
+        progress_callback=_progress,
+    )
+
+    # _process_photo_for_eye must have been invoked at most once — the
+    # first ResourceWaitCancelled must break the loop, not continue to
+    # the second photo (which would waste more work on an already
+    # cancelled pipeline).
+    assert calls["n"] == 1, (
+        f"ResourceWaitCancelled must abort the per-photo loop; expected "
+        f"exactly one _process_photo_for_eye call, got {calls['n']}"
+    )
+
+    # Progress must NOT be emitted for the cancelled photo — the emit
+    # at the tail of the loop body only runs on success. And the
+    # synthetic 100% completion at the end must be skipped so
+    # pipeline_job's cancel summary reports the accurate processed
+    # count (zero here).
+    cancelled_photo_progress = [
+        ev for ev in progress_events
+        if ev[0] == "Eye keypoints" and ev[1] >= 1
+    ]
+    assert not cancelled_photo_progress, (
+        f"A cancelled photo must not be counted as processed. Progress "
+        f"events: {progress_events!r}"
+    )
+    synthetic_hundred = [
+        ev for ev in progress_events
+        if ev[0] == "Eye keypoints" and ev[1] == ev[2] and ev[2] > 0
+    ]
+    assert not synthetic_hundred, (
+        f"The synthetic 100% completion emit must be skipped on abort. "
+        f"Progress events: {progress_events!r}"
+    )
+
+
 def test_eye_keypoint_stage_honors_exclude_photo_ids(tmp_path, monkeypatch):
     """When ``exclude_photo_ids`` is provided, excluded photos are filtered
     out before the eligibility query so the stage doesn't mutate eye_*

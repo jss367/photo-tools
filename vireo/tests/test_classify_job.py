@@ -435,6 +435,56 @@ def test_detect_batch_marks_processed_before_quality_scoring(tmp_path):
     assert 7 in detection_map
 
 
+def test_detect_batch_propagates_resource_wait_cancelled(tmp_path):
+    """Regression: ``ResourceWaitCancelled`` from a MegaDetector
+    inference-lease wait must escape ``_detect_batch``, not be
+    swallowed by the ``except (ImportError, RuntimeError)`` arm
+    (``ResourceWaitCancelled`` subclasses ``RuntimeError``).
+
+    Codex P1: on the reclassify path the caller has already called
+    ``db.clear_detections(photo["id"])`` for this photo before
+    invoking ``_detect_batch``. If the cancel is silently swallowed
+    here, the classify recovery rebuilds predictions using the
+    full-image fallback and lands a committed catalog change even
+    though the user pressed Stop.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from classify_job import _detect_batch
+    from resource_ledger import ResourceWaitCancelled
+
+    runner = FakeRunner()
+    job = _make_job()
+
+    photos = [{"id": 7, "filename": "bird.jpg", "folder_id": 10}]
+    folders = {10: str(tmp_path)}
+
+    img = Image.new("RGB", (100, 100), color="red")
+    img.save(str(tmp_path / "bird.jpg"))
+
+    def raising_detect(*_args, **_kwargs):
+        raise ResourceWaitCancelled(
+            "Cancelled while waiting for GPU inference resources",
+        )
+
+    mock_db = MagicMock()
+
+    with (
+        patch("classify_job.detect_animals", side_effect=raising_detect),
+        patch("classify_job.get_primary_detection", return_value=None),
+        pytest.raises(ResourceWaitCancelled),
+    ):
+        _detect_batch(
+            photos=photos,
+            folders=folders,
+            runner=runner,
+            job=job,
+            reclassify=True,
+            db=mock_db,
+            already_detected_ids=set(),
+        )
+
+
 def test_detect_batch_does_not_pass_threshold_to_detector(tmp_path, monkeypatch):
     """detect_animals is called with just the image path — the workspace
     threshold is NOT applied at write time.
@@ -1107,6 +1157,264 @@ def test_reclassify_skips_purge_when_cancelled_during_model_load(tmp_path, monke
     assert dets_after == 1, (
         "Reclassify purge ran despite cancel during model load — "
         "cached detections were destroyed without replacement."
+    )
+
+
+def test_reclassify_finalizes_steps_on_resource_wait_cancel_during_load(
+    tmp_path, monkeypatch,
+):
+    """Regression: when a classify job is cancelled during a cold ONNX
+    model construction (``onnx_runtime.create_session``'s bound
+    resource cancel probe fires), ``acquire_cached_classifier`` raises
+    ``ResourceWaitCancelled`` — NOT ``ClassificationCancelled``. Without
+    catching both shapes in ``run_classify_job``, the exception escapes
+    to ``JobRunner`` which marks the top-level cancelled but leaves
+    ``load_model`` at "running" and later steps at "pending" instead
+    of finalizing them.
+
+    Sibling to ``test_reclassify_skips_purge_when_cancelled_during_model_load``:
+    the pre-purge gate + purge-preserving semantics from that test
+    apply to this cancellation shape too.
+    """
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+    from resource_ledger import ResourceWaitCancelled
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(pid, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="megadetector-v6")[0]
+    db.add_prediction(
+        det_id, species="Robin", confidence=0.9,
+        model="BioCLIP", labels_fingerprint="legacy",
+    )
+
+    coll_id = db.add_collection(
+        "c", '[{"field":"photo_ids","value":[' + str(pid) + ']}]',
+    )
+
+    runner = FakeRunner()
+
+    fake_weights = tmp_path / "weights"
+    fake_weights.mkdir()
+    (fake_weights / "tol_embeddings.npy").write_bytes(b"stub")
+    (fake_weights / "tol_classes.json").write_bytes(b"[]")
+    import classify_job as cj
+    monkeypatch.setattr(cj, "get_active_model", lambda: {
+        "id": "BioCLIP",
+        "name": "BioCLIP",
+        "model_str": "hf-hub:imageomics/bioclip",
+        "weights_path": str(fake_weights),
+        "model_type": "bioclip",
+        "downloaded": True,
+    })
+
+    # Simulate the exact failure Codex flagged: cold-load lease cancel
+    # surfaces as ``ResourceWaitCancelled`` from inside
+    # ``acquire_cached_classifier`` — not ``ClassificationCancelled``.
+    import classifier_cache
+    def _cancelled_acquire(*args, **kwargs):
+        raise ResourceWaitCancelled(
+            "Cancelled while waiting for ONNX model construction resources",
+        )
+    monkeypatch.setattr(
+        classifier_cache, "acquire_cached_classifier", _cancelled_acquire,
+    )
+
+    job = _make_job()
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None,
+        labels_file=None,
+        model_id=None,
+        model_name="BioCLIP",
+        grouping_window=0,
+        similarity_threshold=0.99,
+        reclassify=True,
+    )
+
+    # Must NOT raise: the cancellation shape must be caught locally so
+    # JobRunner sees a normal return and finalizes step rows.
+    result = run_classify_job(job, runner, db_path, ws, params)
+
+    assert result["predictions_stored"] == 0
+    assert result["detected"] == 0
+
+    finals = _final_step_statuses(runner)
+    assert finals.get("load_model") == "cancelled", (
+        f"load_model must finalize cancelled on ResourceWaitCancelled "
+        f"during cold load, got {finals.get('load_model')!r}"
+    )
+    for step_id in ("detect", "classify", "finalize"):
+        assert finals.get(step_id) == "cancelled", (
+            f"Step {step_id!r} must finalize cancelled when the cold "
+            f"ONNX construction lease is cancelled, got "
+            f"{finals.get(step_id)!r}"
+        )
+
+    # Preservation semantics from the ClassificationCancelled path
+    # apply here too: the reclassify purge must not have run.
+    db2 = Database(db_path)
+    db2.set_active_workspace(ws)
+    preds_after = db2.conn.execute(
+        "SELECT COUNT(*) AS n FROM predictions WHERE detection_id=?",
+        (det_id,),
+    ).fetchone()["n"]
+    assert preds_after == 1, (
+        "Reclassify purge must not run when the cold construction "
+        "lease is cancelled — cached prediction was destroyed."
+    )
+
+
+def test_classify_factory_cancel_check_uses_pure_cancel_probe(
+    tmp_path, monkeypatch,
+):
+    """Regression: the classifier factory closure must call the runner's
+    non-parking ``cancellation_requested`` probe — never ``is_cancelled``
+    — because the factory runs while ``ModelCache._Entry.load_lock`` is
+    held. If the factory parked on pause via ``is_cancelled`` →
+    ``wait_if_paused``, any concurrent unpaused job requesting the same
+    cache key would stall until Resume, since the polling waiter in
+    ``model_cache.py:198`` cannot acquire the shared load_lock.
+    """
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.save_detections(pid, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="megadetector-v6")
+    coll_id = db.add_collection(
+        "c", '[{"field":"photo_ids","value":[' + str(pid) + ']}]',
+    )
+
+    class PureProbeRunner(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.is_cancelled_calls_during_factory = 0
+            self.pure_probe_calls_during_factory = 0
+            self.in_factory = False
+
+        def is_cancelled(self, job_id):
+            if self.in_factory:
+                self.is_cancelled_calls_during_factory += 1
+            return super().is_cancelled(job_id)
+
+        def cancellation_requested(self, job_id):
+            if self.in_factory:
+                self.pure_probe_calls_during_factory += 1
+            return False
+
+    runner = PureProbeRunner()
+
+    fake_weights = tmp_path / "weights"
+    fake_weights.mkdir()
+    (fake_weights / "tol_embeddings.npy").write_bytes(b"stub")
+    (fake_weights / "tol_classes.json").write_bytes(b"[]")
+    import classify_job as cj
+    monkeypatch.setattr(cj, "get_active_model", lambda: {
+        "id": "BioCLIP",
+        "name": "BioCLIP",
+        "model_str": "hf-hub:imageomics/bioclip",
+        "weights_path": str(fake_weights),
+        "model_type": "bioclip",
+        "downloaded": True,
+    })
+
+    # Intercept the factory: mark the "in factory" window, invoke the
+    # closure once so its cancel_check fires against the runner, then
+    # bail with a distinctive error that we catch in the assertion.
+    captured = {}
+
+    class _StopAfterProbe(RuntimeError):
+        pass
+
+    class _StubClassifier:
+        """Minimal object that runs the caller's cancel_check exactly
+        once inside the factory scope, then aborts so the classify
+        pipeline unwinds without needing real ONNX weights."""
+
+        def __init__(self, *args, cancel_check=None, **kwargs):
+            if cancel_check is not None:
+                cancel_check()
+            raise _StopAfterProbe(
+                "abort factory after probing cancel_check",
+            )
+
+    monkeypatch.setattr(cj, "Classifier", _StubClassifier)
+
+    import classifier_cache
+    original_acquire = classifier_cache.acquire_cached_classifier
+
+    def _tracking_acquire(*, factory, **kwargs):
+        runner.in_factory = True
+        try:
+            factory()
+        except _StopAfterProbe as e:
+            captured["factory_error"] = e
+        finally:
+            runner.in_factory = False
+        raise _StopAfterProbe("stop before classification")
+
+    monkeypatch.setattr(
+        classifier_cache, "acquire_cached_classifier", _tracking_acquire,
+    )
+
+    job = _make_job()
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None,
+        labels_file=None,
+        model_id=None,
+        model_name="BioCLIP",
+        grouping_window=0,
+        similarity_threshold=0.99,
+        reclassify=False,
+    )
+
+    with pytest.raises(_StopAfterProbe):
+        run_classify_job(job, runner, db_path, ws, params)
+
+    assert captured.get("factory_error") is not None, (
+        "Factory closure must have been invoked so cancel_check ran; "
+        "if the classify job returned early, this regression cannot "
+        "prove which probe the factory used."
+    )
+    assert runner.pure_probe_calls_during_factory >= 1, (
+        "Factory cancel_check must call runner.cancellation_requested "
+        "(pure probe) — got zero calls, meaning the fix regressed and "
+        "the factory would park on pause while holding ModelCache "
+        "entry.load_lock."
+    )
+    assert runner.is_cancelled_calls_during_factory == 0, (
+        "Factory cancel_check must NOT call runner.is_cancelled — that "
+        "probe parks inside wait_if_paused, so a pause request during "
+        "cold model load would strand every unpaused sibling waiting "
+        "on the same cache key."
     )
 
 
@@ -5310,6 +5618,388 @@ def test_run_classify_job_reclassify_cancel_after_detect_classifies_processed(tm
             f"{det_id}; only the processed subset should be classified."
         )
     assert result["detected"] == 1
+
+
+def test_run_classify_job_finish_cleared_only_suspends_resource_cancel(tmp_path):
+    """Regression: the finish_cleared_only preservation pass must run to
+    completion even when the job-bound resource cancel probe is already
+    True. The classifier's inference lease consults that probe; without
+    suspending the binding for this pass every _flush_batch would raise
+    ResourceWaitCancelled and the processed subset would be left with
+    fresh detections but zero replacement predictions."""
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+    from classify_job import ClassifyParams, run_classify_job
+
+    class PostDetectCancelRunner(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.flipped = False
+
+        def is_cancelled(self, job_id):
+            return self.flipped
+
+    runner = PostDetectCancelRunner()
+    job = _make_job()
+
+    mock_db_instance = MagicMock()
+    mock_db_instance.get_collection_photos.return_value = [
+        {"id": 1, "filename": "processed.jpg", "folder_id": 10,
+         "timestamp": "2024-01-15T10:00:00"},
+    ]
+    mock_db_instance.get_folder_tree.return_value = [
+        {"id": 10, "path": str(tmp_path), "name": "test"},
+    ]
+    mock_db_instance.get_existing_prediction_photo_ids.return_value = set()
+    mock_db_instance.get_photo_embedding.return_value = None
+    mock_db_instance.get_subject_types.return_value = set()
+    mock_db_instance.filter_out_subject_tagged.side_effect = (
+        lambda pids, _types: list(pids)
+    )
+    mock_db_instance.get_classifier_run_keys.return_value = set()
+    mock_db_instance.get_predictions_for_detection.return_value = []
+    mock_db_instance.get_detections.return_value = []
+
+    fake_model = {
+        "id": "test-model",
+        "name": "TestModel",
+        "model_str": "hf-hub:imageomics/bioclip",
+        "weights_path": "/tmp/weights.bin",
+        "model_type": "bioclip",
+        "downloaded": True,
+    }
+    fake_embedding = np.ones(512, dtype=np.float32)
+    fake_preds = [{"species": "Restored", "score": 0.95, "taxonomy": None}]
+
+    # This classifier stand-in consults the bound resource cancel probe
+    # exactly the way acquire_inference_resources does. If the binding is
+    # still active during finish_cleared_only, the probe is True and this
+    # raises — matching the real bug where the CPU inference lease aborts
+    # every flush and the recovery pass writes no predictions.
+    class ProbeCheckingClassifier:
+        def __init__(self):
+            self.calls = 0
+
+        def _check(self):
+            from resource_ledger import (
+                ResourceWaitCancelled,
+                resolve_resource_cancel_check,
+            )
+            probe = resolve_resource_cancel_check()
+            if probe is not None and probe():
+                raise ResourceWaitCancelled(
+                    "bound cancel probe fired inside classifier"
+                )
+
+        def classify_batch_with_embedding(self, images, threshold=0):
+            self._check()
+            self.calls += 1
+            return [(fake_preds, fake_embedding) for _ in images]
+
+        def classify_with_embedding(self, image, threshold=0):
+            self._check()
+            self.calls += 1
+            return (fake_preds, fake_embedding)
+
+    mock_clf = ProbeCheckingClassifier()
+
+    def fake_detect_subjects(photos, folders, runner, job, reclassify, db):
+        assert reclassify is True
+        runner.flipped = True
+        return ({1: [{"id": 101, "box_x": 0, "box_y": 0,
+                      "box_w": 0.4, "box_h": 0.4, "confidence": 0.85,
+                      "category": "animal",
+                      "detector_model": "megadetector-v6"}]}, 1)
+
+    params = ClassifyParams(
+        collection_id="col-1",
+        labels_file=None,
+        labels_files=None,
+        model_id=None,
+        model_name=None,
+        grouping_window=10,
+        similarity_threshold=0.85,
+        reclassify=True,
+    )
+
+    fake_img = MagicMock()
+
+    # Bind a job-level probe that is already True by the time classification
+    # would fire, matching JobRunner._run_job for a cancelled job.
+    from resource_ledger import bind_resource_cancel_check
+    with (
+        bind_resource_cancel_check(lambda: True),
+        patch("classify_job.Database", return_value=mock_db_instance),
+        patch("classify_job.get_active_model", return_value=fake_model),
+        patch("classify_job.get_models", return_value=[fake_model]),
+        patch("classify_job._load_taxonomy", return_value=None),
+        patch("classify_job._load_labels",
+              return_value=(["Restored"], False)),
+        patch("classify_job.Classifier", return_value=mock_clf),
+        patch("classify_job._detect_subjects",
+              side_effect=fake_detect_subjects),
+        patch("classify_job._prepare_image",
+              return_value=(fake_img, str(tmp_path), "p")),
+    ):
+        run_classify_job(job, runner, str(tmp_path / "test.db"), 1, params)
+
+    assert mock_clf.calls >= 1, (
+        "Preservation pass must reach the classifier; the bound cancel "
+        "probe should be suspended for finish_cleared_only."
+    )
+    assert mock_db_instance.add_prediction.call_count >= 1, (
+        "Preservation pass must persist a replacement prediction so the "
+        "processed subset is not stranded empty."
+    )
+
+
+def test_classify_photos_reclassify_cancel_flushes_pending_batch(tmp_path):
+    """Regression: when a reclassify run is cancelled mid-classify, the
+    tail preservation flush must still write predictions for photos
+    whose old predictions the loop already cleared. CPU inference
+    consults the bound resource cancel probe (True on this path), so
+    without suspending the binding just for this tail flush every
+    ``_flush_batch`` call would raise ``ResourceWaitCancelled``, the
+    fallback per-image path would also raise, and the queued photos
+    would be stranded with no replacement predictions."""
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+    from classify_job import _classify_photos
+
+    class MidClassifyCancelRunner(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.checks = 0
+
+        def is_cancelled(self, job_id):
+            # Cancel fires on the second loop iteration, after photo 1
+            # was queued into ``batch`` on iteration 0.
+            self.checks += 1
+            return self.checks >= 2
+
+    runner = MidClassifyCancelRunner()
+    job = _make_job()
+
+    fake_db = MagicMock()
+    fake_db.get_classifier_run_keys.return_value = set()
+    fake_db.get_predictions_for_detection.return_value = []
+
+    fake_embedding = np.ones(512, dtype=np.float32)
+    fake_preds = [{"species": "Restored", "score": 0.95, "taxonomy": None}]
+
+    # This classifier stand-in consults the bound resource cancel probe
+    # exactly the way ``acquire_inference_resources`` does. If the
+    # binding is still active during the reclassify tail flush the
+    # probe is True and this raises — matching the real bug where the
+    # CPU inference lease aborts the flush and no replacement
+    # predictions are written for the queued photos.
+    class ProbeCheckingClassifier:
+        def __init__(self):
+            self.calls = 0
+
+        def _check(self):
+            from resource_ledger import (
+                ResourceWaitCancelled,
+                resolve_resource_cancel_check,
+            )
+            probe = resolve_resource_cancel_check()
+            if probe is not None and probe():
+                raise ResourceWaitCancelled(
+                    "bound cancel probe fired inside classifier"
+                )
+
+        def classify_batch_with_embedding(self, images, threshold=0):
+            self._check()
+            self.calls += 1
+            return [(fake_preds, fake_embedding) for _ in images]
+
+        def classify_with_embedding(self, image, threshold=0):
+            self._check()
+            self.calls += 1
+            return (fake_preds, fake_embedding)
+
+    clf = ProbeCheckingClassifier()
+
+    photos = [
+        {"id": 1, "filename": "a.jpg", "folder_id": 10, "timestamp": None},
+        {"id": 2, "filename": "b.jpg", "folder_id": 10, "timestamp": None},
+    ]
+    folders = {10: str(tmp_path)}
+    detection_map = {
+        1: [{"id": 101, "box_x": 0.0, "box_y": 0.0,
+             "box_w": 1.0, "box_h": 1.0, "confidence": 0.9,
+             "category": "animal",
+             "detector_model": "megadetector-v6"}],
+        2: [{"id": 102, "box_x": 0.0, "box_y": 0.0,
+             "box_w": 1.0, "box_h": 1.0, "confidence": 0.9,
+             "category": "animal",
+             "detector_model": "megadetector-v6"}],
+    }
+    fake_img = MagicMock()
+
+    from resource_ledger import bind_resource_cancel_check
+    with (
+        bind_resource_cancel_check(lambda: True),
+        patch("classify_job._prepare_image",
+              return_value=(fake_img, str(tmp_path), "p")),
+    ):
+        raw_results, failed, _skipped = _classify_photos(
+            photos=photos,
+            folders=folders,
+            detection_map=detection_map,
+            existing_preds=set(),
+            clf=clf,
+            model_type="bioclip",
+            model_name="TestModel",
+            runner=runner,
+            job=job,
+            db=fake_db,
+            top_k=1,
+            vireo_dir=str(tmp_path),
+            labels_fingerprint="fp",
+            reclassify=True,
+            finish_cleared_only=False,
+        )
+
+    assert clf.calls >= 1, (
+        "Reclassify tail flush must reach the classifier; the bound "
+        "cancel probe should be suspended for this preservation pass."
+    )
+    assert failed == 0, (
+        f"Preservation flush must not treat cancellation as failure "
+        f"(got {failed} failures)"
+    )
+    assert len(raw_results) >= 1, (
+        "Preservation flush must persist a replacement prediction so "
+        "the queued reclassify photo is not stranded empty."
+    )
+
+
+def test_classify_photos_reclassify_cancel_mid_batch_flush_preserves_cleared(tmp_path):
+    """Regression: when Stop arrives while a full 16-image reclassify
+    batch is IN FLIGHT through ``_flush_batch`` (not just the final
+    tail), those photos have already had their old predictions cleared
+    by the per-photo ``clear_predictions`` above. The prior fix
+    suspended the bound resource cancel probe only for the tail
+    ``_flush_batch`` at line 1735, so a mid-loop flush at lines
+    1568/1698 that hit ``ResourceWaitCancelled`` would strand the
+    entire 16-photo batch empty. Suspend the probe on every reclassify
+    flush — mid-loop AND tail — via the ``_flush_preserving_cleared``
+    helper.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import numpy as np
+    from classify_job import _BATCH_SIZE, _classify_photos
+
+    class NeverCancelRunner(FakeRunner):
+        def is_cancelled(self, job_id):
+            return False
+
+    runner = NeverCancelRunner()
+    job = _make_job()
+
+    fake_db = MagicMock()
+    fake_db.get_classifier_run_keys.return_value = set()
+    fake_db.get_predictions_for_detection.return_value = []
+
+    fake_embedding = np.ones(512, dtype=np.float32)
+    fake_preds = [{"species": "Restored", "score": 0.9, "taxonomy": None}]
+
+    class ProbeCheckingClassifier:
+        def __init__(self):
+            self.calls = 0
+
+        def _check(self):
+            from resource_ledger import (
+                ResourceWaitCancelled,
+                resolve_resource_cancel_check,
+            )
+            probe = resolve_resource_cancel_check()
+            if probe is not None and probe():
+                raise ResourceWaitCancelled(
+                    "bound cancel probe fired inside classifier",
+                )
+
+        def classify_batch_with_embedding(self, images, threshold=0):
+            self._check()
+            self.calls += 1
+            return [(fake_preds, fake_embedding) for _ in images]
+
+        def classify_with_embedding(self, image, threshold=0):
+            self._check()
+            self.calls += 1
+            return (fake_preds, fake_embedding)
+
+    clf = ProbeCheckingClassifier()
+
+    # Enough photos to trigger at least one mid-loop flush at _BATCH_SIZE.
+    # runner.is_cancelled never fires so the loop drains naturally; the
+    # bound resource cancel probe simulates a cancel that arrived mid-run
+    # (e.g. between the runner-poll and the flush) and stays true
+    # throughout — the exact condition the reclassify mid-loop flush
+    # must survive.
+    n = _BATCH_SIZE + 3
+    photos = [
+        {"id": pid, "filename": f"p{pid}.jpg", "folder_id": 10,
+         "timestamp": None}
+        for pid in range(1, n + 1)
+    ]
+    folders = {10: str(tmp_path)}
+    detection_map = {
+        pid: [{"id": 100 + pid, "box_x": 0.0, "box_y": 0.0,
+               "box_w": 1.0, "box_h": 1.0, "confidence": 0.9,
+               "category": "animal",
+               "detector_model": "megadetector-v6"}]
+        for pid in range(1, n + 1)
+    }
+    fake_img = MagicMock()
+
+    from resource_ledger import bind_resource_cancel_check
+    with (
+        bind_resource_cancel_check(lambda: True),
+        patch("classify_job._prepare_image",
+              return_value=(fake_img, str(tmp_path), "p")),
+    ):
+        raw_results, failed, _skipped = _classify_photos(
+            photos=photos,
+            folders=folders,
+            detection_map=detection_map,
+            existing_preds=set(),
+            clf=clf,
+            model_type="bioclip",
+            model_name="TestModel",
+            runner=runner,
+            job=job,
+            db=fake_db,
+            top_k=1,
+            vireo_dir=str(tmp_path),
+            labels_fingerprint="fp",
+            reclassify=True,
+            finish_cleared_only=False,
+        )
+
+    assert failed == 0, (
+        f"Mid-loop flushes must not treat the bound cancel probe as "
+        f"failure on a reclassify run — the cleared photos would be "
+        f"stranded empty otherwise. Got {failed} failures."
+    )
+    # Every photo's detection must have a raw_result — the mid-loop
+    # flush must have produced predictions for the first _BATCH_SIZE
+    # photos, and the tail flush must have handled the remainder.
+    assert len(raw_results) == n, (
+        f"Expected {n} raw_results (one per detection); got "
+        f"{len(raw_results)}. A stranded mid-loop batch would drop the "
+        f"first _BATCH_SIZE={_BATCH_SIZE} entries."
+    )
+    seen_detection_ids = {r.get("detection_id") for r in raw_results}
+    expected_detection_ids = {100 + pid for pid in range(1, n + 1)}
+    assert seen_detection_ids == expected_detection_ids, (
+        f"Every reclassified detection must appear in raw_results; "
+        f"missing {expected_detection_ids - seen_detection_ids}"
+    )
 
 
 def test_run_classify_job_reclassify_cancel_classifies_empty_scene_processed(tmp_path):

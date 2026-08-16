@@ -2,11 +2,17 @@
 
 Two primitives:
 
-* ``acquire_gpu()`` — a single-holder semaphore that every GPU-using stage
-  (classify, detect, extract_masks, eye_keypoints) wraps around its
-  per-batch inference call. Must be released between batches so a long
-  classify doesn't completely starve a second pipeline that just wants
-  one quick GPU op.
+* ``acquire_inference_resources()`` — a provider-aware inference lease.
+  Pure-GPU sessions (no ``CPUExecutionProvider`` registered) take only
+  the single-holder accelerator semaphore. CPU-only sessions atomically
+  claim their configured CPU permits plus the exclusive ``cpu_ml`` lane.
+  Mixed accelerator+CPU sessions (the default Vireo shape — CUDA / CoreML
+  registered alongside ``CPUExecutionProvider`` for unsupported-op
+  fallback) claim BOTH: ledger-first (CPU permits + ``cpu_ml``), then
+  the GPU semaphore. Without the CPU claim on the mixed path, an
+  op-level CPU fallback would run the session's native ONNX pool
+  alongside a concurrent CPU inference / scan / regroup and overrun
+  the process-wide CPU budget.
 
 * ``acquire_workspace_regroup(workspace_id)`` — a per-workspace lock
   held across BOTH ``regroup_stage`` and ``miss_stage`` so two pipelines
@@ -16,12 +22,13 @@ Two primitives:
   Pipelines on different workspaces never contend.
 
 Lock order (acquire outermost first): ``_progress_lock`` →
-``acquire_workspace_regroup`` → ``JobRunner._lock`` → ``acquire_gpu``.
+``acquire_workspace_regroup`` → ``JobRunner._lock`` → inference lease.
 ``JobRunner._lock`` is a brief leaf lock taken by ``runner.update_step``
 inside the workspace critical section; this is safe because no code
 path under ``JobRunner._lock`` acquires ``acquire_workspace_regroup``,
-so there is no cycle. ``acquire_gpu`` is the innermost: nothing else
-may be acquired while it is held.
+so there is no cycle. Resource-ledger accounting is completed before a
+lease is returned; its mutex is never held during inference. The accelerator
+semaphore remains innermost: nothing else may be acquired while it is held.
 """
 
 import threading
@@ -46,9 +53,61 @@ def acquire_gpu():
 
 
 class _GpuLockContext:
+    def __init__(self, cancel_check=None):
+        self._cancel_check = cancel_check
+
     def __enter__(self):
-        _GPU_SEMAPHORE.acquire()
-        return self
+        from resource_ledger import (
+            ResourceWaitCancelled,
+            get_resource_ledger,
+            resolve_resource_cancel_check,
+        )
+
+        cancel_check = resolve_resource_cancel_check(self._cancel_check)
+        if cancel_check is not None and cancel_check():
+            raise ResourceWaitCancelled(
+                "Cancelled while waiting for GPU inference resources"
+            )
+        if _GPU_SEMAPHORE.acquire(blocking=False):
+            return self
+
+        # Accelerator coordination intentionally remains a semaphore rather
+        # than a ledger lane, but contention must still feed the same live and
+        # persisted per-job resource wait diagnostics as CPU claims.
+        with get_resource_ledger().track_external_wait():
+            while True:
+                if cancel_check is not None and cancel_check():
+                    raise ResourceWaitCancelled(
+                        "Cancelled while waiting for GPU inference resources"
+                    )
+                if _GPU_SEMAPHORE.acquire(timeout=0.2):
+                    if cancel_check is None:
+                        return self
+                    # ``cancel_check`` may PARK — the pipeline bound
+                    # probe is ``pipeline_job._pause_checkpoint``, which
+                    # blocks until Resume when Pause is pending. Release
+                    # the semaphore BEFORE that call so the paused
+                    # participant does not retain the process-wide GPU
+                    # slot for the duration of the pause and block
+                    # unrelated unpaused GPU jobs.
+                    #
+                    # On probe = True (cancel, or cancel-through-pause):
+                    #   raise; semaphore is already released.
+                    # On probe = False (no cancel, or paused-then-
+                    #   resumed): commit ownership via a non-blocking
+                    #   reacquire. If it succeeds we own the slot
+                    #   honestly. If another waiter grabbed the slot
+                    #   while we were parked, fall through to another
+                    #   polling iteration.
+                    _GPU_SEMAPHORE.release()
+                    if cancel_check():
+                        raise ResourceWaitCancelled(
+                            "Cancelled while waiting for GPU inference "
+                            "resources",
+                        )
+                    if _GPU_SEMAPHORE.acquire(blocking=False):
+                        return self
+                    continue
 
     def __exit__(self, exc_type, exc, tb):
         _GPU_SEMAPHORE.release()
@@ -78,29 +137,178 @@ def _session_uses_gpu(session):
     return any(p in _GPU_PROVIDERS for p in providers)
 
 
-def acquire_gpu_if_session_uses_it(session):
-    """Context manager: take the GPU semaphore only for GPU-running sessions.
+class _CompoundInferenceContext:
+    """Compound lease: CPU permits + ``cpu_ml`` lane + GPU semaphore.
 
-    CPU-only ONNX sessions (Apple Silicon with external-data models,
-    CPU-only installs) skip the lock so they don't block concurrent
-    pipelines' real GPU work. GPU-running sessions still serialise.
+    For mixed-provider accelerator sessions (CUDA / CoreML alongside
+    ``CPUExecutionProvider`` — Vireo's default shape from
+    :func:`onnx_runtime.get_providers`), ONNX Runtime may execute some
+    ops on the accelerator and fall back to the session's own CPU
+    thread pool for unsupported ops. ``get_providers()`` reports the
+    registered provider list, not actual node placement, so we cannot
+    tell at claim time whether any given call will fall back — the
+    safe default is to claim BOTH resources.
+
+    Without the CPU claim, the fallback CPU pool would run alongside
+    a concurrent CPU inference / scan / regroup and blow through the
+    process-wide CPU budget: the whole point of the ledger is to make
+    that impossible.
+
+    Acquires in a release-and-retry loop rather than a static
+    ledger-first / semaphore-last order:
+
+    1. Take the CPU lease (may park on Pause; we hold no other
+       resource here so that is fine).
+    2. Try a non-blocking acquire of the GPU semaphore. If it
+       succeeds, both are held atomically.
+    3. If the GPU semaphore is contended: RELEASE the CPU lease,
+       wait for the semaphore with parking allowed, release it
+       immediately, then loop back to step 1.
+
+    Step 3 is what stops this compound context from re-introducing
+    the exact pause-park bug ``_GpuLockContext.__enter__`` was fixed
+    for: if we held the CPU permits + ``cpu_ml`` lane through a
+    parking GPU wait, an unpaused CPU inference or scan would be
+    blocked for the whole pause even though this participant is
+    doing no work. Releasing the CPU lease around any wait that can
+    park keeps unpaused peers unblocked.
+
+    Preserves the "GPU semaphore is innermost" invariant documented
+    at the top of this module: on success, the CPU lease is held
+    first, then the GPU semaphore is acquired without any additional
+    wait. ``__exit__`` releases in reverse (GPU first, then CPU).
+    """
+
+    def __init__(self, ledger, request, cancel_check):
+        self._ledger = ledger
+        self._request = request
+        self._cancel_check = cancel_check
+        self._cpu_lease = None
+        self._gpu_held = False
+
+    def __enter__(self):
+        while True:
+            cpu_lease = self._ledger.acquire(
+                self._request, cancel_check=self._cancel_check,
+            )
+            cpu_lease.__enter__()
+            # Non-blocking GPU acquire. On success both are held and
+            # we return without ever having parked while holding both.
+            if _GPU_SEMAPHORE.acquire(blocking=False):
+                self._cpu_lease = cpu_lease
+                self._gpu_held = True
+                return self
+            # GPU is contended. Release the CPU lease so any unpaused
+            # CPU inference / scan is not blocked while this
+            # participant waits (and possibly parks) for the GPU.
+            cpu_lease.__exit__(None, None, None)
+            # Wait for the GPU semaphore via ``_GpuLockContext`` so
+            # this wait feeds the same live/persisted per-job
+            # diagnostics and honours the pause-park release semantics
+            # already built into it. Release immediately; the next
+            # loop iteration atomically re-acquires CPU + GPU.
+            with _GpuLockContext(self._cancel_check):
+                pass
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._gpu_held:
+                _GPU_SEMAPHORE.release()
+                self._gpu_held = False
+        finally:
+            if self._cpu_lease is not None:
+                self._cpu_lease.__exit__(exc_type, exc, tb)
+                self._cpu_lease = None
+
+
+def _build_cpu_request(session, label):
+    """Construct the ``ResourceRequest`` for this session's CPU claim.
+
+    Shared between the CPU-only path and the mixed accelerator+CPU
+    fallback path — same permits, same ``cpu_ml`` lane; only the label
+    differs so wait diagnostics distinguish the two.
+    """
+    from onnx_runtime import session_cpu_threads
+    from resource_ledger import (
+        CpuRequest,
+        ResourceRequest,
+        cpu_inference_request,
+        get_resource_ledger,
+    )
+
+    ledger = get_resource_ledger()
+    threads = session_cpu_threads(
+        session, default=cpu_inference_request(ledger.cpu_capacity).preferred,
+    )
+    threads = max(1, min(int(threads), ledger.cpu_capacity))
+    return ledger, ResourceRequest(
+        cpu=CpuRequest(threads, threads, threads),
+        lanes=("cpu_ml",),
+        label=label,
+    )
+
+
+def acquire_inference_resources(session, *, cancel_check=None):
+    """Return the enforceable inference lease for an ONNX session.
+
+    CPU-only sessions claim the exact CPU thread count configured when the
+    session was constructed and the initial exclusive ``cpu_ml`` lane.
+    Mixed-provider accelerator sessions (CUDA/CoreML + CPU fallback —
+    Vireo's default) claim BOTH the CPU budget AND the GPU semaphore so
+    unsupported-op fallback to the session's native CPU pool cannot
+    overrun the process-wide CPU budget. Pure-accelerator sessions
+    (no CPUExecutionProvider registered) take only the GPU semaphore.
+    Unknown providers take the conservative accelerator+CPU path.
+
+    ``cancel_check`` is threaded into the CPU claim so a cancelled
+    classify, detection, mask, or embedding worker wakes promptly while
+    another inference call owns the ``cpu_ml`` lane or the required
+    permits — the same guarantee scanner hashing already gets. When
+    omitted, the ledger falls back to whatever probe the current job
+    established via :func:`resource_ledger.bind_resource_cancel_check`
+    at its top level.
 
     Usage::
 
-        with acquire_gpu_if_session_uses_it(session):
+        with acquire_inference_resources(session):
             outputs = session.run(None, feeds)
     """
     if _session_uses_gpu(session):
-        return _GpuLockContext()
-    return _NoOpContext()
+        # Determine provider mix. On any failure treat as compound to
+        # match the conservative "unknown providers" branch below.
+        try:
+            providers = set(session.get_providers())
+        except Exception:
+            providers = None
+        if providers is None or "CPUExecutionProvider" in providers:
+            ledger, request = _build_cpu_request(
+                session, label="mixed accelerator+CPU ONNX inference",
+            )
+            return _CompoundInferenceContext(ledger, request, cancel_check)
+        return _GpuLockContext(cancel_check)
+    try:
+        providers = set(session.get_providers())
+    except Exception:
+        # Unknown provider surface: fall through to the same
+        # conservative compound path — matches the pre-branch behavior
+        # for accelerator sessions with unreadable provider lists.
+        ledger, request = _build_cpu_request(
+            session, label="mixed accelerator+CPU ONNX inference",
+        )
+        return _CompoundInferenceContext(ledger, request, cancel_check)
+    if providers != {"CPUExecutionProvider"}:
+        ledger, request = _build_cpu_request(
+            session, label="mixed accelerator+CPU ONNX inference",
+        )
+        return _CompoundInferenceContext(ledger, request, cancel_check)
+
+    ledger, request = _build_cpu_request(session, label="CPU ONNX inference")
+    return ledger.acquire(request, cancel_check=cancel_check)
 
 
-class _NoOpContext:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
+def acquire_gpu_if_session_uses_it(session, *, cancel_check=None):
+    """Backward-compatible name for provider-aware inference coordination."""
+    return acquire_inference_resources(session, cancel_check=cancel_check)
 
 
 # Per-workspace regroup locks. Created lazily on first request. Entries

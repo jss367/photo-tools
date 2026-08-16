@@ -3223,6 +3223,753 @@ def test_resolve_worker_count_no_windows_cap_on_posix(monkeypatch):
     assert scanner._resolve_worker_count(list(range(200))) == 128
 
 
+def test_scanner_worker_count_obeys_process_cpu_grant(monkeypatch):
+    """scan_workers is a maximum request, not an entitlement."""
+    import config as cfg
+    import resource_ledger
+    import scanner
+
+    monkeypatch.setattr(cfg, "get", lambda _k: 16)
+    monkeypatch.setattr(scanner.os, "cpu_count", lambda: 16)
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=3)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        with scanner._claim_worker_count(list(range(100))) as workers:
+            assert workers == 3
+            assert ledger.snapshot()["cpu"]["allocated"] == 3
+        assert ledger.snapshot()["cpu"]["allocated"] == 0
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
+def test_scanner_reserves_capacity_for_exact_inference_claim(monkeypatch):
+    """Flexible hashing must leave room for the configured ONNX pool."""
+    import config as cfg
+    import resource_ledger
+    import scanner
+
+    monkeypatch.setattr(cfg, "get", lambda _k: 16)
+    monkeypatch.setattr(scanner.os, "cpu_count", lambda: 16)
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=12)
+    inference_threads = resource_ledger.cpu_inference_request(
+        ledger.cpu_capacity,
+    ).preferred
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        with scanner._claim_worker_count(list(range(100))) as workers:
+            assert workers == ledger.cpu_capacity - inference_threads
+            with ledger.acquire(resource_ledger.ResourceRequest(
+                cpu=resource_ledger.cpu_inference_request(ledger.cpu_capacity),
+                lanes=("cpu_ml",),
+            )) as inference:
+                assert inference.cpu_permits == inference_threads
+                assert ledger.snapshot()["cpu"]["allocated"] == ledger.cpu_capacity
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
+def test_scan_worker_wait_uses_bound_cancel_probe_without_explicit_callback(
+    tmp_path,
+):
+    """Job-bound cancellation must interrupt a standalone scanner wait."""
+    import threading
+
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    _create_test_images(
+        root,
+        {'': [f"{index}.jpg" for index in range(9)]},
+    )
+    db = Database(str(tmp_path / "test.db"))
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    holder = ledger.acquire(resource_ledger.ResourceRequest(
+        cpu=resource_ledger.CpuRequest(2, 2, 2),
+    ))
+    cancelled = threading.Event()
+    finished = threading.Event()
+    outcome = []
+
+    def run_scan():
+        with resource_ledger.bind_resource_cancel_check(cancelled.is_set):
+            try:
+                scanner.scan(root, db)
+            except resource_ledger.ResourceWaitCancelled:
+                outcome.append("cancelled")
+            finally:
+                finished.set()
+
+    thread = threading.Thread(target=run_scan)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while ledger.snapshot()["waiters"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ledger.snapshot()["waiters"] == 1
+        cancelled.set()
+        assert finished.wait(timeout=1.0)
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+        assert outcome == ["cancelled"]
+    finally:
+        holder.release()
+        thread.join(timeout=1.0)
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
+def test_concurrent_scanners_preserve_inference_reserve(monkeypatch):
+    """The scanner path wires ``cpu_reserve`` so two scans can't drain it.
+
+    Codex flagged that ``_claim_worker_count`` capping each grant at
+    ``capacity - inference_threads`` per request left two concurrent
+    scanners free to collectively consume the reserve — a 12-permit box
+    could dish out 4+4 permits to two scans, leaving only 4 for an
+    8-permit ONNX request and pushing text search past its 5-second
+    budget. Guards the wiring in ``_claim_worker_count`` itself so a
+    future refactor cannot silently drop ``cpu_reserve``.
+    """
+    import threading
+
+    import config as cfg
+    import resource_ledger
+    import scanner
+
+    monkeypatch.setattr(cfg, "get", lambda _k: 16)
+    monkeypatch.setattr(scanner.os, "cpu_count", lambda: 16)
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=12)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        first_ready = threading.Event()
+        release_first = threading.Event()
+        second_ready = threading.Event()
+        errors = []
+
+        def first_scanner():
+            try:
+                with scanner._claim_worker_count(list(range(100))):
+                    first_ready.set()
+                    assert release_first.wait(timeout=5.0)
+            except BaseException as exc:  # pragma: no cover - diagnostic
+                errors.append(exc)
+
+        def second_scanner():
+            try:
+                assert first_ready.wait(timeout=5.0)
+                second_ready.set()
+                # Would block until the first scanner releases; we don't
+                # care about the eventual grant, only that it doesn't
+                # steal from the reserve while the first still holds it.
+                with scanner._claim_worker_count(list(range(100))):
+                    pass
+            except BaseException as exc:  # pragma: no cover - diagnostic
+                errors.append(exc)
+
+        t1 = threading.Thread(target=first_scanner)
+        t2 = threading.Thread(target=second_scanner)
+        t1.start()
+        t2.start()
+        try:
+            assert first_ready.wait(timeout=5.0)
+            assert second_ready.wait(timeout=5.0)
+            # Give the second scanner a moment to reach its acquire and
+            # block on the exhausted reserve slice.
+            time.sleep(0.1)
+
+            snapshot = ledger.snapshot()
+            # Aggregate scanner-hashing allocation must fit inside the
+            # reserve, so an 8-permit inference request can still get
+            # in immediately.
+            assert snapshot["cpu"]["allocated"] <= 4
+
+            # Bound the inference acquire so a cpu_reserve regression
+            # surfaces as ResourceWaitCancelled instead of blocking the
+            # test thread until the CI job's own timeout hits — the whole
+            # point of this test is to fail fast when the reserve is
+            # bypassed and the first scanner still holds its lease.
+            _deadline = time.monotonic() + 5.0
+            inference_threads = resource_ledger.cpu_inference_request(
+                ledger.cpu_capacity,
+            ).preferred
+            with ledger.acquire(
+                resource_ledger.ResourceRequest(
+                    cpu=resource_ledger.cpu_inference_request(
+                        ledger.cpu_capacity,
+                    ),
+                    lanes=("cpu_ml",),
+                ),
+                cancel_check=lambda: time.monotonic() > _deadline,
+            ) as inference:
+                assert inference.cpu_permits == inference_threads
+        finally:
+            release_first.set()
+            t1.join(timeout=5.0)
+            t2.join(timeout=5.0)
+
+        assert not errors, errors
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
+def test_scan_releases_cpu_permits_while_paused(tmp_path, monkeypatch):
+    """When ``pause_check`` reports a pending pause during hashing, the
+    scanner must drop its CPU lease before parking at ``cancel_check``.
+
+    Codex flagged that the pause-aware ``cancel_check`` parked inside
+    ``_iter_features`` while the ``_claim_worker_count`` context was
+    still open — so a paused scan retained every CPU permit and left
+    submitted futures running. Other scans, model loads, and CPU
+    inference were blocked for the entire pause even though the user
+    intended this job to stop competing for resources.
+
+    Assertion contract: on the FIRST parking-shaped call to
+    ``cancel_check`` (the one that would block in the pipeline), the
+    ledger's CPU allocation must already be zero. After the pause
+    clears, the scanner must reacquire and finish. Every file must
+    still land in the DB.
+    """
+    import threading
+
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['a.jpg', 'b.jpg', 'c.jpg']})
+    db = Database(str(tmp_path / "test.db"))
+
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+
+    pause_state = {"active": False}
+    parking_alloc = []
+    resume_event = threading.Event()
+
+    def pause_check():
+        return pause_state["active"]
+
+    def cancel_check():
+        # Faithful emulation of the pipeline's pause-aware cancel_check:
+        # when a pause is pending, this call would enter
+        # ``pause_gate.checkpoint`` and block until resume. Capture the
+        # ledger allocation right at that moment — the fix's contract is
+        # that the scanner has already released its lease by the time it
+        # gets here. Resume once, so the retry loop can complete.
+        if pause_state["active"]:
+            parking_alloc.append(ledger.snapshot()["cpu"]["allocated"])
+            # In the real pipeline, ``pause_gate.wait_if_paused`` blocks
+            # here. Use a short wait so the test still fails obviously if
+            # the fix regresses (the resume_event will be set by the
+            # background thread below), rather than hanging forever.
+            resume_event.wait(timeout=5.0)
+            pause_state["active"] = False
+        return False
+
+    # Flip the pause on as soon as hashing announces itself (the status
+    # callback fires from inside ``_iter_features`` right after the lease
+    # is granted), then arm resume after a short delay so the ``cancel_
+    # check`` parking call has real breathing room to run under the
+    # unheld lease.
+    triggered = {"done": False}
+
+    def resume_after_delay():
+        time.sleep(0.1)
+        resume_event.set()
+
+    def status_callback(message, phase_current=None, phase_total=None, phase_label=None):
+        if not triggered["done"] and "Hashing" in message:
+            triggered["done"] = True
+            pause_state["active"] = True
+            threading.Thread(target=resume_after_delay, daemon=True).start()
+
+    try:
+        scanner.scan(
+            root,
+            db,
+            cancel_check=cancel_check,
+            pause_check=pause_check,
+            status_callback=status_callback,
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    # The scanner must have parked at cancel_check with the ledger
+    # showing zero CPU allocation — proving the lease was released
+    # before parking rather than being held across the whole pause.
+    assert parking_alloc, (
+        "cancel_check was never called with the pause pending — the "
+        "scanner did not detect the pause request during hashing"
+    )
+    assert parking_alloc[0] == 0, (
+        f"CPU permits were still held while the scanner parked "
+        f"(observed: {parking_alloc[0]}); the pause must drain the "
+        f"pool and release the lease first"
+    )
+    # Post-resume, the ledger must be idle again and every discovered
+    # photo must be recorded — the pause path is not allowed to drop
+    # work on the floor.
+    assert ledger.snapshot()["cpu"]["allocated"] == 0
+    photos = db.get_photos(per_page=100)
+    assert {os.path.basename(p["filename"]) for p in photos} == {
+        "a.jpg", "b.jpg", "c.jpg",
+    }
+
+
+def test_scan_does_not_construct_worker_pool_while_pause_remains_pending(
+    tmp_path, monkeypatch,
+):
+    """A non-parking pause probe must back off before claiming workers."""
+    import threading
+
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    filenames = [f"{letter}.jpg" for letter in "abcdefghi"]
+    _create_test_images(root, {'': filenames})
+    db = Database(str(tmp_path / "test.db"))
+    pause_active = threading.Event()
+    pause_active.set()
+    pool_pause_states = []
+
+    class ReadyFuture:
+        def __init__(self, function, path):
+            self.function = function
+            self.path = path
+
+        def result(self, timeout=None):
+            return self.function(self.path)
+
+    class FakeProcessPool:
+        def __init__(self, *args, **kwargs):
+            pool_pause_states.append(pause_active.is_set())
+            self._processes = {}
+
+        def submit(self, function, path):
+            return ReadyFuture(function, path)
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            return None
+
+    def clear_pause():
+        time.sleep(0.12)
+        pause_active.clear()
+
+    monkeypatch.setattr(scanner, "ProcessPoolExecutor", FakeProcessPool)
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    resume_thread = threading.Thread(target=clear_pause)
+    resume_thread.start()
+    try:
+        scanner.scan(
+            root,
+            db,
+            cancel_check=lambda: False,
+            pause_check=pause_active.is_set,
+        )
+    finally:
+        resume_thread.join(timeout=2.0)
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    assert pool_pause_states == [False]
+    photos = db.get_photos(per_page=100)
+    assert {os.path.basename(photo["filename"]) for photo in photos} == set(filenames)
+
+
+def test_scan_cancel_only_check_prevents_parking_inside_lease(tmp_path):
+    """Regression: without a non-parking cancel probe, the scanner had
+    a race window inside ``_claim_worker_count``. ``_pause_pending()``
+    returned False, Pause was requested externally, then
+    ``_check_cancelled()`` invoked the parking ``cancel_check`` and
+    parked — while the lease and worker pool were still open. The job
+    reported ``paused`` while retaining every CPU permit, blocking
+    replacement scans and CPU inference for the full pause duration.
+
+    With ``cancel_only_check`` supplied, the inside-lease boundaries
+    use it (non-parking) so a Pause arriving in the race window makes
+    ``_check_cancelled_no_park`` raise ``_ScanPauseRequested``; the
+    enclosing frame drains the pool, releases the lease, and only
+    then parks at the outer ``_check_cancelled``. The parking
+    ``cancel_check`` must NEVER be called while the lease is held —
+    that is the deterministic guarantee.
+
+    Contract: with the fix, ``cancel_check`` is called ONLY after the
+    lease has been released (allocated == 0). The test triggers pause
+    exactly in the race window (between ``pause_check`` and the next
+    boundary) by having ``pause_check`` flip True on its second call
+    from inside the lease.
+    """
+    import threading
+
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': [f"{i:02d}.jpg" for i in range(6)]})
+    db = Database(str(tmp_path / "test.db"))
+
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+
+    parking_call_allocs = []
+    pause_pending = threading.Event()
+    resume_event = threading.Event()
+    cancel_only_calls = {"n": 0}
+
+    def pause_check():
+        return pause_pending.is_set()
+
+    def cancel_only_check():
+        cancel_only_calls["n"] += 1
+        # Emulate the race: on the third inside-lease probe, flip the
+        # pause pending flag so that IF the code fell back to the
+        # parking cancel_check, it would observe the race window and
+        # park. With the fix, this is the branch that raises
+        # _ScanPauseRequested and unwinds the lease.
+        if cancel_only_calls["n"] == 3 and not pause_pending.is_set():
+            pause_pending.set()
+            threading.Thread(
+                target=lambda: (time.sleep(0.1), resume_event.set()),
+                daemon=True,
+            ).start()
+        return False
+
+    def cancel_check():
+        # This MUST only fire after the lease is released. Capture the
+        # ledger allocation at every call. The parking behavior is
+        # emulated by waiting on resume_event when pause is pending.
+        parking_call_allocs.append(ledger.snapshot()["cpu"]["allocated"])
+        if pause_pending.is_set():
+            resume_event.wait(timeout=5.0)
+            pause_pending.clear()
+        return False
+
+    try:
+        scanner.scan(
+            root,
+            db,
+            cancel_check=cancel_check,
+            pause_check=pause_check,
+            cancel_only_check=cancel_only_check,
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    # Every parking cancel_check call must have observed the lease as
+    # released. Under the pre-fix behavior at least one call would have
+    # fired while the lease was still held (allocated > 0).
+    assert parking_call_allocs, (
+        "cancel_check was never called — the pause path did not park"
+    )
+    assert all(a == 0 for a in parking_call_allocs), (
+        f"Parking cancel_check must never run while the scanner lease "
+        f"is held. Observed CPU allocations at parking calls: "
+        f"{parking_call_allocs!r}. If any is non-zero, the race window "
+        f"where a Pause arriving between pause_check and cancel_check "
+        f"parked the job while retaining CPU permits is still open."
+    )
+    # Every file must still land: pause+resume is not allowed to drop work.
+    photos = db.get_photos(per_page=100)
+    assert len(photos) == 6, f"expected 6 photos indexed, got {len(photos)}"
+
+
+def test_scan_pause_check_none_preserves_existing_behavior(tmp_path):
+    """Callers that don't supply ``pause_check`` see the historical
+    single-lease hashing path — the new keyword is fully opt-in."""
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['a.jpg', 'b.jpg']})
+    db = Database(str(tmp_path / "test.db"))
+
+    # Should not raise and must catalog every file.
+    scanner.scan(root, db)
+
+    photos = db.get_photos(per_page=100)
+    assert len(photos) == 2
+
+
+def test_scan_pause_while_waiting_for_permits_suspends_wait_timing(
+    tmp_path,
+):
+    """A standalone pause parking inside ``ResourceLedger.acquire``'s wait
+    must NOT accumulate into the persisted resource-wait total.
+
+    Codex flagged that ``_iter_features`` threads ``_check_cancelled``
+    into ``_claim_worker_count`` as the ledger's cancellation probe. On
+    a standalone ``/api/jobs/scan`` or ``/api/jobs/import-photos`` run
+    the caller-supplied ``cancel_check`` is the runner's pause-aware
+    probe, so it parks for the full pause. Without suspending the
+    active-wait timer around that park, the ledger persists the pause
+    duration as resource contention — an hour-long user pause becomes
+    an hour of ``wait_seconds`` even though no scanner or
+    inference contended for those permits.
+
+    Setup: reserve the ledger's only permit, start scanner in a
+    background thread so it blocks in ``ledger.acquire`` waiting for
+    the permit, then flip pause on and have ``cancel_check`` park for
+    ~0.4s before releasing the reservation. The scanner's recorded
+    wait must exclude the parked portion — the wall-clock idle here is
+    still ~0.4s, but the accounted wait must be a small fraction of
+    that.
+    """
+    import threading
+
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['a.jpg']})
+    db = Database(str(tmp_path / "test.db"))
+
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=1)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    blocker = ledger.acquire(resource_ledger.ResourceRequest(
+        cpu=resource_ledger.CpuRequest(1, 1, 1),
+    ))
+
+    pause_state = {"active": False}
+    park_completed = threading.Event()
+    park_duration = 1.0
+
+    def pause_check():
+        return pause_state["active"]
+
+    def cancel_check():
+        if pause_state["active"]:
+            # Emulate the runner's pause-aware probe parking on the
+            # pause. In production this is pause_gate.wait_if_paused.
+            time.sleep(park_duration)
+            pause_state["active"] = False
+            park_completed.set()
+        return False
+
+    scanner_owner = "test-standalone-scan"
+
+    def trigger_pause_then_release():
+        # Wait until the scanner is confirmed blocked in ledger.acquire
+        # (it is the only thing the ledger is waiting for besides the
+        # blocker), then arm the pause. cancel_check parks for
+        # ``park_duration`` and releases the reservation once through.
+        while True:
+            snap = ledger.snapshot()
+            if snap["cpu"]["allocated"] >= 1 and snap.get("waiters", 0) >= 1:
+                break
+            time.sleep(0.01)
+        pause_state["active"] = True
+        park_completed.wait(timeout=5.0)
+        blocker.release()
+
+    try:
+        threading.Thread(
+            target=trigger_pause_then_release, daemon=True,
+        ).start()
+        with resource_ledger.bind_resource_owner(scanner_owner):
+            scanner.scan(
+                root,
+                db,
+                cancel_check=cancel_check,
+                pause_check=pause_check,
+            )
+        timing = ledger.owner_timing(scanner_owner)
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    # The 1.0s park must be excluded from the accounted wait. The
+    # ledger polls its cancel_check on a 0.2s condition-wait interval,
+    # so the recorded wait accounts for that pre-park poll plus small
+    # scheduler jitter — well under half a second — while a regression
+    # that dropped the suspend bracket would report ~1.0 + ~0.2 seconds
+    # (the full park plus the outer poll). Assert well below the park
+    # duration to catch the regression with headroom for slow CI.
+    assert timing["wait_seconds"] < park_duration * 0.6, (
+        f"wait_seconds={timing['wait_seconds']:.3f} is not sufficiently "
+        f"below park_duration={park_duration:.3f}; pause parking is "
+        f"being counted as resource contention"
+    )
+
+
+@pytest.mark.parametrize("pause_after_result", [False, True])
+def test_scan_pause_requeues_worker_result(
+    tmp_path, monkeypatch, pause_after_result,
+):
+    """Pauses during or immediately after a worker wait release the lease."""
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    filenames = [f"{letter}.jpg" for letter in "abcdefghi"]
+    _create_test_images(root, {'': filenames})
+    db = Database(str(tmp_path / "test.db"))
+
+    pause_state = {"active": False, "triggered": False}
+    parking_alloc = []
+
+    class PendingFuture:
+        def __init__(self, function, path):
+            self.function = function
+            self.path = path
+
+        def result(self, timeout=None):
+            if not pause_state["triggered"]:
+                pause_state["triggered"] = True
+                pause_state["active"] = True
+                if pause_after_result:
+                    return self.function(self.path)
+                raise scanner.TimeoutError()
+            return self.function(self.path)
+
+    class FakeProcessPool:
+        def __init__(self, *args, **kwargs):
+            self._processes = {}
+
+        def submit(self, function, path):
+            return PendingFuture(function, path)
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            return None
+
+    def cancel_check():
+        if pause_state["active"]:
+            parking_alloc.append(ledger.snapshot()["cpu"]["allocated"])
+        pause_state["active"] = False
+        return False
+
+    monkeypatch.setattr(scanner, "ProcessPoolExecutor", FakeProcessPool)
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        scanner.scan(
+            root,
+            db,
+            cancel_check=cancel_check,
+            pause_check=lambda: pause_state["active"],
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    assert pause_state["triggered"]
+    assert parking_alloc == [0]
+    photos = db.get_photos(per_page=100)
+    assert {os.path.basename(photo["filename"]) for photo in photos} == set(filenames)
+
+
+def test_sequential_scan_pause_after_compute_releases_lease(tmp_path, monkeypatch):
+    """The one-worker path also checks pause before yielding to its caller."""
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    filenames = ["a.jpg", "b.jpg", "c.jpg"]
+    _create_test_images(root, {'': filenames})
+    db = Database(str(tmp_path / "test.db"))
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    original_compute = scanner._compute_file_features
+    pause_state = {"active": False, "triggered": False}
+    parking_alloc = []
+
+    def compute_then_pause(path):
+        result = original_compute(path)
+        if not pause_state["triggered"]:
+            pause_state["triggered"] = True
+            pause_state["active"] = True
+        return result
+
+    def cancel_check():
+        if pause_state["active"]:
+            parking_alloc.append(ledger.snapshot()["cpu"]["allocated"])
+        pause_state["active"] = False
+        return False
+
+    monkeypatch.setattr(scanner, "_compute_file_features", compute_then_pause)
+    try:
+        scanner.scan(
+            root,
+            db,
+            cancel_check=cancel_check,
+            pause_check=lambda: pause_state["active"],
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    assert parking_alloc == [0]
+    photos = db.get_photos(per_page=100)
+    assert {os.path.basename(photo["filename"]) for photo in photos} == set(filenames)
+
+
+def test_scan_consumer_pause_resumes_generator_before_parking(
+    tmp_path, monkeypatch,
+):
+    """A pause after yield must resume the generator to drop its CPU lease."""
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    filenames = [f"{letter}.jpg" for letter in "abcdefghi"]
+    _create_test_images(root, {'': filenames})
+    db = Database(str(tmp_path / "test.db"))
+    pause_state = {"active": False, "triggered": False}
+    parking_alloc = []
+
+    class ReadyFuture:
+        def __init__(self, function, path):
+            self.function = function
+            self.path = path
+
+        def result(self, timeout=None):
+            return self.function(self.path)
+
+    class FakeProcessPool:
+        def __init__(self, *args, **kwargs):
+            self._processes = {}
+
+        def submit(self, function, path):
+            return ReadyFuture(function, path)
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            return None
+
+    def progress_callback(current, _total):
+        if current == 1 and not pause_state["triggered"]:
+            pause_state["triggered"] = True
+            pause_state["active"] = True
+
+    def cancel_check():
+        if pause_state["active"]:
+            parking_alloc.append(ledger.snapshot()["cpu"]["allocated"])
+        pause_state["active"] = False
+        return False
+
+    monkeypatch.setattr(scanner, "ProcessPoolExecutor", FakeProcessPool)
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        scanner.scan(
+            root,
+            db,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+            pause_check=lambda: pause_state["active"],
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    assert pause_state["triggered"]
+    assert parking_alloc == [0]
+    photos = db.get_photos(per_page=100)
+    assert {os.path.basename(photo["filename"]) for photo in photos} == set(filenames)
+
+
 # -- scan resilience: retry on locked DB, mark folder partial on abort --
 
 

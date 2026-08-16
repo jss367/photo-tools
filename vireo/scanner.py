@@ -9,6 +9,7 @@ import logging
 import multiprocessing
 import os
 import sys
+import time
 from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, TimeoutError
 from datetime import datetime
@@ -36,6 +37,13 @@ from preview_cache import (
 )
 from render_source import exif_orientation as _exif_orientation_from_data
 from render_source import is_undersized
+from resource_ledger import (
+    ResourceRequest,
+    cpu_inference_request,
+    cpu_phase_request,
+    get_resource_ledger,
+    suspend_resource_wait_timing,
+)
 from xmp import read_hierarchical_keywords, read_keywords
 
 log = logging.getLogger(__name__)
@@ -45,6 +53,19 @@ EMPTY_FILE_SHA256 = hashlib.sha256(b"").hexdigest()
 # ``ScanCancelled`` is defined in ``image_loader`` (where the low-level
 # walkers raise it) and re-exported here for callers that use
 # ``from scanner import ScanCancelled``.
+
+
+class _ScanPauseRequested(RuntimeError):
+    """Internal signal that the caller wants the scanner to release its
+    process-wide CPU permits and park before resuming.
+
+    Raised only inside ``_iter_features`` when a ``pause_check`` was
+    supplied. It never escapes the scanner — the enclosing frame catches
+    it, drains the pool, releases the CPU lease by exiting
+    ``_claim_worker_count``, and then invokes the pause-aware
+    ``cancel_check`` (which parks). Once the pause resolves, hashing
+    reacquires a fresh lease and continues with the remaining files.
+    """
 
 
 def _status_callback_supports_phase(status_callback):
@@ -226,6 +247,31 @@ def _resolve_worker_count(files_to_process):
     if sys.platform == "win32":
         workers = min(workers, _WINDOWS_MAX_WORKERS)
     return max(1, min(workers, n))
+
+
+@contextlib.contextmanager
+def _claim_worker_count(files_to_process, cancel_check=None):
+    """Yield the scanner worker grant from the process-wide CPU budget."""
+    desired = _resolve_worker_count(files_to_process)
+    ledger = get_resource_ledger()
+    inference_threads = cpu_inference_request(ledger.cpu_capacity).preferred
+    spare_after_inference = ledger.cpu_capacity - inference_threads
+    cpu_reserve = inference_threads if spare_after_inference > 0 else 0
+    request = ResourceRequest(
+        cpu=cpu_phase_request(
+            ledger.cpu_capacity,
+            minimum=1,
+            preferred=desired,
+            maximum=desired,
+        ),
+        # The ledger applies this reserve to the aggregate allocation, so two
+        # concurrent flexible scans cannot each consume the same nominal
+        # spare capacity and collectively block an exact inference claim.
+        cpu_reserve=cpu_reserve,
+        label="scanner hashing",
+    )
+    with ledger.acquire(request, cancel_check=cancel_check) as lease:
+        yield lease.cpu_permits
 
 
 def _import_keywords_for_photo(db, photo_id, xmp_path_str):
@@ -1631,7 +1677,7 @@ _EMPTY_SCAN_COUNTS = {
 }
 
 
-def scan(root, db, progress_callback=None, incremental=False, extract_full_metadata=True, photo_callback=None, skip_paths=None, status_callback=None, recursive=True, restrict_dirs=None, restrict_files=None, vireo_dir=None, thumb_cache_dir=None, permission_error_callback=None, cancel_check=None, skip_working_copies=False, repair_missing_metadata=False, register_restrict_dirs_as_roots=True, allow_photo_inserts=True, counts=None, discovered_files=None):
+def scan(root, db, progress_callback=None, incremental=False, extract_full_metadata=True, photo_callback=None, skip_paths=None, status_callback=None, recursive=True, restrict_dirs=None, restrict_files=None, vireo_dir=None, thumb_cache_dir=None, permission_error_callback=None, cancel_check=None, pause_check=None, cancel_only_check=None, skip_working_copies=False, repair_missing_metadata=False, register_restrict_dirs_as_roots=True, allow_photo_inserts=True, counts=None, discovered_files=None):
     """Walk a folder tree, discover photos, read metadata, populate database.
 
     Args:
@@ -1676,7 +1722,28 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             — a "Found 0 images" black box from the user's perspective.
         cancel_check: optional callable returning truthy when the caller
             wants scanning to stop promptly. When set, scan raises
-            ScanCancelled at cancellation checkpoints.
+            ScanCancelled at cancellation checkpoints. This probe MAY
+            park (pipeline callers wire it to ``_pause_checkpoint``
+            which blocks on Pause); it is only called between leases,
+            never inside ``_claim_worker_count``.
+        pause_check: optional NON-parking probe returning truthy when a
+            pause is pending. Checked at every inside-lease boundary so
+            the scanner can raise ``_ScanPauseRequested`` and unwind
+            the lease before the caller's parking ``cancel_check`` runs.
+        cancel_only_check: optional NON-parking probe returning truthy
+            when the job is cancelled (but NOT for pause — that is
+            ``pause_check``'s job). Used inside the lease to detect
+            cancellation without triggering the parking cancel path.
+            Without this, the pause_check/cancel_check ordering has a
+            race window: pause set between the pause probe and the
+            (parking) cancel probe would park the job while still
+            holding CPU permits and the process pool. Callers should
+            pass ``runner.cancellation_requested`` when they have a
+            runner. When omitted, the inside-lease boundaries still
+            call the parking ``cancel_check`` — the race window
+            described in that Codex finding remains open in that
+            fallback path, but nothing regresses vs. the pre-fix
+            behavior.
         skip_working_copies: if True, suppress the end-of-scan
             ``_extract_working_copies`` pass while still running
             ``_pair_raw_jpeg_companions`` (with cache context) and
@@ -1777,7 +1844,24 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         return counts
 
     def _check_cancelled():
-        if cancel_check is not None and cancel_check():
+        if cancel_check is None:
+            return
+        # ``_check_cancelled`` is threaded into ``ResourceLedger.acquire``
+        # through ``_claim_worker_count`` as its cancellation probe. On a
+        # standalone ``/api/jobs/scan`` or ``/api/jobs/import-photos`` job
+        # the caller-supplied ``cancel_check`` is the runner's pause-aware
+        # probe, so it parks for the whole pause; without the suspend
+        # bracket, the ledger's active wait timer accumulates that idle
+        # time as resource contention and inflates the persisted
+        # ``resource_wait_seconds`` diagnostic by the full pause length.
+        # The pipeline path already brackets its checkpoints with
+        # ``suspend_resource_wait_timing()`` inside ``_pause_checkpoint``;
+        # mirror that here so both call sites report contention honestly.
+        # When there is no active wait (every non-``ledger.acquire`` call
+        # site), the suspend context is a cheap no-op.
+        with suspend_resource_wait_timing():
+            cancelled = cancel_check()
+        if cancelled:
             raise ScanCancelled("scan cancelled")
 
     def _emit_status(message, phase_current=None, phase_total=None, phase_label=None):
@@ -2418,58 +2502,201 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # every byte of the image; everything else in the loop is cheap DB or
     # dict work. Results stream in order, so workers keep computing the tail
     # while the main thread commits the head — no O(n) buffer of features.
-    workers = _resolve_worker_count(files_to_process)
-    if paths_to_extract and status_callback:
-        _emit_status(
-            f"Hashing {len(paths_to_extract)} files ({workers} worker{'s' if workers != 1 else ''})..."
-        )
+    def _pause_pending():
+        return pause_check is not None and pause_check()
+
+    def _check_cancelled_no_park():
+        """Cancel probe safe to call INSIDE ``_claim_worker_count``.
+
+        Never parks. When ``cancel_only_check`` was supplied the
+        pause/cancel probes are strictly non-parking, so a Pause
+        arriving between the two calls raises ``_ScanPauseRequested``
+        instead of triggering the caller's parking ``cancel_check``.
+        That lets the enclosing frame drain workers and release CPU
+        permits before parking on the outer ``_check_cancelled`` call.
+
+        When ``cancel_only_check`` is not supplied this falls back to
+        the pause-then-parking-cancel sequence with the race window
+        Codex flagged — pause set between the two calls parks the job
+        while it still holds the lease. Not worse than the pre-fix
+        behavior, and every pipeline caller now wires the non-parking
+        probe.
+        """
+        if _pause_pending():
+            raise _ScanPauseRequested()
+        if cancel_only_check is not None:
+            if cancel_only_check():
+                raise ScanCancelled("scan cancelled")
+            return
+        _check_cancelled()
 
     def _iter_features():
-        if workers > 1:
-            mp_ctx = multiprocessing.get_context(_SCAN_MP_METHOD)
-            pool = ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx)
-            try:
-                # Bounded in-flight window instead of pool.map(): on Python
-                # 3.11 Executor.map eagerly submits every input, so on a
-                # 200k-file scan we would hold 200k queued futures in RAM.
-                # A few submissions per worker is enough to keep them fed
-                # while the main thread drains results in order.
-                def _feature_result(fut):
-                    while True:
-                        _check_cancelled()
-                        try:
-                            return fut.result(timeout=0.2)
-                        except TimeoutError:
-                            continue
-
-                max_in_flight = workers * 4
-                pending = deque()
-                inputs = zip(files_to_process, paths_to_extract, strict=True)
-                for image_path, path_str in inputs:
-                    _check_cancelled()
-                    pending.append((image_path, pool.submit(_compute_file_features, path_str)))
-                    if len(pending) >= max_in_flight:
-                        done_path, done_fut = pending.popleft()
-                        _check_cancelled()
-                        yield done_path, _feature_result(done_fut)
-                while pending:
-                    done_path, done_fut = pending.popleft()
-                    _check_cancelled()
-                    yield done_path, _feature_result(done_fut)
-            except BaseException:
-                pool.shutdown(wait=False, cancel_futures=True)
-                raise
-            else:
-                pool.shutdown(wait=True)
-        else:
-            for image_path, path_str in zip(files_to_process, paths_to_extract, strict=True):
+        if not files_to_process:
+            return
+        # Track remaining work outside the ``_claim_worker_count`` context so
+        # a pause can drop the lease, park at the caller's pause-aware
+        # ``cancel_check``, then reacquire a fresh lease for whatever is
+        # left. Without this, ``_check_cancelled`` parking inside the pool
+        # loop would hold every CPU permit for the entire pause — blocking
+        # replacement scans, CPU inference, and model loads even though the
+        # user asked this job to stop competing for resources.
+        remaining = deque(
+            zip(files_to_process, paths_to_extract, strict=True),
+        )
+        while remaining:
+            # A standalone caller may provide a non-parking cancel probe.
+            # Do not repeatedly claim permits and construct a process pool
+            # while its independent pause probe remains true.
+            if _pause_pending():
                 _check_cancelled()
-                yield image_path, _compute_file_features(path_str)
+                if _pause_pending():
+                    time.sleep(0.05)
+                continue
+            with _claim_worker_count(
+                [ip for ip, _ in remaining],
+                cancel_check=(
+                    _check_cancelled if cancel_check is not None else None
+                ),
+            ) as workers:
+                if status_callback:
+                    _emit_status(
+                        f"Hashing {len(remaining)} files "
+                        f"({workers} worker{'s' if workers != 1 else ''})..."
+                    )
+                log.info(
+                    "Scanner hashing granted %d worker(s) for %d files",
+                    workers, len(remaining),
+                )
+                if workers > 1:
+                    mp_ctx = multiprocessing.get_context(_SCAN_MP_METHOD)
+                    pool = ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx)
+                    paused = False
+                    try:
+                        # Bounded in-flight window instead of pool.map(): on Python
+                        # 3.11 Executor.map eagerly submits every input, so on a
+                        # 200k-file scan we would hold 200k queued futures in RAM.
+                        # A few submissions per worker is enough to keep them fed
+                        # while the main thread drains results in order.
+                        #
+                        # Pause is checked BEFORE ``_check_cancelled`` at every
+                        # boundary. The pipeline's ``cancel_check`` parks on a
+                        # pending pause, so calling it first would trap the
+                        # scanner inside the lease context; raising
+                        # ``_ScanPauseRequested`` while the pool is still
+                        # running lets the enclosing frame drain workers and
+                        # release CPU permits before we park.
+                        def _feature_result(fut):
+                            while True:
+                                # ``_check_cancelled_no_park`` raises
+                                # ``_ScanPauseRequested`` on pending pause
+                                # and only calls the parking probe if it
+                                # cannot be avoided (no ``cancel_only_check``
+                                # supplied). Closes the race Codex flagged
+                                # where ``_pause_pending`` returns False,
+                                # Pause fires, and the previously-called
+                                # ``_check_cancelled`` parked while still
+                                # inside the lease and pool.
+                                _check_cancelled_no_park()
+                                try:
+                                    return fut.result(timeout=0.2)
+                                except TimeoutError:
+                                    continue
+
+                        max_in_flight = workers * 4
+                        pending = deque()
+                        while remaining:
+                            _check_cancelled_no_park()
+                            image_path, path_str = remaining[0]
+                            pending.append((
+                                image_path, path_str,
+                                pool.submit(_compute_file_features, path_str),
+                            ))
+                            remaining.popleft()
+                            if len(pending) >= max_in_flight:
+                                done_path, _done_str, done_fut = pending[0]
+                                _check_cancelled_no_park()
+                                result = _feature_result(done_fut)
+                                if _pause_pending():
+                                    raise _ScanPauseRequested()
+                                pending.popleft()
+                                yield done_path, result
+                        while pending:
+                            done_path, _done_str, done_fut = pending[0]
+                            _check_cancelled_no_park()
+                            result = _feature_result(done_fut)
+                            if _pause_pending():
+                                raise _ScanPauseRequested()
+                            pending.popleft()
+                            yield done_path, result
+                    except _ScanPauseRequested:
+                        # Requeue every submitted-but-undrained item so the
+                        # next pass reruns them under a fresh lease. Their
+                        # workers are torn down below.
+                        paused = True
+                        for image_path, path_str, _fut in reversed(pending):
+                            remaining.appendleft((image_path, path_str))
+                        # Terminate now, wait below with the lease still
+                        # held so a replacement scan cannot claim the same
+                        # permits while old workers are still consuming CPU.
+                        for proc in list(getattr(pool, "_processes", {}).values()):
+                            with contextlib.suppress(Exception):
+                                proc.terminate()
+                        pool.shutdown(wait=True, cancel_futures=True)
+                    except BaseException:
+                        # Actively terminate the worker processes so their CPU
+                        # work stops now, then wait for them to actually exit
+                        # before letting ``_claim_worker_count`` release its
+                        # CPU permits. ``shutdown(wait=False)`` alone would
+                        # unwind the lease while old workers were still
+                        # hashing — a replacement scan or CPU inference could
+                        # then receive the same permits and defeat the
+                        # process-wide budget, and ``JobRunner.shutdown()``
+                        # could report completion while hashing continued.
+                        for proc in list(getattr(pool, "_processes", {}).values()):
+                            with contextlib.suppress(Exception):
+                                proc.terminate()
+                        pool.shutdown(wait=True, cancel_futures=True)
+                        raise
+                    else:
+                        pool.shutdown(wait=True)
+                else:
+                    paused = False
+                    while remaining:
+                        # ``_check_cancelled_no_park`` raises
+                        # ``_ScanPauseRequested`` on pending pause and
+                        # only invokes the parking probe if no
+                        # ``cancel_only_check`` was supplied. Caught and
+                        # translated to ``paused = True`` so this branch
+                        # keeps its "drop the lease, then park outside"
+                        # symmetry with the pool branch above.
+                        try:
+                            _check_cancelled_no_park()
+                        except _ScanPauseRequested:
+                            paused = True
+                            break
+                        image_path, path_str = remaining[0]
+                        result = _compute_file_features(path_str)
+                        if _pause_pending():
+                            paused = True
+                            break
+                        remaining.popleft()
+                        yield image_path, result
+            # Lease is released here (``_claim_worker_count`` exited).
+            # Park until the caller resumes (or cancels) before rebuilding
+            # the pool with the remaining files. ``_check_cancelled`` is
+            # pause-aware: when the pipeline is pausing, ``cancel_check``
+            # blocks inside it until resume, and raises ``ScanCancelled``
+            # if the pause turns into a cancellation.
+            if paused:
+                _check_cancelled()
+        # The final result is consumed while this generator is suspended.
+        # Check once more only after the last lease has unwound so a pause or
+        # cancellation arriving during that consumer work cannot strand the
+        # pool and its CPU permits.
+        _check_cancelled()
 
     try:
         for image_path, (phash, file_hash) in _iter_features():
-            _check_cancelled()
-
             # File stats — first touch of the path in this loop. A file
             # deleted/renamed between discovery and here must skip, not
             # abort the scan and flag every folder in scope 'partial'.

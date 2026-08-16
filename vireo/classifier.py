@@ -288,15 +288,15 @@ def _run_text_batched(text_session, text_input_name, tokens, model_dir=None):
     races) are passed through unchanged so a transient runtime error
     can't permanently flag a healthy install for Repair.
     """
-    # Serialise GPU access across concurrent pipelines: when two pipelines
+    # Coordinate inference across concurrent pipelines: when two pipelines
     # load BioCLIP with different label fingerprints, both factories run
     # concurrently under the cache's load_lock-per-key, and each one
     # computes its own label embeddings here. Without this lock, both
-    # text encoders run on the GPU at the same time and can OOM.
-    # Skipped for CPU-only sessions (same rationale as image_session).
-    from pipeline_locks import acquire_gpu_if_session_uses_it
+    # GPU text encoders can otherwise OOM. CPU-only sessions take their
+    # configured CPU permits and the exclusive cpu_ml lane instead.
+    from pipeline_locks import acquire_inference_resources
     try:
-        with acquire_gpu_if_session_uses_it(text_session):
+        with acquire_inference_resources(text_session):
             return text_session.run(None, {text_input_name: tokens})[0]
     except Exception as e:
         if not _looks_like_stale_batched_export(e):
@@ -738,7 +738,7 @@ class Classifier:
             numpy float32 array of shape (1, embedding_dim) -- normalized
         """
         from PIL import Image as PILImage
-        from pipeline_locks import acquire_gpu_if_session_uses_it
+        from pipeline_locks import acquire_inference_resources
 
         if isinstance(image, str | os.PathLike):
             with PILImage.open(image) as img:
@@ -746,16 +746,11 @@ class Classifier:
         else:
             input_arr = self._preprocess(image)
 
-        # GPU serialisation across concurrent pipelines, scoped tightly to
-        # the forward pass. Preprocessing above (load/decode/resize) and the
-        # normalisation below run without the lock so concurrent pipelines
-        # can use the GPU while this one does CPU work. Skipped entirely
-        # for CPU-only sessions — Apple Silicon excludes CoreML when an
-        # external-data ONNX is present, and CPU-only installs likewise
-        # report no GPU provider; taking the semaphore there would block
-        # real GPU stages in other pipelines for work that never touches
-        # the GPU.
-        with acquire_gpu_if_session_uses_it(self._image_session):
+        # Provider-aware coordination is scoped tightly to the forward pass.
+        # Preprocessing above and normalization below run without a lease.
+        # CPU sessions take configured CPU permits plus cpu_ml; accelerator
+        # sessions take the existing process-wide semaphore.
+        with acquire_inference_resources(self._image_session):
             features = self._image_session.run(
                 None, {self._image_input_name: input_arr}
             )[0]

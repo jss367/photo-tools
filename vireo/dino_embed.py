@@ -278,7 +278,10 @@ def _get_dinov2_session(variant="vit-b14"):
     # on the steady-state cache hit. The slow path here serialises first
     # load and variant-swap so two concurrent acquirers don't both create
     # an ONNX session and leak the loser into VRAM.
-    with _dinov2_session_lock:
+    with onnx_runtime.acquire_session_cache_lock(
+        _dinov2_session_lock,
+        label="DINOv2 session cache",
+    ):
         if _session is not None and _variant_loaded == variant:
             return _session
 
@@ -294,7 +297,19 @@ def _get_dinov2_session(variant="vit-b14"):
             )
 
         log.info("Loading DINOv2 ONNX (%s)...", variant)
-        sess = onnx_runtime.create_session(model_path)
+        # Pass the PURE cancel probe (never parks on pause) so
+        # ``ledger.acquire`` inside ``create_session`` cannot park
+        # ``wait_if_paused`` while ``_dinov2_session_lock`` is still
+        # held — an unpaused peer requesting the same model would
+        # otherwise block until Resume. Falls back to the pause-aware
+        # probe when no pure probe is bound (see
+        # ``resolve_resource_pure_cancel_check``), matching the
+        # pre-fix behavior for callers that haven't wired the pure
+        # probe yet.
+        from resource_ledger import resolve_resource_pure_cancel_check
+        sess = onnx_runtime.create_session(
+            model_path, cancel_check=resolve_resource_pure_cancel_check(),
+        )
 
         _session = sess
         _variant_loaded = variant
@@ -353,46 +368,18 @@ def embed_batch(images, variant="vit-b14"):
     ]
     batch = np.concatenate(tensors, axis=0)
 
-    # GPU serialisation across concurrent pipelines, scoped tightly to
-    # the forward pass. Preprocessing above (resize/normalize per image)
-    # runs without the lock so concurrent pipelines aren't blocked on
-    # CPU work.
+    # Provider-aware coordination is scoped tightly to the forward pass.
+    # Preprocessing above (resize/normalize per image) runs without a lease.
     #
-    # Skip the GPU semaphore when the session is CPU-only — on Apple
-    # Silicon with external-data models (CoreML excluded — see
-    # ``onnx_runtime.create_session``) and on CPU-only installs, DINO
-    # runs on the CPU. Taking the process-wide GPU lock there would
-    # needlessly block concurrent detector/classifier/SAM batches that
-    # *do* use the GPU, defeating the concurrency this design enables.
+    # CPU-only sessions skip the GPU semaphore and instead take their
+    # configured CPU permits plus the exclusive cpu_ml lane. Accelerator
+    # sessions retain the process-wide per-batch semaphore.
     input_name = session.get_inputs()[0].name
-    if _session_uses_gpu(session):
-        from pipeline_locks import acquire_gpu
-        with acquire_gpu():
-            outputs = session.run(None, {input_name: batch})
-    else:
+    from pipeline_locks import acquire_inference_resources
+    with acquire_inference_resources(session):
         outputs = session.run(None, {input_name: batch})
 
     return outputs[0].astype(np.float32)
-
-
-_GPU_PROVIDERS = ("CUDAExecutionProvider", "CoreMLExecutionProvider")
-
-
-def _session_uses_gpu(session):
-    """Return True if ``session`` is actually executing on a GPU provider.
-
-    ``InferenceSession.get_providers()`` returns the providers ONNX
-    Runtime decided to use after construction, so this reflects reality
-    even when CoreML was requested but excluded (e.g. for external-data
-    models). Falls back to ``True`` if the session doesn't expose
-    ``get_providers`` — the conservative default that matches prior
-    behavior.
-    """
-    try:
-        providers = session.get_providers()
-    except Exception:
-        return True
-    return any(p in _GPU_PROVIDERS for p in providers)
 
 
 def embed_subject(crop_image, variant="vit-b14"):

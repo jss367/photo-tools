@@ -8,6 +8,7 @@ import os
 import threading
 
 import numpy as np
+from resource_ledger import ResourceWaitCancelled
 
 log = logging.getLogger(__name__)
 
@@ -117,7 +118,12 @@ def _get_session():
     if _session is not None:
         return _session
 
-    with _lock:
+    from onnx_runtime import acquire_session_cache_lock
+
+    with acquire_session_cache_lock(
+        _lock,
+        label="MegaDetector session cache",
+    ):
         if _session is None:
             if not os.path.exists(MEGADETECTOR_ONNX_PATH):
                 raise RuntimeError(
@@ -126,8 +132,17 @@ def _get_session():
                 )
 
             from onnx_runtime import create_session
+            from resource_ledger import resolve_resource_pure_cancel_check
 
-            _session = create_session(MEGADETECTOR_ONNX_PATH)
+            # Pure cancel probe: ``create_session``'s ledger.acquire
+            # runs while ``_lock`` is still held; the pause-aware probe
+            # would park ``wait_if_paused`` under the cache lock and
+            # block every unpaused peer waiting on MegaDetector until
+            # Resume.
+            _session = create_session(
+                MEGADETECTOR_ONNX_PATH,
+                cancel_check=resolve_resource_pure_cancel_check(),
+            )
             log.info("MegaDetector ONNX model loaded")
 
     return _session
@@ -336,18 +351,16 @@ def detect_animals(image_path):
         input_tensor, preprocess_info = _preprocess(img_array)
 
         input_name = session.get_inputs()[0].name
-        # Hold the GPU semaphore for the inference call only, not for image
-        # I/O, decoding, or postprocessing. Holding it wider would block
-        # other pipelines' GPU stages on this pipeline's CPU/disk work.
-        # Skipped entirely for CPU-only sessions — on Apple Silicon the
-        # MegaDetector external-data ONNX excludes CoreML and runs on the
-        # CPU; SAM2/DINO may still be on CoreML in the same process, and
-        # blocking them on detector CPU work would defeat concurrency.
-        from pipeline_locks import acquire_gpu_if_session_uses_it
-        with acquire_gpu_if_session_uses_it(session):
+        # Coordinate only the inference call, not image I/O, decoding, or
+        # postprocessing. CPU sessions take their configured permits and
+        # cpu_ml lane; accelerator sessions take the per-batch GPU semaphore.
+        from pipeline_locks import acquire_inference_resources
+        with acquire_inference_resources(session):
             outputs = session.run(None, {input_name: input_tensor})
 
         return _postprocess(outputs, preprocess_info, RAW_CONF_FLOOR)
+    except ResourceWaitCancelled:
+        raise
     except Exception:
         log.warning("Detection failed for %s", image_path, exc_info=True)
         return None

@@ -10793,6 +10793,136 @@ def test_pipeline_eye_keypoints_stage_download_failure_skips_stage_not_pipeline(
     )
 
 
+def test_pipeline_eye_keypoints_download_cancel_finalizes_as_cancelled_not_failure(
+    tmp_path, monkeypatch,
+):
+    """A ``ResourceWaitCancelled`` from ``ensure_keypoint_weights`` — which
+    ``acquire_session_cache_lock`` raises when the bound cancel/pause
+    probe fires while another thread holds the per-model download lock —
+    must be finalized as a cooperative stage cancel, not misreported as
+    "failed to download keypoint weights". Regression for the CodeRabbit
+    review comment on ``vireo/keypoints.py:95``.
+    """
+    import config as cfg
+    import pipeline as pipeline_mod
+    from db import Database
+    from resource_ledger import ResourceWaitCancelled
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    pid = db.add_photo(folder_id, "p.jpg", ".jpg", 100, 1_000_000.0)
+    _drop_jpeg(folder_path, "p.jpg")
+    db.save_detections(
+        pid,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MegaDetector",
+    )
+    col_id = db.add_collection(
+        "Test", json.dumps([{"field": "photo_ids", "value": [pid]}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    monkeypatch.setattr(
+        pipeline_mod, "eye_keypoint_stage_preflight", lambda config: None,
+    )
+    monkeypatch.setattr(
+        Database, "list_photos_for_eye_keypoint_stage",
+        lambda self, **k: [
+            {"id": pid, "taxonomy_class": "Mammalia", "species_conf": 0.9},
+        ],
+    )
+
+    detect_called = [False]
+
+    def fake_detect_eye_keypoints_stage(*a, **k):
+        detect_called[0] = True
+
+    monkeypatch.setattr(
+        pipeline_mod, "detect_eye_keypoints_stage",
+        fake_detect_eye_keypoints_stage,
+    )
+
+    import keypoints as _kp_mod
+
+    def _ensure_cancelled(name, progress_callback=None):
+        raise ResourceWaitCancelled(
+            f"Cancelled while waiting for {name} keypoint download"
+        )
+
+    monkeypatch.setattr(_kp_mod, "ensure_keypoint_weights", _ensure_cancelled)
+
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_classify=True,
+        skip_extract_masks=False,
+        skip_regroup=True,
+    )
+
+    runner = FakeRunner()
+    job = _make_job()
+    # Must NOT raise: a cooperative cancel during weight-lock contention
+    # cannot tank the pipeline run.
+    result = run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    assert detect_called[0] is False, (
+        "detect_eye_keypoints_stage must be skipped when the weight lock "
+        "wait was cancelled; running it would crash on missing weights."
+    )
+
+    ek_finals = [
+        kw for (_, sid, kw) in runner.step_updates
+        if sid == "eye_keypoints" and "summary" in kw
+    ]
+    assert ek_finals, (
+        f"Expected eye_keypoints final update; got "
+        f"step_updates={runner.step_updates!r}"
+    )
+    final = ek_finals[-1]
+    assert final.get("status") == "completed", (
+        f"eye_keypoints must finalize as completed (cancelled variant), "
+        f"not failed; got {final!r}"
+    )
+    summary = final.get("summary") or ""
+    assert "Cancelled" in summary, (
+        f"eye_keypoints summary must say Cancelled — a user cancel is not "
+        f"a download failure; got {summary!r}"
+    )
+    assert "download" not in summary.lower(), (
+        f"eye_keypoints must not attribute a cancel to a download "
+        f"failure; got {summary!r}"
+    )
+
+    ek_result = result.get("stages", {}).get("eye_keypoints", {})
+    assert ek_result.get("cancelled") is True, (
+        f"result.stages.eye_keypoints must record the cancel; "
+        f"got {ek_result!r}"
+    )
+    assert ek_result.get("skipped") != "weight_download_failed", (
+        f"result.stages.eye_keypoints must not misattribute a cancel to "
+        f"a download failure; got {ek_result!r}"
+    )
+    # The [eye_keypoints] error rollup must not contain a download failure
+    # entry for a cooperative cancel — that would surface a scary-looking
+    # download-failed banner in the job history for what was a user cancel.
+    for err in job.get("errors", []):
+        assert not (
+            err.startswith("[eye_keypoints]") and "download" in err.lower()
+        ), (
+            f"[eye_keypoints] errors must not blame a cancel on a "
+            f"download failure; got {err!r}"
+        )
+
+
 def test_pipeline_eye_keypoints_stage_excluded_photos_do_not_influence_downloads(
     tmp_path, monkeypatch,
 ):
@@ -18481,3 +18611,77 @@ def test_known_mount_roots_round_trip_through_db_meta(tmp_path):
     # a run that saw no live mounts must not blank the record).
     _pj._record_known_mount_roots(db, {"/mnt/nas": False, "/mnt/photos": False})
     assert _pj._load_known_mount_roots(db) == {"/mnt/nas", "/mnt/photos"}
+
+
+def test_pipeline_classifier_factory_uses_non_parking_cancel_probe():
+    """Regression: the ``_construct_classifier`` factory inside
+    ``run_pipeline_job`` runs while ``ModelCache._Entry.load_lock`` is
+    held. ``Classifier._compute_embeddings_with_progress`` calls the
+    factory-supplied ``cancel_check`` between labels; if that closure
+    invokes the parking ``_should_abort`` (which parks on pause via
+    ``_pause_checkpoint``), a Pause arriving during label-embedding
+    setup would keep an unpaused peer requesting the same cache key
+    blocked until Resume. The factory must use
+    ``_should_abort_without_pause`` — same pattern the classify job
+    factory uses (test_classify_factory_cancel_check_uses_pure_cancel_probe
+    in test_classify_job.py) and the ``model_cache.py`` factory-context
+    fix in commit ``5aee48c``. Pause is still honored at the next outer
+    checkpoint after the factory returns and the load lock releases.
+    """
+    import ast
+    import inspect
+
+    import pipeline_job
+
+    source = inspect.getsource(pipeline_job.run_pipeline_job)
+    tree = ast.parse(source)
+
+    def _find_construct_classifier(node):
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.FunctionDef)
+                and child.name == "_construct_classifier"
+            ):
+                return child
+        return None
+
+    construct_fn = _find_construct_classifier(tree)
+    assert construct_fn is not None, (
+        "_construct_classifier factory not found inside "
+        "run_pipeline_job — test needs update if this refactored"
+    )
+
+    inner_cancel_check = None
+    for child in ast.walk(construct_fn):
+        if (
+            isinstance(child, ast.FunctionDef)
+            and child.name == "cancel_check"
+        ):
+            inner_cancel_check = child
+            break
+    assert inner_cancel_check is not None, (
+        "cancel_check closure not found inside _construct_classifier"
+    )
+
+    body_src = ast.unparse(inner_cancel_check)
+    assert "_should_abort_without_pause" in body_src, (
+        "_construct_classifier's inner cancel_check must call "
+        "_should_abort_without_pause (the non-parking probe), not "
+        "_should_abort. Codex thread review#4945197220 on "
+        "model_cache.py:237: the factory runs while entry.load_lock is "
+        "held and Classifier._compute_embeddings_with_progress invokes "
+        "cancel_check between labels; parking there strands every "
+        "unpaused peer waiting for the same cache key until Resume."
+    )
+    # And it must not fall back to the parking probe. Guard against a
+    # regression that adds an ``or _should_abort(...)`` branch.
+    calls = [
+        node for node in ast.walk(inner_cancel_check)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_should_abort"
+    ]
+    assert not calls, (
+        "_construct_classifier's inner cancel_check must not call the "
+        "parking _should_abort — use _should_abort_without_pause"
+    )

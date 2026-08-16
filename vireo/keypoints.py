@@ -18,6 +18,7 @@ import os
 import threading
 
 import numpy as np
+import onnx_runtime
 
 log = logging.getLogger(__name__)
 
@@ -88,7 +89,10 @@ def ensure_keypoint_weights(model_name, progress_callback=None):
     # don't both fetch the same weights. Locks are created lazily; the outer
     # setdefault is itself thread-safe for the dict insert.
     lock = _download_locks.setdefault(model_name, threading.Lock())
-    with lock:
+    with onnx_runtime.acquire_session_cache_lock(
+        lock,
+        label=f"{model_name} keypoint download",
+    ):
         if os.path.isfile(onnx_path) and os.path.isfile(config_path):
             return onnx_path
 
@@ -205,19 +209,28 @@ def _load_session(model_name):
     if model_name in _sessions:
         return _sessions[model_name]
     lock = _locks.setdefault(model_name, threading.Lock())
-    with lock:
+    with onnx_runtime.acquire_session_cache_lock(
+        lock,
+        label=f"{model_name} keypoint session cache",
+    ):
         if model_name in _sessions:
             return _sessions[model_name]
-        import onnxruntime as ort
-
         onnx_path = os.path.join(_model_dir(model_name), "model.onnx")
         if not os.path.isfile(onnx_path):
             raise FileNotFoundError(
                 f"Keypoint model {model_name!r} not found at {onnx_path}. "
                 "Call ensure_keypoint_weights() first."
             )
-        _sessions[model_name] = ort.InferenceSession(
-            onnx_path, providers=["CPUExecutionProvider"]
+        # Pure cancel probe: ``create_session``'s ledger.acquire runs
+        # while ``lock`` is still held; the pause-aware probe would
+        # park ``wait_if_paused`` under the cache lock and block every
+        # unpaused peer waiting on the same keypoint model until
+        # Resume.
+        from resource_ledger import resolve_resource_pure_cancel_check
+        _sessions[model_name] = onnx_runtime.create_session(
+            onnx_path,
+            providers=["CPUExecutionProvider"],
+            cancel_check=resolve_resource_pure_cancel_check(),
         )
     return _sessions[model_name]
 
@@ -268,11 +281,11 @@ def detect_keypoints(image, bbox, model_name):
     arr = arr[np.newaxis, :, :, :]
 
     session = _load_session(model_name)
-    # NOTE: no acquire_gpu() here. The keypoints session is hardcoded
-    # to CPUExecutionProvider (see _load_session). Wrapping the call in
-    # the GPU semaphore would needlessly block real GPU stages in
-    # concurrent pipelines for work that doesn't touch the GPU.
-    outputs = session.run(None, {"pixel_values": arr})
+    # The session is hardcoded to CPU, so this takes CPU permits plus the
+    # exclusive cpu_ml lane without blocking accelerator work.
+    from pipeline_locks import acquire_inference_resources
+    with acquire_inference_resources(session):
+        outputs = session.run(None, {"pixel_values": arr})
 
     output_type = cfg.get("output_type", "heatmap")
     if output_type == "simcc":

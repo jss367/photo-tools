@@ -36,6 +36,41 @@ def test_job_scan_returns_job_id(app_and_db, tmp_path):
     assert data['job_id'].startswith('scan-')
 
 
+def test_job_scan_passes_pause_probe_to_scanner(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Standalone scan jobs let scanner release CPU before parking."""
+    import scanner
+
+    app, _db = app_and_db
+    runner = app._job_runner
+    client = app.test_client()
+    scan_dir = str(tmp_path / "scanme")
+    os.makedirs(scan_dir)
+    observed_job_ids = []
+
+    def pause_requested(job_id):
+        observed_job_ids.append(job_id)
+        return False
+
+    def fake_scan(*_args, pause_check=None, counts=None, **_kwargs):
+        assert pause_check is not None
+        assert pause_check() is False
+        if counts is not None:
+            counts["indexed"] = 0
+
+    monkeypatch.setattr(runner, "pause_requested", pause_requested)
+    monkeypatch.setattr(scanner, "scan", fake_scan)
+
+    response = client.post("/api/jobs/scan", json={"root": scan_dir})
+    assert response.status_code == 200
+    job_id = response.get_json()["job_id"]
+    job = wait_for_job_via_client(client, job_id)
+
+    assert job["status"] == "completed"
+    assert job_id in observed_job_ids
+
+
 def test_job_scan_invalid_root(app_and_db):
     """POST /api/jobs/scan with invalid root returns 400."""
     app, _ = app_and_db
@@ -631,6 +666,23 @@ def test_jobs_list_includes_active_workspace_id(app_and_db):
     data = resp.get_json()
     assert 'active_workspace_id' in data
     assert data['active_workspace_id'] == db._active_workspace_id
+
+
+def test_jobs_list_includes_resource_budget_snapshot(app_and_db):
+    app, _db = app_and_db
+    data = app.test_client().get("/api/jobs").get_json()
+
+    budget = data["resource_budget"]
+    assert budget["cpu"]["capacity"] >= 1
+    assert budget["lanes"]["cpu_ml"]["capacity"] == 1
+    assert budget["lanes"]["model_construction"]["capacity"] == 1
+    resources = {
+        "cpu": budget["cpu"],
+        "cpu_ml": budget["lanes"]["cpu_ml"],
+        "model_construction": budget["lanes"]["model_construction"],
+    }
+    for resource in resources.values():
+        assert 0 <= resource["available"] <= resource["capacity"]
 
 
 def test_jobs_list_includes_workspace_names(app_and_db):
@@ -6166,6 +6218,15 @@ def test_import_in_place_reports_working_copy_phase(app_and_db, tmp_path, monkey
     import scanner
 
     app, _ = app_and_db
+    runner = app._job_runner
+    observed_pause_job_ids = []
+    original_pause_requested = runner.pause_requested
+
+    def record_pause_probe(job_id):
+        observed_pause_job_ids.append(job_id)
+        return original_pause_requested(job_id)
+
+    monkeypatch.setattr(runner, "pause_requested", record_pause_probe)
     source = tmp_path / "raw-card"
     source.mkdir()
     (source / "IMG_0001.nef").write_bytes(b"fake raw data")
@@ -6185,9 +6246,11 @@ def test_import_in_place_reports_working_copy_phase(app_and_db, tmp_path, monkey
         "after_import": None,
     })
     assert resp.status_code == 200, resp.get_json()
-    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+    job_id = resp.get_json()["job_id"]
+    job = wait_for_job_via_client(client, job_id)
 
     assert job["status"] == "completed", job
+    assert job_id in observed_pause_job_ids
     assert job["progress"]["phase_label"] == "Generating working copies"
     assert job["progress"]["phase_current"] == 1
     assert job["progress"]["phase_total"] == 1

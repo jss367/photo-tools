@@ -97,6 +97,135 @@ def test_browse_lightbox_close_selects_current_photo(live_server, page):
     expect(cards.first).not_to_have_class(re.compile(r"\bselected\b"))
 
 
+def test_browse_lightbox_close_during_navigation_returns_to_visible_photo(
+    live_server, page,
+):
+    """Closing mid-navigation focuses the still-visible photo, not the loader.
+
+    `_lightboxCurrentId` advances immediately at the start of navigation while
+    the outgoing bitmap is deliberately held on screen until the incoming
+    /full decodes. Capturing that internal target on close made Browse
+    select and scroll to a photo the user never actually saw — Codex P2 on
+    PR #1486. Track the last committed `lightbox:photochanged` identity.
+    """
+    ids = {"first": None, "second": None}
+
+    def route_full(route):
+        url = route.request.url
+        if ids["second"] is not None and f"/photos/{ids['second']}/full" in url:
+            # Park the incoming photo; the outgoing bitmap stays on screen.
+            return
+        route.fulfill(
+            body=base64.b64decode(_PNG_1X1), content_type="image/png"
+        )
+
+    page.route("**/photos/*/full", route_full)
+    page.goto(f"{live_server['url']}/browse")
+
+    cards = page.locator(".grid-card")
+    cards.nth(1).wait_for(state="visible")
+    ids["first"] = int(cards.first.get_attribute("data-id"))
+    ids["second"] = int(cards.nth(1).get_attribute("data-id"))
+
+    cards.first.dblclick()
+    expect(page.locator("#lightboxOverlay")).to_have_class(
+        "lightbox-overlay active"
+    )
+    page.wait_for_function(
+        "photoId => window._lightboxCommittedId === photoId", arg=ids["first"]
+    )
+
+    page.locator("#lightboxNext").click()
+    page.wait_for_function(
+        "photoId => window._lightboxCurrentId === photoId"
+        " && window._lbVisualTransitionPending === true",
+        arg=ids["second"],
+    )
+    # Incoming photo has not decoded; committed identity stays on photo 1.
+    assert page.evaluate("window._lightboxCommittedId") == ids["first"]
+
+    page.locator(".lightbox-close").click()
+
+    expect(page.locator("#lightboxOverlay")).not_to_have_class(
+        "lightbox-overlay active"
+    )
+    assert page.evaluate("selectedPhotoId") == ids["first"]
+    assert page.evaluate("selectedIndex") == 0
+    assert page.evaluate("selectedPhotos.size") == 0
+    expect(cards.first).to_have_class(re.compile(r"\bselected\b"))
+    expect(cards.nth(1)).not_to_have_class(re.compile(r"\bselected\b"))
+
+
+def test_browse_lightbox_delete_only_photo_does_not_reselect_it(
+    live_server, page,
+):
+    """Deleting the only lightbox photo must not re-select the deleted row.
+
+    `lightboxDelete` used to close the lightbox before removing the row from
+    `photos`, so Browse's `lightbox:closed` reconciliation would still find
+    the deleted photo, call `selectPhoto`/`loadDetail` on it, and then have
+    its own delete cleanup null `selectedPhotoId` — leaving the sidebar
+    blank or showing stale details. Codex P2 on PR #1486. Grid state must
+    be updated before the lightbox transitions.
+    """
+    page.route(
+        "**/photos/*/full",
+        lambda route: route.fulfill(
+            body=base64.b64decode(_PNG_1X1), content_type="image/png"
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+
+    first_card = page.locator(".grid-card").first
+    first_card.wait_for(state="visible")
+    first_id = int(first_card.get_attribute("data-id"))
+    first_filename = first_card.get_attribute("data-filename")
+    initial_count = page.evaluate("window.photos.length")
+
+    # Open the lightbox with a single-photo list so lightboxDelete takes the
+    # closeLightbox branch (rather than opening the next photo).
+    page.evaluate(
+        """([id, filename]) => openLightbox(id, filename, [{id: id, filename: filename}])""",
+        [first_id, first_filename],
+    )
+    expect(page.locator("#lightboxOverlay")).to_have_class(
+        "lightbox-overlay active"
+    )
+    page.wait_for_function(
+        "photoId => window._lightboxCommittedId === photoId", arg=first_id
+    )
+
+    observed = page.evaluate(
+        """() => {
+            const events = [];
+            document.addEventListener('lightbox:closed', event => {
+                events.push({
+                    photoId: event.detail && event.detail.photoId,
+                    photosStillHasDeleted:
+                        typeof photos !== 'undefined' &&
+                        photos.some(p => p.id === event.detail.photoId),
+                    selectedPhotoIdAtClose: selectedPhotoId,
+                });
+            }, { once: true });
+            window.lightboxDelete();
+            const callback = _deleteCallback;
+            hideDeleteModal();
+            callback({deleted: 1, failed_photo_ids: []});
+            return events[0];
+        }"""
+    )
+
+    expect(page.locator("#lightboxOverlay")).not_to_have_class(
+        "lightbox-overlay active"
+    )
+    assert observed["photoId"] == first_id
+    # When lightbox:closed fires, `photos` must already have the deleted
+    # entry filtered out; otherwise the reconciliation re-selects it.
+    assert observed["photosStillHasDeleted"] is False
+    assert page.evaluate("selectedPhotoId") is None
+    assert page.evaluate("window.photos.length") == initial_count - 1
+
+
 def test_lightbox_track_eye_keeps_eye_at_same_screen_position(
     live_server, page, tmp_path,
 ):

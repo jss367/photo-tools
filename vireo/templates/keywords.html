@@ -714,7 +714,7 @@
       const s = document.createElement('script');
       s.src = 'https://maps.googleapis.com/maps/api/js?key=' +
         encodeURIComponent(apiKey) +
-        '&libraries=places&loading=async&callback=_gmapsCallback';
+        '&libraries=places&language=en&loading=async&callback=_gmapsCallback';
       s.async = true;
       s.onerror = function() { reject(new Error('gmaps_load_failed')); };
       document.head.appendChild(s);

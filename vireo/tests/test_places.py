@@ -11,6 +11,7 @@ import io
 import json
 import urllib.error
 import urllib.parse
+from pathlib import Path
 
 import pytest
 
@@ -146,7 +147,9 @@ def test_place_details_parses_response(monkeypatch):
     url = captured[0]
     assert "place_id=ChIJ4zGFAZpYwokRGUGph3Mf37k" in url
     assert "key=FAKE_KEY" in url
-    fields = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["fields"][0]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    assert query["language"] == ["en"]
+    fields = query["fields"][0]
     assert "type" in fields.split(",")
     assert "types" not in fields.split(",")
 
@@ -220,6 +223,19 @@ def test_reverse_geocode_parses_response(monkeypatch):
         "latlng=40.7127753,-74.0059728" in url
     )
     assert "key=FAKE_KEY" in url
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    assert query["language"] == ["en"]
+
+
+@pytest.mark.parametrize(
+    "template_name",
+    ["browse.html", "keywords.html", "location_review.html"],
+)
+def test_google_maps_javascript_loaders_request_english(template_name):
+    """All browser Places flows should use the English localization."""
+    template = Path(__file__).parent.parent / "templates" / template_name
+
+    assert "&libraries=places&language=en&loading=async" in template.read_text()
 
 
 def test_reverse_geocode_returns_none_on_zero_results(monkeypatch):

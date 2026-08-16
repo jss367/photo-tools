@@ -1185,7 +1185,7 @@ body {
       if (window.google && window.google.maps) { resolve(window.google); return; }
       window._vireoLocationReviewMapsReady = function() { resolve(window.google); };
       var script = document.createElement('script');
-      script.src = 'https://maps.googleapis.com/maps/api/js?key=' + encodeURIComponent(apiKey) + '&libraries=places&loading=async&callback=_vireoLocationReviewMapsReady';
+      script.src = 'https://maps.googleapis.com/maps/api/js?key=' + encodeURIComponent(apiKey) + '&libraries=places&language=en&loading=async&callback=_vireoLocationReviewMapsReady';
       script.async = true;
       script.onerror = function() { reject(new Error('maps_load_failed')); };
       document.head.appendChild(script);

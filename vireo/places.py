@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 _PLACE_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
 _GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+_RESULT_LANGUAGE = "en"
 
 def _create_ssl_context():
     """Return a trust context containing configured and bundled CA roots."""
@@ -124,6 +125,7 @@ def place_details(place_id: str, api_key: str) -> dict | None:
         "place_id": place_id,
         "key": api_key,
         "fields": "place_id,name,type,geometry/location,address_components",
+        "language": _RESULT_LANGUAGE,
     }
     url = f"{_PLACE_DETAILS_URL}?{urllib.parse.urlencode(params)}"
 
@@ -185,6 +187,7 @@ def reverse_geocode(lat: float, lng: float, api_key: str) -> dict | None:
     params = {
         "latlng": f"{lat},{lng}",
         "key": api_key,
+        "language": _RESULT_LANGUAGE,
     }
     url = f"{_GEOCODE_URL}?{urllib.parse.urlencode(params)}"
 

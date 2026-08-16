@@ -1380,6 +1380,24 @@ def test_similar_result_lightbox_preserves_scoped_read_only_mode(live_server, pa
     assert page.evaluate("_lbReadOnly") is True
     expect(page.locator("#lightboxDeleteBtn")).to_be_disabled()
 
+    page.evaluate(
+        "closeLightbox(); reviewScopeMode = 'cache'; openGroupReview(0, 0)"
+    )
+    page.wait_for_function("grmState && grmState.seeded === true")
+    page.evaluate(
+        "pid => { grmSetApplying(true); findSimilar(pid); }", photo_ids[0]
+    )
+    page.locator(".similar-card").click()
+
+    expect(page.locator("#lightboxOverlay")).to_have_class(
+        re.compile(r"\bactive\b")
+    )
+    assert page.evaluate("_lbReadOnly") is True
+    assert page.evaluate("_lbReadOnlyMessage") == (
+        "Group Review is applying changes. Wait for it to finish."
+    )
+    expect(page.locator("#lightboxDeleteBtn")).to_be_disabled()
+
 
 def test_lightbox_flag_over_group_review_updates_pending_zones(live_server, page):
     """A flag set from the lightbox above Group Review must route through the
@@ -1894,7 +1912,7 @@ def test_read_only_scope_blocks_collection_and_keyword_writes(live_server, page)
     page.evaluate("hidePipelineKeywordModal(true); hidePipelineCollectionModal(true)")
     page.locator(f'.photo-card[data-photo-id="{photo_id}"]').click(button="right")
     menu = page.locator(".vireo-ctx-menu")
-    for label in ("Add to Collection", "Add Keyword"):
+    for label in ("Add to Collection", "Add Keyword", "Edit Photo"):
         item = menu.locator(".vireo-ctx-item", has_text=label)
         expect(item).to_have_class(re.compile(r"\bvireo-ctx-disabled\b"))
         expect(item).to_have_attribute("title", "Switch to Latest review to make changes")
@@ -1902,6 +1920,7 @@ def test_read_only_scope_blocks_collection_and_keyword_writes(live_server, page)
     assert "Set Representative" not in menu.inner_text()
     page.keyboard.press("Escape")
 
+    original_url = page.url
     blocked = page.evaluate(
         """async pid => {
           window._vireoNativeMenuPhotoIdsOverride = [pid];
@@ -1909,9 +1928,11 @@ def test_read_only_scope_blocks_collection_and_keyword_writes(live_server, page)
           const collectionOverride = window._vireoNativeMenuPhotoIdsOverride;
           window._vireoNativeMenuPhotoIdsOverride = [pid];
           const keyword = batchAddKeyword([pid]);
+          const editor = openPipelinePhotoEditor(pid);
           return {
             collection: collection,
             keyword: keyword,
+            editor: editor,
             collectionOverride: collectionOverride,
             keywordOverride: window._vireoNativeMenuPhotoIdsOverride,
             collectionOpen: document.getElementById('pipelineCollectionModal')
@@ -1925,11 +1946,13 @@ def test_read_only_scope_blocks_collection_and_keyword_writes(live_server, page)
     assert blocked == {
         "collection": False,
         "keyword": False,
+        "editor": False,
         "collectionOverride": None,
         "keywordOverride": None,
         "collectionOpen": False,
         "keywordOpen": False,
     }
+    assert page.url == original_url
 
 
 def test_read_only_scope_disables_lightbox_and_native_mutations(live_server, page):

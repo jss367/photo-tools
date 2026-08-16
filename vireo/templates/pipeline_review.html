@@ -7534,13 +7534,21 @@ function pipelineReviewVisiblePhotoList(photoId) {
 }
 
 function pipelineReviewLightboxOptions() {
-  var readOnly = isScopedReviewView();
+  var groupOverlay = document.getElementById('grmOverlay');
+  var groupApplying = !!(
+    groupOverlay && groupOverlay.classList.contains('open') &&
+    grmState && grmState.applying
+  );
+  var scoped = isScopedReviewView();
+  var readOnly = scoped || groupApplying;
   return {
     readOnly: readOnly,
-    readOnlyMessage: readOnly
-      ? (reviewScopeMode === 'collection' ? 'Collection' : 'Workspace') +
-        ' scope is view-only. Switch to Latest review to make changes.'
-      : undefined,
+    readOnlyMessage: groupApplying
+      ? 'Group Review is applying changes. Wait for it to finish.'
+      : (scoped
+        ? (reviewScopeMode === 'collection' ? 'Collection' : 'Workspace') +
+          ' scope is view-only. Switch to Latest review to make changes.'
+        : undefined),
   };
 }
 window.getLightboxOpenOptions = pipelineReviewLightboxOptions;
@@ -7578,6 +7586,10 @@ async function setWildlifeExcludedFor(photoId, excluded) {
 window.setWildlifeExcludedFor = setWildlifeExcludedFor;
 
 function openPipelinePhotoEditor(photoId) {
+  if (isScopedReviewView()) {
+    notifyReadOnlyScopedView();
+    return false;
+  }
   if (window.vireoEditNav) {
     var list = pipelineReviewVisiblePhotoList(photoId);
     window.vireoEditNav.setList(list, photoId);
@@ -7951,7 +7963,8 @@ function buildPipelinePhotoContextMenu(photoIds, clickedPhotoId, inGroupReview) 
     items = items.concat(window.buildSpeciesRepresentativeMenuItems(photoIds, {showFetchFallback: true}));
   }
   items.push({separator: true});
-  items.push({label: 'Edit Photo', disabled: !one || tauriNavigationBlocked, disabledHint: navigationHint,
+  items.push({label: 'Edit Photo', disabled: !one || !!scopedWriteHint || tauriNavigationBlocked,
+    disabledHint: scopedWriteHint || navigationHint,
     onClick: function() { openPipelinePhotoEditor(clickedPhotoId); }});
   if (typeof window.buildOpenInEditorMenuItems === 'function') {
     items = items.concat(window.buildOpenInEditorMenuItems(photoIds));

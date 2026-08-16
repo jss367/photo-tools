@@ -9527,17 +9527,13 @@ async function _loadDeepLinkPrefix(photoId, focusIndex, shouldContinue) {
   batches.forEach(function(batch) {
     loadedPhotos = loadedPhotos.concat(batch || []);
   });
-  // Parallel offset-paged batches can duplicate a boundary row when
-  // ingestion inserts a photo earlier in the sort order between two
-  // batches: the duplicate double-renders in the grid and pushes the
-  // target beyond the fetched prefix. Because ``totalPhotos`` still
-  // reflects the pre-init snapshot, the raw ``length >= totalPhotos``
-  // check would then set ``allLoaded`` and short-circuit the serial
-  // fallback below, so the deep link would silently fail to render or
-  // highlight the target. Dedupe by id and treat any duplicate as
-  // evidence the snapshot is stale — leave ``allLoaded`` false so
-  // ``loadUntilPhotoRendered`` can extend past the affected range
-  // (Codex review r3792671672).
+  // Parallel offset-paged batches can overlap when ingestion inserts a row
+  // before a boundary, or develop a gap when a row is deleted there.  Either
+  // mutation can leave the target outside the predicted prefix.  Do not
+  // advance currentPage past an inconsistent result: if we see an overlap or
+  // cannot verify the target, leave the first-page bootstrap untouched so the
+  // caller's serial fallback restarts from page 2 against one current ordering
+  // (Codex reviews r3792671672 and r3792693918).
   var seenIds = new Set();
   var dedupedPhotos = [];
   var duplicatesFound = false;
@@ -9547,9 +9543,12 @@ async function _loadDeepLinkPrefix(photoId, focusIndex, shouldContinue) {
     seenIds.add(p.id);
     dedupedPhotos.push(p);
   });
+  var targetFound = dedupedPhotos.some(function(p) { return p.id === photoId; });
+  if (duplicatesFound || !targetFound) return null;
+
   photos = dedupedPhotos;
   currentPage = batchCount * pagesPerBatch + 1;
-  allLoaded = !duplicatesFound && photos.length >= totalPhotos;
+  allLoaded = photos.length >= totalPhotos;
   renderGrid();
   updateFilterSummary();
 
@@ -9593,6 +9592,7 @@ async function _runPhotoDeepLink(photoId) {
   // Prevent the IntersectionObserver from triggering loadPhotos() while deep-link is loading
   loading = true;
   var deepLinkLoaded = false;
+  var isDeepLinkDatasetCurrent = null;
   try {
     applyBrowseConfig(await _cfgPromise);
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
@@ -9623,6 +9623,21 @@ async function _runPhotoDeepLink(photoId) {
     closeDetail();
     document.getElementById('grid').innerHTML = '';
 
+    // A folder click, sort change, or filter edit calls resetAndLoad(), which
+    // advances loadEpoch (and scope changes also advance browseScopeGen).
+    // Snapshot both generations before the first folder request so an older
+    // deep-link response cannot overwrite the user's newer Browse dataset.
+    var deepLinkLoadEpoch = loadEpoch;
+    var deepLinkScopeGen = browseScopeGen;
+    var deepLinkFolderId = photo.folder_id;
+    var deepLinkSort = document.getElementById('sortSelect').value;
+    isDeepLinkDatasetCurrent = function() {
+      return loadEpoch === deepLinkLoadEpoch &&
+        browseScopeGen === deepLinkScopeGen &&
+        activeFolderId === deepLinkFolderId &&
+        document.getElementById('sortSelect').value === deepLinkSort;
+    };
+
     // bootstrapBrowse was skipped, so load the target folder's first page and
     // the shared folder/keyword/collection trees before locating the photo.
     var missingSnapshotVersionAtInitStart =
@@ -9632,10 +9647,11 @@ async function _runPhotoDeepLink(photoId) {
     var initParams = new URLSearchParams();
     initParams.set('folder_id', photo.folder_id);
     initParams.set('per_page', perPage);
-    initParams.set('sort', document.getElementById('sortSelect').value);
+    initParams.set('sort', deepLinkSort);
     initParams.set('focus_photo_id', photoId);
     var initData = await safeFetch('/api/browse/init?' + initParams.toString(), {}, { toast: false });
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
+    if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
     if (initData) {
       // Seed the navbar's missing-folder snapshot from init's workspace-scoped
       // view so the first /api/folders/missing observation has a baseline to
@@ -9658,6 +9674,7 @@ async function _runPhotoDeepLink(photoId) {
           'deep-link-reconcile',
           initData.folder_health_version);
         if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
+        if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
       }
       renderFolderTree(initData.folders || []);
       renderKeywordTree(initData.keywords || []);
@@ -9680,19 +9697,27 @@ async function _runPhotoDeepLink(photoId) {
     // the library changed enough between the position read and bulk fetch
     // that the target is not in the predicted prefix.
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
+    if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
     var el = getGridCard(photoId);
     if (!el && initData && Number.isInteger(initData.focus_index)) {
       try {
-        el = await _loadDeepLinkPrefix(photoId, initData.focus_index, isDeepLinkHealthCurrent);
+        el = await _loadDeepLinkPrefix(photoId, initData.focus_index, function() {
+          return isDeepLinkHealthCurrent() && isDeepLinkDatasetCurrent();
+        });
       } catch (e) { /* serial fallback below */ }
     }
-    if (!el && isDeepLinkHealthCurrent()) {
+    if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
+    if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
+    if (!el) {
       // loadPhotos() honors the setup guard, so release it before the explicit
       // compatibility/reconciliation scan or it would return immediately.
       loading = false;
-      el = await loadUntilPhotoRendered(photoId);
+      el = await loadUntilPhotoRendered(photoId, function() {
+        return isDeepLinkHealthCurrent() && isDeepLinkDatasetCurrent();
+      });
     }
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
+    if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
 
     // Update folder tree active state
     document.querySelectorAll('#folderTree .tree-item').forEach(function(el) {
@@ -9747,7 +9772,8 @@ async function _runPhotoDeepLink(photoId) {
   // ``loading`` here would let a second page-1 request race against the
   // same loadEpoch, producing duplicate cards and off-by-one pagination
   // (Codex review r3686696351).
-  if (isDeepLinkHealthCurrent()) {
+  if (isDeepLinkHealthCurrent() &&
+      (!isDeepLinkDatasetCurrent || isDeepLinkDatasetCurrent())) {
     loading = false;
     if (deepLinkLoaded) {
       rearmInfiniteScrollObserver();

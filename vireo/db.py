@@ -3360,7 +3360,6 @@ class Database:
                            JOIN keywords survivor_k
                              ON survivor_k.id = survivor_pk.keyword_id
                            WHERE survivor_pk.photo_id = pk.photo_id
-                             AND survivor_k.parent_id IS NULL
                              AND survivor_k.name = 'Wildlife' COLLATE NOCASE
                              AND (
                                  survivor_k.id NOT IN ({placeholders})

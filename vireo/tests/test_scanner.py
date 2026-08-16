@@ -3593,6 +3593,107 @@ def test_scan_pause_check_none_preserves_existing_behavior(tmp_path):
     assert len(photos) == 2
 
 
+def test_scan_pause_while_waiting_for_permits_suspends_wait_timing(
+    tmp_path,
+):
+    """A standalone pause parking inside ``ResourceLedger.acquire``'s wait
+    must NOT accumulate into the persisted resource-wait total.
+
+    Codex flagged that ``_iter_features`` threads ``_check_cancelled``
+    into ``_claim_worker_count`` as the ledger's cancellation probe. On
+    a standalone ``/api/jobs/scan`` or ``/api/jobs/import-photos`` run
+    the caller-supplied ``cancel_check`` is the runner's pause-aware
+    probe, so it parks for the full pause. Without suspending the
+    active-wait timer around that park, the ledger persists the pause
+    duration as resource contention — an hour-long user pause becomes
+    an hour of ``wait_seconds`` even though no scanner or
+    inference contended for those permits.
+
+    Setup: reserve the ledger's only permit, start scanner in a
+    background thread so it blocks in ``ledger.acquire`` waiting for
+    the permit, then flip pause on and have ``cancel_check`` park for
+    ~0.4s before releasing the reservation. The scanner's recorded
+    wait must exclude the parked portion — the wall-clock idle here is
+    still ~0.4s, but the accounted wait must be a small fraction of
+    that.
+    """
+    import threading
+
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['a.jpg']})
+    db = Database(str(tmp_path / "test.db"))
+
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=1)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    blocker = ledger.acquire(resource_ledger.ResourceRequest(
+        cpu=resource_ledger.CpuRequest(1, 1, 1),
+    ))
+
+    pause_state = {"active": False}
+    park_completed = threading.Event()
+    park_duration = 1.0
+
+    def pause_check():
+        return pause_state["active"]
+
+    def cancel_check():
+        if pause_state["active"]:
+            # Emulate the runner's pause-aware probe parking on the
+            # pause. In production this is pause_gate.wait_if_paused.
+            time.sleep(park_duration)
+            pause_state["active"] = False
+            park_completed.set()
+        return False
+
+    scanner_owner = "test-standalone-scan"
+
+    def trigger_pause_then_release():
+        # Wait until the scanner is confirmed blocked in ledger.acquire
+        # (it is the only thing the ledger is waiting for besides the
+        # blocker), then arm the pause. cancel_check parks for
+        # ``park_duration`` and releases the reservation once through.
+        while True:
+            snap = ledger.snapshot()
+            if snap["cpu"]["allocated"] >= 1 and snap.get("waiters", 0) >= 1:
+                break
+            time.sleep(0.01)
+        pause_state["active"] = True
+        park_completed.wait(timeout=5.0)
+        blocker.release()
+
+    try:
+        threading.Thread(
+            target=trigger_pause_then_release, daemon=True,
+        ).start()
+        with resource_ledger.bind_resource_owner(scanner_owner):
+            scanner.scan(
+                root,
+                db,
+                cancel_check=cancel_check,
+                pause_check=pause_check,
+            )
+        timing = ledger.owner_timing(scanner_owner)
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    # The 1.0s park must be excluded from the accounted wait. The
+    # ledger polls its cancel_check on a 0.2s condition-wait interval,
+    # so the recorded wait accounts for that pre-park poll plus small
+    # scheduler jitter — well under half a second — while a regression
+    # that dropped the suspend bracket would report ~1.0 + ~0.2 seconds
+    # (the full park plus the outer poll). Assert well below the park
+    # duration to catch the regression with headroom for slow CI.
+    assert timing["wait_seconds"] < park_duration * 0.6, (
+        f"wait_seconds={timing['wait_seconds']:.3f} is not sufficiently "
+        f"below park_duration={park_duration:.3f}; pause parking is "
+        f"being counted as resource contention"
+    )
+
+
 @pytest.mark.parametrize("pause_after_result", [False, True])
 def test_scan_pause_requeues_worker_result(
     tmp_path, monkeypatch, pause_after_result,

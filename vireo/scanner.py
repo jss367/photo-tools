@@ -42,6 +42,7 @@ from resource_ledger import (
     cpu_inference_request,
     cpu_phase_request,
     get_resource_ledger,
+    suspend_resource_wait_timing,
 )
 from xmp import read_hierarchical_keywords, read_keywords
 
@@ -1822,7 +1823,24 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         return counts
 
     def _check_cancelled():
-        if cancel_check is not None and cancel_check():
+        if cancel_check is None:
+            return
+        # ``_check_cancelled`` is threaded into ``ResourceLedger.acquire``
+        # through ``_claim_worker_count`` as its cancellation probe. On a
+        # standalone ``/api/jobs/scan`` or ``/api/jobs/import-photos`` job
+        # the caller-supplied ``cancel_check`` is the runner's pause-aware
+        # probe, so it parks for the whole pause; without the suspend
+        # bracket, the ledger's active wait timer accumulates that idle
+        # time as resource contention and inflates the persisted
+        # ``resource_wait_seconds`` diagnostic by the full pause length.
+        # The pipeline path already brackets its checkpoints with
+        # ``suspend_resource_wait_timing()`` inside ``_pause_checkpoint``;
+        # mirror that here so both call sites report contention honestly.
+        # When there is no active wait (every non-``ledger.acquire`` call
+        # site), the suspend context is a cheap no-op.
+        with suspend_resource_wait_timing():
+            cancelled = cancel_check()
+        if cancelled:
             raise ScanCancelled("scan cancelled")
 
     def _emit_status(message, phase_current=None, phase_total=None, phase_label=None):

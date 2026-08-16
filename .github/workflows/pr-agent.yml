@@ -57,8 +57,8 @@ jobs:
       && (github.event.comment.author_association == 'OWNER'
           || github.event.comment.author_association == 'COLLABORATOR')
     concurrency:
-      group: pr-agent-review-fix-${{ github.event.issue.number }}
-      cancel-in-progress: true
+      group: pr-agent-human-reconcile-${{ github.event.issue.number }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - name: Check live PR state

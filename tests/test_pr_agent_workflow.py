@@ -45,8 +45,14 @@ def test_concurrency_is_scoped_per_task_and_never_workflow_wide():
     # earlier ones without touching merge or CI-fix work.
     review_group_issue = "group: pr-agent-review-fix-${{ github.event.issue.number }}"
     review_group_pr = "group: pr-agent-review-fix-${{ github.event.pull_request.number }}"
-    assert workflow.count(review_group_issue) == 2  # activate + fix-comment-feedback
+    assert workflow.count(review_group_issue) == 1  # fix-comment-feedback only
     assert workflow.count(review_group_pr) == 2  # fix-comments + codex-review
+    human_reconcile_group = "group: pr-agent-human-reconcile-${{ github.event.issue.number }}"
+    assert human_reconcile_group in workflow
+    human_group_idx = workflow.index(human_reconcile_group)
+    human_group_end = workflow.index("\n", human_group_idx)
+    human_group_next = workflow.index("\n", human_group_end + 1)
+    assert "cancel-in-progress: false" in workflow[human_group_end:human_group_next]
 
     # Merge jobs get their own per-PR group so they don't race with —
     # or get cancelled by — the review-fix lane.
@@ -158,6 +164,9 @@ def test_merge_gate_requires_live_head_and_resolved_current_threads():
     assert '"$test_status" != "completed"' in action
     assert '"$test_conclusion" != "success"' in action
     assert "select(.created_at >= $authorized_at)" in action
+    assert "select(.submitted_at >= $authorized_at)" in action
+    assert '.state == "COMMENTED" or .state == "CHANGES_REQUESTED"' in action
+    assert 'select((.body // "") | test("[^[:space:]]"))' in action
     assert 'test("^/merge[[:space:]]+[0-9a-fA-F]{7,40}[[:space:]]*$")' in action
     assert 'if [[ "$newer_feedback" -gt 0 ]]' in action
     assert "PR_AGENT_TITLE_$(openssl rand -hex 16)" in action

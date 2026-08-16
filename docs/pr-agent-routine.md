@@ -143,8 +143,9 @@ forge.
   is still current, every non-outdated review thread is resolved, and the Tests
   workflow succeeded for that exact head. If authorization arrives while Tests
   is running, the successful workflow run retries the same head-bound merge.
-  Actionable top-level feedback posted at or after that authorization requires
-  a fresh approval or exact merge command before the head can merge.
+  Actionable top-level or review-body feedback posted at or after that
+  authorization requires a fresh approval or exact merge command before the
+  head can merge.
 
 Merge calls use `gh pr merge --match-head-commit` without `--auto`, so no
 authorization remains armed across a later push. Merge jobs also skip closed
@@ -169,11 +170,13 @@ The workflow-run SHA is what gets passed as `expected-head` to the
 routine forwarder.
 
 Review-event de-noising. Concurrency is scoped per job, not workflow-wide,
-so unrelated task types never cancel each other. Review-fix firers
-(`activate`, `fix-comment-feedback`, `fix-comments`, `codex-review`) share
-a `pr-agent-review-fix-<PR>` group so newer review events collapse older
-ones. Conflict reconciliation uses the same per-PR lane, so a stale review and
-conflict repair cannot edit the same head concurrently. CI-fix runs derive the
+so unrelated task types never cancel each other. Automated review-fix firers
+(`fix-comment-feedback`, `fix-comments`, `codex-review`) share a
+`pr-agent-review-fix-<PR>` group so newer review events collapse older ones.
+The explicit human `activate` route uses a separate, non-cancellable per-PR
+lane so automated feedback cannot displace an uncapped `/claude-fix`
+reconciliation. Conflict reconciliation uses the automated per-PR lane, so a
+stale review and conflict repair cannot edit the same head concurrently. CI-fix runs derive the
 PR number from
 `workflow_run.pull_requests[0]` (falling back to the workflow_run head
 SHA) so unrelated PRs sharing a default-branch commit do not cancel each

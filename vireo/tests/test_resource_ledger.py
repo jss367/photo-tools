@@ -18,22 +18,25 @@ from resource_ledger import (
 
 
 def test_automatic_capacity_reserves_interactive_cores():
-    # ``usable_cores=None`` bypasses the process-affinity clamp so this
-    # exercises the reserve math on the raw host topology — otherwise a
-    # 2-vCPU CI runner would clamp the input to 2 and derive capacity 1,
-    # measuring the runner's constraint instead of the reserve formula.
+    # ``usable_cores=None`` / ``usable_physical_cores=None`` bypass the
+    # process-affinity clamps so this exercises the reserve math on the
+    # raw host topology — otherwise a 2-vCPU CI runner would clamp the
+    # input to 2 and derive capacity 1, measuring the runner's
+    # constraint instead of the reserve formula.
     assert resource_ledger.automatic_cpu_capacity(
-        physical_cores=16, usable_cores=None,
+        physical_cores=16, usable_cores=None, usable_physical_cores=None,
     ) == 12
     assert resource_ledger.automatic_cpu_capacity(
-        physical_cores=8, usable_cores=None,
+        physical_cores=8, usable_cores=None, usable_physical_cores=None,
     ) == 6
 
 
 def test_automatic_capacity_survives_unavailable_core_counts(monkeypatch):
     monkeypatch.setattr(resource_ledger, "detect_physical_core_count", lambda: None)
     monkeypatch.setattr(resource_ledger.os, "cpu_count", lambda: None)
-    assert resource_ledger.automatic_cpu_capacity(usable_cores=None) == 1
+    assert resource_ledger.automatic_cpu_capacity(
+        usable_cores=None, usable_physical_cores=None,
+    ) == 1
 
 
 def test_automatic_capacity_clamps_to_process_affinity():
@@ -48,7 +51,7 @@ def test_automatic_capacity_clamps_to_process_affinity():
     # Without the clamp this would return 12 (16-core reserve math);
     # with the clamp it must derive from 4 → reserve 2 → capacity 2.
     assert resource_ledger.automatic_cpu_capacity(
-        physical_cores=16, usable_cores=4,
+        physical_cores=16, usable_cores=4, usable_physical_cores=None,
     ) == 2
 
     # Larger usable_cores than physical_cores is a no-op: the smaller
@@ -56,7 +59,82 @@ def test_automatic_capacity_clamps_to_process_affinity():
     # still respects the host topology.
     assert resource_ledger.automatic_cpu_capacity(
         physical_cores=8, usable_cores=32, logical_cores=8,
+        usable_physical_cores=None,
     ) == 6
+
+
+def test_automatic_capacity_prefers_physical_over_logical_usable():
+    """Regression: when the affinity set covers hyperthread siblings of
+    the same physical cores (SMT-heavy pinning), ``usable_cores``
+    reports logical CPUs while capacity sizing must use physical
+    cores — the reserve formula is calibrated against them. Without a
+    separate physical-usable clamp, eight allowed logical CPUs covering
+    four physical cores on a 16-core host would give ``cores=8`` and a
+    6-permit budget, oversubscribing the same four physical cores the
+    ONNX pool actually runs on. With the physical clamp: ``cores=4``,
+    reserve=2, budget=2.
+    """
+    assert resource_ledger.automatic_cpu_capacity(
+        physical_cores=16, usable_cores=8, usable_physical_cores=4,
+    ) == 2
+
+    # And the physical clamp cannot make the answer larger than the
+    # logical clamp when logical is tighter (e.g. a cgroup quota
+    # below the affinity set): min of both still wins.
+    assert resource_ledger.automatic_cpu_capacity(
+        physical_cores=16, usable_cores=2, usable_physical_cores=4,
+    ) == 1  # min(16, 4, 2)=2, reserve max(2, 0.4)=2, budget max(1, 2-2)=1
+
+    # Physical clamp absent (Darwin/Windows/no affinity API) → fall
+    # back to logical-only clamp behaviour.
+    assert resource_ledger.automatic_cpu_capacity(
+        physical_cores=16, usable_cores=4, usable_physical_cores=None,
+    ) == 2
+
+
+def test_process_usable_physical_cpu_count_returns_positive_int_or_none():
+    """The helper returns a positive int on Linux with affinity support
+    and ``None`` elsewhere. A zero or negative value would silently
+    corrupt the derived capacity (callers gate on truthiness), and any
+    non-integer type would trip the downstream ``min``.
+    """
+    result = resource_ledger.process_usable_physical_cpu_count()
+    assert result is None or (isinstance(result, int) and result >= 1)
+
+
+def test_linux_physical_core_count_filters_by_affinity_collapses_smt(
+    monkeypatch,
+):
+    """Regression: SMT siblings pinned to the same physical core count
+    once when the affinity filter is applied. Simulate a 4-package
+    layout where physical ids 0-3 each expose two hyperthreads
+    (processors 0-7 map to (physical_id, core_id) tuples
+    (0,0), (1,0), (2,0), (3,0), (0,0), (1,0), (2,0), (3,0) — HT siblings
+    reuse the same (physical_id, core_id)). An affinity of {0,4} covers
+    both HTs of physical core (0,0) — the count must be 1, not 2.
+    """
+    cpuinfo = "".join(
+        # Each processor entry: processor: N \n physical id: P \n core id: C
+        # HT sibling pairs share (physical_id, core_id). We define 8
+        # processors mapping to 4 unique (physical_id, core_id) pairs.
+        f"processor\t: {p}\nphysical id\t: {p % 4}\ncore id\t: 0\n\n"
+        for p in range(8)
+    )
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({"/proc/cpuinfo": cpuinfo}),
+    )
+    # No filter: all 4 unique (physical_id, core_id) pairs count.
+    assert resource_ledger._linux_physical_core_count() == 4
+    # Affinity {0, 4}: both are on (physical_id=0, core_id=0) — 1 core.
+    assert resource_ledger._linux_physical_core_count(
+        processor_filter={0, 4},
+    ) == 1
+    # Affinity {0, 1}: (physical_id=0, core_id=0) and (physical_id=1,
+    # core_id=0) — 2 distinct physical cores.
+    assert resource_ledger._linux_physical_core_count(
+        processor_filter={0, 1},
+    ) == 2
 
 
 def test_process_usable_cpu_count_returns_positive_int():

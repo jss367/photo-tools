@@ -112,29 +112,60 @@ class ResourceRequest:
             raise ValueError("A resource request must include CPU or a lane")
 
 
-def _linux_physical_core_count():
-    """Best-effort physical-core count from Linux's cpuinfo topology."""
+def _linux_physical_core_count(processor_filter=None):
+    """Best-effort physical-core count from Linux's cpuinfo topology.
+
+    When ``processor_filter`` is a set of logical processor ids, only
+    ``/proc/cpuinfo`` entries whose ``processor:`` field is in that set
+    contribute to the count. That collapses SMT siblings the way the
+    kernel does — two logical CPUs pinned to the same physical core
+    count once — so a container with hyperthread-heavy affinity does
+    not double-count the underlying physical cores.
+    """
     try:
         packages_and_cores = set()
         physical_id = None
         core_id = None
+        processor_id = None
         with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
             for raw_line in cpuinfo:
                 line = raw_line.strip()
                 if not line:
-                    if physical_id is not None and core_id is not None:
+                    if (
+                        physical_id is not None
+                        and core_id is not None
+                        and (
+                            processor_filter is None
+                            or processor_id in processor_filter
+                        )
+                    ):
                         packages_and_cores.add((physical_id, core_id))
                     physical_id = None
                     core_id = None
+                    processor_id = None
                     continue
                 key, separator, value = line.partition(":")
                 if not separator:
                     continue
-                if key.strip() == "physical id":
-                    physical_id = value.strip()
-                elif key.strip() == "core id":
-                    core_id = value.strip()
-        if physical_id is not None and core_id is not None:
+                stripped_key = key.strip()
+                stripped_value = value.strip()
+                if stripped_key == "physical id":
+                    physical_id = stripped_value
+                elif stripped_key == "core id":
+                    core_id = stripped_value
+                elif stripped_key == "processor":
+                    try:
+                        processor_id = int(stripped_value)
+                    except ValueError:
+                        processor_id = None
+        if (
+            physical_id is not None
+            and core_id is not None
+            and (
+                processor_filter is None
+                or processor_id in processor_filter
+            )
+        ):
             packages_and_cores.add((physical_id, core_id))
         return len(packages_and_cores) or None
     except OSError:
@@ -384,25 +415,75 @@ def process_usable_cpu_count():
     return min(positive)
 
 
+def process_usable_physical_cpu_count():
+    """Return the physical-core count usable by this process, or ``None``.
+
+    Distinct from ``process_usable_cpu_count``: that returns *logical*
+    CPUs (affinity or cgroup quota), whereas capacity sizing uses
+    physical cores because the reserve formula was calibrated against
+    them. Mixing the two — ``min(host_physical, logical_usable)`` —
+    silently double-counts SMT siblings. A container pinned to eight
+    hyperthreads covering four physical cores on a 16-core host would
+    otherwise derive ``cores=8`` and a 6-permit budget, oversubscribing
+    the same four physical cores its ONNX pool actually runs on.
+
+    On Linux with ``sched_getaffinity`` available, parse
+    ``/proc/cpuinfo`` filtered to just the processor IDs in the affinity
+    set — that collapses SMT siblings back to physical cores. Returns
+    ``None`` otherwise (Darwin/Windows/no affinity API), so the caller
+    falls back to the logical-usable clamp.
+    """
+    sched_getaffinity = getattr(os, "sched_getaffinity", None)
+    if sched_getaffinity is None or platform.system() != "Linux":
+        return None
+    try:
+        affinity = sched_getaffinity(0)
+    except OSError:
+        return None
+    if not affinity:
+        return None
+    return _linux_physical_core_count(processor_filter=affinity)
+
+
 _USABLE_CORES_UNSET = object()
 
 
 def automatic_cpu_capacity(
-    physical_cores=None, logical_cores=None, usable_cores=_USABLE_CORES_UNSET,
+    physical_cores=None,
+    logical_cores=None,
+    usable_cores=_USABLE_CORES_UNSET,
+    usable_physical_cores=_USABLE_CORES_UNSET,
 ):
     """Apply Vireo's interactive reserve and return a positive capacity.
 
     The detected physical/logical core counts describe the host
     topology, not what this process is actually allowed to schedule on.
-    Clamp the effective core count by ``process_usable_cpu_count`` when
-    available so a ``taskset`` / systemd / container-cpuset / cgroup-
-    quota deployment doesn't derive a budget from cores it can't touch.
+    Clamp the effective core count by every process-scoped signal
+    available so a ``taskset`` / systemd / container-cpuset /
+    cgroup-quota deployment doesn't derive a budget from cores it
+    can't touch:
+
+    - ``usable_physical_cores`` — physical cores in the affinity set
+      (collapses SMT siblings). Preferred when available because the
+      reserve formula was calibrated against physical cores.
+    - ``usable_cores`` — logical usable count (affinity or cgroup
+      quota), used as a further ceiling in case physical detection
+      failed but the affinity set is narrower than the host's
+      physical count.
+
+    ``usable_cores=None`` / ``usable_physical_cores=None`` bypass the
+    respective clamp for unit tests that want to exercise the raw
+    reserve math on synthetic inputs.
     """
     if physical_cores is None:
         physical_cores = detect_physical_core_count()
     if logical_cores is None:
         logical_cores = os.cpu_count()
     cores = max(1, physical_cores or logical_cores or 1)
+    if usable_physical_cores is _USABLE_CORES_UNSET:
+        usable_physical_cores = process_usable_physical_cpu_count()
+    if usable_physical_cores:
+        cores = max(1, min(cores, usable_physical_cores))
     if usable_cores is _USABLE_CORES_UNSET:
         usable_cores = process_usable_cpu_count()
     if usable_cores:

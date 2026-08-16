@@ -1394,7 +1394,7 @@ def _duplicate_gate(state, batch_st, *, source_file, rel, checker, db,
 
 
 def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
-                              rel, attests_bytes):
+                              rel, attests_bytes, *, runner=None, job=None):
     """Run the restricted per-batch catalog scan for everything in
     ``batch_st.landed`` (fresh copies/transfers AND adoptions), capturing
     each landed path's pre-scan photo-row hash first so the caller's
@@ -1403,6 +1403,13 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
     batch_st.dest_read_cancelled:`` gate. Returns ``pre_scan_hashes``.
     On scan failure every landed entry is reclassified to failed and
     ``batch_st.landed`` is cleared.
+
+    ``runner`` and ``job``, when supplied, wire the job's pause and
+    cancellation probes into the per-batch ``scan()`` call so a Pause
+    on a pausable import (``/api/jobs/import-photos``) unwinds the
+    scanner's process pool and drops its CPU lease at the pause
+    checkpoint instead of holding permits until the batch finishes.
+    Same shape as the ``do_scan`` wiring on the other import routes.
     """
     # ``landed`` covers collision-loop adoptions too (origin
     # "skipped_duplicate"), so their photo rows get created by the
@@ -1462,6 +1469,12 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
         # the row. ``restrict_files`` already narrows these batches
         # to a handful of paths, so incremental buys nothing here
         # anyway. See PR #1398 review.
+        scan_cancel_check = None
+        scan_pause_check = None
+        if runner is not None and job is not None:
+            job_id = job["id"]
+            scan_cancel_check = lambda: runner.is_cancelled(job_id)  # noqa: E731
+            scan_pause_check = lambda: runner.pause_requested(job_id)  # noqa: E731
         scan(
             destination, db,
             restrict_dirs=[batch_st.dest_folder],
@@ -1469,6 +1482,8 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
             vireo_dir=params.vireo_dir,
             thumb_cache_dir=params.thumb_cache_dir,
             skip_working_copies=True,
+            cancel_check=scan_cancel_check,
+            pause_check=scan_pause_check,
         )
     except Exception as e:  # scan failure fails the whole batch
         # Each entry was already booked into copied or
@@ -4411,7 +4426,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         if batch_st.landed and not batch_st.dest_read_cancelled:
             pre_scan_hashes = _catalog_scan_and_prescan(
                 state, batch_st, db, params, scan, destination, rel,
-                attests_bytes,
+                attests_bytes, runner=runner, job=job,
             )
 
             # RAW rows whose derived caches need invalidation because a

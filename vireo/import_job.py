@@ -1404,12 +1404,20 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
     On scan failure every landed entry is reclassified to failed and
     ``batch_st.landed`` is cleared.
 
-    ``runner`` and ``job``, when supplied, wire the job's pause and
-    cancellation probes into the per-batch ``scan()`` call so a Pause
-    on a pausable import (``/api/jobs/import-photos``) unwinds the
-    scanner's process pool and drops its CPU lease at the pause
-    checkpoint instead of holding permits until the batch finishes.
-    Same shape as the ``do_scan`` wiring on the other import routes.
+    ``runner`` and ``job``, when supplied, wire the job's PAUSE probe
+    into the per-batch ``scan()`` call so a Pause on a pausable import
+    (``/api/jobs/import-photos``) unwinds the scanner's process pool
+    and drops its CPU lease at the pause checkpoint instead of holding
+    permits until the batch finishes.
+
+    Deliberately does NOT wire a cancel probe: the caller's contract
+    (run_import_job comment at ~lines 4422-4425) is that this scan is
+    the preservation catalog for what already landed on disk, and it
+    must run to completion even after Stop so those files reach a
+    valid catalog state. Passing a cancel_check that already-fired
+    would let ``scan()`` raise ``ScanCancelled`` and the surrounding
+    handler would reclassify every landed entry as failed even though
+    the bytes remain on disk uncataloged.
     """
     # ``landed`` covers collision-loop adoptions too (origin
     # "skipped_duplicate"), so their photo rows get created by the
@@ -1469,21 +1477,16 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
         # the row. ``restrict_files`` already narrows these batches
         # to a handful of paths, so incremental buys nothing here
         # anyway. See PR #1398 review.
-        scan_cancel_check = None
+        # Deliberately no cancel_check: the caller's contract is that
+        # this scan runs to completion even after Stop so already-landed
+        # files reach a valid catalog state (run_import_job comment at
+        # ~lines 4422-4425). Passing an already-fired probe would let
+        # ``scan()`` raise ``ScanCancelled``, and the surrounding
+        # handler would reclassify every landed entry as failed while
+        # the bytes remain on disk uncataloged.
         scan_pause_check = None
         if runner is not None and job is not None:
             job_id = job["id"]
-            # ``runner.is_cancelled`` parks on Pause via
-            # ``wait_if_paused``; suspend the ledger's active-wait
-            # timer around that park so an hour-long pause during a
-            # per-batch scan does not persist as an hour of resource
-            # contention on the job's diagnostics. The context
-            # manager is a no-op when no ledger wait is active.
-            from resource_ledger import suspend_resource_wait_timing
-
-            def scan_cancel_check():
-                with suspend_resource_wait_timing():
-                    return runner.is_cancelled(job_id)
 
             def scan_pause_check():
                 return runner.pause_requested(job_id)
@@ -1494,7 +1497,6 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
             vireo_dir=params.vireo_dir,
             thumb_cache_dir=params.thumb_cache_dir,
             skip_working_copies=True,
-            cancel_check=scan_cancel_check,
             pause_check=scan_pause_check,
         )
     except Exception as e:  # scan failure fails the whole batch

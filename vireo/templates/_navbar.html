@@ -3963,6 +3963,12 @@ function _lbApplyReadOnlyState() {
   }
 }
 
+window.setLightboxReadOnlyMode = function(readOnly, message) {
+  _lbReadOnly = !!readOnly;
+  _lbReadOnlyMessage = message || 'This lightbox is read-only';
+  _lbApplyReadOnlyState();
+};
+
 function _lbSetPhotoTransitionPending(pending) {
   ['lightboxActions', 'lightboxAdjustPanel', 'syncLightboxPanel'].forEach(function(id) {
     var controls = document.getElementById(id);

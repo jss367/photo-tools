@@ -5630,11 +5630,20 @@ function openGroupReview(encIdx, burstIdx, selectPhotoId) {
   });
 }
 
+function refreshPipelineReviewLightboxReadOnlyState() {
+  var lightbox = document.getElementById('lightboxOverlay');
+  if (!lightbox || !lightbox.classList.contains('active') ||
+      typeof window.setLightboxReadOnlyMode !== 'function') return;
+  var options = pipelineReviewLightboxOptions();
+  window.setLightboxReadOnlyMode(options.readOnly, options.readOnlyMessage);
+}
+
 function grmSetApplying(isApplying) {
   if (!grmState) return;
   grmState.applying = isApplying;
   var overlay = document.getElementById('grmOverlay');
   if (overlay) overlay.inert = !!isApplying;
+  refreshPipelineReviewLightboxReadOnlyState();
   var btn = document.getElementById('grmApplyBtn');
   if (!btn) return;
   if (isApplying) {
@@ -5792,6 +5801,8 @@ function closeGroupReview(force) {
     window.clearLightboxProvisionalFlags(grmState.items.map(function(photo) { return photo.id; }));
   }
   document.getElementById('grmOverlay').classList.remove('open');
+  if (grmState) grmState.applying = false;
+  refreshPipelineReviewLightboxReadOnlyState();
   _grmOffsets = {};
   _grmDragging = null;
   _grmLoupeAlignDragging = null;
@@ -7463,6 +7474,10 @@ async function setPipelineReviewRating(photoIds, rating) {
     notifyReadOnlyScopedView();
     return false;
   }
+  if (grmState && grmState.applying) {
+    showToast('Group Review is applying changes — wait for it to finish', 'warning');
+    return false;
+  }
   var ids = pipelineReviewUniquePhotoIds(photoIds);
   if (!ids.length) return false;
   try {
@@ -7591,6 +7606,10 @@ function openPipelineLightbox(photoId) {
 async function setWildlifeExcludedFor(photoId, excluded) {
   if (isScopedReviewView()) {
     notifyReadOnlyScopedView();
+    return false;
+  }
+  if (grmState && grmState.applying) {
+    showToast('Group Review is applying changes — wait for it to finish', 'warning');
     return false;
   }
   try {

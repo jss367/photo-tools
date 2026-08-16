@@ -1431,6 +1431,30 @@ def test_similar_result_lightbox_preserves_scoped_read_only_mode(live_server, pa
     )
     expect(page.locator("#lightboxDeleteBtn")).to_be_disabled()
 
+    native_write_state = page.evaluate(
+        """async () => {
+          const originalSafeFetch = window.safeFetch;
+          const calls = [];
+          window.safeFetch = function(url) {
+            calls.push(url);
+            return Promise.resolve({});
+          };
+          try {
+            await nativeMenuSetRating(5);
+            await nativeMenuSetWildlifeExcluded(true);
+            return {calls: calls};
+          } finally {
+            window.safeFetch = originalSafeFetch;
+          }
+        }"""
+    )
+    assert native_write_state == {"calls": []}
+
+    page.evaluate("grmSetApplying(false)")
+    assert page.evaluate("_lbReadOnly") is False
+    expect(page.locator("#lightboxDeleteBtn")).to_be_enabled()
+    expect(page.locator("#lightboxEditPhoto")).to_be_enabled()
+
 
 def test_lightbox_flag_over_group_review_updates_pending_zones(live_server, page):
     """A flag set from the lightbox above Group Review must route through the

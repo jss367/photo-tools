@@ -16299,10 +16299,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """
         db = _get_db()
         body = request.get_json(silent=True) or {}
-        pred_ids, err = _parse_prediction_ids(db, body)
+        pred_ids, photo_by_pred, err = _parse_prediction_ids(db, body)
         if err is not None:
             return err
 
+        # Confine grouped accepts to the submitted selection: without this,
+        # accepting a species for one group member expands to every other
+        # photo in the burst — including photos the user never selected in
+        # Browse. ``accept_prediction`` already honours ``photo_ids`` when
+        # limiting a grouped accept.
+        submitted_photo_ids = list({int(pid) for pid in photo_by_pred.values()})
         replace_species = bool(body.get("replace_species"))
         items = []
         keyword_id = None
@@ -16310,7 +16316,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         try:
             for pid in pred_ids:
                 result = db.accept_prediction(
-                    pid, replace_species=replace_species, _commit=False,
+                    pid,
+                    replace_species=replace_species,
+                    photo_ids=submitted_photo_ids,
+                    _commit=False,
                 )
                 if result is None:
                     continue
@@ -16361,23 +16370,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     def _parse_prediction_ids(db, body):
         """Validate a batch payload's ``prediction_ids``.
 
-        Returns ``(prediction_ids, None)`` or ``(None, error_response)``. Every
-        id must exist and belong to a photo in the active workspace, so a batch
-        can never reach across a workspace boundary.
+        Returns ``(prediction_ids, photo_by_pred, None)`` or
+        ``(None, None, error_response)``. ``photo_by_pred`` maps each
+        prediction id to its parent photo id — callers pass those photo ids to
+        ``accept_prediction`` so a grouped accept stays scoped to the submitted
+        photos rather than expanding to every burst-group member. Every id must
+        exist and belong to a photo in the active workspace, so a batch can
+        never reach across a workspace boundary.
         """
         raw_ids = body.get("prediction_ids", [])
         if not isinstance(raw_ids, list) or not raw_ids:
-            return None, json_error("prediction_ids required")
+            return None, None, json_error("prediction_ids required")
         pred_ids = []
         seen = set()
         for raw in raw_ids:
             if isinstance(raw, bool) or not isinstance(raw, int):
-                return None, json_error("prediction_ids must be integers")
+                return None, None, json_error("prediction_ids must be integers")
             if raw not in seen:
                 pred_ids.append(raw)
                 seen.add(raw)
         if len(pred_ids) > 1000:
-            return None, json_error("too many prediction_ids", 400)
+            return None, None, json_error("too many prediction_ids", 400)
 
         placeholders = ",".join("?" for _ in pred_ids)
         photo_by_pred = {
@@ -16391,13 +16404,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         }
         for pid in pred_ids:
             if pid not in photo_by_pred:
-                return None, json_error(f"Prediction {pid} not found", 404)
+                return None, None, json_error(f"Prediction {pid} not found", 404)
             if not db._photo_in_workspace(photo_by_pred[pid]):
-                return None, json_error(
+                return None, None, json_error(
                     f"Photo {photo_by_pred[pid]} does not belong to the "
                     "active workspace", 403,
                 )
-        return pred_ids, None
+        return pred_ids, photo_by_pred, None
 
     @app.route("/api/predictions/batch-reject", methods=["POST"])
     def api_batch_reject_predictions():
@@ -16409,7 +16422,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """
         db = _get_db()
         body = request.get_json(silent=True) or {}
-        pred_ids, err = _parse_prediction_ids(db, body)
+        pred_ids, _photo_by_pred, err = _parse_prediction_ids(db, body)
         if err is not None:
             return err
 

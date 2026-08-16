@@ -16723,6 +16723,99 @@ def test_batch_reject_rejects_foreign_prediction(app_and_db):
     assert resp.status_code == 403
 
 
+def test_batch_accept_grouped_stays_scoped_to_submitted_photos(app_and_db):
+    """A grouped accept must not tag photos the caller didn't submit.
+
+    ``accept_prediction`` expands a grouped accept to every photo in the
+    burst group unless ``photo_ids`` is supplied. The batch endpoint has
+    to pass the submitted selection, or accepting a species for one
+    Browse-selected group member tags the hidden burst members too.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_grouped(filename):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=filename, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(
+            det_id, "Bald Eagle", 0.9, "bioclip",
+            group_id="burst-1",
+        )
+        return photo_id
+
+    photo_selected_a = _seed_grouped("grp-a.jpg")
+    photo_selected_b = _seed_grouped("grp-b.jpg")
+    photo_unselected = _seed_grouped("grp-c.jpg")
+
+    pred_a = _prediction_id(db, photo_selected_a, "Bald Eagle")
+    pred_b = _prediction_id(db, photo_selected_b, "Bald Eagle")
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_a, pred_b]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    # Selected photos get the species keyword and their prediction flips.
+    for pid in (photo_selected_a, photo_selected_b):
+        names = {k["name"] for k in db.get_photo_keywords(pid)}
+        assert "Bald Eagle" in names
+
+    # The unselected group member must be untouched — no tag, still pending.
+    unselected_kws = {k["name"] for k in db.get_photo_keywords(photo_unselected)}
+    assert "Bald Eagle" not in unselected_kws
+    unselected_status = next(
+        row["status"] for row in db.get_predictions(photo_ids=[photo_unselected])
+        if row["species"] == "Bald Eagle"
+    )
+    assert unselected_status == "pending"
+
+
+def test_batch_reject_does_not_hide_earlier_undoable_edit(app_and_db):
+    """A reject must not shift ``/api/undo/status`` onto an unrelated edit.
+
+    ``prediction_reject`` is in ``Database._NON_UNDOABLE`` (there is no
+    ``_apply_undo`` handler for it), so the undo endpoint keeps advertising
+    whatever undoable edit came before. The frontend accordingly avoids
+    showing an "undo the reject" toast that would silently reverse the
+    unrelated earlier edit instead.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, _ = _seed_prediction_photo(db, "rej-undo-a.jpg", "Bald Eagle", 0.91)
+    photo_b, _ = _seed_prediction_photo(db, "rej-undo-b.jpg", "Great Blue Heron", 0.9)
+
+    accept_pred = _prediction_id(db, photo_a, "Bald Eagle")
+    reject_pred = _prediction_id(db, photo_b, "Great Blue Heron")
+
+    # An undoable edit first, then a reject after it.
+    assert client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [accept_pred]},
+    ).status_code == 200
+    assert client.post(
+        "/api/predictions/batch-reject",
+        json={"prediction_ids": [reject_pred]},
+    ).status_code == 200
+
+    status = client.get("/api/undo/status").get_json()
+    # The undo cursor still points at the earlier accept, not the reject.
+    # Advertising the reject as undoable would let Ctrl+Z silently undo the
+    # accept instead.
+    assert status["available"] is True
+    assert "Bald Eagle" in status["description"]
+    assert "Great Blue Heron" not in status["description"]
+
+
 def test_prediction_states_distinguish_empty_reasons(app_and_db):
     """Four different reasons a photo shows no predictions, kept apart."""
     app, db = app_and_db

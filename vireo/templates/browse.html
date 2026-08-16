@@ -6485,13 +6485,15 @@ async function rejectDetailPredictions(predictionIds, photoId) {
       body: JSON.stringify({prediction_ids: predictionIds}),
     });
   } catch(e) { return; }
-  // A reject changes no keywords, so only the prediction rows need repainting
-  // — but it does record an edit, so the undo affordance still has to appear.
+  // A reject changes no keywords, so only the prediction rows need repainting.
+  // Deliberately no showUndoToast() here: `prediction_reject` is in the DB's
+  // _NON_UNDOABLE set (no _apply_undo handler), so /api/undo/status would
+  // advertise some earlier edit as reversible and Ctrl+Z would undo THAT
+  // instead of the reject — silently reversing an unrelated action.
   if (window._detailPhotoId === photoId) loadDetailPredictions(photoId);
   selectionPredictionKey = '';
   var selection = getActiveSelection();
   if (selection.length > 1) loadSelectionPredictions(selection);
-  showUndoToast();
 }
 
 async function loadSelectionPredictions(ids) {

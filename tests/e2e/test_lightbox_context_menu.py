@@ -87,6 +87,10 @@ def test_lightbox_color_description_opens_editor(live_server, page):
     expect(blue).to_have_attribute(
         "title", "Blue — Waterbirds · Right-click to edit"
     )
+    # Regression: context-menu chips built after the description finished
+    # loading used to keep the hardcoded "Blue label" aria-label because
+    # no later refreshControls() pass revisited them.
+    expect(blue).to_have_attribute("aria-label", "Blue label: Waterbirds")
     expect(page.locator('.vireo-ctx-chip[data-color="purple"]')).to_be_visible()
 
     blue.click(button="right")

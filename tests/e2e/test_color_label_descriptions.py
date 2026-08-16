@@ -39,6 +39,60 @@ def test_right_click_color_adds_workspace_description(live_server, page):
     assert response.json() == {"red": "Reptiles"}
 
 
+def test_lazily_rendered_color_badges_include_workspace_description(live_server, page):
+    """Cards appended after the description loaded still get the described aria-label.
+
+    Regression: `refreshControls()` fires only when descriptions load or are
+    saved, so cards that go through `appendGridPhotos` afterwards used to keep
+    the hardcoded "Red label" aria-label instead of "Red label: Reptiles".
+    """
+    url = live_server["url"]
+    photos = live_server["data"]["photos"]
+
+    put = page.request.put(
+        f"{url}/api/color-label-descriptions/red",
+        data={"description": "Reptiles"},
+    )
+    assert put.ok
+    color_response = page.request.post(
+        f"{url}/api/photos/{photos[0]}/color_label",
+        data={"color": "red"},
+    )
+    assert color_response.ok
+
+    page.goto(f"{url}/browse")
+    page.locator(".grid-card").first.wait_for(state="visible")
+    # Ensure descriptions have finished loading before we simulate a lazy append.
+    page.wait_for_function(
+        "window.VireoColorLabels"
+        " && window.VireoColorLabels.description('red') === 'Reptiles'",
+        timeout=3000,
+    )
+
+    # Simulate a lazy-loaded batch by re-appending the seeded photo through
+    # the same code path the scroll loader uses. Before the fix the newly
+    # inserted badge kept its build-time aria-label of "Red label".
+    page.evaluate(
+        """(pid) => {
+            const original = photos.find(p => p.id === pid);
+            if (!original) throw new Error('seed photo missing from page state');
+            const clone = Object.assign({}, original, { id: pid + 90000 });
+            colorLabels[clone.id] = 'red';
+            colorLabelsFetched.add(clone.id);
+            appendGridPhotos([clone], 1000);
+        }""",
+        photos[0],
+    )
+
+    appended = page.locator(
+        f'.grid-card[data-id="{photos[0] + 90000}"] .grid-card-color[data-color="red"]'
+    )
+    expect(appended).to_have_attribute("aria-label", "Red label: Reptiles")
+    expect(appended).to_have_attribute(
+        "title", "Red — Reptiles · Right-click to edit"
+    )
+
+
 def test_color_description_can_be_removed_and_right_click_does_not_filter(
     live_server, page
 ):

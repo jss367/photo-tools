@@ -2721,6 +2721,16 @@ document.addEventListener('lightbox:renderchanged', function(e) {
   });
 });
 
+// Fold any already-loaded workspace descriptions into freshly rendered
+// color-label badges so lazily inserted cards get the same title and
+// accessible name as cards rendered after descriptions finished loading.
+function refreshColorLabelControlsIn(scope) {
+  if (!scope) return;
+  if (window.VireoColorLabels && typeof window.VireoColorLabels.refreshControls === 'function') {
+    window.VireoColorLabels.refreshControls(scope);
+  }
+}
+
 function appendGridPhotos(newPhotos, startIdx) {
   if (!newPhotos.length) return;
   var grid = document.getElementById('grid');
@@ -2732,6 +2742,7 @@ function appendGridPhotos(newPhotos, startIdx) {
   if (tail) tail.insertAdjacentHTML('beforebegin', html);
   else grid.insertAdjacentHTML('beforeend', html);
   updateGridTail();
+  refreshColorLabelControlsIn(grid);
 }
 
 /* The grid tail reserves a bounded amount of scroll space for the next photos
@@ -2782,7 +2793,10 @@ function refreshGridCards(photoIds) {
     var card = document.querySelector('.grid-card[data-id="' + id + '"]');
     if (!card) return;
     var info = card.querySelector('.grid-card-info');
-    if (info) info.innerHTML = renderCardInfo(p);
+    if (info) {
+      info.innerHTML = renderCardInfo(p);
+      refreshColorLabelControlsIn(info);
+    }
     // iNat badge lives in img-wrap (not grid-card-info), so sync it explicitly
     // when async metadata arrives after the card was appended.
     var wrap = card.querySelector('.grid-card-img-wrap');
@@ -5202,6 +5216,7 @@ function renderGrid() {
   });
   grid.innerHTML = html;
   updateGridTail();
+  refreshColorLabelControlsIn(grid);
 }
 
 /* ---------- Grid dblclick delegation (XSS-safe) ---------- */

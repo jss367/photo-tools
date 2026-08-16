@@ -2193,6 +2193,13 @@ function sendReport() {
         });
         row.appendChild(b);
       });
+      // Fold any already-loaded workspace descriptions into these freshly
+      // built chips so their titles and aria-labels stay in sync with the
+      // rest of the color-label controls even when the menu opens after
+      // descriptions load (no later refreshControls() pass revisits them).
+      if (window.VireoColorLabels && typeof window.VireoColorLabels.refreshControls === 'function') {
+        window.VireoColorLabels.refreshControls(row);
+      }
       return row;
     }
     const d = document.createElement('div');

@@ -8043,6 +8043,7 @@ async function grmApply() {
     return;
   }
   if (grmState.applying) return;
+  var applySessionId = grmState.sessionId;
   grmSetApplying(true);
   var grmFlagLockIds = [];
 
@@ -8050,6 +8051,11 @@ async function grmApply() {
     await waitForPipelineReviewDirectFlagWrites(
       grmState.items.map(function(photo) { return photo.id; })
     );
+    var activeOverlay = document.getElementById('grmOverlay');
+    if (grmState.sessionId !== applySessionId ||
+        !activeOverlay || !activeOverlay.classList.contains('open')) {
+      return false;
+    }
     var diff = grmComputeDiff();
     var checks = grmResolveChecks(diff);
     var species = document.getElementById('grmSpecies').value.trim();
@@ -8313,7 +8319,8 @@ async function grmApply() {
       pipelineReviewGroupFlagInFlightPhotoIds.delete(pid);
     });
     var overlay = document.getElementById('grmOverlay');
-    if (overlay && overlay.classList.contains('open')) {
+    if (grmState.sessionId === applySessionId &&
+        overlay && overlay.classList.contains('open')) {
       grmSetApplying(false);
     }
   }

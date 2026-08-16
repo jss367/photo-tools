@@ -1588,6 +1588,73 @@ def test_group_apply_waits_for_earlier_direct_flag_write(live_server, page):
         )
 
 
+def test_waiting_group_apply_aborts_after_another_group_opens(live_server, page):
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    photo_id = photo_ids[0]
+    page.evaluate(
+        """pid => {
+          window.__originalSafeFetchForSessionGuard = window.safeFetch;
+          window.__groupApplyCalls = 0;
+          window.safeFetch = function(url, options) {
+            if (url === '/api/photos/' + pid + '/flag') {
+              const args = arguments;
+              return new Promise((resolve, reject) => {
+                window.__releaseSessionGuardFlag = () => {
+                  window.__originalSafeFetchForSessionGuard
+                    .apply(window, args).then(resolve, reject);
+                };
+              });
+            }
+            if (url === '/api/pipeline/group/apply') window.__groupApplyCalls += 1;
+            return window.__originalSafeFetchForSessionGuard.apply(this, arguments);
+          };
+          window.__sessionGuardFlagWrite = setPipelineReviewFlag(pid, 'flagged');
+        }""",
+        photo_id,
+    )
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    original_session = page.evaluate("grmState.sessionId")
+    page.evaluate(
+        """() => {
+          grmMoveReject();
+          window.__staleApplySettled = false;
+          window.__staleApplyPromise = grmApply().then(
+            () => { window.__staleApplySettled = true; },
+            error => {
+              window.__staleApplyError = String(error);
+              window.__staleApplySettled = true;
+            }
+          );
+          closeGroupReview();
+          openGroupReview(0, 1);
+        }"""
+    )
+    page.wait_for_function(
+        "session => grmState.sessionId !== session && grmState.seeded === true",
+        arg=original_session,
+    )
+    new_group_ids = page.evaluate("grmState.items.map(photo => photo.id)")
+
+    try:
+        page.evaluate("window.__releaseSessionGuardFlag()")
+        page.wait_for_function("window.__staleApplySettled === true")
+        assert page.evaluate("window.__staleApplyError || null") is None
+        assert page.evaluate("window.__groupApplyCalls") == 0
+        assert page.evaluate("grmState.items.map(photo => photo.id)") == new_group_ids
+        assert page.evaluate("grmState.applying") is False
+        assert _flags(db, photo_ids) == ["flagged", "none", "none", "none"]
+    finally:
+        page.evaluate(
+            "() => { window.safeFetch = window.__originalSafeFetchForSessionGuard; }"
+        )
+
+
 def test_read_only_scope_lightbox_flag_does_not_mutate_cache(live_server, page):
     db = live_server["db"]
     photo_ids = live_server["data"]["photos"][:4]
@@ -1968,6 +2035,36 @@ def test_popup_blocked_browse_preserves_dirty_group_review(live_server, page):
     assert result is False
     assert page.url == original_url
     assert page.evaluate("grmHasPendingUserEdits()") is True
+    expect(page.locator("#grmOverlay")).to_have_class(re.compile(r"\bopen\b"))
+
+
+def test_tauri_browse_rechecks_dirty_state_after_menu_opens(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    original_url = page.url
+    state = page.evaluate(
+        """() => {
+          window.__TAURI_INTERNALS__ = {};
+          const photoId = grmState.selected;
+          const browseItem = buildPipelinePhotoContextMenu(
+            [photoId], photoId, true
+          ).find(item => item.label === 'Open in Browse');
+          const initiallyDisabled = !!browseItem.disabled;
+          grmMoveReject();
+          browseItem.onClick();
+          return {
+            initiallyDisabled: initiallyDisabled,
+            dirty: grmHasPendingUserEdits(),
+          };
+        }"""
+    )
+    assert state == {"initiallyDisabled": False, "dirty": True}
+    assert page.url == original_url
     expect(page.locator("#grmOverlay")).to_have_class(re.compile(r"\bopen\b"))
 
 

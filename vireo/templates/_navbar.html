@@ -2348,6 +2348,13 @@ function sendReport() {
   window.openInBrowse = function(photoId){
     var url = '/browse?photo_id=' + photoId;
     if (typeof isTauri === 'function' && isTauri()) {
+      var tauriBlockedHint = typeof window.getLightboxBrowseDisabledHint === 'function'
+        ? window.getLightboxBrowseDisabledHint(photoId, true)
+        : null;
+      if (tauriBlockedHint) {
+        if (typeof showToast === 'function') showToast(tauriBlockedHint, 'warning');
+        return false;
+      }
       window.location.href = url;
       return true;
     } else {

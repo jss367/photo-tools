@@ -2154,6 +2154,8 @@ def test_lightbox_deletion_updates_process_and_open_group_state(live_server, pag
             selectedIds: Array.from(grmState.selectedIds),
             selected: grmState.selected,
             rejectDiff: grmComputeDiff().rejectNew,
+            loupeSrc: document.getElementById('grmLoupePhoto').getAttribute('src'),
+            expectedLoupeSrc: grmState.selected ? grmPhotoUrl(grmState.selected) : null,
           };
         }""",
         deleted_id,
@@ -2170,8 +2172,53 @@ def test_lightbox_deletion_updates_process_and_open_group_state(live_server, pag
         assert deleted_id not in state[key]
     assert state["selected"] != deleted_id
     assert state["rejectDiff"] == 0
+    assert state["loupeSrc"] == state["expectedLoupeSrc"]
     expect(page.locator(f'.photo-card[data-photo-id="{deleted_id}"]')).to_have_count(0)
     expect(page.locator(f'.grm-card[data-photo-id="{deleted_id}"]')).to_have_count(0)
+
+
+def test_lightbox_deletion_skips_staged_removed_selection_fallback(
+    live_server, page
+):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    deleted_id = page.evaluate("grmState.selected")
+    page.evaluate(
+        """deletedId => {
+          const survivor = grmState.items.find(photo => photo.id !== deletedId);
+          grmState.removed.add(survivor.id);
+          grmSyncZoneCards();
+        }""",
+        deleted_id,
+    )
+
+    state = page.evaluate(
+        """photoId => {
+          document.dispatchEvent(new CustomEvent('lightbox:photodeleted', {
+            detail: {photoId: photoId, result: {deleted: 1}},
+          }));
+          return {
+            selected: grmState.selected,
+            selectedIds: Array.from(grmState.selectedIds),
+            loupeSrc: document.getElementById('grmLoupePhoto').getAttribute('src'),
+            loupeInfo: document.getElementById('grmLoupeInfo').textContent,
+          };
+        }""",
+        deleted_id,
+    )
+    assert state == {
+        "selected": None,
+        "selectedIds": [],
+        "loupeSrc": None,
+        "loupeInfo": (
+            "Select a photo to preview. Hover to compare sharpness across all frames."
+        ),
+    }
 
 
 def test_lightbox_deletion_remaps_open_group_after_pruning_earlier_units(

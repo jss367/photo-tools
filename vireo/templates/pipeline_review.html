@@ -8492,13 +8492,7 @@ document.addEventListener('lightbox:photodeleted', function(e) {
     ['dbState', 'selectedSubjectByPhoto'].forEach(function(name) {
       if (grmState[name]) delete grmState[name][String(photoId)];
     });
-    if (grmState.selected === photoId) {
-      grmState.selected = grmState.items.length ? grmState.items[0].id : null;
-      grmState.selectionAnchor = grmState.selected;
-      if (grmState.selected != null && grmState.selectedIds) {
-        grmState.selectedIds.add(grmState.selected);
-      }
-    }
+    if (grmState.selectionAnchor === photoId) grmState.selectionAnchor = null;
   }
 
   // Pruning an empty encounter or burst shifts later array indices. Group
@@ -8535,7 +8529,7 @@ document.addEventListener('lightbox:photodeleted', function(e) {
   updateSummaryBar(refreshLocalSummaryCounts());
   refreshLatestScopeSnapshotIfCurrent();
   if (groupOverlay && groupOverlay.classList.contains('open')) {
-    if (grmState.items.length) renderGroupModal();
+    if (grmState.items.length) grmRenderKeepingCurrentSelection(grmState.items);
     else closeGroupReview();
   }
 });

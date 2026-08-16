@@ -5545,20 +5545,14 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 photo_dets = photo_dets[:1]
                             detections_to_classify = photo_dets
                             if not detections_to_classify:
-                                # Distinguish "no eligible detection at the
-                                # workspace threshold" from "MegaDetector found
-                                # nothing at all." Weak raw detections keep the
-                                # existing behavior for now; true no-detection
-                                # photos get full-image classification.
-                                raw_real_dets = [
-                                    d for d in thread_db.get_detections(
-                                        photo["id"], min_conf=0,
-                                    )
-                                    if d["detector_model"] != "full-image"
-                                ]
-                                if raw_real_dets:
-                                    continue
-
+                                # No box is usable at either the ordinary
+                                # threshold or the contextual weak-rescue
+                                # floor. Treat this the same as a true
+                                # no-detection photo and give the classifier a
+                                # full-image attempt. Raw detector output is
+                                # retained for diagnostics/cache reuse, but a
+                                # 1% noise box must not suppress classification
+                                # of an otherwise visible subject.
                                 existing_full = thread_db.get_detections(
                                     photo["id"],
                                     detector_model="full-image",

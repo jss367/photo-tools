@@ -2950,6 +2950,122 @@ def test_pipeline_classifies_full_image_when_detector_finds_nothing(
     assert pred_after_reclassify[0]["species"] == "Full-image Robin"
 
 
+def test_pipeline_classifies_full_image_when_only_raw_noise_boxes_exist(
+    tmp_path, monkeypatch,
+):
+    """A raw detector box below every eligibility floor must not suppress
+    full-image classification.
+
+    MegaDetector persists output down to its raw confidence floor so future
+    threshold changes can reuse it. Previously, the mere presence of one of
+    those rows made classify skip the photo: it was too weak to crop, but also
+    blocked the full-image fallback. That stranded clear subjects whenever the
+    detector emitted only noise-level boxes.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+    from PIL import Image
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    photo_id = db.add_photo(
+        folder_id, "bird-in-branches.jpg", ".jpg", 100, 1_000_000.0,
+    )
+    _drop_jpeg(folder_path, "bird-in-branches.jpg")
+    collection_id = db.add_collection(
+        "Raw noise box",
+        json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+
+    model_id = _setup_fake_downloaded_model(tmp_path, monkeypatch)
+    raw_detection = {
+        "box": {"x": 0.42, "y": 0.48, "w": 0.15, "h": 0.16},
+        "confidence": 0.02,
+        "category": "animal",
+    }
+    raw_detection_id = db.write_detection_batch(
+        photo_id, "megadetector-v6", [raw_detection],
+    )[0]
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det = {
+            "id": raw_detection_id,
+            "box_x": raw_detection["box"]["x"],
+            "box_y": raw_detection["box"]["y"],
+            "box_w": raw_detection["box"]["w"],
+            "box_h": raw_detection["box"]["h"],
+            "confidence": raw_detection["confidence"],
+            "category": "animal",
+            "detector_model": "megadetector-v6",
+        }
+        return {photo_id: [det]}, 1, {photo_id}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    prepared_detections = []
+
+    def fake_prepare_image(photo, folders, detection, vireo_dir=None):
+        prepared_detections.append(detection)
+        return Image.new("RGB", (32, 32), "white"), folder_path, str(
+            os.path.join(folder_path, photo["filename"])
+        )
+
+    monkeypatch.setattr(classify_job, "_prepare_image", fake_prepare_image)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def classify_batch_with_embedding(self, images, threshold=0):
+            import numpy as np
+
+            return [(
+                [{"species": "Downy Woodpecker", "score": 0.94}],
+                np.zeros(512, dtype=np.float32),
+            ) for _ in images]
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    result = run_pipeline_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        PipelineParams(
+            collection_id=collection_id,
+            model_id=model_id,
+            skip_extract_masks=True,
+            skip_regroup=True,
+        ),
+    )
+
+    assert result["stages"]["classify"]["full_image_fallbacks"] == 1
+    assert prepared_detections == [None]
+
+    check = Database(db_path)
+    check.set_active_workspace(ws_id)
+    rows = check.conn.execute(
+        """SELECT d.detector_model, pr.species
+             FROM detections d
+             LEFT JOIN predictions pr ON pr.detection_id = d.id
+            WHERE d.photo_id = ?
+            ORDER BY d.detector_model""",
+        (photo_id,),
+    ).fetchall()
+    assert [dict(row) for row in rows] == [
+        {"detector_model": "full-image", "species": "Downy Woodpecker"},
+        {"detector_model": "megadetector-v6", "species": None},
+    ]
+
+
 def test_pipeline_redownloads_taxonomy_when_existing_file_is_corrupt(
     tmp_path, monkeypatch
 ):

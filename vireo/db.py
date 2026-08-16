@@ -17274,6 +17274,7 @@ class Database:
         prediction_id,
         replace_species=False,
         photo_ids=None,
+        prediction_ids=None,
         _commit=True,
     ):
         """Accept a prediction: mark as accepted and add species keyword.
@@ -17292,6 +17293,22 @@ class Database:
         group members are tagged and marked accepted. This lets callers apply a
         grouped accept to a filtered subset without changing hidden photos.
 
+        ``prediction_ids`` is the stricter form of the same limit, for callers
+        that already know the exact prediction rows they are acting on: the
+        grouped accept touches only those rows. Prefer it over ``photo_ids``
+        whenever the caller has a submitted id list. A photo is not a unique
+        key for a prediction — one photo can carry several rows in the same
+        burst group (one per classifier model, or per detection) — so a
+        photo-id limit lets a grouped accept reach a row on an allowed photo
+        that the caller never submitted. ``photo_ids`` remains for callers
+        whose intent really is "these photos" (highlight confirm, accept
+        subject), where the row set is chosen by this method.
+
+        The returned ``accepted_prediction_ids`` lists every prediction row
+        this call marked accepted, so a caller looping over a submitted batch
+        can skip rows a previous grouped accept already covered instead of
+        re-accepting them into duplicate history items.
+
         All database changes are performed atomically in a single transaction
         unless ``_commit`` is False and the caller owns the transaction.
         """
@@ -17299,6 +17316,9 @@ class Database:
         limited_photo_ids = None
         if photo_ids is not None:
             limited_photo_ids = {int(pid) for pid in photo_ids}
+        limited_pred_ids = None
+        if prediction_ids is not None:
+            limited_pred_ids = {int(pid) for pid in prediction_ids}
         # Load taxonomy once for the whole call so replace_species can protect
         # keywords whose relationship to a neighbouring subject's prediction is
         # broader/same/narrower — not just exact-text matches. Loaded here
@@ -17332,16 +17352,31 @@ class Database:
         if not pred:
             return None
 
-        try:
-            # Reject sibling predictions for the same
-            # (detection, classifier_model, labels_fingerprint) in this
-            # workspace (covers both accepting an alternative and accepting
-            # the top-1). Scoping by fingerprint is critical — without it,
-            # accepting a prediction from a new label set would mark old
-            # label-set rows as rejected, silently rewriting review state
-            # for unrelated fingerprints. Review state is workspace-scoped,
-            # so we upsert each row rather than UPDATE the base predictions
-            # table.
+        def _reject_siblings_of(this_pred_id):
+            """Resolve the losing rows on one accepted row's detection.
+
+            Rejects siblings for the same
+            (detection, classifier_model, labels_fingerprint) in this
+            workspace (covers both accepting an alternative and accepting the
+            top-1). Scoping by fingerprint is critical — without it, accepting
+            a prediction from a new label set would mark old label-set rows as
+            rejected, silently rewriting review state for unrelated
+            fingerprints. Review state is workspace-scoped, so we upsert each
+            row rather than UPDATE the base predictions table.
+
+            Run per accepted row, not once for the entry row: a grouped accept
+            decides every member's detection, so leaving the other members'
+            alternatives at 'alternative' would keep photos in Review's queue
+            that this call already settled — and would make it unsafe for a
+            batch caller to skip a submitted row that a grouped accept covered.
+            """
+            row = self.conn.execute(
+                """SELECT detection_id, classifier_model, labels_fingerprint
+                   FROM predictions WHERE id = ?""",
+                (this_pred_id,),
+            ).fetchone()
+            if row is None:
+                return
             sibs = self.conn.execute(
                 """SELECT pr.id FROM predictions pr
                    LEFT JOIN prediction_review pr_rev
@@ -17351,8 +17386,8 @@ class Database:
                      AND pr.labels_fingerprint = ?
                      AND pr.id != ?
                      AND COALESCE(pr_rev.status, 'pending') IN ('pending', 'alternative')""",
-                (ws, pred["detection_id"], pred["model"],
-                 pred["labels_fingerprint"], prediction_id),
+                (ws, row["detection_id"], row["classifier_model"],
+                 row["labels_fingerprint"], this_pred_id),
             ).fetchall()
             for s in sibs:
                 self.conn.execute(
@@ -17364,6 +17399,9 @@ class Database:
                                      reviewed_at = datetime('now')""",
                     (s["id"], ws),
                 )
+
+        try:
+            _reject_siblings_of(prediction_id)
 
             # For grouped predictions, derive consensus from individual votes
             species = pred["species"]
@@ -17392,8 +17430,17 @@ class Database:
                 species = stored["name"]
             # list of {"photo_id", "prediction_id", "old_species"}
             affected = []
+            # Every row this call flips to accepted, including ones that
+            # produced no ``affected`` entry (a status-only accept under
+            # replace_species). Callers batching over a submitted id list use
+            # it to avoid re-entering rows a grouped accept already covered.
+            accepted_pred_ids = []
 
             def _accept_for_photo(photo_id, this_pred_id):
+                accepted_pred_ids.append(this_pred_id)
+                if this_pred_id != prediction_id:
+                    # The entry row's siblings were already resolved above.
+                    _reject_siblings_of(this_pred_id)
                 self.update_prediction_status(this_pred_id, "accepted", _commit=False)
                 old_species = []
                 already_has_species = photo_id in self.get_photos_with_equivalent_species(
@@ -17723,20 +17770,41 @@ class Database:
                         and gp["photo_id"] not in limited_photo_ids
                     ):
                         continue
+                    # The row-level limit, checked independently: a group
+                    # member's photo being in scope does not make every row
+                    # that member carries in scope.
+                    if (
+                        limited_pred_ids is not None
+                        and gp["id"] not in limited_pred_ids
+                    ):
+                        continue
                     _accept_for_photo(gp["photo_id"], gp["id"])
             else:
                 if (
                     limited_photo_ids is not None
                     and pred["photo_id"] not in limited_photo_ids
+                ) or (
+                    limited_pred_ids is not None
+                    and prediction_id not in limited_pred_ids
                 ):
                     if _commit:
                         self.conn.commit()
-                    return {"species": species, "keyword_id": kid, "affected": []}
+                    return {
+                        "species": species,
+                        "keyword_id": kid,
+                        "affected": [],
+                        "accepted_prediction_ids": [],
+                    }
                 _accept_for_photo(pred["photo_id"], prediction_id)
 
             if _commit:
                 self.conn.commit()
-            return {"species": species, "keyword_id": kid, "affected": affected}
+            return {
+                "species": species,
+                "keyword_id": kid,
+                "affected": affected,
+                "accepted_prediction_ids": accepted_pred_ids,
+            }
         except Exception:
             if _commit:
                 self.conn.rollback()

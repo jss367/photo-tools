@@ -117,16 +117,94 @@ between the user and a mislabelled Accept.
 
 ### One size limit, two endpoints
 
-The selection endpoint caps at 1,000 photos; `batch-accept` caps at 25,000
-prediction ids because one photo can emit several rows for one species
-(several detections, or several classifier models). A flat 1,000-id cap on
-the write rejected Accept buttons the panel had just advertised — 501 photos
-× 2 models = 1,002 ids = a guaranteed 400.
+One bound, one unit, one constant: `_MAX_SELECTION_PHOTOS = 1000` **photos**,
+enforced by the selection endpoints on the way in and by
+`_parse_prediction_ids` (on distinct photos, not on ids) on the way back.
+
+The invariant is *any payload the suggestions endpoint can legally emit, the
+batch endpoints accept*. Bounding the write by id count cannot hold it: the
+producer caps photos and then emits every matching row for them, and
+rows-per-photo has no ceiling (one per detection × one per classifier
+model). Three rounds of review picked a rows-per-photo guess — 1,000, then
+25,000, then 200,000 — and each was either below what the producer could
+emit (so the panel's own Accept button 400ed on a selection it had just
+advertised) or a number with nothing behind it. Counting photos makes the
+invariant hold by construction, with no margin left to re-tune.
+`test_batch_accept_takes_any_payload_the_suggestions_endpoint_emits` drives
+producer into consumer; `test_batch_accept_has_no_prediction_id_count_cap`
+locks that length alone never rejects;
+`test_batch_prediction_payload_shares_the_selection_photo_cap` locks the two
+ends to the same number.
 
 Both the id lookup and the already-accepted probe chunk through
-`_SQL_PARAM_CHUNK`: a 25,000-wide `IN` clause exceeds the 999-variable limit
-older SQLite builds enforce. The workspace check runs once per distinct
-photo rather than once per id.
+`_SQL_PARAM_CHUNK`: a several-thousand-wide `IN` clause exceeds the
+999-variable limit older SQLite builds enforce. The workspace check runs
+once per distinct photo rather than once per id.
+
+### Scoping a grouped accept: rows, not photos
+
+`accept_prediction` expands a grouped (burst) accept to the whole group. The
+batch endpoint must confine that to what the user submitted, and it passes
+`prediction_ids` — the submitted row ids — rather than the union of their
+photo ids. A photo is not a unique key for a prediction: one burst frame
+carries a row per classifier model and a row per detection. Under *any*
+photo-set limit — the batch-wide union, or a per-`(group, model)` bucket —
+photo A submitting model X and photo B submitting model Y let A's grouped
+accept walk the burst under X and accept B's X row too, a row the panel had
+deliberately omitted (below threshold, already accepted, ambiguous). Row
+identity has no such projection to widen, whatever column next distinguishes
+two rows on one photo. The submitted set is also built *after* the
+already-accepted filter, so a resubmitted row cannot be re-accepted through
+a sibling's group expansion. `photo_ids` stays for callers whose intent really is
+"these photos" (highlight confirm, accept subject).
+
+`accept_prediction` returns `accepted_prediction_ids` so the batch loop skips
+siblings a grouped accept already resolved; re-entering them was O(N²) in
+group size and appended a second, status-only history item per photo whose
+recorded previous status was a fiction. For that skip to be safe, rejecting
+the losing alternatives moved from "once, for the entry row" to "once per
+accepted row" — a grouped accept decides every member's detection, so every
+member's alternatives have to be resolved with it. Locked by
+`test_batch_accept_scopes_grouped_accept_to_the_submitted_rows`,
+`test_batch_accept_does_not_re_enter_rows_a_grouped_accept_covered` and
+`test_batch_accept_dedup_still_rejects_skipped_detection_alternatives`.
+
+### The category is a snapshot; the Accept button is not
+
+`predictions.category` records how the prediction compared to the photo's
+keywords *when the classifier ran*. Nothing rewrites it afterwards — the only
+writers are the classify path and duplicate merge — so a photo keyworded
+Robin after a pending Sparrow prediction was stored as `new` still reads
+`new`, and Browse would offer a bare Accept that tags a species the photo
+already contradicts. Compare never trusted the column; it recomputes per
+request. `_effective_category_resolver` shares that computation and both
+Browse surfaces — `/api/predictions` (as `effective_category`) and the
+selection aggregator — recompare before deciding "actionable here" vs "route
+to Review".
+
+Three details are load-bearing:
+
+- the comparison runs on the **consensus** species, since that is what
+  Accept would add;
+- the keyword side comes from `get_species_keywords_for_photos` and the
+  prediction side from `resolve_species_display_name`, the same
+  canonicalization Compare applies — comparing raw `keywords.name` text
+  would make a photo tagged with the hierarchy leaf `Desert Verdin` read as
+  *conflicting* with a `Verdin` prediction whenever the taxonomy file is
+  unavailable, inventing an ambiguity and sending a settled photo to Review;
+- the fresh comparison **wins outright**; the stored snapshot is the
+  fallback for when no fresh comparison could be made, not an extra OR
+  condition. ORing them makes ambiguity a one-way ratchet — a photo whose
+  conflicting keyword was since removed would be routed to Review forever,
+  naming a conflict that no longer exists. That is the same staleness bug
+  pointing the other way.
+
+`test_browse_predictions_stay_acceptable_when_keywords_agree` and
+`test_browse_clears_stale_ambiguity_when_keywords_no_longer_conflict` hold
+the "do not over-route" direction; the routine's
+`test_selection_prediction_suggestions_recomputes_ambiguity_after_keyword_edit`
+and `test_predictions_api_effective_category_reflects_current_keywords` hold
+the "do route the real conflict" direction.
 
 ### Accept is not a tag
 

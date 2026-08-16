@@ -1464,6 +1464,15 @@ def _filter_highlight_curation_state(
 _SQL_PARAM_CHUNK = 900
 
 
+# Largest photo selection the Browse selection panels will act on. Owned here
+# rather than inline so the producer (``/api/selection/*``, which reads a
+# selection) and the consumers (``/api/predictions/batch-*``, which write one)
+# are bounded by the same number. A batch payload is validated in photos, not
+# in prediction ids, precisely so it cannot be tighter than what the producer
+# is allowed to emit for that selection.
+_MAX_SELECTION_PHOTOS = 1000
+
+
 def _chunked(seq, size=_SQL_PARAM_CHUNK):
     """Yield ``seq`` in successive lists of at most ``size`` items."""
     for i in range(0, len(seq), size):
@@ -10063,71 +10072,106 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         except (TypeError, ValueError):
             return species
 
-    def _current_species_by_photo(db, photo_ids):
-        """Return ``{photo_id: [species_keyword_name, ...]}`` for photos in scope.
+    def _effective_category_resolver(db, photo_ids):
+        """Build ``(photo_id, species) -> category`` against *current* keywords.
 
-        Only species-rank rows are returned (linked-taxon species or unlinked
-        rows flagged ``is_species``), matching what ``accept_prediction``
-        replaces when it strips old tags. Used to recompute a pending
-        prediction's ambiguity against the *current* keywords on the photo —
-        ``predictions.category`` is only stamped at classify-time and never
-        refreshed, so a keyword added after classification leaves the stored
-        category stale and Browse would offer a bare Accept for a now-
-        conflicting prediction.
+        ``predictions.category`` is a snapshot of how the prediction compared
+        to the photo's keywords at classification time, and nothing rewrites
+        it when keywords change afterwards (the only writers are the classify
+        path and duplicate merge). So a photo that gained a Robin keyword
+        after a pending Sparrow prediction was stored as ``new`` still reads
+        ``new`` — and Browse would offer a bare Accept that tags a species
+        conflicting with what the photo already says. ``CORE_PHILOSOPHY.md``
+        forbids exactly that: the button must mean what the user reads it as.
+
+        Returns ``match``/``new``/``refinement``/``broader``/``conflict`` from
+        ``compare_prediction_to_keywords`` — Compare's vocabulary, because
+        this is Compare's computation, shared rather than reimplemented (see
+        ``api_predictions_compare``). Callers treat
+        ``refinement``/``broader``/``conflict`` as ambiguous, the same set
+        Browse's ``predictionIsAmbiguous`` refuses to offer a bare Accept for.
+
+        Two details are load-bearing and are the reason this goes through the
+        same helpers Compare uses rather than a raw keyword query:
+
+        * ``get_species_keywords_for_photos`` canonicalizes a hierarchy alias
+          through its linked taxon's root, and ``resolve_species_display_name``
+          does the same for the prediction label. Comparing raw
+          ``keywords.name`` text would make a photo tagged with the leaf
+          ``Desert Verdin`` read as *conflicting* with a ``Verdin``
+          prediction whenever the taxonomy file is unavailable — inventing an
+          ambiguity and sending a settled photo to Review.
+        * the comparison runs on the species the accept path would actually
+          apply (the burst consensus), not the row's own label.
+
+        Returns None when no comparison is possible (compare or the photo set
+        unavailable) so callers can fall back to the stored snapshot.
         """
-        by_photo = {}
+        photo_ids = [pid for pid in dict.fromkeys(photo_ids) if pid is not None]
         if not photo_ids:
-            return by_photo
-        for chunk in _chunked(list(photo_ids)):
-            placeholders = ",".join("?" for _ in chunk)
-            for row in db.conn.execute(
-                f"""SELECT pk.photo_id, k.name
-                    FROM photo_keywords pk
-                    JOIN keywords k ON k.id = pk.keyword_id
-                    LEFT JOIN taxa t ON t.id = k.taxon_id
-                    WHERE pk.photo_id IN ({placeholders})
-                      AND (k.is_species = 1 OR k.type = 'taxonomy')
-                      AND (t.rank = 'species' OR t.rank IS NULL)""",
-                tuple(chunk),
-            ).fetchall():
-                by_photo.setdefault(row["photo_id"], []).append(row["name"])
-        return by_photo
-
-    def _load_prediction_taxonomy():
-        """Best-effort taxonomy load for prediction/keyword comparison.
-
-        ``compare_prediction_to_keywords`` accepts ``None`` and degrades to
-        exact-text comparison, which is enough to catch the Robin/Sparrow
-        case in the finding — a missing or corrupt taxonomy file must never
-        cause the endpoint to hard-fail.
-        """
+            return None
         try:
-            from taxonomy import load_local_taxonomy
-            return load_local_taxonomy()
+            from compare import compare_prediction_to_keywords
         except Exception:
             return None
+        # Cached by mtime inside load_local_taxonomy, so this is a lookup on
+        # the hot path rather than a re-parse per request. None degrades
+        # compare_prediction_to_keywords to exact-text matching, which is
+        # still current-state truth — better than a stale column either way,
+        # and a missing or corrupt taxonomy file must never hard-fail the
+        # endpoint.
+        try:
+            from taxonomy import load_local_taxonomy
+            taxonomy = load_local_taxonomy()
+        except Exception:
+            taxonomy = None
+        species_by_photo = db.get_species_keywords_for_photos(photo_ids)
+        resolved = {}
+        cache = {}
 
-    def _prediction_effective_category(species, existing_species, taxonomy):
-        """Recomputed disposition for a pending prediction against current keywords.
+        def _category(photo_id, species):
+            if not species or photo_id is None:
+                return None
+            if species not in resolved:
+                try:
+                    resolved[species] = db.resolve_species_display_name(species)
+                except Exception:
+                    resolved[species] = species
+            key = (photo_id, resolved[species])
+            if key not in cache:
+                comparison = compare_prediction_to_keywords(
+                    resolved[species],
+                    species_by_photo.get(photo_id, []),
+                    taxonomy,
+                )
+                cache[key] = (
+                    comparison.get("category")
+                    if isinstance(comparison, dict) else None
+                )
+            return cache[key]
 
-        Returns one of ``match``/``new``/``refinement``/``broader``/``conflict``
-        from ``compare_prediction_to_keywords``. Callers treat
-        ``refinement``/``broader``/``conflict`` as ambiguous — the same set
-        Browse's ``predictionIsAmbiguous`` refuses to offer a bare Accept
-        for. ``existing_species`` may include duplicates or empty strings;
-        the compare helper de-dupes at the taxon level.
-        """
-        if not species:
-            return None
-        from compare import compare_prediction_to_keywords
-        result = compare_prediction_to_keywords(
-            species, list(existing_species or []), taxonomy,
-        )
-        return result.get("category") if isinstance(result, dict) else None
+        return _category
 
     _EFFECTIVE_AMBIGUOUS_CATEGORIES = frozenset(
         {"refinement", "broader", "conflict"}
     )
+    # Stored-snapshot categories that mean the same thing, used only when no
+    # fresh comparison is available.
+    _STORED_AMBIGUOUS_CATEGORIES = frozenset({"disagreement", "refinement"})
+
+    def _prediction_is_ambiguous(effective_category, stored_category):
+        """Would a bare Accept here be dishonest?
+
+        The fresh comparison wins outright when there is one. ORing it with
+        the stored snapshot would make ambiguity a one-way ratchet: a photo
+        whose conflicting keyword has since been removed would keep being
+        routed to Review forever, naming a conflict that no longer exists —
+        the same staleness bug in the other direction. The snapshot is the
+        fallback for when no fresh comparison could be made at all.
+        """
+        if effective_category is not None:
+            return effective_category in _EFFECTIVE_AMBIGUOUS_CATEGORIES
+        return stored_category in _STORED_AMBIGUOUS_CATEGORIES
 
     def _parse_selection_photo_ids(body):
         """Validate a selection payload's ``photo_ids``.
@@ -10152,7 +10196,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 seen.add(raw)
         if not photo_ids:
             return None, json_error("photo_ids required")
-        if len(photo_ids) > 1000:
+        if len(photo_ids) > _MAX_SELECTION_PHOTOS:
             return None, json_error("too many photo_ids", 400)
 
         for pid in photo_ids:
@@ -10212,8 +10256,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # against the *current* species keywords per photo so Browse routes
         # those conflicts to Review instead of offering a bare Accept that
         # silently adds a second, disagreeing species.
-        current_species_by_photo = _current_species_by_photo(db, photo_ids)
-        _taxonomy = _load_prediction_taxonomy()
+        effective_category_of = _effective_category_resolver(db, photo_ids)
 
         order = {pid: i for i, pid in enumerate(photo_ids)}
         by_key = {}
@@ -10236,15 +10279,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             })
             entry["models"].add(row["model"])
             entry["confidences"].append(row["confidence"] or 0.0)
-            effective_category = _prediction_effective_category(
-                species,
-                current_species_by_photo.get(row["photo_id"], []),
-                _taxonomy,
+            # Compared on the consensus species, because that is the one the
+            # Accept button would actually add to the photo.
+            effective_category = (
+                effective_category_of(row["photo_id"], species)
+                if effective_category_of is not None else None
             )
             ambiguous = (
                 (row["detection_id"], row["model"]) in alt_keys
-                or row["category"] in ("disagreement", "refinement")
-                or effective_category in _EFFECTIVE_AMBIGUOUS_CATEGORIES
+                or _prediction_is_ambiguous(
+                    effective_category, row["category"],
+                )
             )
             # One photo can hold several detections of the same species, or
             # the same detection classified by several models. Keep every
@@ -16120,28 +16165,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             d.get("photo_id") for d in pred_dicts
             if d.get("status") != "alternative" and d.get("photo_id") is not None
         }
-        current_species_by_photo = _current_species_by_photo(
+        effective_category_of = _effective_category_resolver(
             db, pending_photo_ids,
-        )
-        _taxonomy = (
-            _load_prediction_taxonomy() if pending_photo_ids else None
         )
         for d in pred_dicts:
             if d.get("status") == "alternative":
                 continue  # alternatives are nested, not top-level
             d["edit_recipe"] = recipes_by_photo.get(d.get("photo_id"))
-            existing_species_for_photo = current_species_by_photo.get(
-                d.get("photo_id"), [],
-            )
-            effective_category = _prediction_effective_category(
-                d.get("species"), existing_species_for_photo, _taxonomy,
+            # Species the accept path will actually apply. For an ordinary
+            # prediction this is the row's own species; for a grouped/burst
+            # prediction whose frames disagree, ``accept_prediction`` derives
+            # the burst consensus from ``individual`` vote counts. The Browse
+            # panel labels and groups rows by this so a Sparrow frame in a
+            # majority-Robin burst never surfaces a Sparrow row whose Accept
+            # actually tags Robin. Computed before the comparison below
+            # because that species is the one that would land on the photo.
+            d["consensus_species"] = _prediction_consensus_species(d)
+            effective_category = (
+                effective_category_of(
+                    d.get("photo_id"), d.get("consensus_species"),
+                )
+                if effective_category_of is not None else None
             )
             d["effective_category"] = effective_category
-            needs_existing = (
-                d.get("category") in ("disagreement", "refinement")
-                or effective_category in _EFFECTIVE_AMBIGUOUS_CATEGORIES
-            )
-            if needs_existing:
+            if _prediction_is_ambiguous(effective_category, d.get("category")):
                 keywords = db.get_photo_keywords(d["photo_id"])
                 d["existing_species"] = [
                     k["name"] for k in keywords
@@ -16150,14 +16197,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # Attach alternatives
             key = (d.get("detection_id"), d.get("model"))
             d["alternatives"] = alts_by_key.get(key, [])
-            # Species the accept path will actually apply. For an ordinary
-            # prediction this is the row's own species; for a grouped/burst
-            # prediction whose frames disagree, ``accept_prediction`` derives
-            # the burst consensus from ``individual`` vote counts. The Browse
-            # panel labels and groups rows by this so a Sparrow frame in a
-            # majority-Robin burst never surfaces a Sparrow row whose Accept
-            # actually tags Robin.
-            d["consensus_species"] = _prediction_consensus_species(d)
             results.append(d)
         # Surface the visual clause's status so the Review filter bar's
         # visual chip can warn on fallback. Without this the chip would
@@ -16517,28 +16556,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "single-photo replacement",
                 400,
             )
-        pred_ids, pred_meta, err = _parse_prediction_ids(db, body)
+        pred_ids, err = _parse_prediction_ids(db, body)
         if err is not None:
             return err
-
-        # Confine each grouped accept to the photos that submitted a
-        # prediction in the SAME ``(group_id, classifier_model)`` bucket.
-        # A batch-wide photo union would let one submitted (photo_A, model_X)
-        # accept expand to (photo_B, model_X) whenever B appears in the batch
-        # via a different bucket — even though B's model_X row was hidden
-        # (below threshold, already accepted, or simply not chosen). That
-        # would silently accept a prediction the panel never showed, and its
-        # status-only edit would make Undo reset a previously accepted
-        # prediction to pending. Non-grouped predictions land in their own
-        # ``(None, model, photo_id)`` bucket so they never share a photo set.
-        photos_by_bucket = {}
-        for pid in pred_ids:
-            meta = pred_meta[pid]
-            if meta["group_id"] is None:
-                bucket = ("_solo", pid)
-            else:
-                bucket = (meta["group_id"], meta["model"])
-            photos_by_bucket.setdefault(bucket, set()).add(meta["photo_id"])
 
         # Make a repeat submission a no-op rather than a second accept. A
         # double-clicked Accept button or a stale panel would otherwise
@@ -16547,7 +16567,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # "previous" status is a fiction — undoing it would knock a
         # long-accepted prediction back to pending while keeping the keyword.
         ws = db._ws_id()
-        # Chunked: ``_parse_prediction_ids`` now admits well past the
+        # Chunked: a legal payload runs well past the
         # 999-variable limit older SQLite builds enforce. Every other
         # IN-clause query in this module goes through ``_chunked`` for the
         # same reason (see ``_SQL_PARAM_CHUNK``).
@@ -16564,49 +16584,47 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
         pred_ids = [pid for pid in pred_ids if pid not in already_accepted]
 
-        # Deduplicate submitted grouped predictions before the accept loop.
-        # ``accept_prediction`` on a grouped prediction expands to every
-        # group member whose photo is in ``photo_ids``, so submitting N
-        # burst-group members re-runs the same status/tag work N times per
-        # group and appends N-1 rounds of no-op ``affected`` entries per
-        # photo. Keep one representative per ``(group_id, model)``;
-        # non-representative grouped predictions still need their
-        # per-detection sibling alternatives rejected below because the
-        # representative's ``accept_prediction`` only rejects siblings
-        # scoped to its own detection.
-        representative_ids = []
-        skipped_grouped_ids = []
-        seen_group_keys = set()
-        for pid in pred_ids:
-            meta = pred_meta.get(pid)
-            if meta is None or meta.get("group_id") is None:
-                representative_ids.append(pid)
-                continue
-            key = (meta["group_id"], meta["model"])
-            if key in seen_group_keys:
-                skipped_grouped_ids.append(pid)
-                continue
-            seen_group_keys.add(key)
-            representative_ids.append(pid)
-
+        # Confine the whole batch to the rows the caller actually submitted.
+        # ``accept_prediction`` otherwise expands a grouped (burst) accept to
+        # every row in the group, tagging photos the user never selected.
+        #
+        # The limit travels as prediction ids, not as any photo set derived
+        # from them, because a photo is not a unique key for a prediction row:
+        # one burst photo can carry a row per classifier model and a row per
+        # detection. Under a photo-set limit — batch-wide or per
+        # ``(group, model)`` bucket — submitting photo A's model-X row and
+        # photo B's model-Y row lets A's grouped accept reach B's model-X row,
+        # a row the panel deliberately omitted (below threshold, ambiguous, or
+        # already accepted). Row identity has no such projection to get wrong,
+        # whatever column next distinguishes two rows on one photo. Note this
+        # set is built *after* the already-accepted filter, so a resubmitted
+        # row cannot be re-accepted through a sibling's group expansion
+        # either.
+        submitted_pred_ids = set(pred_ids)
+        # A grouped accept resolves every submitted sibling in its group in
+        # one call — including each one's losing alternatives, which
+        # ``accept_prediction`` now rejects per accepted row rather than only
+        # for the entry row. So the remaining siblings in this loop are
+        # already fully done; re-entering them was O(N^2) in group size and
+        # appended a second, status-only history item per photo whose
+        # recorded "previous" status is a fiction.
+        handled = set()
         items = []
         keyword_id = None
         species = None
         try:
-            for pid in representative_ids:
-                meta = pred_meta[pid]
-                if meta["group_id"] is None:
-                    bucket = ("_solo", pid)
-                else:
-                    bucket = (meta["group_id"], meta["model"])
-                allowed_photo_ids = sorted(photos_by_bucket[bucket])
+            for pid in pred_ids:
+                if pid in handled:
+                    continue
                 result = db.accept_prediction(
                     pid,
-                    photo_ids=allowed_photo_ids,
+                    prediction_ids=submitted_pred_ids,
                     _commit=False,
                 )
+                handled.add(pid)
                 if result is None:
                     continue
+                handled.update(result.get("accepted_prediction_ids", ()))
                 # One edit row carries one ``new_value`` keyword id, which the
                 # undo handler applies to every item. Accepting a mixed bag of
                 # species through one call would therefore undo incorrectly —
@@ -16631,52 +16649,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         "old_value": old_value,
                         "new_value": str(keyword_id),
                     })
-            # ``accept_prediction`` only rejects sibling alternatives for
-            # the representative's own ``detection_id``. For every skipped
-            # grouped prediction that shared a group with a representative,
-            # still reject its per-detection sibling alternatives so
-            # submitted detections' alternatives resolve identically to the
-            # pre-dedup behavior — otherwise a skipped detection's
-            # alternative row stays ``pending``/``alternative`` in Review
-            # even though its parent prediction was accepted via the
-            # representative's group expansion. ``_parse_prediction_ids``
-            # returns just (photo_id, group_id, model), so look up the
-            # detection / fingerprint the sibling query needs here — only
-            # for the skipped subset, which is usually small.
-            if skipped_grouped_ids:
-                for chunk in _chunked(skipped_grouped_ids):
-                    placeholders = ",".join("?" for _ in chunk)
-                    sibling_metas = db.conn.execute(
-                        f"""SELECT pr.id,
-                                   pr.detection_id,
-                                   pr.classifier_model AS model,
-                                   pr.labels_fingerprint
-                            FROM predictions pr
-                            WHERE pr.id IN ({placeholders})""",
-                        tuple(chunk),
-                    ).fetchall()
-                    for meta in sibling_metas:
-                        db.conn.execute(
-                            """INSERT INTO prediction_review
-                                 (prediction_id, workspace_id,
-                                  status, reviewed_at)
-                               SELECT pr.id, ?, 'rejected', datetime('now')
-                               FROM predictions pr
-                               LEFT JOIN prediction_review pr_rev
-                                 ON pr_rev.prediction_id = pr.id
-                                AND pr_rev.workspace_id = ?
-                               WHERE pr.detection_id = ?
-                                 AND pr.classifier_model = ?
-                                 AND pr.labels_fingerprint = ?
-                                 AND pr.id != ?
-                                 AND COALESCE(pr_rev.status, 'pending')
-                                     IN ('pending', 'alternative')
-                               ON CONFLICT(prediction_id, workspace_id)
-                               DO UPDATE SET status = 'rejected',
-                                             reviewed_at = datetime('now')""",
-                            (ws, ws, meta["detection_id"], meta["model"],
-                             meta["labels_fingerprint"], meta["id"]),
-                        )
             db.conn.commit()
         except Exception:
             db.conn.rollback()
@@ -16704,85 +16676,67 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     def _parse_prediction_ids(db, body):
         """Validate a batch payload's ``prediction_ids``.
 
-        Returns ``(prediction_ids, pred_meta, None)`` or
-        ``(None, None, error_response)``. ``pred_meta`` maps each prediction
-        id to ``{"photo_id", "group_id", "model"}``. ``batch-accept`` uses the
-        ``(group_id, classifier_model)`` triple to scope each grouped accept
-        to just the photos that submitted a prediction for the same bucket —
-        so the batch-wide photo union can't quietly tag a hidden burst-group
-        member. Every id must exist and belong to a photo in the active
-        workspace, so a batch can never reach across a workspace boundary.
+        Returns ``(prediction_ids, None)`` or ``(None, error_response)``.
+        Every id must exist and belong to a photo in the active workspace, so
+        a batch can never reach across a workspace boundary.
+
+        Size is bounded in the one unit the producer bounds: photos. These
+        payloads come from ``/api/selection/prediction-suggestions``, which
+        accepts at most ``_MAX_SELECTION_PHOTOS`` photos and then emits every
+        matching prediction row for them — a count it does not (and should
+        not) cap, since a photo legitimately carries one row per detection per
+        classifier model. Counting *ids* here therefore cannot be done without
+        inventing a rows-per-photo guess, and three rounds of review found the
+        guess wrong each time (1,000, then 25,000, then 200,000). Counting
+        distinct photos instead makes the invariant hold by construction: any
+        payload the suggestions endpoint can legally emit spans at most the
+        photo selection it was given, so this endpoint accepts it — no margin
+        to re-tune.
         """
         raw_ids = body.get("prediction_ids", [])
         if not isinstance(raw_ids, list) or not raw_ids:
-            return None, None, json_error("prediction_ids required")
+            return None, json_error("prediction_ids required")
         pred_ids = []
         seen = set()
         for raw in raw_ids:
             if isinstance(raw, bool) or not isinstance(raw, int):
-                return None, None, json_error("prediction_ids must be integers")
+                return None, json_error("prediction_ids must be integers")
             if raw not in seen:
                 pred_ids.append(raw)
                 seen.add(raw)
-        # Raw upper bound on prediction ids — kept high because the semantic
-        # constraint is *photos* (checked below against the same 1,000-photo
-        # cap the selection endpoint enforces), and the suggestions endpoint
-        # is uncapped per photo. A tight id cap made the panel's own Accept
-        # button 400 whenever detections-per-photo × models-per-detection
-        # crossed the threshold (Codex flagged the 25,000 cap: 1,000 photos ×
-        # 26 detections × 1 model = 26,000 ids). This limit is a runaway
-        # guard against a garbage payload, not the enforcement of any user
-        # constraint.
-        if len(pred_ids) > 200000:
-            return None, None, json_error("too many prediction_ids", 400)
 
-        # Chunked because a legal payload can now be well past the
-        # 999-variable limit older SQLite builds enforce. ``_SQL_PARAM_CHUNK``
-        # is the module-wide convention for exactly this.
-        ws = db._ws_id()
-        pred_meta = {}
+        # Chunked because a legal payload runs to many thousands of ids, and a
+        # single IN clause that wide exceeds the 999-variable limit older
+        # SQLite builds enforce. ``_SQL_PARAM_CHUNK`` is the module-wide
+        # convention for exactly this.
+        photo_by_pred = {}
         for chunk in _chunked(pred_ids):
             placeholders = ",".join("?" for _ in chunk)
-            for row in db.conn.execute(
-                f"""SELECT pr.id,
-                          pr.classifier_model AS model,
-                          d.photo_id,
-                          pr_rev.group_id AS group_id
-                    FROM predictions pr
-                    JOIN detections d ON d.id = pr.detection_id
-                    LEFT JOIN prediction_review pr_rev
-                      ON pr_rev.prediction_id = pr.id
-                     AND pr_rev.workspace_id = ?
-                    WHERE pr.id IN ({placeholders})""",
-                (ws, *chunk),
-            ).fetchall():
-                pred_meta[row["id"]] = {
-                    "photo_id": row["photo_id"],
-                    "model": row["model"],
-                    "group_id": row["group_id"],
-                }
+            photo_by_pred.update({
+                row["id"]: row["photo_id"] for row in db.conn.execute(
+                    f"""SELECT pr.id, d.photo_id
+                        FROM predictions pr
+                        JOIN detections d ON d.id = pr.detection_id
+                        WHERE pr.id IN ({placeholders})""",
+                    chunk,
+                ).fetchall()
+            })
+            # Bail as soon as the payload outgrows a legal selection rather
+            # than resolving the rest of a runaway request.
+            if len(set(photo_by_pred.values())) > _MAX_SELECTION_PHOTOS:
+                return None, json_error("too many photos in selection", 400)
         for pid in pred_ids:
-            if pid not in pred_meta:
-                return None, None, json_error(f"Prediction {pid} not found", 404)
-
-        # Match the selection endpoint's photo cap: the two panels feeding
-        # this route (single-photo and multi-select) resolve to at most
-        # 1,000 photos apiece, so the batch route enforces the same bound
-        # semantically rather than via an arbitrary id count.
-        distinct_photo_ids = list(dict.fromkeys(
-            meta["photo_id"] for meta in pred_meta.values()
-        ))
-        if len(distinct_photo_ids) > 1000:
-            return None, None, json_error("too many photos in selection", 400)
+            if pid not in photo_by_pred:
+                return None, json_error(f"Prediction {pid} not found", 404)
         # One workspace query per distinct photo, not per prediction id:
         # several rows on one photo must not cost several round trips each.
-        for photo_id in distinct_photo_ids:
+        for photo_id in dict.fromkeys(photo_by_pred.values()):
             if not db._photo_in_workspace(photo_id):
-                return None, None, json_error(
+                return None, json_error(
                     f"Photo {photo_id} does not belong to the "
                     "active workspace", 403,
                 )
-        return pred_ids, pred_meta, None
+        return pred_ids, None
 
     @app.route("/api/predictions/batch-reject", methods=["POST"])
     def api_batch_reject_predictions():
@@ -16794,7 +16748,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """
         db = _get_db()
         body = request.get_json(silent=True) or {}
-        pred_ids, _pred_meta, err = _parse_prediction_ids(db, body)
+        pred_ids, err = _parse_prediction_ids(db, body)
         if err is not None:
             return err
 

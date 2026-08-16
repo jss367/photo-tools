@@ -6267,16 +6267,17 @@ async function renderBrowseCompare() {
 // classify-time snapshot, so a Robin keyword added AFTER a Sparrow prediction
 // leaves the stored category unchanged; without the effective check Browse
 // would offer a bare Accept that silently adds the conflicting species.
+// The fresh comparison wins outright when the server could make one; the
+// stored `category` is only the fallback for when it could not. ORing the two
+// would make ambiguity a one-way ratchet — a photo whose conflicting keyword
+// has since been removed would keep being routed to Review forever, naming a
+// conflict that no longer exists. That is the same staleness the effective
+// check exists to kill, pointing the other way.
 function predictionIsAmbiguous(p) {
   var eff = p.effective_category;
-  return !!(
-    (p.alternatives && p.alternatives.length) ||
-    p.category === 'disagreement' ||
-    p.category === 'refinement' ||
-    eff === 'conflict' ||
-    eff === 'refinement' ||
-    eff === 'broader'
-  );
+  if (p.alternatives && p.alternatives.length) return true;
+  if (eff) return eff === 'conflict' || eff === 'refinement' || eff === 'broader';
+  return p.category === 'disagreement' || p.category === 'refinement';
 }
 
 function predictionAmbiguityReason(p) {
@@ -6286,9 +6287,11 @@ function predictionAmbiguityReason(p) {
     reasons.push(altCount + (altCount === 1 ? ' alternative' : ' alternatives'));
   }
   var existing = (p.existing_species || []).join(', ');
+  // Same precedence as predictionIsAmbiguous: name the reason the fresh
+  // comparison found, or the stored one only when there is no fresh one.
   var eff = p.effective_category;
-  var isConflict = p.category === 'disagreement' || eff === 'conflict';
-  var isRefinement = p.category === 'refinement' || eff === 'refinement';
+  var isConflict = eff ? eff === 'conflict' : p.category === 'disagreement';
+  var isRefinement = eff ? eff === 'refinement' : p.category === 'refinement';
   var isBroader = eff === 'broader';
   if (isConflict) {
     reasons.push(existing ? 'conflicts with keyworded ' + existing : 'conflicts with existing keywords');

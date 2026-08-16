@@ -695,6 +695,54 @@ def test_browse_lightbox_zoom_toggle_returns_to_fit_near_native(live_server, pag
     assert cancelled["pending"] is False
 
 
+def test_browse_lightbox_hide_chrome_also_hides_zoom_popover(live_server, page):
+    """Hide UI must close the zoom popover and hide its badge with the rest of the chrome."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" '
+        'viewBox="0 0 1600 1200"><rect width="1600" height="1200" fill="#274"/></svg>'
+    )
+    page.route(
+        re.compile(r"/photos/\d+/(full|original|preview)"),
+        lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
+    )
+    page.set_viewport_size({"width": 1000, "height": 800})
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+
+    overlay = page.locator("#lightboxOverlay")
+    badge = page.locator("#lightboxZoomBadge")
+    popover = page.locator("#lightboxZoomPopover")
+    control = page.locator("#lightboxZoomControl")
+    expect(overlay).to_have_class("lightbox-overlay active")
+    page.wait_for_function(
+        """() => {
+            const img = document.getElementById('lightboxImg');
+            return img && img.complete && img.naturalWidth === 1600 &&
+                !window._lbVisualTransitionPending;
+        }"""
+    )
+
+    badge.click()
+    expect(popover).to_have_class("lightbox-zoom-popover open")
+    expect(badge).to_have_attribute("aria-expanded", "true")
+    expect(control).to_be_visible()
+
+    page.evaluate("() => window.toggleLightboxChrome()")
+    expect(overlay).to_have_class("lightbox-overlay active lb-hide-chrome")
+    # The persisted "Lightbox controls: Off" state must not leave the zoom
+    # popover or its badge exposed over the image.
+    expect(popover).to_have_class("lightbox-zoom-popover")
+    expect(badge).to_have_attribute("aria-expanded", "false")
+    expect(control).not_to_be_visible()
+
+    page.evaluate("() => window.toggleLightboxChrome()")
+    expect(overlay).to_have_class("lightbox-overlay active")
+    expect(control).to_be_visible()
+    # Chrome coming back must not silently reopen the popover.
+    expect(popover).to_have_class("lightbox-zoom-popover")
+    expect(badge).to_have_attribute("aria-expanded", "false")
+
+
 def test_browse_lightbox_reserves_space_for_bottom_controls(live_server, page):
     """The fitted image stays above the toolbar and expands when it is hidden."""
     svg = (

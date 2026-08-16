@@ -766,6 +766,56 @@ def test_collection_load_failure_clears_native_selection_override(live_server, p
     assert state == {"override": None, "modalIds": [], "modalOpen": False}
 
 
+def test_latest_collection_load_owns_modal_selection(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    state = page.evaluate(
+        """async ids => {
+          const originalSafeFetch = window.safeFetch;
+          const resolvers = [];
+          window.safeFetch = function(url) {
+            if (url === '/api/collections') {
+              return new Promise(resolve => { resolvers.push(resolve); });
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            const first = addToCollection([ids[0]]);
+            const secondIds = [ids[1], ids[2]];
+            const second = addToCollection(secondIds);
+            resolvers[0]([]);
+            const firstResult = await first;
+            const afterFirst = {
+              open: document.getElementById('pipelineCollectionModal').classList.contains('open'),
+              ids: pipelineReviewModalPhotoIds.slice(),
+            };
+            resolvers[1]([]);
+            const secondResult = await second;
+            return {
+              firstResult,
+              secondResult,
+              afterFirst,
+              finalIds: pipelineReviewModalPhotoIds.slice(),
+              title: document.getElementById('pipelineCollectionTitle').textContent,
+            };
+          } finally {
+            window.safeFetch = originalSafeFetch;
+          }
+        }""",
+        photo_ids,
+    )
+    assert state == {
+        "firstResult": False,
+        "secondResult": True,
+        "afterFirst": {"open": False, "ids": []},
+        "finalIds": photo_ids[1:3],
+        "title": "Add 2 photos to Collection",
+    }
+
+
 def test_new_collection_submission_is_single_flight_and_retryable(live_server, page):
     photo_ids = live_server["data"]["photos"][:4]
     _write_grouped_pipeline_cache(live_server, photo_ids)

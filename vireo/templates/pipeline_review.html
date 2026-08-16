@@ -7313,6 +7313,7 @@ var pipelineReviewCollections = [];
 var pipelineReviewSelectedCollectionId = null;
 var pipelineReviewCollectionSubmitPromise = null;
 var pipelineReviewCreatedCollection = null;
+var pipelineReviewCollectionLoadSeq = 0;
 
 function pipelineReviewUniquePhotoIds(photoIds) {
   var seen = {};
@@ -7486,20 +7487,26 @@ function pipelineCollectionAcceptsManualPhotos(collection) {
 async function addToCollection(photoIds) {
   var ids = pipelineReviewUniquePhotoIds(photoIds || getActiveSelection());
   if (!ids.length) return;
-  pipelineReviewModalPhotoIds = ids;
-  pipelineReviewSelectedCollectionId = null;
-  pipelineReviewCreatedCollection = null;
+  var loadSeq = ++pipelineReviewCollectionLoadSeq;
   var collections;
   try {
     collections = await safeFetch('/api/collections', {}, {toast: false});
   } catch(e) {
+    if (loadSeq !== pipelineReviewCollectionLoadSeq) return false;
     // The native Photo menu pins its selection while this asynchronous modal
     // opens. If loading fails before there is a modal to close, release that
     // override here so later native actions use the current page selection.
     pipelineReviewModalPhotoIds = [];
     window._vireoNativeMenuPhotoIdsOverride = null;
-    return;
+    return false;
   }
+  // A newer invocation owns the shared modal state. Ignore this stale
+  // response rather than opening a dialog that mixes its title/list with the
+  // newer invocation's selected photo IDs.
+  if (loadSeq !== pipelineReviewCollectionLoadSeq) return false;
+  pipelineReviewModalPhotoIds = ids;
+  pipelineReviewSelectedCollectionId = null;
+  pipelineReviewCreatedCollection = null;
   pipelineReviewCollections = (collections || []).filter(pipelineCollectionAcceptsManualPhotos);
   document.getElementById('pipelineCollectionTitle').textContent =
     'Add ' + ids.length + ' photo' + (ids.length === 1 ? '' : 's') + ' to Collection';
@@ -7515,6 +7522,7 @@ async function addToCollection(photoIds) {
   document.getElementById('pipelineCollectionNewName').value = '';
   document.getElementById('pipelineCollectionModal').classList.add('open');
   setTimeout(function() { document.getElementById('pipelineCollectionNewName').focus(); }, 50);
+  return true;
 }
 
 function pickPipelineCollection(collectionId) {

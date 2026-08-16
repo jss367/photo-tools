@@ -6494,6 +6494,12 @@ async function rejectDetailPredictions(predictionIds, photoId) {
   selectionPredictionKey = '';
   var selection = getActiveSelection();
   if (selection.length > 1) loadSelectionPredictions(selection);
+  // A rejection can change membership in prediction-status collections
+  // (e.g. "pending predictions"): refresh counts and re-evaluate the
+  // active collection so the grid and counts don't lag behind the DB.
+  // The accept path fans out the same way via _afterPredictionMutation.
+  scheduleCollectionCountsRefresh();
+  refreshActiveCollectionAfterMembershipChange();
 }
 
 async function loadSelectionPredictions(ids) {
@@ -6565,6 +6571,14 @@ function renderSelectionPredictions(predictions, selectedCount, meta) {
   shown.forEach(function(p, idx) {
     var acceptable = p.acceptable_prediction_ids || [];
     var ambiguous = p.ambiguous_prediction_ids || [];
+    var ambiguousPhotos = p.ambiguous_photo_ids || [];
+    // Distinct photos, not distinct prediction rows: a photo can have several
+    // matching detections and each contributes a prediction id, so `acceptable`
+    // overcounts the photos that would actually be keyworded. Fall back to
+    // acceptable.length for older backend payloads.
+    var acceptablePhotoCount = (typeof p.acceptable_photo_count === 'number')
+      ? p.acceptable_photo_count
+      : acceptable.length;
     selectionPredictionAcceptableById[idx] = acceptable;
 
     var rowMeta = 'Predicted on ' + p.predicted_count + ' of ' + selectedCount;
@@ -6578,25 +6592,25 @@ function renderSelectionPredictions(predictions, selectedCount, meta) {
     // silently accepts 35 is exactly what CORE_PHILOSOPHY.md forbids, so the
     // ambiguous remainder is called out beside it rather than folded in.
     var actions = '';
-    if (acceptable.length) {
+    if (acceptablePhotoCount) {
       actions += '<button class="prediction-accept" onclick="acceptSelectionPrediction(' + idx +
         ')" title="Accept this species on the selected photos that are unambiguous">Accept on ' +
-        acceptable.length + '</button>';
+        acceptablePhotoCount + '</button>';
     }
     var why = '';
-    if (ambiguous.length) {
-      why = ambiguous.length + (ambiguous.length === 1 ? ' photo needs' : ' photos need') +
+    if (ambiguousPhotos.length) {
+      why = ambiguousPhotos.length + (ambiguousPhotos.length === 1 ? ' photo needs' : ' photos need') +
         ' review — alternatives or a conflict with existing keywords';
-      var firstAmbiguousPhoto = (p.ambiguous_photo_ids || [])[0];
-      if (!acceptable.length && firstAmbiguousPhoto != null) {
+      var firstAmbiguousPhoto = ambiguousPhotos[0];
+      if (!acceptablePhotoCount && firstAmbiguousPhoto != null) {
         actions += '<button class="prediction-review-link" onclick="openPredictionInReview(' +
           firstAmbiguousPhoto + ')">Open in Review</button>';
       }
-    } else if (!acceptable.length) {
+    } else if (!acceptablePhotoCount) {
       why = 'Already keyworded on every photo that predicts it';
     }
 
-    html += '<div class="prediction-row' + (ambiguous.length ? ' ambiguous' : '') + '">' +
+    html += '<div class="prediction-row' + (ambiguousPhotos.length ? ' ambiguous' : '') + '">' +
       '<div style="min-width:0;">' +
         '<div class="prediction-species">' + escapeHtml(p.species) + '</div>' +
         '<div class="prediction-meta">' + escapeHtml(rowMeta) + '</div>' +

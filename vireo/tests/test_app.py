@@ -16650,6 +16650,25 @@ def test_browse_page_has_prediction_panels(app_and_db):
     assert "No species above threshold" in html
 
 
+def test_browse_reject_predictions_refreshes_collections(app_and_db):
+    """A rejection can change membership in prediction-status collections
+    (e.g. a "pending predictions" saved collection), so the grid and
+    collection counts must be re-evaluated the same way the accept path
+    does. Without this the rejected photo sticks around in the visible
+    grid and the sidebar counts stay stale until a manual refresh.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    reject_fn_idx = html.find("async function rejectDetailPredictions")
+    assert reject_fn_idx != -1, "rejectDetailPredictions must exist"
+    # Bound the search to the body of the function.
+    next_fn_idx = html.find("\nasync function ", reject_fn_idx + 1)
+    body = html[reject_fn_idx: next_fn_idx if next_fn_idx != -1 else len(html)]
+    assert "scheduleCollectionCountsRefresh()" in body
+    assert "refreshActiveCollectionAfterMembershipChange()" in body
+
+
 def test_selection_prediction_suggestions_applies_confidence_threshold(app_and_db):
     """Low-confidence noise must not arrive wearing an Accept button.
 
@@ -16854,3 +16873,148 @@ def test_review_supports_photo_id_deep_link(app_and_db):
     assert "currentPhotoIdFilter" in html
     # The narrowing must be visible, or a one-photo queue reads as "empty".
     assert "photoFilterPill" in html
+
+
+def test_selection_prediction_suggestions_keeps_all_matching_ids_per_photo(app_and_db):
+    """Every unambiguous prediction row for the species on a selected photo
+    must be submittable in one batch.
+
+    When a photo has the same species predicted from multiple detections
+    (or multiple classifier models), aggregating down to the highest
+    confidence row and submitting only that id would flip only that
+    prediction to ``accepted``. The other sibling rows stay pending in
+    Review, and once the accept keywords the photo the Browse panel
+    filters it out as "already keyworded" — the user is stranded.
+
+    The button label still counts photos, not prediction rows, so
+    ``acceptable_photo_count`` stays honest even when a photo contributes
+    several ids.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    # Photo A: same species predicted on two separate detections.
+    photo_multi = db.add_photo(
+        folder_id=folder_id, filename="multi-det.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_ids = db.save_detections(
+        photo_multi,
+        [
+            {"box": {"x": 0.1, "y": 0.1, "w": 0.4, "h": 0.4},
+             "confidence": 0.9, "category": "animal"},
+            {"box": {"x": 0.5, "y": 0.5, "w": 0.4, "h": 0.4},
+             "confidence": 0.9, "category": "animal"},
+        ],
+        detector_model="MDV6",
+    )
+    db.add_prediction(det_ids[0], "Cape Cormorant", 0.95, "bioclip")
+    db.add_prediction(det_ids[1], "Cape Cormorant", 0.65, "bioclip")
+
+    # Photo B: same species predicted by two classifier models on one detection.
+    photo_multi_model = db.add_photo(
+        folder_id=folder_id, filename="multi-model.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_b = db.save_detections(
+        photo_multi_model,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    db.add_prediction(det_b, "Cape Cormorant", 0.9, "bioclip")
+    db.add_prediction(det_b, "Cape Cormorant", 0.7, "inat21")
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_multi, photo_multi_model]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    entry = next(
+        p for p in resp.get_json()["predictions"]
+        if p["species"] == "Cape Cormorant"
+    )
+    # Counted by photos.
+    assert entry["predicted_count"] == 2
+    assert entry["acceptable_photo_count"] == 2
+
+    # Every matching prediction row is submittable — not just the top one.
+    all_pred_ids = {
+        row["id"]
+        for row in db.get_predictions(photo_ids=[photo_multi, photo_multi_model])
+        if row["species"] == "Cape Cormorant"
+    }
+    assert set(entry["acceptable_prediction_ids"]) == all_pred_ids
+    assert entry["ambiguous_prediction_ids"] == []
+
+    # Submitting the batch flips every one of them to accepted — Review
+    # is left with nothing pending on this species.
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": entry["acceptable_prediction_ids"]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    remaining = [
+        row for row in db.get_predictions(
+            photo_ids=[photo_multi, photo_multi_model], status="pending",
+        )
+        if row["species"] == "Cape Cormorant"
+    ]
+    assert remaining == []
+
+
+def test_selection_prediction_suggestions_marks_photo_ambiguous_across_siblings(app_and_db):
+    """One ambiguous sibling flags the whole photo, and every id on that
+    photo is routed to ``ambiguous_prediction_ids``.
+
+    A partial accept — flipping only the "clean" sibling while leaving the
+    ambiguous one pending — would leave Review with the same conflict to
+    resolve later. The panel routes the whole photo to Review instead.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="mixed.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_ids = db.save_detections(
+        photo_id,
+        [
+            {"box": {"x": 0.1, "y": 0.1, "w": 0.4, "h": 0.4},
+             "confidence": 0.9, "category": "animal"},
+            {"box": {"x": 0.5, "y": 0.5, "w": 0.4, "h": 0.4},
+             "confidence": 0.9, "category": "animal"},
+        ],
+        detector_model="MDV6",
+    )
+    # Clean sibling.
+    db.add_prediction(det_ids[0], "Verdin", 0.9, "bioclip")
+    # Ambiguous sibling: has an alternative row for the same (detection, model).
+    db.add_prediction(
+        det_ids[1], "Verdin", 0.55, "bioclip", labels_fingerprint="fp1",
+    )
+    db.add_prediction(
+        det_ids[1], "Bushtit", 0.45, "bioclip",
+        status="alternative", labels_fingerprint="fp1",
+    )
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    entry = next(
+        p for p in resp.get_json()["predictions"] if p["species"] == "Verdin"
+    )
+    verdin_ids = {
+        row["id"]
+        for row in db.get_predictions(photo_ids=[photo_id])
+        if row["species"] == "Verdin"
+    }
+    # Whole photo is ambiguous; no clean id leaks into acceptable.
+    assert entry["acceptable_prediction_ids"] == []
+    assert entry["acceptable_photo_count"] == 0
+    assert set(entry["ambiguous_prediction_ids"]) == verdin_ids
+    assert entry["ambiguous_photo_ids"] == [photo_id]

@@ -10125,18 +10125,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 (row["detection_id"], row["model"]) in alt_keys
                 or row["category"] in ("disagreement", "refinement")
             )
-            prior = entry["rows_by_photo"].get(row["photo_id"])
-            # One photo can hold several detections of the same species. Keep
-            # the highest-confidence row as the one an Accept would act on,
-            # but let any ambiguous sibling mark the photo ambiguous.
-            if prior is None or (row["confidence"] or 0) > (prior["confidence"] or 0):
-                entry["rows_by_photo"][row["photo_id"]] = {
-                    "id": row["id"],
-                    "confidence": row["confidence"],
-                    "ambiguous": ambiguous or (prior or {}).get("ambiguous", False),
-                }
-            elif ambiguous:
-                prior["ambiguous"] = True
+            # One photo can hold several detections of the same species, or
+            # the same detection classified by several models. Keep every
+            # matching prediction id so the batch accept flips them all —
+            # keywording the photo once and leaving nothing pending in Review.
+            # Submitting only the top-confidence id used to accept that row,
+            # keyword the photo, and then hide the sibling rows behind the
+            # "already keyworded" filter with no way to resolve them.
+            photo_entry = entry["rows_by_photo"].setdefault(row["photo_id"], {
+                "ids": [],
+                "max_confidence": None,
+                "ambiguous": False,
+            })
+            photo_entry["ids"].append((row["confidence"] or 0, row["id"]))
+            if ambiguous:
+                photo_entry["ambiguous"] = True
+            conf = row["confidence"] or 0
+            if (
+                photo_entry["max_confidence"] is None
+                or conf > photo_entry["max_confidence"]
+            ):
+                photo_entry["max_confidence"] = conf
 
         # Resolve "already carries this species" against linked taxa, not
         # spelling, so a hierarchical Birds|Verdin tag counts as keyworded.
@@ -10159,11 +10168,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             acceptable, ambiguous_ids, ambiguous_photos = [], [], []
             for pid in missing_ids:
                 row = entry["rows_by_photo"][pid]
+                # Highest confidence first so a stable, obvious order lands in
+                # the payload (and any downstream truncation keeps the
+                # strongest evidence per photo).
+                ids_here = [
+                    rid for _c, rid in sorted(row["ids"], reverse=True)
+                ]
                 if row["ambiguous"]:
-                    ambiguous_ids.append(row["id"])
+                    ambiguous_ids.extend(ids_here)
                     ambiguous_photos.append(pid)
                 else:
-                    acceptable.append(row["id"])
+                    acceptable.extend(ids_here)
+            # Photo-level count for the button label. A photo with several
+            # matching detections contributes several ids to `acceptable`, so
+            # `len(acceptable)` overcounts the photos that would be keyworded.
+            acceptable_photo_count = len(missing_ids) - len(ambiguous_photos)
             results.append({
                 "species": entry["species"],
                 "models": sorted(entry["models"]),
@@ -10173,6 +10192,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "missing_photo_ids": missing_ids,
                 "prediction_ids": acceptable + ambiguous_ids,
                 "acceptable_prediction_ids": acceptable,
+                "acceptable_photo_count": acceptable_photo_count,
                 "ambiguous_prediction_ids": ambiguous_ids,
                 "ambiguous_photo_ids": ambiguous_photos,
                 "min_confidence": min(entry["confidences"]),

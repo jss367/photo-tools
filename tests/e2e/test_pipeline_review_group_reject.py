@@ -769,3 +769,87 @@ def test_group_context_menu_preserves_selection_for_collection_action(
 
     members = db.get_collection_photos(collection_id, per_page=100)
     assert {member["id"] for member in members} == set(selected_ids)
+
+
+def test_lightbox_over_group_review_suppresses_group_shortcuts(live_server, page):
+    """Space/Delete/Backspace pressed inside the shared lightbox must not
+    reach the Group Review keydown handler on the hidden overlay beneath."""
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    page.evaluate("openGroupReview(0, 0)")
+    expect(page.locator("#grmOverlay")).to_have_class(re.compile(r"\bopen\b"))
+    burst_ids = photo_ids[:2]
+    expect(page.locator("#grmOverlay .grm-card[data-photo-id]")).to_have_count(2)
+
+    # Open the lightbox above the group review on the first burst photo. The
+    # burst overlay stays open beneath; grmState.selected still names the
+    # first photo, so a stray Space or Delete would silently move it or drop
+    # it from the group.
+    page.evaluate(
+        "pid => openPipelineLightbox(pid)",
+        burst_ids[0],
+    )
+    expect(page.locator("#lightboxOverlay")).to_have_class(
+        re.compile(r"\bactive\b")
+    )
+
+    page.locator("#lightboxImg").press("Space")
+    page.locator("#lightboxImg").press("Delete")
+    page.locator("#lightboxImg").press("Backspace")
+
+    # Group Review's pending zones and touched set must be untouched.
+    zones = page.evaluate(
+        "() => ({"
+        "picks: Array.from(grmState.picks),"
+        "rejects: Array.from(grmState.rejects),"
+        "removed: Array.from(grmState.removed),"
+        "touched: Array.from(grmState.touched || []),"
+        "})"
+    )
+    assert zones == {"picks": [], "rejects": [], "removed": [], "touched": []}
+
+
+def test_lightbox_flag_over_group_review_updates_pending_zones(live_server, page):
+    """A flag set from the lightbox above Group Review must route through the
+    burst's pending zones, not write the database directly — otherwise the
+    burst's Apply overwrites the newer flag with its stale zone snapshot."""
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    page.evaluate("openGroupReview(0, 0)")
+    expect(page.locator("#grmOverlay")).to_have_class(re.compile(r"\bopen\b"))
+    burst_ids = photo_ids[:2]
+
+    page.evaluate(
+        "pid => openPipelineLightbox(pid)",
+        burst_ids[0],
+    )
+    expect(page.locator("#lightboxOverlay")).to_have_class(
+        re.compile(r"\bactive\b")
+    )
+
+    # Simulate the lightbox flag action for the visible burst photo. The write
+    # must land in the burst's pending zones — not the database — so a later
+    # Apply from Group Review reflects it instead of clobbering it.
+    landed = page.evaluate(
+        "pid => window.setFlagFor(pid, 'rejected')",
+        burst_ids[0],
+    )
+    assert landed is not False
+
+    zones = page.evaluate(
+        "() => ({"
+        "picks: Array.from(grmState.picks),"
+        "rejects: Array.from(grmState.rejects),"
+        "touched: Array.from(grmState.touched || []),"
+        "})"
+    )
+    assert zones["rejects"] == [burst_ids[0]]
+    assert zones["picks"] == []
+    assert burst_ids[0] in zones["touched"]
+    assert _flags(db, photo_ids) == ["none"] * 4

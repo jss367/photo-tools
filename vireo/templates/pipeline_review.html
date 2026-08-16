@@ -4045,6 +4045,31 @@ function setPipelineReviewFlag(photoId, flag) {
     notifyReadOnlyScopedView();
     return Promise.resolve();
   }
+  // When the shared lightbox (or any other caller) writes a flag while Group
+  // Review is open and this photo is a group member, route the change through
+  // the burst's pending zones instead of writing the DB directly — the group
+  // context menu already does this for its own flag chips. Otherwise the
+  // burst's Apply reads a stale zone value and can clobber this newer flag,
+  // and closing the lightbox shows the pre-lightbox pick/reject state.
+  var grmOverlay = document.getElementById('grmOverlay');
+  if (grmOverlay && grmOverlay.classList.contains('open') && grmState && grmState.items) {
+    var inGroup = grmState.items.some(function(p) { return p.id === photoId; });
+    if (inGroup) {
+      _grmMarkTouched(photoId);
+      if (flag === 'flagged') {
+        grmState.rejects.delete(photoId);
+        grmState.picks.add(photoId);
+      } else if (flag === 'rejected') {
+        grmState.picks.delete(photoId);
+        grmState.rejects.add(photoId);
+      } else {
+        grmState.picks.delete(photoId);
+        grmState.rejects.delete(photoId);
+      }
+      grmSyncZoneCards();
+      return Promise.resolve(true);
+    }
+  }
   // A group action snapshots live flags before writing its batch. Allowing a
   // per-photo pick/reject for one of those same IDs before the batch finishes
   // would let the batch overwrite the newer choice, while its Undo would
@@ -7215,6 +7240,11 @@ function grmRemoveFromGroup() {
 
 document.addEventListener('keydown', function(e) {
   if (!document.getElementById('grmOverlay').classList.contains('open')) return;
+  // The shared lightbox stacks over Group Review and owns its own key handling.
+  // Its handler consumes arrows and P/X but not Space/Delete/Backspace, so those
+  // would otherwise fall through here and silently mutate the hidden selection.
+  var lb = document.getElementById('lightboxOverlay');
+  if (lb && lb.classList.contains('active')) return;
   // A context-menu action can open an organization dialog above Group
   // Review. That dialog owns Escape and all review shortcuts until it closes.
   if (document.querySelector('#pipelineKeywordModal.open, #pipelineCollectionModal.open')) return;

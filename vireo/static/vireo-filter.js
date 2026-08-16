@@ -1,8 +1,8 @@
 /* Universal photo filter bar — shared across Browse/Map/Review/Duplicates/Misses.
  *
  * Owns the filter expression (a smart-collection rule tree, the same JSON
- * collections store), its UI (quick search, chips, popover with quick
- * filters + rule builder), pause state, and per-workspace persistence.
+ * collections store), its UI (live search, always-visible quick filters,
+ * chips, and the rule-builder popover), pause state, and per-workspace persistence.
  * All evaluation is server-side: pages call VireoFilter.getRules() and
  * fetch /api/photos/query themselves; the module fires onChange when the
  * effective expression changes.
@@ -67,6 +67,7 @@
   let snapshots = [];
   let persistTimer = null;
   let suggestTimer = null;
+  let quickSearchTimer = null;
   let toastTimer = null;
   let wouldMatchEpoch = 0;
 
@@ -564,8 +565,19 @@
     };
   }
 
-  function applyQuickSearch(text) {
+  function cancelQuickSearchTimer() {
+    if (quickSearchTimer !== null) {
+      clearTimeout(quickSearchTimer);
+      quickSearchTimer = null;
+    }
+  }
+
+  function applyQuickSearch(text, opts) {
+    cancelQuickSearchTimer();
     const value = String(text || '').trim();
+    const current = quickSearchGroup();
+    if ((!value && !current) ||
+        (value && current && current._qs_text === value && !state.visual)) return;
     // A cleared quick search is the one filter edit where the previously
     // selected/open photo is expected to reappear in the wider result set.
     // Flag it so the page can preserve the anchor for this case without
@@ -582,10 +594,14 @@
         state.visual = null;
         state.visualInfo = null;
       }
-    }, cleared ? { reason: 'quickSearchCleared' } : undefined);
+    }, {
+      ...(opts || {}),
+      reason: cleared ? 'quickSearchCleared' : ((opts && opts.reason) || undefined),
+    });
   }
 
   function applyVisualSearch(text) {
+    cancelQuickSearchTimer();
     const value = String(text || '').trim();
     mutate(() => {
       // The visual clause and the quick-search clause are alternatives for
@@ -615,9 +631,32 @@
     if (!drop) return;
     if (!q) { drop.hidden = true; return; }
     drop.innerHTML = `
-      <button type="button" data-search-kind="text"><span>⌕</span><span>Search text for “${esc(q)}”</span><em>Enter</em></button>
+      <button type="button" data-search-kind="text"><span>⌕</span><span>Text matches for “${esc(q)}”</span><em>Live</em></button>
       <button type="button" data-search-kind="visual" class="vf-suggest-visual"><span>✦</span><span>Visually similar to “${esc(q)}”</span><em></em></button>`;
     drop.hidden = false;
+  }
+
+  function scheduleQuickSearch() {
+    showSearchSuggest();
+    cancelQuickSearchTimer();
+    const value = $('.vf-search input').value.trim();
+    // Clearing should feel instantaneous. Non-empty input gets a very short
+    // debounce so a normal burst of typing results in one server query while
+    // still filtering without Enter or any other confirmation.
+    if (!value) {
+      if (state.visual) applyVisualSearch('');
+      else applyQuickSearch('', { noSnapshot: true });
+      return;
+    }
+    // With a visual clause active the box holds its prompt for editing;
+    // live-applying here would silently convert the visual search into a
+    // text search mid-edit. While the clause is set, switching modes stays
+    // an explicit action (Enter or the suggestion dropdown).
+    if (state.visual) return;
+    quickSearchTimer = setTimeout(() => {
+      quickSearchTimer = null;
+      applyQuickSearch(value, { noSnapshot: true });
+    }, 150);
   }
 
   function syncQuickSearchInput() {
@@ -1049,9 +1088,16 @@
         e.preventDefault();
         hideSearchSuggest();
         applyQuickSearch(searchInput.value);
-      } else if (e.key === 'Escape') { hideSearchSuggest(); searchInput.blur(); }
+      } else if (e.key === 'Escape') {
+        cancelQuickSearchTimer();
+        hideSearchSuggest();
+        searchInput.blur();
+      }
     });
-    searchInput.addEventListener('input', showSearchSuggest);
+    searchInput.addEventListener('input', (e) => {
+      if (!e.isComposing) scheduleQuickSearch();
+    });
+    searchInput.addEventListener('compositionend', scheduleQuickSearch);
     searchInput.addEventListener('focus', showSearchSuggest);
     searchInput.addEventListener('blur', () => {
       setTimeout(hideSearchSuggest, 150);
@@ -1096,6 +1142,9 @@
       });
     }
     $('.vf-clear').addEventListener('click', () => {
+      // Kill any pending live-search debounce so it can't silently reinstate
+      // the just-typed text after "Filters cleared" (Codex review r3791783342).
+      cancelQuickSearchTimer();
       mutate(() => {
         state.root = { mode: 'all', rules: [] };
         state.muted = false;
@@ -1105,6 +1154,7 @@
       toast('Filters cleared', true);
     });
     $('.vf-clear-rules').addEventListener('click', () => {
+      cancelQuickSearchTimer();
       mutate(() => {
         state.root = { mode: 'all', rules: [] };
         state.muted = false;
@@ -1551,6 +1601,9 @@
       // condition) — opening one is simply "show everything", not a chip.
       root.rules = root.rules.filter((r) => !(r && r.field === 'all'));
       const reason = (opts && opts.reason) || 'expressionLoaded';
+      // A pending debounce from just-typed text would fire after the load
+      // and overwrite the collection's expression (Codex r3791783342).
+      cancelQuickSearchTimer();
       mutate(() => {
         state.root = root;
         state.muted = false;
@@ -1611,6 +1664,7 @@
     // dropping them on the first filter interaction) briefly paints the
     // wrong photo set and desyncs chips from the visible grid.
     clearAll(silent) {
+      cancelQuickSearchTimer();
       if (silent) {
         state.root = { mode: 'all', rules: [] };
         state.muted = false;

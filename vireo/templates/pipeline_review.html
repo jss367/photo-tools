@@ -5546,7 +5546,9 @@ function openGroupReview(encIdx, burstIdx, selectPhotoId) {
   _grmSuppressLoupeClick = false;
   grmRefreshResetAllVisibility();
 
-  document.getElementById('grmOverlay').classList.add('open');
+  var overlay = document.getElementById('grmOverlay');
+  overlay.inert = false;
+  overlay.classList.add('open');
   var title = document.getElementById('grmTitle');
   if (title) {
     title.textContent = source === 'browse-selection'
@@ -5617,6 +5619,8 @@ function openGroupReview(encIdx, burstIdx, selectPhotoId) {
 function grmSetApplying(isApplying) {
   if (!grmState) return;
   grmState.applying = isApplying;
+  var overlay = document.getElementById('grmOverlay');
+  if (overlay) overlay.inert = !!isApplying;
   var btn = document.getElementById('grmApplyBtn');
   if (!btn) return;
   if (isApplying) {
@@ -5767,7 +5771,8 @@ function grmSyncZoneCards() {
   grmUpdateApplyLabel();
 }
 
-function closeGroupReview() {
+function closeGroupReview(force) {
+  if (grmState && grmState.applying && force !== true) return false;
   if (grmState && Array.isArray(grmState.items) &&
       typeof window.clearLightboxProvisionalFlags === 'function') {
     window.clearLightboxProvisionalFlags(grmState.items.map(function(photo) { return photo.id; }));
@@ -5779,6 +5784,9 @@ function closeGroupReview() {
   document.removeEventListener('mousemove', grmLoupeMouseMove);
   document.removeEventListener('mouseup', grmLoupeMouseUp);
   grmRefreshResetAllVisibility();
+  var overlay = document.getElementById('grmOverlay');
+  if (overlay) overlay.inert = false;
+  return true;
 }
 
 function grmHasSpeciesKeyword(photoId, species) {
@@ -7215,6 +7223,7 @@ function _grmMarkTouchedMany(photoIds) {
 }
 
 function grmMoveUp() {
+  if (grmState && grmState.applying) return false;
   var ids = _grmActionTargetIds();
   if (!ids.length) return;
   _grmMarkTouchedMany(ids);
@@ -7230,6 +7239,7 @@ function grmMoveUp() {
 }
 
 function grmMoveDown() {
+  if (grmState && grmState.applying) return false;
   var ids = _grmActionTargetIds();
   if (!ids.length) return;
   _grmMarkTouchedMany(ids);
@@ -7245,6 +7255,7 @@ function grmMoveDown() {
 }
 
 function grmMovePick() {
+  if (grmState && grmState.applying) return false;
   var ids = _grmActionTargetIds();
   if (!ids.length) return;
   _grmMarkTouchedMany(ids);
@@ -7256,6 +7267,7 @@ function grmMovePick() {
 }
 
 function grmMoveReject() {
+  if (grmState && grmState.applying) return false;
   var ids = _grmActionTargetIds();
   if (!ids.length) return;
   _grmMarkTouchedMany(ids);
@@ -7267,6 +7279,7 @@ function grmMoveReject() {
 }
 
 function grmMoveCandidate() {
+  if (grmState && grmState.applying) return false;
   var ids = _grmActionTargetIds();
   if (!ids.length) return;
   _grmMarkTouchedMany(ids);
@@ -7278,6 +7291,7 @@ function grmMoveCandidate() {
 }
 
 function grmRemoveFromGroup() {
+  if (grmState && grmState.applying) return false;
   if (grmState && grmState.allowRemove === false) return;
   var ids = _grmActionTargetIds();
   if (!ids.length) return;
@@ -7311,6 +7325,13 @@ document.addEventListener('keydown', function(e) {
   // A context-menu action can open an organization dialog above Group
   // Review. That dialog owns Escape and all review shortcuts until it closes.
   if (document.querySelector('#pipelineKeywordModal.open, #pipelineCollectionModal.open')) return;
+  if (grmState && grmState.applying) {
+    if (['Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+         'Delete', 'Backspace', 'p', 'P', 'x', 'X', ' '].indexOf(e.key) !== -1) {
+      e.preventDefault();
+    }
+    return;
+  }
   if (e.target.tagName === 'INPUT') return;
   // The mouse-help control is focusable so keyboard users can read its
   // popover; don't let keystrokes there (e.g. Space) fall through to the
@@ -7549,11 +7570,17 @@ function openPipelinePhotoEditor(photoId) {
   }
   var url = '/edit/' + photoId;
   var groupOpen = document.getElementById('grmOverlay').classList.contains('open');
-  if (groupOpen && !(typeof isTauri === 'function' && isTauri())) {
+  var tauri = typeof isTauri === 'function' && isTauri();
+  if (groupOpen && tauri && grmHasPendingUserEdits()) {
+    showToast('Apply or close Group Review before leaving this page', 'warning');
+    return false;
+  }
+  if (groupOpen && !tauri) {
     window.open(url, '_blank', 'noopener');
   } else {
     window.location.href = url;
   }
+  return true;
 }
 
 function grmHasPendingUserEdits() {
@@ -8047,15 +8074,17 @@ async function grmApply() {
   grmSetApplying(true);
   var grmFlagLockIds = [];
 
+  function sessionIsActive() {
+    var overlay = document.getElementById('grmOverlay');
+    return grmState.sessionId === applySessionId &&
+      overlay && overlay.classList.contains('open');
+  }
+
   try {
     await waitForPipelineReviewDirectFlagWrites(
       grmState.items.map(function(photo) { return photo.id; })
     );
-    var activeOverlay = document.getElementById('grmOverlay');
-    if (grmState.sessionId !== applySessionId ||
-        !activeOverlay || !activeOverlay.classList.contains('open')) {
-      return false;
-    }
+    if (!sessionIsActive()) return false;
     var diff = grmComputeDiff();
     var checks = grmResolveChecks(diff);
     var species = document.getElementById('grmSpecies').value.trim();
@@ -8111,6 +8140,7 @@ async function grmApply() {
         console.error('Pipeline group apply failed:', e);
         return;
       }
+      if (!sessionIsActive()) return false;
 
     // Update local pipelineResults with pick/reject/candidate decisions
     var photoMap = {};
@@ -8175,7 +8205,7 @@ async function grmApply() {
           // encounter (0 photos but still 1 encounter/1 burst, with a Reopen
           // flow that can no longer reopen).
           document.getElementById('grmSpecies').value = '';
-          closeGroupReview();
+          closeGroupReview(true);
           fallbackToNormalPipelineReview();
           return;
         }
@@ -8269,6 +8299,7 @@ async function grmApply() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(pipelineResults),
       });
+      if (!sessionIsActive()) return false;
     }
 
   // --- Species side ---
@@ -8293,6 +8324,7 @@ async function grmApply() {
         // species side. No try/catch — propagating the throw is the desired
         // "keep modal open" behavior.
         await grmConfirmSpeciesCall(species, memberIds);
+        if (!sessionIsActive()) return false;
       }
     }
 
@@ -8305,7 +8337,7 @@ async function grmApply() {
     }
 
     refreshLatestScopeSnapshotIfCurrent();
-    closeGroupReview();
+    closeGroupReview(true);
     // Clear the species input for next use
     document.getElementById('grmSpecies').value = '';
     window.requestAnimationFrame(function() {

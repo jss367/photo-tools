@@ -1655,6 +1655,111 @@ def test_waiting_group_apply_aborts_after_another_group_opens(live_server, page)
         )
 
 
+def test_group_apply_freezes_controls_and_aborts_after_later_session_change(
+    live_server, page
+):
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    original_session = page.evaluate("grmState.sessionId")
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetchForApplyLifecycle = window.safeFetch;
+          window.__lifecycleSaveCacheCalls = 0;
+          window.safeFetch = function(url, options) {
+            if (url === '/api/pipeline/group/apply') {
+              const args = arguments;
+              return new Promise((resolve, reject) => {
+                window.__releaseLifecycleApply = () => {
+                  window.__originalSafeFetchForApplyLifecycle
+                    .apply(window, args).then(resolve, reject);
+                };
+              });
+            }
+            if (url === '/api/pipeline/save-cache') {
+              window.__lifecycleSaveCacheCalls += 1;
+            }
+            return window.__originalSafeFetchForApplyLifecycle.apply(this, arguments);
+          };
+          grmMoveReject();
+          window.__lifecycleApplySettled = false;
+          window.__lifecycleApplyPromise = grmApply().then(
+            () => { window.__lifecycleApplySettled = true; },
+            error => {
+              window.__lifecycleApplyError = String(error);
+              window.__lifecycleApplySettled = true;
+            }
+          );
+        }"""
+    )
+    page.wait_for_function("typeof window.__releaseLifecycleApply === 'function'")
+
+    frozen_state = page.evaluate(
+        """() => {
+          const selected = grmState.selected;
+          const rejectedBefore = grmState.rejects.has(selected);
+          return {
+            applying: grmState.applying,
+            inert: document.getElementById('grmOverlay').inert,
+            closeResult: closeGroupReview(),
+            moveResult: grmMovePick(),
+            stillRejected: rejectedBefore && grmState.rejects.has(selected),
+            stillOpen: document.getElementById('grmOverlay').classList.contains('open'),
+          };
+        }"""
+    )
+    assert frozen_state == {
+        "applying": True,
+        "inert": True,
+        "closeResult": False,
+        "moveResult": False,
+        "stillRejected": True,
+        "stillOpen": True,
+    }
+
+    page.evaluate("openGroupReview(0, 1)")
+    page.wait_for_function(
+        "session => grmState.sessionId !== session && grmState.seeded === true",
+        arg=original_session,
+    )
+    replacement_state = page.evaluate(
+        """() => ({
+          sessionId: grmState.sessionId,
+          itemIds: grmState.items.map(photo => photo.id),
+          picks: Array.from(grmState.picks),
+          rejects: Array.from(grmState.rejects),
+          applying: grmState.applying,
+          inert: document.getElementById('grmOverlay').inert,
+        })"""
+    )
+
+    try:
+        page.evaluate("window.__releaseLifecycleApply()")
+        page.wait_for_function("window.__lifecycleApplySettled === true")
+        assert page.evaluate("window.__lifecycleApplyError || null") is None
+        assert page.evaluate("window.__lifecycleSaveCacheCalls") == 0
+        assert page.evaluate(
+            """() => ({
+              sessionId: grmState.sessionId,
+              itemIds: grmState.items.map(photo => photo.id),
+              picks: Array.from(grmState.picks),
+              rejects: Array.from(grmState.rejects),
+              applying: grmState.applying,
+              inert: document.getElementById('grmOverlay').inert,
+            })"""
+        ) == replacement_state
+        assert _flags(db, photo_ids) == ["rejected", "none", "none", "none"]
+    finally:
+        page.evaluate(
+            "() => { window.safeFetch = window.__originalSafeFetchForApplyLifecycle; }"
+        )
+
+
 def test_read_only_scope_lightbox_flag_does_not_mutate_cache(live_server, page):
     db = live_server["db"]
     photo_ids = live_server["data"]["photos"][:4]
@@ -2054,16 +2159,26 @@ def test_tauri_browse_rechecks_dirty_state_after_menu_opens(live_server, page):
           const browseItem = buildPipelinePhotoContextMenu(
             [photoId], photoId, true
           ).find(item => item.label === 'Open in Browse');
-          const initiallyDisabled = !!browseItem.disabled;
+          const editItem = buildPipelinePhotoContextMenu(
+            [photoId], photoId, true
+          ).find(item => item.label === 'Edit Photo');
+          const initiallyDisabled = {
+            browse: !!browseItem.disabled,
+            edit: !!editItem.disabled,
+          };
           grmMoveReject();
           browseItem.onClick();
+          editItem.onClick();
           return {
             initiallyDisabled: initiallyDisabled,
             dirty: grmHasPendingUserEdits(),
           };
         }"""
     )
-    assert state == {"initiallyDisabled": False, "dirty": True}
+    assert state == {
+        "initiallyDisabled": {"browse": False, "edit": False},
+        "dirty": True,
+    }
     assert page.url == original_url
     expect(page.locator("#grmOverlay")).to_have_class(re.compile(r"\bopen\b"))
 

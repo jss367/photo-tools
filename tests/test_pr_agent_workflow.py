@@ -42,6 +42,8 @@ def test_review_events_are_collapsed_and_generated_feedback_is_ignored():
     assert workflow.count("uses: actions/checkout@v5") == workflow.count(
         "ref: ${{ github.event.repository.default_branch }}"
     )
+    assert "issue_comment:\n    types: [created, edited]" in workflow
+    assert "pull_request_review:\n    types: [submitted, edited, dismissed]" in workflow
 
 
 def test_concurrency_is_scoped_per_task_and_never_workflow_wide():
@@ -197,8 +199,10 @@ def test_merge_gate_requires_live_head_and_resolved_current_threads():
     assert ".headSha == $head" in action
     assert '"$test_status" != "completed"' in action
     assert '"$test_conclusion" != "success"' in action
-    assert "select(.created_at >= $authorized_at)" in action
-    assert "select(.submitted_at >= $authorized_at)" in action
+    assert "select(.updated_at >= $authorized_at)" in action
+    assert "select(.updatedAt >= $authorized_at)" in action
+    assert "reviews(first:100" in action
+    assert '.author.login == "chatgpt-codex-connector"' not in action
     assert '.state == "COMMENTED" or .state == "CHANGES_REQUESTED"' in action
     assert 'select((.body // "") | test("[^[:space:]]"))' in action
     assert 'endswith("<!-- pr-agent-generated -->")' in action
@@ -241,7 +245,7 @@ def test_merge_is_synchronous_and_retried_only_for_the_authorized_tested_head():
     assert 'echo "authorized_at=${authorized_at}"' in workflow
     assert "authorized-at: ${{ github.event.review.submitted_at }}" in workflow
     assert "approval-id: ${{ github.event.review.id }}" in workflow
-    assert "authorized-at: ${{ github.event.comment.created_at }}" in workflow
+    assert "authorized-at: ${{ github.event.comment.updated_at }}" in workflow
     assert "merge-comment-id: ${{ github.event.comment.id }}" in workflow
     assert "authorized-at: ${{ steps.authorization.outputs.authorized_at }}" in workflow
     assert "approval-id: ${{ steps.authorization.outputs.approval_id }}" in workflow

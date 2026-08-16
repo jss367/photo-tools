@@ -152,6 +152,10 @@ forge.
   head can merge. The live gate also confirms that the exact approval remains
   active or that the exact merge-command comment still exists unchanged.
 
+Created and edited comments and reviews are wakeups. Merge authorization is
+ordered against comment and review update timestamps, so adding feedback to an
+older item still requires reconciliation and fresh authorization.
+
 Merge calls use `gh pr merge --match-head-commit` without `--auto`, so no
 authorization remains armed across a later push. Merge jobs also skip closed
 PRs, forks, non-`main` bases, branches with open child PRs, unresolved current

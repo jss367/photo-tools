@@ -4423,7 +4423,9 @@ function renderRuleValueInput(r, i) {
     'noise_estimate', 'crop_complete', 'prediction_confidence'].indexOf(r.field) !== -1;
   return '<input type="' + (numeric ? 'number' : 'text') + '" value="' +
     escapeAttr(String(r.value == null ? '' : r.value)) +
-    '" onchange="updateRule(\'' + p + '\',\'value\',this.value)" placeholder="value" style="flex:1;">';
+    '" onchange="updateRule(\'' + p + '\',\'value\',this.value)"' +
+    ' onkeydown="if(event.key===\'Enter\'){event.preventDefault();this.blur();}"' +
+    ' placeholder="value" style="flex:1;">';
 }
 
 function renderFieldOptions(selected) {

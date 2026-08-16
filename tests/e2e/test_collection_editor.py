@@ -1,0 +1,18 @@
+from playwright.sync_api import expect
+
+
+def test_enter_commits_collection_keyword_and_refreshes_preview(live_server, page):
+    """Enter commits a rule value without saving or closing the editor."""
+    page.goto(live_server["url"] + "/browse")
+    page.get_by_role("button", name="+ New Collection").click()
+
+    modal = page.locator("#collectionModal")
+    value_input = modal.locator("#ruleRows input[type='text']")
+    expect(value_input).to_be_visible()
+
+    value_input.fill("Red-tailed Hawk")
+    value_input.press("Enter")
+
+    expect(value_input).not_to_be_focused()
+    expect(modal.locator("#rulePreview")).to_have_text("Matches: 1 photo")
+    expect(modal).to_have_class("modal-overlay open")

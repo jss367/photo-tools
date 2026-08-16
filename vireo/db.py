@@ -563,11 +563,6 @@ class Database:
         # SELECT 1 LIMIT 1 short-circuit) — matches ensure_default_workspace
         # above.
         self.ensure_default_genre_keywords()
-        # Retire the old automatically-attached Wildlife genre. The migration
-        # is idempotent and preserves the keyword row so old edit-history ids,
-        # manual associations, and user-created hierarchy children remain
-        # valid.
-        self.retire_builtin_wildlife_genre()
         # Idempotent, one-shot: seed species_highlights from legacy
         # photo_preferences rows with purpose='highlights' so upgraded
         # DBs don't lose their prior Highlights picks the first time the
@@ -19168,16 +19163,45 @@ class Database:
         self.conn.commit()
         return cur.rowcount
 
-    def clear_pending(self, change_ids):
-        """Delete pending changes by id."""
+    def clear_pending(
+        self, change_ids, *, clear_equivalent_flat_removals=False,
+    ):
+        """Delete pending changes by id.
+
+        When ``clear_equivalent_flat_removals`` is true, a successfully
+        applied flat keyword removal also clears equivalent rows from sibling
+        workspaces. The sidecar is global to the photo even though the review
+        queue is workspace-scoped; leaving migration-generated duplicates in
+        sibling queues would let a later sync replay a stale removal after the
+        user had re-added the keyword.
+        """
         if not change_ids:
             return
         workspace_id = self._ws_id()
+        shared_flat_removals = set()
         for chunk in _chunks(change_ids):
             placeholders = ",".join("?" for _ in chunk)
+            if clear_equivalent_flat_removals:
+                rows = self.conn.execute(
+                    f"""SELECT photo_id, value FROM pending_changes
+                        WHERE id IN ({placeholders}) AND workspace_id = ?
+                          AND change_type = 'keyword_remove_flat'""",
+                    [*chunk, workspace_id],
+                ).fetchall()
+                shared_flat_removals.update(
+                    (row["photo_id"], row["value"]) for row in rows
+                )
             self.conn.execute(
                 f"DELETE FROM pending_changes WHERE id IN ({placeholders}) AND workspace_id = ?",
                 [*chunk, workspace_id],
+            )
+        if shared_flat_removals:
+            self.conn.executemany(
+                """DELETE FROM pending_changes
+                   WHERE photo_id = ?
+                     AND change_type = 'keyword_remove_flat'
+                     AND value = ? COLLATE NOCASE""",
+                shared_flat_removals,
             )
         self.conn.commit()
 

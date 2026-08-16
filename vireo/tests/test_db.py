@@ -14013,6 +14013,24 @@ def test_tag_photo_with_taxonomy_keyword_does_not_add_wildlife_genre(tmp_path):
     assert by_name == {"Northern cardinal": "taxonomy"}
 
 
+def test_database_constructor_defers_wildlife_retirement_to_app_startup(
+    tmp_path, monkeypatch,
+):
+    """Background database handles must not retry unavailable sidecars."""
+    from db import Database
+
+    attempts = []
+    monkeypatch.setattr(
+        Database,
+        "retire_builtin_wildlife_genre",
+        lambda self, force=False: attempts.append(force),
+    )
+
+    Database(str(tmp_path / "test.db"))
+
+    assert attempts == []
+
+
 def test_retire_builtin_wildlife_detaches_associations_and_queues_flat_removal(tmp_path):
     """Upgrade cleanup removes the redundant tag without touching hierarchy."""
     from db import Database

@@ -163,6 +163,53 @@ def test_sync_to_xmp_keyword_remove_flat_leaves_matching_hierarchy(tmp_path):
     assert len(db.get_pending_changes()) == 0
 
 
+def test_sync_to_xmp_clears_sibling_workspace_flat_removals(tmp_path):
+    """One global sidecar write retires equivalent workspace queue rows.
+
+    Retirement is visible in every workspace owning a shared folder, but the
+    XMP file itself is shared. After one workspace applies the removal, a
+    sibling must not retain a stale row that can delete a later manual re-add.
+    """
+    from db import Database
+    from sync import sync_to_xmp
+    from xmp import read_keywords, write_sidecar
+
+    db = Database(str(tmp_path / "test.db"))
+    ws1 = db.ensure_default_workspace()
+    ws2 = db.create_workspace("sibling")
+    db.set_active_workspace(ws1)
+    pid, xmp_path = _setup_photo_with_xmp(
+        tmp_path, db, keywords={"Wildlife"},
+    )
+    folder_id = db.get_photo(pid)["folder_id"]
+    db.add_workspace_folder(ws1, folder_id)
+    db.add_workspace_folder(ws2, folder_id)
+    db.queue_change(
+        pid, "keyword_remove_flat", "Wildlife", workspace_id=ws1,
+    )
+    db.queue_change(
+        pid, "keyword_remove_flat", "Wildlife", workspace_id=ws2,
+    )
+
+    result = sync_to_xmp(db)
+
+    assert result["synced"] == 1
+    assert "Wildlife" not in read_keywords(xmp_path)
+    assert db.conn.execute(
+        """SELECT 1 FROM pending_changes
+           WHERE photo_id = ? AND change_type = 'keyword_remove_flat'""",
+        (pid,),
+    ).fetchone() is None
+
+    # A later manual re-add must survive visiting and syncing the sibling.
+    write_sidecar(
+        xmp_path, flat_keywords={"Wildlife"}, hierarchical_keywords=set(),
+    )
+    db.set_active_workspace(ws2)
+    assert sync_to_xmp(db)["synced"] == 0
+    assert "Wildlife" in read_keywords(xmp_path)
+
+
 def test_sync_to_xmp_writes_rating(tmp_path):
     """sync_to_xmp writes rating changes to XMP sidecars."""
     from xml.etree import ElementTree as ET

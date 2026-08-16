@@ -295,7 +295,9 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
 
     # Clear successfully synced changes
     if synced_ids:
-        db.clear_pending(synced_ids)
+        db.clear_pending(
+            synced_ids, clear_equivalent_flat_removals=True,
+        )
 
     log.info("Sync complete: %d synced, %d failed", synced, failed)
     return {"synced": synced, "failed": failed, "failures": failures}

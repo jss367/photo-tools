@@ -1092,6 +1092,34 @@ def test_collection_and_keyword_dialogs_have_separate_selections(live_server, pa
     }
 
 
+def test_newest_organization_dialog_is_frontmost_and_owns_escape(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    assert page.evaluate("ids => addToCollection([ids[0]])", photo_ids) is True
+    page.evaluate("ids => batchAddKeyword([ids[1]])", photo_ids)
+
+    collection = page.locator("#pipelineCollectionModal")
+    keyword = page.locator("#pipelineKeywordModal")
+    expect(collection).to_have_class(re.compile(r"\bopen\b"))
+    expect(keyword).to_have_class(re.compile(r"\bopen\b"))
+    stack = page.evaluate(
+        "() => ({"
+        "active: pipelineReviewActiveOrganizationModal,"
+        "collection: Number(document.getElementById('pipelineCollectionModal').style.zIndex),"
+        "keyword: Number(document.getElementById('pipelineKeywordModal').style.zIndex),"
+        "})"
+    )
+    assert stack == {"active": "keyword", "collection": 550, "keyword": 551}
+
+    page.keyboard.press("Escape")
+    expect(keyword).not_to_have_class(re.compile(r"\bopen\b"))
+    expect(collection).to_have_class(re.compile(r"\bopen\b"))
+    assert page.evaluate("pipelineReviewActiveOrganizationModal") == "collection"
+
+
 def test_photo_context_menu_updates_rating_and_adds_keyword(live_server, page):
     db = live_server["db"]
     photo_ids = live_server["data"]["photos"][:4]
@@ -1433,6 +1461,40 @@ def test_read_only_scope_lightbox_flag_does_not_mutate_cache(live_server, page):
     )
     assert state == {"confirmed": "none", "cached": "none", "status": "No flag"}
     assert _flags(db, photo_ids) == ["none"] * 4
+
+
+def test_read_only_scope_rating_does_not_mutate_cache_or_database(live_server, page):
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    photo_id = photo_ids[0]
+    before_cache = page.evaluate(
+        "pid => pipelineResults.photos.find(photo => photo.id === pid).rating",
+        photo_id,
+    )
+    before_db = db.conn.execute(
+        "SELECT rating FROM photos WHERE id = ?", (photo_id,)
+    ).fetchone()["rating"]
+    attempted_rating = next(
+        value for value in range(6) if value not in {before_cache, before_db}
+    )
+    result = page.evaluate(
+        "args => { reviewScopeMode = 'workspace'; "
+        "return setRatingFor(args.photoId, args.rating); }",
+        {"photoId": photo_id, "rating": attempted_rating},
+    )
+    assert result is False
+    assert page.evaluate(
+        "pid => pipelineResults.photos.find(photo => photo.id === pid).rating",
+        photo_id,
+    ) == before_cache
+    rating = db.conn.execute(
+        "SELECT rating FROM photos WHERE id = ?", (photo_id,)
+    ).fetchone()["rating"]
+    assert rating == before_db
 
 
 def test_tauri_disables_navigation_when_group_review_is_dirty(live_server, page):

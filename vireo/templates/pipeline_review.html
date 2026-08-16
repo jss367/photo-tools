@@ -7322,12 +7322,34 @@ var pipelineReviewCollectionSubmitPromise = null;
 var pipelineReviewCreatedCollection = null;
 var pipelineReviewCollectionLoadSeq = 0;
 var pipelineReviewKeywordSubmitPromise = null;
+var pipelineReviewActiveOrganizationModal = null;
 
 function pipelineReviewAnyOrganizationModalOpen() {
   var collection = document.getElementById('pipelineCollectionModal');
   var keyword = document.getElementById('pipelineKeywordModal');
   return !!((collection && collection.classList.contains('open')) ||
     (keyword && keyword.classList.contains('open')));
+}
+
+function pipelineReviewActivateOrganizationModal(kind) {
+  var collection = document.getElementById('pipelineCollectionModal');
+  var keyword = document.getElementById('pipelineKeywordModal');
+  pipelineReviewActiveOrganizationModal = kind;
+  if (collection) collection.style.zIndex = kind === 'collection' ? '551' : '550';
+  if (keyword) keyword.style.zIndex = kind === 'keyword' ? '551' : '550';
+}
+
+function pipelineReviewDeactivateOrganizationModal(kind) {
+  if (pipelineReviewActiveOrganizationModal !== kind) return;
+  var other = kind === 'collection' ? 'keyword' : 'collection';
+  var otherEl = document.getElementById(
+    other === 'collection' ? 'pipelineCollectionModal' : 'pipelineKeywordModal'
+  );
+  if (otherEl && otherEl.classList.contains('open')) {
+    pipelineReviewActivateOrganizationModal(other);
+  } else {
+    pipelineReviewActiveOrganizationModal = null;
+  }
 }
 
 function pipelineReviewUniquePhotoIds(photoIds) {
@@ -7355,6 +7377,10 @@ function getActiveSelection() {
 }
 
 async function setPipelineReviewRating(photoIds, rating) {
+  if (isScopedReviewView()) {
+    notifyReadOnlyScopedView();
+    return false;
+  }
   var ids = pipelineReviewUniquePhotoIds(photoIds);
   if (!ids.length) return false;
   try {
@@ -7540,6 +7566,7 @@ async function addToCollection(photoIds) {
   document.getElementById('pipelineCollectionList').innerHTML = listHtml;
   document.getElementById('pipelineCollectionNewName').value = '';
   document.getElementById('pipelineCollectionModal').classList.add('open');
+  pipelineReviewActivateOrganizationModal('collection');
   setTimeout(function() { document.getElementById('pipelineCollectionNewName').focus(); }, 50);
   return true;
 }
@@ -7556,6 +7583,7 @@ function pickPipelineCollection(collectionId) {
 function hidePipelineCollectionModal(force) {
   if (pipelineReviewCollectionSubmitPromise && force !== true) return false;
   document.getElementById('pipelineCollectionModal').classList.remove('open');
+  pipelineReviewDeactivateOrganizationModal('collection');
   pipelineReviewCollectionPhotoIds = [];
   pipelineReviewSelectedCollectionId = null;
   pipelineReviewCreatedCollection = null;
@@ -7638,12 +7666,14 @@ function batchAddKeyword(photoIds) {
     'Add Keyword to ' + ids.length + ' Photo' + (ids.length === 1 ? '' : 's');
   document.getElementById('pipelineKeywordInput').value = '';
   document.getElementById('pipelineKeywordModal').classList.add('open');
+  pipelineReviewActivateOrganizationModal('keyword');
   setTimeout(function() { document.getElementById('pipelineKeywordInput').focus(); }, 50);
 }
 
 function hidePipelineKeywordModal(force) {
   if (pipelineReviewKeywordSubmitPromise && force !== true) return false;
   document.getElementById('pipelineKeywordModal').classList.remove('open');
+  pipelineReviewDeactivateOrganizationModal('keyword');
   pipelineReviewKeywordPhotoIds = [];
   // Preserve the native selection override while the collection dialog is
   // still open, so its own confirmation reads the pinned photo IDs.
@@ -7664,6 +7694,18 @@ function setPipelineKeywordSubmitting(submitting) {
 
 document.addEventListener('keydown', function(e) {
   if (e.key !== 'Escape') return;
+  if (pipelineReviewActiveOrganizationModal === 'keyword' &&
+      document.getElementById('pipelineKeywordModal').classList.contains('open')) {
+    hidePipelineKeywordModal();
+    e.preventDefault();
+    return;
+  }
+  if (pipelineReviewActiveOrganizationModal === 'collection' &&
+      document.getElementById('pipelineCollectionModal').classList.contains('open')) {
+    hidePipelineCollectionModal();
+    e.preventDefault();
+    return;
+  }
   if (document.getElementById('pipelineCollectionModal').classList.contains('open')) {
     hidePipelineCollectionModal();
     e.preventDefault();

@@ -4064,8 +4064,25 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     class ClassificationCancelled(RuntimeError):
                         pass
 
+                # Non-parking cancel probe: this factory runs under
+                # ``ModelCache.entry.load_lock`` (see ``model_cache.acquire``),
+                # and ``Classifier._compute_embeddings_with_progress`` invokes
+                # this callback between labels while custom-label embeddings
+                # are being computed. A parking probe here would call
+                # ``_pause_checkpoint`` and block on ``wait_if_paused`` while
+                # the shared load_lock is still held, so any unpaused peer
+                # waiting on the same cache entry would stay blocked until
+                # Resume (Codex discussion_r3791005913 — sibling of the
+                # resource-probe rebinding in ``model_cache.py``, which only
+                # covers the bound resource cancel probe, not this explicit
+                # captured callback). Cancel still fires; pause is honored at
+                # the next outer ``_pause_checkpoint`` after ``load_lock`` is
+                # released.
                 def cancel_check():
-                    return _should_abort(abort) or _cancellation_requested()
+                    return (
+                        _should_abort_without_pause(abort)
+                        or _cancellation_requested()
+                    )
 
                 if model_type == "timm":
                     if cancel_check():

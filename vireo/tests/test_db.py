@@ -18680,11 +18680,15 @@ def test_get_classifier_run_cache_hits_includes_contextual_weak(tmp_path):
         folder_id=fid, filename="weak_uncached.jpg", extension=".jpg",
         file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
     )
-    d_weak_cached = _add_one_detection(db, p_weak_cached, conf=0.15)
+    d_weak_cached = _add_one_detection(
+        db, p_weak_cached, detector_model="megadetector-v6", conf=0.15,
+    )
     db.record_classifier_run(
         d_weak_cached, "BioCLIP-2.5", "fp-a", prediction_count=1,
     )
-    _ = _add_one_detection(db, p_weak_uncached, conf=0.15)
+    _ = _add_one_detection(
+        db, p_weak_uncached, detector_model="megadetector-v6", conf=0.15,
+    )
 
     # Legacy path (no weak args): both photos below the normal floor,
     # neither counted. This is the buggy behavior the fix corrects.
@@ -18718,11 +18722,15 @@ def test_get_classifier_run_cache_hits_weak_scoped_per_photo(tmp_path):
         folder_id=fid, filename="weak.jpg", extension=".jpg",
         file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
     )
-    d_normal_low = _add_one_detection(db, p_normal_weak_only, conf=0.15)
+    d_normal_low = _add_one_detection(
+        db, p_normal_weak_only, detector_model="megadetector-v6", conf=0.15,
+    )
     db.record_classifier_run(
         d_normal_low, "BioCLIP-2.5", "fp-a", prediction_count=1,
     )
-    d_weak = _add_one_detection(db, p_weak, conf=0.15)
+    d_weak = _add_one_detection(
+        db, p_weak, detector_model="megadetector-v6", conf=0.15,
+    )
     db.record_classifier_run(
         d_weak, "BioCLIP-2.5", "fp-a", prediction_count=1,
     )
@@ -18758,8 +18766,12 @@ def test_get_classifier_run_cache_hits_weak_matches_top_detection_only(tmp_path)
         folder_id=fid, filename="lower.jpg", extension=".jpg",
         file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
     )
-    _ = _add_one_detection(db, p_lower_cached, conf=0.18)
-    d_lower = _add_one_detection(db, p_lower_cached, conf=0.13)
+    _ = _add_one_detection(
+        db, p_lower_cached, detector_model="megadetector-v6", conf=0.18,
+    )
+    d_lower = _add_one_detection(
+        db, p_lower_cached, detector_model="megadetector-v6", conf=0.13,
+    )
     db.record_classifier_run(
         d_lower, "BioCLIP-2.5", "fp-a", prediction_count=1,
     )
@@ -18770,8 +18782,12 @@ def test_get_classifier_run_cache_hits_weak_matches_top_detection_only(tmp_path)
         folder_id=fid, filename="top.jpg", extension=".jpg",
         file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
     )
-    d_top = _add_one_detection(db, p_top_cached, conf=0.18)
-    _ = _add_one_detection(db, p_top_cached, conf=0.13)
+    d_top = _add_one_detection(
+        db, p_top_cached, detector_model="megadetector-v6", conf=0.18,
+    )
+    _ = _add_one_detection(
+        db, p_top_cached, detector_model="megadetector-v6", conf=0.13,
+    )
     db.record_classifier_run(
         d_top, "BioCLIP-2.5", "fp-a", prediction_count=1,
     )
@@ -18797,8 +18813,12 @@ def test_get_classifier_run_cache_hits_weak_ties_break_by_id(tmp_path):
         folder_id=fid, filename="tie.jpg", extension=".jpg",
         file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
     )
-    d_first = _add_one_detection(db, p, conf=0.15)
-    d_second = _add_one_detection(db, p, conf=0.15)
+    d_first = _add_one_detection(
+        db, p, detector_model="megadetector-v6", conf=0.15,
+    )
+    d_second = _add_one_detection(
+        db, p, detector_model="megadetector-v6", conf=0.15,
+    )
     # Only the SECOND (higher-id) detection has a run key. The runtime
     # picks the first (lowest id) and infers, so preflight must not
     # count this photo.
@@ -18822,6 +18842,64 @@ def test_get_classifier_run_cache_hits_weak_ties_break_by_id(tmp_path):
     )
     db.conn.commit()
 
+    hits = db.get_classifier_run_cache_hits(
+        [p], "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids={p},
+        weak_confidence=0.12,
+    )
+    assert hits == {p}
+
+
+def test_get_classifier_run_cache_hits_weak_ignores_foreign_detector(tmp_path):
+    """The runtime weak fallback restricts itself to
+    ``detector_model='megadetector-v6'``. If the preflight ranked any
+    non-full-image detector instead, a stale weak row from another
+    detector model could win the ROW_NUMBER tie-break and carry the
+    matching run key, marking the photo cached even though the runtime
+    would infer the uncached megadetector-v6 top box. Because that
+    runtime-selected detection has no run key of its own, the overcount
+    tracker cannot correct the phantom cache hit and the ETA would
+    undercount the uncached tail (Codex #1468 P2).
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    p = db.add_photo(
+        folder_id=fid, filename="foreign_top.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    # Foreign detector weak row: higher confidence, would rank #1 if the
+    # preflight considered non-megadetector rows. Carries the matching
+    # run key.
+    d_foreign = _add_one_detection(
+        db, p, detector_model="megadetector-v5", conf=0.19,
+    )
+    db.record_classifier_run(
+        d_foreign, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+    # MegaDetector-v6 weak row: what the runtime actually picks. No run
+    # key — runtime will infer.
+    _ = _add_one_detection(
+        db, p, detector_model="megadetector-v6", conf=0.15,
+    )
+
+    hits = db.get_classifier_run_cache_hits(
+        [p], "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids={p},
+        weak_confidence=0.12,
+    )
+    assert hits == set()
+
+    # Sanity: once the megadetector-v6 top box has the run key too, the
+    # photo does count as cached.
+    d_v6_top = db.conn.execute(
+        "SELECT id FROM detections "
+        "WHERE photo_id = ? AND detector_model = 'megadetector-v6'",
+        (p,),
+    ).fetchone()["id"]
+    db.record_classifier_run(
+        d_v6_top, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
     hits = db.get_classifier_run_cache_hits(
         [p], "BioCLIP-2.5", "fp-a",
         contextual_weak_photo_ids={p},

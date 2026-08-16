@@ -17962,6 +17962,19 @@ class Database:
         # miss never registered as a fall-through overcount either
         # (the top detection has no run key at all), leaving a phantom
         # cache hit in the ETA (Codex #1468 P2).
+        #
+        # Restrict the CTE to ``detector_model = 'megadetector-v6'`` to
+        # mirror the runtime weak fallback at ``pipeline_job.py``, which
+        # calls ``get_detections(..., detector_model='megadetector-v6')``
+        # for contextual-weak photos. Foreign-detector weak rows (e.g. a
+        # stale detection from another detector model still in the
+        # database) can otherwise rank first in the ROW_NUMBER window and
+        # carry the matching run key while the megadetector-v6 top box
+        # does not; that used to mark the photo cached, but the runtime
+        # would still infer the uncached megadetector-v6 box, leaving a
+        # phantom cache hit the overcount tracker cannot correct because
+        # the runtime-selected detection has no run key of its own
+        # (Codex #1468 P2).
         for i in range(0, len(weak_ids), CHUNK):
             chunk = weak_ids[i:i + CHUNK]
             if not chunk:
@@ -17976,7 +17989,7 @@ class Database:
                                             id ASC
                                ) AS rn
                           FROM detections
-                         WHERE detector_model != 'full-image'
+                         WHERE detector_model = 'megadetector-v6'
                            AND category = 'animal'
                            AND detector_confidence >= ?
                            AND photo_id IN ({placeholders})

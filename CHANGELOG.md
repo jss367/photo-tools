@@ -7,7 +7,8 @@ All notable changes to Vireo are documented in this file.
 ### Added
 - **Described color labels.** Right-click any photo color label to give that
   color a short, workspace-specific meaning such as “Reptiles.” The meaning
-  appears in color-label tooltips wherever that color is shown.
+  appears in color-label tooltips wherever that color is shown, including the
+  lightbox context menu.
 - **Automatic catalog backup before upgrades.** When a new Vireo version
   needs to migrate the database, a snapshot is saved next to it (e.g.
   `vireo.db.pre-v8.bak`) before any migration runs. Only the most recent

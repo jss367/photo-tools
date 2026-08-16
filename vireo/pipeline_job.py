@@ -1360,6 +1360,49 @@ STAGE_WEIGHTS = {
 _CLASSIFICATION_ETA_MIN_ATTEMPTS = 16
 
 
+def _cached_classify_detections(detections, floor, *, contextual_weak=False):
+    """Filter cached detector rows to the classify runtime's candidates.
+
+    Contextual-weak rescues are defined exclusively from MegaDetector V6
+    evidence.  Keep that restriction on the initial cached-detection path as
+    well as the later DB fallback so runtime selection matches the cache ETA
+    preflight and a stale foreign-detector row cannot displace the cached
+    MegaDetector crop.
+    """
+    return [
+        detection for detection in detections
+        if detection.get("detector_model") != "full-image"
+        and detection.get("category", "animal") == "animal"
+        and (
+            not contextual_weak
+            or detection.get("detector_model") == "megadetector-v6"
+        )
+        and detection.get(
+            "confidence", detection.get("detector_confidence", 0),
+        ) >= floor
+    ]
+
+
+def _remove_attempted_cache_overcounts(
+    attempted_photo_ids, cache_overcounted_ids, cache_hit_ids,
+):
+    """Remove attempted preflight misses from the live cache-hit bucket.
+
+    A multi-detection photo can produce one real cache hit and still require
+    inference for another detection whose preflight run key has no usable
+    predictions.  Once that inference is attempted, the photo represents
+    uncached work even if inference fails and produces no result to trigger
+    the ordinary successful-promotion path.
+    """
+    attempted_overcounts = (
+        set(attempted_photo_ids)
+        & set(cache_overcounted_ids)
+        & set(cache_hit_ids)
+    )
+    cache_hit_ids.difference_update(attempted_overcounts)
+    return len(attempted_overcounts)
+
+
 def _classification_eta_progress(
     *, total, seen, cached_estimate, cache_hits, inference_attempts,
     classified, elapsed, cache_overcount=0,
@@ -5605,6 +5648,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         photos_cached_in_spec=photos_cached_in_spec,
                         photos_inferred_in_spec=photos_inferred_in_spec,
                         photos_attempted_in_spec=photos_attempted_in_spec,
+                        photos_cache_overcounted_in_spec=(
+                            photos_cache_overcounted_in_spec
+                        ),
                     ):
                         nonlocal failed, has_flushed_in_spec, inference_seconds
                         if not inference_batch:
@@ -5613,9 +5659,21 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         pending = list(inference_batch)
                         inference_batch.clear()
                         has_flushed_in_spec = True
-                        photos_attempted_in_spec.update(
+                        attempted_photo_ids = {
                             entry["photo"]["id"] for entry in pending
+                        }
+                        photos_attempted_in_spec.update(attempted_photo_ids)
+                        removed_cache_hits = _remove_attempted_cache_overcounts(
+                            attempted_photo_ids,
+                            photos_cache_overcounted_in_spec,
+                            photos_cached_in_spec,
                         )
+                        if removed_cache_hits:
+                            stages["classify"]["cached"] = max(
+                                0,
+                                stages["classify"].get("cached", 0)
+                                - removed_cache_hits,
+                            )
                         pre_len = len(raw_results)
                         # GPU serialisation lives inside _flush_batch around the
                         # inference call so the DB upserts/result-building afterward
@@ -5733,15 +5791,11 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 # see real, qualifying animal boxes. _detect_batch's
                                 # fresh cache contains raw low-confidence boxes too,
                                 # while DB reads normally apply this threshold.
-                                photo_dets = [
-                                    d for d in cached_detections[photo["id"]]
-                                    if d.get("detector_model") != "full-image"
-                                    and d.get("category", "animal") == "animal"
-                                    and d.get(
-                                        "confidence",
-                                        d.get("detector_confidence", 0),
-                                    ) >= detection_floor
-                                ]
+                                photo_dets = _cached_classify_detections(
+                                    cached_detections[photo["id"]],
+                                    detection_floor,
+                                    contextual_weak=is_contextual_weak,
+                                )
                             else:
                                 photo_dets = [
                                     {

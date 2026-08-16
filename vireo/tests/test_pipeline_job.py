@@ -14,7 +14,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from pipeline_job import (
     STAGE_WEIGHTS,
     PipelineParams,
+    _cached_classify_detections,
     _classification_eta_progress,
+    _remove_attempted_cache_overcounts,
     _stage_fraction,
     _weighted_progress,
     run_pipeline_job,
@@ -63,6 +65,44 @@ class FakeRunner:
 
     def is_cancelled(self, job_id):
         return job_id in self.cancelled_ids
+
+
+def test_contextual_weak_cached_candidates_ignore_foreign_detectors():
+    detections = [
+        {
+            "id": 1,
+            "detector_model": "other-detector",
+            "category": "animal",
+            "confidence": 0.9,
+        },
+        {
+            "id": 2,
+            "detector_model": "megadetector-v6",
+            "category": "animal",
+            "confidence": 0.3,
+        },
+    ]
+
+    ordinary = _cached_classify_detections(detections, 0.2)
+    contextual = _cached_classify_detections(
+        detections, 0.2, contextual_weak=True,
+    )
+
+    assert [d["id"] for d in ordinary] == [1, 2]
+    assert [d["id"] for d in contextual] == [2]
+
+
+def test_attempted_cache_overcount_is_not_still_reported_as_cached():
+    cache_hits = {10, 20}
+
+    removed = _remove_attempted_cache_overcounts(
+        attempted_photo_ids={10, 30},
+        cache_overcounted_ids={10, 30},
+        cache_hit_ids=cache_hits,
+    )
+
+    assert removed == 1
+    assert cache_hits == {20}
 
 
 def test_classification_eta_excludes_fast_cache_hits_from_rate():

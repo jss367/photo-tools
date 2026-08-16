@@ -158,6 +158,55 @@ def test_gpu_inference_wait_wakes_on_bound_cancel_check():
         holder.__exit__(None, None, None)
 
 
+def test_gpu_inference_contention_records_live_and_completed_owner_timing():
+    """Accelerator semaphore waits feed the shared job diagnostics."""
+    import resource_ledger
+    from pipeline_locks import acquire_inference_resources
+    from resource_ledger import ResourceLedger, bind_resource_owner
+
+    sess = _FakeSession(["CUDAExecutionProvider", "CPUExecutionProvider"])
+    ledger = ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    holder = acquire_gpu()
+    holder.__enter__()
+    holder_released = False
+    waiting = threading.Event()
+    finished = threading.Event()
+
+    def waiter():
+        with bind_resource_owner("gpu-job"):
+            waiting.set()
+            with acquire_inference_resources(sess):
+                pass
+        finished.set()
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    try:
+        assert waiting.wait(timeout=1.0)
+        _wait_until(
+            lambda: ledger.owner_timing("gpu-job")["wait_count"] == 1,
+        )
+        active = ledger.owner_timing("gpu-job")
+        assert active["wait_seconds"] >= 0
+        assert ledger.snapshot()["waiters"] == 1
+
+        holder.__exit__(None, None, None)
+        holder_released = True
+        assert finished.wait(timeout=1.0)
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+        completed = ledger.owner_timing("gpu-job")
+        assert completed["wait_count"] == 1
+        assert completed["wait_seconds"] >= active["wait_seconds"]
+        assert ledger.snapshot()["waiters"] == 0
+    finally:
+        if not holder_released:
+            holder.__exit__(None, None, None)
+        thread.join(timeout=1.0)
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
 def test_acquire_gpu_if_session_uses_it_defaults_to_lock_when_providers_missing():
     """A session that doesn't expose get_providers (or raises) must
     conservatively take the lock — same behavior as before this check existed.

@@ -53,17 +53,29 @@ class _GpuLockContext:
     def __enter__(self):
         from resource_ledger import (
             ResourceWaitCancelled,
+            get_resource_ledger,
             resolve_resource_cancel_check,
         )
 
         cancel_check = resolve_resource_cancel_check(self._cancel_check)
-        while True:
-            if cancel_check is not None and cancel_check():
-                raise ResourceWaitCancelled(
-                    "Cancelled while waiting for GPU inference resources"
-                )
-            if _GPU_SEMAPHORE.acquire(timeout=0.2):
-                return self
+        if cancel_check is not None and cancel_check():
+            raise ResourceWaitCancelled(
+                "Cancelled while waiting for GPU inference resources"
+            )
+        if _GPU_SEMAPHORE.acquire(blocking=False):
+            return self
+
+        # Accelerator coordination intentionally remains a semaphore rather
+        # than a ledger lane, but contention must still feed the same live and
+        # persisted per-job resource wait diagnostics as CPU claims.
+        with get_resource_ledger().track_external_wait():
+            while True:
+                if cancel_check is not None and cancel_check():
+                    raise ResourceWaitCancelled(
+                        "Cancelled while waiting for GPU inference resources"
+                    )
+                if _GPU_SEMAPHORE.acquire(timeout=0.2):
+                    return self
 
     def __exit__(self, exc_type, exc, tb):
         _GPU_SEMAPHORE.release()

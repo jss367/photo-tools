@@ -319,6 +319,25 @@ class ResourceLedger:
         if not starts:
             self._active_owner_waits.pop(owner_id, None)
 
+    @contextlib.contextmanager
+    def track_external_wait(self, *, owner_id=None):
+        """Include a non-ledger resource wait in job timing diagnostics.
+
+        Some process-wide resources, such as the accelerator semaphore, are
+        deliberately coordinated outside ``acquire``. This context preserves
+        the same live and completed owner timing semantics for those waits.
+        """
+        owner_id = owner_id if owner_id is not None else _RESOURCE_OWNER.get()
+        wait_started = self._clock()
+        with self._condition:
+            self._waiters += 1
+            self._track_active_owner_wait_locked(owner_id, wait_started)
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._record_wait_locked(owner_id, wait_started)
+
     def acquire(
         self, request, *, cancel_check=None, owner_id=None, on_wait=None,
     ):

@@ -312,7 +312,11 @@ def test_location_review_ranks_saved_and_google_places_by_distance(
         "Saved location"
     )
 
-    coordinate_toggle = page.get_by_label("Include coordinates")
+    coordinate_toggle = page.get_by_label("Show coordinates")
+    expect(page.locator('label[for="locationReviewIncludeCoordinates"]')).to_have_attribute(
+        "title",
+        "Display only. This does not change location assignments or metadata written to XMP.",
+    )
     expect(coordinate_toggle).not_to_be_checked()
     expect(candidates.locator(".location-review-candidate-coordinates")).to_have_count(0)
 

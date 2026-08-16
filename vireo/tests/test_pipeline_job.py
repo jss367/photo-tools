@@ -10809,7 +10809,7 @@ def test_pipeline_eye_keypoints_download_cancel_finalizes_as_cancelled_not_failu
     from resource_ledger import ResourceWaitCancelled
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
 
     db_path = str(tmp_path / "test.db")
     db = Database(db_path)

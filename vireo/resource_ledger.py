@@ -243,8 +243,14 @@ def _ancestor_dirs(path):
     "/system.slice", "/"]``. Ancestor quotas below the leaf can also
     apply — cgroup enforces the tightest along the chain — so walking
     every ancestor and taking the ``min`` matches kernel semantics.
+
+    Non-absolute inputs return without yielding — ``_process_cgroup_paths``
+    reads external file content, and a stubbed or malformed
+    ``/proc/self/cgroup`` (``"foo"``) would otherwise loop forever
+    because ``"foo".rsplit("/", 1)[0] == "foo"``, and the caller
+    consumes this generator in an unbounded ``for`` loop.
     """
-    if not path:
+    if not path or not path.startswith("/"):
         return
     normalized = path.rstrip("/") or "/"
     yield normalized

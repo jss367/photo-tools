@@ -25332,6 +25332,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "phase": "Scanning photos",
                 })
 
+            # ``import-photos`` is a pausable job (registered as a
+            # pause participant by the runner). Without these probes
+            # the scan phase would keep hashing on its process pool
+            # and hold its CPU lease across the entire pause, ignoring
+            # the pause signal until the current source finishes.
+            # Same wiring the in-place import path picked up in
+            # 37e0e3a0 for the identical reason.
+            def scan_cancel_check():
+                return runner.is_cancelled(job["id"])
+
+            def scan_pause_check():
+                return runner.pause_requested(job["id"])
+
             vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
             try:
                 # copy=false: scan_target is the source and restrict_dirs is
@@ -25348,6 +25361,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     vireo_dir=vireo_dir,
                     thumb_cache_dir=app.config["THUMB_CACHE_DIR"],
                     restrict_dirs=restrict_dirs,
+                    cancel_check=scan_cancel_check,
+                    pause_check=scan_pause_check,
                 )
             finally:
                 # scanner.scan commits photo rows incrementally, so even a mid-scan

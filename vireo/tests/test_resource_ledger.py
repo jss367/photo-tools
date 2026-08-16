@@ -206,6 +206,22 @@ def test_cgroup_cpu_quota_falls_back_to_v1_split(monkeypatch):
     assert resource_ledger._cgroup_cpu_quota_cpus() is None
 
 
+def test_ancestor_dirs_ignores_non_absolute_paths():
+    """Regression: a stubbed or malformed ``/proc/self/cgroup`` line
+    could hand ``_ancestor_dirs`` a non-absolute path like ``"foo"``.
+    ``"foo".rsplit("/", 1)[0]`` returns ``"foo"``, so the ancestor walk
+    would loop forever and the caller (unbounded ``for``) would hang
+    process startup. Guarded by returning without yielding on any
+    input that does not begin with ``/``.
+    """
+    assert list(resource_ledger._ancestor_dirs("")) == []
+    assert list(resource_ledger._ancestor_dirs("foo")) == []
+    assert list(resource_ledger._ancestor_dirs("foo/bar")) == []
+    # Absolute paths still walk as before.
+    assert list(resource_ledger._ancestor_dirs("/")) == ["/"]
+    assert list(resource_ledger._ancestor_dirs("/a/b")) == ["/a/b", "/a", "/"]
+
+
 def test_cgroup_cpu_quota_v1_reads_comounted_cpu_cpuacct(monkeypatch):
     """Regression: on Ubuntu/Debian/Alpine/older-Fedora hosts, the
     ``cpu`` and ``cpuacct`` controllers are co-mounted at
@@ -305,9 +321,20 @@ def test_process_usable_cpu_count_takes_minimum_of_affinity_and_cgroup(
     a 12-permit budget and oversubscribes its two-CPU allocation.
     """
     # Simulate a host with wide affinity (16 CPUs) but a 2-CPU cgroup
-    # quota. The specific affinity source depends on the Python version,
-    # so patch both possible surfaces.
-    monkeypatch.setattr(resource_ledger.os, "process_cpu_count", lambda: 16)
+    # quota. ``os.process_cpu_count`` only exists on Python 3.13+; on
+    # 3.11/3.12 the helper falls through to ``os.sched_getaffinity`` on
+    # Linux. Patch BOTH surfaces (with ``raising=False`` so a missing
+    # attribute on the current interpreter is added rather than an
+    # error) so the test asserts the same clamped result on every
+    # supported Python version regardless of which branch the helper
+    # takes.
+    monkeypatch.setattr(
+        resource_ledger.os, "process_cpu_count", lambda: 16, raising=False,
+    )
+    monkeypatch.setattr(
+        resource_ledger.os,
+        "sched_getaffinity", lambda _pid: set(range(16)), raising=False,
+    )
     monkeypatch.setattr(
         "builtins.open",
         _make_open_stub({
@@ -318,7 +345,13 @@ def test_process_usable_cpu_count_takes_minimum_of_affinity_and_cgroup(
     assert resource_ledger.process_usable_cpu_count() == 2
 
     # And with a 4-CPU affinity + 8-CPU quota, affinity wins.
-    monkeypatch.setattr(resource_ledger.os, "process_cpu_count", lambda: 4)
+    monkeypatch.setattr(
+        resource_ledger.os, "process_cpu_count", lambda: 4, raising=False,
+    )
+    monkeypatch.setattr(
+        resource_ledger.os,
+        "sched_getaffinity", lambda _pid: set(range(4)), raising=False,
+    )
     monkeypatch.setattr(
         "builtins.open",
         _make_open_stub({

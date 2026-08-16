@@ -193,13 +193,19 @@ def test_scan_frozen_manifest_rejects_paths_in_excluded_bundle(tmp_path):
     Image.new('RGB', (200, 100), color='blue').save(bundle_file)
 
     db = Database(str(tmp_path / "test.db"))
+    progress = []
     result = scan(
         root,
         db,
         discovered_files=[os.path.join(root, "real.jpg"), bundle_file],
+        progress_callback=lambda current, total: progress.append(
+            (current, total)
+        ),
     )
 
-    assert result["discovered"] == 1
+    assert result["discovered"] == 2
+    assert result["vanished"] == 1
+    assert progress[-1] == (2, 2)
     assert {p['filename'] for p in db.get_photos(per_page=100)} == {'real.jpg'}
 
 
@@ -247,7 +253,8 @@ def test_scan_frozen_manifest_rejects_paths_under_symlinked_bundle(tmp_path):
     ]
     result = scan(str(root), db, discovered_files=frozen)
 
-    assert result["discovered"] == 1
+    assert result["discovered"] == 2
+    assert result["vanished"] == 1
     filenames = {p['filename'] for p in db.get_photos(per_page=100)}
     assert filenames == {'real.jpg'}
 

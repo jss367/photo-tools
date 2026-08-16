@@ -1799,6 +1799,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     _check_cancelled()
     if frozen_files is None and status_callback:
         _emit_status("Discovering files...")
+    excluded_frozen = 0
     if frozen_files is not None:
         # A frozen manifest was captured before any per-source scan began, so
         # a later source can wait minutes behind earlier ones. In that window
@@ -1811,7 +1812,6 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         # excluded bundle) and re-trip the TCC prompt this guard exists to
         # avoid — or catalog files from a substituted subtree.
         image_files = []
-        excluded_frozen = 0
         for path in frozen_files:
             candidate = Path(path)
             if is_excluded_scan_path(candidate):
@@ -2017,11 +2017,16 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     image_files.sort()
     _check_cancelled()
 
-    total = len(image_files)
+    # Excluded frozen paths were part of the caller's promised manifest.
+    # Account for them as vanished work so progress still reaches that
+    # frozen denominator and import-in-place surfaces a partial-source
+    # failure instead of silently succeeding on a smaller queue.
+    total = len(image_files) + excluded_frozen
     counts["discovered"] = total
+    counts["vanished"] = excluded_frozen
     log.info("Found %d images in %s", total, root)
     if progress_callback:
-        progress_callback(0, total)
+        progress_callback(excluded_frozen, total)
 
     # Build existing photo lookup for incremental mode
     existing_photos = {}
@@ -2221,7 +2226,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # First pass: determine which files need full processing (for incremental mode).
     # Handle XMP-only changes inline; collect files needing metadata extraction.
     files_to_process = []
-    processed_count = 0
+    processed_count = excluded_frozen
     # ``processed_count`` advances for every file the scan *disposes of*,
     # including ones it deliberately skips — that is what a progress bar
     # needs to reach 100%. It is NOT the number of photos indexed, and the

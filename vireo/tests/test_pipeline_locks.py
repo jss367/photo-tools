@@ -370,20 +370,84 @@ def test_session_cache_lock_post_acquire_still_releases_on_pure_cancel():
 
 
 def test_acquire_gpu_if_session_uses_it_takes_lock_for_cuda_session():
+    """Mixed CUDA+CPU sessions take BOTH the GPU semaphore AND CPU permits.
+
+    Vireo's default provider order registers CPU alongside CUDA/CoreML
+    so unsupported ops fall back per-op to CPU. The compound claim
+    prevents an op-level CPU fallback from overrunning the process CPU
+    budget while a concurrent scan / CPU inference is also running.
+    """
+    import resource_ledger
+
     sess = _FakeSession(["CUDAExecutionProvider", "CPUExecutionProvider"])
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=8)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
     before = _GPU_SEMAPHORE._value
-    with acquire_gpu_if_session_uses_it(sess):
-        held = _GPU_SEMAPHORE._value
-    after = _GPU_SEMAPHORE._value
+    try:
+        with acquire_gpu_if_session_uses_it(sess):
+            held = _GPU_SEMAPHORE._value
+            snapshot = ledger.snapshot()
+            assert snapshot["cpu"]["allocated"] > 0, (
+                "mixed CUDA+CPU session must claim CPU permits so an "
+                "op-level fallback cannot exceed the process budget"
+            )
+            assert snapshot["lanes"]["cpu_ml"]["allocated"] == 1, (
+                "mixed CUDA+CPU session must hold the cpu_ml lane too"
+            )
+        after = _GPU_SEMAPHORE._value
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
     assert before == 1
     assert held == 0, "semaphore should be acquired for GPU sessions"
     assert after == 1
+    assert ledger.snapshot()["cpu"]["allocated"] == 0, "CPU permits leaked"
+    assert ledger.snapshot()["lanes"]["cpu_ml"]["allocated"] == 0, (
+        "cpu_ml lane leaked"
+    )
 
 
 def test_acquire_gpu_if_session_uses_it_takes_lock_for_coreml_session():
+    """Mixed CoreML+CPU: same compound claim as the CUDA path."""
+    import resource_ledger
+
     sess = _FakeSession(["CoreMLExecutionProvider", "CPUExecutionProvider"])
-    with acquire_gpu_if_session_uses_it(sess):
-        assert _GPU_SEMAPHORE._value == 0
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=8)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        with acquire_gpu_if_session_uses_it(sess):
+            assert _GPU_SEMAPHORE._value == 0
+            assert ledger.snapshot()["cpu"]["allocated"] > 0
+            assert ledger.snapshot()["lanes"]["cpu_ml"]["allocated"] == 1
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
+def test_acquire_inference_resources_pure_gpu_session_takes_only_semaphore():
+    """A pure-accelerator session (no CPUExecutionProvider registered)
+    takes ONLY the GPU semaphore.
+
+    The compound claim is a fallback safeguard for op-level CPU
+    fallback; when the session has no CPU provider at all, no such
+    fallback is possible and adding the CPU claim would serialize
+    accelerator work against unrelated CPU inference for no benefit.
+    """
+    import resource_ledger
+    from pipeline_locks import acquire_inference_resources
+
+    sess = _FakeSession(["CUDAExecutionProvider"])
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=8)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        with acquire_inference_resources(sess):
+            assert _GPU_SEMAPHORE._value == 0, "must hold GPU semaphore"
+            assert ledger.snapshot()["cpu"]["allocated"] == 0, (
+                "pure-accelerator session must NOT claim CPU permits — "
+                "op-level fallback is not possible when no CPU provider "
+                "is registered"
+            )
+            assert ledger.snapshot()["lanes"]["cpu_ml"]["allocated"] == 0
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
 
 
 def test_acquire_gpu_if_session_uses_it_skips_lock_for_cpu_only_session():

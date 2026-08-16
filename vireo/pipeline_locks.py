@@ -3,10 +3,16 @@
 Two primitives:
 
 * ``acquire_inference_resources()`` — a provider-aware inference lease.
-  GPU sessions take the single-holder accelerator semaphore. CPU-only
-  sessions atomically claim their configured CPU permits plus the exclusive
-  ``cpu_ml`` lane, preventing independent native ONNX pools from
-  oversubscribing the process budget.
+  Pure-GPU sessions (no ``CPUExecutionProvider`` registered) take only
+  the single-holder accelerator semaphore. CPU-only sessions atomically
+  claim their configured CPU permits plus the exclusive ``cpu_ml`` lane.
+  Mixed accelerator+CPU sessions (the default Vireo shape — CUDA / CoreML
+  registered alongside ``CPUExecutionProvider`` for unsupported-op
+  fallback) claim BOTH: ledger-first (CPU permits + ``cpu_ml``), then
+  the GPU semaphore. Without the CPU claim on the mixed path, an
+  op-level CPU fallback would run the session's native ONNX pool
+  alongside a concurrent CPU inference / scan / regroup and overrun
+  the process-wide CPU budget.
 
 * ``acquire_workspace_regroup(workspace_id)`` — a per-workspace lock
   held across BOTH ``regroup_stage`` and ``miss_stage`` so two pipelines
@@ -131,13 +137,101 @@ def _session_uses_gpu(session):
     return any(p in _GPU_PROVIDERS for p in providers)
 
 
+class _CompoundInferenceContext:
+    """Compound lease: CPU permits + ``cpu_ml`` lane + GPU semaphore.
+
+    For mixed-provider accelerator sessions (CUDA / CoreML alongside
+    ``CPUExecutionProvider`` — Vireo's default shape from
+    :func:`onnx_runtime.get_providers`), ONNX Runtime may execute some
+    ops on the accelerator and fall back to the session's own CPU
+    thread pool for unsupported ops. ``get_providers()`` reports the
+    registered provider list, not actual node placement, so we cannot
+    tell at claim time whether any given call will fall back — the
+    safe default is to claim BOTH resources.
+
+    Without the CPU claim, the fallback CPU pool would run alongside
+    a concurrent CPU inference / scan / regroup and blow through the
+    process-wide CPU budget: the whole point of the ledger is to make
+    that impossible.
+
+    Acquires in ledger-first, semaphore-last order so the "GPU
+    semaphore is innermost" invariant documented at the top of this
+    module is preserved. Releases in reverse.
+    """
+
+    def __init__(self, ledger, request, cancel_check):
+        self._ledger = ledger
+        self._request = request
+        self._cancel_check = cancel_check
+        self._cpu_lease = None
+        self._gpu_ctx = None
+
+    def __enter__(self):
+        cpu_lease = self._ledger.acquire(
+            self._request, cancel_check=self._cancel_check,
+        )
+        cpu_lease.__enter__()
+        self._cpu_lease = cpu_lease
+        try:
+            gpu_ctx = _GpuLockContext(self._cancel_check)
+            gpu_ctx.__enter__()
+            self._gpu_ctx = gpu_ctx
+        except BaseException:
+            # GPU acquire failed (cancel-race, etc.) — release the CPU
+            # lease we already committed to before propagating so the
+            # ledger doesn't leak permits.
+            self._cpu_lease.__exit__(None, None, None)
+            self._cpu_lease = None
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._gpu_ctx is not None:
+                self._gpu_ctx.__exit__(exc_type, exc, tb)
+        finally:
+            if self._cpu_lease is not None:
+                self._cpu_lease.__exit__(exc_type, exc, tb)
+
+
+def _build_cpu_request(session, label):
+    """Construct the ``ResourceRequest`` for this session's CPU claim.
+
+    Shared between the CPU-only path and the mixed accelerator+CPU
+    fallback path — same permits, same ``cpu_ml`` lane; only the label
+    differs so wait diagnostics distinguish the two.
+    """
+    from onnx_runtime import session_cpu_threads
+    from resource_ledger import (
+        CpuRequest,
+        ResourceRequest,
+        cpu_inference_request,
+        get_resource_ledger,
+    )
+
+    ledger = get_resource_ledger()
+    threads = session_cpu_threads(
+        session, default=cpu_inference_request(ledger.cpu_capacity).preferred,
+    )
+    threads = max(1, min(int(threads), ledger.cpu_capacity))
+    return ledger, ResourceRequest(
+        cpu=CpuRequest(threads, threads, threads),
+        lanes=("cpu_ml",),
+        label=label,
+    )
+
+
 def acquire_inference_resources(session, *, cancel_check=None):
     """Return the enforceable inference lease for an ONNX session.
 
     CPU-only sessions claim the exact CPU thread count configured when the
     session was constructed and the initial exclusive ``cpu_ml`` lane.
-    Accelerator sessions keep the existing per-batch GPU serialization.
-    Unknown providers take the conservative accelerator path.
+    Mixed-provider accelerator sessions (CUDA/CoreML + CPU fallback —
+    Vireo's default) claim BOTH the CPU budget AND the GPU semaphore so
+    unsupported-op fallback to the session's native CPU pool cannot
+    overrun the process-wide CPU budget. Pure-accelerator sessions
+    (no CPUExecutionProvider registered) take only the GPU semaphore.
+    Unknown providers take the conservative accelerator+CPU path.
 
     ``cancel_check`` is threaded into the CPU claim so a cancelled
     classify, detection, mask, or embedding worker wakes promptly while
@@ -153,38 +247,36 @@ def acquire_inference_resources(session, *, cancel_check=None):
             outputs = session.run(None, feeds)
     """
     if _session_uses_gpu(session):
+        # Determine provider mix. On any failure treat as compound to
+        # match the conservative "unknown providers" branch below.
+        try:
+            providers = set(session.get_providers())
+        except Exception:
+            providers = None
+        if providers is None or "CPUExecutionProvider" in providers:
+            ledger, request = _build_cpu_request(
+                session, label="mixed accelerator+CPU ONNX inference",
+            )
+            return _CompoundInferenceContext(ledger, request, cancel_check)
         return _GpuLockContext(cancel_check)
     try:
         providers = set(session.get_providers())
     except Exception:
-        return _GpuLockContext(cancel_check)
+        # Unknown provider surface: fall through to the same
+        # conservative compound path — matches the pre-branch behavior
+        # for accelerator sessions with unreadable provider lists.
+        ledger, request = _build_cpu_request(
+            session, label="mixed accelerator+CPU ONNX inference",
+        )
+        return _CompoundInferenceContext(ledger, request, cancel_check)
     if providers != {"CPUExecutionProvider"}:
-        return _GpuLockContext(cancel_check)
+        ledger, request = _build_cpu_request(
+            session, label="mixed accelerator+CPU ONNX inference",
+        )
+        return _CompoundInferenceContext(ledger, request, cancel_check)
 
-    from onnx_runtime import session_cpu_threads
-    from resource_ledger import (
-        CpuRequest,
-        ResourceRequest,
-        cpu_inference_request,
-        get_resource_ledger,
-    )
-
-    ledger = get_resource_ledger()
-    threads = session_cpu_threads(
-        session, default=cpu_inference_request(ledger.cpu_capacity).preferred,
-    )
-    # A test may replace the process ledger after constructing a session.
-    # Production uses one immutable startup capacity, but clamping here keeps
-    # the request valid without weakening the configured production budget.
-    threads = max(1, min(int(threads), ledger.cpu_capacity))
-    return ledger.acquire(
-        ResourceRequest(
-            cpu=CpuRequest(threads, threads, threads),
-            lanes=("cpu_ml",),
-            label="CPU ONNX inference",
-        ),
-        cancel_check=cancel_check,
-    )
+    ledger, request = _build_cpu_request(session, label="CPU ONNX inference")
+    return ledger.acquire(request, cancel_check=cancel_check)
 
 
 def acquire_gpu_if_session_uses_it(session, *, cancel_check=None):

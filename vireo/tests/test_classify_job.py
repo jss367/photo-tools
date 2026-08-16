@@ -1228,6 +1228,146 @@ def test_reclassify_finalizes_steps_on_resource_wait_cancel_during_load(
     )
 
 
+def test_classify_factory_cancel_check_uses_pure_cancel_probe(
+    tmp_path, monkeypatch,
+):
+    """Regression: the classifier factory closure must call the runner's
+    non-parking ``cancellation_requested`` probe — never ``is_cancelled``
+    — because the factory runs while ``ModelCache._Entry.load_lock`` is
+    held. If the factory parked on pause via ``is_cancelled`` →
+    ``wait_if_paused``, any concurrent unpaused job requesting the same
+    cache key would stall until Resume, since the polling waiter in
+    ``model_cache.py:198`` cannot acquire the shared load_lock.
+    """
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.save_detections(pid, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="megadetector-v6")
+    coll_id = db.add_collection(
+        "c", '[{"field":"photo_ids","value":[' + str(pid) + ']}]',
+    )
+
+    class PureProbeRunner(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.is_cancelled_calls_during_factory = 0
+            self.pure_probe_calls_during_factory = 0
+            self.in_factory = False
+
+        def is_cancelled(self, job_id):
+            if self.in_factory:
+                self.is_cancelled_calls_during_factory += 1
+            return super().is_cancelled(job_id)
+
+        def cancellation_requested(self, job_id):
+            if self.in_factory:
+                self.pure_probe_calls_during_factory += 1
+            return False
+
+    runner = PureProbeRunner()
+
+    fake_weights = tmp_path / "weights"
+    fake_weights.mkdir()
+    (fake_weights / "tol_embeddings.npy").write_bytes(b"stub")
+    (fake_weights / "tol_classes.json").write_bytes(b"[]")
+    import classify_job as cj
+    monkeypatch.setattr(cj, "get_active_model", lambda: {
+        "id": "BioCLIP",
+        "name": "BioCLIP",
+        "model_str": "hf-hub:imageomics/bioclip",
+        "weights_path": str(fake_weights),
+        "model_type": "bioclip",
+        "downloaded": True,
+    })
+
+    # Intercept the factory: mark the "in factory" window, invoke the
+    # closure once so its cancel_check fires against the runner, then
+    # bail with a distinctive error that we catch in the assertion.
+    captured = {}
+
+    class _StopAfterProbe(RuntimeError):
+        pass
+
+    class _StubClassifier:
+        """Minimal object that runs the caller's cancel_check exactly
+        once inside the factory scope, then aborts so the classify
+        pipeline unwinds without needing real ONNX weights."""
+
+        def __init__(self, *args, cancel_check=None, **kwargs):
+            if cancel_check is not None:
+                cancel_check()
+            raise _StopAfterProbe(
+                "abort factory after probing cancel_check",
+            )
+
+    monkeypatch.setattr(cj, "Classifier", _StubClassifier)
+
+    import classifier_cache
+    original_acquire = classifier_cache.acquire_cached_classifier
+
+    def _tracking_acquire(*, factory, **kwargs):
+        runner.in_factory = True
+        try:
+            factory()
+        except _StopAfterProbe as e:
+            captured["factory_error"] = e
+        finally:
+            runner.in_factory = False
+        raise _StopAfterProbe("stop before classification")
+
+    monkeypatch.setattr(
+        classifier_cache, "acquire_cached_classifier", _tracking_acquire,
+    )
+
+    job = _make_job()
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None,
+        labels_file=None,
+        model_id=None,
+        model_name="BioCLIP",
+        grouping_window=0,
+        similarity_threshold=0.99,
+        reclassify=False,
+    )
+
+    with pytest.raises(_StopAfterProbe):
+        run_classify_job(job, runner, db_path, ws, params)
+
+    assert captured.get("factory_error") is not None, (
+        "Factory closure must have been invoked so cancel_check ran; "
+        "if the classify job returned early, this regression cannot "
+        "prove which probe the factory used."
+    )
+    assert runner.pure_probe_calls_during_factory >= 1, (
+        "Factory cancel_check must call runner.cancellation_requested "
+        "(pure probe) — got zero calls, meaning the fix regressed and "
+        "the factory would park on pause while holding ModelCache "
+        "entry.load_lock."
+    )
+    assert runner.is_cancelled_calls_during_factory == 0, (
+        "Factory cancel_check must NOT call runner.is_cancelled — that "
+        "probe parks inside wait_if_paused, so a pause request during "
+        "cold model load would strand every unpaused sibling waiting "
+        "on the same cache key."
+    )
+
+
 def test_classify_photos_surfaces_cached_full_image_predictions(tmp_path):
     """When a photo has no real detections and the full-image synthetic
     detection is gated by classifier_runs, the cached top prediction

@@ -3028,6 +3028,21 @@ def run_classify_job(
             },
         )
 
+        # Pure-cancel probe for the classifier factory. The factory runs
+        # under ``ModelCache._Entry.load_lock``; parking there on pause
+        # would strand every concurrent unpaused sibling that acquires
+        # the same cache key until Resume (they poll the load_lock at
+        # ``model_cache.py:198`` without their own pause boundary). Using
+        # the non-parking probe lets construction continue through a
+        # pause request — the lock releases as soon as the factory
+        # returns, then the outer classify loop honors the pause at the
+        # next boundary. Cancel still aborts immediately.
+        def _factory_cancel_check():
+            probe = getattr(runner, "cancellation_requested", None)
+            if probe is not None:
+                return probe(job["id"])
+            return runner.is_cancelled(job["id"])
+
         if model_type == "timm":
             if runner.is_cancelled(job["id"]):
                 runner.update_step(
@@ -3048,7 +3063,7 @@ def run_classify_job(
                     "failed": 0,
                 }
             def _construct_classifier():
-                if runner.is_cancelled(job["id"]):
+                if _factory_cancel_check():
                     raise ClassificationCancelled("classification cancelled")
                 return TimmClassifier(model_str, taxonomy=tax)
         else:
@@ -3075,7 +3090,7 @@ def run_classify_job(
                     model_str=model_str,
                     pretrained_str=weights_path,
                     embedding_progress_callback=_emb_progress,
-                    cancel_check=lambda: runner.is_cancelled(job["id"]),
+                    cancel_check=_factory_cancel_check,
                 )
 
         try:

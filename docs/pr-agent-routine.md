@@ -152,9 +152,21 @@ retries when it contains the exact `[pr-agent-fix-ci:<number>]` marker the
 routine prompt asks the agent to write. Regular contributor commits with
 similar wording still route to the routine.
 
-Review-event de-noising. Per-PR workflow concurrency cancels superseded queued
-deliveries instead of preserving the whole queue. The `fix-comments` and
-`codex-review` jobs gate the
+Review-event de-noising. Concurrency is scoped per job, not workflow-wide,
+so unrelated task types never cancel each other. Review-fix firers
+(`activate`, `fix-comment-feedback`, `fix-comments`, `codex-review`) share
+a `pr-agent-review-fix-<PR>` group so newer review events collapse older
+ones. CI-fix runs derive the PR number from
+`workflow_run.pull_requests[0]` (falling back to the workflow_run head
+SHA) so unrelated PRs sharing a default-branch commit do not cancel each
+other's CI-repair. Merge jobs (`merge-on-approval`, `merge-on-command`)
+get their own `pr-agent-merge-<PR>` group with
+`cancel-in-progress: false` so an in-flight `/merge` or approval-driven
+auto-merge run is never cancelled by an ignored generated comment or a
+later approval event. `/merge <sha>` comments are also excluded from
+`fix-comment-feedback` so the routine cannot push a new head — and
+invalidate the human's SHA-bound merge authorization — in parallel with
+the merge job. The `fix-comments` and `codex-review` jobs gate the
 routine on the `has-open-threads` composite action before firing. Codex
 re-reviews every commit and re-posts its still-open findings as fresh inline
 comments, and its review body is always the same stock template — so neither

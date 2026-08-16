@@ -1177,8 +1177,13 @@ async function loadPredictions() {
 // Undo/redo lives in the shared navbar. The database changes there, but this
 // page otherwise keeps rendering the status snapshot fetched on initial load.
 // Refetch after a history change so cards, tabs, and counts match the database.
+// Route through ``switchCollection`` (not ``loadPredictions`` directly) so the
+// active collection's ``collectionPhotoIds`` snapshot is refreshed too — an
+// undo can move a photo into a rating- or keyword-based collection, and
+// ``loadPredictions`` would otherwise intersect the fresh server response with
+// the stale set and drop the newly matching card.
 document.addEventListener('vireo:edit-history-changed', function() {
-  loadPredictions();
+  switchCollection(currentCollection);
 });
 
 /* ---------- Render ---------- */

@@ -6590,7 +6590,8 @@ async function _afterPredictionMutation(photoIds, opts) {
 }
 
 // A stale panel can submit rows the server then declines to accept: decided
-// elsewhere, or no longer unambiguous against the photos' current keywords.
+// elsewhere, no longer unambiguous against the photos' current keywords, or
+// superseded by a later classification run.
 // The refreshed panel shows the survivors, but the gap between "Accept on 35"
 // and 33 accepts has to be named, not left for the user to notice — the same
 // rule that made the button disclose its count in the first place.
@@ -6603,6 +6604,14 @@ function _reportSkippedAccepts(data) {
   if (data.skipped_ambiguous) {
     parts.push(data.skipped_ambiguous +
       ' now conflicting with keywords — resolve in Review');
+  }
+  // Named separately from the conflict case on purpose: nothing is wrong with
+  // these photos and there is nothing to resolve. Classification re-ran with a
+  // different label set, so the row this panel rendered is no longer the
+  // current one — the refresh below replaces it.
+  if (data.skipped_superseded) {
+    parts.push(data.skipped_superseded +
+      ' replaced by a newer classification run');
   }
   if (!parts.length) return;
   var accepted = data.accepted || 0;

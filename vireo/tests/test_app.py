@@ -17815,6 +17815,235 @@ def test_batch_accept_revalidates_ambiguity_after_keywords_move(app_and_db):
     assert reloaded_entry["acceptable_prediction_ids"] == []
 
 
+def _db_file(db):
+    """The on-disk path behind a Database, for opening a second connection."""
+    return next(
+        row["file"] for row in db.conn.execute("PRAGMA database_list")
+        if row["name"] == "main"
+    )
+
+
+def _reclassify(db, detection_id, species, confidence,
+                model="bioclip", labels_fingerprint="fp2"):
+    """Add a newer label set's prediction on an existing detection.
+
+    ``get_predictions`` keeps only the newest ``labels_fingerprint`` per
+    ``(detection, classifier_model)``, so this is what "classification re-ran"
+    looks like to every read path: the old row still exists and is still
+    pending, but no surface shows it any more.
+    """
+    db.add_prediction(
+        detection_id, species, confidence, model,
+        status="pending", labels_fingerprint=labels_fingerprint,
+    )
+
+
+def test_batch_accept_skips_superseded_label_set_rows(app_and_db):
+    """A payload rendered before a re-classification cannot accept the old row.
+
+    Same shape as the decided-status and ambiguity preconditions: the panel
+    told the truth when it rendered, and stopped telling the truth before the
+    click. Accepting here would tag the photo from a label set nothing
+    displays and mark accepted a row the user can no longer see, while the
+    current prediction stayed pending in the panel in front of them.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, det_id = _seed_prediction_photo(
+        db, "superseded.jpg", "TestZanclusdelta", 0.9,
+    )
+    stale_pred = _prediction_id(db, photo_id, "TestZanclusdelta")
+
+    # What Browse rendered.
+    rendered = client.post(
+        "/api/selection/prediction-suggestions", json={"photo_ids": [photo_id]},
+    )
+    entry = next(
+        p for p in rendered.get_json()["predictions"]
+        if p["species"] == "TestZanclusdelta"
+    )
+    assert entry["acceptable_prediction_ids"] == [stale_pred]
+
+    # Classification re-runs against a new label set between render and click.
+    _reclassify(db, det_id, "TestZanclusepsilon", 0.95)
+    current_pred = _prediction_id(db, photo_id, "TestZanclusepsilon")
+    assert current_pred != stale_pred
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [stale_pred]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["accepted"] == 0
+    assert body["skipped_superseded"] == 1
+    # Counted as superseded, not folded into a conflict the user would go
+    # looking for in Review and never find.
+    assert body["skipped_ambiguous"] == 0
+    assert body["already_decided"] == 0
+
+    names = {k["name"] for k in db.get_photo_keywords(photo_id)}
+    assert "TestZanclusdelta" not in names, (
+        "accepted a species from a label set the catalog has moved past"
+    )
+    stale_status = db.conn.execute(
+        """SELECT COALESCE(pr_rev.status, 'pending') AS status
+           FROM predictions pr
+           LEFT JOIN prediction_review pr_rev
+             ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+           WHERE pr.id = ?""",
+        (db._ws_id(), stale_pred),
+    ).fetchone()["status"]
+    assert stale_status == "pending"
+    # The current row is untouched and still offered.
+    reloaded = client.post(
+        "/api/selection/prediction-suggestions", json={"photo_ids": [photo_id]},
+    )
+    current_entry = next(
+        p for p in reloaded.get_json()["predictions"]
+        if p["species"] == "TestZanclusepsilon"
+    )
+    assert current_entry["acceptable_prediction_ids"] == [current_pred]
+
+
+def test_batch_reject_skips_superseded_label_set_rows(app_and_db):
+    """The reject side applies the same rule through the same helper.
+
+    A stale reject writes no keyword, but it misreports just as loudly: the
+    user dismisses a species, the row marked ``rejected`` is one no panel
+    shows, and the current prediction stays pending in front of them.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, det_id = _seed_prediction_photo(
+        db, "superseded-reject.jpg", "TestZancluszeta", 0.9,
+    )
+    stale_pred = _prediction_id(db, photo_id, "TestZancluszeta")
+    _reclassify(db, det_id, "TestZancluseta", 0.95)
+
+    resp = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": [stale_pred]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["rejected"] == 0
+    assert body["skipped_superseded"] == 1
+    assert body["already_decided"] == 0
+    stale_status = db.conn.execute(
+        """SELECT COALESCE(pr_rev.status, 'pending') AS status
+           FROM predictions pr
+           LEFT JOIN prediction_review pr_rev
+             ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+           WHERE pr.id = ?""",
+        (db._ws_id(), stale_pred),
+    ).fetchone()["status"]
+    assert stale_status == "pending"
+    assert db.get_edit_history() == []
+
+
+def test_batch_accept_checks_and_writes_are_one_transaction(
+    app_and_db, monkeypatch,
+):
+    """No other writer can decide these rows between the check and the write.
+
+    The preconditions (decided, superseded, ambiguous) are only worth what
+    their atomicity with the write is worth. Read them outside a transaction
+    and two overlapping requests — a double-clicked Accept, or an Accept and a
+    Reject fired before the panel reloads — both pass the same checks against
+    the same pre-write state and then both write.
+
+    The interleave is exercised in-process, deterministically: a competing
+    connection tries to record a decision on the very row being accepted, at
+    the exact instant between the endpoint's checks and its first write
+    (hooked through ``Database.accept_prediction``, the call that separates
+    them). It runs with a short ``busy_timeout``, so it either commits — which
+    is the bug — or is refused because the endpoint already holds SQLite's
+    writer lock, which is the guarantee. Nothing here depends on thread
+    scheduling luck: the hook blocks the request until the competing writer
+    has had its answer.
+    """
+    import sqlite3
+    import threading
+
+    import db as db_module
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(
+        db, "atomic.jpg", "TestZanclustheta", 0.9,
+    )
+    pred_id = _prediction_id(db, photo_id, "TestZanclustheta")
+    ws_id = db._ws_id()
+    db_file = _db_file(db)
+
+    competing = {}
+
+    def _competing_reject():
+        # 0.5s busy timeout: long enough that an *unlocked* window is taken
+        # without a race, short enough that a properly locked one gives up
+        # well inside the test.
+        conn = sqlite3.connect(db_file, timeout=0.5)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """INSERT INTO prediction_review
+                     (prediction_id, workspace_id, status, reviewed_at)
+                   VALUES (?, ?, 'rejected', datetime('now'))
+                   ON CONFLICT(prediction_id, workspace_id)
+                   DO UPDATE SET status = 'rejected'""",
+                (pred_id, ws_id),
+            )
+            conn.commit()
+            competing["committed"] = True
+        except sqlite3.OperationalError as exc:
+            competing["refused"] = str(exc)
+        finally:
+            conn.close()
+
+    original_accept = db_module.Database.accept_prediction
+    fired = []
+
+    def _accept_with_interleave(self, *args, **kwargs):
+        if not fired:
+            fired.append(True)
+            thread = threading.Thread(target=_competing_reject)
+            thread.start()
+            thread.join(timeout=30)
+            assert not thread.is_alive()
+        return original_accept(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        db_module.Database, "accept_prediction", _accept_with_interleave,
+    )
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert fired, "the interleave hook never ran, so nothing was exercised"
+    assert not competing.get("committed"), (
+        "another connection recorded a decision between batch-accept's "
+        "precondition check and its write — the check is not atomic with "
+        "the write it guards"
+    )
+    assert "locked" in competing.get("refused", ""), competing
+
+    # And the accept the endpoint was allowed to make is the whole truth:
+    # status and keyword agree, with no rejected-then-accepted overwrite.
+    assert resp.get_json()["accepted"] == 1
+    status = db.conn.execute(
+        """SELECT COALESCE(pr_rev.status, 'pending') AS status
+           FROM predictions pr
+           LEFT JOIN prediction_review pr_rev
+             ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+           WHERE pr.id = ?""",
+        (ws_id, pred_id),
+    ).fetchone()["status"]
+    assert status == "accepted"
+    assert "TestZanclustheta" in {
+        k["name"] for k in db.get_photo_keywords(photo_id)
+    }
+
+
 def test_batch_accept_skips_ambiguous_rows_with_alternatives(app_and_db):
     """The alternative-sibling half of the rule is enforced server-side too.
 
@@ -18036,7 +18265,7 @@ def test_batch_accept_dedup_still_rejects_skipped_detection_alternatives(
     assert declined.status_code == 200, declined.get_data(as_text=True)
     assert declined.get_json() == {
         "ok": True, "accepted": 0, "already_decided": 0,
-        "skipped_ambiguous": 2, "species": None,
+        "skipped_ambiguous": 2, "skipped_superseded": 0, "species": None,
     }
 
     db.accept_prediction(pred_ids[0], prediction_ids=set(pred_ids))

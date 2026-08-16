@@ -21,6 +21,7 @@ import queue
 import re
 import secrets
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -16580,16 +16581,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         encoding ``api_accept_prediction`` already uses.
 
         Contract: every row this endpoint accepts is one that is still
-        undecided AND still unambiguous *at the moment of the write*, judged
-        against the database rather than against whatever the caller's panel
-        believed. Both preconditions are re-derived here — statuses via
-        ``_decided_prediction_ids``, ambiguity via
-        ``_ambiguous_prediction_ids``, the same helper that produced the
-        panel's ``acceptable_prediction_ids``. Rows failing either are
-        skipped, never accepted, and counted back in ``already_decided`` and
-        ``skipped_ambiguous``. A stale payload can therefore accept less than
-        the caller asked for, but never something the caller was not shown as
-        acceptable.
+        undecided, still unambiguous, and still from the current label set *at
+        the moment of the write* — judged against the database rather than
+        against whatever the caller's panel believed. All three preconditions
+        are re-derived here: statuses via ``_decided_prediction_ids``,
+        staleness via ``_superseded_prediction_ids``, ambiguity via
+        ``_ambiguous_prediction_ids`` (the same helper that produced the
+        panel's ``acceptable_prediction_ids``). Rows failing any of them are
+        skipped, never accepted, and counted back in ``already_decided``,
+        ``skipped_superseded`` and ``skipped_ambiguous``. A stale payload can
+        therefore accept less than the caller asked for, but never something
+        the caller was not shown as acceptable.
+
+        "At the moment of the write" is literal, not approximate: the checks
+        and the writes run inside one ``BEGIN IMMEDIATE`` transaction
+        (``_begin_prediction_decision``), so no other connection can decide
+        these rows in between. Two overlapping requests are serialized by
+        SQLite's writer lock — the second reads what the first committed and
+        skips accordingly, rather than acting on state it read before the
+        first one wrote.
         """
         db = _get_db()
         body = request.get_json(silent=True) or {}
@@ -16615,6 +16625,34 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if err is not None:
             return err
 
+        # Everything from here to the commit is one transaction, taken with
+        # the writer lock held from the first read (see
+        # ``_begin_prediction_decision``). The three preconditions below are
+        # only worth what their atomicity with the write is worth: read them
+        # outside the transaction and a second overlapping request can pass the
+        # same checks against the same pre-write state.
+        #
+        # ``_parse_prediction_ids`` stays outside deliberately — it validates
+        # the payload's shape and workspace ownership, which is not the state
+        # these preconditions race against, and it can walk a 1,000-photo
+        # selection. The lock is held for the decision, not for parsing.
+        lock_err = _begin_prediction_decision(db)
+        if lock_err is not None:
+            return lock_err
+        try:
+            return _batch_accept_under_lock(db, pred_ids)
+        except Exception:
+            db.conn.rollback()
+            raise
+
+    def _batch_accept_under_lock(db, pred_ids):
+        """The checks and writes of ``batch-accept``, inside its transaction.
+
+        Split out only so the transaction's boundaries are impossible to
+        misread: every statement here runs with the writer lock already held,
+        and the single ``commit`` at the end is the moment any of it becomes
+        visible to another request.
+        """
         # Make a submission of an already-decided row a no-op rather than a
         # second accept. A double-clicked Accept button or a stale panel would
         # otherwise re-accept rows that are already accepted: the keyword now
@@ -16630,6 +16668,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # instead of restoring the winner's accepted state.
         already_decided = _decided_prediction_ids(db, pred_ids)
         pred_ids = [pid for pid in pred_ids if pid not in already_decided]
+
+        # Drop rows whose label set the catalog has moved past. Re-classifying
+        # a detection after Browse rendered the panel leaves the old row
+        # ``pending`` — nothing rewrites it — while every read path, including
+        # the panel that produced this payload, has already switched to the
+        # newest ``labels_fingerprint``. Accepting the old row would tag the
+        # photo from a label set nothing displays and mark accepted a row the
+        # user can no longer see, while the current prediction stayed pending.
+        #
+        # Before the ambiguity check so the two counts stay disjoint: a
+        # superseded row is reported as superseded, not as a conflict the user
+        # would go to Review to resolve and never find.
+        superseded_ids = _superseded_prediction_ids(db, pred_ids)
+        pred_ids = [pid for pid in pred_ids if pid not in superseded_ids]
 
         # Re-derive ambiguity instead of trusting the payload. The decided
         # filter above only catches rows whose *status* moved; a row can stay
@@ -16680,56 +16732,54 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         items = []
         keyword_id = None
         species = None
-        try:
-            for pid in pred_ids:
-                if pid in handled:
-                    continue
-                result = db.accept_prediction(
-                    pid,
-                    prediction_ids=submitted_pred_ids,
-                    _commit=False,
+        for pid in pred_ids:
+            if pid in handled:
+                continue
+            result = db.accept_prediction(
+                pid,
+                prediction_ids=submitted_pred_ids,
+                _commit=False,
+            )
+            handled.add(pid)
+            if result is None:
+                continue
+            accepted_now = result.get("accepted_prediction_ids", ())
+            handled.update(accepted_now)
+            if not accepted_now:
+                # A no-op accept (nothing in this row's scope) changed
+                # nothing, so it carries no species to reconcile against
+                # the batch's — and its ``keyword_id`` may be None because
+                # no keyword was created. Folding it into the check below
+                # would 400 a perfectly uniform batch.
+                continue
+            # One edit row carries one ``new_value`` keyword id, which the
+            # undo handler applies to every item. Accepting a mixed bag of
+            # species through one call would therefore undo incorrectly —
+            # refuse rather than record an entry that cannot be reversed.
+            if keyword_id is None:
+                keyword_id, species = result["keyword_id"], result["species"]
+            elif result["keyword_id"] != keyword_id:
+                db.conn.rollback()
+                return json_error(
+                    "prediction_ids must all resolve to one species", 400,
                 )
-                handled.add(pid)
-                if result is None:
-                    continue
-                accepted_now = result.get("accepted_prediction_ids", ())
-                handled.update(accepted_now)
-                if not accepted_now:
-                    # A no-op accept (nothing in this row's scope) changed
-                    # nothing, so it carries no species to reconcile against
-                    # the batch's — and its ``keyword_id`` may be None because
-                    # no keyword was created. Folding it into the check below
-                    # would 400 a perfectly uniform batch.
-                    continue
-                # One edit row carries one ``new_value`` keyword id, which the
-                # undo handler applies to every item. Accepting a mixed bag of
-                # species through one call would therefore undo incorrectly —
-                # refuse rather than record an entry that cannot be reversed.
-                if keyword_id is None:
-                    keyword_id, species = result["keyword_id"], result["species"]
-                elif result["keyword_id"] != keyword_id:
-                    db.conn.rollback()
-                    return json_error(
-                        "prediction_ids must all resolve to one species", 400,
-                    )
-                for a in result["affected"]:
-                    if a.get("changed_tag", True):
-                        old_value = str(a["prediction_id"])
-                    else:
-                        old_value = json.dumps({
-                            "prediction_id": a["prediction_id"],
-                            "no_tag": True,
-                        })
-                    items.append({
-                        "photo_id": a["photo_id"],
-                        "old_value": old_value,
-                        "new_value": str(keyword_id),
+            for a in result["affected"]:
+                if a.get("changed_tag", True):
+                    old_value = str(a["prediction_id"])
+                else:
+                    old_value = json.dumps({
+                        "prediction_id": a["prediction_id"],
+                        "no_tag": True,
                     })
-            db.conn.commit()
-        except Exception:
-            db.conn.rollback()
-            raise
+                items.append({
+                    "photo_id": a["photo_id"],
+                    "old_value": old_value,
+                    "new_value": str(keyword_id),
+                })
 
+        # History joins the same transaction rather than committing after it:
+        # the accepted statuses and the entry that undoes them become visible
+        # together, so no reader can see accepted rows with no way back.
         if items:
             photo_count = len({item["photo_id"] for item in items})
             desc = f'Accepted prediction: added "{species}"'
@@ -16737,8 +16787,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 desc += f" to {photo_count} photos"
             db.record_edit(
                 "prediction_accept", desc, str(keyword_id), items,
-                is_batch=photo_count > 1,
+                is_batch=photo_count > 1, _commit=False,
             )
+        db.conn.commit()
+        if items:
+            # ``record_edit`` skips its prune under ``_commit=False``; run it
+            # once the decision is durable so history stays bounded.
+            db._prune_edit_history()
         return jsonify({
             "ok": True,
             "accepted": len({item["photo_id"] for item in items}),
@@ -16758,6 +16813,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # Review. Browse turns this into a toast rather than letting the
             # count vanish between "Accept on 35" and 33 accepts.
             "skipped_ambiguous": len(ambiguous_ids),
+            # Rows still pending, but from a label set a later classification
+            # run replaced. Its own count for the same reason: the user's next
+            # step is neither "nothing" nor "Review" — the refreshed panel
+            # simply shows the current prediction in this row's place, and a
+            # count folded into ``skipped_ambiguous`` would send them hunting
+            # for a keyword conflict that does not exist.
+            "skipped_superseded": len(superseded_ids),
             "species": species,
         })
 
@@ -16767,9 +16829,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         Selected by id rather than through ``get_predictions(photo_ids=...)``
         so a submitted row is judged on its own merits: the photo-scoped query
         also returns siblings the caller never submitted, and filters to the
-        latest ``labels_fingerprint``, which would silently drop a submitted
-        row from the check instead of judging it. Workspace scoping is already
-        settled by ``_parse_prediction_ids``, which runs first.
+        latest ``labels_fingerprint`` — which would silently drop a superseded
+        row from the ambiguity check and leave the caller unable to tell "not
+        ambiguous" from "not current". Staleness is judged explicitly instead,
+        by ``_superseded_prediction_ids``, and reported under its own name.
+        Workspace scoping is already settled by ``_parse_prediction_ids``,
+        which runs first.
 
         Chunked for the same reason every other id query here is — a legal
         payload runs past the 999-variable limit older SQLite builds enforce.
@@ -16836,6 +16901,104 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
             )
         return found
+
+    def _superseded_prediction_ids(db, pred_ids):
+        """Which of ``pred_ids`` belong to a label set the catalog moved past.
+
+        The third precondition both batch endpoints share, alongside
+        ``_decided_prediction_ids`` and ``_ambiguous_prediction_ids``, and the
+        same *shape* as those two: a payload that was truthful when the panel
+        rendered it and is not truthful any more. Re-classify a detection
+        against a new label set between render and click and the old row stays
+        ``pending`` — nothing rewrites it — while ``get_predictions`` (and so
+        every panel, Review grid and summary) has already moved to the newest
+        ``labels_fingerprint`` for that ``(detection, classifier_model)``.
+        Accepting the old row would tag the photo with a species from a label
+        set the catalog no longer shows, and mark a row accepted that no
+        surface displays; rejecting it would report a dismissal while the
+        current row stays pending in the panel the user is looking at.
+
+        A peer helper rather than a branch inside ``_ambiguous_prediction_ids``
+        because the two verdicts are not the same fact and do not lead the user
+        to the same place: an ambiguous row needs a decision in Review, a
+        superseded row needs nothing at all — the panel refresh simply shows
+        the current row in its place. Folding it in would put superseded rows
+        under a ``skipped_ambiguous`` count that names a conflict the user
+        would go looking for and never find, which is the sort of quiet
+        mis-description ``CORE_PHILOSOPHY.md`` rules out. What *is* shared is
+        that the rule has one implementation for both endpoints, so accept and
+        reject cannot drift on what "current" means.
+
+        The latest-fingerprint expression is the one ``get_predictions``,
+        ``/api/species/summary`` and ``get_top_prediction_for_photo`` all use:
+        newest ``created_at``, ties broken by ``id``.
+
+        Chunked for the same reason every other id query here is (see
+        ``_SQL_PARAM_CHUNK``).
+        """
+        if not pred_ids:
+            return set()
+        found = set()
+        for chunk in _chunked(pred_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            found.update(
+                row["id"] for row in db.conn.execute(
+                    f"""SELECT pr.id FROM predictions pr
+                        WHERE pr.id IN ({placeholders})
+                          AND pr.labels_fingerprint != (
+                              SELECT pr2.labels_fingerprint FROM predictions pr2
+                              WHERE pr2.detection_id = pr.detection_id
+                                AND pr2.classifier_model = pr.classifier_model
+                              ORDER BY pr2.created_at DESC, pr2.id DESC
+                              LIMIT 1)""",
+                    chunk,
+                )
+            )
+        return found
+
+    def _begin_prediction_decision(db):
+        """Hold SQLite's write lock across a decision's checks *and* its writes.
+
+        Both batch endpoints are check-then-write: they read each row's
+        status, ambiguity and label set, then write the rows that pass. Read
+        and write have to be one indivisible step, or the preconditions only
+        *narrow* the race they claim to close — two overlapping requests (a
+        double-clicked Accept, or an Accept and a Reject fired before the panel
+        reloads) can both finish their reads while the row is still pending and
+        then both write. Waitress serves these routes on 16 threads, and
+        ``_get_db`` hands each request its own connection, so "overlapping" is
+        a real interleaving and not a thought experiment.
+
+        ``BEGIN IMMEDIATE`` takes the database's single writer lock up front,
+        before the first read. That is what makes the whole sequence atomic:
+        SQLite's WAL mode allows one writer at a time, so a second decision
+        request blocks here until the first commits and then re-reads the state
+        the first one left. The alternative — a conditional
+        ``UPDATE ... WHERE status = 'pending'`` — would only guard the status
+        column, leaving ambiguity (a function of the photo's keywords) and the
+        keyword/history writes outside the guarantee, and would need a second
+        code path for the sibling and group writes that hang off the same
+        decision. Python's ``sqlite3`` would otherwise open its implicit
+        transaction at the *first write*, which is exactly too late.
+
+        Returns ``None`` on success, or an error response when the lock cannot
+        be taken within the connection's ``busy_timeout``. Reporting that
+        plainly beats a silent non-atomic fallback: the caller can retry, and
+        nothing has been written.
+        """
+        if db.conn.in_transaction:
+            # A previous statement in this request may have opened sqlite3's
+            # implicit transaction; BEGIN cannot nest.
+            db.conn.commit()
+        try:
+            db.conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            return json_error(
+                "another prediction decision is in progress; nothing was "
+                "changed — try again",
+                503,
+            )
+        return None
 
     def _parse_prediction_ids(db, body):
         """Validate a batch payload's ``prediction_ids``.
@@ -16909,6 +17072,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         A photo with several detections carries one prediction row per
         detection, so Browse groups them into one species row. Dismissing that
         row must be one Cmd-Z, not one per detection.
+
+        Contract, and the transaction that backs it, are ``batch-accept``'s:
+        the preconditions and the writes share one ``BEGIN IMMEDIATE``
+        transaction, so an Accept and a Reject fired before the panel reloads
+        are serialized instead of interleaved. Rows already decided, or from a
+        superseded label set, are skipped and counted back.
         """
         db = _get_db()
         body = request.get_json(silent=True) or {}
@@ -16916,6 +17085,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if err is not None:
             return err
 
+        lock_err = _begin_prediction_decision(db)
+        if lock_err is not None:
+            return lock_err
+        try:
+            return _batch_reject_under_lock(db, pred_ids)
+        except Exception:
+            db.conn.rollback()
+            raise
+
+    def _batch_reject_under_lock(db, pred_ids):
+        """The checks and writes of ``batch-reject``, inside its transaction."""
         # The same filter ``batch-accept`` applies, through the same helper —
         # not a parallel copy that can be tightened on one side only. Without
         # it, a stale panel — or an Accept then Reject before the panel
@@ -16928,49 +17108,56 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         already_decided = _decided_prediction_ids(db, pred_ids)
         pred_ids = [pid for pid in pred_ids if pid not in already_decided]
 
+        # Superseded rows are skipped on this side too, through the same
+        # helper. A reject writes no keyword, so the damage is smaller than a
+        # stale accept's — but it is the same misreport: the user dismisses a
+        # species, the row that vanished from every panel is the one marked
+        # ``rejected``, and the current prediction the panel *does* show stays
+        # pending. One rule, one implementation, both endpoints — the lesson
+        # the status precondition already taught here.
+        superseded_ids = _superseded_prediction_ids(db, pred_ids)
+        pred_ids = [pid for pid in pred_ids if pid not in superseded_ids]
+
         ws = db._ws_id()
         items = []
         species = None
-        try:
-            for pid in pred_ids:
-                pred = db.conn.execute(
-                    """SELECT pr.id, pr.species, pr.detection_id,
-                              pr.classifier_model AS model,
-                              pr.labels_fingerprint, d.photo_id
-                       FROM predictions pr
-                       JOIN detections d ON d.id = pr.detection_id
-                       WHERE pr.id = ?""",
-                    (pid,),
-                ).fetchone()
-                if pred is None:
-                    continue
-                species = species or pred["species"]
-                db.update_prediction_status(pid, "rejected", _commit=False)
-                # Sibling alternatives go down with the parent, scoped by
-                # fingerprint so a new label set can't rewrite an old one's
-                # review state — same rule as the single-prediction reject.
-                for row in db.conn.execute(
-                    """SELECT pr.id FROM predictions pr
-                       JOIN prediction_review pr_rev
-                         ON pr_rev.prediction_id = pr.id
-                        AND pr_rev.workspace_id = ?
-                       WHERE pr.detection_id = ? AND pr.classifier_model = ?
-                         AND pr.labels_fingerprint = ? AND pr.id != ?
-                         AND pr_rev.status = 'alternative'""",
-                    (ws, pred["detection_id"], pred["model"],
-                     pred["labels_fingerprint"], pid),
-                ).fetchall():
-                    db.update_prediction_status(row["id"], "rejected", _commit=False)
-                items.append({
-                    "photo_id": pred["photo_id"],
-                    "old_value": "pending",
-                    "new_value": "rejected",
-                })
-            db.conn.commit()
-        except Exception:
-            db.conn.rollback()
-            raise
+        for pid in pred_ids:
+            pred = db.conn.execute(
+                """SELECT pr.id, pr.species, pr.detection_id,
+                          pr.classifier_model AS model,
+                          pr.labels_fingerprint, d.photo_id
+                   FROM predictions pr
+                   JOIN detections d ON d.id = pr.detection_id
+                   WHERE pr.id = ?""",
+                (pid,),
+            ).fetchone()
+            if pred is None:
+                continue
+            species = species or pred["species"]
+            db.update_prediction_status(pid, "rejected", _commit=False)
+            # Sibling alternatives go down with the parent, scoped by
+            # fingerprint so a new label set can't rewrite an old one's
+            # review state — same rule as the single-prediction reject.
+            for row in db.conn.execute(
+                """SELECT pr.id FROM predictions pr
+                   JOIN prediction_review pr_rev
+                     ON pr_rev.prediction_id = pr.id
+                    AND pr_rev.workspace_id = ?
+                   WHERE pr.detection_id = ? AND pr.classifier_model = ?
+                     AND pr.labels_fingerprint = ? AND pr.id != ?
+                     AND pr_rev.status = 'alternative'""",
+                (ws, pred["detection_id"], pred["model"],
+                 pred["labels_fingerprint"], pid),
+            ).fetchall():
+                db.update_prediction_status(row["id"], "rejected", _commit=False)
+            items.append({
+                "photo_id": pred["photo_id"],
+                "old_value": "pending",
+                "new_value": "rejected",
+            })
 
+        # In the same transaction as the statuses it records, for the reason
+        # ``batch-accept`` gives.
         if items:
             photo_count = len({item["photo_id"] for item in items})
             desc = f'Rejected prediction "{species}"'
@@ -16978,8 +17165,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 desc += f" on {photo_count} photos"
             db.record_edit(
                 "prediction_reject", desc, "rejected", items,
-                is_batch=photo_count > 1,
+                is_batch=photo_count > 1, _commit=False,
             )
+        db.conn.commit()
+        if items:
+            db._prune_edit_history()
         return jsonify({
             "ok": True,
             "rejected": len(items),
@@ -16987,6 +17177,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # name batch-accept uses: a caller that resubmits should be able
             # to tell "nothing to do, already decided" from "nothing matched".
             "already_decided": len(already_decided),
+            # Same name and meaning as on the accept side: rows a later
+            # classification run replaced.
+            "skipped_superseded": len(superseded_ids),
         })
 
     @app.route("/api/predictions/<int:pred_id>/accept", methods=["POST"])

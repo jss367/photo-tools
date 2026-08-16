@@ -423,11 +423,57 @@ describe different sets. This is the lesson the status precondition and the
 accept scope each taught earlier: a rule with two implementations is a rule
 that drifts.
 
+**Superseded label sets.** The third precondition, and the same shape as the
+first two: a payload that was truthful when it rendered and is not any more.
+Re-classifying a detection against a new label set leaves the old prediction
+row `pending` — nothing rewrites it — while `get_predictions`, and so every
+panel, Review grid and summary, has already switched to the newest
+`labels_fingerprint` for that `(detection, classifier_model)`. Accepting the
+old row would tag the photo from a label set nothing displays and mark
+accepted a row the user can no longer see; rejecting it would report a
+dismissal while the current prediction stays pending in the panel in front of
+them.
+
+`_superseded_prediction_ids(db, pred_ids)` is a peer of
+`_decided_prediction_ids`, used by both endpoints — one rule, one
+implementation — but deliberately *not* a branch inside
+`_ambiguous_prediction_ids`. The two verdicts are different facts leading to
+different next steps: an ambiguous row needs a decision in Review, a
+superseded row needs nothing at all, since the panel refresh puts the current
+row in its place. Counting it under `skipped_ambiguous` would send the user
+hunting for a keyword conflict that does not exist. It is checked *before*
+ambiguity so the two counts stay disjoint.
+
+**Atomicity.** A precondition that is not atomic with the write it guards only
+narrows the race. Both batch endpoints therefore open one `BEGIN IMMEDIATE`
+transaction (`_begin_prediction_decision`) *before* the first precondition read
+and commit once, after the writes and the history entry. SQLite's WAL mode
+allows a single writer, so a second overlapping decision — a double-clicked
+Accept, or an Accept and a Reject fired before the panel reloads — blocks at
+`BEGIN IMMEDIATE` and then reads the state the first one committed, instead of
+acting on state it read before the first one wrote. Python's `sqlite3` would
+otherwise open its implicit transaction at the first *write*, leaving every
+check outside it.
+
+A conditional `UPDATE ... WHERE status = 'pending'` was the alternative. It was
+rejected because it guards only the status column: ambiguity is a function of
+the photo's keywords, and the keyword, sibling, group and history writes hang
+off the same decision — the invariant would hold for one column and need a
+second code path for the rest. When the lock cannot be taken inside the
+connection's 30 s `busy_timeout`, the endpoint returns 503 with nothing
+written, rather than falling back to a non-atomic path.
+
+`_parse_prediction_ids` stays outside the transaction on purpose: it validates
+payload shape and workspace ownership, which is not the state these
+preconditions race against, and it can walk a 1,000-photo selection.
+
 **The endpoint's contract.** Every row `batch-accept` accepts is one that is
-still undecided AND still unambiguous *at the moment of the write*, judged
-against the database rather than against whatever the caller's panel
-believed. Rows failing either precondition are skipped — never accepted —
-and counted back as `already_decided` and `skipped_ambiguous`. A stale
+still undecided, still unambiguous, AND still from the current label set *at
+the moment of the write* — literally that moment, since the checks and the
+write share one transaction. All three are judged against the database rather
+than against whatever the caller's panel believed. Rows failing any of them are
+skipped — never accepted — and counted back as `already_decided`,
+`skipped_superseded` and `skipped_ambiguous`. A stale
 payload can accept *less* than the caller asked for, never something the
 caller was not shown as acceptable. Skipping beats a 400: the rest of the
 batch is still exactly what the user asked for, and failing the whole call
@@ -436,10 +482,12 @@ would strand 34 honest accepts on one row that moved.
 Two consequences at the caller:
 
 - Browse names the gap. `_reportSkippedAccepts` turns a non-zero
-  `already_decided` / `skipped_ambiguous` into a toast, because the distance
+  `already_decided` / `skipped_ambiguous` / `skipped_superseded` into a toast,
+  because the distance
   between "Accept on 35" and 33 accepts has to be spoken, not left for the
-  user to spot. The two counts stay separate because the next step differs —
-  a decided row needs nothing, an ambiguous one needs Review.
+  user to spot. The counts stay separate because the next step differs —
+  a decided row needs nothing, an ambiguous one needs Review, a superseded one
+  is simply replaced by the refresh.
 - The undo toast is gated on `accepted`. A payload whose rows have all been
   decided or turned ambiguous returns `accepted: 0` and records no undoable
   edit, so an unconditional toast would advertise — and Ctrl+Z would
@@ -472,6 +520,20 @@ is where the group-expansion behaviour is now covered.
 - `test_batch_accept_skips_ambiguous_rows_with_alternatives` — the
   alternative-sibling half of the same rule, and the no-op leaves nothing on
   the undo stack.
+- `test_batch_accept_skips_superseded_label_set_rows` /
+  `test_batch_reject_skips_superseded_label_set_rows` — a payload rendered
+  before a re-classification: the old row is skipped and counted as
+  `skipped_superseded` (not as ambiguous), stays pending and untagged, and the
+  current row is still offered by the panel afterwards.
+- `test_batch_accept_checks_and_writes_are_one_transaction` — the overlap
+  itself, in-process and deterministically. A competing connection tries to
+  record a decision on the row being accepted at the exact instant between the
+  endpoint's checks and its first write, hooked through
+  `Database.accept_prediction`, with a 0.5 s `busy_timeout`. It either commits
+  (the bug) or is refused because the endpoint holds the writer lock (the
+  guarantee); the hook blocks the request until the competing writer has its
+  answer, so nothing depends on thread-scheduling luck. Verified to fail
+  against a build with the `BEGIN IMMEDIATE` removed.
 - The panels' invalidation lives in `_refreshBrowseKeywordState` (before its
   early returns) and in a `vireo:edit-history-changed` listener, so the
   coverage is structural rather than per-call-site.

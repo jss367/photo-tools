@@ -38,6 +38,13 @@ def _shared_environment(tmp_path):
 def test_shared_folder_uses_one_local_copy_in_every_workspace(tmp_path):
     db, vireo_dir, source, first, second, folder_id = _shared_environment(tmp_path)
     try:
+        remote_status = workspace_status(db, first, str(vireo_dir))
+        assert remote_status["folders"][0]["workspace_ids"] == [first, second]
+        assert remote_status["linked_workspaces"] == [
+            {"id": first, "name": "First"},
+            {"id": second, "name": "Second"},
+        ]
+
         result = stage_folder(db, folder_id, str(vireo_dir))
 
         first_status = workspace_status(db, first, str(vireo_dir))
@@ -46,6 +53,10 @@ def test_shared_folder_uses_one_local_copy_in_every_workspace(tmp_path):
         assert second_status["state"] == "active"
         assert first_status["folders"][0]["local_path"] == second_status["folders"][0]["local_path"]
         assert first_status["folders"][0]["workspace_ids"] == [first, second]
+        assert first_status["linked_workspaces"] == [
+            {"id": first, "name": "First"},
+            {"id": second, "name": "Second"},
+        ]
         assert result["local_path"].startswith(str(vireo_dir / "local-folders"))
 
         local_root = Path(db.get_folder(folder_id)["path"])

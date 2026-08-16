@@ -615,6 +615,32 @@ def test_folder_tree_synthesizes_recovery_when_initial_tree_is_empty(
     expect(phantom_row.locator(".count")).to_have_text("23")
 
 
+def test_folder_health_change_refreshes_local_folder_status(live_server, page):
+    """Health transitions refresh ancestry-sensitive local status directly."""
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".tree-item[data-folder-id]").first.wait_for(state="visible")
+    page.wait_for_function("() => !!window.vireoLocalFolders")
+
+    page.evaluate(
+        """() => {
+          window.__localFolderStatusLoads = 0;
+          const original = window.vireoLocalFolders.load;
+          window.vireoLocalFolders.load = function() {
+            window.__localFolderStatusLoads += 1;
+            return original.apply(this, arguments);
+          };
+          document.dispatchEvent(new CustomEvent(
+            'vireo:folder-health-changed',
+            {detail: {source: 'local-status-refresh-test'}}
+          ));
+        }"""
+    )
+
+    page.wait_for_function(
+        "() => window.__localFolderStatusLoads > 0", timeout=5000
+    )
+
+
 def test_folder_tree_filter_by_folder_fires_filter(live_server, page):
     """Clicking 'Filter by this folder' sets activeFolderId to that folder."""
     url = live_server["url"]

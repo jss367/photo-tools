@@ -4183,6 +4183,16 @@ async function refreshBrowseAfterFolderHealthChange(detail) {
     }, 2000 * Math.pow(2, retryAttempt));
     return;
   }
+  // Folder health can change which visible ancestor represents a hidden
+  // local session. Refresh the authoritative local-folder payload after the
+  // fresh tree has rendered so recovery badges move to the correct ancestor
+  // (or synthesize a top-level row) immediately. Encoding folder health in
+  // the 15-second blocker fingerprint either misses non-mapped ancestors or
+  // makes that lightweight polling payload grow with catalog size.
+  if (window.vireoLocalFolders &&
+      typeof window.vireoLocalFolders.load === 'function') {
+    window.vireoLocalFolders.load();
+  }
   // Use the health-owned response rather than the DOM. A later unrelated
   // loadFolders() call may supersede this render while still being in flight;
   // in that window the DOM is intentionally old even though this response

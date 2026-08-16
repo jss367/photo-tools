@@ -320,10 +320,52 @@ prediction rows plus the membership-dependent surfaces:
   advertise some *earlier* edit as reversible and Cmd-Z would silently undo
   that unrelated action instead of the rejection.
 
-**Repeat accepts.** `/api/predictions/batch-accept` skips prediction ids
-already marked accepted and reports them as `already_accepted`. A
-double-clicked button would otherwise record a status-only edit whose
-"previous" status is a fiction, and undoing it would knock a
+**Panel freshness is not a per-call-site concern.** Everything the panels
+display is derived state: a row's `effective_category` (ambiguous or not) and
+a selection row's `keyworded_count` / `missing_photo_ids` are recomputed by
+the server from the photos' *current* species keywords and review status. So
+the panels go stale on far more than accept/reject — any keyword add, remove
+or retype, and any undo/redo, invalidates them. An "Accept on 38" left over
+from before the user keyworded 10 of those photos states a falsehood, which
+`CORE_PHILOSOPHY.md`'s "no black boxes" forbids.
+
+Adding a reload to each new mutation site is how this drifted; instead one
+`refreshPredictionPanels(opts)` hangs off the chokepoints every mutation
+already passes through:
+
+| Chokepoint | Covers |
+| --- | --- |
+| `_refreshBrowseKeywordState(ids, opts)` | every keyword write in Browse — `addKeyword`, `removeKeyword`, `applySelectionKeyword`, `removeSelectionKeyword`, the batch keyword modal, `setKeywordType` — because each must refetch card badges anyway |
+| `document` event `vireo:edit-history-changed` | undo and redo, which the navbar performs |
+| `_afterPredictionMutation` / `rejectDetailPredictions` | prediction status writes |
+
+A future keyword mutation path therefore gets panel freshness for free.
+`opts.skipDetail` is for callers about to run a full `loadDetail` (which
+re-fetches the photo *and* its predictions), so one accept does not issue two
+identical prediction requests.
+
+**The Review deep link.** "Open in Review" navigates to
+`/review?photo_id=N&filters=<empty expression>`. The explicit empty handoff is
+load-bearing: `VireoFilter.init()` restores the last persisted Review
+expression whenever the URL carries no `filters` param, so a filter the user
+left active there could exclude the very row Browse withheld — an empty queue
+under a pill reading "Showing one photo from Browse". The payload has to be
+well-formed (`{"root":{"mode":"all","rules":[]},"visual":null}`), not a bare
+`?filters=`, which `init()` treats as a corrupt handoff and throws on.
+
+**Repeat and contradictory decisions.** Both batch endpoints share
+`_prediction_ids_with_status(db, pred_ids, statuses)` and skip rows whose
+decision is already made:
+
+- `batch-accept` skips `accepted` ids and reports `already_accepted`.
+- `batch-reject` skips `accepted` *and* `rejected` ids and reports
+  `already_decided`. Overwriting an `accepted` row would leave the species
+  keyword the accept added attached to a prediction now marked `rejected`.
+  `alternative` rows stay actionable — they are the runners-up a reject
+  sweeps up.
+
+Without this, a double-clicked button or a stale panel records a status-only
+edit whose "previous" status is a fiction, and undoing it would knock a
 long-accepted prediction back to pending.
 
 ## Testing
@@ -337,6 +379,12 @@ long-accepted prediction back to pending.
   and already keyworded on others.
 - Batch accept flips `prediction_review.status`, not just the keyword.
 - Batch accept records a single undo entry.
+- Batch reject skips already-accepted and already-rejected rows, leaving the
+  accept's keyword and status intact and writing no history entry.
+- The panels' invalidation lives in `_refreshBrowseKeywordState` (before its
+  early returns) and in a `vireo:edit-history-changed` listener, so the
+  coverage is structural rather than per-call-site.
+- "Open in Review" sends an explicit empty `filters` handoff.
 
 Plus a Playwright pass driving the real panel — selecting photos, accepting,
 confirming the Review queue drains.

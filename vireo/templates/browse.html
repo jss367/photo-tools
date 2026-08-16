@@ -6488,28 +6488,95 @@ function renderDetailPredictions(data, photoId) {
 }
 
 function openPredictionInReview(photoId) {
-  window.location.href = '/review?photo_id=' + encodeURIComponent(photoId);
+  // Hand off an EXPLICIT empty filter expression, not just ?photo_id=.
+  // VireoFilter.init() falls through to restorePersisted() whenever the URL
+  // carries no `filters` param, so a filter the user left active on Review
+  // last visit (say "rating >= 3") would silently intersect with this deep
+  // link. If it excludes the photo, Review renders an empty queue under a
+  // pill reading "Showing one photo from Browse" — the pill would be
+  // describing a scope that is not the one in effect. Sending `filters`
+  // makes the deep link's scope exactly what the pill claims: this photo.
+  // A well-formed empty payload (rather than `?filters=`) matters:
+  // init() throws on a present-but-unparseable handoff.
+  var noFilters = encodeURIComponent(JSON.stringify({
+    root: { mode: 'all', rules: [] }, visual: null,
+  }));
+  window.location.href = '/review?photo_id=' + encodeURIComponent(photoId) +
+    '&filters=' + noFilters;
 }
+
+// Everything the prediction panels display is DERIVED state: a row's
+// `effective_category` (ambiguous or not) and a selection row's
+// `keyworded_count` / `missing_photo_ids` are all recomputed by the server
+// from the photos' CURRENT species keywords and prediction_review status. So
+// the panels go stale on far more than accept/reject — any keyword add,
+// remove or retype, and any undo/redo, invalidates them too. An "Accept on 38"
+// button left over from before the user keyworded 10 of those photos states a
+// falsehood, which CORE_PHILOSOPHY.md's "no black boxes" forbids outright.
+//
+// Rather than bolt a reload onto each mutation site (which is how this drifted
+// in the first place), panel freshness hangs off the chokepoints every
+// mutation already passes through:
+//   * `_refreshBrowseKeywordState` — every keyword write in Browse calls it,
+//     because card badges have to be refetched anyway;
+//   * the `vireo:edit-history-changed` document event — undo and redo;
+//   * `_afterPredictionMutation` / `rejectDetailPredictions` — status writes.
+// A future keyword mutation path therefore gets panel freshness for free.
+//
+// `opts.skipDetail` is for callers about to run a full `loadDetail`, which
+// re-fetches the photo AND its predictions: without it one accept would issue
+// two identical prediction requests.
+function refreshPredictionPanels(opts) {
+  opts = opts || {};
+  // Drop the cache key first: `loadSelectionPredictions` early-returns when
+  // the key matches, and the selection itself has not changed here — only the
+  // state its rows are computed from.
+  selectionPredictionKey = '';
+  var selection = getActiveSelection();
+  if (selection.length > 1) loadSelectionPredictions(selection);
+  // Only one of the two panels is on screen at a time: a multi-selection
+  // replaces the single-photo detail with the batch inspector. Guarding on
+  // the selection as well as the pointer keeps a stale `_detailPhotoId` from
+  // repainting the departed anchor's rows underneath a batch selection.
+  else if (!opts.skipDetail && window._detailPhotoId != null) {
+    loadDetailPredictions(window._detailPhotoId);
+  }
+}
+
+// Undo/redo lives in the shared navbar and writes straight to the database:
+// undoing a `prediction_accept` returns the row to pending and strips the
+// keyword it added. Without this listener Browse keeps rendering the accepted
+// state — a status tag, no Accept button — until the photo is reselected,
+// even though the toast that offered the undo was Browse's own. Review has
+// listened for this event since it shipped.
+document.addEventListener('vireo:edit-history-changed', function() {
+  // Card badges move with the same edits, so refresh the loaded grid rows
+  // too; that call fans out to refreshPredictionPanels itself.
+  var loadedIds = photos.map(function(photo) { return photo.id; });
+  if (loadedIds.length) _refreshBrowseKeywordState(loadedIds);
+  else refreshPredictionPanels();
+});
 
 // Accepting writes a keyword, so every surface that counts keywords has to be
 // told — the same fan-out applySelectionKeyword performs. refreshPendingSyncBanner
 // matters especially: an accept queues a pending XMP change.
 async function _afterPredictionMutation(photoIds, opts) {
   opts = opts || {};
-  await _refreshBrowseKeywordState(photoIds);
+  var reloadingDetail = !!(
+    opts.reloadDetail
+    && opts.photoId != null
+    && window._detailPhotoId === opts.photoId
+  );
   selectionKeywordKey = '';
-  selectionPredictionKey = '';
+  // Refreshes the grid's keyword state AND, through it, both prediction
+  // panels: the accept changed the photos' species keywords, so the surviving
+  // rows' ambiguity and keyworded counts have both moved. `skipDetail` keeps
+  // one accept from issuing two identical prediction requests, since
+  // `loadDetail` below re-fetches the photo AND its predictions.
+  await _refreshBrowseKeywordState(photoIds, { skipDetail: reloadingDetail });
   var selection = getActiveSelection();
-  if (selection.length > 1) {
-    loadSelectionKeywordSuggestions(selection);
-    loadSelectionPredictions(selection);
-  }
-  if (opts.photoId != null && window._detailPhotoId === opts.photoId) {
-    // loadDetail re-fetches the photo AND its predictions, so asking for both
-    // would double the requests for one accept.
-    if (opts.reloadDetail) loadDetail(opts.photoId);
-    else loadDetailPredictions(opts.photoId);
-  }
+  if (selection.length > 1) loadSelectionKeywordSuggestions(selection);
+  if (reloadingDetail) loadDetail(opts.photoId);
   loadKeywords();
   scheduleCollectionCountsRefresh();
   refreshActiveCollectionAfterMembershipChange();
@@ -6543,10 +6610,7 @@ async function rejectDetailPredictions(predictionIds, photoId) {
   // _NON_UNDOABLE set (no _apply_undo handler), so /api/undo/status would
   // advertise some earlier edit as reversible and Ctrl+Z would undo THAT
   // instead of the reject — silently reversing an unrelated action.
-  if (window._detailPhotoId === photoId) loadDetailPredictions(photoId);
-  selectionPredictionKey = '';
-  var selection = getActiveSelection();
-  if (selection.length > 1) loadSelectionPredictions(selection);
+  refreshPredictionPanels();
   // A rejection can change membership in prediction-status collections
   // (e.g. "pending predictions"): refresh counts and re-evaluate the
   // active collection so the grid and counts don't lag behind the DB.
@@ -6904,7 +6968,13 @@ function _keywordNameFromCache(keywordId) {
 // badges render from the separate `photos` cache populated by /api/photos.
 // Refresh the loaded rows from the authoritative batch endpoint after every
 // keyword mutation so taxonomy badges and representative state cannot drift.
-async function _refreshBrowseKeywordState(photoIds) {
+async function _refreshBrowseKeywordState(photoIds, opts) {
+  // Species keywords are exactly the input the prediction panels' ambiguity
+  // and "N missing" counts are computed from, so repaint them here rather
+  // than at each keyword call site — see refreshPredictionPanels. Done first,
+  // and before the early returns below, so it still runs when the mutated
+  // photos are outside the loaded grid page.
+  refreshPredictionPanels(opts);
   if (!Array.isArray(photoIds) || !photoIds.length) return;
   var loadedIds = new Set(photos.map(function(photo) { return photo.id; }));
   var ids = Array.from(new Set(photoIds)).filter(function(id) {
@@ -8239,7 +8309,11 @@ async function addKeyword(keyword) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    await _refreshBrowseKeywordState(ids);
+    // skipDetail when the single-photo branch below runs a full loadDetail,
+    // which re-fetches this photo's predictions anyway.
+    await _refreshBrowseKeywordState(ids, {
+      skipDetail: !useBatch && !!selectedPhotoId,
+    });
     input.value = '';
     state.selectedKeyword = null;
     hideKeywordSuggestions('addKeywordInput');
@@ -8271,7 +8345,8 @@ async function removeKeyword(photoId, keywordId) {
     await safeFetch('/api/photos/' + photoId + '/keywords/' + keywordId, {
       method: 'DELETE',
     });
-    await _refreshBrowseKeywordState([photoId]);
+    // loadDetail below re-fetches this photo's predictions.
+    await _refreshBrowseKeywordState([photoId], { skipDetail: true });
     _clearRepresentativeStateAfterKeywordRemoval(
       [photoId],
       _keywordNameFromCache(keywordId),
@@ -8979,7 +9054,13 @@ async function setKeywordType(kwId, newType, el) {
     var dropdown = el.closest('.keyword-type-dropdown');
     if (dropdown) dropdown.classList.remove('open');
     // Refresh detail panel and keyword tree
-    await _refreshBrowseKeywordState(photos.map(function(photo) { return photo.id; }));
+    // Retyping a keyword to/from `species` changes which predictions count as
+    // disagreements, so the prediction panels move too — _refreshBrowseKeyword
+    // State repaints them, except where loadDetail below already will.
+    await _refreshBrowseKeywordState(
+      photos.map(function(photo) { return photo.id; }),
+      { skipDetail: !!selectedPhotoId },
+    );
     if (selectedPhotoId) loadDetail(selectedPhotoId);
     loadKeywords();
   } catch(e) {}

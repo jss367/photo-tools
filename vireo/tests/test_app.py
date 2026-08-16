@@ -18329,3 +18329,162 @@ def test_browse_uses_ascii_case_fold_for_prediction_group_key(app_and_db):
     # ``displaySpecies.toLowerCase()`` at the grouping site.
     assert "asciiCaseFoldKey(displaySpecies)" in html
     assert "displaySpecies.toLowerCase()" not in html
+
+
+def test_batch_reject_skips_already_accepted_predictions(app_and_db):
+    """Accept-then-Reject must not overwrite the accept.
+
+    A double click, a second tab, or a Browse panel that loaded before the
+    accept landed can all submit an ``accepted`` row to ``batch-reject``.
+    Overwriting the status leaves the species keyword the accept added
+    attached to a photo whose prediction now reads ``rejected`` — keyword
+    state and review state contradicting each other with nothing in the UI
+    admitting it. ``batch-accept`` has skipped already-accepted rows since
+    f031e077; this is the missing symmetric guard.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "acc-then-rej.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+
+    accepted = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+    )
+    assert accepted.status_code == 200, accepted.get_data(as_text=True)
+    keywords_after_accept = db.get_photo_keywords(photo_id)
+    assert keywords_after_accept, "accept should have tagged the photo"
+    edits_after_accept = len(db.get_edit_history(limit=50))
+
+    resp = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["rejected"] == 0
+    assert body["already_decided"] == 1
+
+    statuses = [row["status"] for row in db.get_predictions(photo_ids=[photo_id])]
+    assert statuses == ["accepted"], (
+        "the stale reject overwrote a completed accept, orphaning its keyword"
+    )
+    assert db.get_photo_keywords(photo_id) == keywords_after_accept
+    # And nothing was recorded: a no-op must not sit on the undo stack.
+    assert len(db.get_edit_history(limit=50)) == edits_after_accept
+
+
+def test_batch_reject_skips_already_rejected_predictions(app_and_db):
+    """A resubmitted reject is a no-op, not a second history entry.
+
+    The recorded ``old_value`` is a hard-coded ``"pending"``; replaying it
+    for a row that was already ``rejected`` writes a previous status that
+    never existed.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "rej-twice.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+
+    first = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": [pred_id]},
+    )
+    assert first.status_code == 200
+    assert first.get_json()["rejected"] == 1
+    edits_after_first = len(db.get_edit_history(limit=50))
+
+    second = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": [pred_id]},
+    )
+    assert second.status_code == 200
+    body = second.get_json()
+    assert body["rejected"] == 0
+    assert body["already_decided"] == 1
+    assert len(db.get_edit_history(limit=50)) == edits_after_first
+
+
+def _browse_js_function_body(html, signature):
+    """The source text of one inline Browse function, for structure asserts."""
+    start = html.find(signature)
+    assert start != -1, f"{signature} must exist in browse.html"
+    nxt = html.find("\nfunction ", start + 1)
+    nxt_async = html.find("\nasync function ", start + 1)
+    ends = [i for i in (nxt, nxt_async) if i != -1]
+    return html[start: min(ends) if ends else len(html)]
+
+
+def test_browse_prediction_panels_refresh_on_keyword_edits(app_and_db):
+    """Prediction rows are computed from the photos' CURRENT species
+    keywords, so a keyword edit invalidates the panel just as an accept
+    does. ``keyworded_count`` / ``missing_photo_ids`` move underneath the
+    "Accept on N" button, and CORE_PHILOSOPHY.md forbids a button that
+    states a count it will not act on.
+
+    The invalidation hangs off ``_refreshBrowseKeywordState`` — the one
+    function every Browse keyword mutation already calls — rather than
+    being re-added at each call site, so a future keyword path cannot ship
+    with a stale panel.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    assert "function refreshPredictionPanels(" in html
+    body = _browse_js_function_body(
+        html, "async function _refreshBrowseKeywordState(",
+    )
+    assert "refreshPredictionPanels(" in body, (
+        "keyword mutations must invalidate the prediction panels"
+    )
+    # It has to run before the early returns, or a mutation on photos
+    # outside the loaded grid page would silently skip the refresh.
+    refresh_at = body.find("refreshPredictionPanels(")
+    first_return = body.find("return;")
+    assert first_return == -1 or refresh_at < first_return
+
+
+def test_browse_prediction_panels_refresh_on_undo_and_redo(app_and_db):
+    """Undo/redo lives in the navbar and writes straight to the database.
+
+    Undoing a ``prediction_accept`` returns the row to pending and strips
+    the keyword, so Browse's panel — which offered the Undo toast in the
+    first place — must not keep rendering the accepted state.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    listener_at = html.find(
+        "document.addEventListener('vireo:edit-history-changed'"
+    )
+    assert listener_at != -1, "Browse must listen for undo/redo"
+    handler = html[listener_at: listener_at + 700]
+    assert (
+        "refreshPredictionPanels" in handler
+        or "_refreshBrowseKeywordState" in handler
+    )
+
+
+def test_browse_review_deep_link_clears_persisted_filters(app_and_db):
+    """``/review?photo_id=N`` alone is not the scope the pill advertises.
+
+    ``VireoFilter.init()`` restores the last persisted Review expression
+    whenever the URL carries no ``filters`` param, so a filter left active
+    on Review can exclude the very photo Browse just handed over — an empty
+    queue under a pill reading "Showing one photo from Browse".
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    body = _browse_js_function_body(html, "function openPredictionInReview(")
+    assert "filters=" in body, (
+        "the Review deep link must send an explicit empty filter handoff"
+    )
+    # A well-formed empty payload: VireoFilter.init throws on a
+    # present-but-unparseable ``filters`` param.
+    assert "rules: []" in body
+    import urllib.parse
+
+    review_resp = client.get(
+        "/review?photo_id=1&filters="
+        + urllib.parse.quote(
+            json.dumps({"root": {"mode": "all", "rules": []}, "visual": None})
+        )
+    )
+    assert review_resp.status_code == 200

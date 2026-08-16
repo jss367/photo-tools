@@ -16566,22 +16566,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # the second pass records a status-only ``no_tag`` item whose
         # "previous" status is a fiction — undoing it would knock a
         # long-accepted prediction back to pending while keeping the keyword.
-        ws = db._ws_id()
-        # Chunked: a legal payload runs well past the
-        # 999-variable limit older SQLite builds enforce. Every other
-        # IN-clause query in this module goes through ``_chunked`` for the
-        # same reason (see ``_SQL_PARAM_CHUNK``).
-        already_accepted = set()
-        for chunk in _chunked(pred_ids):
-            placeholders = ",".join("?" for _ in chunk)
-            already_accepted.update(
-                row["prediction_id"] for row in db.conn.execute(
-                    f"""SELECT prediction_id FROM prediction_review
-                        WHERE workspace_id = ? AND status = 'accepted'
-                          AND prediction_id IN ({placeholders})""",
-                    (ws, *chunk),
-                )
-            )
+        already_accepted = _prediction_ids_with_status(db, pred_ids, ("accepted",))
         pred_ids = [pid for pid in pred_ids if pid not in already_accepted]
 
         # Confine the whole batch to the rows the caller actually submitted.
@@ -16673,6 +16658,39 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "species": species,
         })
 
+    def _prediction_ids_with_status(db, pred_ids, statuses):
+        """Which of ``pred_ids`` already sit in one of ``statuses``.
+
+        Both batch endpoints need the same precondition: the panel that
+        produced this payload listed the rows as pending, but a decision may
+        have landed since — from a double-clicked button, a second tab, or
+        Review. Accepting or rejecting a row whose decision is already made
+        writes a history item whose recorded "previous" status is a fiction,
+        and in the accept-then-reject case leaves the accepted species keyword
+        attached to a row now marked ``rejected``. One helper so the two
+        endpoints cannot drift apart on what "still actionable" means.
+
+        Chunked: a legal payload runs well past the 999-variable limit older
+        SQLite builds enforce (see ``_SQL_PARAM_CHUNK``).
+        """
+        ws = db._ws_id()
+        statuses = tuple(statuses)
+        if not pred_ids or not statuses:
+            return set()
+        status_ph = ",".join("?" for _ in statuses)
+        found = set()
+        for chunk in _chunked(pred_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            found.update(
+                row["prediction_id"] for row in db.conn.execute(
+                    f"""SELECT prediction_id FROM prediction_review
+                        WHERE workspace_id = ? AND status IN ({status_ph})
+                          AND prediction_id IN ({placeholders})""",
+                    (ws, *statuses, *chunk),
+                )
+            )
+        return found
+
     def _parse_prediction_ids(db, body):
         """Validate a batch payload's ``prediction_ids``.
 
@@ -16752,6 +16770,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if err is not None:
             return err
 
+        # Symmetric with ``batch-accept``'s already-accepted filter. Without
+        # it, a stale panel — or an Accept then Reject before the panel
+        # reloads — overwrites an ``accepted`` row with ``rejected`` while the
+        # species keyword the accept added stays on the photo: keyword state
+        # and review state then contradict each other, and nothing in the UI
+        # points at the contradiction. Rows already ``rejected`` are skipped
+        # for the same reason the accept side skips accepted ones: re-writing
+        # them appends a history item whose ``old_value`` of "pending" never
+        # happened. ``alternative`` rows stay actionable — they are the
+        # runners-up a reject is meant to sweep up.
+        already_decided = _prediction_ids_with_status(
+            db, pred_ids, ("accepted", "rejected"),
+        )
+        pred_ids = [pid for pid in pred_ids if pid not in already_decided]
+
         ws = db._ws_id()
         items = []
         species = None
@@ -16804,7 +16837,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "prediction_reject", desc, "rejected", items,
                 is_batch=photo_count > 1,
             )
-        return jsonify({"ok": True, "rejected": len(items)})
+        return jsonify({
+            "ok": True,
+            "rejected": len(items),
+            # Reported rather than folded into ``rejected``, matching
+            # batch-accept's ``already_accepted``: a caller that resubmits
+            # should be able to tell "nothing to do, already decided" from
+            # "nothing matched".
+            "already_decided": len(already_decided),
+        })
 
     @app.route("/api/predictions/<int:pred_id>/accept", methods=["POST"])
     def api_accept_prediction(pred_id):

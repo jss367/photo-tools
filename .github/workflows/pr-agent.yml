@@ -607,7 +607,7 @@ jobs:
     needs: authorize_approval
     if: needs.authorize_approval.outputs.authorized == 'true'
     concurrency:
-      group: pr-agent-merge-${{ github.event.pull_request.number }}-${{ github.event.review.commit_id }}
+      group: pr-agent-merge-approval-${{ github.event.pull_request.number }}-${{ github.event.review.id }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
@@ -641,9 +641,17 @@ jobs:
           HEAD_SHA: ${{ steps.ready.outputs.head-sha }}
           TITLE: ${{ steps.ready.outputs.title }}
         run: |
-          gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
+          if ! merge_output=$(gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
             --match-head-commit "$HEAD_SHA" \
-            --subject "${TITLE} (#${PR})"
+            --subject "${TITLE} (#${PR})" 2>&1); then
+            state=$(gh pr view "$PR" --repo "$REPO" --json state --jq .state)
+            if [[ "$state" == "MERGED" ]]; then
+              echo "PR #${PR} was merged by another valid authorization."
+              exit 0
+            fi
+            echo "$merge_output"
+            exit 1
+          fi
           echo "Merged PR #${PR} at authorized head ${HEAD_SHA}."
 
   # For repositories where the PR author cannot submit an approving review,
@@ -695,7 +703,7 @@ jobs:
     needs: authorize_merge_command
     if: needs.authorize_merge_command.outputs.authorized == 'true'
     concurrency:
-      group: pr-agent-merge-${{ github.event.issue.number }}-${{ needs.authorize_merge_command.outputs.approved_head }}
+      group: pr-agent-merge-command-${{ github.event.issue.number }}-${{ github.event.comment.id }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
@@ -729,9 +737,17 @@ jobs:
           HEAD_SHA: ${{ steps.ready.outputs.head-sha }}
           TITLE: ${{ steps.ready.outputs.title }}
         run: |
-          gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
+          if ! merge_output=$(gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
             --match-head-commit "$HEAD_SHA" \
-            --subject "${TITLE} (#${PR})"
+            --subject "${TITLE} (#${PR})" 2>&1); then
+            state=$(gh pr view "$PR" --repo "$REPO" --json state --jq .state)
+            if [[ "$state" == "MERGED" ]]; then
+              echo "PR #${PR} was merged by another valid authorization."
+              exit 0
+            fi
+            echo "$merge_output"
+            exit 1
+          fi
           echo "Merged PR #${PR} at authorized head ${HEAD_SHA}."
 
   # If a human authorized the current head while Tests was still running,
@@ -744,7 +760,7 @@ jobs:
       && github.event.workflow_run.event == 'pull_request'
       && github.event.workflow_run.conclusion == 'success'
     concurrency:
-      group: pr-agent-merge-${{ github.event.workflow_run.pull_requests[0].number || 'none' }}-${{ github.event.workflow_run.head_sha }}
+      group: pr-agent-merge-tests-${{ github.event.workflow_run.id }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
@@ -866,7 +882,15 @@ jobs:
           HEAD_SHA: ${{ steps.ready.outputs.head-sha }}
           TITLE: ${{ steps.ready.outputs.title }}
         run: |
-          gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
+          if ! merge_output=$(gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
             --match-head-commit "$HEAD_SHA" \
-            --subject "${TITLE} (#${PR})"
+            --subject "${TITLE} (#${PR})" 2>&1); then
+            state=$(gh pr view "$PR" --repo "$REPO" --json state --jq .state)
+            if [[ "$state" == "MERGED" ]]; then
+              echo "PR #${PR} was merged by another valid authorization."
+              exit 0
+            fi
+            echo "$merge_output"
+            exit 1
+          fi
           echo "Merged PR #${PR} after Tests succeeded at authorized head ${HEAD_SHA}."

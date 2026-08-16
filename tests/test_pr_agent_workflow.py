@@ -70,19 +70,13 @@ def test_concurrency_is_scoped_per_task_and_never_workflow_wide():
     human_group_next = workflow.index("\n", human_group_end + 1)
     assert "cancel-in-progress: false" in workflow[human_group_end:human_group_next]
 
-    # Merge jobs get their own per-PR group so they don't race with —
-    # or get cancelled by — the review-fix lane.
+    # Each merge authorization gets a distinct non-cancellable group, so one
+    # valid pending authorization cannot evict another.
     assert (
-        "group: pr-agent-merge-${{ github.event.pull_request.number }}-${{ github.event.review.commit_id }}"
+        "group: pr-agent-merge-approval-${{ github.event.pull_request.number }}-${{ github.event.review.id }}"
     ) in workflow
-    assert (
-        "group: pr-agent-merge-${{ github.event.issue.number }}-"
-        "${{ needs.authorize_merge_command.outputs.approved_head }}"
-    ) in workflow
-    assert (
-        "group: pr-agent-merge-${{ github.event.workflow_run.pull_requests[0].number "
-        "|| 'none' }}-${{ github.event.workflow_run.head_sha }}"
-    ) in workflow
+    assert ("group: pr-agent-merge-command-${{ github.event.issue.number }}-${{ github.event.comment.id }}") in workflow
+    assert "group: pr-agent-merge-tests-${{ github.event.workflow_run.id }}" in workflow
     assert "needs: authorize_approval" in workflow
     assert "if: needs.authorize_approval.outputs.authorized == 'true'" in workflow
     assert "needs: authorize_merge_command" in workflow
@@ -260,6 +254,8 @@ def test_merge_is_synchronous_and_retried_only_for_the_authorized_tested_head():
     assert "approval-id: ${{ steps.authorization.outputs.approval_id }}" in workflow
     assert "merge-comment-id: ${{ steps.authorization.outputs.merge_comment_id }}" in workflow
     assert workflow.count('--match-head-commit "$HEAD_SHA"') == 3
+    assert workflow.count('if [[ "$state" == "MERGED" ]]') == 3
+    assert workflow.count("was merged by another valid authorization") == 3
 
 
 def test_merge_jobs_can_read_the_exact_heads_tests_run():

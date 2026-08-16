@@ -191,14 +191,13 @@ stale review and conflict repair cannot edit the same head concurrently. CI-fix 
 PR number from
 `workflow_run.pull_requests[0]` (falling back to the workflow_run head
 SHA) so unrelated PRs sharing a default-branch commit do not cancel each
-other's CI-repair. Merge jobs (`merge-on-approval`, `merge-on-command`,
-`merge-after-tests`)
-get their own `pr-agent-merge-<PR>-<head>` group with
-`cancel-in-progress: false` so an in-flight `/merge` or approval-driven
-merge run is never cancelled by an ignored generated comment or a
-later approval event. Approval and merge-command authorization happens in
-live-head preflight jobs before this shared lane, so unauthorized or stale
-events cannot replace a valid pending merge retry. `/merge <sha>` comments are also excluded from
+other's CI-repair. Every approval, merge command, and Tests retry gets its own
+authorization-specific merge concurrency key with `cancel-in-progress: false`,
+so one pending authorization cannot evict another. Concurrent valid attempts
+are idempotent: once one exact-head merge succeeds, the others recognize the
+merged PR and finish successfully. Approval and merge-command authorization
+happens in live-head preflight jobs, so unauthorized or stale events never
+reach these lanes. `/merge <sha>` comments are also excluded from
 `fix-comment-feedback` so the routine cannot push a new head — and
 invalidate the human's SHA-bound merge authorization — in parallel with
 the merge job. The `fix-comments` and `codex-review` jobs gate the

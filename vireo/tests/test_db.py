@@ -14128,6 +14128,70 @@ def test_retire_builtin_wildlife_preserves_unsynced_manual_add(tmp_path):
     ]
 
 
+def test_retire_builtin_wildlife_scopes_pending_add_to_same_name_survivor(tmp_path):
+    """A name-only pending add must not stamp every homonym as manual.
+
+    The pending-change row does not carry a keyword ID. When a user adds an
+    individual-type Wildlife beside the generated genre, the accompanying
+    edit history identifies the individual exactly; treating the pending name
+    as provenance for the genre would preserve the generated association
+    forever. Retire the genre while leaving the unsynced survivor untouched.
+    """
+    from db import Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    xmp_path = photo_dir / "p1.xmp"
+    write_sidecar(
+        str(xmp_path), flat_keywords=set(), hierarchical_keywords=set(),
+    )
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_path.stat().st_mtime,
+    )
+    genre_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    individual_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'individual')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.tag_photo(p1, genre_id)
+    db.tag_photo(p1, individual_id)
+    db.queue_change(p1, "keyword_add", "Wildlife", _commit=False)
+    db.record_edit(
+        "keyword_add",
+        'Added keyword "Wildlife"',
+        str(individual_id),
+        [{"photo_id": p1, "old_value": "", "new_value": str(individual_id)}],
+        _commit=False,
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+    remaining = {
+        row["keyword_id"]
+        for row in db.conn.execute(
+            "SELECT keyword_id FROM photo_keywords WHERE photo_id = ?", (p1,),
+        ).fetchall()
+    }
+    assert genre_id not in remaining
+    assert individual_id in remaining
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is not None
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+
+
 def test_retire_builtin_wildlife_preserves_synced_manual_add_history(tmp_path):
     """A retained keyword-add edit proves the synced tag was user-authored."""
     from db import Database

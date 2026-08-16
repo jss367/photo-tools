@@ -3253,6 +3253,24 @@ class Database:
                           WHERE pending_add.photo_id = photo_keywords.photo_id
                             AND pending_add.change_type = 'keyword_add'
                             AND pending_add.value = 'Wildlife' COLLATE NOCASE
+                            AND NOT EXISTS (
+                                -- Pending changes store only a name, not the
+                                -- keyword ID. Use that evidence only when the
+                                -- association is unambiguous; otherwise the
+                                -- exact keyword_add history/source stamp below
+                                -- identifies the manual same-name survivor.
+                                SELECT 1
+                                FROM photo_keywords other_pk
+                                JOIN keywords other_k
+                                  ON other_k.id = other_pk.keyword_id
+                                WHERE other_pk.photo_id
+                                      = photo_keywords.photo_id
+                                  AND other_pk.keyword_id
+                                      <> photo_keywords.keyword_id
+                                  AND other_k.parent_id IS NULL
+                                  AND other_k.name
+                                      = 'Wildlife' COLLATE NOCASE
+                            )
                       )
                       OR EXISTS (
                           SELECT 1

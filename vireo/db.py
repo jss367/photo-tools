@@ -19178,23 +19178,33 @@ class Database:
         if not change_ids:
             return
         workspace_id = self._ws_id()
-        shared_flat_removals = set()
+        synced_changes = []
         for chunk in _chunks(change_ids):
             placeholders = ",".join("?" for _ in chunk)
             if clear_equivalent_flat_removals:
                 rows = self.conn.execute(
-                    f"""SELECT photo_id, value FROM pending_changes
+                    f"""SELECT photo_id, change_type, value
+                        FROM pending_changes
                         WHERE id IN ({placeholders}) AND workspace_id = ?
                           AND change_type = 'keyword_remove_flat'""",
                     [*chunk, workspace_id],
                 ).fetchall()
-                shared_flat_removals.update(
-                    (row["photo_id"], row["value"]) for row in rows
-                )
+                synced_changes.extend(rows)
             self.conn.execute(
                 f"DELETE FROM pending_changes WHERE id IN ({placeholders}) AND workspace_id = ?",
                 [*chunk, workspace_id],
             )
+        if synced_changes:
+            self.clear_equivalent_flat_removals(synced_changes, _commit=False)
+        self.conn.commit()
+
+    def clear_equivalent_flat_removals(self, changes, _commit=True):
+        """Clear shared-sidecar flat removals represented by ``changes``."""
+        shared_flat_removals = {
+            (change["photo_id"], change["value"])
+            for change in changes
+            if change["change_type"] == "keyword_remove_flat"
+        }
         if shared_flat_removals:
             self.conn.executemany(
                 """DELETE FROM pending_changes
@@ -19203,7 +19213,8 @@ class Database:
                      AND value = ? COLLATE NOCASE""",
                 shared_flat_removals,
             )
-        self.conn.commit()
+        if _commit:
+            self.conn.commit()
 
     def queue_flag_change_if_enabled(self, photo_id, flag, workspace_id=None, _commit=True):
         """Queue a flag write when the active config opts into XMP flag sync."""

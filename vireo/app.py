@@ -12663,6 +12663,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "DELETE FROM pending_changes WHERE workspace_id = ?",
                     (ws_id,),
                 )
+                db.clear_equivalent_flat_removals(changes, _commit=False)
                 if changes:
                     items = [
                         {
@@ -12703,7 +12704,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             list(change_ids) + [db._ws_id()],
         ).fetchall()
 
-        db.clear_pending(change_ids)
+        db.clear_pending(
+            change_ids, clear_equivalent_flat_removals=True,
+        )
 
         # Record discard in history (not undoable)
         if changes:

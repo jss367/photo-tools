@@ -9072,8 +9072,8 @@ def test_create_app_retires_builtin_wildlife_synchronously(tmp_path, monkeypatch
     species_id = db.add_keyword("House Sparrow", is_species=True)
     db.tag_photo(photo_id, species_id)
     db.conn.execute(
-        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-        (photo_id, wildlife_id),
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        (photo_id, wildlife_id, "generated"),
     )
     db.conn.execute(
         "DELETE FROM db_meta WHERE key = ?",
@@ -15777,6 +15777,49 @@ def test_sync_discard_reports_true_count(app_and_db):
     assert resp.status_code == 200
     assert resp.get_json()["discarded"] == 1
     assert db.get_pending_changes() == []
+
+
+def test_sync_discard_clears_sibling_workspace_flat_removals(app_and_db):
+    """Selective and discard-all choices coordinate a shared sidecar."""
+    app, db = app_and_db
+    client = app.test_client()
+    ws1 = db._active_workspace_id
+    ws2 = db.create_workspace("discard-sibling")
+    pid = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()["id"]
+
+    def queue_in_both():
+        db.queue_change(
+            pid, "keyword_remove_flat", "Wildlife", workspace_id=ws1,
+        )
+        db.queue_change(
+            pid, "keyword_remove_flat", "Wildlife", workspace_id=ws2,
+        )
+        return db.conn.execute(
+            """SELECT id FROM pending_changes
+               WHERE photo_id = ? AND workspace_id = ?
+                 AND change_type = 'keyword_remove_flat'""",
+            (pid, ws1),
+        ).fetchone()["id"]
+
+    active_id = queue_in_both()
+    resp = client.post(
+        "/api/sync/discard", json={"change_ids": [active_id]},
+    )
+    assert resp.status_code == 200
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (pid,),
+    ).fetchone() is None
+
+    queue_in_both()
+    preview = client.get("/api/sync/preview").get_json()
+    resp = client.post(
+        "/api/sync/discard",
+        json={"discard_all": True, "revision": preview["revision"]},
+    )
+    assert resp.status_code == 200
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (pid,),
+    ).fetchone() is None
 
 
 def test_audit_resolve_validates_direction_and_photo_id(app_and_db):

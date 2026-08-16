@@ -110,7 +110,9 @@ def test_scan_raises_when_frozen_manifest_source_vanishes(tmp_path):
     with pytest.raises(FileNotFoundError) as excinfo:
         scan(missing_root, db, discovered_files=frozen)
 
-    assert missing_root in str(excinfo.value)
+    assert os.path.normcase(excinfo.value.filename) == os.path.normcase(
+        missing_root
+    )
 
 
 def test_scan_without_manifest_still_tolerates_missing_root(tmp_path):

@@ -18115,11 +18115,19 @@ class Database:
             chunk = fresh_detection_ids_list[i:i + CHUNK]
             placeholders = ",".join("?" * len(chunk))
             rows = self.conn.execute(
-                f"""SELECT DISTINCT detection_id
-                      FROM classifier_runs
-                     WHERE detection_id IN ({placeholders})
-                       AND classifier_model = ?
-                       AND labels_fingerprint = ?""",
+                f"""SELECT DISTINCT cr.detection_id
+                      FROM classifier_runs cr
+                     WHERE cr.detection_id IN ({placeholders})
+                       AND cr.classifier_model = ?
+                       AND cr.labels_fingerprint = ?
+                       AND EXISTS (
+                             SELECT 1 FROM predictions p
+                              WHERE p.detection_id = cr.detection_id
+                                AND p.classifier_model = cr.classifier_model
+                                AND p.labels_fingerprint
+                                    = cr.labels_fingerprint
+                                AND p.confidence >= 0
+                           )""",
                 [*chunk, classifier_model, labels_fingerprint],
             ).fetchall()
             cached_fresh_detection_ids.update(
@@ -18170,6 +18178,15 @@ class Database:
                 f"        WHERE cr.detection_id = d2.id "
                 f"          AND cr.classifier_model = ? "
                 f"          AND cr.labels_fingerprint = ? "
+                f"          AND EXISTS ( "
+                f"              SELECT 1 FROM predictions p "
+                f"              WHERE p.detection_id = cr.detection_id "
+                f"                AND p.classifier_model "
+                f"                    = cr.classifier_model "
+                f"                AND p.labels_fingerprint "
+                f"                    = cr.labels_fingerprint "
+                f"                AND p.confidence >= 0 "
+                f"          ) "
                 f"      ) "
                 f"  )",
                 [min_conf, *chunk, min_conf, classifier_model,
@@ -18227,7 +18244,15 @@ class Database:
                         ON cr.detection_id = td.detection_id
                        AND cr.classifier_model = ?
                        AND cr.labels_fingerprint = ?
-                     WHERE td.rn = 1""",
+                     WHERE td.rn = 1
+                       AND EXISTS (
+                             SELECT 1 FROM predictions p
+                              WHERE p.detection_id = cr.detection_id
+                                AND p.classifier_model = cr.classifier_model
+                                AND p.labels_fingerprint
+                                    = cr.labels_fingerprint
+                                AND p.confidence >= 0
+                           )""",
                 [weak_conf, *chunk, classifier_model, labels_fingerprint],
             ).fetchall()
             for r in rows:
@@ -18267,6 +18292,14 @@ class Database:
                               WHERE d.photo_id = fa.photo_id
                                 AND d.detector_model != 'full-image'
                                 AND d.detector_confidence >= ?
+                           )
+                       AND EXISTS (
+                             SELECT 1 FROM predictions p
+                              WHERE p.detection_id = cr.detection_id
+                                AND p.classifier_model = cr.classifier_model
+                                AND p.labels_fingerprint
+                                    = cr.labels_fingerprint
+                                AND p.confidence >= 0
                            )""",
                 [*chunk, classifier_model, labels_fingerprint, min_conf],
             ).fetchall()

@@ -18448,6 +18448,20 @@ def _add_one_detection(db, photo_id, detector_model="test-det", conf=0.9):
     return cur.lastrowid
 
 
+def _record_usable_classifier_run(db, detection_id, model, fingerprint):
+    """Record the run key plus the prediction runtime requires for a hit."""
+    db.record_classifier_run(
+        detection_id, model, fingerprint, prediction_count=1,
+    )
+    db.add_prediction(
+        detection_id,
+        species="Robin",
+        confidence=0.9,
+        model=model,
+        labels_fingerprint=fingerprint,
+    )
+
+
 def test_count_classifier_runs_filters_by_model_and_fingerprint(tmp_path):
     """count_classifier_runs returns the number of distinct photos in the
     given id list where every qualifying detection has a classifier_runs
@@ -18471,9 +18485,9 @@ def test_count_classifier_runs_filters_by_model_and_fingerprint(tmp_path):
     d2 = _add_one_detection(db, p2)
     d3 = _add_one_detection(db, p3)
 
-    db.record_classifier_run(d1, "BioCLIP-2.5", "fp-a", prediction_count=1)
-    db.record_classifier_run(d2, "BioCLIP-2.5", "fp-b", prediction_count=1)
-    db.record_classifier_run(d3, "iNat21", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(db, d1, "BioCLIP-2.5", "fp-a")
+    _record_usable_classifier_run(db, d2, "BioCLIP-2.5", "fp-b")
+    _record_usable_classifier_run(db, d3, "iNat21", "fp-a")
 
     # Only p1 matches (BioCLIP-2.5 + fp-a).
     assert db.count_classifier_runs(
@@ -18487,14 +18501,14 @@ def test_count_classifier_runs_filters_by_model_and_fingerprint(tmp_path):
     # the runtime would still need to infer the uncached detection, and the
     # photo would end up in ``count`` (inferred), not ``cached``.
     d2b = _add_one_detection(db, p2)
-    db.record_classifier_run(d2b, "BioCLIP-2.5", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(db, d2b, "BioCLIP-2.5", "fp-a")
     assert db.count_classifier_runs(
         [p1, p2, p3], "BioCLIP-2.5", "fp-a"
     ) == 1  # only p1 — p2 still has d2 (fp-b) with no matching run key
 
     # Once every qualifying detection on p2 has a matching run key, p2
     # counts too.
-    db.record_classifier_run(d2, "BioCLIP-2.5", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(db, d2, "BioCLIP-2.5", "fp-a")
     assert db.count_classifier_runs(
         [p1, p2, p3], "BioCLIP-2.5", "fp-a"
     ) == 2  # p1 and p2
@@ -18517,7 +18531,7 @@ def test_count_classifier_runs_chunks_large_id_lists(tmp_path):
             width=1, height=1,
         )
         did = _add_one_detection(db, pid)
-        db.record_classifier_run(did, "BioCLIP-2.5", "fp-a", prediction_count=1)
+        _record_usable_classifier_run(db, did, "BioCLIP-2.5", "fp-a")
         photo_ids.append(pid)
 
     assert db.count_classifier_runs(
@@ -18545,17 +18559,17 @@ def test_count_classifier_runs_excludes_full_image_and_below_threshold(tmp_path)
     # p1: only a full-image detection has a matching run key. Should NOT
     # be counted (runtime gate skips full-image rows when picking primary).
     d1_full = _add_one_detection(db, p1, detector_model="full-image", conf=0.9)
-    db.record_classifier_run(d1_full, "BioCLIP-2.5", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(db, d1_full, "BioCLIP-2.5", "fp-a")
 
     # p2: only a below-threshold detection has a matching run key. Should
     # NOT be counted (runtime gate filters at detector_confidence >= 0.2).
     d2_low = _add_one_detection(db, p2, conf=0.05)
-    db.record_classifier_run(d2_low, "BioCLIP-2.5", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(db, d2_low, "BioCLIP-2.5", "fp-a")
 
     # p3: a normal above-threshold non-full-image detection has a matching
     # run key. Should be counted.
     d3 = _add_one_detection(db, p3, conf=0.9)
-    db.record_classifier_run(d3, "BioCLIP-2.5", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(db, d3, "BioCLIP-2.5", "fp-a")
 
     assert db.count_classifier_runs(
         [p1, p2, p3], "BioCLIP-2.5", "fp-a",
@@ -18582,7 +18596,7 @@ def test_count_classifier_runs_ignores_non_animal_detections(tmp_path):
     # p1: one animal detection (cached) + one uncached person detection.
     # The person box gets skipped at runtime so p1 IS fully cache-served.
     d1_animal = _add_one_detection(db, p1, conf=0.9)
-    db.record_classifier_run(d1_animal, "BioCLIP-2.5", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(db, d1_animal, "BioCLIP-2.5", "fp-a")
     db.conn.execute(
         """INSERT INTO detections
              (photo_id, detector_model, box_x, box_y, box_w, box_h,
@@ -18604,7 +18618,9 @@ def test_count_classifier_runs_ignores_non_animal_detections(tmp_path):
         (p2,),
     )
     db.conn.commit()
-    db.record_classifier_run(cur.lastrowid, "BioCLIP-2.5", "fp-a", prediction_count=1)
+    _record_usable_classifier_run(
+        db, cur.lastrowid, "BioCLIP-2.5", "fp-a",
+    )
 
     assert db.count_classifier_runs(
         [p1, p2], "BioCLIP-2.5", "fp-a",
@@ -18635,17 +18651,13 @@ def test_get_classifier_run_cache_hits_returns_matched_photo_ids(tmp_path):
     )
 
     d_cached = _add_one_detection(db, p_cached)
-    db.record_classifier_run(
-        d_cached, "BioCLIP-2.5", "fp-a", prediction_count=1,
-    )
+    _record_usable_classifier_run(db, d_cached, "BioCLIP-2.5", "fp-a")
 
     # Multi-detection: one has a run key, the other doesn't. Preflight
     # must NOT count p_partial — the runtime will infer the uncached one.
     d_partial_a = _add_one_detection(db, p_partial)
     _ = _add_one_detection(db, p_partial)
-    db.record_classifier_run(
-        d_partial_a, "BioCLIP-2.5", "fp-a", prediction_count=1,
-    )
+    _record_usable_classifier_run(db, d_partial_a, "BioCLIP-2.5", "fp-a")
 
     _ = _add_one_detection(db, p_none)
 
@@ -18657,6 +18669,36 @@ def test_get_classifier_run_cache_hits_returns_matched_photo_ids(tmp_path):
         "overcount tracker to this set is what keeps Codex #1468 P2's "
         "unrelated-photo deflation from happening."
     )
+
+
+def test_get_classifier_run_cache_hits_requires_usable_prediction(tmp_path):
+    """A run key without prediction rows is an inference miss at runtime."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    photo_id = db.add_photo(
+        folder_id=fid, filename="run-only.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    detection_id = _add_one_detection(db, photo_id)
+    db.record_classifier_run(
+        detection_id, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+
+    assert db.get_classifier_run_cache_hits(
+        [photo_id], "BioCLIP-2.5", "fp-a",
+    ) == set()
+
+    db.add_prediction(
+        detection_id,
+        species="Robin",
+        confidence=0.9,
+        model="BioCLIP-2.5",
+        labels_fingerprint="fp-a",
+    )
+    assert db.get_classifier_run_cache_hits(
+        [photo_id], "BioCLIP-2.5", "fp-a",
+    ) == {photo_id}
 
 
 def test_get_classifier_run_cache_hits_uses_fresh_runtime_candidates(tmp_path):
@@ -18686,8 +18728,8 @@ def test_get_classifier_run_cache_hits_uses_fresh_runtime_candidates(tmp_path):
     fresh_detection_id = _add_one_detection(
         db, p_processed, detector_model="megadetector-v6", conf=0.8,
     )
-    db.record_classifier_run(
-        fresh_detection_id, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    _record_usable_classifier_run(
+        db, fresh_detection_id, "BioCLIP-2.5", "fp-a",
     )
 
     # This photo represents an individual detector failure: it is absent from
@@ -18695,8 +18737,8 @@ def test_get_classifier_run_cache_hits_uses_fresh_runtime_candidates(tmp_path):
     failed_fallback_id = _add_one_detection(
         db, p_failed, detector_model="megadetector-v6", conf=0.7,
     )
-    db.record_classifier_run(
-        failed_fallback_id, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    _record_usable_classifier_run(
+        db, failed_fallback_id, "BioCLIP-2.5", "fp-a",
     )
 
     assert db.get_classifier_run_cache_hits(
@@ -18741,9 +18783,7 @@ def test_get_classifier_run_cache_hits_includes_noise_full_image_anchor(
         db, p_noise, detector_model="full-image", conf=0,
     )
     db.record_detector_run(p_noise, "megadetector-v6", box_count=1)
-    db.record_classifier_run(
-        noise_anchor, "BioCLIP-2.5", "fp-a", prediction_count=1,
-    )
+    _record_usable_classifier_run(db, noise_anchor, "BioCLIP-2.5", "fp-a")
 
     db.conn.execute(
         """INSERT INTO detections
@@ -18756,9 +18796,7 @@ def test_get_classifier_run_cache_hits_includes_noise_full_image_anchor(
         db, p_person, detector_model="full-image", conf=0,
     )
     db.record_detector_run(p_person, "megadetector-v6", box_count=1)
-    db.record_classifier_run(
-        person_anchor, "BioCLIP-2.5", "fp-a", prediction_count=1,
-    )
+    _record_usable_classifier_run(db, person_anchor, "BioCLIP-2.5", "fp-a")
 
     hits = db.get_classifier_run_cache_hits(
         [p_noise, p_person], "BioCLIP-2.5", "fp-a",
@@ -18778,8 +18816,8 @@ def test_fresh_preflight_reloads_omitted_contextual_weak_candidate(tmp_path):
     weak_detection_id = _add_one_detection(
         db, photo_id, detector_model="megadetector-v6", conf=0.15,
     )
-    db.record_classifier_run(
-        weak_detection_id, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    _record_usable_classifier_run(
+        db, weak_detection_id, "BioCLIP-2.5", "fp-a",
     )
 
     # _detect_batch's ordinary-threshold reuse path records the photo as
@@ -18830,9 +18868,7 @@ def test_get_classifier_run_cache_hits_includes_contextual_weak(tmp_path):
     d_weak_cached = _add_one_detection(
         db, p_weak_cached, detector_model="megadetector-v6", conf=0.15,
     )
-    db.record_classifier_run(
-        d_weak_cached, "BioCLIP-2.5", "fp-a", prediction_count=1,
-    )
+    _record_usable_classifier_run(db, d_weak_cached, "BioCLIP-2.5", "fp-a")
     _ = _add_one_detection(
         db, p_weak_uncached, detector_model="megadetector-v6", conf=0.15,
     )
@@ -18872,15 +18908,11 @@ def test_get_classifier_run_cache_hits_weak_scoped_per_photo(tmp_path):
     d_normal_low = _add_one_detection(
         db, p_normal_weak_only, detector_model="megadetector-v6", conf=0.15,
     )
-    db.record_classifier_run(
-        d_normal_low, "BioCLIP-2.5", "fp-a", prediction_count=1,
-    )
+    _record_usable_classifier_run(db, d_normal_low, "BioCLIP-2.5", "fp-a")
     d_weak = _add_one_detection(
         db, p_weak, detector_model="megadetector-v6", conf=0.15,
     )
-    db.record_classifier_run(
-        d_weak, "BioCLIP-2.5", "fp-a", prediction_count=1,
-    )
+    _record_usable_classifier_run(db, d_weak, "BioCLIP-2.5", "fp-a")
 
     # Only p_weak is in the contextual weak set; p_normal_weak_only stays
     # gated by the ordinary detector_confidence floor.
@@ -18919,9 +18951,7 @@ def test_get_classifier_run_cache_hits_weak_matches_top_detection_only(tmp_path)
     d_lower = _add_one_detection(
         db, p_lower_cached, detector_model="megadetector-v6", conf=0.13,
     )
-    db.record_classifier_run(
-        d_lower, "BioCLIP-2.5", "fp-a", prediction_count=1,
-    )
+    _record_usable_classifier_run(db, d_lower, "BioCLIP-2.5", "fp-a")
 
     # p_top_cached: same shape, but the run key is on the TOP box —
     # runtime cache-hits, preflight counts it.
@@ -18935,9 +18965,7 @@ def test_get_classifier_run_cache_hits_weak_matches_top_detection_only(tmp_path)
     _ = _add_one_detection(
         db, p_top_cached, detector_model="megadetector-v6", conf=0.13,
     )
-    db.record_classifier_run(
-        d_top, "BioCLIP-2.5", "fp-a", prediction_count=1,
-    )
+    _record_usable_classifier_run(db, d_top, "BioCLIP-2.5", "fp-a")
 
     hits = db.get_classifier_run_cache_hits(
         [p_lower_cached, p_top_cached],
@@ -18969,9 +18997,7 @@ def test_get_classifier_run_cache_hits_weak_ties_break_by_id(tmp_path):
     # Only the SECOND (higher-id) detection has a run key. The runtime
     # picks the first (lowest id) and infers, so preflight must not
     # count this photo.
-    db.record_classifier_run(
-        d_second, "BioCLIP-2.5", "fp-a", prediction_count=1,
-    )
+    _record_usable_classifier_run(db, d_second, "BioCLIP-2.5", "fp-a")
     assert d_first < d_second
 
     hits = db.get_classifier_run_cache_hits(
@@ -18985,6 +19011,10 @@ def test_get_classifier_run_cache_hits_weak_ties_break_by_id(tmp_path):
     # photo is counted.
     db.conn.execute(
         "UPDATE classifier_runs SET detection_id = ? WHERE detection_id = ?",
+        (d_first, d_second),
+    )
+    db.conn.execute(
+        "UPDATE predictions SET detection_id = ? WHERE detection_id = ?",
         (d_first, d_second),
     )
     db.conn.commit()
@@ -19021,9 +19051,7 @@ def test_get_classifier_run_cache_hits_weak_ignores_foreign_detector(tmp_path):
     d_foreign = _add_one_detection(
         db, p, detector_model="megadetector-v5", conf=0.19,
     )
-    db.record_classifier_run(
-        d_foreign, "BioCLIP-2.5", "fp-a", prediction_count=1,
-    )
+    _record_usable_classifier_run(db, d_foreign, "BioCLIP-2.5", "fp-a")
     # MegaDetector-v6 weak row: what the runtime actually picks. No run
     # key — runtime will infer.
     _ = _add_one_detection(
@@ -19044,9 +19072,7 @@ def test_get_classifier_run_cache_hits_weak_ignores_foreign_detector(tmp_path):
         "WHERE photo_id = ? AND detector_model = 'megadetector-v6'",
         (p,),
     ).fetchone()["id"]
-    db.record_classifier_run(
-        d_v6_top, "BioCLIP-2.5", "fp-a", prediction_count=1,
-    )
+    _record_usable_classifier_run(db, d_v6_top, "BioCLIP-2.5", "fp-a")
     hits = db.get_classifier_run_cache_hits(
         [p], "BioCLIP-2.5", "fp-a",
         contextual_weak_photo_ids={p},

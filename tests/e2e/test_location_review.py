@@ -91,7 +91,24 @@ GOOGLE_MAPS_STUB = """
     };
   }
   function Geocoder() {
-    this.geocode = function(request, callback) { callback([], 'ZERO_RESULTS'); };
+    this.geocode = function(request, callback) {
+      if (request.location.lat() < 40) { callback([], 'ZERO_RESULTS'); return; }
+      function area(placeId, name, type, lat, lng) {
+        return {
+          place_id: placeId,
+          name: name,
+          types: [type, 'political'],
+          formatted_address: name + ', France',
+          address_components: [{long_name: name, short_name: name, types: [type, 'political']}],
+          geometry: {location: new LatLng(lat, lng)}
+        };
+      }
+      callback([
+        area('garrieux', 'Garrieux', 'neighborhood', 42.810, 2.940),
+        area('saint-hippolyte', 'Saint-Hippolyte', 'locality', 42.810, 2.940),
+        area('pyrenees-orientales', 'Pyrénées-Orientales', 'administrative_area_level_2', 42.810, 2.940)
+      ], 'OK');
+    };
   }
   function Autocomplete() {
     this.bindTo = function() {};
@@ -302,8 +319,8 @@ def test_location_review_ranks_saved_and_google_places_by_distance(
     page.goto(f"{live_server['url']}/locations/review?source=selection")
 
     candidates = page.locator(".location-review-candidate")
-    expect(candidates).to_have_count(2)
-    expect(candidates.first).to_contain_text("Nearby Park")
+    expect(candidates).to_have_count(3)
+    expect(candidates.first).to_contain_text("Nearby General Store")
     saved_candidate = candidates.filter(has_text="Far Saved Place")
     expect(saved_candidate.locator(".location-review-candidate-badge")).to_have_text(
         "Previously used"
@@ -318,7 +335,7 @@ def test_location_review_ranks_saved_and_google_places_by_distance(
 
     coordinate_toggle.check()
     expect(candidates.first.locator(".location-review-candidate-coordinates")).to_have_text(
-        "32.751000, -117.001000"
+        "32.750000, -117.000000"
     )
     expect(saved_candidate.locator(".location-review-candidate-coordinates")).to_have_text(
         "32.938000, -117.000000"
@@ -328,10 +345,10 @@ def test_location_review_ranks_saved_and_google_places_by_distance(
     expect(candidates.locator(".location-review-candidate-coordinates")).to_have_count(0)
 
 
-def test_location_review_suggests_campgrounds_and_can_show_all_nearby_places(
+def test_location_review_filters_nature_and_places_strictly(
     live_server, page,
 ):
-    """Focused suggestions include campgrounds; the toggle broadens categories."""
+    """Category controls filter one shared candidate pool rather than changing queries."""
     photo_id = live_server["data"]["photos"][0]
     with live_server["db"].conn:
         live_server["db"].conn.execute(
@@ -359,9 +376,10 @@ def test_location_review_suggests_campgrounds_and_can_show_all_nearby_places(
     )
     page.goto(f"{live_server['url']}/locations/review?source=selection")
 
+    recommended_button = page.locator('[data-suggestion-mode="recommended"]')
     nature_button = page.locator('[data-suggestion-mode="nature"]')
-    all_button = page.locator('[data-suggestion-mode="all"]')
-    expect(nature_button).to_have_attribute("aria-pressed", "true")
+    places_button = page.locator('[data-suggestion-mode="places"]')
+    expect(recommended_button).to_have_attribute("aria-pressed", "true")
     campground = page.locator(
         ".location-review-candidate", has_text="Tamarisk Grove Campground"
     )
@@ -370,13 +388,23 @@ def test_location_review_suggests_campgrounds_and_can_show_all_nearby_places(
         "Campground"
     )
 
-    all_button.click()
+    general_store = page.locator(
+        ".location-review-candidate", has_text="Nearby General Store"
+    )
+    expect(general_store).to_be_visible()
 
-    expect(all_button).to_have_attribute("aria-pressed", "true")
+    nature_button.click()
+
+    expect(nature_button).to_have_attribute("aria-pressed", "true")
+    expect(recommended_button).to_have_attribute("aria-pressed", "false")
+    expect(campground).to_be_visible()
+    expect(general_store).to_have_count(0)
+
+    places_button.click()
+
+    expect(places_button).to_have_attribute("aria-pressed", "true")
     expect(nature_button).to_have_attribute("aria-pressed", "false")
-    expect(
-        page.locator(".location-review-candidate", has_text="Nearby General Store")
-    ).to_be_visible()
+    expect(general_store).to_be_visible()
     expect(campground).to_have_count(0)
 
     requested_types = page.evaluate(
@@ -384,6 +412,68 @@ def test_location_review_suggests_campgrounds_and_can_show_all_nearby_places(
     )
     assert "campground" in requested_types
     assert None in requested_types
+
+
+def test_location_review_groups_hamlets_and_keeps_a_selection_across_filters(
+    live_server, page,
+):
+    """Local areas such as Garrieux are grouped and remain selectable across filters."""
+    photo_id = live_server["data"]["photos"][0]
+    with live_server["db"].conn:
+        live_server["db"].conn.execute(
+            "UPDATE photos SET latitude = ?, longitude = ? WHERE id = ?",
+            (42.810, 2.940, photo_id),
+        )
+
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(json={"google_maps_api_key": "test-key"}),
+    )
+    page.route(
+        "https://maps.googleapis.com/maps/api/js**",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/javascript",
+            body=GOOGLE_MAPS_STUB,
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+
+    at_photos = page.locator('[data-candidate-group="at"]')
+    expect(at_photos.locator(".location-review-candidate-group-title")).to_have_text(
+        "At the photos"
+    )
+    garrieux = at_photos.locator(
+        ".location-review-candidate", has_text="Garrieux"
+    )
+    expect(garrieux).to_be_visible()
+    expect(garrieux.locator(".location-review-candidate-meta")).to_contain_text(
+        "Neighborhood · At photo coordinates"
+    )
+    expect(
+        page.locator('[data-candidate-group="broader"]')
+    ).to_contain_text("Pyrénées-Orientales")
+
+    page.locator('[data-suggestion-mode="areas"]').click()
+    expect(page.locator(".location-review-candidate")).to_have_count(3)
+    expect(page.locator(".location-review-candidate", has_text="Nearby Park")).to_have_count(0)
+
+    garrieux = page.locator(".location-review-candidate", has_text="Garrieux")
+    garrieux.click()
+    page.locator('[data-suggestion-mode="nature"]').click()
+
+    expect(garrieux).to_be_visible()
+    expect(page.locator('[data-candidate-group="selected"]')).to_contain_text(
+        "Selected location"
+    )
+    expect(page.locator(".location-review-candidate", has_text="Nearby Park")).to_be_visible()
+    expect(page.locator(".location-review-candidate", has_text="Nearby General Store")).to_have_count(0)
 
 
 def test_location_review_photo_marker_opens_the_photo_preview(live_server, page):

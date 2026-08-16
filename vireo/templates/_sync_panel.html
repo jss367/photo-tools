@@ -152,6 +152,10 @@ var _syncModalOpen = false;
 var _syncEscToken = null;
 var _syncLightboxPanelEl = null;
 var _syncPreviewLoading = false;
+// Distinct "the load finished cleanly" flag. `_syncPreviewLoading` also
+// goes false on partial-load failure, so re-renders (filter toggle, Show
+// More) would otherwise re-enable Sync / Discard on a truncated queue.
+var _syncPreviewComplete = false;
 var _syncPreviewLoadToken = 0;
 var _syncPreviewAbortController = null;
 var _syncPreviewStartedAt = 0;
@@ -315,6 +319,7 @@ function _syncStopPreviewLoad() {
     _syncPreviewElapsedTimer = null;
   }
   _syncPreviewLoading = false;
+  _syncPreviewComplete = false;
 }
 
 async function _syncStartPreviewLoad(restartCount) {
@@ -378,7 +383,10 @@ async function _syncStartPreviewLoad(restartCount) {
       Array.prototype.push.apply(_syncPreviewData.photos, page.photos || []);
       offset = page.next_offset;
       firstPage = false;
-      if (!page.has_more) _syncPreviewLoading = false;
+      if (!page.has_more) {
+        _syncPreviewLoading = false;
+        _syncPreviewComplete = true;
+      }
       renderSyncPreview();
       _syncUpdatePreviewProgress(page.has_more ? 'loading' : 'complete');
 
@@ -558,7 +566,7 @@ function renderSyncPreview() {
   var changeWord = visibleCount === 1 ? 'change' : 'changes';
   var photoWord = visiblePhotos === 1 ? 'photo' : 'photos';
   var reviewedSuffix = _syncPreviewLoading ? ' reviewed so far' : '';
-  var actionsDisabled = _syncPreviewLoading ? ' disabled' : '';
+  var actionsDisabled = _syncPreviewComplete ? '' : ' disabled';
   html += '<div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;">' +
     '<span style="font-size:12px;color:var(--text-dim);flex:1;">' + visibleCount.toLocaleString() + ' ' + changeWord + ' across ' + visiblePhotos.toLocaleString() + ' ' + photoWord + reviewedSuffix + '</span>' +
     '<button class="sync-preview-action" onclick="discardAllChanges()"' + actionsDisabled + ' style="background:none;color:var(--danger);border:1px solid var(--danger);border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;">Discard All</button>' +
@@ -625,7 +633,7 @@ function renderSyncPreview() {
 
   content.innerHTML = html;
   _syncSetPreviewActionsEnabled(
-    !_syncPreviewLoading && (_syncPreviewData.total_changes || 0) > 0
+    _syncPreviewComplete && (_syncPreviewData.total_changes || 0) > 0
   );
   if (_syncLightboxPanelEl && typeof _lightboxCurrentId !== 'undefined') {
     _syncRenderLightboxPanel(_lightboxCurrentId);
@@ -680,7 +688,7 @@ function getVisibleSyncChangeIds() {
 }
 
 function runVisibleSync() {
-  if (_syncPreviewLoading) return;
+  if (!_syncPreviewComplete) return;
   var changeIds = getVisibleSyncChangeIds();
   if (changeIds.length === 0) {
     var status = document.getElementById('syncStatus');
@@ -753,7 +761,7 @@ function _syncRenderLightboxPanel(photoId) {
   }
   var panel = _syncEnsureLightboxPanel();
   if (!panel) return;
-  var actionsDisabled = _syncPreviewLoading ? ' disabled' : '';
+  var actionsDisabled = _syncPreviewComplete ? '' : ' disabled';
   var html = '<div style="font-weight:600;margin-bottom:6px;color:var(--accent);">Pending changes</div>';
   visible.forEach(function(c) {
     var style = _syncChangeStyle(c);
@@ -776,7 +784,7 @@ function _syncRenderLightboxPanel(photoId) {
 }
 
 async function _syncDiscardFromLightbox(changeIds, photoId) {
-  if (_syncPreviewLoading || !changeIds || changeIds.length === 0) return;
+  if (!_syncPreviewComplete || !changeIds || changeIds.length === 0) return;
   try {
     await safeFetch('/api/sync/discard', {
       method: 'POST',
@@ -841,7 +849,7 @@ async function _syncRefreshPreviewAfterDiscard() {
 }
 
 async function discardSyncChanges(changeIds) {
-  if (_syncPreviewLoading || !changeIds || changeIds.length === 0) return;
+  if (!_syncPreviewComplete || !changeIds || changeIds.length === 0) return;
   try {
     await safeFetch('/api/sync/discard', {
       method: 'POST',
@@ -861,7 +869,7 @@ function discardPhotoChanges(changeIds) {
 }
 
 async function discardAllChanges() {
-  if (_syncPreviewLoading || !_syncPreviewData) return;
+  if (!_syncPreviewComplete || !_syncPreviewData) return;
   if (!confirm('Discard ALL pending changes? Nothing will be written to XMP.')) return;
   try {
     var allIds = [];

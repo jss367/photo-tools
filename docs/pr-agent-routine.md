@@ -54,6 +54,10 @@ routine** and fill in:
 - **Triggers**: add an **API** trigger. Click **Generate token** and copy
   both the URL and the token immediately (token is shown once).
 
+The routine prompt is not synchronized from the repository. After changing
+`pr-agent-routine-prompt.md`, paste the updated contents into the existing
+routine before relying on the new behavior.
+
 Do **not** add a schedule or GitHub trigger — this routine is invoked from
 the GHA forwarder, which knows the richer set of events we care about
 (`issue_comment`, `workflow_run`, `push`) that the native GitHub trigger
@@ -160,6 +164,13 @@ review whose feedback lives entirely in the review body). The body-firing
 check excludes the Codex connector bot because its body is always the stock
 template; Codex findings still route through inline comments and the thread
 gate.
+
+There is no fixed per-PR review/fix round cap. Each eligible review event can
+invoke the routine while the PR remains open, regardless of how many earlier
+rounds occurred. The routine escalates only a concrete finding that needs a
+maintainer decision, conflicts with repository requirements, or cannot be
+handled safely within the PR's scope; review count alone is never a reason to
+stop.
 
 ## Limits and caveats
 

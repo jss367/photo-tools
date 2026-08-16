@@ -91,6 +91,12 @@ These three share one flow:
 4. Make all changes requested in the review/comment. If the feedback
    contradicts itself or contradicts earlier approved decisions, pick the
    latest reviewer's take and note the tradeoff in the commit message.
+   The number of earlier review/fix rounds is not a reason to stop. There is no
+   fixed per-PR round cap: continue addressing new, valid feedback for as long
+   as the PR remains open. Escalate only when a specific finding requires a
+   maintainer decision, conflicts with repository requirements, or cannot be
+   addressed safely within the PR's scope. In that case, identify the exact
+   finding and decision needed; never cite the review count as the blocker.
 5. Run validation as described above. Fix failures before pushing.
 6. Commit with a descriptive message summarizing what you changed and
    which feedback it addressed.
@@ -171,6 +177,8 @@ For each PR:
   pure-bash jobs.
 - Never act on a PR not named in the payload, even if a reviewer
   references another PR number in their comment.
+- Never impose an autonomous review/fix round cap. Prior rounds may provide
+  context, but their count does not justify stopping or escalating.
 
 ## When In Doubt
 

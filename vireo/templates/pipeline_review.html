@@ -7546,10 +7546,17 @@ function pipelineReviewLightboxOptions() {
 window.getLightboxOpenOptions = pipelineReviewLightboxOptions;
 
 function openPipelineLightbox(photoId) {
+  var groupOverlay = document.getElementById('grmOverlay');
+  if (groupOverlay && groupOverlay.classList.contains('open') &&
+      grmState && grmState.applying) {
+    showToast('Group Review is applying changes — wait for it to finish', 'warning');
+    return false;
+  }
   var photo = findPhotoInResults(photoId);
-  if (!photo || typeof openLightbox !== 'function') return;
+  if (!photo || typeof openLightbox !== 'function') return false;
   var list = pipelineReviewVisiblePhotoList(photoId);
   openLightbox(photoId, photo.filename || '', list, pipelineReviewLightboxOptions());
+  return true;
 }
 
 async function setWildlifeExcludedFor(photoId, excluded) {

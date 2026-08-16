@@ -1687,6 +1687,7 @@ def test_group_apply_freezes_controls_and_aborts_after_later_session_change(
             return window.__originalSafeFetchForApplyLifecycle.apply(this, arguments);
           };
           grmMoveReject();
+          openPipelineLightbox(grmState.selected);
           window.__lifecycleApplySettled = false;
           window.__lifecycleApplyPromise = grmApply().then(
             () => { window.__lifecycleApplySettled = true; },
@@ -1725,7 +1726,6 @@ def test_group_apply_freezes_controls_and_aborts_after_later_session_change(
     selected_id = page.evaluate(
         """() => {
           const selected = grmState.selected;
-          openPipelineLightbox(selected);
           _lbApplyFlag(selected, 'flagged');
           return selected;
         }"""
@@ -1746,7 +1746,20 @@ def test_group_apply_freezes_controls_and_aborts_after_later_session_change(
     }
     assert _flags(db, photo_ids) == ["none"] * 4
 
-    page.evaluate("closeLightbox(); openGroupReview(0, 1)")
+    reopen_state = page.evaluate(
+        """pid => {
+          closeLightbox();
+          return {
+            result: openPipelineLightbox(pid),
+            lightboxOpen: document.getElementById('lightboxOverlay')
+              .classList.contains('active'),
+          };
+        }""",
+        selected_id,
+    )
+    assert reopen_state == {"result": False, "lightboxOpen": False}
+
+    page.evaluate("openGroupReview(0, 1)")
     page.wait_for_function(
         "session => grmState.sessionId !== session && grmState.seeded === true",
         arg=original_session,

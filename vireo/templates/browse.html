@@ -1959,6 +1959,7 @@ body.sidebar-resizing {
    Empty string when no key is configured; the Location section then
    degrades to free-text-only (no autocomplete, no script injection). */
 window.GOOGLE_MAPS_API_KEY = '';
+window.GOOGLE_MAPS_PREFER_ENGLISH = true;
 
 /* ---------- State ---------- */
 var photos = [];
@@ -2497,6 +2498,7 @@ var _cfgPromise = (async function() {
     _shortcuts = Object.assign({}, _BROWSE_SC_DEFAULTS, saved);
     window._vireoShortcuts = cfg.keyboard_shortcuts || {};
     window.GOOGLE_MAPS_API_KEY = cfg.google_maps_api_key || '';
+    window.GOOGLE_MAPS_PREFER_ENGLISH = cfg.google_maps_prefer_english !== false;
     return cfg;
   } catch(e) {
     _shortcuts = Object.assign({}, _BROWSE_SC_DEFAULTS);
@@ -7621,7 +7623,9 @@ function loadGoogleMapsJs() {
     var s = document.createElement('script');
     s.src = 'https://maps.googleapis.com/maps/api/js?key=' +
       encodeURIComponent(apiKey) +
-      '&libraries=places&loading=async&callback=_gmapsCallback';
+      '&libraries=places' +
+      (window.GOOGLE_MAPS_PREFER_ENGLISH ? '&language=en' : '') +
+      '&loading=async&callback=_gmapsCallback';
     s.async = true;
     s.onerror = function() { reject(new Error('gmaps_load_failed')); };
     document.head.appendChild(s);

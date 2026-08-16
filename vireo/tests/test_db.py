@@ -18539,10 +18539,8 @@ def test_count_classifier_runs_chunks_large_id_lists(tmp_path):
     ) == 1500
 
 
-def test_count_classifier_runs_excludes_full_image_and_below_threshold(tmp_path):
-    """count_classifier_runs mirrors the runtime gate: full-image rows and
-    sub-threshold detections are excluded so prior full-image classifier
-    runs and stale low-confidence boxes don't inflate cached_estimate."""
+def test_count_classifier_runs_uses_full_image_not_below_threshold_crop(tmp_path):
+    """Preflight reuses a fallback anchor, not a sub-threshold crop."""
     from db import Database
     db = Database(str(tmp_path / "test.db"))
     fid = db.add_folder("/photos", name="photos")
@@ -18556,8 +18554,8 @@ def test_count_classifier_runs_excludes_full_image_and_below_threshold(tmp_path)
                      file_size=1, file_mtime=1.0, timestamp=None,
                      width=1, height=1)
 
-    # p1: only a full-image detection has a matching run key. Should NOT
-    # be counted (runtime gate skips full-image rows when picking primary).
+    # p1: only a full-image fallback has a matching run key. It counts even
+    # without a MegaDetector run row, matching detector-failure runtime reuse.
     d1_full = _add_one_detection(db, p1, detector_model="full-image", conf=0.9)
     _record_usable_classifier_run(db, d1_full, "BioCLIP-2.5", "fp-a")
 
@@ -18573,7 +18571,7 @@ def test_count_classifier_runs_excludes_full_image_and_below_threshold(tmp_path)
 
     assert db.count_classifier_runs(
         [p1, p2, p3], "BioCLIP-2.5", "fp-a",
-    ) == 1
+    ) == 2
 
 
 def test_count_classifier_runs_ignores_non_animal_detections(tmp_path):
@@ -18763,7 +18761,7 @@ def test_get_classifier_run_cache_hits_uses_fresh_runtime_candidates(tmp_path):
 def test_get_classifier_run_cache_hits_includes_noise_full_image_anchor(
     tmp_path,
 ):
-    """Noise-only photos use their cached full-image classifier run."""
+    """Noise and detector-failure photos reuse cached full-image runs."""
     from db import Database
     db = Database(str(tmp_path / "test.db"))
     fid = db.add_folder("/photos", name="photos")
@@ -18773,6 +18771,10 @@ def test_get_classifier_run_cache_hits_includes_noise_full_image_anchor(
     )
     p_person = db.add_photo(
         folder_id=fid, filename="person.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_detector_failure = db.add_photo(
+        folder_id=fid, filename="detector-failure.jpg", extension=".jpg",
         file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
     )
 
@@ -18798,10 +18800,19 @@ def test_get_classifier_run_cache_hits_includes_noise_full_image_anchor(
     db.record_detector_run(p_person, "megadetector-v6", box_count=1)
     _record_usable_classifier_run(db, person_anchor, "BioCLIP-2.5", "fp-a")
 
-    hits = db.get_classifier_run_cache_hits(
-        [p_noise, p_person], "BioCLIP-2.5", "fp-a",
+    # _detect_batch does not write a MegaDetector run row when inference
+    # fails, but classify can still create and later reuse this anchor.
+    failure_anchor = _add_one_detection(
+        db, p_detector_failure, detector_model="full-image", conf=0,
     )
-    assert hits == {p_noise}
+    _record_usable_classifier_run(
+        db, failure_anchor, "BioCLIP-2.5", "fp-a",
+    )
+
+    hits = db.get_classifier_run_cache_hits(
+        [p_noise, p_person, p_detector_failure], "BioCLIP-2.5", "fp-a",
+    )
+    assert hits == {p_noise, p_detector_failure}
 
 
 def test_fresh_preflight_reloads_omitted_contextual_weak_candidate(tmp_path):

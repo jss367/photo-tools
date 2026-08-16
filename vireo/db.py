@@ -18274,14 +18274,15 @@ class Database:
                       )
                     SELECT DISTINCT fa.photo_id
                       FROM full_anchor fa
-                      JOIN detector_runs dr
+                      LEFT JOIN detector_runs dr
                         ON dr.photo_id = fa.photo_id
                        AND dr.detector_model = 'megadetector-v6'
                       JOIN classifier_runs cr
                         ON cr.detection_id = fa.detection_id
                        AND cr.classifier_model = ?
                        AND cr.labels_fingerprint = ?
-                     WHERE (dr.box_count = 0 OR EXISTS (
+                     WHERE (dr.photo_id IS NULL
+                            OR dr.box_count = 0 OR EXISTS (
                              SELECT 1 FROM detections consistent
                               WHERE consistent.photo_id = fa.photo_id
                                 AND consistent.detector_model

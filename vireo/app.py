@@ -8323,7 +8323,47 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             found.update(row["photo_id"] for row in rows)
         return found
 
-    def _resolve_exif_place_for_photo(db, photo, api_key, grid_cache):
+    _REVERSE_GEOCODE_CACHE_LANGUAGE_KEY = "_vireo_result_language"
+
+    def _google_maps_result_language(config):
+        """Return Google's language preference for the current configuration."""
+        return "en" if config.get("google_maps_prefer_english", True) else None
+
+    def _google_place_details(place_id, api_key, language):
+        """Fetch details while preserving the wrapper's default-on API."""
+        if language == "en":
+            return places.place_details(place_id, api_key)
+        return places.place_details(place_id, api_key, language=None)
+
+    def _google_reverse_geocode(lat, lng, api_key, language):
+        """Reverse-geocode while preserving the wrapper's default-on API."""
+        if language == "en":
+            return places.reverse_geocode(lat, lng, api_key)
+        return places.reverse_geocode(lat, lng, api_key, language=None)
+
+    def _decode_cached_reverse_geocode(cached, language):
+        """Return ``(matches_language, details)`` for a cached response."""
+        try:
+            details = json.loads(cached["response"] or "{}")
+        except (ValueError, TypeError):
+            details = {}
+        if not isinstance(details, dict):
+            details = {}
+        cached_language = details.pop(
+            _REVERSE_GEOCODE_CACHE_LANGUAGE_KEY, None,
+        )
+        return cached_language == language, details
+
+    def _encode_cached_reverse_geocode(details, language):
+        """Serialize details with the requested language for cache matching."""
+        payload = dict(details) if isinstance(details, dict) else {}
+        if language:
+            payload[_REVERSE_GEOCODE_CACHE_LANGUAGE_KEY] = language
+        return json.dumps(payload)
+
+    def _resolve_exif_place_for_photo(
+        db, photo, api_key, language, grid_cache,
+    ):
         """Resolve one photo's EXIF coordinates into normalized place details.
 
         Returns ``(details, reason)`` where ``details`` is the normalized
@@ -8349,24 +8389,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         cached = db.reverse_geocode_cache_get(lat, lng)
         if cached is not None:
-            if cached["place_id"] is None:
-                result = (None, "no_match")
+            language_matches, details = _decode_cached_reverse_geocode(
+                cached, language,
+            )
+            if language_matches:
+                if cached["place_id"] is None:
+                    result = (None, "no_match")
+                    grid_cache[grid] = result
+                    return result
+                if not details.get("place_id"):
+                    details["place_id"] = cached["place_id"]
+                if details.get("place_id"):
+                    result = (details, None)
+                else:
+                    result = (None, "no_match")
                 grid_cache[grid] = result
                 return result
-            try:
-                details = json.loads(cached["response"] or "{}")
-            except (ValueError, TypeError):
-                details = {}
-            if not isinstance(details, dict):
-                details = {}
-            if not details.get("place_id"):
-                details["place_id"] = cached["place_id"]
-            if details.get("place_id"):
-                result = (details, None)
-            else:
-                result = (None, "no_match")
-            grid_cache[grid] = result
-            return result
 
         if not api_key:
             result = (None, "no_api_key")
@@ -8374,7 +8412,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return result
 
         try:
-            details = places.reverse_geocode(lat, lng, api_key)
+            details = _google_reverse_geocode(
+                lat, lng, api_key, language,
+            )
         except places.PlacesTransientError:
             app.logger.warning(
                 "bulk reverse_geocode transient failure for photo=%s lat=%s lng=%s",
@@ -8391,7 +8431,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             lat,
             lng,
             place_id=cache_place_id,
-            response_json=json.dumps(details or {}),
+            response_json=_encode_cached_reverse_geocode(details, language),
         )
         if not details or not details.get("place_id"):
             result = (None, "no_match")
@@ -8716,7 +8756,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         assigned_ids = _location_keyword_photo_ids(db, photo_ids)
         import config as cfg
-        api_key = (cfg.load().get("google_maps_api_key", "") or "").strip()
+        maps_config = cfg.load()
+        api_key = (maps_config.get("google_maps_api_key", "") or "").strip()
+        language = _google_maps_result_language(maps_config)
 
         grid_cache = {}
         groups = {}
@@ -8737,7 +8779,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 })
                 continue
             details, reason = _resolve_exif_place_for_photo(
-                db, photo, api_key, grid_cache,
+                db, photo, api_key, language, grid_cache,
             )
             if reason is not None:
                 unresolved.append({
@@ -10184,10 +10226,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         details = _normalize_client_place_details(body)
         if details is None:
             import config as cfg
-            key = cfg.load().get("google_maps_api_key", "")
+            maps_config = cfg.load()
+            key = maps_config.get("google_maps_api_key", "")
             if not key:
                 return _google_maps_not_configured_error()
-            details = places.place_details(place_id, key)
+            details = _google_place_details(
+                place_id,
+                key,
+                _google_maps_result_language(maps_config),
+            )
             if details is None:
                 return _google_place_not_found_error()
 
@@ -10426,10 +10473,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         details = _normalize_client_place_details(body)
         if details is None:
             import config as cfg
-            key = cfg.load().get("google_maps_api_key", "")
+            maps_config = cfg.load()
+            key = maps_config.get("google_maps_api_key", "")
             if not key:
                 return _google_maps_not_configured_error()
-            details = places.place_details(place_id, key)
+            details = _google_place_details(
+                place_id,
+                key,
+                _google_maps_result_language(maps_config),
+            )
             if details is None:
                 return _google_place_not_found_error()
 
@@ -10596,30 +10648,33 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not (math.isfinite(lat) and math.isfinite(lng)):
             return json_error("invalid coords", 400)
 
+        import config as cfg
+
+        maps_config = cfg.load()
+        language = _google_maps_result_language(maps_config)
         db = _get_db()
         cached = db.reverse_geocode_cache_get(lat, lng)
         if cached is not None:
-            if cached["place_id"] is None:
-                # Cached negative — Google previously had no match here.
-                return jsonify({"place_id": None, "summary": None})
-            try:
-                details = json.loads(cached["response"])
-            except (ValueError, TypeError):
-                details = {}
-            return jsonify({
-                "place_id": cached["place_id"],
-                "summary": _summarize_details(details),
-            })
+            language_matches, details = _decode_cached_reverse_geocode(
+                cached, language,
+            )
+            if language_matches:
+                if cached["place_id"] is None:
+                    # Cached negative — Google previously had no match here.
+                    return jsonify({"place_id": None, "summary": None})
+                return jsonify({
+                    "place_id": cached["place_id"],
+                    "summary": _summarize_details(details),
+                })
 
         # Cache miss.
-        import config as cfg
-        key = cfg.load().get("google_maps_api_key", "")
+        key = maps_config.get("google_maps_api_key", "")
         if not key:
             # Don't cache here — see docstring.
             return jsonify({"place_id": None, "summary": None})
 
         try:
-            details = places.reverse_geocode(lat, lng, key)
+            details = _google_reverse_geocode(lat, lng, key, language)
         except places.PlacesTransientError:
             # OVER_QUERY_LIMIT / REQUEST_DENIED / network blip — Google
             # may answer this later, so do NOT cache. Returning null here
@@ -10635,7 +10690,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         db.reverse_geocode_cache_put(
             lat, lng,
             place_id=cache_place_id,
-            response_json=json.dumps(details or {}),
+            response_json=_encode_cached_reverse_geocode(details, language),
         )
         if details is None:
             return jsonify({"place_id": None, "summary": None})
@@ -10680,10 +10735,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         details = _normalize_client_place_details(body)
         if details is None:
             import config as cfg
-            key = cfg.load().get("google_maps_api_key", "")
+            maps_config = cfg.load()
+            key = maps_config.get("google_maps_api_key", "")
             if not key:
                 return _google_maps_not_configured_error()
-            details = places.place_details(place_id, key)
+            details = _google_place_details(
+                place_id,
+                key,
+                _google_maps_result_language(maps_config),
+            )
             if details is None:
                 return _google_place_not_found_error()
 

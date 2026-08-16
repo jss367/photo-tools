@@ -231,11 +231,47 @@ def test_reverse_geocode_parses_response(monkeypatch):
     "template_name",
     ["browse.html", "keywords.html", "location_review.html"],
 )
-def test_google_maps_javascript_loaders_request_english(template_name):
-    """All browser Places flows should use the English localization."""
+def test_google_maps_javascript_loaders_honor_english_preference(template_name):
+    """All browser Places flows should conditionally request English."""
     template = Path(__file__).parent.parent / "templates" / template_name
+    source = template.read_text()
 
-    assert "&libraries=places&language=en&loading=async" in template.read_text()
+    assert "google_maps_prefer_english" in source
+    assert "&language=en" in source
+
+
+def test_place_details_omits_language_when_disabled(monkeypatch):
+    """The local-name preference leaves Google's language parameter unset."""
+    from vireo import places
+
+    captured = []
+    monkeypatch.setattr(
+        "vireo.places.urllib.request.urlopen",
+        _make_fake_urlopen({"status": "ZERO_RESULTS"}, captured),
+    )
+
+    assert places.place_details("somewhere", "FAKE_KEY", language=None) is None
+    query = urllib.parse.parse_qs(
+        urllib.parse.urlparse(captured[0]).query,
+    )
+    assert "language" not in query
+
+
+def test_reverse_geocode_omits_language_when_disabled(monkeypatch):
+    """Reverse geocoding also supports Google's default localization."""
+    from vireo import places
+
+    captured = []
+    monkeypatch.setattr(
+        "vireo.places.urllib.request.urlopen",
+        _make_fake_urlopen({"status": "ZERO_RESULTS"}, captured),
+    )
+
+    assert places.reverse_geocode(1.0, 2.0, "FAKE_KEY", language=None) is None
+    query = urllib.parse.parse_qs(
+        urllib.parse.urlparse(captured[0]).query,
+    )
+    assert "language" not in query
 
 
 def test_reverse_geocode_returns_none_on_zero_results(monkeypatch):

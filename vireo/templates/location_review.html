@@ -1180,12 +1180,15 @@ body {
     return 12742000 * Math.asin(Math.min(1, Math.sqrt(value)));
   }
 
-  function loadGoogleMaps(apiKey) {
+  function loadGoogleMaps(apiKey, preferEnglish) {
     return new Promise(function(resolve, reject) {
       if (window.google && window.google.maps) { resolve(window.google); return; }
       window._vireoLocationReviewMapsReady = function() { resolve(window.google); };
       var script = document.createElement('script');
-      script.src = 'https://maps.googleapis.com/maps/api/js?key=' + encodeURIComponent(apiKey) + '&libraries=places&language=en&loading=async&callback=_vireoLocationReviewMapsReady';
+      script.src = 'https://maps.googleapis.com/maps/api/js?key=' +
+        encodeURIComponent(apiKey) + '&libraries=places' +
+        (preferEnglish ? '&language=en' : '') +
+        '&loading=async&callback=_vireoLocationReviewMapsReady';
       script.async = true;
       script.onerror = function() { reject(new Error('maps_load_failed')); };
       document.head.appendChild(script);
@@ -1214,7 +1217,10 @@ body {
     var message = document.getElementById('locationReviewMapMessage');
     if (state.config && state.config.google_maps_api_key) {
       try {
-        await loadGoogleMaps(state.config.google_maps_api_key);
+        await loadGoogleMaps(
+          state.config.google_maps_api_key,
+          state.config.google_maps_prefer_english !== false
+        );
         state.mapMode = 'google';
         state.map = new google.maps.Map(document.getElementById('locationReviewMap'), {
           center: {lat: 20, lng: 0}, zoom: 2, mapTypeId: 'roadmap',

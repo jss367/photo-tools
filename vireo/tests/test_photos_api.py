@@ -7198,6 +7198,37 @@ def test_post_photo_location_with_valid_place_id(app_and_db, monkeypatch):
     assert rows[0]["name"] == "Central Park"
 
 
+def test_post_photo_location_can_use_google_default_language(
+    app_and_db, monkeypatch,
+):
+    """Disabling the preference omits English from Place Details requests."""
+    import config as cfg
+    import places
+    app, db = app_and_db
+
+    cfg.save({
+        **cfg.load(),
+        "google_maps_api_key": "FAKE-KEY",
+        "google_maps_prefer_english": False,
+    })
+    captured = {}
+
+    def fake_place_details(place_id, key, *, language="en"):
+        captured["language"] = language
+        return _central_park_details()
+
+    monkeypatch.setattr(places, "place_details", fake_place_details)
+    photo_id = db.get_photos()[0]["id"]
+
+    response = app.test_client().post(
+        f"/api/photos/{photo_id}/location",
+        json={"place_id": "ChIJ_x"},
+    )
+
+    assert response.status_code == 200, response.get_json()
+    assert captured["language"] is None
+
+
 def test_post_photo_location_accepts_client_place_details_without_server_lookup(
     app_and_db, monkeypatch,
 ):
@@ -8011,10 +8042,12 @@ def test_reverse_geocode_cache_hit_returns_summary(app_and_db, monkeypatch):
     app, db = app_and_db
 
     lat, lng = 40.7828, -73.9654
+    cached_details = _central_park_geocode_response()
+    cached_details["_vireo_result_language"] = "en"
     db.reverse_geocode_cache_put(
         lat, lng,
         place_id="ChIJ4zGFAZpYwokRGUGph3Mf37k",
-        response_json=json.dumps(_central_park_geocode_response()),
+        response_json=json.dumps(cached_details),
     )
 
     # Counter-mock proves we never reached out to Google.
@@ -8044,7 +8077,12 @@ def test_reverse_geocode_cache_negative_hit_returns_null(app_and_db, monkeypatch
 
     lat, lng = 12.345, 67.890
     # Negative cache entry — Google was previously asked and returned no match.
-    db.reverse_geocode_cache_put(lat, lng, place_id=None, response_json="{}")
+    db.reverse_geocode_cache_put(
+        lat,
+        lng,
+        place_id=None,
+        response_json='{"_vireo_result_language": "en"}',
+    )
 
     calls = {"n": 0}
 
@@ -8094,6 +8132,54 @@ def test_reverse_geocode_cache_miss_calls_google_and_caches(app_and_db, monkeypa
     assert data2["place_id"] == data1["place_id"]
     assert data2["summary"] == data1["summary"]
     assert calls["n"] == 1  # unchanged — second call was served from cache
+
+
+def test_reverse_geocode_setting_change_refreshes_other_language_cache(
+    app_and_db, monkeypatch,
+):
+    """Changing the preference must not reuse a cache entry in another language."""
+    import json
+
+    import config as cfg
+    import places
+    app, db = app_and_db
+
+    lat, lng = 46.4596, 6.8420
+    english_details = _central_park_geocode_response()
+    english_details["_vireo_result_language"] = "en"
+    db.reverse_geocode_cache_put(
+        lat,
+        lng,
+        place_id=english_details["place_id"],
+        response_json=json.dumps(english_details),
+    )
+    cfg.save({
+        **cfg.load(),
+        "google_maps_api_key": "FAKE-KEY",
+        "google_maps_prefer_english": False,
+    })
+
+    requested_languages = []
+
+    def fake_reverse_geocode(lat_, lng_, key, *, language="en"):
+        requested_languages.append(language)
+        return _central_park_geocode_response()
+
+    monkeypatch.setattr(places, "reverse_geocode", fake_reverse_geocode)
+    client = app.test_client()
+
+    local_response = client.get(
+        f"/api/places/reverse-geocode?lat={lat}&lng={lng}",
+    )
+    assert local_response.status_code == 200
+    assert requested_languages == [None]
+
+    cfg.save({**cfg.load(), "google_maps_prefer_english": True})
+    english_response = client.get(
+        f"/api/places/reverse-geocode?lat={lat}&lng={lng}",
+    )
+    assert english_response.status_code == 200
+    assert requested_languages == [None, "en"]
 
 
 def test_reverse_geocode_cache_miss_caches_negative_when_google_returns_none(

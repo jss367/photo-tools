@@ -47,7 +47,6 @@ logger = logging.getLogger(__name__)
 
 _PLACE_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
 _GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
-_RESULT_LANGUAGE = "en"
 
 def _create_ssl_context():
     """Return a trust context containing configured and bundled CA roots."""
@@ -115,7 +114,12 @@ def _check_status(status: str, where: str) -> bool:
     return False
 
 
-def place_details(place_id: str, api_key: str) -> dict | None:
+def place_details(
+    place_id: str,
+    api_key: str,
+    *,
+    language: str | None = "en",
+) -> dict | None:
     """Look up a Google place by its ``place_id``.
 
     Returns the normalized dict described in the module docstring, or ``None``
@@ -125,8 +129,9 @@ def place_details(place_id: str, api_key: str) -> dict | None:
         "place_id": place_id,
         "key": api_key,
         "fields": "place_id,name,type,geometry/location,address_components",
-        "language": _RESULT_LANGUAGE,
     }
+    if language:
+        params["language"] = language
     url = f"{_PLACE_DETAILS_URL}?{urllib.parse.urlencode(params)}"
 
     try:
@@ -174,7 +179,13 @@ class PlacesTransientError(Exception):
     """
 
 
-def reverse_geocode(lat: float, lng: float, api_key: str) -> dict | None:
+def reverse_geocode(
+    lat: float,
+    lng: float,
+    api_key: str,
+    *,
+    language: str | None = "en",
+) -> dict | None:
     """Reverse-geocode a (lat, lng) pair via the Geocoding API.
 
     - Returns the normalized dict on success.
@@ -187,8 +198,9 @@ def reverse_geocode(lat: float, lng: float, api_key: str) -> dict | None:
     params = {
         "latlng": f"{lat},{lng}",
         "key": api_key,
-        "language": _RESULT_LANGUAGE,
     }
+    if language:
+        params["language"] = language
     url = f"{_GEOCODE_URL}?{urllib.parse.urlencode(params)}"
 
     try:

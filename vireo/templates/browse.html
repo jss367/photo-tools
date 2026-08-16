@@ -5549,6 +5549,7 @@ function reloadBrowseResults(options) {
 
 function updateScrollPosition() {
   var el = document.getElementById('filterSummary');
+  var positionOffset = Math.max(0, (earliestPage - 1) * perPage);
   if (photos.length === 0) {
     el.textContent = totalPhotos + ' photos';
     return;
@@ -5570,8 +5571,14 @@ function updateScrollPosition() {
   if (lastCard.offsetTop + lastCard.offsetHeight < scrollTop) {
     var frac = Math.min(1, (scrollTop + viewHeight / 2) / Math.max(1, container.scrollHeight));
     var skeletonCount = document.querySelectorAll('#gridTail .skel-card').length;
-    var representedPhotos = Math.min(totalPhotos, photos.length + skeletonCount);
-    var approx = Math.max(1, Math.min(representedPhotos, Math.round(frac * representedPhotos)));
+    var representedPhotos = Math.min(
+      totalPhotos - positionOffset,
+      photos.length + skeletonCount
+    );
+    var approx = positionOffset + Math.max(
+      1,
+      Math.min(representedPhotos, Math.round(frac * representedPhotos))
+    );
     el.textContent = '≈' + approx.toLocaleString() + ' of ' + totalPhotos.toLocaleString();
     return;
   }
@@ -5590,7 +5597,8 @@ function updateScrollPosition() {
       break;
     }
   }
-  el.textContent = first + '–' + last + ' of ' + totalPhotos.toLocaleString();
+  el.textContent = (positionOffset + first) + '–' +
+    (positionOffset + last) + ' of ' + totalPhotos.toLocaleString();
 }
 
 /* ---------- iNaturalist ---------- */

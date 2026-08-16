@@ -1185,7 +1185,18 @@ def test_browse_photo_id_deep_link_loads_target_after_first_folder_page(live_ser
     assert target_queries == []
 
     initial_ids = page.evaluate("photos.map(function(p) { return p.id; })")
-    assert page.evaluate("earliestPage") > 1
+    paging = page.evaluate("({earliestPage: earliestPage, perPage: perPage})")
+    initial_page = paging["earliestPage"]
+    assert initial_page > 1
+    position_summary = page.evaluate(
+        """() => {
+          updateScrollPosition();
+          return document.getElementById('filterSummary').textContent;
+        }"""
+    )
+    visible_range = re.match(r"(\d+)–(\d+) of", position_summary)
+    assert visible_range is not None
+    assert int(visible_range.group(1)) >= (initial_page - 1) * paging["perPage"] + 1
     page.locator("#loadPreviousPhotosButton").click()
     page.wait_for_function("photos.length > %d" % len(initial_ids), timeout=5000)
     assert page.evaluate("earliestPage") > 0

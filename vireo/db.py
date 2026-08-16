@@ -3228,6 +3228,22 @@ class Database:
                         AND manual_edit.undone = 0
                         AND manual_item.new_value = CAST(pk.keyword_id AS TEXT)
                   )
+                  AND NOT EXISTS (
+                      -- ``/api/sync/discard`` deliberately leaves no sidecar
+                      -- but records the discarded add as ``keyword_add:<value>``
+                      -- in a ``discard`` edit-history item. With a small
+                      -- ``_prune_edit_history`` limit that record can outlive
+                      -- the original ``keyword_add`` entry, so the discard
+                      -- item itself is durable evidence the tag was manual.
+                      SELECT 1
+                      FROM edit_history_items discard_item
+                      JOIN edit_history discard_edit
+                        ON discard_edit.id = discard_item.edit_id
+                      WHERE discard_item.photo_id = pk.photo_id
+                        AND discard_edit.action_type = 'discard'
+                        AND discard_edit.undone = 0
+                        AND discard_item.old_value = 'keyword_add:Wildlife' COLLATE NOCASE
+                  )
                   AND EXISTS (
                       SELECT 1
                       FROM photo_keywords species_pk
@@ -3272,20 +3288,46 @@ class Database:
                     else:
                         sidecar_wildlife_by_photo[pid] = False
                 else:
+                    # read_keywords() swallows ``ET.ParseError`` and returns
+                    # an empty set for a corrupt sidecar, which is
+                    # indistinguishable from a genuinely empty one. Parse
+                    # explicitly so a malformed sidecar defers retirement
+                    # (like the offline branch above) rather than silently
+                    # classifying the tag as generated and stripping it.
+                    import xml.etree.ElementTree as _ET
                     try:
-                        from xmp import read_keywords
-
-                        sidecar_wildlife_by_photo[pid] = any(
-                            keyword_match_key(value) == "wildlife"
-                            for value in read_keywords(xmp_path)
+                        _ET.parse(xmp_path)
+                    except _ET.ParseError:
+                        log.warning(
+                            "Corrupt sidecar %s during Wildlife retirement; deferring",
+                            xmp_path,
                         )
+                        sidecar_wildlife_by_photo[pid] = True
+                        deferred_unavailable_sidecar = True
                     except Exception:
                         log.warning(
-                            "Could not inspect Wildlife provenance in %s; preserving association",
+                            "Could not read sidecar %s during Wildlife retirement; deferring",
                             xmp_path,
                             exc_info=True,
                         )
                         sidecar_wildlife_by_photo[pid] = True
+                        deferred_unavailable_sidecar = True
+                    else:
+                        try:
+                            from xmp import read_keywords
+
+                            sidecar_wildlife_by_photo[pid] = any(
+                                keyword_match_key(value) == "wildlife"
+                                for value in read_keywords(xmp_path)
+                            )
+                        except Exception:
+                            log.warning(
+                                "Could not inspect Wildlife provenance in %s; deferring",
+                                xmp_path,
+                                exc_info=True,
+                            )
+                            sidecar_wildlife_by_photo[pid] = True
+                            deferred_unavailable_sidecar = True
             if sidecar_wildlife_by_photo[pid]:
                 continue
             ws = row["workspace_id"]

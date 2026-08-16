@@ -14261,6 +14261,117 @@ def test_retire_builtin_wildlife_defers_when_sidecar_unavailable(tmp_path):
     assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
 
 
+def test_retire_builtin_wildlife_defers_when_sidecar_is_corrupt(tmp_path):
+    """A malformed sidecar must defer retirement instead of stripping the tag.
+
+    ``read_keywords()`` swallows ``ET.ParseError`` and returns an empty set
+    for a corrupt XMP file, which is indistinguishable from a genuinely
+    empty sidecar. Without a corruption check the migration would classify
+    the association as generated, detach it from the database, queue a
+    sidecar removal, and stamp the completion marker so a later run could
+    never recover the tag. The migration must instead treat a parse failure
+    the same as an offline sidecar: preserve the association and leave the
+    marker unset so the next startup re-inspects the file.
+    """
+    from db import Database
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    xmp_path = photo_dir / "p1.xmp"
+    xmp_path.write_text("<not-valid-xml>", encoding="utf-8")
+    xmp_mtime = xmp_path.stat().st_mtime
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_mtime,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        (p1, wildlife_id),
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 0
+    # Association preserved and no sidecar removal queued, because the
+    # sidecar could not be parsed to prove the tag was auto-generated.
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+    # Marker stays unset so a later startup re-inspects this photo once the
+    # sidecar is repaired or replaced.
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) != "1"
+
+
+def test_retire_builtin_wildlife_preserves_discarded_manual_add(tmp_path):
+    """Discarded-add history is durable evidence a Wildlife tag was manual.
+
+    ``/api/sync/discard`` deliberately leaves no sidecar addition but
+    records the discarded change as a ``discard`` edit-history item whose
+    ``old_value`` is ``keyword_add:Wildlife``. With a small configurable
+    history limit that record can outlive the original ``keyword_add``
+    entry, so the migration would otherwise find no pending or retained
+    ``keyword_add`` evidence and delete the still-intentional association.
+    The discard item itself must be treated as manual-authorship evidence.
+    """
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        (p1, wildlife_id),
+    )
+    # Simulate the aftermath of a manual Wildlife add whose pending sidecar
+    # write was later discarded: the original ``keyword_add`` history entry
+    # has been pruned (small retention limit), leaving only the ``discard``
+    # record as authorship provenance.
+    db.record_edit(
+        "discard",
+        "Discarded 1 pending changes",
+        "",
+        [{"photo_id": p1, "old_value": "keyword_add:Wildlife", "new_value": ""}],
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 0
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+
+
 def test_retire_builtin_wildlife_queues_removal_in_every_owning_workspace(tmp_path):
     """A folder shared across workspaces must have the cleanup queued in each.
 

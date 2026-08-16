@@ -3384,10 +3384,21 @@ def test_concurrent_scanners_preserve_inference_reserve(monkeypatch):
             # in immediately.
             assert snapshot["cpu"]["allocated"] <= 4
 
-            with ledger.acquire(resource_ledger.ResourceRequest(
-                cpu=resource_ledger.cpu_inference_request(ledger.cpu_capacity),
-                lanes=("cpu_ml",),
-            )) as inference:
+            # Bound the inference acquire so a cpu_reserve regression
+            # surfaces as ResourceWaitCancelled instead of blocking the
+            # test thread until the CI job's own timeout hits — the whole
+            # point of this test is to fail fast when the reserve is
+            # bypassed and the first scanner still holds its lease.
+            _deadline = time.monotonic() + 5.0
+            with ledger.acquire(
+                resource_ledger.ResourceRequest(
+                    cpu=resource_ledger.cpu_inference_request(
+                        ledger.cpu_capacity,
+                    ),
+                    lanes=("cpu_ml",),
+                ),
+                cancel_check=lambda: time.monotonic() > _deadline,
+            ) as inference:
                 assert inference.cpu_permits == 8
         finally:
             release_first.set()

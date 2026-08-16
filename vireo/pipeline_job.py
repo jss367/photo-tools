@@ -7585,6 +7585,31 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 kp.ensure_keypoint_weights(
                                     kp_model, progress_callback=_dl_progress,
                                 )
+                    except ResourceWaitCancelled:
+                        # A cancel or pause that fires while another thread
+                        # holds the per-model download lock surfaces here
+                        # as ResourceWaitCancelled from
+                        # ``acquire_session_cache_lock`` — that is a
+                        # cooperative cancel, not a download failure.
+                        # Finalize the stage as cancelled the same way the
+                        # extract_masks path handles its own
+                        # ResourceWaitCancelled (line ~7293) so the job
+                        # tree does not report "failed to download
+                        # keypoint weights" for what was actually a user
+                        # cancel.
+                        abort.set()
+                        stages["eye_keypoints"]["status"] = "completed"
+                        runner.update_step(
+                            job["id"], "eye_keypoints",
+                            status="completed",
+                            summary="Cancelled",
+                        )
+                        result["stages"]["eye_keypoints"] = {
+                            "processed": 0, "total": total,
+                            "cancelled": True,
+                        }
+                        _update_stages(runner, job["id"], stages)
+                        return
                     except Exception as dl_err:
                         log.warning(
                             "Eye keypoints stage skipped — weight download "

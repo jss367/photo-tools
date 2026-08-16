@@ -178,7 +178,17 @@ def test_encode_text_caching(monkeypatch, tmp_path):
 
 
 def test_text_session_cache_wait_honors_cancellation(monkeypatch):
-    """A second cold lookup must not block past its interactive deadline."""
+    """A second cold lookup must not block past its interactive deadline.
+
+    The cancel is delayed until the worker has actually reached the
+    cache-lock contention loop and probed ``cancel_check`` mid-contention
+    — otherwise a blocking, non-cancellable guard that happens to check
+    cancellation only on entry (before any lock acquire) could satisfy
+    the outcome assertion because the first probe would already see the
+    cancel flag. Setting ``cancelled`` only after the mid-loop probe
+    fires makes the test verify cancellation during lock contention
+    rather than before it.
+    """
     import threading
 
     import text_encoder
@@ -188,12 +198,27 @@ def test_text_session_cache_wait_honors_cancellation(monkeypatch):
     cancelled = threading.Event()
     finished = threading.Event()
     outcome = []
+    contending = threading.Event()
+    probe_calls = {"n": 0}
+
+    def probing_cancel_check():
+        probe_calls["n"] += 1
+        # The first probe fires on guard entry, before any lock acquire.
+        # From the second probe onward, the worker has necessarily
+        # completed at least one ``acquire(timeout=0.05)`` round-trip
+        # against the held lock and is now polling ``cancel_check``
+        # during contention. Only signal after that point so the test
+        # can be sure the worker is actively contending when the cancel
+        # is triggered.
+        if probe_calls["n"] >= 2:
+            contending.set()
+        return cancelled.is_set()
 
     def lookup():
         try:
             text_encoder._get_text_session(
                 "ViT-B-16",
-                cancel_check=cancelled.is_set,
+                cancel_check=probing_cancel_check,
             )
         except ResourceWaitCancelled:
             outcome.append("cancelled")
@@ -204,6 +229,11 @@ def test_text_session_cache_wait_honors_cancellation(monkeypatch):
     thread = threading.Thread(target=lookup)
     thread.start()
     try:
+        assert contending.wait(timeout=2.0), (
+            "worker never polled cancel_check while contending on the "
+            "cache lock — either it never entered the guard or it "
+            "acquired the lock without blocking"
+        )
         cancelled.set()
         assert finished.wait(timeout=1.0)
         thread.join(timeout=1.0)

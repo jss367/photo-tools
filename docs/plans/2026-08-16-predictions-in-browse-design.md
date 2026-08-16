@@ -170,6 +170,23 @@ member's alternatives have to be resolved with it. Locked by
 `test_batch_accept_does_not_re_enter_rows_a_grouped_accept_covered` and
 `test_batch_accept_dedup_still_rejects_skipped_detection_alternatives`.
 
+**Expansion discovers undecided rows only.** The scope limits above protect
+the batch endpoint, which passes one; the *unscoped* callers — Review's
+`/api/predictions/<id>/accept`, highlight confirm, accept-subject — get no
+such list, and a grouped accept there reaches every member of the burst
+regardless of what the user already decided about them. So `accept_prediction`
+now excludes `accepted` and `rejected` members from the expansion itself:
+accepting one frame must not resurrect a sibling the user rejected in Review
+(tagging that photo with the species it was denied), nor re-flip a
+long-accepted one into a history item whose recorded previous status never
+happened — undo would then knock it back to pending. Rows the caller *named*
+are exempt, because then the caller chose them rather than the expansion: the
+entry row, and anything in `prediction_ids`. `batch-accept` never names a
+decided row (`_decided_prediction_ids` removes them first), so its behaviour
+is unchanged. Locked by
+`test_accept_prediction_grouped_skips_already_decided_members` in
+`vireo/tests/test_db.py`.
+
 ### The category is a snapshot; the Accept button is not
 
 `predictions.category` records how the prediction compared to the photo's
@@ -383,8 +400,26 @@ well-formed (`{"root":{"mode":"all","rules":[]},"visual":null}`), not a bare
 decision is already made, through one helper that owns the status list:
 `_decided_prediction_ids(db, pred_ids)` returns the `accepted` and `rejected`
 rows. Neither endpoint passes its own statuses, so the two cannot drift apart
-on what "still actionable" means. `alternative` rows stay actionable on both
-paths — they are the runners-up an accept promotes and a reject sweeps up.
+on what "still actionable" means. `alternative` is not a decision, so this
+helper passes those rows through on both paths — but "undecided" is where the
+two endpoints stop agreeing, and deliberately so (the full rule is below under
+*Ambiguity*, and stated once here so the two places cannot drift):
+
+**The alternative-row contract.** Wherever an `alternative` row exists on a
+`(detection, classifier_model)`, `batch-accept` accepts nothing on that key —
+neither the alternative itself nor the pending row it competes with, because
+`_ambiguous_prediction_ids` keys ambiguity on exactly that pair and both rows
+share it. Both come back under `skipped_ambiguous`, never `already_decided`,
+since the reason is "we would be picking a winner you were not shown", not "a
+decision already exists". `batch-reject` acts on both: submitted directly, an
+alternative is rejected on its own (its winner untouched — dismissing a
+runner-up says nothing about the row it lost to); submitted as the top-1, its
+alternatives are swept down with it, the same rule the single-photo reject
+already applies. Promoting a runner-up therefore has exactly one path,
+Review's `/api/predictions/<id>/accept`, which is where the user can see what
+they are choosing between. Locked by
+`test_batch_accept_skips_ambiguous_rows_with_alternatives` (both rows in one
+call) and `test_batch_reject_resolves_alternative_rows`.
 
 Both report the skipped count as `already_decided` (the accept side's earlier
 `already_accepted` was renamed once it also covered rejected rows — a field
@@ -493,11 +528,14 @@ Two consequences at the caller:
   edit, so an unconditional toast would advertise — and Ctrl+Z would
   reverse — some older, unrelated edit.
 
-Because the check applies to alternatives too, a row with an `alternative`
-sibling can no longer be accepted through this endpoint at all. That matches
-what the panel offers; Review's single-photo `/api/predictions/<id>/accept`
-is the path that deliberately still accepts with alternatives on screen, and
-is where the group-expansion behaviour is now covered.
+This is where the alternative-row contract stated above lands: because the
+check keys on `(detection, classifier_model)`, neither a row with an
+`alternative` sibling nor an `alternative` row itself can be accepted through
+this endpoint, and both are reported as `skipped_ambiguous`. That matches what
+the panel offers; Review's single-photo `/api/predictions/<id>/accept` is the
+path that deliberately still accepts with alternatives on screen, and is where
+the group-expansion behaviour is now covered. `batch-reject` is unaffected —
+it has no ambiguity check because there is no winner to pick.
 
 ## Testing
 
@@ -518,8 +556,14 @@ is where the group-expansion behaviour is now covered.
   and stays pending and untagged, and a reload of the suggestions endpoint
   agrees with what the write just did.
 - `test_batch_accept_skips_ambiguous_rows_with_alternatives` — the
-  alternative-sibling half of the same rule, and the no-op leaves nothing on
+  alternative half of the same rule, in both its shapes: the pending row that
+  *has* an alternative and the alternative row itself, submitted in one call,
+  both skipped as ambiguous (not as decided), and the no-op leaves nothing on
   the undo stack.
+- `test_batch_reject_resolves_alternative_rows` — the reject side of that
+  contract: an alternative submitted directly is rejected while its winner
+  stays undecided, and an alternative sibling of a submitted top-1 goes down
+  with it.
 - `test_batch_accept_skips_superseded_label_set_rows` /
   `test_batch_reject_skips_superseded_label_set_rows` — a payload rendered
   before a re-classification: the old row is skipped and counted as

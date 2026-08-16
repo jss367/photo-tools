@@ -18063,22 +18063,92 @@ def test_batch_accept_skips_ambiguous_rows_with_alternatives(app_and_db):
         status="alternative", labels_fingerprint="fp1",
     )
     pred_id = _prediction_id(db, photo_id, "TestZanclusgamma")
+    alt_id = _prediction_id(db, photo_id, "TestZanclusdelta")
     edits_before = len(db.get_edit_history(limit=50))
 
+    # Both halves of the contract in one call: the pending row that *has* an
+    # alternative, and the alternative row itself. ``_ambiguous_prediction_ids``
+    # keys on ``(detection, model)``, which the two share, so neither is
+    # acceptable here — promoting a runner-up stays a Review decision.
     resp = client.post(
-        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_id, alt_id]},
     )
     assert resp.status_code == 200, resp.get_data(as_text=True)
     body = resp.get_json()
     assert body["accepted"] == 0
-    assert body["skipped_ambiguous"] == 1
-    assert "TestZanclusgamma" not in {
-        k["name"] for k in db.get_photo_keywords(photo_id)
-    }
+    assert body["skipped_ambiguous"] == 2
+    assert body["already_decided"] == 0, (
+        "an alternative row is undecided, not decided — it is skipped for "
+        "ambiguity, and the count the user is shown has to say which"
+    )
+    assert {"TestZanclusgamma", "TestZanclusdelta"}.isdisjoint(
+        {k["name"] for k in db.get_photo_keywords(photo_id)}
+    )
     # A no-op must leave nothing on the undo stack: Browse gates its undo
     # toast on ``accepted``, and an entry here would let Ctrl+Z reverse some
     # older, unrelated edit.
     assert len(db.get_edit_history(limit=50)) == edits_before
+    assert app is not None
+
+
+def test_batch_reject_resolves_alternative_rows(app_and_db):
+    """The other half of the alternative contract: reject still acts on them.
+
+    ``batch-accept`` skips anything with an ``alternative`` in play because a
+    bare accept would pick a winner the user was never shown. Rejection has no
+    such problem — dismissing the species dismisses its runners-up too, which
+    is exactly what the single-photo reject already does — so the alternative
+    row is actionable here whether it is submitted directly or swept up as a
+    sibling of the row that was.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    swept_photo, swept_det = _seed_prediction_photo(
+        db, "reject-alt-sweep.jpg", "TestZanclusgamma", 0.7,
+    )
+    db.add_prediction(
+        swept_det, "TestZanclusdelta", 0.3, "bioclip",
+        status="alternative", labels_fingerprint="fp1",
+    )
+    direct_photo, direct_det = _seed_prediction_photo(
+        db, "reject-alt-direct.jpg", "TestZanclusgamma", 0.7,
+    )
+    db.add_prediction(
+        direct_det, "TestZanclusdelta", 0.3, "bioclip",
+        status="alternative", labels_fingerprint="fp1",
+    )
+
+    def _status(photo_id, species):
+        return db.conn.execute(
+            """SELECT pr_rev.status FROM predictions pr
+               JOIN detections d ON d.id = pr.detection_id
+               LEFT JOIN prediction_review pr_rev
+                 ON pr_rev.prediction_id = pr.id
+                AND pr_rev.workspace_id = ?
+               WHERE d.photo_id = ? AND pr.species = ?""",
+            (db._ws_id(), photo_id, species),
+        ).fetchone()["status"]
+
+    resp = client.post(
+        "/api/predictions/batch-reject",
+        json={"prediction_ids": [
+            _prediction_id(db, swept_photo, "TestZanclusgamma"),
+            _prediction_id(db, direct_photo, "TestZanclusdelta"),
+        ]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["rejected"] == 2
+    assert body["already_decided"] == 0
+    # Submitted top-1: its alternative goes down with it.
+    assert _status(swept_photo, "TestZanclusgamma") == "rejected"
+    assert _status(swept_photo, "TestZanclusdelta") == "rejected"
+    # Submitted alternative: rejected on its own, and the row it lost to is
+    # untouched — dismissing a runner-up says nothing about the winner.
+    assert _status(direct_photo, "TestZanclusdelta") == "rejected"
+    # No review row at all: the winner is still undecided, exactly as it was.
+    assert _status(direct_photo, "TestZanclusgamma") is None
     assert app is not None
 
 

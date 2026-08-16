@@ -17304,6 +17304,13 @@ class Database:
         whose intent really is "these photos" (highlight confirm, accept
         subject), where the row set is chosen by this method.
 
+        Independently of either limit, group expansion only ever *discovers*
+        undecided rows: a group member already ``accepted`` or ``rejected`` is
+        left alone unless the caller named it (as the entry row, or in
+        ``prediction_ids``). Accepting one burst member must not resurrect a
+        sibling the user rejected in Review, nor re-flip a long-accepted one
+        into a history item whose "previous" status never happened.
+
         Both limits are settled before the first write, so a call whose scope
         excludes every candidate row is a true no-op: no keyword row is
         created, no sibling alternative is rejected, no status is flipped. It
@@ -17448,11 +17455,39 @@ class Database:
                 )
                 return photo_allowed and row_allowed
 
+            def _expansion_allowed(this_pred_id, status):
+                """May group expansion *discover* this row?
+
+                Group expansion reaches rows the caller never named — that is
+                its whole point — so it must not reach rows whose decision is
+                already made. Without this, accepting one burst member from
+                Review re-accepts a sibling the user explicitly rejected
+                earlier (tagging that photo with the species it was denied)
+                and re-flips long-accepted siblings, whose "previous" status
+                in the resulting history item is then a fiction: undo would
+                knock them back to pending.
+
+                Rows the caller *named* are exempt, because then the caller,
+                not the expansion, chose them: the entry row itself, and any
+                row listed in ``limited_pred_ids``. ``batch-accept`` never
+                lists a decided row (``_decided_prediction_ids`` filters them
+                out first), so in practice this only ever exempts a row a
+                route was pointed at directly.
+                """
+                if this_pred_id == prediction_id:
+                    return True
+                if (
+                    limited_pred_ids is not None
+                    and this_pred_id in limited_pred_ids
+                ):
+                    return True
+                return status not in ("accepted", "rejected")
+
             # If grouped, accept every prediction in the group (in this
             # workspace) that survives the caller's scope.
             if pred["group_id"]:
                 group_preds = self.conn.execute(
-                    """SELECT pr.id, d.photo_id
+                    """SELECT pr.id, d.photo_id, pr_rev.status AS status
                        FROM predictions pr
                        JOIN prediction_review pr_rev
                          ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
@@ -17467,6 +17502,7 @@ class Database:
                     (gp["photo_id"], gp["id"])
                     for gp in group_preds
                     if _in_scope(gp["photo_id"], gp["id"])
+                    and _expansion_allowed(gp["id"], gp["status"])
                 ]
             elif _in_scope(pred["photo_id"], prediction_id):
                 targets = [(pred["photo_id"], prediction_id)]

@@ -7885,8 +7885,12 @@ def test_accept_prediction_out_of_scope_row_mutates_nothing(tmp_path):
 
     assert result["accepted_prediction_ids"] == []
     assert result["affected"] == []
-    assert _review_status(db, top) != "accepted"
-    assert _review_status(db, sibling) != "rejected", (
+    # Exactly ``None``, not merely "not accepted": a row this call was told
+    # to leave alone must carry no decision at all. ``!=`` would also pass if
+    # the entry row landed on the *other* terminal status, which is the same
+    # bug wearing the other hat.
+    assert _review_status(db, top) is None
+    assert _review_status(db, sibling) is None, (
         "an out-of-scope accept resolved the entry row's sibling"
     )
     # ``add_keyword`` is a write too — a no-op accept must not invent the
@@ -7951,12 +7955,84 @@ def test_accept_prediction_grouped_leaves_out_of_scope_entry_row_alone(tmp_path)
 
     assert result["accepted_prediction_ids"] == [pred_b]
     assert _review_status(db, pred_b) == "accepted"
-    assert _review_status(db, pred_a) != "accepted"
-    assert _review_status(db, alt_a) != "rejected", (
+    # Same exactness as above, against each row's untouched value: the entry
+    # row carries a ``prediction_review`` row because it is grouped, so it
+    # must still read exactly ``pending`` (``!= "accepted"`` would also pass
+    # if it had been rejected), while the alternative, which has no review
+    # row of its own, must still have none.
+    assert _review_status(db, pred_a) == "pending"
+    assert _review_status(db, alt_a) is None, (
         "the grouped accept resolved the out-of-scope entry row's "
         "alternative"
     )
     assert {a["photo_id"] for a in result["affected"]} == {photo_b}
+
+
+def test_accept_prediction_grouped_skips_already_decided_members(tmp_path):
+    """Group expansion may discover undecided rows only.
+
+    An unscoped accept — Review's ``/api/predictions/<id>/accept``, highlight
+    confirm, accept-subject — expands a burst accept to every member of the
+    group. Members the user already decided must be left exactly as they are:
+    re-accepting a *rejected* sibling tags that photo with the species the
+    user just denied it, and re-flipping an *accepted* one records a history
+    item whose "previous" status never happened, so undo would knock a
+    long-accepted row back to pending.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos")
+
+    def _seed(filename):
+        photo_id = db.add_photo(
+            folder_id=fid, filename=filename, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(photo_id, [
+            {"box": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4},
+             "confidence": 0.9, "category": "animal"},
+        ], detector_model="MDV6")[0]
+        db.add_prediction(
+            det_id, "Elk", 0.9, "bioclip", group_id="burst-decided",
+        )
+        pred_id = db.conn.execute(
+            "SELECT id FROM predictions WHERE detection_id = ?", (det_id,),
+        ).fetchone()["id"]
+        return photo_id, pred_id
+
+    photo_entry, pred_entry = _seed("entry.jpg")
+    photo_rejected, pred_rejected = _seed("rejected.jpg")
+    photo_accepted, pred_accepted = _seed("accepted.jpg")
+    photo_pending, pred_pending = _seed("pending.jpg")
+
+    # Decisions the user made in Review before this accept.
+    db.update_prediction_status(pred_rejected, "rejected")
+    db.update_prediction_status(pred_accepted, "accepted")
+
+    # Unscoped: exactly what Review's single-accept route does.
+    result = db.accept_prediction(pred_entry)
+
+    assert set(result["accepted_prediction_ids"]) == {pred_entry, pred_pending}
+    assert {a["photo_id"] for a in result["affected"]} == {
+        photo_entry, photo_pending,
+    }
+    assert _review_status(db, pred_rejected) == "rejected", (
+        "a grouped accept resurrected a sibling the user rejected"
+    )
+    assert _review_status(db, pred_accepted) == "accepted"
+    assert "Elk" not in {
+        k["name"] for k in db.get_photo_keywords(photo_rejected)
+    }, "the rejected sibling's photo was tagged with the denied species"
+    # The already-accepted member keeps whatever it had; it simply is not
+    # re-decided by this call, so undoing this accept cannot reset it.
+    assert pred_accepted not in result["accepted_prediction_ids"]
+
+    # Naming a decided row explicitly is the caller's call to make, and the
+    # exemption that keeps ``batch-accept``'s submitted-id scope meaningful.
+    named = db.accept_prediction(
+        pred_entry, prediction_ids=[pred_entry, pred_rejected],
+    )
+    assert pred_rejected in named["accepted_prediction_ids"]
 
 
 def test_get_existing_detection_photo_ids(tmp_path):

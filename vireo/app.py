@@ -16860,10 +16860,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             ).fetchall())
         return rows
 
-    # The one definition of "no longer actionable" for both batch prediction
-    # endpoints. ``pending`` rows are the normal case; ``alternative`` rows
-    # stay actionable on purpose — they are the runners-up an accept promotes
-    # and a reject sweeps up.
+    # The one definition of "already decided" for both batch prediction
+    # endpoints. ``pending`` rows are the normal case; ``alternative`` is not a
+    # decision, so this list deliberately omits it — but that only means the
+    # rows survive *this* filter. ``batch-reject`` then acts on them (a reject
+    # sweeps the runners-up down with the winner); ``batch-accept`` still
+    # refuses every row on a ``(detection, model)`` that carries one, via
+    # ``_ambiguous_prediction_ids`` below, because promoting a runner-up picks
+    # a winner the user was never shown. Skipped there is reported as
+    # ``skipped_ambiguous``, never ``already_decided``: the two counts name
+    # different problems with different next steps.
     _DECIDED_PREDICTION_STATUSES = ("accepted", "rejected")
 
     def _decided_prediction_ids(db, pred_ids):

@@ -155,29 +155,56 @@ so distinct taxa can never collide, then URL-safe encoded (see "Card ID
 encoding" below).
 
 **Node identity.** The graph keys each burst-group node as
-`(classifier_model, labels_fingerprint, job_id, group_id)`, not by
-`group_id` alone and not by `(model, fingerprint, group_id)` either.
-`_store_grouped_predictions` mints group IDs as
-`f"g{job_id[-6:]}-{group_count:04d}"`, so two classify jobs commonly
-share both `classifier_model` and `labels_fingerprint` — a re-run of the
-same model against the same label set is exactly that case — and if
-their truncated `job_id[-6:]` suffix plus per-job group counter also
-happens to match, the `(model, fingerprint, group_id)` tuple is still
-identical. That would let two unrelated bursts occupy one graph node
-and become one card without any same-taxon overlap edge, contradicting
-the goal. Adding the full `job_id` to the key makes the node identity
-collision-resistant on its own — two jobs cannot share a `job_id`
-regardless of what the group ID generator does — and eliminates any
-dependency on the group-ID uniqueness landing first. `job_id` is
-already available on every stored prediction row (via the job that
-wrote it), so the merge graph reads it alongside `group_id` without a
-schema change. Singleton nodes key on `(classifier_model,
-labels_fingerprint, job_id, "p" + prediction_id)` for the same reason
-— `job_id` is required for the group case, so keeping it in the
-singleton tuple keeps the shape uniform. A follow-up cleanup should
-still widen `_store_grouped_predictions` to use the full `job_id` (or a
-UUID) so downstream storage and history are collision-free too, but
-the merge graph does not depend on that landing first.
+`(classifier_model, labels_fingerprint, group_id)`. That tuple is
+collision-resistant *only if* the raw `group_id` is itself unique across
+jobs sharing the same model and fingerprint — which today's
+`_store_grouped_predictions` scheme
+(`f"g{job_id[-6:]}-{group_count:04d}"`, `classify_job.py:2212`) cannot
+guarantee: two same-model, same-fingerprint jobs whose truncated
+`job_id[-6:]` suffix and per-job group counter both align mint identical
+`group_id`s for disjoint photo sets. Two such bursts would occupy one
+graph node and become one card without any same-taxon overlap edge,
+contradicting the goal.
+
+The read side cannot repair this after the fact: `predictions` has no
+`job_id` column, `add_prediction` does not receive a job identifier, and
+`prediction_review` carries only the plain `group_id` string
+(`db.py:865-883, 925-935, 15802-15818`). Only the truncated 6-char
+suffix embedded inside `group_id` survives to disk, so no merge-time
+key over stored rows can recover the full job identity without a
+schema change and a companion backfill — which would violate the
+"works retroactively on existing prediction rows with no destructive
+migration" goal.
+
+The fix is on the write path, not the read path. **Phase 0 (new,
+prerequisite of §2)** widens `_store_grouped_predictions` to mint
+group IDs with enough entropy to be unique on their own. Two
+independently correct options — either lands the design's guarantees:
+
+- `gid = f"g{job_id}-{group_count:04d}"` — keeps the full `job_id`
+  (e.g. `classify-1732000000000-3`), which is unique across jobs by
+  construction (`jobs.py:689,763`). Backwards-compatible string;
+  read-side treats it as opaque.
+- `gid = f"g{secrets.token_hex(4)}-{group_count:04d}"` — appends 32
+  bits of entropy; collision probability under a per-job counter reset
+  is negligible even at high job volume.
+
+The design assumes option (a) unless profiling of downstream string
+handling shows the longer key hurts. Either way, the node key stays
+`(classifier_model, labels_fingerprint, group_id)` — no read-side
+change beyond §2, and no schema change to `predictions` or
+`prediction_review`. Rows written *before* Phase 0 keep their short
+IDs; their theoretical collision surface (two same-model,
+same-fingerprint jobs whose short suffix and counter both align)
+predates this feature and is left as-is. Phase 0 closes the window
+prospectively before the merge-graph work in Phase 3 ships, so all
+rows the merge graph reads with the new semantics are already
+collision-resistant.
+
+Singleton nodes key on `(classifier_model, labels_fingerprint, "p" +
+prediction_id)`; `prediction_id` is a unique primary key
+(`db.py:866`), so this tuple is collision-resistant on its own without
+depending on Phase 0.
 
 Why overlap, not identical membership: the two models' burst groups for the
 same event frequently differ by a frame or two — grouping runs per job, and
@@ -250,25 +277,52 @@ label set" honest (a merged card has no single model or fingerprint) and
 costs nothing: the server already receives the filter context, or the
 client can group the filtered subset by node identity.
 
-*Active-filter detection.* The existing Review client stores
-`currentModel` as a string (default `'all'`) and `currentLabelsFingerprint`
-as either a fingerprint string or `null` (default `null`, meaning "no
-filter"), and today it treats truthiness as "active" for the fingerprint
-side. The design uses those same sentinels: a filter is active when
-`currentModel && currentModel !== 'all'` or when
-`currentLabelsFingerprint` is truthy (i.e., non-null and non-empty). No
-sentinel change; the fallback branch runs only when the user has
-actually chosen a filter. (If the client is later refactored to use
-`'all'` as the labels-fingerprint no-filter sentinel, both checks
-collapse to `!== 'all'`; the design does not require that change.)
+*Active-filter detection.* The fallback runs whenever *any* of the
+four predicates `getVisibleItems` applies would hide rows the server
+returned — not just the model and fingerprint filters. Concretely
+(matching `review.html:1281-1300` verbatim):
+
+- `minConfidence > 0` — hides rows whose `confidence` is below the
+  slider value.
+- `currentModel && currentModel !== 'all'` — hides rows from other
+  classifier models.
+- `currentLabelsFingerprint` truthy (non-null, non-empty string) —
+  hides rows written under other label-set fingerprints.
+- `currentTab && currentTab !== 'all'` — hides rows whose `status`
+  differs from the selected tab (`pending` / `accepted` / `rejected`).
+
+Any single one being true triggers the per-node fallback for card
+construction. This is stricter than "model or fingerprint only" for
+good reason: a below-`minConfidence` bridge row, or an
+already-accepted `status != currentTab` sibling row, is exactly the
+kind of hidden bridge that lets the server-computed full-component
+`card_id` stitch two visible groups into one displayed card — and
+lets `/api/predictions/card?id=<card_id>` re-expose the hidden bridge
+rows on open. Forwarding the same predicates into the mutation POST
+(§3) is necessary but not sufficient: without also rebuilding the
+displayed card on the client, the *display* would still show a merged
+card whose members the mutation then refuses to touch, and the user
+would see a click that "does nothing" to visible siblings while
+silently mutating hidden ones. So the fallback trigger and the
+mutation scope tuple stay symmetric: same four predicates on both
+sides, always.
+
+No sentinel change is required — the existing `currentModel` default
+(`'all'`), `currentLabelsFingerprint` default (`null`), `minConfidence`
+default (`0`), and `currentTab` default (`'all'`) all resolve to
+"no filter active" under the checks above. (If the client is later
+refactored to use `'all'` as the labels-fingerprint no-filter sentinel
+too, the fingerprint check collapses to `!== 'all'`; the design does
+not require that change.)
 
 *Fallback dedup key.* Server computes `card_id` per row from the *full*
-row set; the client, whenever a filter is active, ignores `card_id` and
-dedups over the filtered rows by the row's **node identity** — the same
-tuple the server uses when building the merge graph (§2, "Node
-identity"): `(classifier_model, labels_fingerprint, job_id, group_id)`
-for grouped rows, and `(classifier_model, labels_fingerprint, job_id,
-"p" + prediction_id)` for singletons. Using node identity — not
+row set; the client, whenever a filter is active, ignores `card_id`
+entirely — both for deduping the displayed row set and for the
+subsequent mutation — and instead uses the row's **node identity** — the
+same tuple the server uses when building the merge graph (§2, "Node
+identity"): `(classifier_model, labels_fingerprint, group_id)` for
+grouped rows, and `(classifier_model, labels_fingerprint, "p" +
+prediction_id)` for singletons. Using node identity — not
 `(taxon_key, group_id)` — is essential: (a) singleton rows all carry
 `group_id = NULL`, so `(taxon_key, group_id)` would collapse every
 ungrouped prediction of the same taxon on unrelated photos into one
@@ -278,14 +332,48 @@ endpoint does *not* expose across filter boundaries, so the fallback is a strict
 subset of what the unfiltered view would show. The merged-card endpoint
 is never invoked from a filtered view.
 
+*Mutation ID from the fallback view.* Every row the server returns
+still carries the full-component `card_id`. In a filtered view that
+`card_id` is not a usable mutation handle: when the server-computed
+component contains N > 1 nodes and the filter causes the client to
+render some subset of them as separate fallback cards, every rendered
+row *shares the same* `card_id` (the anchor of the full component), so
+a POST that names only `card_id` cannot tell the server which of the
+visible fallback nodes was clicked; further, when the filter hides the
+node the server anchored on, the `card_id` decodes to a
+`smallest_member_key` that isn't in the visible set at all. Both
+failures produce silent mismatches between what the user clicked and
+what the mutation resolves. So from a filtered view the client sends
+the clicked row's node identity tuple verbatim
+(`(classifier_model, labels_fingerprint, group_id)` for grouped rows,
+`(classifier_model, labels_fingerprint, "p" + prediction_id)` for
+singletons) plus the full four-predicate scope tuple from §3, and does
+*not* send the server's `card_id`. The mutation POST therefore
+distinguishes two request shapes: (i) unfiltered — carries `card_id`,
+scope tuple all-`null`, server resolves the full component; (ii)
+filtered — carries `node_id` (the encoded node identity tuple, same
+base64url-of-JSON encoding as `card_id` for uniformity, decoding to
+`[classifier_model, labels_fingerprint, group_id_or_pid]`) plus the
+scope tuple, and the server treats the card as exactly that single
+node, resolving photos only from that node's members and running the
+same taxon-matched sibling pass §3 describes within the scope tuple.
+An unrecognized `node_id` (stale after a re-run) is a 400; a POST
+that carries both `card_id` and `node_id` is a client bug and
+rejected as a 400. From an unfiltered view the mutation shape is
+unchanged from what §3 already specifies.
+
 *Why the fallback matters for privacy.* If server-computed components
-stitched groups A and C together only through a group B whose
-fingerprint the user has just filtered out, opening the "A+C card" from
-the filtered view would otherwise re-expose B's hidden rows through the
+stitched groups A and C together only through a bridge row B that the
+current filter hides — a group at another fingerprint, a
+below-`minConfidence` row, a `status != currentTab` sibling, or a
+row from another classifier model — opening the "A+C card" from the
+filtered view would otherwise re-expose B's hidden rows through the
 `/api/predictions/card?id=<card_id>` union. Falling back to per-node
-cards in filtered views eliminates that exposure entirely. When the user
-clears the filter, the full server components (and the merged card
-endpoint) apply again.
+cards *and* per-node `node_id` mutation handles in filtered views
+eliminates that exposure entirely: the union endpoint is never called,
+and every mutation names exactly one visible node under the same scope
+tuple. When the user clears every filter, the full server components
+(and the merged card endpoint) apply again.
 
 ### 3. Cross-model accept and reject
 
@@ -298,34 +386,38 @@ and, if grouped, its group siblings — restricted to `pr.classifier_model =
 union**, not just the clicked group's photos:
 
 1. **Resolve the card, with the same filter scope the client rendered.**
-   The mutation POST carries the `card_id` **plus every filter
-   `getVisibleItems` applies** on the way from `/api/predictions` rows to
-   what the card actually shows. Concretely that is: `rules`,
-   `collection_id`, `model` (from `currentModel`), `labels_fingerprint`
-   (from `currentLabelsFingerprint`), `min_confidence` (from
-   `minConfidence`, `review.html:1281-1283`), and `status` (from
-   `currentTab`, `review.html:1298-1300`) — server-applied filters that
-   affected the GET plus client-applied filters that affected the
-   displayed card, one uniform tuple. The client already threads
-   `rules`/`collection_id` into `/api/predictions`
-   (`review.html:1091-1111`); the mutation is extended to carry the full
-   tuple (`review.html:1576-1581` and the reject path) verbatim. Note
-   the two hidden failure modes this closes: (a) a
-   below-`minConfidence` sibling row that bridges two groups would
-   otherwise stitch the server's full component through a row the user
-   couldn't see; (b) a `status != currentTab` row (e.g. an already-
-   accepted sibling on the "pending" tab) could similarly bridge or be
-   re-mutated. Both are excluded from the resolved component by
-   forwarding the same predicates. The server re-runs the same
-   card-building graph over the same scoped row set the GET used, then
-   intersects the resolved component with the returned rows so mutation
-   membership can never exceed the displayed membership. Where the
-   client sends only a `prediction_id`/`group_id` (older payloads,
-   deep-link buttons), the server treats the scope as "unfiltered" and
-   resolves the full-workspace card; a stale-but-scoped POST is
-   therefore safe (narrower than what the user sees), and a
-   stale-and-unscoped POST is a legacy behavior that simply matches
-   today's semantics.
+   The mutation POST carries **either** `card_id` (unfiltered view) **or**
+   `node_id` (filtered view — see §2 "Mutation ID from the fallback
+   view"), never both, **plus every filter `getVisibleItems` applies**
+   on the way from `/api/predictions` rows to what the card actually
+   shows. Concretely the scope tuple is: `rules`, `collection_id`,
+   `model` (from `currentModel`), `labels_fingerprint` (from
+   `currentLabelsFingerprint`), `min_confidence` (from `minConfidence`,
+   `review.html:1281-1283`), and `status` (from `currentTab`,
+   `review.html:1298-1300`) — server-applied filters that affected the
+   GET plus client-applied filters that affected the displayed card,
+   one uniform tuple. The client already threads `rules`/`collection_id`
+   into `/api/predictions` (`review.html:1091-1111`); the mutation is
+   extended to carry the full tuple (`review.html:1576-1581` and the
+   reject path) verbatim. Note the two hidden failure modes this
+   closes: (a) a below-`minConfidence` sibling row that bridges two
+   groups would otherwise stitch the server's full component through a
+   row the user couldn't see; (b) a `status != currentTab` row (e.g.
+   an already-accepted sibling on the "pending" tab) could similarly
+   bridge or be re-mutated. Both are excluded from the resolved
+   component by forwarding the same predicates. For a `card_id`
+   request, the server re-runs the same card-building graph over the
+   same scoped row set the GET used, then intersects the resolved
+   component with the returned rows so mutation membership can never
+   exceed the displayed membership. For a `node_id` request, the
+   server resolves exactly the named single node under the scope
+   tuple, without any component expansion — matching the per-node
+   fallback the filtered view rendered. Where the client sends only a
+   `prediction_id`/`group_id` (older payloads, deep-link buttons), the
+   server treats the scope as "unfiltered" and resolves the
+   full-workspace card; a stale-but-scoped POST is therefore safe
+   (narrower than what the user sees), and a stale-and-unscoped POST
+   is a legacy behavior that simply matches today's semantics.
 2. **Enumerate photos from the resolved (filtered) component.** The
    candidate photo set is the union of every member group's/singleton's
    photos *within the resolved card* — not the clicked group's photos, and
@@ -471,6 +563,18 @@ caeruleus*") on the Keywords page with a one-click merge.
 
 Each phase lands as its own PR and is independently useful.
 
+0. **Collision-resistant `group_id` in `_store_grouped_predictions`**
+   (prerequisite of Phase 3; see §2 "Node identity"). Change the ID
+   template from `f"g{job_id[-6:]}-{group_count:04d}"` to
+   `f"g{job_id}-{group_count:04d}"` (or the `secrets.token_hex(4)`
+   variant if the longer key impacts downstream string handling). Tests:
+   the same job's group IDs remain distinct; two independently minted
+   jobs' group IDs are always distinct across every combination of
+   `classifier_model` × `labels_fingerprint`; existing consumers of
+   `group_id` (`add_prediction`, `prediction_review.group_id`,
+   `_folded_species_key`, the review-endpoint dedup path) accept the
+   longer string unchanged (opaque). No schema change; no read-side
+   change; safe to land ahead of the merge feature.
 1. **Taxon key helper** (`taxonomy.py`) + unit tests: scientific-name hit,
    common-name hit, normalized hit, alternate-name via **pre-seeded lookup
    cache** (no live HTTP in the test path), unresolvable fallback,
@@ -488,50 +592,81 @@ Each phase lands as its own PR and is independently useful.
    models, same taxon, 8-vs-7 overlap) yields one `card_id`; different taxa
    don't merge; model filter yields per-model cards; **transitive overlap
    fixture** (three groups A/B/C forming an A-B-C chain, same taxon) yields
-   one `card_id` covering the full union; **group-id-collision fixture**
-   (two classify jobs with the *same* `classifier_model` and
-   `labels_fingerprint` whose truncated `job_id` suffix and group counter
-   both collide, minting identical raw `group_id`s for disjoint photo
-   sets) stays as two separate nodes — because their full `job_id`s
-   differ, the four-tuple node identity distinguishes them — and does
-   not merge into one card; **cross-fingerprint hidden-row
-   fixture** (groups A and C at fingerprint X, group B at fingerprint Y
-   bridging them by shared photos, plus a singleton S with the same
-   taxon on an unrelated photo) — with the fingerprint filter set to X,
-   the client dedups the filtered rows by node identity and shows A, C,
-   and S as three separate cards (the singleton is not collapsed into
-   A/C), and the merged-card endpoint is not called; with the filter
-   cleared, A+B+C become one card and S stays separate (no photo
-   overlap) as expected; **singleton-collapse-bug fixture** (three
-   singleton predictions of the same taxon on three unrelated photos,
-   any filter active) — the fallback preserves all three as distinct
-   rows and does not collapse them into one; **URL-hostile card-id fixture** — a `name:`-keyed card
-   derived from a custom label whose folded form contains `/`, `?`, `#`,
-   `|`, and `:` (all of which appear inside the raw taxon/member key
-   syntax) round-trips through the JSON-structured base64url-encoded id
-   and the card endpoint's query parameter without a 404, and the server
-   decodes back to the exact `(taxon_key, member_key)` pair.
+   one `card_id` covering the full union; **group-id-uniqueness
+   fixture** (two classify jobs with the *same* `classifier_model` and
+   `labels_fingerprint`, run back-to-back so their timestamps land in
+   the same second and their per-job group counters both start at 1)
+   mint distinct `group_id`s under the Phase 0 write path — full
+   `job_id` in the ID template makes them different by construction —
+   so their `(classifier_model, labels_fingerprint, group_id)` nodes
+   are distinct and their disjoint bursts stay as two separate cards;
+   the same fixture built with legacy pre-Phase-0 rows (same short
+   suffix + counter, colliding `group_id`) still resolves as two cards
+   *when their taxa or photo memberships differ* (no edge is drawn),
+   and is documented as a known pre-Phase-0 collision surface when
+   both taxa and disjoint photos coincidentally line up (this predates
+   the feature and is what Phase 0 closes prospectively);
+   **cross-fingerprint hidden-row fixture** (groups A and C at
+   fingerprint X, group B at fingerprint Y bridging them by shared
+   photos, plus a singleton S with the same taxon on an unrelated
+   photo) — with the fingerprint filter set to X, the client dedups
+   the filtered rows by node identity and shows A, C, and S as three
+   separate cards (the singleton is not collapsed into A/C), and the
+   merged-card endpoint is not called; with the filter cleared, A+B+C
+   become one card and S stays separate (no photo overlap) as
+   expected; **min-confidence hidden-bridge fixture** — groups A and F
+   at confidence above the slider, group E at confidence below, E
+   shares a photo with both A and F; with `minConfidence` raised above
+   E, the fallback triggers (per §2 "Active-filter detection"), A and
+   F render as two separate cards, and the merged-card endpoint is
+   not called; with `minConfidence = 0`, A+E+F become one card;
+   **status-tab hidden-bridge fixture** — a `currentTab = 'pending'`
+   view with an already-accepted sibling G on a photo shared between
+   pending groups A and F: the fallback triggers, A and F render as
+   two separate cards, and G is untouched by any subsequent mutation;
+   **singleton-collapse-bug fixture** (three singleton predictions of
+   the same taxon on three unrelated photos, any filter active) — the
+   fallback preserves all three as distinct rows and does not collapse
+   them into one; **URL-hostile card-id fixture** — a `name:`-keyed
+   card derived from a custom label whose folded form contains `/`,
+   `?`, `#`, `|`, and `:` (all of which appear inside the raw
+   taxon/member key syntax) round-trips through the JSON-structured
+   base64url-encoded id and the card endpoint's query parameter
+   without a 404, and the server decodes back to the exact
+   `(taxon_key, member_key)` pair; **filtered-view mutation-ID
+   fixture** — with any of the four active filters, the client's
+   mutation POST carries `node_id` (not `card_id`), and a fixture
+   POST that names a non-existent `node_id` or that carries both
+   `card_id` and `node_id` returns 400.
 4. **Cross-model accept/reject** + undo coverage. DB tests: accepting the
-   merged card flips both models' rows; undo restores both; reject mirrors;
-   Compare's `accept_subject_species` matches across name variants;
-   **transitive-component accept fixture** — accepting the A-B-C card flips
-   every pending row on photos 1-4 for the matching taxon and leaves other
-   taxa untouched; undo restores every flipped row (including C's);
-   **scoped-mutation fixture** — with a collection filter that excludes
-   group D (same taxon, overlapping photos), the accept POST carries the
-   collection scope and D's rows stay pending; without the filter, D
-   merges and is accepted; a **min-confidence-scoped fixture** —
+   merged card (unfiltered — POST carries `card_id`) flips both models'
+   rows; undo restores both; reject mirrors; Compare's
+   `accept_subject_species` matches across name variants;
+   **transitive-component accept fixture** — accepting the A-B-C card
+   (POST carries `card_id`, no filter scope) flips every pending row on
+   photos 1-4 for the matching taxon and leaves other taxa untouched;
+   undo restores every flipped row (including C's); **scoped-mutation
+   fixture** — with a collection filter that excludes group D (same
+   taxon, overlapping photos), the accept POST carries `card_id` plus
+   the collection scope and D's rows stay pending; without the filter,
+   D merges and is accepted; a **min-confidence-scoped fixture** —
    `minConfidence` is set above group E's confidence so E is hidden and
    would otherwise bridge two visible groups A and F through a shared
-   photo, the accept POST carries `min_confidence` and E's rows stay
-   pending while A and F resolve; a **status-scoped fixture** — with
-   `currentTab` = `pending`, an already-accepted sibling row G on a
-   bridging photo is excluded from the displayed component and the
-   POST carries `status = "pending"` so G is not re-mutated and does
-   not stitch unrelated groups together; a stale POST that omits the
-   scope tuple resolves the full-workspace card (documented legacy
-   behavior); a POST that carries a scope narrower than the server's
-   full component cannot exceed the displayed membership.
+   photo, the accept POST from a filtered view carries `node_id`
+   (naming A's node) plus `min_confidence` and only A is resolved,
+   E and F stay pending; accepting F likewise resolves only F; a
+   **status-scoped fixture** — with `currentTab` = `pending`, an
+   already-accepted sibling row G on a bridging photo is excluded from
+   the displayed component and a per-node `node_id` accept plus
+   `status = "pending"` in the scope tuple leaves G untouched and does
+   not stitch unrelated groups together; a **filtered-mutation shape
+   fixture** — a POST that carries both `card_id` and `node_id` is
+   rejected 400; a POST that carries a `node_id` unknown to the server
+   (e.g. after a re-run rewrote group IDs) is rejected 400; a stale
+   POST that omits the scope tuple resolves the full-workspace card
+   (documented legacy behavior); a POST that carries a scope narrower
+   than the server's full component cannot exceed the displayed
+   membership.
 5. **Keyword canonicalization** (taxon-matched keyword reuse) + the
    "tags as …" transparency note. DB tests: **inat-id-translation
    fixture** — an existing "Eurasian Blue Tit" keyword linked to the

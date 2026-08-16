@@ -1224,6 +1224,69 @@ def test_browse_photo_id_deep_link_loads_target_after_first_folder_page(live_ser
     expect(page.locator("#loadPreviousPhotosBanner")).to_be_hidden()
 
 
+def test_browse_photo_id_deep_link_invalidates_older_workspace_load(live_server, page):
+    """A focused folder claim must discard a load started during metadata fetch."""
+    _, folder_b = live_server["data"]["folders"]
+    target_id = live_server["data"]["photos"][4]
+
+    page.goto(f"{live_server['url']}/browse")
+    page.wait_for_function("browseDatasetReady", timeout=5000)
+
+    result = page.evaluate(
+        """async ({targetId, folderId}) => {
+          const originalFetch = window.safeFetch;
+          let releaseMetadata;
+          let releaseOldLoad;
+          let metadataRequested;
+          let oldLoadRequested;
+          const metadataSeen = new Promise(resolve => { metadataRequested = resolve; });
+          const oldLoadSeen = new Promise(resolve => { oldLoadRequested = resolve; });
+          const metadataResponse = new Promise(resolve => { releaseMetadata = resolve; });
+          const oldLoadResponse = new Promise(resolve => { releaseOldLoad = resolve; });
+          let interceptOldLoad = false;
+
+          window.safeFetch = async function(url, options, behavior) {
+            if (url === '/api/photos/' + targetId) {
+              metadataRequested();
+              return metadataResponse;
+            }
+            if (interceptOldLoad && url === '/api/photos/query') {
+              interceptOldLoad = false;
+              oldLoadRequested();
+              return oldLoadResponse;
+            }
+            return originalFetch.call(window, url, options, behavior);
+          };
+
+          try {
+            const deepLink = _runPhotoDeepLink(targetId);
+            await metadataSeen;
+
+            interceptOldLoad = true;
+            const oldLoad = resetAndLoad();
+            await oldLoadSeen;
+
+            releaseMetadata({id: targetId, folder_id: folderId});
+            await deepLink;
+            releaseOldLoad({photos: [{id: -999, folder_id: -1}], total: 1});
+            await oldLoad;
+
+            return {
+              activeFolderId,
+              ids: photos.map(function(photo) { return photo.id; }),
+            };
+          } finally {
+            window.safeFetch = originalFetch;
+          }
+        }""",
+        {"targetId": target_id, "folderId": folder_b},
+    )
+
+    assert result["activeFolderId"] == folder_b
+    assert target_id in result["ids"]
+    assert -999 not in result["ids"]
+
+
 def test_browse_lightbox_arrows_preserve_one_to_one_zoom(live_server, page):
     """Navigating from a 1:1 lightbox view keeps the next photo at 1:1."""
     url = live_server["url"]

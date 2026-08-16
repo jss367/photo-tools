@@ -278,6 +278,16 @@ def _classify_plan(
     scope_ids = (
         list(db.get_photo_ids()) if photo_ids is None else list(photo_ids)
     )
+    try:
+        from computation_cache import megadetector_runtime_fingerprint
+
+        detector_runtime = megadetector_runtime_fingerprint()
+    except (OSError, ValueError):
+        detector_runtime = None
+    current_detector_photo_ids = db.get_detector_run_photo_ids(
+        "megadetector-v6",
+        runtime_fingerprint=detector_runtime,
+    )
     contextual_weak_ids = set()
     weak_detection_confidence = pipeline_cfg.get(
         "weak_detection_confidence", 0.12,
@@ -318,11 +328,9 @@ def _classify_plan(
     # floor are counted as fallback candidates. Without it the plan would
     # ignore noise-only photos even though classify_stage now sends them
     # through the full-image fallback (PR #1484).
-    fallback_photo_ids = photo_ids
-    if contextual_weak_ids:
-        fallback_photo_ids = (
-            set(db.get_photo_ids()) if photo_ids is None else set(photo_ids)
-        ) - contextual_weak_ids
+    fallback_photo_ids = (
+        set(scope_ids) - contextual_weak_ids
+    ) & current_detector_photo_ids
     full_image_fallbacks = db.count_full_image_fallback_photos(
         fallback_photo_ids, min_conf=detector_confidence,
     )
@@ -423,22 +431,9 @@ def _classify_plan(
                     "fingerprint_reason": fingerprint_reason,
                 },
             }
-        try:
-            from computation_cache import megadetector_runtime_fingerprint
-
-            detector_runtime = megadetector_runtime_fingerprint()
-        except (OSError, ValueError):
-            detector_runtime = None
-        detected_photo_ids = (
-            db.get_detector_run_photo_ids(
-                "megadetector-v6",
-                runtime_fingerprint=detector_runtime,
-            )
-            if detector_runtime is not None else set()
-        )
         if (
             scope_ids
-            and set(scope_ids).issubset(detected_photo_ids)
+            and set(scope_ids).issubset(current_detector_photo_ids)
             and new_count == 0
         ):
             return {

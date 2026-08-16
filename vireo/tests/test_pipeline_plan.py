@@ -289,6 +289,43 @@ def test_full_image_fallback_counts_reject_torn_detector_run(tmp_path):
     ) == 0
 
 
+def test_classify_plan_excludes_stale_runtime_noise_fallback(
+    tmp_path, monkeypatch,
+):
+    from pipeline_plan import compute_plan
+
+    db, folder_id = _make_db(tmp_path)
+    photo_id, _ = _add_photo_with_detection(
+        db, folder_id, "stale-noise.jpg", conf=0.05,
+    )
+    db.record_detector_run(
+        photo_id, "megadetector-v6", box_count=1,
+        runtime_fingerprint="old-runtime",
+    )
+
+    import labels as labels_mod
+    import models as models_mod
+
+    monkeypatch.setattr(models_mod, "get_models", lambda: [
+        {"id": "m1", "name": "BioCLIP-2",
+         "model_str": "hf-hub:imageomics/bioclip-2",
+         "model_type": "bioclip", "downloaded": True,
+         "weights_path": _tol_weights(tmp_path)},
+    ])
+    monkeypatch.setattr(labels_mod, "get_active_labels", lambda: [])
+    monkeypatch.setattr(labels_mod, "get_saved_labels", lambda: [])
+    monkeypatch.setattr(
+        "computation_cache.megadetector_runtime_fingerprint",
+        lambda: "current-runtime",
+    )
+
+    classify = compute_plan(
+        db, _params(model_ids=["m1"]), str(tmp_path / "test.db"),
+    )["stages"]["Classify"]
+    assert classify["state"] == "will-run"
+    assert classify["detail"]["full_image_fallbacks"] == 0
+
+
 def test_count_classify_pending_excludes_recorded_runs(tmp_path):
     """The pending-pair count must mirror the classify gate exactly: a
     detection with a classifier_runs row for (model, fp) is done.

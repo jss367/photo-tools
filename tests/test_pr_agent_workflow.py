@@ -157,6 +157,12 @@ def test_merge_gate_requires_live_head_and_resolved_current_threads():
     assert ".headSha == $head" in action
     assert '"$test_status" != "completed"' in action
     assert '"$test_conclusion" != "success"' in action
+    assert "select(.created_at >= $authorized_at)" in action
+    assert 'test("^/merge[[:space:]]+[0-9a-fA-F]{7,40}[[:space:]]*$")' in action
+    assert 'if [[ "$newer_feedback" -gt 0 ]]' in action
+    assert "PR_AGENT_TITLE_$(openssl rand -hex 16)" in action
+    assert 'while grep -Fqx "$title_delimiter"' in action
+    assert "title<<PR_AGENT_TITLE" not in action
 
 
 def test_routine_contract_is_bounded_quiet_and_resolves_addressed_threads():
@@ -185,13 +191,20 @@ def test_merge_is_synchronous_and_retried_only_for_the_authorized_tested_head():
     assert "sort_by(.submitted_at)" in workflow
     assert '"$latest_state" == "APPROVED"' in workflow
     assert '"$TESTED_HEAD" == "$approved_head"*' in workflow
+    assert 'authorized_at=""' in workflow
+    assert 'echo "authorized_at=${authorized_at}"' in workflow
+    assert "authorized-at: ${{ github.event.review.submitted_at }}" in workflow
+    assert "authorized-at: ${{ github.event.comment.created_at }}" in workflow
+    assert "authorized-at: ${{ steps.authorization.outputs.authorized_at }}" in workflow
     assert workflow.count('--match-head-commit "$HEAD_SHA"') == 3
 
 
 def test_merge_jobs_can_read_the_exact_heads_tests_run():
     workflow = _read(WORKFLOW)
 
-    merge_permissions = "permissions:\n      actions: read\n      contents: write\n      pull-requests: write"
+    merge_permissions = (
+        "permissions:\n      actions: read\n      contents: write\n      issues: read\n      pull-requests: write"
+    )
     assert workflow.count(merge_permissions) == 3
 
 

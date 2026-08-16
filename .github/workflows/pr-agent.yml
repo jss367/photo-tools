@@ -552,6 +552,7 @@ jobs:
     permissions:
       actions: read
       contents: write
+      issues: read
       pull-requests: write
     steps:
       - name: Authorize human reviewer
@@ -581,6 +582,7 @@ jobs:
           pr: ${{ github.event.pull_request.number }}
           token: ${{ secrets.GITHUB_TOKEN }}
           approved-head: ${{ github.event.review.commit_id }}
+          authorized-at: ${{ github.event.review.submitted_at }}
 
       - name: Squash-merge authorized head
         if: steps.ready.outputs.ready == 'true'
@@ -615,6 +617,7 @@ jobs:
     permissions:
       actions: read
       contents: write
+      issues: read
       pull-requests: write
     steps:
       - name: Parse human merge authorization
@@ -651,6 +654,7 @@ jobs:
           pr: ${{ github.event.issue.number }}
           token: ${{ secrets.GITHUB_TOKEN }}
           approved-head: ${{ steps.command.outputs.approved_head }}
+          authorized-at: ${{ github.event.comment.created_at }}
 
       - name: Squash-merge authorized head
         if: steps.ready.outputs.ready == 'true'
@@ -682,8 +686,8 @@ jobs:
     permissions:
       actions: read
       contents: write
-      pull-requests: write
       issues: read
+      pull-requests: write
     steps:
       - name: Recover head-bound human authorization
         id: authorization
@@ -708,9 +712,10 @@ jobs:
             exit 0
           fi
 
-          reviews=$(gh api "repos/${REPO}/pulls/${pr}/reviews" --paginate --slurp | jq 'add')
+          authorized_at=""
+          reviews=$(gh api "repos/${REPO}/pulls/${pr}/reviews" --paginate --slurp | jq 'add // []')
           for actor in $HUMAN_MERGE_ACTORS; do
-            latest_state=$(jq -r --arg actor "$actor" --arg head "$TESTED_HEAD" '
+            latest_review=$(jq -r --arg actor "$actor" --arg head "$TESTED_HEAD" '
               [ .[] | select(
                   .user.login == $actor
                   and .commit_id == $head
@@ -718,18 +723,16 @@ jobs:
                 ) ]
               | sort_by(.submitted_at)
               | last
-              | .state // empty' <<< "$reviews")
-            if [[ "$latest_state" == "APPROVED" ]]; then
-              {
-                echo "authorized=true"
-                echo "pr=${pr}"
-                echo "head=${TESTED_HEAD}"
-              } >> "$GITHUB_OUTPUT"
-              exit 0
+              | [(.state // ""), (.submitted_at // "")]
+              | @tsv' <<< "$reviews")
+            IFS=$'\t' read -r latest_state latest_submitted_at <<< "$latest_review"
+            if [[ "$latest_state" == "APPROVED" \
+              && "$latest_submitted_at" > "$authorized_at" ]]; then
+              authorized_at="$latest_submitted_at"
             fi
           done
 
-          comments=$(gh api "repos/${REPO}/issues/${pr}/comments" --paginate --slurp | jq 'add')
+          comments=$(gh api "repos/${REPO}/issues/${pr}/comments" --paginate --slurp | jq 'add // []')
           while IFS= read -r encoded; do
             comment=$(base64 --decode <<< "$encoded")
             author=$(jq -r '.user.login' <<< "$comment")
@@ -744,17 +747,24 @@ jobs:
             if [[ "$body" =~ ^/merge[[:space:]]+([0-9a-fA-F]{7,40})[[:space:]]*$ ]]; then
               approved_head=$(tr '[:upper:]' '[:lower:]' <<< "${BASH_REMATCH[1]}")
               if [[ "$TESTED_HEAD" == "$approved_head"* ]]; then
-                {
-                  echo "authorized=true"
-                  echo "pr=${pr}"
-                  echo "head=${TESTED_HEAD}"
-                } >> "$GITHUB_OUTPUT"
-                exit 0
+                created_at=$(jq -r '.created_at' <<< "$comment")
+                if [[ "$created_at" > "$authorized_at" ]]; then
+                  authorized_at="$created_at"
+                fi
               fi
             fi
           done < <(jq -r '.[] | @base64' <<< "$comments")
 
-          echo "No human authorization is bound to PR #${pr} head ${TESTED_HEAD}."
+          if [[ -z "$authorized_at" ]]; then
+            echo "No human authorization is bound to PR #${pr} head ${TESTED_HEAD}."
+            exit 0
+          fi
+          {
+            echo "authorized=true"
+            echo "authorized_at=${authorized_at}"
+            echo "pr=${pr}"
+            echo "head=${TESTED_HEAD}"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v5
         if: steps.authorization.outputs.authorized == 'true'
@@ -771,6 +781,7 @@ jobs:
           pr: ${{ steps.authorization.outputs.pr }}
           token: ${{ secrets.GITHUB_TOKEN }}
           approved-head: ${{ steps.authorization.outputs.head }}
+          authorized-at: ${{ steps.authorization.outputs.authorized_at }}
 
       - name: Squash-merge authorized tested head
         if: steps.ready.outputs.ready == 'true'

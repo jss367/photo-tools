@@ -143,6 +143,8 @@ forge.
   is still current, every non-outdated review thread is resolved, and the Tests
   workflow succeeded for that exact head. If authorization arrives while Tests
   is running, the successful workflow run retries the same head-bound merge.
+  Actionable top-level feedback posted at or after that authorization requires
+  a fresh approval or exact merge command before the head can merge.
 
 Merge calls use `gh pr merge --match-head-commit` without `--auto`, so no
 authorization remains armed across a later push. Merge jobs also skip closed

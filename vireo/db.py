@@ -18057,6 +18057,7 @@ class Database:
         *,
         contextual_weak_photo_ids=None,
         weak_confidence=None,
+        fresh_detections_by_photo=None,
     ):
         """Return the SET of photo IDs the classify runtime skips at the
         ``raw_real_dets`` continue branch.
@@ -18070,6 +18071,23 @@ class Database:
         from the ETA's ``remaining_photos`` count a tail of below-
         threshold photos can inflate a numeric ETA that the runtime
         will actually traverse without work (Codex #1468 P2).
+
+        ``fresh_detections_by_photo`` is an in-memory ``{photo_id:
+        [detection_dict, ...]}`` map (the ``detect_state["detections"]``
+        that ``_detect_batch`` populated). When provided, the "any
+        animal detection >= floor?" predicate is answered from this
+        fresh set instead of the DB — mirroring what the runtime's
+        ``photo_dets`` filter actually sees. This matters on reclassify
+        runs, where pre-run detection rows from a legacy detector model
+        can survive in ``detections`` until the deferred stale purge
+        at ``classify_stage`` finishes. Without this override, a photo
+        whose fresh MegaDetector rows are all below the floor but whose
+        pre-run rows are above it slips out of ``preflight_
+        unclassifiable_ids``, and the ETA keeps counting it as pending
+        inference work even though runtime will skip it (Codex #1468 P2).
+        Each detection dict must expose ``confidence`` (or
+        ``detector_confidence``) and ``category`` (defaulting to
+        ``"animal"`` when absent, matching ``_detect_batch``'s output).
         """
         if not photo_ids:
             return set()
@@ -18081,15 +18099,65 @@ class Database:
         weak_conf = (
             float(weak_confidence) if weak_confidence is not None else min_conf
         )
-        normal_ids = [pid for pid in photo_ids if pid not in weak_photo_ids]
-        weak_ids = [pid for pid in photo_ids if pid in weak_photo_ids]
         # Chunk to stay under SQLITE_MAX_VARIABLE_NUMBER (default 999).
         CHUNK = 500
+
+        def _fresh_has_animal_above(photo_id, floor):
+            dets = fresh_detections_by_photo.get(photo_id) or ()
+            for d in dets:
+                if d.get("category", "animal") != "animal":
+                    continue
+                conf = d.get("confidence", d.get("detector_confidence", 0))
+                try:
+                    if float(conf or 0) >= floor:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+            return False
+
         unclassifiable: set = set()
-        # A photo is skipped when EXISTS(real detection at any confidence)
-        # AND NOT EXISTS(real animal detection >= floor). "Real" means
-        # non-full-image. The floor differs by whether the photo was
-        # selected for contextual-weak rescue.
+        normal_ids = [pid for pid in photo_ids if pid not in weak_photo_ids]
+        weak_ids = [pid for pid in photo_ids if pid in weak_photo_ids]
+
+        if fresh_detections_by_photo is None:
+            # Original DB-only path. A photo is skipped when EXISTS(real
+            # detection at any confidence) AND NOT EXISTS(real animal
+            # detection >= floor). "Real" means non-full-image. The floor
+            # differs by whether the photo was selected for contextual-
+            # weak rescue.
+            for pool, floor in (
+                (normal_ids, min_conf), (weak_ids, weak_conf),
+            ):
+                for i in range(0, len(pool), CHUNK):
+                    chunk = pool[i:i + CHUNK]
+                    if not chunk:
+                        continue
+                    placeholders = ",".join("?" * len(chunk))
+                    rows = self.conn.execute(
+                        f"""SELECT DISTINCT d.photo_id
+                              FROM detections d
+                             WHERE d.detector_model != 'full-image'
+                               AND d.photo_id IN ({placeholders})
+                               AND NOT EXISTS (
+                                     SELECT 1 FROM detections d2
+                                      WHERE d2.photo_id = d.photo_id
+                                        AND d2.detector_model
+                                            != 'full-image'
+                                        AND d2.category = 'animal'
+                                        AND d2.detector_confidence >= ?
+                                   )""",
+                        [*chunk, floor],
+                    ).fetchall()
+                    for r in rows:
+                        unclassifiable.add(r["photo_id"])
+            return unclassifiable
+
+        # Reclassify path: the "photo has an animal detection >= floor?"
+        # test uses the fresh in-memory map (matching the runtime's
+        # ``photo_dets`` filter), while "photo has any real detection?"
+        # still reads the DB — that mirrors the runtime's ``raw_real_dets``
+        # branch, which also reads the DB and would enter the skip path
+        # even if a pre-run row is the only real detection recorded.
         for pool, floor in ((normal_ids, min_conf), (weak_ids, weak_conf)):
             for i in range(0, len(pool), CHUNK):
                 chunk = pool[i:i + CHUNK]
@@ -18100,18 +18168,13 @@ class Database:
                     f"""SELECT DISTINCT d.photo_id
                           FROM detections d
                          WHERE d.detector_model != 'full-image'
-                           AND d.photo_id IN ({placeholders})
-                           AND NOT EXISTS (
-                                 SELECT 1 FROM detections d2
-                                  WHERE d2.photo_id = d.photo_id
-                                    AND d2.detector_model != 'full-image'
-                                    AND d2.category = 'animal'
-                                    AND d2.detector_confidence >= ?
-                               )""",
-                    [*chunk, floor],
+                           AND d.photo_id IN ({placeholders})""",
+                    chunk,
                 ).fetchall()
                 for r in rows:
-                    unclassifiable.add(r["photo_id"])
+                    pid = r["photo_id"]
+                    if not _fresh_has_animal_above(pid, floor):
+                        unclassifiable.add(pid)
         return unclassifiable
 
     def get_labels_fingerprints(self):

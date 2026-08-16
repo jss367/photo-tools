@@ -18904,6 +18904,71 @@ def test_get_unclassifiable_photos_ignores_non_animal_boxes(tmp_path):
     assert unclassifiable == {p_person_only}
 
 
+def test_get_unclassifiable_photos_uses_fresh_detections_when_provided(tmp_path):
+    """On a reclassify run the DB can still hold pre-run detection rows
+    from a legacy detector model (the stale purge runs later in the
+    classify stage). ``fresh_detections_by_photo`` lets the caller
+    scope the "any animal >= floor?" test to the freshly detected
+    boxes the runtime will actually consult, so a photo whose fresh
+    MegaDetector rows are all below the floor doesn't slip out of the
+    preflight-unclassifiable set just because a leftover legacy row
+    is still above it (Codex #1468 P2).
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+
+    # A photo whose DB rows (both stale legacy AND fresh) sit above the
+    # floor — the fresh set contains a qualifying box, so the photo
+    # must NOT be flagged unclassifiable.
+    p_still_classifiable = db.add_photo(
+        folder_id=fid, filename="still.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    _add_one_detection(
+        db, p_still_classifiable, detector_model="megadetector-v5", conf=0.5,
+    )
+    _add_one_detection(
+        db, p_still_classifiable, detector_model="megadetector-v6", conf=0.5,
+    )
+
+    # A photo whose stale legacy row IS above the floor but whose fresh
+    # detections are all below it. The DB-only view would keep this
+    # photo out of the unclassifiable set; the fresh-scoped view must
+    # flag it because the runtime's ``photo_dets`` filter (which reads
+    # the fresh in-memory map) sees only below-floor boxes.
+    p_fresh_all_low = db.add_photo(
+        folder_id=fid, filename="fresh-low.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    _add_one_detection(
+        db, p_fresh_all_low, detector_model="megadetector-v5", conf=0.5,
+    )
+    _add_one_detection(
+        db, p_fresh_all_low, detector_model="megadetector-v6", conf=0.1,
+    )
+
+    fresh_map = {
+        p_still_classifiable: [
+            {"confidence": 0.5, "category": "animal"},
+        ],
+        p_fresh_all_low: [
+            {"confidence": 0.1, "category": "animal"},
+        ],
+    }
+
+    # Sanity: DB-only view returns nothing (both photos have >= floor rows).
+    assert db.get_unclassifiable_photos(
+        [p_still_classifiable, p_fresh_all_low],
+    ) == set()
+
+    unclassifiable = db.get_unclassifiable_photos(
+        [p_still_classifiable, p_fresh_all_low],
+        fresh_detections_by_photo=fresh_map,
+    )
+    assert unclassifiable == {p_fresh_all_low}
+
+
 def test_all_nav_ids_covers_every_page():
     from db import ALL_NAV_IDS
     expected = {

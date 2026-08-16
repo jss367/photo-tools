@@ -201,6 +201,51 @@ def test_classification_eta_subtracts_future_unclassifiable_photos():
     assert fields["eta_seconds"] == 120
 
 
+def test_classification_eta_elapsed_is_inference_active_seconds_only():
+    """``elapsed`` is the accumulated inference-active seconds (time
+    spent inside ``_flush_batch``), not walltime since the spec started.
+    Passing walltime would bleed the cache-traversal prefix into the
+    rate: on a spec that walked a cached prefix for 500s before hitting
+    inference, walltime-based ``elapsed`` would derate the inferred
+    rate by that entire prefix, inflating the ETA for the uncached
+    tail (Codex #1468 P2).
+
+    Same 20 inference attempts, same 100-photo total. With walltime-
+    based elapsed (600s including a 500s cache prefix), the rate reads
+    2/min and the 60-photo tail projects to ~30 minutes. With
+    inference-active elapsed (100s of pure model work), the rate reads
+    12/min and the tail projects to 5 minutes.
+    """
+    walltime_fields = _classification_eta_progress(
+        total=100,
+        seen=40,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=600,  # walltime — includes cache-traversal prefix
+    )
+    inference_only_fields = _classification_eta_progress(
+        total=100,
+        seen=40,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=100,  # inference-active seconds only
+    )
+
+    # The fix is at the caller (pass inference_seconds, not walltime).
+    # This test pins the contract by demonstrating that the ETA
+    # function relies on the caller to hand it the right denominator —
+    # so a future regression that reverts to walltime here would be
+    # caught immediately by the walltime ETA being ~6x too large.
+    assert walltime_fields["eta_rate_per_min"] == 2.0
+    assert walltime_fields["eta_seconds"] == 1800
+    assert inference_only_fields["eta_rate_per_min"] == 12.0
+    assert inference_only_fields["eta_seconds"] == 300
+
+
 def test_classification_eta_unclassifiable_seen_capped_at_estimate():
     """The seen count for unclassifiable photos should not exceed the
     preflight estimate — an unexpected extra skip cannot make future

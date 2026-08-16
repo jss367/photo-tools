@@ -1373,6 +1373,17 @@ def _classification_eta_progress(
     entered an inference batch, while using the preflight cache count to
     subtract cache hits that are still expected later in the collection.
 
+    ``elapsed`` must be inference-active seconds only — the wall time
+    accumulated inside ``_flush_batch`` — not the wall time since the
+    per-spec start. Passing walltime here still lets the cache-traversal
+    prefix bleed into the denominator: on a spec that spends thirty seconds
+    walking a cached prefix before ever hitting inference, ``elapsed``
+    would be ~30s while ``inference_attempts`` is still zero, and by the
+    time the first inference lands the effective rate is derated by that
+    entire prefix. The runtime tracks a ``inference_seconds`` accumulator
+    that only ticks around ``_flush_batch`` calls and passes it here
+    (Codex #1468 P2).
+
     ``cache_overcount`` is the count of photos where the preflight assumed
     a cache hit (a classifier_runs row existed) but runtime found no cached
     predictions and fell through to fresh inference. Subtracting it from
@@ -5404,6 +5415,17 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # ETA's remaining-work count, a tail of below-threshold
                     # photos inflates a numeric ETA the runtime will actually
                     # traverse without any inference work (Codex #1468 P2).
+                    #
+                    # On a reclassify run we pass ``detect_state["detections"]``
+                    # so the "any animal >= floor?" test uses the fresh
+                    # in-memory map instead of the DB. Pre-run detection
+                    # rows from a legacy detector model can survive in
+                    # ``detections`` until the deferred stale-row purge
+                    # further down in this stage; scoping the check to
+                    # the fresh set keeps a photo whose fresh MegaDetector
+                    # rows are all below the floor (but whose stale
+                    # pre-run rows aren't) from slipping out of the
+                    # preflight-unclassifiable set (Codex #1468 P2).
                     preflight_unclassifiable_ids: set = (
                         thread_db.get_unclassifiable_photos(
                             [p["id"] for p in photos],
@@ -5411,6 +5433,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             weak_confidence=(
                                 weak_detection_confidence
                                 if contextual_weak_ids
+                                else None
+                            ),
+                            fresh_detections_by_photo=(
+                                detect_state["detections"]
+                                if params.reclassify
+                                and detect_state.get("ran")
                                 else None
                             ),
                         )
@@ -5529,6 +5557,15 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # the end of the spec regardless of outcome mix.
                     processed_in_spec = 0
                     start_time = time.time()
+                    # Wall time since ``start_time`` includes cache-lookup and
+                    # result-building for the cache-hit prefix, which can dwarf
+                    # actual model work on cache-heavy collections. Dividing
+                    # ``inference_attempts`` by that walltime yields an
+                    # artificially low rate and inflates the ETA for the
+                    # uncached tail. Accumulate the seconds spent inside
+                    # ``_flush_batch`` here so the ETA rate reflects
+                    # inference throughput only (Codex #1468 P2).
+                    inference_seconds = 0.0
                     batch_size = 32  # classification batch granularity
                     inference_batch_size = _BATCH_SIZE
                     inference_batch: list = []
@@ -5551,7 +5588,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         photos_inferred_in_spec=photos_inferred_in_spec,
                         photos_attempted_in_spec=photos_attempted_in_spec,
                     ):
-                        nonlocal failed, has_flushed_in_spec
+                        nonlocal failed, has_flushed_in_spec, inference_seconds
                         if not inference_batch:
                             return
 
@@ -5565,9 +5602,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         # GPU serialisation lives inside _flush_batch around the
                         # inference call so the DB upserts/result-building afterward
                         # don't hold the semaphore while the GPU is idle.
+                        _flush_started = time.time()
                         n_batch_failed = _flush_batch(
                             pending, clf, model_type, model_name,
                             thread_db, raw_results,
+                        )
+                        inference_seconds += max(
+                            time.time() - _flush_started, 0.0,
                         )
                         failed += n_batch_failed
 
@@ -6234,7 +6275,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         photos_attempted_in_spec
                                     ),
                                     classified=len(photos_inferred_in_spec),
-                                    elapsed=elapsed,
+                                    # Inference-active seconds only. Wall time
+                                    # since ``start_time`` includes the cache-
+                                    # traversal prefix and would deflate the
+                                    # per-attempt rate on cache-heavy runs
+                                    # (Codex #1468 P2).
+                                    elapsed=inference_seconds,
                                     cache_overcount=len(
                                         photos_cache_overcounted_in_spec
                                     ),

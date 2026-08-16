@@ -7653,6 +7653,18 @@ function _lbZoomDisplayText() {
   return fitMultiple + '\u00d7 Fit';
 }
 
+function _lbNativeSliderPercent() {
+  return _lbNativeZoom ? _lbZoomSliderPosition(_lbNativeZoom) / 10 : 0;
+}
+
+function _lbNativeCoincidesWithFit() {
+  // Below this slider position the standalone 1:1 stop would overlap the fit
+  // stop, so the HUD combines the two labels and the fit action must satisfy
+  // the 1:1 half \u2014 otherwise native zooms in the 1.001\u2013~1.128 range have no
+  // labeled path to exact 1:1.
+  return !!_lbNativeZoom && _lbNativeSliderPercent() < 8;
+}
+
 function _lbUpdateZoomControl() {
   var badge = document.getElementById('lightboxZoomBadge');
   var slider = document.getElementById('lightboxZoomSlider');
@@ -7675,12 +7687,13 @@ function _lbUpdateZoomControl() {
   if (zoomOut) zoomOut.disabled = _lbVisualTransitionPending || _lbZoom <= 1.001;
   if (zoomIn) zoomIn.disabled = _lbVisualTransitionPending || _lbZoom >= _lbMaxZoom() - 0.001;
 
-  if (fitStop) fitStop.textContent = (_lbNativeZoom && _lbNativeZoom <= 1.001) ? 'Fit \u00b7 1:1' : 'Fit';
+  var combinedFitNative = _lbNativeCoincidesWithFit();
+  if (fitStop) fitStop.textContent = combinedFitNative ? 'Fit \u00b7 1:1' : 'Fit';
   if (nativeStop) {
-    var nativePosition = _lbNativeZoom ? _lbZoomSliderPosition(_lbNativeZoom) / 10 : 0;
-    // When fit is already effectively 1:1, combine the labels at the left edge
-    // instead of stacking two controls on top of each other.
-    nativeStop.style.display = (_lbNativeZoom && nativePosition >= 8) ? 'inline-block' : 'none';
+    var nativePosition = _lbNativeSliderPercent();
+    // When fit and 1:1 are visually indistinguishable, combine the labels at the
+    // left edge instead of stacking two controls on top of each other.
+    nativeStop.style.display = (_lbNativeZoom && !combinedFitNative) ? 'inline-block' : 'none';
     nativeStop.style.left = nativePosition + '%';
   }
   if (maxLabel) maxLabel.textContent = _lbNativeZoom ? '400%' : '4\u00d7 Fit';
@@ -7713,6 +7726,14 @@ function stepLightboxZoom(direction) {
 function setLightboxZoomToFit() {
   if (_lbVisualTransitionPending) return;
   _lbClearPendingViewportRestore();
+  // When the HUD has combined the Fit and 1:1 labels (native zoom too close
+  // to fit for a standalone stop), route through the labelled 1:1 path so the
+  // fit action honors the 1:1 half of the label instead of silently landing
+  // slightly short of native pixels.
+  if (_lbNativeCoincidesWithFit()) {
+    setLightboxZoomToOneToOne();
+    return;
+  }
   _lbSetZoom(1.0, null, null);
 }
 

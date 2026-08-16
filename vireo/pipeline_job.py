@@ -58,6 +58,7 @@ from resource_ledger import (
     ResourceWaitCancelled,
     bind_resource_cancel_check,
     bind_resource_owner,
+    suspend_resource_wait_timing,
 )
 
 log = logging.getLogger(__name__)
@@ -1567,7 +1568,14 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
         participant = getattr(pause_context, "participant", None)
         if participant is None:
             return _cancellation_requested()
-        cancelled = pause_gate.checkpoint(participant)
+        if pause_gate._pause_requested():
+            # A resource waiter that parks for a user-requested pause is no
+            # longer contending. Keep the logical wait open for diagnostics,
+            # but stop its elapsed clock until the participant resumes.
+            with suspend_resource_wait_timing():
+                cancelled = pause_gate.checkpoint(participant)
+        else:
+            cancelled = pause_gate.checkpoint(participant)
         if cancelled:
             abort.set()
         return cancelled

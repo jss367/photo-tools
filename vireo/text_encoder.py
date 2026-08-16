@@ -4,6 +4,7 @@ Uses ONNX Runtime for inference with text encoder models stored in
 ~/.vireo/models/{model-id}/.
 """
 
+import contextlib
 import logging
 import os
 import threading
@@ -33,6 +34,24 @@ _MODELS_ROOT = os.path.expanduser("~/.vireo/models")
 # Context length for CLIP-style tokenizers
 _CONTEXT_LENGTH = 77
 _INTERACTIVE_RESOURCE_WAIT_SECONDS = 5.0
+
+
+@contextlib.contextmanager
+def _session_cache_guard(cancel_check):
+    """Acquire cold-session coordination without outliving a caller deadline."""
+    while True:
+        if cancel_check is not None and cancel_check():
+            from resource_ledger import ResourceWaitCancelled
+
+            raise ResourceWaitCancelled(
+                "Cancelled while waiting for text session cache resources",
+            )
+        if _session_cache_lock.acquire(timeout=0.05):
+            break
+    try:
+        yield
+    finally:
+        _session_cache_lock.release()
 
 
 def _get_text_session(model_str, pretrained_str=None, *, cancel_check=None):
@@ -68,7 +87,7 @@ def _get_text_session(model_str, pretrained_str=None, *, cancel_check=None):
             )
         model_dir = os.path.join(_MODELS_ROOT, dir_name)
 
-    with _session_cache_lock:
+    with _session_cache_guard(cancel_check):
         cached = _session_cache.get(model_dir)
         if cached is not None:
             return cached

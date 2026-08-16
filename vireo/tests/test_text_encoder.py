@@ -177,6 +177,43 @@ def test_encode_text_caching(monkeypatch, tmp_path):
     )
 
 
+def test_text_session_cache_wait_honors_cancellation(monkeypatch):
+    """A second cold lookup must not block past its interactive deadline."""
+    import threading
+
+    import text_encoder
+    from resource_ledger import ResourceWaitCancelled
+
+    monkeypatch.setattr(text_encoder, "_session_cache", {})
+    cancelled = threading.Event()
+    finished = threading.Event()
+    outcome = []
+
+    def lookup():
+        try:
+            text_encoder._get_text_session(
+                "ViT-B-16",
+                cancel_check=cancelled.is_set,
+            )
+        except ResourceWaitCancelled:
+            outcome.append("cancelled")
+        finally:
+            finished.set()
+
+    text_encoder._session_cache_lock.acquire()
+    thread = threading.Thread(target=lookup)
+    thread.start()
+    try:
+        cancelled.set()
+        assert finished.wait(timeout=1.0)
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+        assert outcome == ["cancelled"]
+    finally:
+        text_encoder._session_cache_lock.release()
+        thread.join(timeout=1.0)
+
+
 def test_unknown_model_raises(monkeypatch):
     """_get_text_session raises ValueError for unknown model."""
     monkeypatch.setattr("text_encoder._session_cache", {})

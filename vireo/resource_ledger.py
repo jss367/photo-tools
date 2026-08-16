@@ -21,11 +21,43 @@ _RESOURCE_OWNER = contextvars.ContextVar("vireo_resource_owner", default=None)
 _RESOURCE_CANCEL_CHECK = contextvars.ContextVar(
     "vireo_resource_cancel_check", default=None,
 )
+_RESOURCE_ACTIVE_WAIT = contextvars.ContextVar(
+    "vireo_resource_active_wait", default=None,
+)
 DEFAULT_CPU_INFERENCE_THREADS = 8
 
 
 class ResourceWaitCancelled(RuntimeError):
     """Raised when a caller cancels while waiting for a resource claim."""
+
+
+class _WaitTiming:
+    """Mutable elapsed-time state for one logical resource wait."""
+
+    def __init__(self, ledger, owner_id, started_at):
+        self.ledger = ledger
+        self.owner_id = owner_id
+        self.started_at = started_at
+        self.accumulated = 0.0
+        self.suspend_depth = 0
+
+    def elapsed(self, now):
+        elapsed = self.accumulated
+        if self.suspend_depth == 0:
+            elapsed += max(0.0, now - self.started_at)
+        return elapsed
+
+    def suspend(self, now):
+        if self.suspend_depth == 0:
+            self.accumulated += max(0.0, now - self.started_at)
+        self.suspend_depth += 1
+
+    def resume(self, now):
+        if self.suspend_depth < 1:
+            return
+        self.suspend_depth -= 1
+        if self.suspend_depth == 0:
+            self.started_at = now
 
 
 @dataclass(frozen=True)
@@ -287,12 +319,12 @@ class ResourceLedger:
             return False
         return bool(cancel_check())
 
-    def _record_wait_locked(self, owner_id, wait_started):
-        wait_seconds = max(0.0, self._clock() - wait_started)
+    def _record_wait_locked(self, owner_id, wait_timing):
+        wait_seconds = wait_timing.elapsed(self._clock())
         self._total_wait_seconds += wait_seconds
         self._wait_count += 1
         self._waiters -= 1
-        self._drop_active_owner_wait_locked(owner_id, wait_started)
+        self._drop_active_owner_wait_locked(owner_id, wait_timing)
         if owner_id is not None:
             timing = self._owner_timing.setdefault(
                 owner_id, {"wait_seconds": 0.0, "wait_count": 0}
@@ -301,19 +333,19 @@ class ResourceLedger:
             timing["wait_count"] += 1
         return wait_seconds
 
-    def _track_active_owner_wait_locked(self, owner_id, wait_started):
+    def _track_active_owner_wait_locked(self, owner_id, wait_timing):
         if owner_id is None:
             return
-        self._active_owner_waits.setdefault(owner_id, []).append(wait_started)
+        self._active_owner_waits.setdefault(owner_id, []).append(wait_timing)
 
-    def _drop_active_owner_wait_locked(self, owner_id, wait_started):
+    def _drop_active_owner_wait_locked(self, owner_id, wait_timing):
         if owner_id is None:
             return
         starts = self._active_owner_waits.get(owner_id)
         if not starts:
             return
         try:
-            starts.remove(wait_started)
+            starts.remove(wait_timing)
         except ValueError:
             return
         if not starts:
@@ -328,15 +360,17 @@ class ResourceLedger:
         the same live and completed owner timing semantics for those waits.
         """
         owner_id = owner_id if owner_id is not None else _RESOURCE_OWNER.get()
-        wait_started = self._clock()
+        wait_timing = _WaitTiming(self, owner_id, self._clock())
         with self._condition:
             self._waiters += 1
-            self._track_active_owner_wait_locked(owner_id, wait_started)
+            self._track_active_owner_wait_locked(owner_id, wait_timing)
+        token = _RESOURCE_ACTIVE_WAIT.set(wait_timing)
         try:
             yield
         finally:
+            _RESOURCE_ACTIVE_WAIT.reset(token)
             with self._condition:
-                self._record_wait_locked(owner_id, wait_started)
+                self._record_wait_locked(owner_id, wait_timing)
 
     def acquire(
         self, request, *, cancel_check=None, owner_id=None, on_wait=None,
@@ -357,21 +391,27 @@ class ResourceLedger:
         self._validate_request(request)
         owner_id = owner_id if owner_id is not None else _RESOURCE_OWNER.get()
         cancel_check = resolve_resource_cancel_check(cancel_check)
-        wait_started = None
+        wait_timing = None
         announce_wait = False
 
         while True:
+            wait_token = None
+            if wait_timing is not None:
+                wait_token = _RESOURCE_ACTIVE_WAIT.set(wait_timing)
             try:
                 cancelled = self._cancel_requested(cancel_check)
             except BaseException:
-                if wait_started is not None:
+                if wait_timing is not None:
                     with self._condition:
-                        self._record_wait_locked(owner_id, wait_started)
+                        self._record_wait_locked(owner_id, wait_timing)
                 raise
+            finally:
+                if wait_token is not None:
+                    _RESOURCE_ACTIVE_WAIT.reset(wait_token)
             if cancelled:
-                if wait_started is not None:
+                if wait_timing is not None:
                     with self._condition:
-                        self._record_wait_locked(owner_id, wait_started)
+                        self._record_wait_locked(owner_id, wait_timing)
                 raise ResourceWaitCancelled(
                     f"Cancelled while waiting for {request.label} resources"
                 )
@@ -382,7 +422,7 @@ class ResourceLedger:
                         on_wait(request)
                     except BaseException:
                         with self._condition:
-                            self._record_wait_locked(owner_id, wait_started)
+                            self._record_wait_locked(owner_id, wait_timing)
                         raise
             with self._condition:
                 if self._can_grant(request):
@@ -398,9 +438,9 @@ class ResourceLedger:
                         self._lane_allocated[lane] += 1
 
                     wait_seconds = 0.0
-                    if wait_started is not None:
+                    if wait_timing is not None:
                         wait_seconds = self._record_wait_locked(
-                            owner_id, wait_started,
+                            owner_id, wait_timing,
                         )
                     return ResourceLease(
                         self,
@@ -411,11 +451,13 @@ class ResourceLedger:
                         cpu_reserve=request.cpu_reserve,
                     )
 
-                if wait_started is None:
-                    wait_started = self._clock()
+                if wait_timing is None:
+                    wait_timing = _WaitTiming(
+                        self, owner_id, self._clock(),
+                    )
                     self._waiters += 1
                     self._track_active_owner_wait_locked(
-                        owner_id, wait_started,
+                        owner_id, wait_timing,
                     )
                     announce_wait = True
                     # Run the callback outside the ledger mutex before
@@ -450,12 +492,12 @@ class ResourceLedger:
         with self._condition:
             timing = self._owner_timing.get(owner_id)
             result = dict(timing or {"wait_seconds": 0.0, "wait_count": 0})
-            active_starts = self._active_owner_waits.get(owner_id)
-            if active_starts:
+            active_waits = self._active_owner_waits.get(owner_id)
+            if active_waits:
                 now = self._clock()
-                for start in active_starts:
-                    result["wait_seconds"] += max(0.0, now - start)
-                result["wait_count"] += len(active_starts)
+                for wait_timing in active_waits:
+                    result["wait_seconds"] += wait_timing.elapsed(now)
+                result["wait_count"] += len(active_waits)
             if remove:
                 self._owner_timing.pop(owner_id, None)
         result["wait_seconds"] = round(result["wait_seconds"], 3)
@@ -494,6 +536,23 @@ def get_resource_ledger():
         if _DEFAULT_LEDGER is None:
             _DEFAULT_LEDGER = ResourceLedger(automatic_cpu_capacity())
         return _DEFAULT_LEDGER
+
+
+@contextlib.contextmanager
+def suspend_resource_wait_timing():
+    """Exclude deliberate parking from the current resource wait interval."""
+    wait_timing = _RESOURCE_ACTIVE_WAIT.get()
+    if wait_timing is None:
+        yield
+        return
+    ledger = wait_timing.ledger
+    with ledger._condition:
+        wait_timing.suspend(ledger._clock())
+    try:
+        yield
+    finally:
+        with ledger._condition:
+            wait_timing.resume(ledger._clock())
 
 
 @contextlib.contextmanager

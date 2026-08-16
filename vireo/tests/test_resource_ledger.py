@@ -166,6 +166,35 @@ def test_owner_wait_timing_uses_injected_clock():
     assert ledger.snapshot()["wait_seconds"] == 2.5
 
 
+def test_suspended_resource_wait_excludes_parked_time():
+    """A user-requested pause must not inflate contention diagnostics."""
+    now = [10.0]
+    ledger = ResourceLedger(cpu_capacity=1, clock=lambda: now[0])
+
+    from resource_ledger import suspend_resource_wait_timing
+
+    with bind_resource_owner("paused-job"):
+        with ledger.track_external_wait():
+            now[0] = 12.0
+            with suspend_resource_wait_timing():
+                assert ledger.owner_timing("paused-job") == {
+                    "wait_seconds": 2.0,
+                    "wait_count": 1,
+                }
+                now[0] = 112.0
+                assert ledger.owner_timing("paused-job") == {
+                    "wait_seconds": 2.0,
+                    "wait_count": 1,
+                }
+            now[0] = 114.0
+
+    assert ledger.owner_timing("paused-job") == {
+        "wait_seconds": 4.0,
+        "wait_count": 1,
+    }
+    assert ledger.snapshot()["wait_seconds"] == 4.0
+
+
 def test_owner_timing_includes_active_wait_before_grant():
     """A blocked owner shows its live wait in owner_timing snapshots.
 

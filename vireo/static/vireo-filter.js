@@ -565,9 +565,15 @@
     };
   }
 
+  function cancelQuickSearchTimer() {
+    if (quickSearchTimer !== null) {
+      clearTimeout(quickSearchTimer);
+      quickSearchTimer = null;
+    }
+  }
+
   function applyQuickSearch(text, opts) {
-    clearTimeout(quickSearchTimer);
-    quickSearchTimer = null;
+    cancelQuickSearchTimer();
     const value = String(text || '').trim();
     const current = quickSearchGroup();
     if ((!value && !current) ||
@@ -595,8 +601,7 @@
   }
 
   function applyVisualSearch(text) {
-    clearTimeout(quickSearchTimer);
-    quickSearchTimer = null;
+    cancelQuickSearchTimer();
     const value = String(text || '').trim();
     mutate(() => {
       // The visual clause and the quick-search clause are alternatives for
@@ -633,8 +638,7 @@
 
   function scheduleQuickSearch() {
     showSearchSuggest();
-    clearTimeout(quickSearchTimer);
-    quickSearchTimer = null;
+    cancelQuickSearchTimer();
     const value = $('.vf-search input').value.trim();
     // Clearing should feel instantaneous. Non-empty input gets a very short
     // debounce so a normal burst of typing results in one server query while
@@ -1085,8 +1089,7 @@
         hideSearchSuggest();
         applyQuickSearch(searchInput.value);
       } else if (e.key === 'Escape') {
-        clearTimeout(quickSearchTimer);
-        quickSearchTimer = null;
+        cancelQuickSearchTimer();
         hideSearchSuggest();
         searchInput.blur();
       }
@@ -1139,6 +1142,9 @@
       });
     }
     $('.vf-clear').addEventListener('click', () => {
+      // Kill any pending live-search debounce so it can't silently reinstate
+      // the just-typed text after "Filters cleared" (Codex review r3791783342).
+      cancelQuickSearchTimer();
       mutate(() => {
         state.root = { mode: 'all', rules: [] };
         state.muted = false;
@@ -1148,6 +1154,7 @@
       toast('Filters cleared', true);
     });
     $('.vf-clear-rules').addEventListener('click', () => {
+      cancelQuickSearchTimer();
       mutate(() => {
         state.root = { mode: 'all', rules: [] };
         state.muted = false;
@@ -1594,6 +1601,9 @@
       // condition) — opening one is simply "show everything", not a chip.
       root.rules = root.rules.filter((r) => !(r && r.field === 'all'));
       const reason = (opts && opts.reason) || 'expressionLoaded';
+      // A pending debounce from just-typed text would fire after the load
+      // and overwrite the collection's expression (Codex r3791783342).
+      cancelQuickSearchTimer();
       mutate(() => {
         state.root = root;
         state.muted = false;
@@ -1654,6 +1664,7 @@
     // dropping them on the first filter interaction) briefly paints the
     // wrong photo set and desyncs chips from the visible grid.
     clearAll(silent) {
+      cancelQuickSearchTimer();
       if (silent) {
         state.root = { mode: 'all', rules: [] };
         state.muted = false;

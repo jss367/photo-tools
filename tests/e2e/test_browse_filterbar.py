@@ -404,6 +404,32 @@ def test_typing_keeps_active_visual_clause(live_server, page):
     assert "hawk flying" in chips
 
 
+def test_clear_cancels_pending_live_search_debounce(live_server, page):
+    """Clear during the debounce must not silently reinstate the typed text.
+
+    Regression for Codex review r3791783342: the 150 ms `quickSearchTimer`
+    from an in-progress live-search keystroke used to fire after `.vf-clear`
+    reset the state, silently reinstalling the search after the UI reported
+    "Filters cleared."
+    """
+    _open_browse(page, live_server)
+    # Establish an active filter so `.vf-clear` is visible in the top bar.
+    page.click(".vf-filters-btn")
+    page.click('.vf-quick-rating .vf-star[data-rating="4"]')
+    _wait_total(page, 1)
+    page.click(".vf-done")
+
+    search = page.locator(".vf-search input")
+    search.fill("haw")
+    # Click Clear before the 150 ms debounce fires; the pending timer must
+    # be cancelled, not left to overwrite the just-cleared state.
+    page.click(".vf-clear")
+    page.wait_for_timeout(400)
+    assert not page.evaluate("VireoFilter.hasFilters()")
+    assert search.input_value() == ""
+    _wait_total(page, 5)
+
+
 def test_pause_resume_with_backslash(live_server, page):
     _open_browse(page, live_server)
     page.click(".vf-filters-btn")

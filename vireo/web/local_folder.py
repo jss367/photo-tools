@@ -375,13 +375,20 @@ def create_local_folder_blueprint(
                 ORDER BY root_folder_id""",
             tuple(sorted(visible)),
         ).fetchall()
+        # Aggregate by the small, fixed folder-status vocabulary. Returning
+        # one token per mapped folder would make this 15-second polling
+        # payload grow with large catalogs; counts still change whenever a
+        # mapping disconnects or reconnects while keeping the fingerprint
+        # bounded per local root.
         health_rows = db.conn.execute(
-            f"""SELECT lfm.root_folder_id, lfm.folder_id,
-                       COALESCE(f.status, '') AS folder_status
+            f"""SELECT lfm.root_folder_id,
+                       COALESCE(f.status, '') AS folder_status,
+                       COUNT(*) AS folder_count
                 FROM local_folder_mappings lfm
                 LEFT JOIN folders f ON f.id = lfm.folder_id
                 WHERE lfm.root_folder_id IN ({placeholders})
-                ORDER BY lfm.root_folder_id, lfm.folder_id""",
+                GROUP BY lfm.root_folder_id, COALESCE(f.status, '')
+                ORDER BY lfm.root_folder_id, folder_status""",
             tuple(sorted(visible)),
         ).fetchall()
         health_by_root: dict[int, list[str]] = {}
@@ -389,7 +396,7 @@ def create_local_folder_blueprint(
             health_by_root.setdefault(
                 int(health_row["root_folder_id"]), []
             ).append(
-                f"{health_row['folder_id']}:{health_row['folder_status']}"
+                f"{health_row['folder_status']}:{health_row['folder_count']}"
             )
         parts = [
             "{root}:{state}:{activated}:{created}:{health}".format(

@@ -8341,8 +8341,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return places.reverse_geocode(lat, lng, api_key)
         return places.reverse_geocode(lat, lng, api_key, language=None)
 
+    _REVERSE_GEOCODE_CACHE_LEGACY = object()
+
     def _decode_cached_reverse_geocode(cached, language):
-        """Return ``(matches_language, details)`` for a cached response."""
+        """Return ``(matches_language, details)`` for a cached response.
+
+        Rows written before the language field existed have no
+        ``_vireo_result_language`` key at all; treat those as compatible
+        with the current preference so a rollout does not silently
+        invalidate every previously cached lookup — and, when no API
+        key is configured, force the caller into the ``no_api_key``
+        branch instead of reusing the cached result. Post-PR writes
+        always include the key (``null`` for the opt-out preference,
+        ``"en"`` for the default), so subsequent preference changes
+        still invalidate correctly.
+        """
         try:
             details = json.loads(cached["response"] or "{}")
         except (ValueError, TypeError):
@@ -8350,15 +8363,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not isinstance(details, dict):
             details = {}
         cached_language = details.pop(
-            _REVERSE_GEOCODE_CACHE_LANGUAGE_KEY, None,
+            _REVERSE_GEOCODE_CACHE_LANGUAGE_KEY,
+            _REVERSE_GEOCODE_CACHE_LEGACY,
         )
+        if cached_language is _REVERSE_GEOCODE_CACHE_LEGACY:
+            return True, details
         return cached_language == language, details
 
     def _encode_cached_reverse_geocode(details, language):
-        """Serialize details with the requested language for cache matching."""
+        """Serialize details with the requested language for cache matching.
+
+        The language key is always written — including as ``null`` for
+        the opt-out preference — so the decoder can distinguish a
+        legacy untagged row from a row explicitly written under
+        ``language=None``.
+        """
         payload = dict(details) if isinstance(details, dict) else {}
-        if language:
-            payload[_REVERSE_GEOCODE_CACHE_LANGUAGE_KEY] = language
+        payload[_REVERSE_GEOCODE_CACHE_LANGUAGE_KEY] = language
         return json.dumps(payload)
 
     def _resolve_exif_place_for_photo(

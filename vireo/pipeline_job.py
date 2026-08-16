@@ -1383,39 +1383,33 @@ def _cached_classify_detections(detections, floor, *, contextual_weak=False):
     ]
 
 
-def _remove_attempted_cache_overcounts(
-    attempted_photo_ids, cache_overcounted_ids, cache_hit_ids,
-):
-    """Remove attempted preflight misses from the live cache-hit bucket.
+def _remove_attempted_cache_hits(attempted_photo_ids, cache_hit_ids):
+    """Remove photos with any inference attempt from the cache-hit bucket.
 
     A multi-detection photo can produce one real cache hit and still require
-    inference for another detection whose preflight run key has no usable
-    predictions.  Once that inference is attempted, the photo represents
-    uncached work even if inference fails and produces no result to trigger
-    the ordinary successful-promotion path.
+    inference for another detection. Once that inference is attempted, the
+    photo is not wholly cached even if inference fails and produces no result
+    to trigger the ordinary successful-promotion path. This is independent of
+    whether the cache preflight counted the photo in its estimate.
     """
-    attempted_overcounts = (
-        set(attempted_photo_ids)
-        & set(cache_overcounted_ids)
-        & set(cache_hit_ids)
-    )
-    cache_hit_ids.difference_update(attempted_overcounts)
-    return len(attempted_overcounts)
+    attempted_cache_hits = set(attempted_photo_ids) & set(cache_hit_ids)
+    cache_hit_ids.difference_update(attempted_cache_hits)
+    return len(attempted_cache_hits)
 
 
 def _record_unattempted_cache_hit(
-    photo_id, inferred_photo_ids, cache_overcounted_ids, cache_hit_ids,
+    photo_id, inferred_photo_ids, attempted_photo_ids, cache_hit_ids,
 ):
     """Record a cache-hit photo only while it remains wholly cached.
 
     A failed inference can be flushed before a later detection on the same
     photo reaches its cache hit.  In that ordering the photo is already an
-    observed preflight miss, so restoring it to the cache-hit bucket would
+    observed inference attempt, so restoring it to the cache-hit bucket would
     make the ETA treat the same photo as both cached and uncached work.
     """
     if (
         photo_id in inferred_photo_ids
-        or photo_id in cache_overcounted_ids
+        or photo_id in attempted_photo_ids
         or photo_id in cache_hit_ids
     ):
         return False
@@ -5683,9 +5677,8 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             entry["photo"]["id"] for entry in pending
                         }
                         photos_attempted_in_spec.update(attempted_photo_ids)
-                        removed_cache_hits = _remove_attempted_cache_overcounts(
+                        removed_cache_hits = _remove_attempted_cache_hits(
                             attempted_photo_ids,
-                            photos_cache_overcounted_in_spec,
                             photos_cached_in_spec,
                         )
                         if removed_cache_hits:
@@ -6073,7 +6066,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                             if _record_unattempted_cache_hit(
                                                 photo["id"],
                                                 photos_inferred_in_spec,
-                                                photos_cache_overcounted_in_spec,
+                                                photos_attempted_in_spec,
                                                 photos_cached_in_spec,
                                             ):
                                                 stages["classify"]["cached"] += 1

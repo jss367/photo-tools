@@ -17,7 +17,7 @@ from pipeline_job import (
     _cached_classify_detections,
     _classification_eta_progress,
     _record_unattempted_cache_hit,
-    _remove_attempted_cache_overcounts,
+    _remove_attempted_cache_hits,
     _stage_fraction,
     _weighted_progress,
     run_pipeline_job,
@@ -93,12 +93,11 @@ def test_contextual_weak_cached_candidates_ignore_foreign_detectors():
     assert [d["id"] for d in contextual] == [2]
 
 
-def test_attempted_cache_overcount_is_not_still_reported_as_cached():
+def test_attempted_photo_is_not_still_reported_as_cached():
     cache_hits = {10, 20}
 
-    removed = _remove_attempted_cache_overcounts(
+    removed = _remove_attempted_cache_hits(
         attempted_photo_ids={10, 30},
-        cache_overcounted_ids={10, 30},
         cache_hit_ids=cache_hits,
     )
 
@@ -106,13 +105,13 @@ def test_attempted_cache_overcount_is_not_still_reported_as_cached():
     assert cache_hits == {20}
 
 
-def test_later_cache_hit_does_not_restore_attempted_overcount():
+def test_later_cache_hit_does_not_restore_attempted_photo():
     cache_hits = set()
 
     recorded = _record_unattempted_cache_hit(
         photo_id=10,
         inferred_photo_ids=set(),
-        cache_overcounted_ids={10},
+        attempted_photo_ids={10},
         cache_hit_ids=cache_hits,
     )
 

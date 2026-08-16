@@ -78,6 +78,10 @@ def taxon_key_for(label, scientific_names, tax):
     distinct non-NULL scientific names carried by that label's rows. See
     "One key per label, not per row" below for why the second argument is
     a set and not a row's column.
+
+    If two members of ``scientific_names`` resolve to different taxa the
+    ladder is not run at all: the return is the ``('name', label)``
+    fallback. See "Conflicts fall to the name key, not to the next rung".
     """
 ```
 
@@ -187,12 +191,50 @@ before the graph is built**:
    step 1 yields `('taxon', that_id)` for every row labelled `L`.
 3. If two elements of `S(L)` resolve to **different** `taxon_id`s, that
    is a genuine conflict — a taxonomic split or lump recorded at two
-   different write times — and step 1 is skipped entirely for `L`. The
-   ladder continues at step 2, which is label-only and therefore
-   single-valued. No tie-break and no arbitrary winner: choosing one of
-   two real taxa by lexical order is exactly the guessing the rules above
-   forbid, and skipping the rung degrades to today's behavior (merge only
-   identical labels) rather than to a wrong merge.
+   different write times — and the ladder is **abandoned for `L`
+   entirely**. Its key is the rung-4 fallback, `('name', L)`, computed
+   on the canonical folded spelling chosen in step 1. Rungs 2 and 3 are
+   not consulted. No tie-break and no arbitrary winner: choosing one of
+   two real taxa by lexical order is exactly the guessing the rules
+   above forbid.
+
+**Conflicts fall to the name key, not to the next rung.** Skipping only
+rung 1 and letting the ladder continue would look like a conservative
+degradation and would not be one. Rungs 2 and 3 key off the *label*,
+which is single-valued by construction, so they resolve happily and
+return some `('taxon', X)` — and a taxon key is precisely the thing that
+merges across *different* labels. The conflict just detected would then
+be silently resolved after all, in favour of whichever taxon the
+common-name lookup (or its cached iNat alternate) happens to prefer, and
+every row labelled `L` would merge with alternate-label rows for `X`.
+Accepting that card would canonicalize and keyword predictions whose own
+strongest stored metadata names the other taxon — the exact failure the
+conflict detection exists to prevent, reintroduced one rung lower.
+
+Only the `name:` key actually declines to choose. Two properties of it,
+both already stated in the rules above, are what make the conflicting
+label's rows stay put:
+
+- `('name', L)` never merges with any `('taxon', …)` key, so no
+  alternate-label node for either candidate taxon can attach to `L`'s
+  nodes, however the taxonomy resolves those labels.
+- `('name', L)` merges with another `name:` key only on string equality,
+  so `L`'s nodes still merge with each other across models and bursts —
+  the same-spelling merge Review already does today.
+
+So a conflicting label's component is exactly the set of nodes spelling
+`L`, no wider: identical-label rows still collapse into one card, and
+every differently-spelled node stays a separate card, which is today's
+behavior for that label rather than a wrong merge. `mixed` badges,
+frozen membership and the sibling scan all operate on that narrower
+component unchanged — nothing else in the design needs a special case,
+because a conflicting label produces an ordinary `name:`-keyed card.
+
+The cost is bounded and visible: a label with genuinely contradictory
+stored scientific names loses cross-label merging until the underlying
+disagreement is fixed (by a reclassify, which rewrites
+`scientific_name`). It does not lose same-label merging, and it never
+produces a card that spans two taxa.
 
 The invariant this buys is stronger than "one key per node", and it is
 what the rest of the design leans on:
@@ -729,11 +771,12 @@ carries the **server-applied** scope, and it rebuilds the scoped row set
 itself rather than composing `/api/predictions/group/<group_id>`.
 
 Both halves are load-bearing, and neither is covered by the per-node
-fallback. That fallback triggers on the five *client-applied*
-predicates; `rules` and `collection_id` are not among them, because the
-server enforces them on the GET rather than the client hiding rows after
-the fact. So a Review view with an active collection or universal-filter
-rule — and no client-applied predicate — is a **merged-card view**: it
+fallback. That fallback triggers on the four *client-applied*
+predicates; `rules`, `collection_id` and `visual` are not among them,
+because the server enforces all three on the GET rather than the client
+hiding rows after the fact. So a Review view with an active collection,
+universal-filter rule or visual-search clause — and no client-applied
+predicate — is a **merged-card view**: it
 dedups by `card_id` and opens this endpoint. An `id`-only URL gives the
 endpoint no way to know which scope produced the card, so it would
 rebuild the component over the whole workspace and hand back member
@@ -765,11 +808,15 @@ the modal is where the user decides whether to accept. Absent
 `rows`, the endpoint returns the whole scoped component (the legacy
 shape) and flags `"expanded"` so the client can say so.
 
-`visual` travels on this URL too even though a non-null visual clause
-also trips the client-side fallback (so the endpoint should not be
-reachable while one is active). That is deliberate belt-and-braces: the
-endpoint's contract is "rebuild exactly the scoped row set", and it
-should not depend on a client-side rule to stay honest.
+`visual` is **not** optional on this URL, and it is not belt-and-braces.
+A visual clause is server-applied like `rules` and `collection_id`
+(`_apply_visual_to_rules` folds it into `rules` before the query,
+`app.py:15300-15315`; the client sends the clause and does not remove
+any row afterwards), so it does not trip the client-side fallback and a
+Review view whose only active filter is a visual clause reaches this
+endpoint by design. Omitting `visual` here would rebuild the component
+over the unfiltered workspace and hand back exactly the rows the visual
+clause excluded — the same failure as omitting `collection_id`.
 
 **Card ID encoding.** `card_id` is treated as opaque bytes on the wire.
 Node keys carry model and fingerprint strings *and* the folded
@@ -902,28 +949,46 @@ kinds of filter achieve that differently, and conflating them is what
 leaves the card endpoint unscoped:
 
 - **Server-applied** — `rules`, `collection_id`, and the `visual`
-  clause `_apply_visual_to_rules` folds into `rules`. These shrink the
+  clause. All three reach `db.get_predictions` as `rules`: the visual
+  clause is resolved by `_apply_visual_to_rules` into an inlined
+  `photo_ids` rule and appended to `rules` *before* the query
+  (`app.py:5729-5743`, called at `app.py:15300-15315`), and the client
+  merely sends the clause as its own `visual=<json>` parameter
+  (`review.html:1091-1096`) — it removes no row from the response
+  afterwards. These shrink the
   *graph input* (corollary 1): the excluded rows never reach card
   building, so `card_id` stays a truthful identity and merging still
   happens correctly *within* the filtered row set. They do **not**
-  trigger the per-node fallback — a collection-scoped Review is still a
-  merged-card view. What they require instead is that every server
+  trigger the per-node fallback — a collection-scoped or
+  visually-scoped Review is still a merged-card view. What they require
+  instead is that every server
   entry point which re-expands a handle receives them: the mutation
   POST (§3, step 1) and the card detail GET ("Card detail endpoint"
   above), or the re-expansion silently rebuilds a wider component than
   the grid showed.
-- **Client-applied** — the five predicates listed below, which hide
+- **Client-applied** — the four predicates listed below, which hide
   rows *after* the server returned them. The server cannot fold these
   into the graph input, so the client stops trusting `card_id` and
   builds cards from the matching rows only, per node identity. Merging
   becomes an intra-filter no-op and the page shows exactly what the
   visible rows said.
 
+The visual clause belongs on the first side, not the second, and the
+distinction is not cosmetic: the two sides get opposite treatment. A
+server-applied clause never suppresses merging but must travel on every
+re-expanding call; a client-applied one suppresses merging and makes
+`card_id` unusable as a handle. Classifying `visual` as client-applied
+would demand a fallback the structural detector below cannot even
+trigger (the returned row set and the rendered row set are identical
+under a visual clause, so `predictions.length !== allPredictions.length`
+is false), leaving the specification asking for a card mode no
+implementation could produce.
+
 The client-side half keeps every filter honest (a merged card has no
 single model, no single fingerprint, no single confidence, and no
 single status) and costs nothing: the client groups the visible rows by
 the node identity the server stamped on each row. The moment such a
-predicate — a confidence slider, a status tab, a visual clause —
+predicate — a confidence slider, a status tab —
 removes a row that was a *bridge* between two components, the server's
 `card_id` describes a card the user is not looking at. See "Fallback
 dedup key" below for what the client uses instead.
@@ -942,9 +1007,8 @@ queried (a stale set after a collection edit). A structural test is
 closed under future predicates — a new filter added to
 `getVisibleItems` cannot silently escape it.
 
-The predicates that cause a divergence today are the five
-`getVisibleItems` and the filter bar apply, matching
-`review.html:1091-1096, 1281-1300` verbatim:
+The predicates that cause a divergence today are the four
+`getVisibleItems` applies, matching `review.html:1281-1300` verbatim:
 
 - `minConfidence > 0` — hides rows whose `confidence` is below the
   slider value.
@@ -954,19 +1018,17 @@ The predicates that cause a divergence today are the five
   hides rows written under other label-set fingerprints.
 - `currentTab && currentTab !== 'all'` — hides rows whose `status`
   differs from the selected tab (`pending` / `accepted` / `rejected`).
-- `VireoFilter.getVisual()` non-null — a visual-search clause that the
-  server resolves via `_apply_visual_to_rules` (`app.py:5703`) into a
-  matched photo-id set; the client sends this payload as a **separate**
-  `visual=<json>` parameter from `rules` on the GET
-  (`review.html:1091-1096`), and rows on photos outside that matched
-  set are hidden from the Review grid.
+
+`VireoFilter.getVisual()` is deliberately **not** on this list.
+`getVisibleItems` does not consult it; the rows a visual clause excludes
+were already dropped by `db.get_predictions` and never reached the
+client. It is a server-applied filter and is handled as one, above.
 
 Any single one being true — or any other client-side drop, per the
 structural test above — triggers the per-node fallback for card
 construction. This is stricter than "model or fingerprint only" for
-good reason: a below-`minConfidence` bridge row, an already-accepted
-`status != currentTab` sibling row, or a same-taxon row on a photo
-outside the visual clause's match set is exactly the kind of hidden
+good reason: a below-`minConfidence` bridge row or an already-accepted
+`status != currentTab` sibling row is exactly the kind of hidden
 bridge that lets the server-computed full-component `card_id` stitch
 two visible groups into one displayed card — and lets
 `/api/predictions/card?id=<card_id>` re-expose the hidden bridge rows
@@ -984,8 +1046,7 @@ detail GET alike.
 
 No sentinel change is required — the existing `currentModel` default
 (`'all'`), `currentLabelsFingerprint` default (`null`), `minConfidence`
-default (`0`), `currentTab` default (`'all'`), and
-`VireoFilter.getVisual()` default (`null`) all resolve to
+default (`0`) and `currentTab` default (`'all'`) all resolve to
 "no filter active" under the checks above. (If the client is later
 refactored to use `'all'` as the labels-fingerprint no-filter sentinel
 too, the fingerprint check collapses to `!== 'all'`; the design does
@@ -1040,11 +1101,16 @@ the clicked row's node identity tuple verbatim
 (`(classifier_model, labels_fingerprint, group_id, species_key)` for
 grouped rows, `(classifier_model, labels_fingerprint, "p" +
 prediction_id)` for singletons — encoded as the `node_id` the server
-stamped on that row) plus the full five-predicate scope tuple from
-§3, and does *not* send the server's `card_id`. The mutation POST
-therefore distinguishes two request shapes: (i) unfiltered — carries
-`card_id`, scope tuple all-`null`, server resolves the full component;
-(ii) filtered — carries `node_id` (the encoded node identity tuple,
+stamped on that row) plus the full seven-entry scope tuple from
+§3 — the four client-applied predicates and the three server-applied
+ones — and does *not* send the server's `card_id`. The mutation POST
+therefore distinguishes two request shapes: (i) **merged-card view**
+(no client-applied predicate active) — carries `card_id` with the four
+client-applied scope entries `null` and the server-applied
+`rules`/`collection_id`/`visual` still populated with whatever the GET
+sent, and the server resolves the full component *within that scoped
+row set*; (ii) **fallback view** (at least one client-applied predicate
+active) — carries `node_id` (the encoded node identity tuple,
 same base64url-of-JSON encoding as `card_id` for uniformity, decoding
 to `[classifier_model, labels_fingerprint, group_id, species_key]` for
 grouped rows or `[classifier_model, labels_fingerprint, "p" +
@@ -1065,8 +1131,9 @@ are gone — a re-run rewrote the bucket's `group_id`s, or the rows were
 deleted — which is a true stale handle, not a boundary artifact.
 An unrecognized `node_id` (stale after a re-run) is a 400; a POST
 that carries both `card_id` and `node_id` is a client bug and
-rejected as a 400. From an unfiltered view the mutation shape is
-unchanged from what §3 already specifies.
+rejected as a 400. From a merged-card view — including one scoped only
+by server-applied `rules`/`collection_id`/`visual` — the mutation shape
+is unchanged from what §3 already specifies.
 
 *Why the fallback matters for privacy.* If server-computed components
 stitched groups A and C together only through a bridge row B that the
@@ -1092,12 +1159,14 @@ and, if grouped, its group siblings — restricted to `pr.classifier_model =
 union**, not just the clicked group's photos:
 
 1. **Resolve the card, with the same filter scope the client rendered.**
-   The mutation POST carries **either** `card_id` (unfiltered view —
+   The mutation POST carries **either** `card_id` (merged-card view —
    accompanied by `member_prediction_ids`, the card's frozen
    membership, below) **or**
-   `node_id` (filtered view — see §2 "Mutation ID from the fallback
-   view"), never both, **plus every filter `getVisibleItems` applies**
-   on the way from `/api/predictions` rows to what the card actually
+   `node_id` (client-filtered view — see §2 "Mutation ID from the
+   fallback view"), never both, **plus every filter that shaped the
+   card** — the server-applied ones that shaped the GET's row set and
+   the client-applied ones `getVisibleItems` then applied
+   on the way to what the card actually
    shows. Concretely the scope tuple is: `rules`, `collection_id`,
    `model` (from `currentModel`), `labels_fingerprint` (from
    `currentLabelsFingerprint`), `min_confidence` (from `minConfidence`,
@@ -1113,15 +1182,18 @@ union**, not just the clicked group's photos:
    verbatim, `visual` included, so the server can call the same
    `_apply_visual_to_rules` (`app.py:5703`) resolver on the mutation path
    and reproduce the exact matched-photo-id set the GET used. Note the
-   three hidden failure modes this closes: (a) a below-`minConfidence`
+   three hidden failure modes this closes, two client-applied and one
+   server-applied: (a) a below-`minConfidence`
    sibling row that bridges two groups would otherwise stitch the
    server's full component through a row the user couldn't see; (b) a
    `status != currentTab` row (e.g. an already-accepted sibling on the
    "pending" tab) could similarly bridge or be re-mutated; (c) a
    same-taxon sibling row on a photo *outside* the active visual
-   clause's match set would similarly bridge two visible groups
-   through a photo the user couldn't see, and a mutation that only
-   carried `rules` would re-expose it because `rules` does not
+   clause's match set — this one never reached the GET's graph at all,
+   because the clause is server-applied, which is exactly why the POST
+   must re-apply it: a mutation that carried only `rules` would
+   *re-admit* the row on the rebuild and stitch two cards the grid
+   showed separately, since `rules` as the client sends it does not
    subsume the visual clause. All three are excluded from the resolved
    component by forwarding the same predicates. For a `card_id`
    request, the server decodes to the anchor node key, rebuilds the same
@@ -1214,7 +1286,8 @@ union**, not just the clicked group's photos:
    The pass differs by request shape, in order to honour what §2 already
    promises for `node_id` resolution ("the server treats the card as
    exactly that single node … without any component expansion"):
-   - **`card_id` request (unfiltered view).** For each photo in the
+   - **`card_id` request (merged-card view — no client-applied
+     predicate; server-applied scope may still be active).** For each photo in the
      resolved component's union, find predictions on that photo whose
      taxon key matches the card's `taxon_key`, from **any** classifier
      model that was in scope for the GET (i.e., predictions the user's
@@ -1338,7 +1411,7 @@ union**, not just the clicked group's photos:
      `db.py:18756`) — unchanged by this design, and the reason "Reject
      all" is offered on a `mixed` card at all: it is the only way to
      revise an accept-vs-reject contradiction from Review.
-   - **`node_id` request (filtered view, per-node fallback).** The
+   - **`node_id` request (client-filtered view, per-node fallback).** The
      mutation touches **only the named node's own rows** — no cross-model
      sibling scan, no expansion onto other visible nodes, even for a
      photo the node shares with a visible sibling node that has the same
@@ -1722,8 +1795,10 @@ caeruleus*") on the Keywords page with a one-click merge.
   scientific names, so the stale-`NULL` rows inherit the resolved key
   instead of splitting off as `name:` (§1, "One key per label"). Two
   scientific names that resolve to *different* taxa are treated as a
-  conflict, not a vote: the rung is skipped and the label falls through
-  to the label-only ladder.
+  conflict, not a vote: the whole ladder is abandoned and the label's
+  key is `('name', L)` — not the next rung down, which would re-pick a
+  single taxon from the label string and merge the rows anyway (§1,
+  "Conflicts fall to the name key, not to the next rung").
 - **Alternatives** (`status="alternative"` rows): not review cards; excluded
   from card building and untouched by sibling resolution. They are
   therefore never card *members* either, which is what keeps the card
@@ -1934,9 +2009,19 @@ Each phase lands as its own PR and is independently useful.
    photos — all `NULL` scientific names — merges into it rather than
    rendering separately. A per-row ladder yields `taxon:13094` and
    `name:eurasian blue tit` inside one node and fails on the first
-   assertion; a second variant where the two stored scientific names
-   resolve to *different* taxon ids asserts the whole label falls back
-   to the label-only ladder, one key, no arbitrary winner; a
+   assertion; a **scientific-name-conflict fixture** — the same burst,
+   but the two stored scientific names resolve to *different* taxon
+   ids, under a label the common-name index **does** resolve (so rung 2
+   would succeed if it were consulted), plus an alternate-label group
+   on overlapping photos that resolves to one of the two candidate
+   taxa. Assert the conflicting label's key is `name:<folded label>`
+   for every one of its rows, that its nodes merge with each other and
+   with nothing else, and specifically that the alternate-label group
+   renders as a **separate** card. An implementation that merely skips
+   rung 1 returns a `taxon:` key here, merges the alternate-label
+   group in, and fails the last assertion — this is the regression
+   guard for §1, "Conflicts fall to the name key, not to the next
+   rung"; a
    **normal-burst-not-split fixture** — an ordinary
    single-job burst of eight rows on eight distinct photos resolves as
    *one* node, not eight (the regression the "photo-connectivity"
@@ -1974,14 +2059,21 @@ Each phase lands as its own PR and is independently useful.
    view with an already-accepted sibling G on a photo shared between
    pending groups A and F: the fallback triggers, A and F render as
    two separate cards, and G is untouched by any subsequent mutation;
-   **visual-clause hidden-bridge fixture** — an active
+   **visual-clause server-scoping fixture** — an active
    `VireoFilter.getVisual()` visual-search clause whose matched
-   photo-id set excludes photo `p*`, on which a same-taxon sibling
-   row V sits bridging pending groups A and F (both otherwise inside
-   the matched set): the fallback triggers on the non-null visual
-   value, A and F render as two separate cards, V is not rendered,
-   and the merged-card endpoint is not called; with the visual
-   clause cleared, A+V+F become one card;
+   photo-id set excludes photo `p*`, on which a same-taxon group V
+   sits overlapping pending groups A and F (both otherwise inside
+   the matched set): because `_apply_visual_to_rules` folds the clause
+   into `rules` before the query (`app.py:15300-15315`), V's rows never
+   reach card building, so the **server** emits A and F as two
+   components with two distinct `card_id`s, the client stays in
+   merged-card mode (the structural test does not fire —
+   `predictions.length === allPredictions.length`), and the merged-card
+   endpoint **is** reachable and is called with the same `visual`
+   payload; a variant that calls it without `visual` returns V and
+   fails, which is the regression guard for classifying the clause as
+   server-applied. With the visual clause cleared, A+V+F become one
+   card;
    **collection-scoped card-endpoint fixture** — a collection filter
    excludes group D (same taxon, photos overlapping visible group A)
    while **no** client-applied predicate is active, so the view stays a
@@ -2067,11 +2159,15 @@ Each phase lands as its own PR and is independently useful.
    the lower-anchored handle resolving successfully onto the other
    subset's hidden rows (§2, "Capture time — also rejected");
    **filtered-view mutation-ID
-   fixture** — with any of the five active filters (including a
-   non-null visual clause), the client's mutation POST carries
+   fixture** — with any of the four client-applied predicates active,
+   the client's mutation POST carries
    `node_id` (not `card_id`), and a fixture POST that names a
    non-existent `node_id` or that carries both `card_id` and
-   `node_id` returns 400.
+   `node_id` returns 400; its **server-applied counterpart** — with
+   only a `visual` clause (or only `collection_id`/`rules`) active, the
+   POST carries `card_id` plus `member_prediction_ids` plus the
+   server-applied scope, and the four client-applied scope entries
+   `null`.
 4. **Keyword canonicalization** (taxon-matched keyword reuse) + the
    "tags as …" transparency note + the `'accept'` value on
    **PR #1488's** `photo_keywords.source` column
@@ -2170,14 +2266,20 @@ Each phase lands as its own PR and is independently useful.
    `status = "pending"` in the scope tuple leaves G untouched and does
    not stitch unrelated groups together; a **visual-scoped fixture** —
    an active `VireoFilter.getVisual()` clause whose match set excludes
-   photo `p*`, on which a same-taxon sibling row V would otherwise
-   bridge visible groups A and F, the accept POST from the filtered
-   view carries `node_id` (naming A's node) plus the same `visual`
-   JSON payload that the GET sent, the server re-runs
+   photo `p*`, on which a same-taxon group V would otherwise
+   bridge visible groups A and F. Because the clause is server-applied,
+   this is a merged-card view: the accept POST carries **`card_id`**
+   (A's own component, V having never entered the graph) plus
+   `member_prediction_ids` plus the same `visual` JSON payload the GET
+   sent, the server re-runs
    `_apply_visual_to_rules` on the mutation path and resolves against
    the identical matched-photo-id set, and only A is resolved — V
    (on the excluded photo) and F stay pending; accepting F likewise
-   resolves only F; a **visible-sibling-node fixture** — under an
+   resolves only F. The negative half is the load-bearing one: an
+   otherwise identical POST that **omits** `visual` rebuilds over the
+   unscoped row set, re-admits V, and accepts A+V+F in one click — the
+   regression guard for "server-applied filters travel on every
+   re-expanding call"; a **visible-sibling-node fixture** — under an
    active filter that forces per-node fallback (e.g.
    `currentModel = 'BioCLIP-2.5'` chip active but the taxon-key merger
    would otherwise unite it with an iNat21 node, or a similarity re-run

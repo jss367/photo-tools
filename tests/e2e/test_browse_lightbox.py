@@ -1184,6 +1184,13 @@ def test_browse_photo_id_deep_link_loads_target_after_first_folder_page(live_ser
     assert page.evaluate("window.loading") is False
     assert target_queries == []
 
+    initial_ids = page.evaluate("photos.map(function(p) { return p.id; })")
+    assert page.evaluate("earliestPage") > 1
+    page.locator("#loadPreviousPhotosButton").click()
+    page.wait_for_function("photos.length > %d" % len(initial_ids), timeout=5000)
+    assert page.evaluate("earliestPage") > 0
+    assert page.evaluate("photos.map(function(p) { return p.id; })")[-len(initial_ids):] == initial_ids
+
 
 def test_browse_lightbox_arrows_preserve_one_to_one_zoom(live_server, page):
     """Navigating from a 1:1 lightbox view keeps the next photo at 1:1."""

@@ -1363,6 +1363,7 @@ _CLASSIFICATION_ETA_MIN_ATTEMPTS = 16
 def _classification_eta_progress(
     *, total, seen, cached_estimate, cache_hits, inference_attempts,
     classified, elapsed, cache_overcount=0,
+    unclassifiable_estimate=0, unclassifiable_seen=0,
 ):
     """Return step-progress fields for a cache-aware classification ETA.
 
@@ -1380,6 +1381,14 @@ def _classification_eta_progress(
     preflight overcounts because it can't see the empty-predictions case
     (e.g. a prior pass wrote ``category == 'match'`` with no predictions).
 
+    ``unclassifiable_estimate`` / ``unclassifiable_seen`` count photos the
+    runtime skips at the ``raw_real_dets`` continue branch (has real
+    detections but none above the classify floor and not a contextual-weak
+    rescue). Runtime never enters an inference batch for them, so the
+    unvisited share of them is subtracted from ``remaining_uncached`` —
+    otherwise a tail of below-threshold photos inflates a numeric ETA
+    that the runtime will actually traverse without work (Codex #1468 P2).
+
     The first classifier call is deliberately flushed as a one-photo batch
     for cancellation responsiveness and includes model warm-up.  Wait for a
     normal batch's worth of attempts before publishing a numeric ETA.
@@ -1392,6 +1401,12 @@ def _classification_eta_progress(
     classified = max(int(classified or 0), 0)
     elapsed = max(float(elapsed or 0), 0.0)
     cache_overcount = max(int(cache_overcount or 0), 0)
+    unclassifiable_estimate = min(
+        max(int(unclassifiable_estimate or 0), 0), total,
+    )
+    unclassifiable_seen = min(
+        max(int(unclassifiable_seen or 0), 0), unclassifiable_estimate,
+    )
 
     # Project future cache hits from the observed success rate of preflight
     # cache predictions. ``cache_hits + cache_overcount`` is the count of
@@ -1413,10 +1428,18 @@ def _classification_eta_progress(
     expected_future_cache_hits = max(
         corrected_cached_estimate - cache_hits, 0,
     )
-    remaining_uncached = max(
-        remaining_photos - expected_future_cache_hits, 0,
+    expected_future_unclassifiable = max(
+        unclassifiable_estimate - unclassifiable_seen, 0,
     )
-    expected_uncached = max(total - corrected_cached_estimate, 0)
+    remaining_uncached = max(
+        remaining_photos
+        - expected_future_cache_hits
+        - expected_future_unclassifiable,
+        0,
+    )
+    expected_uncached = max(
+        total - corrected_cached_estimate - unclassifiable_estimate, 0,
+    )
     min_attempts = min(
         _CLASSIFICATION_ETA_MIN_ATTEMPTS,
         max(expected_uncached, 1),
@@ -5374,6 +5397,24 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # retaining this spec's value for its ETA.
                     cached_est = 0
                     preflight_cached_ids: set = set()
+                    # Photos whose runtime path deterministically skips
+                    # inference at the ``raw_real_dets`` continue branch
+                    # (real detections all below the classify floor, not
+                    # contextual-weak). Without subtracting them from the
+                    # ETA's remaining-work count, a tail of below-threshold
+                    # photos inflates a numeric ETA the runtime will actually
+                    # traverse without any inference work (Codex #1468 P2).
+                    preflight_unclassifiable_ids: set = (
+                        thread_db.get_unclassifiable_photos(
+                            [p["id"] for p in photos],
+                            contextual_weak_photo_ids=contextual_weak_ids,
+                            weak_confidence=(
+                                weak_detection_confidence
+                                if contextual_weak_ids
+                                else None
+                            ),
+                        )
+                    )
                     if not params.reclassify:
                         preflight_cached_ids = (
                             thread_db.get_classifier_run_cache_hits(
@@ -5445,6 +5486,14 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # instead of leaving a phantom future cache hit that
                     # collapses ``remaining_uncached`` to zero.
                     photos_cache_overcounted_in_spec: set = set()
+                    # Photos observed to hit the ``raw_real_dets`` continue
+                    # branch this spec (real detections all below the
+                    # classify floor, not contextual-weak). Paired with
+                    # ``preflight_unclassifiable_ids`` so the ETA can
+                    # subtract the unvisited share from remaining work
+                    # instead of treating a fast tail as inference work
+                    # (Codex #1468 P2).
+                    photos_unclassifiable_in_spec: set = set()
                     # Per-spec tracking of photos whose per-photo iteration
                     # was actually entered in THIS spec. Used by the
                     # reclassify clear below so it never wipes predictions
@@ -5692,6 +5741,15 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     if d["detector_model"] != "full-image"
                                 ]
                                 if raw_real_dets:
+                                    # Record the skip so the ETA can
+                                    # subtract the still-unvisited share
+                                    # of unclassifiable photos from
+                                    # remaining work instead of scoring
+                                    # them as pending inference load
+                                    # (Codex #1468 P2).
+                                    photos_unclassifiable_in_spec.add(
+                                        photo["id"],
+                                    )
                                     continue
 
                                 existing_full = thread_db.get_detections(
@@ -6152,6 +6210,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     elapsed=elapsed,
                                     cache_overcount=len(
                                         photos_cache_overcounted_in_spec
+                                    ),
+                                    unclassifiable_estimate=len(
+                                        preflight_unclassifiable_ids
+                                    ),
+                                    unclassifiable_seen=len(
+                                        photos_unclassifiable_in_spec
                                     ),
                                 ),
                             },

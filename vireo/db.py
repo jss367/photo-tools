@@ -17950,31 +17950,45 @@ class Database:
             ).fetchall()
             for r in rows:
                 matched.add(r["photo_id"])
-        # Contextual-weak photos: the runtime classifies a single
-        # weak-threshold detection per photo (photo_dets[:1] in the
-        # classify loop). Mirror that by counting the photo whenever at
-        # least one of its weak-threshold animal detections carries a
-        # matching run key. This may optimistically count a photo whose
-        # picked detection turns out uncached — the pipeline's overcount
-        # tracker (photos_cache_overcounted_in_spec) then reconciles it
-        # via observed misses, which is only accurate because those
-        # misses are now scoped to preflight-expected photos.
+        # Contextual-weak photos: the runtime classifies a SINGLE
+        # weak-threshold detection per photo (``photo_dets[:1]`` in the
+        # classify loop, after ordering by ``detector_confidence DESC,
+        # id ASC`` in ``get_detections``). Mirror that by counting the
+        # photo only when THAT top detection carries a matching run
+        # key. An earlier revision accepted any qualifying weak
+        # detection with a run key, which meant a photo whose only
+        # cached row was a lower-ranked box was marked cached even
+        # though the runtime would infer the uncached top box; that
+        # miss never registered as a fall-through overcount either
+        # (the top detection has no run key at all), leaving a phantom
+        # cache hit in the ETA (Codex #1468 P2).
         for i in range(0, len(weak_ids), CHUNK):
             chunk = weak_ids[i:i + CHUNK]
             if not chunk:
                 continue
             placeholders = ",".join("?" * len(chunk))
             rows = self.conn.execute(
-                f"SELECT DISTINCT d.photo_id "
-                f"FROM detections d "
-                f"JOIN classifier_runs cr ON cr.detection_id = d.id "
-                f"  AND cr.classifier_model = ? "
-                f"  AND cr.labels_fingerprint = ? "
-                f"WHERE d.detector_model != 'full-image' "
-                f"  AND d.category = 'animal' "
-                f"  AND d.detector_confidence >= ? "
-                f"  AND d.photo_id IN ({placeholders})",
-                [classifier_model, labels_fingerprint, weak_conf, *chunk],
+                f"""WITH top_weak_det AS (
+                        SELECT photo_id, id AS detection_id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY photo_id
+                                   ORDER BY detector_confidence DESC,
+                                            id ASC
+                               ) AS rn
+                          FROM detections
+                         WHERE detector_model != 'full-image'
+                           AND category = 'animal'
+                           AND detector_confidence >= ?
+                           AND photo_id IN ({placeholders})
+                      )
+                    SELECT DISTINCT td.photo_id
+                      FROM top_weak_det td
+                      JOIN classifier_runs cr
+                        ON cr.detection_id = td.detection_id
+                       AND cr.classifier_model = ?
+                       AND cr.labels_fingerprint = ?
+                     WHERE td.rn = 1""",
+                [weak_conf, *chunk, classifier_model, labels_fingerprint],
             ).fetchall()
             for r in rows:
                 matched.add(r["photo_id"])
@@ -18036,6 +18050,69 @@ class Database:
             contextual_weak_photo_ids=contextual_weak_photo_ids,
             weak_confidence=weak_confidence,
         ))
+
+    def get_unclassifiable_photos(
+        self,
+        photo_ids,
+        *,
+        contextual_weak_photo_ids=None,
+        weak_confidence=None,
+    ):
+        """Return the SET of photo IDs the classify runtime skips at the
+        ``raw_real_dets`` continue branch.
+
+        A photo is skipped when its detection state has real
+        (non-full-image) boxes but none pass the classify floor: the
+        ordinary ``detector_confidence`` for most photos, and the lower
+        ``weak_confidence`` for photos ``contextual_weak_photo_ids``
+        marks as contextual-weak rescues. The runtime never enters an
+        inference batch for these photos, so without excluding them
+        from the ETA's ``remaining_photos`` count a tail of below-
+        threshold photos can inflate a numeric ETA that the runtime
+        will actually traverse without work (Codex #1468 P2).
+        """
+        if not photo_ids:
+            return set()
+        import config as cfg
+        min_conf = self.get_effective_config(cfg.load()).get(
+            "detector_confidence", 0.2,
+        )
+        weak_photo_ids = set(contextual_weak_photo_ids or ())
+        weak_conf = (
+            float(weak_confidence) if weak_confidence is not None else min_conf
+        )
+        normal_ids = [pid for pid in photo_ids if pid not in weak_photo_ids]
+        weak_ids = [pid for pid in photo_ids if pid in weak_photo_ids]
+        # Chunk to stay under SQLITE_MAX_VARIABLE_NUMBER (default 999).
+        CHUNK = 500
+        unclassifiable: set = set()
+        # A photo is skipped when EXISTS(real detection at any confidence)
+        # AND NOT EXISTS(real animal detection >= floor). "Real" means
+        # non-full-image. The floor differs by whether the photo was
+        # selected for contextual-weak rescue.
+        for pool, floor in ((normal_ids, min_conf), (weak_ids, weak_conf)):
+            for i in range(0, len(pool), CHUNK):
+                chunk = pool[i:i + CHUNK]
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" * len(chunk))
+                rows = self.conn.execute(
+                    f"""SELECT DISTINCT d.photo_id
+                          FROM detections d
+                         WHERE d.detector_model != 'full-image'
+                           AND d.photo_id IN ({placeholders})
+                           AND NOT EXISTS (
+                                 SELECT 1 FROM detections d2
+                                  WHERE d2.photo_id = d.photo_id
+                                    AND d2.detector_model != 'full-image'
+                                    AND d2.category = 'animal'
+                                    AND d2.detector_confidence >= ?
+                               )""",
+                    [*chunk, floor],
+                ).fetchall()
+                for r in rows:
+                    unclassifiable.add(r["photo_id"])
+        return unclassifiable
 
     def get_labels_fingerprints(self):
         """Return all rows from the labels_fingerprints sidecar.

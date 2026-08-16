@@ -18738,6 +18738,172 @@ def test_get_classifier_run_cache_hits_weak_scoped_per_photo(tmp_path):
     assert hits == {p_weak}
 
 
+def test_get_classifier_run_cache_hits_weak_matches_top_detection_only(tmp_path):
+    """Contextual-weak photos are classified via ``photo_dets[:1]`` — the
+    single top detection by (confidence DESC, id ASC). The preflight
+    must mirror that: a photo whose only cached run key sits on a
+    lower-ranked box should NOT be counted, because the runtime will
+    infer the uncached top box and neither the cache-hit nor the
+    fall-through overcount branch would record it, leaving a phantom
+    cache hit in the ETA (Codex #1468 P2).
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+
+    # p_lower_cached: two weak-threshold detections. The higher-
+    # confidence (0.18) has no run key; the lower (0.13) does. Runtime
+    # infers the top one, so preflight must NOT count this photo.
+    p_lower_cached = db.add_photo(
+        folder_id=fid, filename="lower.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    _ = _add_one_detection(db, p_lower_cached, conf=0.18)
+    d_lower = _add_one_detection(db, p_lower_cached, conf=0.13)
+    db.record_classifier_run(
+        d_lower, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+
+    # p_top_cached: same shape, but the run key is on the TOP box —
+    # runtime cache-hits, preflight counts it.
+    p_top_cached = db.add_photo(
+        folder_id=fid, filename="top.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    d_top = _add_one_detection(db, p_top_cached, conf=0.18)
+    _ = _add_one_detection(db, p_top_cached, conf=0.13)
+    db.record_classifier_run(
+        d_top, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+
+    hits = db.get_classifier_run_cache_hits(
+        [p_lower_cached, p_top_cached],
+        "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids={p_lower_cached, p_top_cached},
+        weak_confidence=0.12,
+    )
+    assert hits == {p_top_cached}
+
+
+def test_get_classifier_run_cache_hits_weak_ties_break_by_id(tmp_path):
+    """When two weak detections tie on confidence, the runtime picks the
+    lowest id (get_detections orders by ``confidence DESC, id ASC``).
+    The preflight must mirror that tie-break exactly.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    p = db.add_photo(
+        folder_id=fid, filename="tie.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    d_first = _add_one_detection(db, p, conf=0.15)
+    d_second = _add_one_detection(db, p, conf=0.15)
+    # Only the SECOND (higher-id) detection has a run key. The runtime
+    # picks the first (lowest id) and infers, so preflight must not
+    # count this photo.
+    db.record_classifier_run(
+        d_second, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+    assert d_first < d_second
+
+    hits = db.get_classifier_run_cache_hits(
+        [p], "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids={p},
+        weak_confidence=0.12,
+    )
+    assert hits == set()
+
+    # Move the run key to the first detection — now it matches and the
+    # photo is counted.
+    db.conn.execute(
+        "UPDATE classifier_runs SET detection_id = ? WHERE detection_id = ?",
+        (d_first, d_second),
+    )
+    db.conn.commit()
+
+    hits = db.get_classifier_run_cache_hits(
+        [p], "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids={p},
+        weak_confidence=0.12,
+    )
+    assert hits == {p}
+
+
+def test_get_unclassifiable_photos_flags_below_threshold_tail(tmp_path):
+    """A photo whose real detections all sit below ``detector_confidence``
+    and is NOT contextual-weak gets skipped at the ``raw_real_dets``
+    continue branch. The ETA must subtract these from remaining work
+    (Codex #1468 P2).
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+
+    # Above threshold — classifiable, should NOT be flagged.
+    p_ok = db.add_photo(
+        folder_id=fid, filename="ok.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    _add_one_detection(db, p_ok, conf=0.5)
+
+    # Below threshold, not contextual weak — SKIPPED at runtime.
+    p_skip = db.add_photo(
+        folder_id=fid, filename="skip.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    _add_one_detection(db, p_skip, conf=0.15)
+
+    # No real detections at all — goes to full-image fallback, not the
+    # skip branch. Must NOT be flagged.
+    p_empty = db.add_photo(
+        folder_id=fid, filename="empty.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+
+    # Below threshold BUT in the contextual-weak set — the runtime lowers
+    # the floor for it, so it classifies rather than skips.
+    p_weak_rescued = db.add_photo(
+        folder_id=fid, filename="rescued.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    _add_one_detection(db, p_weak_rescued, conf=0.15)
+
+    unclassifiable = db.get_unclassifiable_photos(
+        [p_ok, p_skip, p_empty, p_weak_rescued],
+        contextual_weak_photo_ids={p_weak_rescued},
+        weak_confidence=0.12,
+    )
+    assert unclassifiable == {p_skip}
+
+
+def test_get_unclassifiable_photos_ignores_non_animal_boxes(tmp_path):
+    """A photo whose only above-threshold boxes are non-animal
+    (person/vehicle) has no runtime-classifiable target but IS still
+    skipped at ``raw_real_dets`` (raw includes any real detection at
+    any confidence, animal or not). Verify the query flags it.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+
+    p_person_only = db.add_photo(
+        folder_id=fid, filename="person.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    db.conn.execute(
+        """INSERT INTO detections
+             (photo_id, detector_model, box_x, box_y, box_w, box_h,
+              detector_confidence, category)
+           VALUES (?, ?, 0.0, 0.0, 1.0, 1.0, 0.9, 'person')""",
+        (p_person_only, "test-det"),
+    )
+    db.conn.commit()
+
+    unclassifiable = db.get_unclassifiable_photos([p_person_only])
+    assert unclassifiable == {p_person_only}
+
+
 def test_all_nav_ids_covers_every_page():
     from db import ALL_NAV_IDS
     expected = {

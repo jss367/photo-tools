@@ -171,6 +171,59 @@ def test_classification_eta_overcount_floors_at_observed_cache_hits():
     assert fields["remaining_uncached"] == 60
 
 
+def test_classification_eta_subtracts_future_unclassifiable_photos():
+    """Photos the runtime deterministically skips at the ``raw_real_dets``
+    continue branch (real detections but none above the classify floor,
+    not contextual-weak) must not inflate ``remaining_uncached`` — the
+    runtime never enters an inference batch for them, so the ETA
+    otherwise reports a large numeric estimate for a tail that will be
+    traversed almost immediately (Codex #1468 P2).
+    """
+    # 100 photos total; preflight identified 60 as unclassifiable. After
+    # 20 seen (0 skipped so far — the prefix happens to be all
+    # classifiable), we have 20 real inference attempts. The remaining
+    # 80 photos include 60 unclassifiable — only 20 are real work.
+    fields = _classification_eta_progress(
+        total=100,
+        seen=20,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=120,
+        unclassifiable_estimate=60,
+        unclassifiable_seen=0,
+    )
+
+    assert fields["remaining_uncached"] == 20
+    assert fields["eta_state"] == "ready"
+    assert fields["eta_rate_per_min"] == 10.0
+    assert fields["eta_seconds"] == 120
+
+
+def test_classification_eta_unclassifiable_seen_capped_at_estimate():
+    """The seen count for unclassifiable photos should not exceed the
+    preflight estimate — an unexpected extra skip cannot make future
+    unclassifiable count go negative and cancel out real work.
+    """
+    fields = _classification_eta_progress(
+        total=100,
+        seen=40,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=60,
+        unclassifiable_estimate=10,
+        unclassifiable_seen=15,  # runtime skipped more than preflight said
+    )
+
+    # remaining_photos = 60; expected_future_unclassifiable clamps at 0
+    # (all 10 preflight-predicted skips accounted for by seen), so all
+    # 60 remaining photos count as work.
+    assert fields["remaining_uncached"] == 60
+
+
 def test_pipeline_params_has_skip_classify():
     """PipelineParams should support skip_classify flag."""
     params = PipelineParams(collection_id=1, skip_classify=True)

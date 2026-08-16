@@ -98,6 +98,19 @@ def test_merge_command_does_not_double_fire_the_review_fix_routine():
     assert "!startsWith(github.event.comment.body, '/merge ')" in workflow
 
 
+def test_ci_fix_binds_to_failing_run_head_not_live_pr_head():
+    workflow = _read(WORKFLOW)
+
+    # When Tests for commit A completes after the PR has advanced to
+    # commit B, passing the live PR head B as expected-head would let the
+    # routine edit B while diagnosing A's failure logs. The stale-head
+    # skip and the expected-head passthrough must both key on
+    # `github.event.workflow_run.head_sha`, not the current PR head.
+    assert "WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}" in workflow
+    assert 'if [[ "$live_head" != "$WORKFLOW_RUN_HEAD_SHA" ]]' in workflow
+    assert 'echo "head_sha=$WORKFLOW_RUN_HEAD_SHA"' in workflow
+
+
 def test_routine_fire_rechecks_live_pr_state_and_expected_head():
     action = _read(FIRE_ACTION)
 

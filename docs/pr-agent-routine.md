@@ -152,6 +152,13 @@ retries when it contains the exact `[pr-agent-fix-ci:<number>]` marker the
 routine prompt asks the agent to write. Regular contributor commits with
 similar wording still route to the routine.
 
+The `fix-ci` job binds the routine to the exact commit whose Tests run
+failed. If the PR head has advanced past `workflow_run.head_sha` by the
+time the failure lands, the job skips instead of firing — otherwise the
+routine would edit the newer commit while diagnosing older failure logs.
+The workflow-run SHA is what gets passed as `expected-head` to the
+routine forwarder.
+
 Review-event de-noising. Concurrency is scoped per job, not workflow-wide,
 so unrelated task types never cancel each other. Review-fix firers
 (`activate`, `fix-comment-feedback`, `fix-comments`, `codex-review`) share

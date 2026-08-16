@@ -303,6 +303,11 @@ jobs:
   # produced the failing run rather than `github.sha`, which for
   # `workflow_run` events is the default-branch head and would let
   # unrelated PRs' CI-fix runs cancel each other.
+  #
+  # The failing run's head SHA is what the routine diagnoses and what the
+  # stale-head guard binds to; a run whose PR has advanced past that SHA
+  # is dropped before fire so the routine never edits a newer commit
+  # against older failure logs.
   fix-ci:
     if: >-
       github.event_name == 'workflow_run'
@@ -318,6 +323,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKFLOW_RUN_PULL_REQUESTS: ${{ toJson(github.event.workflow_run.pull_requests) }}
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           pr_number=$(jq -r '.[0].number // empty' <<< "$WORKFLOW_RUN_PULL_REQUESTS")
 
@@ -337,10 +343,24 @@ jobs:
             exit 0
           fi
 
-          head_sha=$(gh pr view "$pr_number" --repo "${{ github.repository }}" \
+          # Bind the CI-repair to the exact commit whose Tests run failed.
+          # If the PR head has advanced past the failing run, the failure
+          # logs describe a commit that is no longer the head; diagnosing
+          # them while editing the newer commit would produce a phantom fix
+          # against work that has already moved on. The stale-state guard
+          # inside fire-routine catches the same drift, but skipping here
+          # avoids spending a routine invocation on it.
+          live_head=$(gh pr view "$pr_number" --repo "${{ github.repository }}" \
             --json headRefOid \
             --jq '.headRefOid')
-          commit=$(gh api "repos/${{ github.repository }}/commits/${head_sha}")
+
+          if [[ "$live_head" != "$WORKFLOW_RUN_HEAD_SHA" ]]; then
+            echo "PR #${pr_number} head ${live_head} has advanced past the failing run's head ${WORKFLOW_RUN_HEAD_SHA}; skipping stale CI-fix."
+            echo "should_fix=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          commit=$(gh api "repos/${{ github.repository }}/commits/${WORKFLOW_RUN_HEAD_SHA}")
           commit_msg=$(jq -r '.commit.message' <<< "$commit")
 
           if grep -Fq "[pr-agent-fix-ci:${pr_number}]" <<< "$commit_msg"; then
@@ -349,10 +369,10 @@ jobs:
             exit 0
           fi
 
-          echo "Will attempt to fix CI for PR #${pr_number}"
+          echo "Will attempt to fix CI for PR #${pr_number} at ${WORKFLOW_RUN_HEAD_SHA}"
           {
             echo "pr_number=$pr_number"
-            echo "head_sha=$head_sha"
+            echo "head_sha=$WORKFLOW_RUN_HEAD_SHA"
             echo "should_fix=true"
           } >> "$GITHUB_OUTPUT"
 

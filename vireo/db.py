@@ -3702,6 +3702,7 @@ class Database:
                     "candidate_keyword_ids": set(),
                     "wildlife_genre_count": int(row["wildlife_genre_count"]),
                     "survivor": bool(row["has_same_name_survivor"]),
+                    "xmp_mtime": row["xmp_mtime"],
                 },
             )
             entry["candidate_keyword_ids"].add(row["keyword_id"])
@@ -3745,6 +3746,8 @@ class Database:
                                FROM photo_keywords candidate_pk
                                JOIN keywords candidate_k
                                  ON candidate_k.id = candidate_pk.keyword_id
+                               JOIN photos candidate_p
+                                 ON candidate_p.id = candidate_pk.photo_id
                                WHERE candidate_pk.photo_id = ?
                                  AND candidate_pk.keyword_id = ?
                                  AND (candidate_pk.source IS NULL
@@ -3752,8 +3755,9 @@ class Database:
                                  AND candidate_k.name
                                      = 'Wildlife' COLLATE NOCASE
                                  AND candidate_k.type = 'genre'
-                                 AND candidate_k.parent_id IS NULL""",
-                            (photo_id, keyword_id),
+                                 AND candidate_k.parent_id IS NULL
+                                 AND candidate_p.xmp_mtime IS ?""",
+                            (photo_id, keyword_id, entry["xmp_mtime"]),
                         ).fetchone() is not None
                     }
                     if candidate_ids:

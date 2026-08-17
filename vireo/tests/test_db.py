@@ -14425,6 +14425,7 @@ def test_retire_builtin_wildlife_detaches_associations_and_queues_flat_removal(t
     [
         ("promote_candidate", 0),
         ("retype_candidate", 0),
+        ("accept_changed_sidecar", 0),
         ("add_same_name_survivor", 1),
     ],
 )
@@ -14482,6 +14483,12 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
                 concurrent_db.update_keyword(
                     wildlife_id, type="individual",
                 )
+            elif concurrent_change == "accept_changed_sidecar":
+                concurrent_db.conn.execute(
+                    "UPDATE photos SET xmp_mtime = ? WHERE id = ?",
+                    (2.0, photo_id),
+                )
+                concurrent_db.conn.commit()
             else:
                 survivor_id = concurrent_db.conn.execute(
                     "INSERT INTO keywords (name, type) "
@@ -14509,6 +14516,9 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
             "SELECT type FROM keywords WHERE id = ?",
             (wildlife_id,),
         ).fetchone()["type"] == "individual"
+    elif concurrent_change == "accept_changed_sidecar":
+        assert genre_association is not None
+        assert db.get_photo(photo_id)["xmp_mtime"] == 2.0
     else:
         assert genre_association is None
         assert db.conn.execute(

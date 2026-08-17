@@ -22,6 +22,8 @@ body {
 }
 .editor-stage {
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   background: var(--bg-panel);
   display: grid;
   grid-template-rows: auto 1fr auto;
@@ -139,6 +141,19 @@ body {
 .editor-canvas-wrap.zoom-actual {
   align-items: flex-start;
   justify-content: flex-start;
+  cursor: grab;
+}
+.editor-canvas-wrap.zoom-actual .crop-box {
+  cursor: grab;
+}
+.editor-canvas-wrap.space-pan,
+.editor-canvas-wrap.space-pan .crop-box,
+.editor-canvas-wrap.space-pan .crop-handle {
+  cursor: grab !important;
+}
+.editor-canvas-wrap.panning,
+.editor-canvas-wrap.panning * {
+  cursor: grabbing !important;
 }
 .editor-canvas {
   position: relative;
@@ -791,6 +806,8 @@ var editorState = {
   previewSeq: 0,
   previewTimer: null,
   drag: null,
+  pan: null,
+  spacePan: false,
   showBefore: false,
   zoomMode: 'fit',
   cropAspect: null,
@@ -2580,11 +2597,69 @@ function initUnloadGuard() {
 
 function initCropDrag() {
   var box = document.getElementById('editorCropBox');
+  var wrap = document.getElementById('editorCanvasWrap');
+
+  function updatePanCursor() {
+    wrap.classList.toggle('space-pan', editorState.spacePan);
+    wrap.classList.toggle('panning', !!editorState.pan);
+  }
+
+  function startPan(e) {
+    if (editorState.loading || editorState.pan || e.button !== 0) return;
+    // Leave touch scrolling to the browser; this gesture fills the missing
+    // mouse interaction without replacing the trackpad/touch behavior.
+    if (e.pointerType && e.pointerType !== 'mouse') return;
+    editorState.pan = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      scrollLeft: wrap.scrollLeft,
+      scrollTop: wrap.scrollTop,
+    };
+    wrap.setPointerCapture(e.pointerId);
+    updatePanCursor();
+    e.preventDefault();
+  }
+
+  function movePan(e) {
+    var pan = editorState.pan;
+    if (!pan || e.pointerId !== pan.pointerId) return;
+    wrap.scrollLeft = pan.scrollLeft - (e.clientX - pan.startX);
+    wrap.scrollTop = pan.scrollTop - (e.clientY - pan.startY);
+    e.preventDefault();
+  }
+
+  function finishPan(e) {
+    var pan = editorState.pan;
+    if (!pan || (e && e.pointerId != null && e.pointerId !== pan.pointerId)) return;
+    editorState.pan = null;
+    if (wrap.hasPointerCapture && wrap.hasPointerCapture(pan.pointerId)) {
+      wrap.releasePointerCapture(pan.pointerId);
+    }
+    updatePanCursor();
+  }
+
+  window.setEditorSpacePan = function(active) {
+    editorState.spacePan = !!active;
+    updatePanCursor();
+  };
+
+  wrap.addEventListener('pointerdown', function(e) {
+    if (editorState.zoomMode === 'actual' || editorState.spacePan) startPan(e);
+  });
+  wrap.addEventListener('pointermove', movePan);
+  wrap.addEventListener('pointerup', finishPan);
+  wrap.addEventListener('pointercancel', finishPan);
+  wrap.addEventListener('lostpointercapture', finishPan);
+
   box.addEventListener('pointerdown', function(e) {
-    if (editorState.loading) return;
+    if (editorState.loading || e.button !== 0) return;
     var img = document.getElementById('editorImg');
     if (!img || !img.clientWidth || !img.clientHeight) return;
     var handle = e.target && e.target.dataset ? e.target.dataset.handle : '';
+    // At 100%, dragging the photo pans it. Corner handles keep resizing the
+    // crop, unless Space is held as an explicit pan override.
+    if (editorState.spacePan || (editorState.zoomMode === 'actual' && !handle)) return;
     editorState.drag = {
       handle: handle || 'move',
       startX: e.clientX,
@@ -2595,6 +2670,7 @@ function initCropDrag() {
     };
     box.setPointerCapture(e.pointerId);
     e.preventDefault();
+    e.stopPropagation();
   });
   document.addEventListener('pointermove', function(e) {
     var drag = editorState.drag;
@@ -2653,6 +2729,10 @@ function initCropDrag() {
     renderCropBox();
     updateHistogramFeedback();
     positionMaskOverlay();
+  });
+  window.addEventListener('blur', function() {
+    window.setEditorSpacePan(false);
+    finishPan();
   });
 }
 
@@ -2910,10 +2990,16 @@ async function loadPhoto(photoId, opts) {
 
 function initEditorKeyboard() {
   document.addEventListener('keydown', function(e) {
-    if (e.metaKey || e.ctrlKey || e.altKey) return;
     var t = e.target;
     var tag = t && t.tagName ? t.tagName.toLowerCase() : '';
-    if (tag === 'input' || tag === 'textarea' || tag === 'select' || (t && t.isContentEditable)) return;
+    var isTextEntry = tag === 'input' || tag === 'textarea' || tag === 'select' ||
+      (t && t.isContentEditable);
+    if ((e.key === ' ' || e.code === 'Space') && !e.metaKey && !e.ctrlKey && !e.altKey && !isTextEntry) {
+      window.setEditorSpacePan(true);
+      e.preventDefault();
+      return;
+    }
+    if (e.metaKey || e.ctrlKey || e.altKey || isTextEntry) return;
     if (e.key === 'ArrowLeft') { e.preventDefault(); editorNav(-1); }
     else if (e.key === 'ArrowRight') { e.preventDefault(); editorNav(1); }
     else if (e.key === 'Enter') {
@@ -2928,6 +3014,12 @@ function initEditorKeyboard() {
           role === 'button' || role === 'link' || role === 'menuitem' || role === 'tab') return;
       var saveBtn = document.getElementById('saveBtn');
       if (saveBtn && !saveBtn.disabled) { e.preventDefault(); saveRecipe(); }
+    }
+  });
+  document.addEventListener('keyup', function(e) {
+    if ((e.key === ' ' || e.code === 'Space') && editorState.spacePan) {
+      window.setEditorSpacePan(false);
+      e.preventDefault();
     }
   });
 }

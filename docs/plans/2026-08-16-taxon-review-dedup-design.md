@@ -2019,13 +2019,39 @@ these two are halves of one mutation, at runtime.)
   removed and no keyword-related predicate is evaluated.
 - **Phase B — keyword effects.** Only after the last Phase-A write:
   resolve the card's single keyword over the union of member photos (§4,
-  "Resolved once per mutation, not once per photo"), evaluate the
-  retraction predicate, perform the untag or tag, and compute the
-  disclosure counts — all against the post-Phase-A state. The keyword
+  "Resolved once per mutation, not once per photo") — the *written*
+  string on an accept, and the string the accept's disclosure names —
+  evaluate the retraction predicate, perform the tag on accept or the
+  per-photo enumeration untag on reject (below), and compute the
+  disclosure counts, all against the post-Phase-A state. The keyword
   resolution belongs in Phase B for the same reason the retraction
   predicate does: it reads which member photos already carry a
   taxon-matched keyword, and on a reconciling accept that set is only
   final once every member's status is written.
+
+  *The single-string rule bounds writes and disclosure, not removals.*
+  §4 case 2 — member photos carrying two or more different taxon-matched
+  keywords from earlier accepts, an admitted residual whose merge is a
+  Keywords-page follow-up — is exactly the case where resolving reject
+  to one spelling would leak: the retraction would flip every member to
+  `rejected` while leaving the other accept-owned synonym (and its
+  sidecar change) on the photos that carry it, the same
+  badge-disagrees-with-metadata failure this section exists to prevent,
+  this time bounded by an addition rule reject has no reason to obey.
+  Retraction is therefore *per photo, over every accept-owned
+  taxon-matched association*: for each affected photo, enumerate every
+  `photo_keywords` row whose `keywords.taxon_id` resolves to the card's
+  taxon (through the same `taxa.inat_id` → `taxa.id` translation §4
+  precedence-1 uses, so synonym rows are found even when their id
+  differs from the resolved-once card keyword), and retract each one
+  whose folded `source = 'accept'` that survives the liveness predicate
+  below. §4 case 2's stated invariant is that accept "may leave other
+  synonyms already on member photos in place" — precisely those
+  synonyms are the set a later reconciling reject must retract, or the
+  card's badge outruns its own metadata trail one accept later. When
+  that set has more than one member on the same card, the disclosure
+  names each string rather than picking a representative:
+  `untagged "Blue Tit" and "Eurasian Blue Tit" from 3 photos`.
 
 Without the split, a row-at-a-time loop evaluates each keyword decision
 against a state the same click is about to invalidate. The concrete
@@ -2063,11 +2089,12 @@ rejected, so they no longer count as live. One rule, no list.
 
 *What "another live assertion" means, precisely.* Phase B is where it
 runs, so it is worth pinning down: a row in
-`predictions`/`prediction_review` on that photo, in the active
-workspace, whose §1 taxon key equals the card's and whose
-**post-Phase-A** status is `pending` or `accepted`. Both `rejected`
-and `alternative` are excluded, and for the same reason: only
-top-level, still-in-play assertions can keep an accept-owned tag
+`predictions`/`prediction_review` on that photo, in **any workspace
+that contains the photo — not just the active one** (see the
+cross-workspace note below), whose §1 taxon key equals the card's and
+whose **post-Phase-A** status is `pending` or `accepted`. Both
+`rejected` and `alternative` are excluded, and for the same reason:
+only top-level, still-in-play assertions can keep an accept-owned tag
 alive. `rejected` is out because the reviewer has retired it;
 `alternative` is out because it was never a card in the first place —
 it is a runner-up in some other row's top-k output that §Edge cases
@@ -2095,6 +2122,41 @@ not `get_photos_with_equivalent_species` (`db.py:13874`), which
 answers the different question "does this photo already carry an
 equivalent species keyword" and is the accept path's idempotence
 check.
+
+*Cross-workspace, and load-bearing.* `photo_keywords` is a
+catalog-global table — `(photo_id, keyword_id)` with no
+`workspace_id` column (`db.py:728-732`) — while
+`prediction_review.status` is workspace-scoped, keyed on
+`(prediction_id, workspace_id)` (`db.py:925-935`). The two rows point
+at the same photo but answer different questions: the keyword row is
+"does the photo carry this tag at all", and the review row is "did
+the reviewer in *this* workspace decide about this prediction". A
+liveness predicate restricted to the active workspace would therefore
+let a reconciling reject in workspace A strip a globally-stored
+keyword that workspace B still `pending`- or `accepted`-asserts
+through its own `prediction_review` row for the same photo. The
+metadata written to disk would silently contradict the state
+workspace B still displays, and A's own disclosure would name a count
+of zero live assertions when B has several — the same
+badge-disagrees-with-metadata failure the retraction rule exists to
+prevent, this time arriving through the workspace axis rather than
+the mutation-order axis. The predicate therefore evaluates over every
+workspace that contains the affected photo — joining
+`prediction_review` back to `predictions` and through
+`workspace_folders` (as `_photo_in_workspace` does at
+`db.py:2121-2129`, generalized from "the active workspace" to
+"every workspace containing this photo") — and retraction happens
+only when the set of live assertions is empty catalog-wide. The
+alternative — giving `photo_keywords` its own `workspace_id` column
+and duplicating each taxon keyword per workspace — is rejected for the
+same reason §4 precedence-1 reuses a taxon-matched keyword globally in
+the first place: keywords back XMP sidecars on disk, which have no
+concept of a workspace, so a per-workspace tag row would either write
+one workspace's synonyms to a shared file or split the file per
+workspace, both of which break the "one tag per photo per taxon"
+invariant the tagging pipeline is built on. The cross-workspace check
+preserves that global rule and lets retraction stay per-photo, which
+is the same shape the Phase-B enumeration above uses.
 
 **Retraction requires provenance, and provenance cannot live in the
 edit log.** Stripping a keyword is only safe if we know the *accept*
@@ -2170,16 +2232,24 @@ to. Two rules, split by what is actually knowable:
     writes to `photo_keywords` is part of the Phase 4 checklist; a path
     that moves a row without folding provenance is a bug, not a gap.
   - **Retraction reads the folded value, and `manual` is never
-    retracted.** A reconciling reject strips only `source = 'accept'`.
-    A row that is `'manual'` — including one that became `'manual'` by
-    the fold above, i.e. the user's ownership survived a merge into an
-    accept-owned row — is left in place and takes the disclosure path
-    below, with the wording adjusted to say why ("kept 'Blue Tit' — you
-    added this keyword yourself"). This is strictly stronger than
-    #1488's contract, not in tension with it: #1488 promises manual
-    stamps are never downgraded; this design additionally promises that
-    a manual-stamped association is never removed by an automated
-    review action at all.
+    retracted.** For each affected photo, a reconciling reject
+    enumerates every `photo_keywords` row whose `keywords.taxon_id`
+    resolves to the card's taxon (the same `taxa.inat_id` → `taxa.id`
+    translation §4 precedence-1 uses) and strips those whose folded
+    value is `source = 'accept'`. The enumeration — rather than
+    "strip the resolved-once card keyword" — is what makes §4 case 2's
+    residual synonym rows retractable: two accepts that happened to
+    reuse different taxon-matched keywords on different member photos
+    are both accept-owned, and both come out on a subsequent Reject
+    all. A row that is `'manual'` — including one that became
+    `'manual'` by the fold above, i.e. the user's ownership survived a
+    merge into an accept-owned row — is left in place and takes the
+    disclosure path below, with the wording adjusted to say why ("kept
+    'Blue Tit' — you added this keyword yourself"). This is strictly
+    stronger than #1488's contract, not in tension with it: #1488
+    promises manual stamps are never downgraded; this design
+    additionally promises that a manual-stamped association is never
+    removed by an automated review action at all.
 - **Retrospectively — never strip on a guess.** A `NULL`-source row is
   left in place. The card says so instead of silently disagreeing with
   its own badge: "Rejected — kept the 'Blue Tit' keyword on 3 photos
@@ -3214,6 +3284,38 @@ Each phase lands as its own PR and is independently useful.
    `prediction_accept` entry, which is the regression guard for not
    sourcing provenance from the bounded edit log), and another live
    non-rejected prediction still asserting the taxon; a
+   **case-2 multi-synonym retraction fixture** — a card whose earlier
+   accepts (under §4 case 2) left `source = 'accept'` "Blue Tit" on
+   photo P1 and `source = 'accept'` "Eurasian Blue Tit" on photo P2:
+   "Reject all" now retracts *both* synonyms (each recorded as its own
+   undoable `keyword_remove`) and the disclosure names both strings,
+   `untagged "Blue Tit" and "Eurasian Blue Tit" from 2 photos`. A build
+   that resolves the reject to the single card keyword and untags only
+   that spelling leaves the other synonym stuck on its photo and fails
+   — the regression guard for "the single-string rule bounds writes
+   and disclosure, not removals" (§3, Phase B). Two negative variants:
+   one where P2's "Eurasian Blue Tit" row is `source = 'manual'` (the
+   user typed it), which is left in place and takes the disclosure
+   path ("kept 'Eurasian Blue Tit' on 1 photo — you added this keyword
+   yourself") while P1's `'accept'` row is still stripped; and one
+   where a third same-taxon synonym exists globally on some *other*
+   photo but has no `photo_keywords` row on P1 or P2, which is
+   untouched — enumeration is per affected photo, not per taxon-scoped
+   keyword; a
+   **cross-workspace liveness fixture** — a photo P appears in
+   workspaces A and B (both have `workspace_folders` rows for P's
+   folder), each carrying its own `prediction_review` row for a
+   same-taxon prediction, both `pending`. In workspace A the user runs
+   "Reject all" on the card containing A's row: A's `prediction_review`
+   status flips to `rejected`, but the keyword (accept-owned from an
+   earlier click) **stays** on P because B's row is still a live
+   assertion catalog-wide, and A's disclosure reads "kept 'Blue Tit'
+   — still predicted on 1 photo" naming the cross-workspace count
+   rather than zero. A build whose liveness query filters by
+   `workspace_id = active` strips the keyword and fails. Symmetric
+   variant: once B also rejects, the keyword is retracted on the
+   *second* reject, from B's workspace, because the catalog-wide live
+   set is now empty; a
    **two-phase-ordering fixture** — "Reject all" on an
    `{accepted, pending}` card whose two members assert the **same taxon
    on the same photo**, the accepted one having tagged it

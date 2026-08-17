@@ -79,7 +79,7 @@ const sections = [
       </div>
     </aside>
 
-    <main class="guide-content" id="start">
+    <div class="guide-content" id="start">
       <section id="overview" class="guide-section intro-section">
         <p class="section-label">Overview</p>
         <h2>One place to make the final review decisions</h2>
@@ -411,15 +411,15 @@ const sections = [
             <div class="structure-title"><span class="verb verb--extract">Extract</span><strong>Remove selected items</strong></div>
             <div class="structure-before"><b>A</b><b class="picked">B</b><b>C</b><b class="picked">D</b></div>
             <span class="down-arrow" aria-hidden="true">↓</span>
-            <div class="structure-after"><span><b>A</b><b>C</b></span><span class="extracted"><b>B</b><b>D</b></span></div>
-            <p>Use when noncontiguous photos or one whole burst should become a separate sibling group.</p>
+            <div class="structure-after"><span><b>A</b></span><span class="extracted"><b>B</b></span><span><b>C</b></span><span class="extracted"><b>D</b></span></div>
+            <p>Use when noncontiguous photos or one whole burst should become separate sibling groups. Vireo partitions the source into maximal selected and unselected chronological runs, and every run becomes its own burst so no group spans an intervening run.</p>
           </div>
           <figcaption id="structure-caption">“Detach” is represented in the interface by a specific extraction command: Extract photos to new burst or Separate burst as encounter.</figcaption>
         </figure>
 
         <div class="operation-list">
           <article><div><span>Burst</span><h3>Split burst here</h3></div><p>Cuts one burst between two adjacent photos. Photos before the boundary stay in the first burst; photos at and after it form the second.</p></article>
-          <article><div><span>Burst</span><h3>Extract photos to new burst</h3></div><p>Removes the selected photos from their current burst and creates a sibling burst in the same encounter. The selected photos do not need to be adjacent.</p></article>
+          <article><div><span>Burst</span><h3>Extract photos to new burst</h3></div><p>Removes the selected photos from their current burst and places them into new sibling burst membership in the same encounter. When the selection is not contiguous, the source burst is partitioned into maximal selected and unselected chronological runs and each run becomes its own burst.</p></article>
           <article><div><span>Burst</span><h3>Merge adjacent bursts</h3></div><p>Combines neighboring bursts inside the same encounter while preserving chronological photo order.</p></article>
           <article><div><span>Encounter</span><h3>Split encounter here</h3></div><p>Cuts an encounter between adjacent bursts. Bursts before the boundary stay together; the remainder becomes a new encounter.</p></article>
           <article><div><span>Encounter</span><h3>Separate burst as encounter</h3></div><p>Removes one complete burst and turns it into its own encounter. Other bursts remain in their existing encounter.</p></article>
@@ -522,7 +522,7 @@ const sections = [
         <p>Use Process to create or refresh analysis, Browse for photo-first exploration, Cull for fast triage, and sidecar synchronization to share supported decisions with other photo applications.</p>
         <a href={`${base}docs/`} class="btn btn--primary">Back to all documentation</a>
       </footer>
-    </main>
+    </div>
   </div>
 </Base>
 

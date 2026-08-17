@@ -14429,6 +14429,7 @@ def test_retire_builtin_wildlife_detaches_associations_and_queues_flat_removal(t
         ("add_workspace_owner", 1),
         ("add_same_name_survivor", 1),
         ("add_survivor_with_manual_sidecar", 1),
+        ("remove_survivor_with_manual_sidecar", 1),
     ],
 )
 def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
@@ -14442,7 +14443,10 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
     db_path = str(tmp_path / "test.db")
     photos_dir = tmp_path / "photos"
     photos_dir.mkdir()
-    if concurrent_change == "add_survivor_with_manual_sidecar":
+    if concurrent_change in {
+        "add_survivor_with_manual_sidecar",
+        "remove_survivor_with_manual_sidecar",
+    }:
         from xmp import write_sidecar
 
         write_sidecar(
@@ -14474,12 +14478,20 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
         "VALUES (?, ?, ?)",
         (photo_id, wildlife_id, "generated"),
     )
+    survivor_id = None
+    if concurrent_change == "remove_survivor_with_manual_sidecar":
+        survivor_id = db.conn.execute(
+            "INSERT INTO keywords (name, type) "
+            "VALUES ('Wildlife', 'individual')"
+        ).lastrowid
+        db.tag_photo(
+            photo_id, survivor_id, source="manual", _commit=False,
+        )
     db.conn.commit()
     db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
 
     original_parse = ET.parse
     promoted = False
-    survivor_id = None
     new_ws_id = None
 
     def promote_during_parse(path, *args, **kwargs):
@@ -14504,6 +14516,18 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
             elif concurrent_change == "add_workspace_owner":
                 new_ws_id = concurrent_db.create_workspace("new owner")
                 concurrent_db.add_workspace_folder(new_ws_id, fid)
+            elif concurrent_change == "remove_survivor_with_manual_sidecar":
+                concurrent_db.untag_photo(
+                    photo_id, survivor_id, _commit=False,
+                )
+                concurrent_db.queue_change(
+                    photo_id,
+                    "keyword_remove",
+                    "Wildlife",
+                    workspace_id=ws,
+                    _commit=False,
+                )
+                concurrent_db.conn.commit()
             else:
                 survivor_id = concurrent_db.conn.execute(
                     "INSERT INTO keywords (name, type) "
@@ -14548,6 +14572,21 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
             ).fetchall()
         }
         assert queued_ws_ids == {ws, new_ws_id}
+    elif concurrent_change == "remove_survivor_with_manual_sidecar":
+        assert genre_association is None
+        assert db.conn.execute(
+            "SELECT 1 FROM photo_keywords "
+            "WHERE photo_id = ? AND keyword_id = ?",
+            (photo_id, survivor_id),
+        ).fetchone() is None
+        pending_types = {
+            row["change_type"]
+            for row in db.conn.execute(
+                "SELECT change_type FROM pending_changes WHERE photo_id = ?",
+                (photo_id,),
+            ).fetchall()
+        }
+        assert pending_types == {"keyword_remove"}
     else:
         assert genre_association is None
         assert db.conn.execute(
@@ -14555,7 +14594,10 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
             "WHERE photo_id = ? AND keyword_id = ?",
             (photo_id, survivor_id),
         ).fetchone()["source"] == "manual"
-    if concurrent_change != "add_workspace_owner":
+    if concurrent_change not in {
+        "add_workspace_owner",
+        "remove_survivor_with_manual_sidecar",
+    }:
         assert db.conn.execute(
             "SELECT 1 FROM pending_changes WHERE photo_id = ?",
             (photo_id,),

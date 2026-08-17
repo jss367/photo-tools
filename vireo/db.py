@@ -3530,7 +3530,22 @@ class Database:
 
         rows = self.conn.execute(
             f"""SELECT DISTINCT pk.photo_id, pk.keyword_id, pk.source,
-                       p.filename, p.xmp_mtime, f.path AS folder_path
+                       p.filename, p.xmp_mtime, f.path AS folder_path,
+                       EXISTS (
+                           SELECT 1
+                           FROM photo_keywords survivor_pk
+                           JOIN keywords survivor_k
+                             ON survivor_k.id = survivor_pk.keyword_id
+                           WHERE survivor_pk.photo_id = pk.photo_id
+                             AND survivor_k.name = 'Wildlife' COLLATE NOCASE
+                             AND (
+                                 survivor_k.id NOT IN ({placeholders})
+                                 OR (
+                                     survivor_k.id <> pk.keyword_id
+                                     AND survivor_pk.source = 'manual'
+                                 )
+                             )
+                       ) AS has_scan_survivor
                 FROM photo_keywords pk
                 JOIN photos p ON p.id = pk.photo_id
                 JOIN folders f ON f.id = p.folder_id
@@ -3547,7 +3562,7 @@ class Database:
                         AND (species_k.type = 'taxonomy'
                              OR species_k.is_species = 1)
                   )""",
-            keyword_ids,
+            [*keyword_ids, *keyword_ids],
         ).fetchall()
 
         # Group candidates per photo so their sidecar verdict and locked
@@ -3650,9 +3665,14 @@ class Database:
                     "candidate_keyword_ids": set(),
                     "xmp_mtime": row["xmp_mtime"],
                     "manual_sidecar": verdict == "manual",
+                    "scan_survivor": bool(row["has_scan_survivor"]),
                 },
             )
             entry["candidate_keyword_ids"].add(row["keyword_id"])
+            entry["scan_survivor"] = (
+                entry["scan_survivor"]
+                or bool(row["has_scan_survivor"])
+            )
 
         if unknown_without_sidecar_pairs:
             self.conn.executemany(
@@ -3736,6 +3756,7 @@ class Database:
                         if (
                             entry["manual_sidecar"]
                             and not has_current_same_name_survivor
+                            and not entry["scan_survivor"]
                         ):
                             # The sidecar's flat Wildlife term belongs to the
                             # candidate only when no same-name association
@@ -3755,6 +3776,11 @@ class Database:
                                 ],
                             )
                             continue
+                        # A survivor present during the scan but absent now
+                        # owned the observed sidecar term. Its concurrent
+                        # removal must not promote the obsolete genre; retire
+                        # the candidate and let the queued removal (or the
+                        # flat-removal fallback below) clean up XMP.
                         still_retirable[photo_id] = (
                             entry,
                             candidate_ids,

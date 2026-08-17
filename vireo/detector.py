@@ -52,7 +52,7 @@ TILED_CROP_FRACTION = 0.60
 TILED_SOURCE_MAX_SIZE = 2560
 TILED_EDGE_MARGIN = 0.01
 TILED_NMS_IOU = 0.45
-TILED_MAX_ADDITIONS = 20
+TILED_MAX_ADDITIONS_PER_CATEGORY = 20
 
 
 def ensure_megadetector_weights(progress_callback=None):
@@ -471,8 +471,9 @@ def _merge_detections(full_frame, tiled):
     )
 
     merged = list(full_frame)
-    additions = 0
+    additions_by_category = {}
     for candidate in tiled_after_nms:
+        category = candidate.get("category", "animal")
         overlaps = [
             index
             for index, existing in enumerate(merged)
@@ -488,9 +489,10 @@ def _merge_detections(full_frame, tiled):
             if candidate["confidence"] > merged[closest]["confidence"]:
                 merged[closest] = candidate
             continue
-        if additions < TILED_MAX_ADDITIONS:
+        additions = additions_by_category.get(category, 0)
+        if additions < TILED_MAX_ADDITIONS_PER_CATEGORY:
             merged.append(candidate)
-            additions += 1
+            additions_by_category[category] = additions + 1
 
     merged.sort(key=lambda d: float(d["confidence"]), reverse=True)
     return merged

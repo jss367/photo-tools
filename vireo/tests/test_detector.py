@@ -377,6 +377,30 @@ def test_merge_detections_upgrades_overlapping_full_frame_subject():
     assert detector._merge_detections([weak], [strong]) == [strong]
 
 
+def test_merge_detections_caps_tiled_additions_per_category():
+    import detector
+
+    tiled = [
+        {
+            "box": {"x": i / 100, "y": 0.1, "w": 0.005, "h": 0.01},
+            "confidence": 0.99 - i / 1000,
+            "category": "person",
+        }
+        for i in range(21)
+    ]
+    animal = {
+        "box": {"x": 0.8, "y": 0.8, "w": 0.1, "h": 0.1},
+        "confidence": 0.3,
+        "category": "animal",
+    }
+    tiled.append(animal)
+
+    merged = detector._merge_detections([], tiled)
+
+    assert animal in merged
+    assert sum(d["category"] == "person" for d in merged) == 20
+
+
 def test_detect_animals_runs_tiled_fallback_after_weak_full_pass(
     monkeypatch, tmp_path,
 ):

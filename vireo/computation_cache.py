@@ -123,7 +123,7 @@ def megadetector_runtime_fingerprint(weights_path=None):
         TILED_CROP_FRACTION,
         TILED_EDGE_MARGIN,
         TILED_FALLBACK_TRIGGER_CONFIDENCE,
-        TILED_MAX_ADDITIONS,
+        TILED_MAX_ADDITIONS_PER_CATEGORY,
         TILED_NMS_IOU,
         TILED_SOURCE_MAX_SIZE,
     )
@@ -137,7 +137,7 @@ def megadetector_runtime_fingerprint(weights_path=None):
         "weights_sha256": sha256_file(weights_path),
         "input_recipe": "vireo-detector-source-v1",
         "preprocess": {
-            "version": 5,
+            "version": 6,
             "input_size": INPUT_SIZE,
             "resize": "Pillow.BILINEAR-letterbox",
             "padding": 114,
@@ -155,7 +155,7 @@ def megadetector_runtime_fingerprint(weights_path=None):
             "raw_confidence_floor": RAW_CONF_FLOOR,
             "categories": [[key, CLASS_NAMES[key]] for key in sorted(CLASS_NAMES)],
             "tiled_nms_iou": TILED_NMS_IOU,
-            "tiled_max_additions": TILED_MAX_ADDITIONS,
+            "tiled_max_additions_per_category": TILED_MAX_ADDITIONS_PER_CATEGORY,
         },
         "comparison_policy": "provider-tolerance-experimental-v1",
     })

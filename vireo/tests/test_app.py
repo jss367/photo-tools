@@ -18093,6 +18093,32 @@ def test_browse_detail_panel_suppresses_borrowed_only_buckets(app_and_db):
     assert "consensus-attributable score above your confidence threshold" in html
 
 
+def test_browse_detail_empty_message_names_borrowed_suppression(app_and_db):
+    """When every bucket was dropped for borrowed evidence, the empty
+    message must name the suppression rather than the classifier or the
+    threshold.
+
+    The bug: ``predictionEmptyMessage(state, hidden)`` took only the
+    below-threshold count. When the suppression guard emptied the panel
+    but no row was dropped for being under the floor, ``hidden`` was
+    zero and the message read "Classification ran and produced no
+    species" — a claim contradicted by the ``suppressedNote`` rendered
+    right beside it. When rows *were* also below the floor, the message
+    said "every prediction is below your confidence floor", which does
+    not fit the suppressed subset. The empty message needs to know
+    which filter emptied the panel.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    # The function accepts a third arg for the suppressed count and
+    # branches on it before either of the other two facts.
+    assert "function predictionEmptyMessage(state, hiddenCount, suppressedCount)" in html
+    assert "if (suppressedCount) return 'Pending predictions exist but were suppressed" in html
+    # The call site in the borrowed-suppression branch passes the count.
+    assert "predictionEmptyMessage(state, hidden, suppressedBorrowedRows)" in html
+
+
 def test_browse_selection_panel_renders_suppressed_borrowed_count(app_and_db):
     """The selection panel surfaces the server's suppressed_borrowed_count.
 

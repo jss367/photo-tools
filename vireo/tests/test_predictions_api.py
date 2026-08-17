@@ -1280,6 +1280,69 @@ def test_group_apply_writes_every_side_effect_in_one_transaction(
     ).fetchone() is None
 
 
+def test_group_apply_treats_regenerated_predictions_as_stale(app_and_db):
+    """Classification rerunning while the burst modal is open makes the photo stale.
+
+    The bug: ``_stale_group_apply_photos`` checked only the observed row's
+    status. If a classifier rerun inserted a new prediction row for the same
+    ``(detection, classifier_model)`` while the modal was open, the observed
+    row's status was still pending, so the check passed — and
+    ``update_predictions_status_by_photo`` blindly wrote the modal's decision
+    to *every* prediction on the photo, including the newly generated row the
+    user never saw, tagging the photo with the modal's stale species.
+
+    The fix: an observed row that is no longer the latest ``labels_fingerprint``
+    for its ``(detection, classifier_model)`` invalidates its photo. The photo
+    is dropped from the apply the same way status drift drops one.
+    """
+    app, db = app_and_db
+    (pred_a, photo_a), (pred_b, photo_b) = _seed_burst_group(db, 'gregen')
+    ws = db._active_workspace_id
+    client = app.test_client()
+
+    # Classifier reruns on photo A between render and click: a new prediction
+    # row is inserted for the same detection with a newer labels_fingerprint.
+    # The old row stays pending, so status-only staleness would clear.
+    det_a = db.conn.execute(
+        "SELECT detection_id FROM predictions WHERE id = ?", (pred_a,)
+    ).fetchone()['detection_id']
+    db.add_prediction(
+        detection_id=det_a, species='Verdin', confidence=0.7,
+        model='test-model', category='new',
+        labels_fingerprint='rerun-v2',
+    )
+    new_pred_a = db.conn.execute(
+        """SELECT id FROM predictions
+             WHERE detection_id = ? AND classifier_model = ? AND species = ?""",
+        (det_a, 'test-model', 'Verdin'),
+    ).fetchone()['id']
+    assert new_pred_a != pred_a
+    flag_before = db.get_photo(photo_a)['flag'] or 'none'
+
+    resp = client.post('/api/predictions/group/apply', json={
+        'picks': [photo_a],
+        'rejects': [photo_b],
+        'removed': [],
+        'species': 'Azure Jay',
+        # What the modal showed when it opened: both pending, only the *old*
+        # predictions listed. The new row is not observed.
+        'observed': {str(pred_a): 'pending', str(pred_b): 'pending'},
+    })
+    assert resp.status_code == 200
+    assert resp.get_json()['already_decided'] == 1
+
+    # Nothing was written for photo A — including the new row that the write
+    # would have blindly touched — and the modal's species did not attach.
+    assert db.get_review_status(pred_a, ws) == 'pending'
+    assert db.get_review_status(new_pred_a, ws) == 'pending'
+    assert (db.get_photo(photo_a)['flag'] or 'none') == flag_before
+    assert 'Azure Jay' not in {k['name'] for k in db.get_photo_keywords(photo_a)}
+
+    # Photo B, whose detections were untouched, still applies.
+    assert db.get_review_status(pred_b, ws) == 'rejected'
+    assert db.get_photo(photo_b)['flag'] == 'rejected'
+
+
 def test_group_apply_rejects_a_malformed_baseline(app_and_db):
     """``observed`` is validated rather than silently ignored.
 

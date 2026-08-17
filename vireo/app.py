@@ -17542,7 +17542,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return observed, None
 
     def _stale_group_apply_photos(db, observed):
-        """Photos whose group member was decided since the modal rendered.
+        """Photos whose group member was decided or regenerated since the modal rendered.
 
         Group apply is the one decision route where "already decided" is *not*
         the right precondition. The single-row and batch endpoints can use it
@@ -17556,17 +17556,34 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         would describe the user's own prior decision as somebody else's.
 
         So the precondition is compare-and-swap against what the modal
-        actually displayed: skip a photo only when its member's status is no
-        longer the one the client saw. A deliberate re-decision passes
-        (observed ``accepted`` still matches current ``accepted``); a decision
-        that landed from Browse or a second tab after the modal opened does
-        not. That is the same rule the rest of this PR enforces — "decided
-        after the payload was rendered" — expressed against a baseline
-        instead of inferred from the button's existence.
+        actually displayed: skip a photo only when the picture the modal saw
+        has moved. Two shapes of "moved" invalidate a photo, in the same
+        pass so the check cannot narrow to one and miss the other:
+
+        1. **Status drift on an observed row.** An observed row's stored
+           status is no longer the one the client displayed — a decision that
+           landed from Browse or a second tab after the modal opened. A
+           deliberate re-decision passes (observed ``accepted`` still matches
+           current ``accepted``); a foreign decision does not.
+        2. **Superseded label set.** An observed row is no longer the latest
+           ``labels_fingerprint`` for its ``(detection, classifier_model)`` —
+           classification reran between render and click and inserted new
+           prediction rows for the same detections. The old row still exists
+           with an unchanged status, so shape 1 alone would clear the check.
+           But the write below (``update_predictions_status_by_photo``) does
+           not respect the observed set: it rewrites every prediction on the
+           photo, including the newly inserted rows the modal never saw, and
+           applies the modal's stale species to them.
 
         Photo-level because the write is: ``update_predictions_status_by_photo``
         restates every prediction of the photo, so one stale member
         invalidates the whole photo's write, not just its own row.
+
+        The latest-fingerprint expression is the one ``_superseded_prediction_ids``,
+        ``get_predictions``, ``/api/species/summary`` and
+        ``get_top_prediction_for_photo`` all use: newest ``created_at``, ties
+        broken by ``id``. Keeping one definition of "current" everywhere is
+        the property the rest of this PR's precondition family relies on.
         """
         if not observed:
             return set()
@@ -17576,7 +17593,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             placeholders = ",".join("?" for _ in chunk)
             for row in db.conn.execute(
                 f"""SELECT pr.id AS prediction_id, d.photo_id AS photo_id,
-                           COALESCE(pr_rev.status, 'pending') AS status
+                           COALESCE(pr_rev.status, 'pending') AS status,
+                           (pr.labels_fingerprint != (
+                               SELECT pr2.labels_fingerprint FROM predictions pr2
+                               WHERE pr2.detection_id = pr.detection_id
+                                 AND pr2.classifier_model = pr.classifier_model
+                               ORDER BY pr2.created_at DESC, pr2.id DESC
+                               LIMIT 1
+                           )) AS is_superseded
                       FROM predictions pr
                       JOIN detections d ON d.id = pr.detection_id
                       LEFT JOIN prediction_review pr_rev
@@ -17585,7 +17609,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                      WHERE pr.id IN ({placeholders})""",
                 (ws, *chunk),
             ):
-                if row["status"] != observed[row["prediction_id"]]:
+                if (row["status"] != observed[row["prediction_id"]]
+                        or row["is_superseded"]):
                     stale.add(row["photo_id"])
         return stale
 

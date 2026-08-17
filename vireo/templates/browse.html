@@ -6814,10 +6814,22 @@ function predictionAmbiguityReason(p) {
 // "nothing detected" would be a stale explanation. `hiddenCount` splits the
 // last case in two — blaming the threshold when the classifier produced no
 // species at all would name a cause that never fired.
-function predictionEmptyMessage(state, hiddenCount) {
+function predictionEmptyMessage(state, hiddenCount, suppressedCount) {
   if (!state) return 'No predictions for this photo.';
   if (!state.detector_ran) return 'Not yet classified — no detector has run on this photo.';
   if (state.classifier_ran) {
+    // Borrowed-confidence suppression (see the ``suppressedBorrowedRows``
+    // guard in renderDetailPredictions) drops buckets whose only above-
+    // threshold rows carry a raw score for a different species than their
+    // consensus. Those pending predictions exist — the panel just refuses
+    // to show them because the score does not attribute to what the button
+    // would tag. Claiming "no species were produced" would deny they exist;
+    // claiming "every prediction is below your confidence floor" would name
+    // a filter that did not fire. So the suppression wins over both when it
+    // is what emptied the panel, and the ``suppressedNote`` beside this
+    // message still counts how many rows are in Review with the burst
+    // context.
+    if (suppressedCount) return 'Pending predictions exist but were suppressed — none carry a consensus-attributable score above your confidence floor.';
     if (hiddenCount) return 'No species above threshold — every prediction is below your confidence floor.';
     return 'Classification ran and produced no species for this photo.';
   }
@@ -7073,8 +7085,8 @@ function renderDetailPredictions(data, photoId) {
         formatPredictionConfidence(threshold) + ').</div>'
       : '';
     list.innerHTML = '<div class="selection-empty">' +
-      escapeHtml(predictionEmptyMessage(state, hidden)) + '</div>' +
-      belowNote + suppressedNote;
+      escapeHtml(predictionEmptyMessage(state, hidden, suppressedBorrowedRows)) +
+      '</div>' + belowNote + suppressedNote;
     return;
   }
 

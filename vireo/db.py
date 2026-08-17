@@ -3739,14 +3739,31 @@ class Database:
                 ).fetchone() is not None
             }
             if candidate_ids:
-                still_retirable[photo_id] = (entry, candidate_ids)
+                candidate_placeholders = ",".join("?" for _ in candidate_ids)
+                has_current_same_name_survivor = self.conn.execute(
+                    f"""SELECT 1
+                        FROM photo_keywords survivor_pk
+                        JOIN keywords survivor_k
+                          ON survivor_k.id = survivor_pk.keyword_id
+                        WHERE survivor_pk.photo_id = ?
+                          AND survivor_k.name = 'Wildlife' COLLATE NOCASE
+                          AND survivor_pk.keyword_id
+                              NOT IN ({candidate_placeholders})
+                        LIMIT 1""",
+                    [photo_id, *candidate_ids],
+                ).fetchone() is not None
+                still_retirable[photo_id] = (
+                    entry,
+                    candidate_ids,
+                    has_current_same_name_survivor,
+                )
 
-        for photo_id, (entry, candidate_ids) in still_retirable.items():
-            has_preserved_genre = (
-                len(candidate_ids)
-                < entry["wildlife_genre_count"]
-            )
-            if entry["survivor"] or has_preserved_genre:
+        for photo_id, (
+            entry,
+            _candidate_ids,
+            has_current_same_name_survivor,
+        ) in still_retirable.items():
+            if has_current_same_name_survivor:
                 # Another top-level 'Wildlife' keyword (e.g. type='individual')
                 # still owns the flat XMP subject. Removing it would strip the
                 # surviving user-authored tag from the sidecar, and a later
@@ -3780,7 +3797,11 @@ class Database:
         retired_photo_ids = list(still_retirable.keys())
         retired_associations = [
             (photo_id, keyword_id)
-            for photo_id, (_entry, candidate_ids) in still_retirable.items()
+            for photo_id, (
+                _entry,
+                candidate_ids,
+                _has_current_same_name_survivor,
+            ) in still_retirable.items()
             for keyword_id in candidate_ids
         ]
         if retired_associations:

@@ -14420,10 +14420,14 @@ def test_retire_builtin_wildlife_detaches_associations_and_queues_flat_removal(t
     ).fetchone() is not None
 
 
-def test_retire_builtin_wildlife_preserves_manual_add_during_sidecar_scan(
-    tmp_path, monkeypatch,
+@pytest.mark.parametrize(
+    ("concurrent_change", "expected_retired"),
+    [("promote_candidate", 0), ("add_same_name_survivor", 1)],
+)
+def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
+    tmp_path, monkeypatch, concurrent_change, expected_retired,
 ):
-    """A manual add racing the long XMP scan must win before final deletion."""
+    """Manual candidate/survivor changes racing the XMP scan must win."""
     import xml.etree.ElementTree as ET
 
     from db import Database
@@ -14459,25 +14463,45 @@ def test_retire_builtin_wildlife_preserves_manual_add_during_sidecar_scan(
 
     original_parse = ET.parse
     promoted = False
+    survivor_id = None
 
     def promote_during_parse(path, *args, **kwargs):
-        nonlocal promoted
+        nonlocal promoted, survivor_id
         if not promoted:
             promoted = True
             concurrent_db = Database(db_path, initialize_schema=False)
-            concurrent_db.tag_photo(photo_id, wildlife_id, source="manual")
+            if concurrent_change == "promote_candidate":
+                concurrent_db.tag_photo(
+                    photo_id, wildlife_id, source="manual",
+                )
+            else:
+                survivor_id = concurrent_db.conn.execute(
+                    "INSERT INTO keywords (name, type) "
+                    "VALUES ('Wildlife', 'individual')"
+                ).lastrowid
+                concurrent_db.tag_photo(
+                    photo_id, survivor_id, source="manual",
+                )
             concurrent_db.close()
         return original_parse(path, *args, **kwargs)
 
     monkeypatch.setattr(ET, "parse", promote_during_parse)
 
-    assert db.retire_builtin_wildlife_genre() == 0
-    association = db.conn.execute(
+    assert db.retire_builtin_wildlife_genre() == expected_retired
+    genre_association = db.conn.execute(
         "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
         (photo_id, wildlife_id),
     ).fetchone()
-    assert association is not None
-    assert association["source"] == "manual"
+    if concurrent_change == "promote_candidate":
+        assert genre_association is not None
+        assert genre_association["source"] == "manual"
+    else:
+        assert genre_association is None
+        assert db.conn.execute(
+            "SELECT source FROM photo_keywords "
+            "WHERE photo_id = ? AND keyword_id = ?",
+            (photo_id, survivor_id),
+        ).fetchone()["source"] == "manual"
     assert db.conn.execute(
         "SELECT 1 FROM pending_changes WHERE photo_id = ?",
         (photo_id,),

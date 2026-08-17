@@ -10702,10 +10702,18 @@ async function removeWorkspaceRootFromBrowse(fid) {
     // carries the removed root when ``renderFolderTree`` runs, so
     // ``folderLocalStatuses`` synthesizes a phantom top-level row for it
     // and leaves the removed folder visible until the next blocker poll
-    // (Codex review r3798912105).
+    // (Codex review r3798912105). ``load()`` swallows fetch failures and
+    // returns ``null``; rendering against the pre-DELETE
+    // ``window.vireoLocalFolderData`` in that case would resurrect the
+    // removed root as a phantom, so reload instead of rebuilding from
+    // stale local state (Codex review r3799142116).
     if (window.vireoLocalFolders &&
         typeof window.vireoLocalFolders.load === 'function') {
-      await window.vireoLocalFolders.load();
+      var localRefreshed = await window.vireoLocalFolders.load();
+      if (localRefreshed === null) {
+        window.location.reload();
+        return;
+      }
     }
 
     var loaded = await Promise.all([

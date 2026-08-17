@@ -140,6 +140,7 @@ KEYWORD_SOURCE_CONFLICT_SQL = (
 
 _SQLITE_PARAM_CHUNK_SIZE = 800
 _MISSING_PHOTOS_PROGRESS_INTERVAL = 200
+_WILDLIFE_RETIREMENT_WRITE_CHUNK_SIZE = 100
 
 
 class IncompatibleDatabaseError(RuntimeError):
@@ -3529,14 +3530,7 @@ class Database:
 
         rows = self.conn.execute(
             f"""SELECT DISTINCT pk.photo_id, pk.keyword_id, pk.source,
-                       wf.workspace_id,
                        p.filename, p.xmp_mtime, f.path AS folder_path,
-                       (
-                           SELECT COUNT(*)
-                           FROM photo_keywords all_genre_pk
-                           WHERE all_genre_pk.photo_id = pk.photo_id
-                             AND all_genre_pk.keyword_id IN ({placeholders})
-                       ) AS wildlife_genre_count,
                        EXISTS (
                            SELECT 1
                            FROM photo_keywords survivor_pk
@@ -3551,11 +3545,10 @@ class Database:
                                      AND survivor_pk.source = 'manual'
                                  )
                              )
-                       ) AS has_same_name_survivor
+                       ) AS has_scan_survivor
                 FROM photo_keywords pk
                 JOIN photos p ON p.id = pk.photo_id
                 JOIN folders f ON f.id = p.folder_id
-                LEFT JOIN workspace_folders wf ON wf.folder_id = p.folder_id
                 WHERE pk.keyword_id IN ({placeholders})
                   -- Authorship was latched above, so one durable predicate
                   -- replaces the pending/history/discard evidence hunt.
@@ -3569,18 +3562,11 @@ class Database:
                         AND (species_k.type = 'taxonomy'
                              OR species_k.is_species = 1)
                   )""",
-            [*keyword_ids, *keyword_ids, *keyword_ids],
+            [*keyword_ids, *keyword_ids],
         ).fetchall()
 
-        # Group owning workspaces per photo. get_pending_changes() and the
-        # sync panel are per-workspace, so if a photo's folder belongs to
-        # multiple workspaces the sidecar cleanup must be queued in each
-        # of them or the stale term stays in XMP for the unqueued owners
-        # even after the migration marks itself complete. Also carry the
-        # per-photo "same-name survivor" flag so photos whose flat subject
-        # is still needed by another top-level Wildlife keyword skip the
-        # sidecar removal while their generated genre association is still
-        # detached from the DB.
+        # Group candidates per photo so their sidecar verdict and locked
+        # retirement decision stay consistent across duplicate genre rows.
         photo_workspaces = {}
         # pid -> "manual" (readable sidecar carries a flat Wildlife term),
         # "defer" (sidecar unreadable/corrupt — decide on a later run), or
@@ -3588,11 +3574,10 @@ class Database:
         # (no sidecar was ever imported, so a legacy NULL source cannot be
         # distinguished from metadata imported with write_xmp=False).
         sidecar_verdict_by_photo = {}
-        sidecar_manual_pairs = []
-        deferred_unavailable_sidecar = False
+        unknown_without_sidecar_pairs = []
+        deferred_sidecar = False
         for row in rows:
             pid = row["photo_id"]
-            survivor = bool(row["has_same_name_survivor"])
             if pid not in sidecar_verdict_by_photo:
                 base = os.path.splitext(row["filename"])[0]
                 xmp_path = os.path.join(row["folder_path"], base + ".xmp")
@@ -3607,7 +3592,7 @@ class Database:
                     # after the volume comes back online.
                     if row["xmp_mtime"] is not None:
                         sidecar_verdict_by_photo[pid] = "defer"
-                        deferred_unavailable_sidecar = True
+                        deferred_sidecar = True
                     else:
                         sidecar_verdict_by_photo[pid] = "absent"
                 else:
@@ -3626,7 +3611,7 @@ class Database:
                             xmp_path,
                         )
                         sidecar_verdict_by_photo[pid] = "defer"
-                        deferred_unavailable_sidecar = True
+                        deferred_sidecar = True
                     except Exception:
                         log.warning(
                             "Could not read sidecar %s during Wildlife retirement; deferring",
@@ -3634,7 +3619,7 @@ class Database:
                             exc_info=True,
                         )
                         sidecar_verdict_by_photo[pid] = "defer"
-                        deferred_unavailable_sidecar = True
+                        deferred_sidecar = True
                     else:
                         try:
                             from xmp import read_keywords
@@ -3654,33 +3639,12 @@ class Database:
                                 exc_info=True,
                             )
                             sidecar_verdict_by_photo[pid] = "defer"
-                            deferred_unavailable_sidecar = True
+                            deferred_sidecar = True
             verdict = sidecar_verdict_by_photo[pid]
             preserve_unknown_without_sidecar = (
                 verdict == "absent" and row["source"] is None
             )
-            if (
-                (verdict == "manual" and not survivor)
-                or preserve_unknown_without_sidecar
-            ):
-                # The sidecar itself carries the flat term, so a person put it
-                # there. Latch that verdict: a later run may not be able to
-                # reach the file (offline volume), and a sidecar rewrite must
-                # not be able to erase the provenance either.
-                #
-                # ``survivor`` shortcuts this branch. When another top-level
-                # ``Wildlife`` keyword of a different type (for example
-                # ``type='individual'``) already lives on the photo, the flat
-                # ``Wildlife`` subject in the sidecar is attributable to that
-                # surviving keyword rather than to the generated ``genre``
-                # association. Latching ``source='manual'`` on the genre from
-                # that shared subject — or skipping the photo entirely — would
-                # preserve the generated association forever, and the global
-                # completion marker would then stamp so no later run could
-                # recover it. Fall through so the genre is detached from the
-                # DB below; ``entry["survivor"]`` still suppresses the flat
-                # XMP removal so the survivor's sidecar term stays intact.
-                #
+            if preserve_unknown_without_sidecar:
                 # A legacy NULL-source association with no sidecar is also
                 # preserved. Lightroom catalog imports historically called
                 # execute_import(write_xmp=False) by default and attached the
@@ -3689,97 +3653,255 @@ class Database:
                 # discriminator, so prefer metadata preservation and latch
                 # the association as manual. New catalog imports are stamped
                 # at write time and known generated sources can still retire.
-                sidecar_manual_pairs.append((pid, row["keyword_id"]))
+                unknown_without_sidecar_pairs.append(
+                    (pid, row["keyword_id"]),
+                )
                 continue
             if verdict == "defer":
                 continue
-            ws = row["workspace_id"]
             entry = photo_workspaces.setdefault(
                 pid,
                 {
-                    "ws_ids": set(),
                     "candidate_keyword_ids": set(),
-                    "wildlife_genre_count": int(row["wildlife_genre_count"]),
-                    "survivor": bool(row["has_same_name_survivor"]),
+                    "xmp_mtime": row["xmp_mtime"],
+                    "manual_sidecar": verdict == "manual",
+                    "scan_survivor": bool(row["has_scan_survivor"]),
                 },
             )
             entry["candidate_keyword_ids"].add(row["keyword_id"])
-            if ws is not None:
-                entry["ws_ids"].add(ws)
+            entry["scan_survivor"] = (
+                entry["scan_survivor"]
+                or bool(row["has_scan_survivor"])
+            )
 
-        if sidecar_manual_pairs:
+        if unknown_without_sidecar_pairs:
             self.conn.executemany(
                 "UPDATE photo_keywords SET source = "
                 + keyword_source_max_sql(
                     "photo_keywords.source", f"'{KEYWORD_SOURCE_MANUAL}'",
                 )
                 + " WHERE photo_id = ? AND keyword_id = ?",
-                sidecar_manual_pairs,
+                unknown_without_sidecar_pairs,
             )
             self.conn.commit()
 
-        for photo_id, entry in photo_workspaces.items():
-            has_preserved_genre = (
-                len(entry["candidate_keyword_ids"])
-                < entry["wildlife_genre_count"]
-            )
-            if entry["survivor"] or has_preserved_genre:
-                # Another top-level 'Wildlife' keyword (e.g. type='individual')
-                # still owns the flat XMP subject. Removing it would strip the
-                # surviving user-authored tag from the sidecar, and a later
-                # XMP reconciliation could detach it from the DB. Leave the
-                # sidecar alone and only detach the generated genre row below.
-                continue
-            ws_ids = entry["ws_ids"]
-            target_ws_ids = (
-                ws_ids
-                if ws_ids
-                else ({fallback_workspace} if fallback_workspace is not None else set())
-            )
-            for ws_id in target_ws_ids:
-                existing_remove = self.conn.execute(
-                    """SELECT 1 FROM pending_changes
-                       WHERE photo_id = ? AND workspace_id = ?
-                         AND change_type IN ('keyword_remove', 'keyword_remove_flat')
-                         AND value = 'Wildlife' COLLATE NOCASE
-                       LIMIT 1""",
-                    (photo_id, ws_id),
-                ).fetchone()
-                if existing_remove is None:
-                    self.queue_change(
-                        photo_id,
-                        "keyword_remove_flat",
-                        "Wildlife",
-                        workspace_id=ws_id,
-                        _commit=False,
-                    )
+        # Finalize in bounded writer transactions. The sidecar scan above can
+        # take minutes on a large catalog, during which a person may re-add,
+        # retype, or create another Wildlife keyword. Each chunk takes the
+        # writer lock, revalidates those facts, queues cleanup, and deletes the
+        # exact associations atomically. An edit before the lock is observed;
+        # an edit after the commit follows the normal route and cancels any
+        # now-stale flat removal. Bounding the chunk prevents this background
+        # migration from monopolizing SQLite's single writer for the entire
+        # catalog and turning otherwise-live edit requests into lock errors.
+        retired_photo_ids = set()
+        for photo_chunk in _chunks(
+            photo_workspaces.items(),
+            _WILDLIFE_RETIREMENT_WRITE_CHUNK_SIZE,
+        ):
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                still_retirable = {}
+                for photo_id, entry in photo_chunk:
+                    current_photo = self.conn.execute(
+                        "SELECT xmp_mtime FROM photos WHERE id = ?",
+                        (photo_id,),
+                    ).fetchone()
+                    if (
+                        current_photo is not None
+                        and current_photo["xmp_mtime"] != entry["xmp_mtime"]
+                    ):
+                        # An XMP-to-DB reconciliation won the race with the
+                        # sidecar scan. Preserve this association and leave
+                        # the marker unset so the next startup inspects the
+                        # newly accepted sidecar state.
+                        deferred_sidecar = True
+                        continue
+                    candidate_ids = {
+                        keyword_id
+                        for keyword_id in entry["candidate_keyword_ids"]
+                        if self.conn.execute(
+                            """SELECT 1
+                               FROM photo_keywords candidate_pk
+                               JOIN keywords candidate_k
+                                 ON candidate_k.id = candidate_pk.keyword_id
+                               WHERE candidate_pk.photo_id = ?
+                                 AND candidate_pk.keyword_id = ?
+                                 AND (candidate_pk.source IS NULL
+                                      OR candidate_pk.source <> 'manual')
+                                 AND candidate_k.name
+                                     = 'Wildlife' COLLATE NOCASE
+                                 AND candidate_k.type = 'genre'
+                                 AND candidate_k.parent_id IS NULL""",
+                            (photo_id, keyword_id),
+                        ).fetchone() is not None
+                    }
+                    if candidate_ids:
+                        candidate_placeholders = ",".join(
+                            "?" for _ in candidate_ids
+                        )
+                        has_current_same_name_survivor = self.conn.execute(
+                            f"""SELECT 1
+                                FROM photo_keywords survivor_pk
+                                JOIN keywords survivor_k
+                                  ON survivor_k.id = survivor_pk.keyword_id
+                                WHERE survivor_pk.photo_id = ?
+                                  AND survivor_k.name
+                                      = 'Wildlife' COLLATE NOCASE
+                                  AND survivor_pk.keyword_id
+                                      NOT IN ({candidate_placeholders})
+                                LIMIT 1""",
+                            [photo_id, *candidate_ids],
+                        ).fetchone() is not None
+                        if (
+                            entry["manual_sidecar"]
+                            and not has_current_same_name_survivor
+                            and not entry["scan_survivor"]
+                        ):
+                            # The sidecar's flat Wildlife term belongs to the
+                            # candidate only when no same-name association
+                            # currently survives. Decide this under the writer
+                            # lock: a survivor may have been added or removed
+                            # while the sidecar was being read.
+                            self.conn.executemany(
+                                "UPDATE photo_keywords SET source = "
+                                + keyword_source_max_sql(
+                                    "photo_keywords.source",
+                                    f"'{KEYWORD_SOURCE_MANUAL}'",
+                                )
+                                + " WHERE photo_id = ? AND keyword_id = ?",
+                                [
+                                    (photo_id, keyword_id)
+                                    for keyword_id in candidate_ids
+                                ],
+                            )
+                            continue
+                        # A survivor present during the scan but absent now
+                        # owned the observed sidecar term. Its concurrent
+                        # removal must not promote the obsolete genre; retire
+                        # the candidate and let the queued removal (or the
+                        # flat-removal fallback below) clean up XMP.
+                        still_retirable[photo_id] = (
+                            entry,
+                            candidate_ids,
+                            has_current_same_name_survivor,
+                        )
 
-        retired_photo_ids = list(photo_workspaces.keys())
-        retired_associations = [
-            (photo_id, keyword_id)
-            for photo_id, entry in photo_workspaces.items()
-            for keyword_id in entry["candidate_keyword_ids"]
-        ]
-        if retired_associations:
-            # Delete the exact candidate associations. A catalog can contain
-            # case-variant duplicate genre rows (``Wildlife``/``wildlife``),
-            # and provenance is evaluated per keyword ID; deleting every
-            # matching genre from a candidate photo would erase a duplicate
-            # association that the manual-history predicates preserved.
-            self.conn.executemany(
-                "DELETE FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
-                retired_associations,
-            )
-        # Only stamp the completion marker if every candidate photo was
-        # actually inspected. When a previously-imported sidecar is offline
-        # we cannot tell whether its Wildlife association is generated or
-        # user-authored, so leave the marker unset and let the next startup
-        # re-inspect once the volume returns.
-        if not deferred_unavailable_sidecar:
-            self.set_meta(
-                self._RETIRED_WILDLIFE_GENRE_KEY, "1", _commit=False,
-            )
-        self.conn.commit()
+                for photo_id, (
+                    _entry,
+                    _candidate_ids,
+                    has_current_same_name_survivor,
+                ) in still_retirable.items():
+                    if has_current_same_name_survivor:
+                        # Another top-level 'Wildlife' keyword (for example,
+                        # type='individual') still owns the flat XMP subject.
+                        # Keep its sidecar term while detaching the generated
+                        # genre association below.
+                        continue
+                    # Workspace links may also change while the sidecar scan
+                    # is running. Re-read every current owner under this
+                    # chunk's writer lock so each workspace's independent
+                    # pending queue receives the cleanup.
+                    ws_ids = {
+                        row["workspace_id"]
+                        for row in self.conn.execute(
+                            """SELECT wf.workspace_id
+                               FROM photos p
+                               JOIN workspace_folders wf
+                                 ON wf.folder_id = p.folder_id
+                               WHERE p.id = ?""",
+                            (photo_id,),
+                        ).fetchall()
+                    }
+                    target_ws_ids = (
+                        ws_ids
+                        if ws_ids
+                        else (
+                            {fallback_workspace}
+                            if fallback_workspace is not None
+                            else set()
+                        )
+                    )
+                    for ws_id in target_ws_ids:
+                        existing_remove = self.conn.execute(
+                            """SELECT 1 FROM pending_changes
+                               WHERE photo_id = ? AND workspace_id = ?
+                                 AND change_type IN (
+                                     'keyword_remove', 'keyword_remove_flat'
+                                 )
+                                 AND value = 'Wildlife' COLLATE NOCASE
+                               LIMIT 1""",
+                            (photo_id, ws_id),
+                        ).fetchone()
+                        if existing_remove is None:
+                            self.queue_change(
+                                photo_id,
+                                "keyword_remove_flat",
+                                "Wildlife",
+                                workspace_id=ws_id,
+                                _commit=False,
+                            )
+
+                retired_associations = [
+                    (photo_id, keyword_id)
+                    for photo_id, (
+                        _entry,
+                        candidate_ids,
+                        _has_current_same_name_survivor,
+                    ) in still_retirable.items()
+                    for keyword_id in candidate_ids
+                ]
+                if retired_associations:
+                    # Delete only the exact candidates revalidated under this
+                    # chunk's writer lock. The source predicate is repeated as
+                    # a final fail-safe against future code movement.
+                    self.conn.executemany(
+                        """DELETE FROM photo_keywords
+                           WHERE photo_id = ? AND keyword_id = ?
+                             AND (source IS NULL OR source <> 'manual')""",
+                        retired_associations,
+                    )
+                self.conn.commit()
+                retired_photo_ids.update(still_retirable)
+            except Exception:
+                self.conn.rollback()
+                raise
+        # Only stamp the completion marker after a final locked population
+        # check. A photo can become eligible while the sidecar scan is in
+        # progress (for example, when a species is added), and XMP-to-DB
+        # reconciliation uses this same writer lock from sidecar read through
+        # its mtime stamp. The marker and this query therefore describe one
+        # stable catalog state; any remaining or newly eligible candidate
+        # leaves the marker unset for the next startup.
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            remaining_candidate = self.conn.execute(
+                """SELECT 1
+                   FROM photo_keywords pk
+                   JOIN keywords k ON k.id = pk.keyword_id
+                   WHERE k.name = 'Wildlife' COLLATE NOCASE
+                     AND k.type = 'genre'
+                     AND k.parent_id IS NULL
+                     AND (pk.source IS NULL OR pk.source <> 'manual')
+                     AND EXISTS (
+                         SELECT 1
+                         FROM photo_keywords species_pk
+                         JOIN keywords species_k
+                           ON species_k.id = species_pk.keyword_id
+                         WHERE species_pk.photo_id = pk.photo_id
+                           AND (species_k.type = 'taxonomy'
+                                OR species_k.is_species = 1)
+                     )
+                   LIMIT 1""",
+            ).fetchone()
+            if not deferred_sidecar and remaining_candidate is None:
+                self.set_meta(
+                    self._RETIRED_WILDLIFE_GENRE_KEY, "1", _commit=False,
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
         return len(retired_photo_ids)
 
     _SPECIES_HIGHLIGHTS_BACKFILL_KEY = "species_highlights_from_preferences_backfill"

@@ -28,6 +28,9 @@ All notable changes to Vireo are documented in this file.
   updater, and uninstall-preservation gates before publication.
 
 ### Fixed
+- Large existing photo catalogs no longer fail Vireo's startup check while a
+  one-time Wildlife metadata migration scans tens of thousands of sidecar
+  files. The app opens first and completes that migration in the background.
 - Wildlife detection now retries weak full-frame MegaDetector results on
   overlapping higher-resolution crops. Small or unusually posed birds that
   were previously labeled "No subject" can clear the normal confidence floor

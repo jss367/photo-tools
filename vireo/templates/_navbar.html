@@ -9395,6 +9395,17 @@ async function inatDoSubmit() {
 // See src-tauri/src/menu.rs for the menu definition.
 // If adding JS-based navigation shortcuts, guard with:
 //   if (window.__TAURI_INTERNALS__) return;
+// True when the key event's target is a field where typing/arrows must edit
+// the field instead of driving lightbox shortcuts. Checkboxes and radios are
+// deliberately NOT editable: the View menu's toggles keep focus after a
+// click, and they consume no text or arrow keys, so hotkeys (b, h, arrows)
+// must keep working while one is focused. Text inputs, selects, and range
+// sliders (the Adjust panel) genuinely consume keys, so they stay guarded.
+function _lbKeyTargetEditable(t) {
+  if (!t) return false;
+  if (t.tagName === 'INPUT') return !(t.type === 'checkbox' || t.type === 'radio');
+  return t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || !!t.isContentEditable;
+}
 document.addEventListener('keydown', function(e) {
   // Esc handling for the lightbox + overlay cascade is owned by the Keymap.pushEsc
   // stack now: each open*() pushes its close*() and each close*() pops it. The
@@ -9406,9 +9417,7 @@ document.addEventListener('keydown', function(e) {
   // so the lightbox keeps keyboard precedence; the burst modal's own keydown
   // handler bails while the lightbox is open.
   if (document.querySelector('.pipeline-overlay.active, .similar-overlay.active, .modal-overlay.open, .inspect-overlay.open, .shortcuts-overlay.open, .help-overlay.active, .report-overlay.active')) return;
-  var tag0 = e.target && e.target.tagName;
-  var editable0 = tag0 === 'INPUT' || tag0 === 'TEXTAREA' || tag0 === 'SELECT' ||
-    (e.target && e.target.isContentEditable);
+  var editable0 = _lbKeyTargetEditable(e.target);
   // Editable check must come before arrow handling so arrows inside form
   // fields (e.g. the mask-variant <select>) change the value, not the photo.
   if (!editable0 && e.key === 'ArrowRight') {
@@ -9448,10 +9457,7 @@ document.addEventListener('keydown', function(e) {
   }
   var boxesKey = (window._vireoShortcuts && window._vireoShortcuts.browse && window._vireoShortcuts.browse.toggle_boxes) || 'b';
   if (matchesShortcut(e, boxesKey)) {
-    var tag2 = e.target && e.target.tagName;
-    var editable2 = tag2 === 'INPUT' || tag2 === 'TEXTAREA' || tag2 === 'SELECT' ||
-      (e.target && e.target.isContentEditable);
-    if (!editable2) {
+    if (!_lbKeyTargetEditable(e.target)) {
       toggleLightboxBoxes();
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -9464,10 +9470,7 @@ document.addEventListener('keydown', function(e) {
   var browseSc = window._vireoShortcuts && window._vireoShortcuts.browse;
   var uiKey = browseSc && 'toggle_ui' in browseSc ? browseSc.toggle_ui : 'h';
   if (matchesShortcut(e, uiKey)) {
-    var tagUi = e.target && e.target.tagName;
-    var editableUi = tagUi === 'INPUT' || tagUi === 'TEXTAREA' || tagUi === 'SELECT' ||
-      (e.target && e.target.isContentEditable);
-    if (!editableUi) {
+    if (!_lbKeyTargetEditable(e.target)) {
       toggleLightboxChrome();
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -9486,9 +9489,7 @@ document.addEventListener('keydown', function(e) {
   }
   // Skip when focus is in a form field — modals opened from the lightbox (e.g. iNaturalist)
   // need '-' / '0' as literal input in lat/lon fields.
-  var tag = e.target && e.target.tagName;
-  var editable = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' ||
-    (e.target && e.target.isContentEditable);
+  var editable = _lbKeyTargetEditable(e.target);
   // Flag / Reject / Unflag — operate on the photo currently displayed in the
   // lightbox. The lightbox is shared across pages; setFlagFor (browse) and
   // setReviewFlag (review) update their page's local model, so prefer them

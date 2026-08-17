@@ -26926,6 +26926,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     def _start_move_folder_job(runner, workspace_id, *, folder_id,
                                destination, display_dest, destination_name,
+                               source_path, resolved_destination,
                                merge, remote, developed_dir, folder_template="",
                                chained_from=None, serialize_lock=None,
                                allow_tracked_merge=False):
@@ -27096,6 +27097,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         job_config = {
             "folder_id": folder_id, "destination": display_dest, "merge": merge,
+            # Snapshot both ends of the move when it is enqueued. The source
+            # catalog row is rewritten after a successful move, so resolving
+            # it later would make completed jobs misleading. Likewise,
+            # ``destination`` above is only the selected parent; the jobs UI
+            # needs the actual landing path (including a rename/source leaf).
+            "source_path": source_path,
+            "resolved_destination": resolved_destination,
         }
         if folder_template:
             job_config["folder_template"] = folder_template
@@ -27147,7 +27155,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "destination_name cannot be combined with folder_template"
             )
 
-        guard_err = _move_folder_guard_error(_get_db(), folder_id)
+        request_db = _get_db()
+        folder = request_db.conn.execute(
+            "SELECT path, name FROM folders WHERE id = ?", (folder_id,)
+        ).fetchone()
+        if not folder:
+            return json_error("Folder not found", status=404)
+
+        guard_err = _move_folder_guard_error(request_db, folder_id)
         if guard_err is not None:
             return json_error(guard_err, 409)
 
@@ -27158,7 +27173,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 destination_name_raw)
         except ValueError as exc:
             return json_error(str(exc))
-        effective_cfg = _get_db().get_effective_config(cfg.load())
+        effective_cfg = request_db.get_effective_config(cfg.load())
         developed_dir = effective_cfg.get("darktable_output_dir", "") or ""
 
         # Remote (SSH) destination vs local path. A remote target carries its
@@ -27231,21 +27246,42 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if folder_template:
             try:
                 date_plan = move_mod.plan_folder_date_moves(
-                    _get_db(), folder_id, destination, folder_template,
+                    request_db, folder_id, destination, folder_template,
                 )
             except ValueError as exc:
                 return json_error(str(exc))
             if not date_plan:
                 return json_error("No tracked photos found in the source folder")
 
+        if folder_template:
+            # A date-organized move fans out into several final folders. The
+            # selected root is the most truthful single destination to show.
+            resolved_destination = display_dest
+        elif remote:
+            import posixpath
+
+            landing_name = destination_name or folder["name"] \
+                or os.path.basename(folder["path"].rstrip("/\\"))
+            resolved_destination = move_mod.rsync_dest_spec(
+                target,
+                posixpath.join(remote["ssh_dest_base"], landing_name),
+            )
+        else:
+            resolved_destination = move_mod.resolve_folder_dest(
+                folder["path"], folder["name"], destination,
+                destination_name,
+            )
+
         runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
+        active_ws = request_db._active_workspace_id
         job_id = _start_move_folder_job(
             runner, active_ws,
             folder_id=folder_id,
             destination=destination,
             display_dest=display_dest,
             destination_name=destination_name,
+            source_path=folder["path"],
+            resolved_destination=resolved_destination,
             merge=merge,
             remote=remote,
             developed_dir=developed_dir,
@@ -33084,6 +33120,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # ("2026/trip/trip").
         remote = move_mod.build_remote_move_spec(
             target, posixpath.dirname(subpath), rsync_bin, ssh_bin)
+        folder = thread_db.conn.execute(
+            "SELECT path, name FROM folders WHERE id = ?", (folder_id,)
+        ).fetchone()
+        if not folder:
+            raise RuntimeError("folder no longer exists")
+        landing_name = folder["name"] \
+            or os.path.basename(folder["path"].rstrip("/\\"))
+        resolved_destination = move_mod.rsync_dest_spec(
+            target,
+            posixpath.join(remote["ssh_dest_base"], landing_name),
+        )
         return _start_move_folder_job(
             runner, workspace_id,
             folder_id=folder_id,
@@ -33091,6 +33138,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             display_dest=move_mod.rsync_dest_spec(
                 target, remote["ssh_dest_base"]),
             destination_name="",
+            source_path=folder["path"],
+            resolved_destination=resolved_destination,
             merge=True,
             remote=remote,
             developed_dir=effective_cfg.get("darktable_output_dir", "") or "",

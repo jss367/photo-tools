@@ -345,6 +345,10 @@ def test_move_folder_job_passes_explicit_destination_name(
     job = wait_for_job_via_client(client, resp.get_json()["job_id"])
     assert job["status"] == "completed"
     assert captured["destination_name"] == "2026-07-12"
+    assert job["config"]["source_path"] == db.get_folder_tree()[0]["path"]
+    assert job["config"]["resolved_destination"] == str(
+        parent / "2026-07-12"
+    )
 
 
 def test_move_folder_job_organizes_photos_into_capture_date_folders(
@@ -378,6 +382,9 @@ def test_move_folder_job_organizes_photos_into_capture_date_folders(
     assert job["status"] == "completed", job
     assert job["result"]["moved"] == 2
     assert job["result"]["destination_count"] == 2
+    assert job["config"]["source_path"] == str(src)
+    assert job["config"]["resolved_destination"] == str(archive)
+    assert job["config"]["folder_template"] == "%Y-%m-%d"
     assert (archive / "2026-07-12" / "dated-1.jpg").exists()
     assert (archive / "2026-07-13" / "dated-2.jpg").exists()
 

@@ -14428,6 +14428,7 @@ def test_retire_builtin_wildlife_detaches_associations_and_queues_flat_removal(t
         ("accept_changed_sidecar", 0),
         ("add_workspace_owner", 1),
         ("add_same_name_survivor", 1),
+        ("add_survivor_with_manual_sidecar", 1),
     ],
 )
 def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
@@ -14441,9 +14442,18 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
     db_path = str(tmp_path / "test.db")
     photos_dir = tmp_path / "photos"
     photos_dir.mkdir()
-    (photos_dir / "p1.xmp").write_text(
-        "<x:xmpmeta xmlns:x='adobe:ns:meta/'/>", encoding="utf-8",
-    )
+    if concurrent_change == "add_survivor_with_manual_sidecar":
+        from xmp import write_sidecar
+
+        write_sidecar(
+            str(photos_dir / "p1.xmp"),
+            flat_keywords={"Wildlife"},
+            hierarchical_keywords=set(),
+        )
+    else:
+        (photos_dir / "p1.xmp").write_text(
+            "<x:xmpmeta xmlns:x='adobe:ns:meta/'/>", encoding="utf-8",
+        )
 
     db = Database(db_path)
     ws = db.create_workspace("ws")

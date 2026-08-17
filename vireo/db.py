@@ -3530,28 +3530,7 @@ class Database:
 
         rows = self.conn.execute(
             f"""SELECT DISTINCT pk.photo_id, pk.keyword_id, pk.source,
-                       p.filename, p.xmp_mtime, f.path AS folder_path,
-                       (
-                           SELECT COUNT(*)
-                           FROM photo_keywords all_genre_pk
-                           WHERE all_genre_pk.photo_id = pk.photo_id
-                             AND all_genre_pk.keyword_id IN ({placeholders})
-                       ) AS wildlife_genre_count,
-                       EXISTS (
-                           SELECT 1
-                           FROM photo_keywords survivor_pk
-                           JOIN keywords survivor_k
-                             ON survivor_k.id = survivor_pk.keyword_id
-                           WHERE survivor_pk.photo_id = pk.photo_id
-                             AND survivor_k.name = 'Wildlife' COLLATE NOCASE
-                             AND (
-                                 survivor_k.id NOT IN ({placeholders})
-                                 OR (
-                                     survivor_k.id <> pk.keyword_id
-                                     AND survivor_pk.source = 'manual'
-                                 )
-                             )
-                       ) AS has_same_name_survivor
+                       p.filename, p.xmp_mtime, f.path AS folder_path
                 FROM photo_keywords pk
                 JOIN photos p ON p.id = pk.photo_id
                 JOIN folders f ON f.id = p.folder_id
@@ -3568,14 +3547,11 @@ class Database:
                         AND (species_k.type = 'taxonomy'
                              OR species_k.is_species = 1)
                   )""",
-            [*keyword_ids, *keyword_ids, *keyword_ids],
+            keyword_ids,
         ).fetchall()
 
-        # Group candidates per photo. Also carry the per-photo "same-name
-        # survivor" flag so photos whose flat subject
-        # is still needed by another top-level Wildlife keyword skip the
-        # sidecar removal while their generated genre association is still
-        # detached from the DB.
+        # Group candidates per photo so their sidecar verdict and locked
+        # retirement decision stay consistent across duplicate genre rows.
         photo_workspaces = {}
         # pid -> "manual" (readable sidecar carries a flat Wildlife term),
         # "defer" (sidecar unreadable/corrupt — decide on a later run), or
@@ -3583,11 +3559,10 @@ class Database:
         # (no sidecar was ever imported, so a legacy NULL source cannot be
         # distinguished from metadata imported with write_xmp=False).
         sidecar_verdict_by_photo = {}
-        sidecar_manual_pairs = []
+        unknown_without_sidecar_pairs = []
         deferred_sidecar = False
         for row in rows:
             pid = row["photo_id"]
-            survivor = bool(row["has_same_name_survivor"])
             if pid not in sidecar_verdict_by_photo:
                 base = os.path.splitext(row["filename"])[0]
                 xmp_path = os.path.join(row["folder_path"], base + ".xmp")
@@ -3654,28 +3629,7 @@ class Database:
             preserve_unknown_without_sidecar = (
                 verdict == "absent" and row["source"] is None
             )
-            if (
-                (verdict == "manual" and not survivor)
-                or preserve_unknown_without_sidecar
-            ):
-                # The sidecar itself carries the flat term, so a person put it
-                # there. Latch that verdict: a later run may not be able to
-                # reach the file (offline volume), and a sidecar rewrite must
-                # not be able to erase the provenance either.
-                #
-                # ``survivor`` shortcuts this branch. When another top-level
-                # ``Wildlife`` keyword of a different type (for example
-                # ``type='individual'``) already lives on the photo, the flat
-                # ``Wildlife`` subject in the sidecar is attributable to that
-                # surviving keyword rather than to the generated ``genre``
-                # association. Latching ``source='manual'`` on the genre from
-                # that shared subject — or skipping the photo entirely — would
-                # preserve the generated association forever, and the global
-                # completion marker would then stamp so no later run could
-                # recover it. Fall through so the genre is detached from the
-                # DB below; ``entry["survivor"]`` still suppresses the flat
-                # XMP removal so the survivor's sidecar term stays intact.
-                #
+            if preserve_unknown_without_sidecar:
                 # A legacy NULL-source association with no sidecar is also
                 # preserved. Lightroom catalog imports historically called
                 # execute_import(write_xmp=False) by default and attached the
@@ -3684,7 +3638,9 @@ class Database:
                 # discriminator, so prefer metadata preservation and latch
                 # the association as manual. New catalog imports are stamped
                 # at write time and known generated sources can still retire.
-                sidecar_manual_pairs.append((pid, row["keyword_id"]))
+                unknown_without_sidecar_pairs.append(
+                    (pid, row["keyword_id"]),
+                )
                 continue
             if verdict == "defer":
                 continue
@@ -3692,21 +3648,20 @@ class Database:
                 pid,
                 {
                     "candidate_keyword_ids": set(),
-                    "wildlife_genre_count": int(row["wildlife_genre_count"]),
-                    "survivor": bool(row["has_same_name_survivor"]),
                     "xmp_mtime": row["xmp_mtime"],
+                    "manual_sidecar": verdict == "manual",
                 },
             )
             entry["candidate_keyword_ids"].add(row["keyword_id"])
 
-        if sidecar_manual_pairs:
+        if unknown_without_sidecar_pairs:
             self.conn.executemany(
                 "UPDATE photo_keywords SET source = "
                 + keyword_source_max_sql(
                     "photo_keywords.source", f"'{KEYWORD_SOURCE_MANUAL}'",
                 )
                 + " WHERE photo_id = ? AND keyword_id = ?",
-                sidecar_manual_pairs,
+                unknown_without_sidecar_pairs,
             )
             self.conn.commit()
 
@@ -3778,6 +3733,28 @@ class Database:
                                 LIMIT 1""",
                             [photo_id, *candidate_ids],
                         ).fetchone() is not None
+                        if (
+                            entry["manual_sidecar"]
+                            and not has_current_same_name_survivor
+                        ):
+                            # The sidecar's flat Wildlife term belongs to the
+                            # candidate only when no same-name association
+                            # currently survives. Decide this under the writer
+                            # lock: a survivor may have been added or removed
+                            # while the sidecar was being read.
+                            self.conn.executemany(
+                                "UPDATE photo_keywords SET source = "
+                                + keyword_source_max_sql(
+                                    "photo_keywords.source",
+                                    f"'{KEYWORD_SOURCE_MANUAL}'",
+                                )
+                                + " WHERE photo_id = ? AND keyword_id = ?",
+                                [
+                                    (photo_id, keyword_id)
+                                    for keyword_id in candidate_ids
+                                ],
+                            )
+                            continue
                         still_retirable[photo_id] = (
                             entry,
                             candidate_ids,

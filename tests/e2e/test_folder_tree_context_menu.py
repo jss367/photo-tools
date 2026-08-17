@@ -121,6 +121,54 @@ def test_folder_tree_remove_strips_folder_id_from_url(live_server, page):
     )
 
 
+def test_folder_tree_remove_strips_descendant_folder_id_from_url(
+    live_server, page
+):
+    """Removing a root also clears ``?folder_id=<descendant>`` from the URL.
+
+    ``activeFolderId`` in memory is refreshed by ``loadFolders()``, but the
+    URL still points at the detached descendant. Either recovery reload
+    inside ``removeWorkspaceRootFromBrowse`` — or a later manual refresh —
+    would restore that scope and load an empty Browse view because the
+    refreshed tree no longer contains it (Codex review r3799361364).
+    """
+    db = live_server["db"]
+    root_id = live_server["data"]["folders"][0]
+    child_id = db.add_folder(
+        "/photos/park/nested",
+        name="nested",
+        parent_id=root_id,
+        workspace_root=False,
+    )
+    workspace_id = db._active_workspace_id
+
+    page.goto(f"{live_server['url']}/browse?folder_id={child_id}")
+    root = page.locator(f'.tree-item[data-folder-id="{root_id}"]')
+    root.wait_for(state="visible")
+    expect(root).to_have_attribute("data-workspace-root", "1")
+    root.click(button="right")
+
+    page.once("dialog", lambda dialog: dialog.accept())
+    with page.expect_response(
+        lambda response: response.request.method == "DELETE"
+        and response.url.endswith(
+            f"/api/workspaces/{workspace_id}/folders/{root_id}"
+        )
+        and response.status == 200
+    ):
+        page.locator(
+            ".vireo-ctx-menu .vireo-ctx-item",
+            has_text="Remove from This Workspace…",
+        ).click()
+
+    expect(root).to_have_count(0)
+    page.wait_for_function(
+        "() => !(new URLSearchParams(window.location.search)"
+        ".has('folder_id'))",
+        timeout=5000,
+    )
+
+
 def test_folder_tree_does_not_offer_remove_for_inherited_descendant(
     live_server, page
 ):

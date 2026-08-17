@@ -115,8 +115,17 @@ def live_server(tmp_path, monkeypatch):
     import config as cfg
     from app import create_app
     from db import Database
+    from services import local_workspace
 
     monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    # Work Locally's production reserve scales with the host volume and can be
+    # as large as 20 GiB. Browser tests copy only a few bytes into tmp_path and
+    # exercise the workflow rather than host-capacity policy, so keep their
+    # reserve deterministic instead of failing when a developer or CI runner's
+    # disk happens to have less than 20 GiB free. Capacity policy has focused
+    # unit coverage in test_local_folder.py.
+    monkeypatch.setattr(local_workspace, "local_space_reserve", lambda _total: 1024**2)
 
     # Pin models.py paths to tmp_path so a model staged for the test is
     # resolvable regardless of when models.py was first imported in the session.

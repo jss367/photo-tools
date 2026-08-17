@@ -77,7 +77,9 @@ The `summary.targets` object reports the initial responsiveness gates:
 - Jobs API 95th-percentile (`p95`) latency below 500 milliseconds. The gate
   additionally requires zero failed samples during the run.
 - System idle CPU 5th-percentile (`p05`) of at least 10 percent.
-- No equal-key embedding single-flight violations.
+- No equal-key embedding single-flight violations. Reported as `null` when
+  any API sample failed during the run, because a violation occurring after
+  the last successful poll would otherwise be invisible.
 - The Vireo executable remained present for the complete run. Reported as
   `null` when the executable path could not be read (for example on hosts
   that deny `psutil` inspection) — the gate has to be verified manually

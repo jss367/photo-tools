@@ -507,9 +507,14 @@ def build_summary(baseline, samples):
             "system_idle_cpu_p05_at_least_10_percent": (
                 idle_summary is not None and idle_summary["p05"] >= 10.0
             ),
+            # `embedding_delta` is computed from the last *successful* API
+            # sample.  If polling failed at some point, any single-flight
+            # violation that occurred after that last success would be
+            # invisible, so we surface the invariant as unknown (None)
+            # rather than falsely reporting it verified.
             "no_embedding_single_flight_violations": (
                 embedding_delta.get("single_flight_violations", 0) == 0
-                if has_embedding_diagnostics
+                if has_embedding_diagnostics and api_failure_count == 0
                 else None
             ),
             "vireo_executable_present_throughout": executable_present,
@@ -707,9 +712,13 @@ def discover_server(
             )
         return {"pid": requested_pid, "url": requested_url.rstrip("/")}
     requested_port = None
+    requested_hostname = None
     if requested_url:
         parsed = urllib.parse.urlparse(requested_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or not parsed.port:
+            raise RuntimeError("--url must include http(s), a host, and a port")
         requested_port = parsed.port
+        requested_hostname = parsed.hostname
     candidates = []
     for process in psutil_module.process_iter(["pid", "name", "cmdline", "create_time"]):
         try:
@@ -726,6 +735,15 @@ def discover_server(
                     continue
                 port = connection.laddr.port
                 if requested_port is not None and requested_port != port:
+                    continue
+                # When --url was passed, the URL's hostname must actually
+                # resolve to the listener's bound address; otherwise a
+                # local vireo sharing the port with a *remote* vireo would
+                # be selected while the URL fetches from the remote one,
+                # pairing local CPU/RSS with remote Jobs data.
+                if requested_hostname is not None and not _listener_reachable_via(
+                    requested_hostname, connection.laddr.ip, resolver=resolver,
+                ):
                     continue
                 host = connection.laddr.ip
                 if host in {"0.0.0.0", "::", "::1"}:

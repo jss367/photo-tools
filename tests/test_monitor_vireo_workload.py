@@ -371,6 +371,51 @@ def test_job_summary_tracks_history_only_jobs_and_ignores_baseline_history():
     assert scenario["workload_makespan_seconds"] == 0.3
 
 
+def test_single_flight_target_is_unknown_when_any_api_sample_fails():
+    """`embedding_delta` is computed from the last successful API poll,
+    so any single-flight violation happening after the last success is
+    invisible.  When there were API failures the invariant must be
+    surfaced as unknown (None), not as verified True.
+    """
+    clock = _FakeClock()
+    api = _SequenceApi([
+        _api_sample(  # baseline
+            latency=0.001, wait_count=0, wait_seconds=0.0,
+            producer_starts=0, waiter_joins=0,
+        ),
+        _api_sample(
+            latency=0.010, wait_count=0, wait_seconds=0.0,
+            producer_starts=0, waiter_joins=0,
+        ),
+        {"status": None, "latency_seconds": 5.0, "error": "timeout"},
+    ])
+    process = _SequenceSampler(
+        [
+            {"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True},
+            {"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True},
+        ],
+        {"pid": 123, "executable_exists": True},
+    )
+    system = _SequenceSampler(
+        [{"cpu_idle_percent": 50.0}, {"cpu_idle_percent": 50.0}],
+        {"logical_cpu_count": 16},
+    )
+
+    report = collect_workload(
+        duration=2.0,
+        interval=1.0,
+        api_client=api,
+        process_sampler=process,
+        system_sampler=system,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    targets = report["summary"]["targets"]
+    assert report["summary"]["api_failure_count"] == 1
+    assert targets["no_embedding_single_flight_violations"] is None
+
+
 def test_latency_target_fails_when_api_samples_fail():
     """A run with one fast success and one long timeout used to report
     ``jobs_api_p95_below_500ms: true`` because failed requests were excluded
@@ -698,6 +743,52 @@ def test_explicit_server_rejected_when_pid_does_not_own_url_port():
             psutil_module=fake,
             resolver=_LOOPBACK_RESOLVER,
         )
+
+
+def test_url_only_discovery_rejects_host_that_local_listener_does_not_serve():
+    """`--url http://remote-host:50222` with no `--pid`: even though a
+    local vireo-server also listens on port 50222, the URL points to a
+    remote host, so selecting the local process would pair local CPU/RSS
+    with remote Jobs API data.  The URL-only branch must apply the same
+    host reachability check as `--pid`+`--url`.
+    """
+    proc = _FakeProc(4242, port=50222, listener_ip="127.0.0.1")
+    fake = _FakePsutil([proc])
+    # Emulate psutil.process_iter over our fake.
+    fake.process_iter = lambda attrs=None: iter([])
+    proc.info = {
+        "pid": 4242, "name": "vireo-server",
+        "cmdline": ["vireo-server"], "create_time": 0,
+    }
+    fake.process_iter = lambda attrs=None: iter([proc])
+    proc.parents = lambda: []
+    resolver = _fake_resolver({"remote-host": ["192.168.1.5"]})
+
+    with pytest.raises(RuntimeError, match="no listening local vireo-server"):
+        discover_server(
+            requested_url="http://remote-host:50222",
+            psutil_module=fake,
+            resolver=resolver,
+        )
+
+
+def test_url_only_discovery_accepts_loopback_hostname_for_local_listener():
+    proc = _FakeProc(4242, port=50222, listener_ip="127.0.0.1")
+    proc.info = {
+        "pid": 4242, "name": "vireo-server",
+        "cmdline": ["vireo-server"], "create_time": 0,
+    }
+    proc.parents = lambda: []
+    fake = _FakePsutil([proc])
+    fake.process_iter = lambda attrs=None: iter([proc])
+
+    server = discover_server(
+        requested_url="http://127.0.0.1:50222",
+        psutil_module=fake,
+        resolver=_LOOPBACK_RESOLVER,
+    )
+
+    assert server == {"pid": 4242, "url": "http://127.0.0.1:50222"}
 
 
 def test_explicit_server_rejected_when_url_host_does_not_match_listener_ip():

@@ -9108,7 +9108,7 @@ class Database:
         ).fetchall()
         return [row[0] for row in rows]
 
-    def update_photo_rating(self, photo_id, rating, verify_workspace=True):
+    def update_photo_rating(self, photo_id, rating, verify_workspace=True, _commit=True):
         """Set photo rating (0-5).
 
         Args:
@@ -9117,9 +9117,13 @@ class Database:
                 False from background jobs that already scope their photo
                 lists, or from undo/redo where the edit history is already
                 workspace-scoped.
+            _commit: If False, skip the internal commit (caller is responsible
+                     for committing the transaction). Callers holding a
+                     ``BEGIN IMMEDIATE`` writer lock must pass False so the
+                     lock is not released mid-decision.
         """
         self._photo_review_repository().set_rating(
-            photo_id, rating, verify_workspace=verify_workspace
+            photo_id, rating, verify_workspace=verify_workspace, _commit=_commit,
         )
 
     def batch_update_photo_rating(self, photo_ids, rating, verify_workspace=True):
@@ -9149,15 +9153,23 @@ class Database:
             photo_id, flag, verify_workspace=verify_workspace, _commit=_commit
         )
 
-    def update_photo_wildlife_excluded(self, photo_id, excluded, verify_workspace=True):
-        """Set whether a photo is excluded from wildlife detection/classification."""
+    def update_photo_wildlife_excluded(self, photo_id, excluded, verify_workspace=True, _commit=True):
+        """Set whether a photo is excluded from wildlife detection/classification.
+
+        Args:
+            _commit: If False, skip the internal commit (caller is responsible
+                     for committing the transaction). Callers holding a
+                     ``BEGIN IMMEDIATE`` writer lock must pass False so the
+                     lock is not released mid-decision.
+        """
         if verify_workspace:
             self._verify_photo_in_workspace(photo_id)
         self.conn.execute(
             "UPDATE photos SET wildlife_excluded = ? WHERE id = ?",
             (1 if excluded else 0, photo_id),
         )
-        self.conn.commit()
+        if _commit:
+            self.conn.commit()
 
     def batch_update_photo_flag(self, photo_ids, flag, verify_workspace=True):
         """Set flag for multiple photos in a single transaction.
@@ -9181,13 +9193,25 @@ class Database:
 
     from repositories.photo_labels import VALID_COLOR_LABELS
 
-    def set_color_label(self, photo_id, color):
-        """Set a color label for a photo in the active workspace."""
-        self._photo_label_repository().set(photo_id, color)
+    def set_color_label(self, photo_id, color, _commit=True):
+        """Set a color label for a photo in the active workspace.
 
-    def remove_color_label(self, photo_id):
-        """Remove the color label for a photo in the active workspace."""
-        self._photo_label_repository().remove(photo_id)
+        Args:
+            _commit: If False, skip the internal commit (caller is responsible
+                     for committing the transaction). Callers holding a
+                     ``BEGIN IMMEDIATE`` writer lock must pass False so the
+                     lock is not released mid-decision.
+        """
+        self._photo_label_repository().set(photo_id, color, _commit=_commit)
+
+    def remove_color_label(self, photo_id, _commit=True):
+        """Remove the color label for a photo in the active workspace.
+
+        Args:
+            _commit: If False, skip the internal commit (caller is responsible
+                     for committing the transaction).
+        """
+        self._photo_label_repository().remove(photo_id, _commit=_commit)
 
     def get_color_label(self, photo_id):
         """Return the color label for a photo in the active workspace, or None."""
@@ -9265,11 +9289,17 @@ class Database:
                     out[row["photo_id"]] = recipe
         return out
 
-    def set_photo_edit_recipe(self, photo_id, recipe, verify_workspace=True):
+    def set_photo_edit_recipe(self, photo_id, recipe, verify_workspace=True, _commit=True):
         """Set or clear a non-destructive edit recipe for a photo.
 
         Returns the normalized recipe dict, or None when the provided recipe is
         a no-op and the stored row was cleared.
+
+        Args:
+            _commit: If False, skip the internal commit (caller is responsible
+                     for committing the transaction). Callers holding a
+                     ``BEGIN IMMEDIATE`` writer lock must pass False so the
+                     lock is not released mid-decision.
         """
         if verify_workspace:
             self._verify_photo_in_workspace(photo_id)
@@ -9280,7 +9310,8 @@ class Database:
                 "DELETE FROM photo_edit_recipes WHERE photo_id = ?",
                 (photo_id,),
             )
-            self.conn.commit()
+            if _commit:
+                self.conn.commit()
             return None
         self.conn.execute(
             """INSERT INTO photo_edit_recipes (photo_id, recipe_json, updated_at)
@@ -9290,7 +9321,8 @@ class Database:
                    updated_at = excluded.updated_at""",
             (photo_id, recipe_json),
         )
-        self.conn.commit()
+        if _commit:
+            self.conn.commit()
         return copy_recipe(recipe_json)
 
     def clear_photo_edit_recipe(self, photo_id, verify_workspace=True):
@@ -20701,33 +20733,53 @@ class Database:
         return entry
 
     def _apply_undo(self, entry, items):
-        """Reverse the effects of an edit entry."""
+        """Reverse the effects of an edit entry.
+
+        Every helper called from here takes ``_commit=False`` so the writer
+        lock the caller opened with ``BEGIN IMMEDIATE`` is held across the
+        entire replay. ``untag_photo``/``remove_pending_changes`` /
+        ``update_photo_flag`` and friends default to committing on their own,
+        and letting them do so here would release the lock mid-replay — a
+        concurrent decision could then land between two of this replay's
+        writes, splitting keyword and review state or overwriting the status
+        this replay is about to restore. The single ``conn.commit()`` in the
+        caller (``undo_last_edit``) closes the transaction after both
+        ``_apply_undo`` and the ``edit_history.undone`` cursor update are
+        durable.
+        """
         for item in items:
             old_val = item['old_value']
             pid = item['photo_id']
             if entry['action_type'] == 'rating':
                 # Edit history is already workspace-scoped; skip re-verification
-                self.update_photo_rating(pid, int(old_val), verify_workspace=False)
+                self.update_photo_rating(
+                    pid, int(old_val), verify_workspace=False, _commit=False,
+                )
                 if old_val != entry['new_value']:
-                    self.remove_pending_changes(pid, 'rating', entry['new_value'])
-                    self.queue_change(pid, 'rating', old_val)
+                    self.remove_pending_changes(
+                        pid, 'rating', entry['new_value'], _commit=False,
+                    )
+                    self.queue_change(pid, 'rating', old_val, _commit=False)
             elif entry['action_type'] == 'flag':
-                self.update_photo_flag(pid, old_val, verify_workspace=False)
-                self.queue_flag_change_if_enabled(pid, old_val)
+                self.update_photo_flag(
+                    pid, old_val, verify_workspace=False, _commit=False,
+                )
+                self.queue_flag_change_if_enabled(pid, old_val, _commit=False)
             elif entry['action_type'] == 'wildlife_excluded':
                 self.update_photo_wildlife_excluded(
-                    pid, old_val == "1", verify_workspace=False
+                    pid, old_val == "1", verify_workspace=False, _commit=False,
                 )
             elif entry['action_type'] == 'color_label':
                 if old_val:
-                    self.set_color_label(pid, old_val)
+                    self.set_color_label(pid, old_val, _commit=False)
                 else:
-                    self.remove_color_label(pid)
+                    self.remove_color_label(pid, _commit=False)
             elif entry['action_type'] == 'edit_recipe':
                 self.set_photo_edit_recipe(
                     pid,
                     old_val if old_val else None,
                     verify_workspace=False,
+                    _commit=False,
                 )
             elif entry['action_type'] in ('keyword_add', 'prediction_accept'):
                 old_meta = self._edit_old_value_meta(old_val)
@@ -20743,9 +20795,11 @@ class Database:
                 kw = self.conn.execute("SELECT name FROM keywords WHERE id = ?",
                                        (int(entry['new_value']),)).fetchone()
                 if not _skip_tag_undo:
-                    self.untag_photo(pid, int(entry['new_value']))
+                    self.untag_photo(pid, int(entry['new_value']), _commit=False)
                     if kw:
-                        self.remove_pending_changes(pid, 'keyword_add', kw['name'])
+                        self.remove_pending_changes(
+                            pid, 'keyword_add', kw['name'], _commit=False,
+                        )
                 if entry['action_type'] == 'keyword_add':
                     self._restore_edit_prediction_status(old_meta)
                     # Predicted-only relabels (no prior species tag)
@@ -20834,14 +20888,17 @@ class Database:
                                 (top_id, ws),
                             )
                         touched = True
-                    if touched:
-                        self.conn.commit()
+                    # No intermediate commit here: the caller
+                    # (``undo_last_edit``) commits once after the whole
+                    # replay and the ``edit_history.undone`` cursor update
+                    # are both durable, so the writer lock is not released
+                    # mid-replay.
             elif entry['action_type'] == 'keyword_remove':
                 # Undo is an explicit request to restore the removed tag.
                 # Stamp the recreated association so durable authorship does
                 # not disappear merely because untagging deleted the row.
                 self.tag_photo(
-                    pid, int(entry['new_value']), source='manual',
+                    pid, int(entry['new_value']), source='manual', _commit=False,
                 )
                 kw = self.conn.execute("SELECT name FROM keywords WHERE id = ?",
                                        (int(entry['new_value']),)).fetchone()
@@ -20854,10 +20911,12 @@ class Database:
                     # flow leaves the tag on the photo with no pending
                     # sidecar write, and the restored keyword never syncs.
                     cancelled = self.remove_pending_changes(
-                        pid, 'keyword_remove', kw['name']
+                        pid, 'keyword_remove', kw['name'], _commit=False,
                     )
                     if cancelled == 0:
-                        self.queue_change(pid, 'keyword_add', kw['name'])
+                        self.queue_change(
+                            pid, 'keyword_add', kw['name'], _commit=False,
+                        )
             elif entry['action_type'] == 'species_replace':
                 # Atomic swap: the edit replaced old_value's species with
                 # new_value's. Undo untags the new species and retags the
@@ -20867,28 +20926,32 @@ class Database:
                 old_kids = old_meta.get("keyword_ids") or []
                 new_kw_name = None
                 if new_kid:
-                    self.untag_photo(pid, new_kid)
+                    self.untag_photo(pid, new_kid, _commit=False)
                     new_kw = self.conn.execute(
                         "SELECT name FROM keywords WHERE id = ?", (new_kid,)
                     ).fetchone()
                     if new_kw:
                         new_kw_name = new_kw['name']
                         cancelled = self.remove_pending_changes(
-                            pid, 'keyword_add', new_kw['name']
+                            pid, 'keyword_add', new_kw['name'], _commit=False,
                         )
                         if cancelled == 0:
-                            self.queue_change(pid, 'keyword_remove', new_kw['name'])
+                            self.queue_change(
+                                pid, 'keyword_remove', new_kw['name'], _commit=False,
+                            )
                 for old_kid in old_kids:
-                    self.tag_photo(pid, old_kid, source='manual')
+                    self.tag_photo(pid, old_kid, source='manual', _commit=False)
                     old_kw = self.conn.execute(
                         "SELECT name FROM keywords WHERE id = ?", (old_kid,)
                     ).fetchone()
                     if old_kw:
                         cancelled = self.remove_pending_changes(
-                            pid, 'keyword_remove', old_kw['name']
+                            pid, 'keyword_remove', old_kw['name'], _commit=False,
                         )
                         if cancelled == 0:
-                            self.queue_change(pid, 'keyword_add', old_kw['name'])
+                            self.queue_change(
+                                pid, 'keyword_add', old_kw['name'], _commit=False,
+                            )
                 # Restore any species_highlights / photo_preferences rows the
                 # original relabel migrated to `new_kw_name`. Without this,
                 # the photo is back in its old species bucket but the
@@ -20902,34 +20965,51 @@ class Database:
                 self._restore_edit_prediction_status(old_meta)
 
     def _apply_redo(self, entry, items):
-        """Re-apply the effects of an undone edit entry."""
+        """Re-apply the effects of an undone edit entry.
+
+        Every helper called from here takes ``_commit=False`` for the same
+        reason ``_apply_undo`` does: the caller holds a ``BEGIN IMMEDIATE``
+        writer lock and letting any intermediate helper commit would release
+        it mid-replay, letting a concurrent decision land between two of
+        this replay's writes. The single ``conn.commit()`` in the caller
+        (``redo_last_undo``) closes the transaction after both this replay
+        and the ``edit_history.undone`` cursor update are durable.
+        """
         for item in items:
             new_val = item['new_value']
             pid = item['photo_id']
             if entry['action_type'] == 'rating':
                 # Edit history is already workspace-scoped; skip re-verification
-                self.update_photo_rating(pid, int(new_val) if new_val else 0, verify_workspace=False)
+                self.update_photo_rating(
+                    pid, int(new_val) if new_val else 0,
+                    verify_workspace=False, _commit=False,
+                )
                 old_val = item['old_value']
                 if old_val != new_val:
-                    self.remove_pending_changes(pid, 'rating', old_val)
-                    self.queue_change(pid, 'rating', new_val)
+                    self.remove_pending_changes(
+                        pid, 'rating', old_val, _commit=False,
+                    )
+                    self.queue_change(pid, 'rating', new_val, _commit=False)
             elif entry['action_type'] == 'flag':
-                self.update_photo_flag(pid, new_val, verify_workspace=False)
-                self.queue_flag_change_if_enabled(pid, new_val)
+                self.update_photo_flag(
+                    pid, new_val, verify_workspace=False, _commit=False,
+                )
+                self.queue_flag_change_if_enabled(pid, new_val, _commit=False)
             elif entry['action_type'] == 'wildlife_excluded':
                 self.update_photo_wildlife_excluded(
-                    pid, new_val == "1", verify_workspace=False
+                    pid, new_val == "1", verify_workspace=False, _commit=False,
                 )
             elif entry['action_type'] == 'color_label':
                 if new_val:
-                    self.set_color_label(pid, new_val)
+                    self.set_color_label(pid, new_val, _commit=False)
                 else:
-                    self.remove_color_label(pid)
+                    self.remove_color_label(pid, _commit=False)
             elif entry['action_type'] == 'edit_recipe':
                 self.set_photo_edit_recipe(
                     pid,
                     new_val if new_val else None,
                     verify_workspace=False,
+                    _commit=False,
                 )
             elif entry['action_type'] in ('keyword_add', 'prediction_accept'):
                 old_meta = self._edit_old_value_meta(item['old_value'])
@@ -20946,10 +21026,12 @@ class Database:
                                        (int(entry['new_value']),)).fetchone()
                 if not _skip_tag_redo:
                     self.tag_photo(
-                        pid, int(entry['new_value']), source='manual',
+                        pid, int(entry['new_value']), source='manual', _commit=False,
                     )
                     if kw:
-                        self.queue_change(pid, 'keyword_add', kw['name'])
+                        self.queue_change(
+                            pid, 'keyword_add', kw['name'], _commit=False,
+                        )
                 if entry['action_type'] == 'keyword_add':
                     self._reject_edit_prediction(old_meta)
                     # Mirror of the `keyword_add` undo branch: predicted-
@@ -20987,7 +21069,9 @@ class Database:
                             pred_row["detection_id"], pred_row["model"],
                             pred_row["labels_fingerprint"],
                         )
-                        self.update_prediction_status(pred_id, 'accepted')
+                        self.update_prediction_status(
+                            pred_id, 'accepted', _commit=False,
+                        )
                         accepted_by_scope.setdefault(scope, set()).add(pred_id)
                     for scope, accepted_ids in accepted_by_scope.items():
                         placeholders = ",".join("?" * len(accepted_ids))
@@ -21019,10 +21103,13 @@ class Database:
                                                  reviewed_at = datetime('now')""",
                                 (s["id"], ws),
                             )
-                    if accepted_by_scope:
-                        self.conn.commit()
+                    # No intermediate commit here: the caller
+                    # (``redo_last_undo``) commits once after the whole
+                    # replay and the ``edit_history.undone`` cursor update
+                    # are both durable, so the writer lock is not released
+                    # mid-replay.
             elif entry['action_type'] == 'keyword_remove':
-                self.untag_photo(pid, int(entry['new_value']))
+                self.untag_photo(pid, int(entry['new_value']), _commit=False)
                 kw = self.conn.execute("SELECT name FROM keywords WHERE id = ?",
                                        (int(entry['new_value']),)).fetchone()
                 if kw:
@@ -21030,10 +21117,12 @@ class Database:
                     # `keyword_add`, redo should cancel it rather than
                     # stack a conflicting `keyword_remove` alongside it.
                     cancelled = self.remove_pending_changes(
-                        pid, 'keyword_add', kw['name']
+                        pid, 'keyword_add', kw['name'], _commit=False,
                     )
                     if cancelled == 0:
-                        self.queue_change(pid, 'keyword_remove', kw['name'])
+                        self.queue_change(
+                            pid, 'keyword_remove', kw['name'], _commit=False,
+                        )
             elif entry['action_type'] == 'species_replace':
                 # Re-apply the swap: untag old, retag new, mirror pending queue.
                 old_meta = self._edit_old_value_meta(item['old_value'])
@@ -21041,28 +21130,32 @@ class Database:
                 old_kids = old_meta.get("keyword_ids") or []
                 new_kw_name = None
                 for old_kid in old_kids:
-                    self.untag_photo(pid, old_kid)
+                    self.untag_photo(pid, old_kid, _commit=False)
                     old_kw = self.conn.execute(
                         "SELECT name FROM keywords WHERE id = ?", (old_kid,)
                     ).fetchone()
                     if old_kw:
                         cancelled = self.remove_pending_changes(
-                            pid, 'keyword_add', old_kw['name']
+                            pid, 'keyword_add', old_kw['name'], _commit=False,
                         )
                         if cancelled == 0:
-                            self.queue_change(pid, 'keyword_remove', old_kw['name'])
+                            self.queue_change(
+                                pid, 'keyword_remove', old_kw['name'], _commit=False,
+                            )
                 if new_kid:
-                    self.tag_photo(pid, new_kid, source='manual')
+                    self.tag_photo(pid, new_kid, source='manual', _commit=False)
                     new_kw = self.conn.execute(
                         "SELECT name FROM keywords WHERE id = ?", (new_kid,)
                     ).fetchone()
                     if new_kw:
                         new_kw_name = new_kw['name']
                         cancelled = self.remove_pending_changes(
-                            pid, 'keyword_remove', new_kw['name']
+                            pid, 'keyword_remove', new_kw['name'], _commit=False,
                         )
                         if cancelled == 0:
-                            self.queue_change(pid, 'keyword_add', new_kw['name'])
+                            self.queue_change(
+                                pid, 'keyword_add', new_kw['name'], _commit=False,
+                            )
                 if new_kw_name:
                     self._reapply_relabel_curation(
                         entry['workspace_id'], pid, new_kw_name,

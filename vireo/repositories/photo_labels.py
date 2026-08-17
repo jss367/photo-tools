@@ -50,7 +50,7 @@ class PhotoLabelRepository:
             visible.update(row["id"] for row in rows)
         return [photo_id for photo_id in requested if photo_id in visible]
 
-    def set(self, photo_id, color):
+    def set(self, photo_id, color, *, _commit=True):
         if color not in VALID_COLOR_LABELS:
             raise ValueError(
                 f"Invalid color label: {color}. Must be one of {VALID_COLOR_LABELS}"
@@ -60,15 +60,17 @@ class PhotoLabelRepository:
             "(photo_id, workspace_id, color) VALUES (?, ?, ?)",
             (photo_id, self.workspace_id, color),
         )
-        self.conn.commit()
+        if _commit:
+            self.conn.commit()
 
-    def remove(self, photo_id):
+    def remove(self, photo_id, *, _commit=True):
         self.conn.execute(
             "DELETE FROM photo_color_labels "
             "WHERE photo_id = ? AND workspace_id = ?",
             (photo_id, self.workspace_id),
         )
-        self.conn.commit()
+        if _commit:
+            self.conn.commit()
 
     def set_many(self, photo_ids, color):
         if not photo_ids:

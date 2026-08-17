@@ -17028,6 +17028,83 @@ def test_batch_accept_records_single_undo_entry(app_and_db):
         assert "Bald Eagle" not in names
 
 
+def test_prediction_accept_undo_holds_writer_lock_through_replay(app_and_db):
+    """Undoing a ``prediction_accept`` must not release the writer lock mid-replay.
+
+    ``api_undo`` opens ``BEGIN IMMEDIATE`` before calling
+    ``undo_last_edit`` — the same shape every prediction-decision route
+    uses — so the whole replay is one serialized transaction. The bug that
+    used to break that: ``_apply_undo``'s ``untag_photo`` and
+    ``remove_pending_changes`` calls defaulted to ``_commit=True``, and each
+    ``conn.commit()`` released SQLite's single writer lock. A concurrent
+    decision could then land between two of the replay's writes and split
+    keyword and review state, or overwrite the status the replay was about
+    to restore.
+
+    The guarantee we want here is expressible without racing a second
+    thread: every helper call in ``_apply_undo`` must be ``_commit=False``,
+    and the only ``conn.commit()`` during a ``prediction_accept`` undo must
+    be the single one in ``undo_last_edit`` after the ``edit_history``
+    cursor update. Racing two threads would test the same property with
+    more variance and more setup.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "undo-lock.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 200
+
+    # Spy on the helpers ``_apply_undo`` calls from the ``prediction_accept``
+    # branch. Every call must pass ``_commit=False``; a regression would let
+    # one of them default back to True and release the writer lock.
+    from unittest.mock import patch
+
+    def _wrap(name):
+        orig = getattr(db, name)
+        recorded = []
+
+        def wrapper(*args, **kwargs):
+            recorded.append(kwargs.get("_commit", True))
+            return orig(*args, **kwargs)
+
+        return wrapper, recorded
+
+    untag_wrapped, untag_calls = _wrap("untag_photo")
+    remove_wrapped, remove_calls = _wrap("remove_pending_changes")
+
+    with patch.object(db, "untag_photo", untag_wrapped), \
+         patch.object(db, "remove_pending_changes", remove_wrapped):
+        db.undo_last_edit()
+
+    assert untag_calls, "untag_photo must be called during prediction_accept undo"
+    assert all(c is False for c in untag_calls), (
+        f"untag_photo must be called with _commit=False; saw {untag_calls}"
+    )
+    assert remove_calls, (
+        "remove_pending_changes must be called during prediction_accept undo"
+    )
+    assert all(c is False for c in remove_calls), (
+        f"remove_pending_changes must be called with _commit=False; "
+        f"saw {remove_calls}"
+    )
+
+    # And the ``_apply_redo`` path takes the same lock, so its
+    # ``update_prediction_status`` calls must also be ``_commit=False``.
+    update_status_wrapped, update_status_calls = _wrap("update_prediction_status")
+    with patch.object(db, "update_prediction_status", update_status_wrapped):
+        db.redo_last_undo()
+    assert update_status_calls, (
+        "update_prediction_status must be called during prediction_accept redo"
+    )
+    assert all(c is False for c in update_status_calls), (
+        f"update_prediction_status must be called with _commit=False; "
+        f"saw {update_status_calls}"
+    )
+
+
 def test_batch_accept_chunks_oversized_id_payloads(app_and_db):
     """The raised cap must not hand SQLite a 25,000-variable IN clause.
 

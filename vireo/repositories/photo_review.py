@@ -7,13 +7,14 @@ class PhotoReviewRepository:
         self.workspace_id = workspace_id
         self.chunk_size = chunk_size
 
-    def set_rating(self, photo_id, rating, *, verify_workspace=True):
+    def set_rating(self, photo_id, rating, *, verify_workspace=True, _commit=True):
         if verify_workspace:
             self._verify_photo(photo_id)
         self.conn.execute(
             "UPDATE photos SET rating = ? WHERE id = ?", (rating, photo_id)
         )
-        self.conn.commit()
+        if _commit:
+            self.conn.commit()
 
     def set_ratings(self, photo_ids, rating, *, verify_workspace=True):
         self._set_many(

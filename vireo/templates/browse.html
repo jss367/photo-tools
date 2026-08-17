@@ -3663,7 +3663,7 @@ function renderFolderTree(folders) {
       var partialBadge = f.status === 'partial'
         ? '<span class="folder-status-partial" title="Scan did not complete — re-scan to finish">partial</span>'
         : '';
-      html += '<div class="tree-item' + activeClass + '" onclick="filterByFolder(' + f.id + ')" data-folder-id="' + f.id + '">' +
+      html += '<div class="tree-item' + activeClass + '" onclick="filterByFolder(' + f.id + ')" data-folder-id="' + f.id + '" data-workspace-root="' + (f.is_workspace_root ? '1' : '0') + '">' +
         indent + toggle +
         '<span class="folder-name">' + escapeHtml(f.name) + '</span>' +
         '<span class="folder-local-status-slot">' + folderLocalStatusMarkup(localStatuses[f.id]) + '</span>' +
@@ -10617,6 +10617,51 @@ async function rescanFolder(fid) {
   }
 }
 
+async function removeWorkspaceRootFromBrowse(fid) {
+  var folder = browseFolderRows.find(function(row) {
+    return Number(row.id) === Number(fid);
+  });
+  if (!folder || !folder.is_workspace_root) return;
+
+  var path = folder.path || folder.name || 'this folder';
+  var msg = 'Remove "' + path + '" from this workspace?\n\n' +
+    'Photos in this folder and its subfolders will no longer appear in this workspace, ' +
+    'and predictions, collections, and pending changes referencing them will be hidden here too.\n\n' +
+    'Photos and folders are not deleted. You can re-add the folder later to restore visibility.';
+  if (!confirm(msg)) return;
+
+  try {
+    var active = await safeFetch('/api/workspaces/active', {}, { toast: false });
+    await safeFetch('/api/workspaces/' + active.id + '/folders/' + fid, {
+      method: 'DELETE',
+    });
+
+    var loaded = await Promise.all([
+      loadFolders(),
+      loadKeywords(),
+      loadCollections(),
+    ]);
+    // A transient folder-list failure leaves the old tree in place. Reloading
+    // is safer than showing a removed root until the next health transition.
+    if (loaded[0] === null) {
+      window.location.reload();
+      return;
+    }
+    if (activeFolderId && !loaded[0].some(function(row) {
+      return Number(row.id) === Number(activeFolderId);
+    })) {
+      activeFolderId = null;
+    }
+    await resetAndLoad({ preserveCollection: !!activeCollectionId });
+    loadCollectionCounts();
+    loadSummary();
+    if (timelineMode) loadCalendarData();
+    showToast('Folder removed from this workspace.', 'success');
+  } catch (err) {
+    console.error('removeWorkspaceRootFromBrowse failed', err);
+  }
+}
+
 document.addEventListener('contextmenu', function(e) {
   var ti = e.target.closest('.tree-item[data-folder-id]');
   if (!ti) return;
@@ -10625,7 +10670,7 @@ document.addEventListener('contextmenu', function(e) {
   e.preventDefault();
   var fid = parseInt(ti.dataset.folderId, 10);
   if (isNaN(fid)) return;
-  openContextMenu(e, [
+  var items = [
     { label: 'Filter by this folder', onClick: function() { filterByFolder(fid); } },
     { separator: true },
     { label: window.VIREO_REVEAL_LABEL, onClick: function() { revealFolder(fid); } },
@@ -10635,7 +10680,15 @@ document.addEventListener('contextmenu', function(e) {
     { label: 'Work Locally\u2026', onClick: function() { workLocallyFolder(fid); } },
     { label: 'Move\u2026', onClick: function() { moveFolder(fid); } },
     { label: 'Rescan this Folder', onClick: function() { rescanFolder(fid); } },
-  ]);
+  ];
+  if (ti.dataset.workspaceRoot === '1') {
+    items.push({ separator: true });
+    items.push({
+      label: 'Remove from This Workspace\u2026',
+      onClick: function() { removeWorkspaceRootFromBrowse(fid); },
+    });
+  }
+  openContextMenu(e, items);
 });
 
 /* ---------- Collection sidebar context menu ---------- */

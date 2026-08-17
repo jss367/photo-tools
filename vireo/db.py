@@ -4000,8 +4000,8 @@ class Database:
         ws = self._ws_id()
         return self.conn.execute(
             """WITH RECURSIVE
-               visible(id) AS (
-                   SELECT f.id FROM folders f
+               visible(id, is_workspace_root) AS (
+                   SELECT f.id, wf.is_root FROM folders f
                    JOIN workspace_folders wf ON wf.folder_id = f.id
                    WHERE wf.workspace_id = ? AND f.status IN ('ok', 'partial')
                ),
@@ -4024,7 +4024,8 @@ class Database:
                )
                SELECT f.id, f.path, f.name,
                       e.parent_id AS parent_id,
-                      f.photo_count, f.status
+                      f.photo_count, f.status,
+                      v.is_workspace_root
                FROM folders f
                JOIN visible v ON v.id = f.id
                JOIN effective e ON e.start_id = f.id

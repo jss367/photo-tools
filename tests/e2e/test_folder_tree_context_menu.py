@@ -10,9 +10,10 @@ Menu items:
 - Work Locally…
 - Move…
 - Rescan this Folder
+- Remove from This Workspace… (workspace roots only)
 
-"Expand All Children", "Collapse All Children", and "Hide from this Workspace"
-are intentionally deferred — no matching helpers exist yet.
+"Expand All Children", "Collapse All Children", and hiding arbitrary inherited
+subtrees are intentionally deferred — workspace roots are the removable unit.
 """
 
 from playwright.sync_api import expect
@@ -37,10 +38,74 @@ def test_folder_tree_right_click_opens_menu(live_server, page):
         "Work Locally…",
         "Move…",
         "Rescan this Folder",
+        "Remove from This Workspace…",
     ]:
         expect(
             menu.locator(".vireo-ctx-item", has_text=label)
         ).to_be_visible()
+
+
+def test_folder_tree_removes_workspace_root_without_deleting_folder(
+    live_server, page
+):
+    """The destructive root action unlinks membership, not catalog data."""
+    db = live_server["db"]
+    folder_id = live_server["data"]["folders"][0]
+    workspace_id = db._active_workspace_id
+
+    page.goto(f"{live_server['url']}/browse")
+    item = page.locator(f'.tree-item[data-folder-id="{folder_id}"]')
+    item.wait_for(state="visible")
+    expect(item).to_have_attribute("data-workspace-root", "1")
+    item.click(button="right")
+
+    page.once("dialog", lambda dialog: dialog.accept())
+    with page.expect_response(
+        lambda response: response.request.method == "DELETE"
+        and response.url.endswith(
+            f"/api/workspaces/{workspace_id}/folders/{folder_id}"
+        )
+        and response.status == 200
+    ):
+        page.locator(
+            ".vireo-ctx-menu .vireo-ctx-item",
+            has_text="Remove from This Workspace…",
+        ).click()
+
+    expect(item).to_have_count(0)
+    assert db.get_folder(folder_id) is not None
+    assert folder_id not in {
+        row["id"] for row in db.get_workspace_folders(workspace_id)
+    }
+
+
+def test_folder_tree_does_not_offer_remove_for_inherited_descendant(
+    live_server, page
+):
+    """Descendants require exclusion semantics and cannot be unlinked alone."""
+    db = live_server["db"]
+    root_id = live_server["data"]["folders"][0]
+    child_id = db.add_folder(
+        "/photos/park/nested",
+        name="nested",
+        parent_id=root_id,
+        workspace_root=False,
+    )
+
+    page.goto(f"{live_server['url']}/browse")
+    root = page.locator(f'.tree-item[data-folder-id="{root_id}"]')
+    root.locator(".tree-toggle").click()
+    child = page.locator(f'.tree-item[data-folder-id="{child_id}"]')
+    expect(child).to_be_visible()
+    expect(child).to_have_attribute("data-workspace-root", "0")
+    child.click(button="right")
+
+    expect(
+        page.locator(
+            ".vireo-ctx-menu .vireo-ctx-item",
+            has_text="Remove from This Workspace…",
+        )
+    ).to_have_count(0)
 
 
 def test_folder_tree_move_opens_move_page_with_source_selected(live_server, page):

@@ -17430,6 +17430,14 @@ class Database:
 
         return [r for r in rows if _eval(root, r)]
 
+    # The one definition of "this prediction's review is already settled".
+    # ``app.py`` binds ``_DECIDED_PREDICTION_STATUSES`` to it, the grouped
+    # accept expansion below uses it, and Browse's panel mirrors it in JS, so
+    # no surface can drift on which rows are still actionable. See
+    # ``app.py``'s ``_decided_prediction_ids`` for why ``alternative`` is
+    # absent and what each endpoint then does with those rows.
+    DECIDED_PREDICTION_STATUSES = ("accepted", "rejected", "reviewed")
+
     def update_prediction_status(self, prediction_id, status, _commit=True):
         """Update per-workspace review status for a prediction.
 
@@ -17533,12 +17541,17 @@ class Database:
             )
         return rows
 
-    def update_predictions_status_by_photo(self, photo_id, status):
+    def update_predictions_status_by_photo(self, photo_id, status,
+                                           _commit=True):
         """Upsert review status for every prediction of a photo in the active workspace.
 
         Review state is workspace-scoped (``prediction_review``); detections
         and predictions are global.  We enumerate the prediction ids via the
         detections join and upsert each review row.
+
+        ``_commit=False`` lets a caller that already holds the prediction
+        decision lock (``app.py``'s ``_under_prediction_decision_lock``) fold
+        these writes into that transaction.
         """
         ws = self._ws_id()
         rows = self.conn.execute(
@@ -17557,9 +17570,10 @@ class Database:
                                  reviewed_at = excluded.reviewed_at""",
                 (r["id"], ws, status),
             )
-        self.conn.commit()
+        if _commit:
+            self.conn.commit()
 
-    def ungroup_prediction(self, prediction_id):
+    def ungroup_prediction(self, prediction_id, _commit=True):
         """Remove a prediction from its group in the active workspace.
 
         ``group_id`` lives in ``prediction_review``; this only clears the
@@ -17570,7 +17584,8 @@ class Database:
                WHERE prediction_id = ? AND workspace_id = ?""",
             (prediction_id, self._ws_id()),
         )
-        self.conn.commit()
+        if _commit:
+            self.conn.commit()
 
     def get_existing_prediction_photo_ids(self, model, labels_fingerprint=None):
         """Return photo_ids with predictions for a (model, fingerprint), scoped to active workspace.
@@ -18118,7 +18133,7 @@ class Database:
                     and this_pred_id in limited_pred_ids
                 ):
                     return True
-                return status not in ("accepted", "rejected", "reviewed")
+                return status not in self.DECIDED_PREDICTION_STATUSES
 
             # If grouped, accept every prediction in the group (in this
             # workspace) that survives the caller's scope.

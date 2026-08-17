@@ -175,11 +175,13 @@ the batch endpoint, which passes one; the *unscoped* callers — Review's
 `/api/predictions/<id>/accept`, highlight confirm, accept-subject — get no
 such list, and a grouped accept there reaches every member of the burst
 regardless of what the user already decided about them. So `accept_prediction`
-now excludes `accepted` and `rejected` members from the expansion itself:
-accepting one frame must not resurrect a sibling the user rejected in Review
-(tagging that photo with the species it was denied), nor re-flip a
-long-accepted one into a history item whose recorded previous status never
-happened — undo would then knock it back to pending. Rows the caller *named*
+now excludes every member whose status is in
+`Database.DECIDED_PREDICTION_STATUSES` from the expansion itself: accepting one
+frame must not resurrect a sibling the user rejected in Review (tagging that
+photo with the species it was denied), re-flip a long-accepted one, or
+overwrite one marked `reviewed` — each lands a history item whose recorded
+previous status never happened, so undo would knock it back to pending. Rows
+the caller *named*
 are exempt, because then the caller chose them rather than the expansion: the
 entry row, and anything in `prediction_ids`. `batch-accept` never names a
 decided row (`_decided_prediction_ids` removes them first), so its behaviour
@@ -250,7 +252,7 @@ Row: `Bald Eagle · 87% · SpeciesNet`, in one of three states:
 |---|---|
 | Pending, unambiguous | `Accept` / `Reject`, wired to the existing per-prediction endpoints |
 | Pending, ambiguous | No bare Accept. States why — "3 alternatives", "conflicts with keyworded Bald Eagle" — and offers **Open in Review** |
-| Already decided | Muted, marked Accepted or Rejected |
+| Already decided | Muted, marked `accepted`, `rejected` or `reviewed` — the three statuses in `Database.DECIDED_PREDICTION_STATUSES`, so the panel and the endpoints agree on which rows are still actionable. The tag carries a tooltip saying what the status means, since `reviewed` is written from ID Conflicts and would otherwise be a bare word where two buttons used to be. |
 
 An empty list has five different meanings and a blank panel implies only the
 first, so `/api/predictions?photo_ids=…` returns a `photo_states` entry per
@@ -396,14 +398,39 @@ under a pill reading "Showing one photo from Browse". The payload has to be
 well-formed (`{"root":{"mode":"all","rules":[]},"visual":null}`), not a bare
 `?filters=`, which `init()` treats as a corrupt handoff and throws on.
 
-**Repeat and contradictory decisions.** Both batch endpoints skip rows whose
-decision is already made, through one helper that owns the status list:
-`_decided_prediction_ids(db, pred_ids)` returns the `accepted` and `rejected`
-rows. Neither endpoint passes its own statuses, so the two cannot drift apart
-on what "still actionable" means. `alternative` is not a decision, so this
-helper passes those rows through on both paths — but "undecided" is where the
-two endpoints stop agreeing, and deliberately so (the full rule is below under
-*Ambiguity*, and stated once here so the two places cannot drift):
+**Repeat and contradictory decisions.** Every prediction endpoint refuses a row
+whose decision is already made, against one status list that lives in
+`Database.DECIDED_PREDICTION_STATUSES`: `accepted`, `rejected`, `reviewed`. No
+endpoint passes its own statuses, `accept_prediction`'s group expansion reads
+the same tuple, and Browse's panel mirrors it in `PREDICTION_DECIDED_STATUSES`
+— so no surface can drift on what "still actionable" means, and no button is
+offered for an action the server will refuse. The batch endpoints use the set
+form (`_decided_prediction_ids`); the single-row endpoints use
+`_prediction_status` and answer 409 naming the status they found.
+
+`reviewed` is on that list because it is a decision, not a waypoint. ID
+Conflicts writes it through `/api/predictions/<id>/reviewed` to mean "I looked
+at this and chose not to act"; that endpoint already refused to move a
+non-pending row, Review disables every action button on the row afterwards, and
+`prediction_reviewed` is in `_NON_UNDOABLE`, so nothing walks it back to
+`pending`. Treating it as still-actionable let Browse's panel render
+Accept/Reject on it and let an accept record `pending` as the previous status —
+a state that never existed, so Undo would restore the wrong thing. The panel now
+renders it as a decided row with a `reviewed` tag and a tooltip saying where it
+came from, rather than hiding it: a decided row that vanishes is the failure the
+five empty states exist to prevent.
+
+Refusing rather than overwriting matches what Review's own UI already does — it
+disables Accept, Reject, Replace and Reviewed on any row whose status is not
+`pending` — so no legitimate flow is blocked: a request to re-decide a settled
+row only ever comes from a stale tab, a double click, or a decision that landed
+in between. Review surfaces the 409 as a toast and reloads, instead of
+swallowing the click.
+
+`alternative` is deliberately *not* on the list — a runner-up is awaiting a
+decision, not carrying one — but "undecided" is where the two batch endpoints
+stop agreeing, and deliberately so (the full rule is below under *Ambiguity*,
+and stated once here so the two places cannot drift):
 
 **The alternative-row contract.** Wherever an `alternative` row exists on a
 `(detection, classifier_model)`, `batch-accept` accepts nothing on that key —
@@ -479,16 +506,58 @@ row in its place. Counting it under `skipped_ambiguous` would send the user
 hunting for a keyword conflict that does not exist. It is checked *before*
 ambiguity so the two counts stay disjoint.
 
-**Atomicity.** A precondition that is not atomic with the write it guards only
-narrows the race. Both batch endpoints therefore open one `BEGIN IMMEDIATE`
-transaction (`_begin_prediction_decision`) *before* the first precondition read
-and commit once, after the writes and the history entry. SQLite's WAL mode
-allows a single writer, so a second overlapping decision — a double-clicked
-Accept, or an Accept and a Reject fired before the panel reloads — blocks at
-`BEGIN IMMEDIATE` and then reads the state the first one committed, instead of
-acting on state it read before the first one wrote. Python's `sqlite3` would
-otherwise open its implicit transaction at the first *write*, leaving every
-check outside it.
+**Atomicity, and who it covers.** A precondition that is not atomic with the
+write it guards only narrows the race. Every prediction-decision route
+therefore opens one `BEGIN IMMEDIATE` transaction
+(`_begin_prediction_decision`) *before* its first precondition read and commits
+once, after the writes and the history entry. SQLite's WAL mode allows a single
+writer, so a second overlapping decision — a double-clicked Accept, or Browse's
+batch accept and Review's single reject fired before either page reloads —
+blocks at `BEGIN IMMEDIATE` and then reads the state the first one committed,
+instead of acting on state it read before the first one wrote. Python's
+`sqlite3` would otherwise open its implicit transaction at the first *write*,
+leaving every check outside it.
+
+"Every route" is the guarantee, and it took two passes to become true. The lock
+started on the batch endpoints alone, which made them atomic against each other
+and against nothing else: Review's `/api/predictions/<id>/reject` could read a
+row's last-committed state (`pending`) while a Browse batch accept held the
+writer lock, block at its own first write, and then land `rejected` over the
+accept the instant that batch committed — leaving the species keyword the
+accept added on a photo whose row says it was dismissed. Extending it to the
+five single-row routes then left five more behind. A lock only some writers
+take is not a lock, so the set is now enumerated:
+
+| Route | What it decides |
+|---|---|
+| `/api/predictions/batch-accept` | Browse panel accept |
+| `/api/predictions/batch-reject` | Browse panel reject |
+| `/api/predictions/<id>/accept` | Review per-row accept |
+| `/api/predictions/<id>/accept-subject` | Review additional-subject accept |
+| `/api/predictions/<id>/reject` | Review per-row reject |
+| `/api/predictions/<id>/reviewed` | ID Conflicts "mark reviewed" |
+| `/api/predictions/<id>/replace-keywords` | Review replace-keyword accept |
+| `/api/predictions/group/apply` | Burst group pick/reject (status tail only — the flag and keyword writes above it are not review state) |
+| `/api/highlights/confirm` | Highlight confirm, via `accept_prediction` |
+| `/api/highlights/relabel` | Rejects each photo's top prediction |
+| `/api/undo`, `/api/redo` | Replay `prediction_review` statuses out of edit history |
+
+The list is declared in `_PREDICTION_DECISION_ROUTES` and checked against the
+set derived from `create_app`'s own call graph by
+`test_route_contract.py::test_every_prediction_decision_route_locks`, which
+walks every function inside `create_app`, finds the routes that can reach a
+`prediction_review` writer, and fails if that set differs from the declared one
+or if any declared route does not reach `_begin_prediction_decision`. Derived
+rather than hand-maintained, because both gaps so far were omissions, and a
+list maintained by memory would produce a third.
+
+The single-row endpoints hold the lock inline, rolling back explicitly at each
+early exit; the multi-exit routes go through `_under_prediction_decision_lock`,
+which rolls back in a `finally`. Both matter for the same reason: a 404 or 409
+returns without committing, and leaving `BEGIN IMMEDIATE` open would hold the
+database's single writer lock for the rest of that connection's life. Undo and
+redo run their edit-recipe XMP queueing *after* the locked section — it commits
+on its own and touches no prediction state.
 
 A conditional `UPDATE ... WHERE status = 'pending'` was the alternative. It was
 rejected because it guards only the status column: ambiguity is a function of
@@ -578,6 +647,29 @@ it has no ambiguity check because there is no winner to pick.
   guarantee); the hook blocks the request until the competing writer has its
   answer, so nothing depends on thread-scheduling luck. Verified to fail
   against a build with the `BEGIN IMMEDIATE` removed.
+- `test_single_reject_serializes_with_concurrent_batch_accept` — the same proof
+  for the single-row side, through the same deterministic interleave hook.
+- `test_every_prediction_decision_route_locks` — the completeness check
+  described above: the declared route list versus the one derived from
+  `create_app`'s call graph, plus an assertion that each declared route reaches
+  `_begin_prediction_decision`. It is the only test that fails when a *new*
+  decision route forgets the lock.
+- `test_browse_panel_treats_reviewed_status_as_decided` — the panel's
+  `PREDICTION_DECIDED_STATUSES` is asserted equal to
+  `Database.DECIDED_PREDICTION_STATUSES`, so drift in either direction fails
+  rather than only the direction that was fixed.
+- `test_mark_reviewed_transition_and_reject_refuses_reviewed`,
+  `test_single_accept_refuses_reviewed_prediction`,
+  `test_batch_endpoints_skip_reviewed_predictions` and
+  `test_grouped_accept_expansion_skips_reviewed_group_member` — `reviewed` is
+  terminal on the single-row routes (409, state and history untouched),
+  counted as `already_decided` by the batch pair, and invisible to grouped
+  expansion.
+- `test_decision_routes_leave_no_transaction_open`,
+  `test_undo_of_an_accept_still_works_under_the_decision_lock` and
+  `test_group_apply_records_decisions_under_the_lock` — the newly locked
+  routes still do what they did, and no refusal or empty path strands the
+  writer lock: each ends with a decision that must still succeed.
 - The panels' invalidation lives in `_refreshBrowseKeywordState` (before its
   early returns) and in a `vireo:edit-history-changed` listener, so the
   coverage is structural rather than per-call-site.

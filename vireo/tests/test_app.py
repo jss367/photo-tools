@@ -19684,15 +19684,33 @@ def test_browse_panel_treats_reviewed_status_as_decided(app_and_db):
     posts a payload the server refuses, leaving the user staring at a button
     that appears to do nothing.
     """
+    import re
+
+    from db import Database
+
     app, _ = app_and_db
     client = app.test_client()
     html = client.get("/browse").get_data(as_text=True)
-    marker = "var decided ="
-    at = html.find(marker)
-    assert at != -1, "the panel's decided-status check is missing"
-    snippet = html[at: at + 200]
-    for status in ("'accepted'", "'rejected'", "'reviewed'"):
-        assert status in snippet, (
-            f"the panel's decided-status check must include {status}; "
-            f"currently: {snippet!r}"
-        )
+
+    # The panel routes its check through one named constant rather than an
+    # inline comparison, so assert the constant equals the backend's list
+    # instead of grepping near the comparison. That catches drift in either
+    # direction — a status added to the server and forgotten in the panel, or
+    # the reverse — which a proximity check on literals cannot.
+    match = re.search(
+        r"var PREDICTION_DECIDED_STATUSES = \[([^\]]*)\]", html,
+    )
+    assert match, "the panel's decided-status constant is missing"
+    panel_statuses = [
+        part.strip().strip("'\"")
+        for part in match.group(1).split(",")
+        if part.strip()
+    ]
+    assert panel_statuses == list(Database.DECIDED_PREDICTION_STATUSES), (
+        "the panel's decided-status list must match "
+        "Database.DECIDED_PREDICTION_STATUSES; "
+        f"panel has {panel_statuses}"
+    )
+    assert "var decided = predictionIsDecided(p);" in html, (
+        "the panel's row grouping must use the shared decided-status check"
+    )

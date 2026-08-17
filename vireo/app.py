@@ -12534,12 +12534,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     @app.route("/api/undo", methods=["POST"])
     def api_undo():
+        """Undo the most recent undoable edit.
+
+        A prediction-decision route, so it takes the shared writer lock:
+        ``prediction_accept`` entries restore ``prediction_review`` statuses,
+        and undo is check-then-write like every other decision path — it reads
+        the newest undoable entry, then rewrites the statuses that entry
+        recorded. Without the lock it can restore a status on top of a batch
+        decision that landed in between, and two overlapping undos can pick
+        the same entry and apply it twice.
+        """
         db = _get_db()
-        result = db.undo_last_edit()
-        if result is None:
-            return json_error("nothing to undo")
+        undone = []
+
+        def _apply():
+            entry = db.undo_last_edit()
+            if entry is None:
+                return json_error("nothing to undo")
+            undone.append(entry)
+            return None
+
+        early = _under_prediction_decision_lock(db, _apply)
+        if early is not None:
+            return early
+        result = undone[0]
         edit_recipe_updates = None
         if result.get("action_type") == "edit_recipe":
+            # Deliberately outside the locked section: this queues XMP sync
+            # rows and commits them itself, and it touches no prediction
+            # state, so it has nothing to serialize against.
             edit_recipe_updates = _edit_recipe_history_updates(db, result["id"])
         response = {"ok": True, "undone": result["description"]}
         if edit_recipe_updates is not None:
@@ -12572,12 +12595,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     @app.route("/api/redo", methods=["POST"])
     def api_redo():
+        """Redo the most recently undone edit.
+
+        Under the prediction decision lock for the reason ``api_undo`` gives.
+        """
         db = _get_db()
-        result = db.redo_last_undo()
-        if result is None:
-            return json_error("nothing to redo")
+        redone = []
+
+        def _apply():
+            entry = db.redo_last_undo()
+            if entry is None:
+                return json_error("nothing to redo")
+            redone.append(entry)
+            return None
+
+        early = _under_prediction_decision_lock(db, _apply)
+        if early is not None:
+            return early
+        result = redone[0]
         edit_recipe_updates = None
         if result.get("action_type") == "edit_recipe":
+            # Outside the locked section, for the reason ``api_undo`` gives.
             edit_recipe_updates = _edit_recipe_history_updates(db, result["id"])
         response = {"ok": True, "redone": result["description"]}
         if edit_recipe_updates is not None:
@@ -14681,6 +14719,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     @app.route("/api/highlights/confirm", methods=["POST"])
     def api_highlights_confirm():
+        """Confirm highlight photos by accepting their top prediction.
+
+        A prediction-decision route, so it takes the shared writer lock: it
+        reads which photos already carry a species and which prediction is top
+        *before* it accepts, and those reads have to be atomic with the
+        accepts for the same reason the batch endpoints' are.
+        """
         db = _get_db()
         body = request.get_json(silent=True) or {}
         photo_ids, error = _parse_highlight_photo_ids(body)
@@ -14689,7 +14734,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         error, status = _validate_highlight_photo_ids(db, photo_ids)
         if error:
             return json_error(error, status)
+        return _under_prediction_decision_lock(
+            db, lambda: _highlights_confirm_under_lock(db, photo_ids),
+        )
 
+    def _highlights_confirm_under_lock(db, photo_ids):
         try:
             top_predictions = _highlight_top_predictions(db, photo_ids)
             accepted_photo_ids = set()
@@ -14844,7 +14893,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         error, status = _validate_highlight_photo_ids(db, photo_ids)
         if error:
             return json_error(error, status)
+        # Relabelling rejects each photo's top prediction, so it is a
+        # prediction-decision route and takes the shared writer lock. Taken
+        # here, before ``_highlight_top_predictions`` — the read that picks
+        # *which* row gets rejected is exactly the read that must not race a
+        # concurrent decision on that row.
+        return _under_prediction_decision_lock(
+            db, lambda: _highlights_relabel_under_lock(db, photo_ids, species),
+        )
 
+    def _highlights_relabel_under_lock(db, photo_ids, species):
         top_predictions = _highlight_top_predictions(db, photo_ids)
         # Snapshot the top-prediction species per photo, keyed by
         # keyword_match_key (SQLite's ASCII-only NOCASE fold). Used below
@@ -17198,7 +17256,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     # fiction. Batch endpoints skip the row and report it as
     # ``already_decided``; single-row endpoints refuse with 409, mirroring
     # ``api_mark_prediction_reviewed``'s own precondition.
-    _DECIDED_PREDICTION_STATUSES = ("accepted", "rejected", "reviewed")
+    # Owned by ``Database`` so ``db.py``'s grouped-accept expansion and this
+    # module read the same tuple rather than two copies of it; Browse's panel
+    # mirrors the same three values in ``PREDICTION_DECIDED_STATUSES``.
+    _DECIDED_PREDICTION_STATUSES = Database.DECIDED_PREDICTION_STATUSES
 
     def _decided_prediction_ids(db, pred_ids):
         """Which of ``pred_ids`` already have a decision recorded.
@@ -17319,18 +17380,57 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
         return found
 
+    # Every route that records a prediction decision, and therefore every
+    # route that must take the writer lock below.
+    #
+    # Serialization is only worth what the *least* careful writer does: a lock
+    # one side takes and the other does not is not a lock. That is exactly how
+    # the last gap arose — the batch endpoints held it, Review's single-row
+    # routes did not — and fixing only the routes a review names repeats the
+    # mistake one level up. So this list is checked against the set derived
+    # from ``create_app``'s own call graph by
+    # ``test_route_contract.py::test_every_prediction_decision_route_locks``,
+    # which also asserts each name here reaches ``_begin_prediction_decision``.
+    # A new route that touches ``prediction_review`` fails that test until it
+    # is listed and locked.
+    #
+    # The five below the single-row group were the remainder of the sweep:
+    # burst group apply writes accepted/rejected for whole photos, highlight
+    # confirm accepts through ``accept_prediction``, highlight relabel rejects
+    # each photo's top prediction, and undo/redo replay recorded statuses back
+    # out of edit history.
+    _PREDICTION_DECISION_ROUTES = (
+        "api_batch_accept_predictions",
+        "api_batch_reject_predictions",
+        "api_accept_prediction",
+        "api_accept_subject_species",
+        "api_reject_prediction",
+        "api_mark_prediction_reviewed",
+        "api_replace_species_keywords_with_prediction",
+        "api_prediction_group_apply",
+        "api_highlights_confirm",
+        "api_highlights_relabel",
+        "api_undo",
+        "api_redo",
+    )
+
     def _begin_prediction_decision(db):
         """Hold SQLite's write lock across a decision's checks *and* its writes.
 
-        Both batch endpoints are check-then-write: they read each row's
-        status, ambiguity and label set, then write the rows that pass. Read
-        and write have to be one indivisible step, or the preconditions only
-        *narrow* the race they claim to close — two overlapping requests (a
-        double-clicked Accept, or an Accept and a Reject fired before the panel
-        reloads) can both finish their reads while the row is still pending and
-        then both write. Waitress serves these routes on 16 threads, and
-        ``_get_db`` hands each request its own connection, so "overlapping" is
-        a real interleaving and not a thought experiment.
+        Every route in ``_PREDICTION_DECISION_ROUTES`` is check-then-write: it
+        reads a row's status (and, for the batch pair, its ambiguity and label
+        set), then writes the rows that pass. Read and write have to be one
+        indivisible step, or the preconditions only *narrow* the race they
+        claim to close — two overlapping requests (a double-clicked Accept, or
+        Browse's batch accept and Review's single reject fired before either
+        page reloads) can both finish their reads while the row is still
+        pending and then both write. Waitress serves these routes on 16
+        threads, and ``_get_db`` hands each request its own connection, so
+        "overlapping" is a real interleaving and not a thought experiment.
+
+        The completeness of that route list is the guarantee, not an
+        implementation detail: a decision route that skips this lock puts
+        every other route's atomicity back to "narrowed, not closed".
 
         ``BEGIN IMMEDIATE`` takes the database's single writer lock up front,
         before the first read. That is what makes the whole sequence atomic:
@@ -17362,6 +17462,28 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 503,
             )
         return None
+
+    def _under_prediction_decision_lock(db, work):
+        """Run ``work()`` as one serialized prediction decision.
+
+        The wrapper form of ``_begin_prediction_decision`` for routes whose
+        body has several exits. ``work`` commits when it writes; the
+        ``finally`` covers the paths that do not — an early ``404``/``409``
+        precondition failure, or an exception unwinding — because leaving
+        ``BEGIN IMMEDIATE`` open would hold the database's single writer lock
+        for the rest of this connection's life and stall every later decision
+        served on it. The single-row endpoints take the same lock inline with
+        explicit rollbacks at each exit; both shapes are equivalent, and the
+        route-contract test checks the lock, not the shape.
+        """
+        lock_err = _begin_prediction_decision(db)
+        if lock_err is not None:
+            return lock_err
+        try:
+            return work()
+        finally:
+            if db.conn.in_transaction:
+                db.conn.rollback()
 
     def _parse_prediction_ids(db, body):
         """Validate a batch payload's ``prediction_ids``.
@@ -17997,16 +18119,29 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             desc = f'Group prediction: flagged {len(picks)}, rejected {len(rejects)}'
             db.record_edit('flag', desc, 'group_apply', flag_items, is_batch=True)
 
-        # Mark all predictions in this group as accepted/rejected
-        for pid in picks:
-            db.update_predictions_status_by_photo(pid, 'accepted')
-        for pid in rejects:
-            db.update_predictions_status_by_photo(pid, 'rejected')
+        # The prediction decisions themselves, under the lock every decision
+        # route takes. Only this tail is wrapped: the flag and keyword writes
+        # above commit on their own and are not review state, so opening the
+        # transaction earlier would hold the database's single writer lock
+        # across work that is not a decision.
+        def _apply_group_decisions():
+            # Mark all predictions in this group as accepted/rejected
+            for pid in picks:
+                db.update_predictions_status_by_photo(
+                    pid, 'accepted', _commit=False,
+                )
+            for pid in rejects:
+                db.update_predictions_status_by_photo(
+                    pid, 'rejected', _commit=False,
+                )
 
-        # Remove predictions from group
-        for pred_id in removed:
-            db.ungroup_prediction(pred_id)
-        return jsonify({"ok": True})
+            # Remove predictions from group
+            for pred_id in removed:
+                db.ungroup_prediction(pred_id, _commit=False)
+            db.conn.commit()
+            return jsonify({"ok": True})
+
+        return _under_prediction_decision_lock(db, _apply_group_decisions)
 
     # -- Detection API routes --
 

@@ -1563,7 +1563,16 @@ function bestPrediction(photo) {
 
 async function predictionAction(predId, action) {
   var url = '/api/predictions/' + predId + '/' + endpointForAction(action);
-  await jsonFetch(url, { method: 'POST' });
+  try {
+    await jsonFetch(url, { method: 'POST' });
+  } catch (e) {
+    // The decision endpoints now answer 409 when the row was already settled
+    // — from a second tab, or from a Browse batch decision landing while this
+    // page sat open. The buttons here are disabled for non-pending rows, so
+    // reaching this means the page is stale: say so and reload, rather than
+    // swallowing the click, which would look like the action succeeded.
+    showToast(e.message || 'Could not apply that decision', 'error');
+  }
   await loadComparison();
 }
 
@@ -1580,10 +1589,26 @@ async function batchAction(action) {
   var photos = (compareData.photos || []).filter(function(photo) {
     return ids.indexOf(photo.photo_id) >= 0;
   });
+  var attempted = 0;
+  var failures = [];
   for (var i = 0; i < photos.length; i++) {
     var pred = bestPrediction(photos[i]);
     if (!pred) continue;
-    await jsonFetch('/api/predictions/' + pred.id + '/' + endpointForAction(action), { method: 'POST' });
+    attempted++;
+    try {
+      await jsonFetch('/api/predictions/' + pred.id + '/' + endpointForAction(action), { method: 'POST' });
+    } catch (e) {
+      // One already-settled row must not abandon the rest of the batch, but
+      // the count has to be named — a batch that quietly did less than the
+      // selection implies is the gap this whole flow exists to close. The
+      // denominator is what was actually attempted, not the selection: rows
+      // with no usable prediction were never sent.
+      failures.push(e.message || 'request failed');
+    }
+  }
+  if (failures.length) {
+    showToast(failures.length + ' of ' + attempted + ' not applied — ' +
+      failures[0], 'error');
   }
   selectedRows.clear();
   await loadComparison();

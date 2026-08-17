@@ -6808,6 +6808,37 @@ function formatPredictionConfidence(conf) {
   return Math.round(conf * 100) + '%';
 }
 
+// Mirrors Database.DECIDED_PREDICTION_STATUSES (vireo/db.py), which every
+// prediction endpoint uses as its "already decided" precondition. The panel
+// has to agree with it exactly: a row this list omits gets Accept and Reject
+// buttons, and the endpoint behind those buttons answers 409 (single-row) or
+// skips it as `already_decided` (batch) — a button that promises an action
+// the server refuses is the black box CORE_PHILOSOPHY.md rules out. Named
+// once here rather than spelled out at the comparison, so the panel's copy of
+// the rule is findable from the backend's.
+//
+// `alternative` is deliberately absent, matching the backend: a runner-up is
+// awaiting a decision, not carrying one. The panel never sees those as
+// top-level rows anyway — /api/predictions nests them under their parent.
+var PREDICTION_DECIDED_STATUSES = ['accepted', 'rejected', 'reviewed'];
+
+function predictionIsDecided(p) {
+  return PREDICTION_DECIDED_STATUSES.indexOf(p && p.status) >= 0;
+}
+
+// Why a decided row carries no buttons. `reviewed` in particular is not
+// self-explanatory in Browse — it is written from ID Conflicts — so the tag
+// says what it means rather than leaving a bare word where two buttons were.
+function predictionStatusExplanation(status) {
+  if (status === 'accepted') return 'Accepted — the species keyword was added.';
+  if (status === 'rejected') return 'Rejected — this prediction was dismissed.';
+  if (status === 'reviewed') {
+    return 'Marked reviewed in ID Conflicts — settled without accepting or ' +
+      'rejecting, so there is nothing left to decide here.';
+  }
+  return 'This prediction has already been decided.';
+}
+
 // Fold only A-Z→a-z, leaving non-ASCII letters alone. Mirrors the backend's
 // keyword_match_key (vireo/keyword_normalization.py) and SQLite's ASCII
 // NOCASE. JS's Unicode-aware String.prototype.toLowerCase() folds "Éclair"
@@ -6894,9 +6925,7 @@ function renderDetailPredictions(data, photoId) {
     // record a history entry whose "previous" status of ``pending`` is a
     // fiction. Server guards refuse the flip (see _DECIDED_PREDICTION_STATUSES
     // in app.py), but the panel must not offer the action in the first place.
-    var decided = p.status === 'accepted' ||
-                  p.status === 'rejected' ||
-                  p.status === 'reviewed';
+    var decided = predictionIsDecided(p);
     var displaySpecies = p.consensus_species || p.species || 'Unknown';
     var key = asciiCaseFoldKey(displaySpecies) + '|' + (decided ? p.status : 'pending');
     var g = groupByKey[key];
@@ -6935,7 +6964,12 @@ function renderDetailPredictions(data, photoId) {
     if (g.count > 1) meta += ' · on ' + g.count + ' detections';
     var actions;
     if (g.decided) {
-      actions = '<span class="prediction-status-tag">' + escapeHtml(g.status) + '</span>';
+      // Decided rows stay listed rather than disappearing, and say which
+      // decision they carry — "reviewed" is a real answer to "what happened
+      // to this prediction", not a row worth hiding.
+      actions = '<span class="prediction-status-tag" title="' +
+        escapeAttr(predictionStatusExplanation(g.status)) + '">' +
+        escapeHtml(g.status) + '</span>';
     } else if (ambiguous) {
       actions = '<button class="prediction-review-link" onclick="openPredictionInReview(' +
         photoId + ')" title="This prediction needs Review\'s full decision UI">Open in Review</button>';
@@ -7125,15 +7159,36 @@ async function acceptDetailPredictions(predictionIds, photoId) {
   _reportSkippedAccepts(data);
 }
 
+// The reject side of _reportSkippedAccepts. batch-reject skips the same
+// already-decided and superseded rows, and a stale panel's Reject dropping
+// rows without saying so is the same silent gap on the other button.
+function _reportSkippedRejects(data) {
+  if (!data) return;
+  var parts = [];
+  if (data.already_decided) {
+    parts.push(data.already_decided + ' already decided elsewhere');
+  }
+  if (data.skipped_superseded) {
+    parts.push(data.skipped_superseded +
+      ' replaced by a newer classification run');
+  }
+  if (!parts.length) return;
+  var rejected = data.rejected || 0;
+  showToast((rejected ? 'Rejected ' + rejected + '; skipped ' :
+    'Nothing rejected: ') + parts.join(', '));
+}
+
 async function rejectDetailPredictions(predictionIds, photoId) {
   if (!predictionIds || !predictionIds.length) return;
+  var data;
   try {
-    await safeFetch('/api/predictions/batch-reject', {
+    data = await safeFetch('/api/predictions/batch-reject', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({prediction_ids: predictionIds}),
     });
   } catch(e) { return; }
+  _reportSkippedRejects(data);
   // A reject changes no keywords, so only the prediction rows need repainting.
   // Deliberately no showUndoToast() here: `prediction_reject` is in the DB's
   // _NON_UNDOABLE set (no _apply_undo handler), so /api/undo/status would

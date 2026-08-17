@@ -801,3 +801,124 @@ def test_get_predictions_classifier_model_is_not_keeps_other_model_siblings(app_
         'row-level pass failed to drop the model-a sibling from the '
         'is-not result set'
     )
+
+
+def _one_prediction(db, species='Blue Jay', photo_index=2, model='test-model'):
+    """Seed one ungrouped prediction and return (prediction_id, photo_id).
+
+    Each call makes its own detection, so several predictions can share a
+    photo without colliding — the fixture catalog is small.
+    """
+    photos = db.get_photos()
+    photo_id = photos[photo_index % len(photos)]['id']
+    det = _make_detection(db, photo_id)
+    db.add_prediction(detection_id=det, species=species, confidence=0.90,
+                      model=model, category='new', group_id=None)
+    row = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ? AND species = ?",
+        (det, species),
+    ).fetchone()
+    return row['id'], photo_id
+
+
+def test_decision_routes_leave_no_transaction_open(app_and_db):
+    """Every path out of the lock releases it, including the refusals.
+
+    ``BEGIN IMMEDIATE`` holds SQLite's single writer lock, so a 404 or a 409
+    that returned without committing would stall every later decision served
+    on the same connection. The successful accept after the refusals is the
+    assertion that matters — without the release it would block until the
+    30 s ``busy_timeout`` and come back 503.
+    """
+    app, db = app_and_db
+    _seed_predictions(db)
+    client = app.test_client()
+
+    assert client.post('/api/predictions/999999/reject').status_code == 404
+    # /accept answers 200 for a missing id (``accept_prediction`` returns None
+    # and the route reports a no-op) — unchanged behaviour, exercised here
+    # because it is another path that leaves the lock without writing.
+    assert client.post('/api/predictions/999999/accept').status_code == 200
+
+    settled, _ = _one_prediction(db, species='Woodhouse Scrub Jay')
+    db.update_prediction_status(settled, 'reviewed')
+    assert client.post(f'/api/predictions/{settled}/accept').status_code == 409
+
+    fresh, photo_id = _one_prediction(db, species='Florida Scrub Jay',
+                                      photo_index=3)
+    resp = client.post(f'/api/predictions/{fresh}/accept')
+    assert resp.status_code == 200
+    kw_names = {k['name'] for k in db.get_photo_keywords(photo_id)}
+    assert 'Florida Scrub Jay' in kw_names
+
+
+def test_undo_of_an_accept_still_works_under_the_decision_lock(app_and_db):
+    """Undo restores prediction status from inside the shared writer lock.
+
+    ``/api/undo`` replays ``prediction_review`` statuses out of edit history,
+    which makes it a decision route: it was the last of the unlocked ones, and
+    wrapping it must not change what it does. Nothing to undo also has to
+    release the lock, so the accept afterwards is part of the assertion.
+    """
+    app, db = app_and_db
+    _seed_predictions(db)
+    client = app.test_client()
+    ws = db._active_workspace_id
+
+    pred_id, photo_id = _one_prediction(db, species='Unicolored Jay')
+    assert client.post(f'/api/predictions/{pred_id}/accept').status_code == 200
+    assert db.get_review_status(pred_id, ws) == 'accepted'
+    kw_names = {k['name'] for k in db.get_photo_keywords(photo_id)}
+    assert 'Unicolored Jay' in kw_names
+
+    assert client.post('/api/undo').status_code == 200
+    assert db.get_review_status(pred_id, ws) == 'pending'
+    kw_names = {k['name'] for k in db.get_photo_keywords(photo_id)}
+    assert 'Unicolored Jay' not in kw_names
+
+    assert client.post('/api/redo').status_code == 200
+    assert db.get_review_status(pred_id, ws) == 'accepted'
+
+    # "Nothing to redo" returns without writing; the lock must still be gone.
+    assert client.post('/api/redo').status_code == 400
+    second, _ = _one_prediction(db, species='White-throated Magpie-Jay',
+                                photo_index=1)
+    assert client.post(f'/api/predictions/{second}/accept').status_code == 200
+    assert db.get_review_status(second, ws) == 'accepted'
+
+
+def test_group_apply_records_decisions_under_the_lock(app_and_db):
+    """Burst group apply writes review statuses, so it holds the lock too.
+
+    Its status writes have no precondition of their own — that is precisely
+    why it was easy to miss — but they still have to be serialized against the
+    batch endpoints' check-then-write window rather than landing inside it.
+    """
+    app, db = app_and_db
+    photos = db.get_photos()
+    pick, reject = photos[0]['id'], photos[1]['id']
+    det_a = _make_detection(db, pick)
+    det_b = _make_detection(db, reject)
+    db.add_prediction(detection_id=det_a, species='Azure Jay', confidence=0.9,
+                      model='test-model', category='new', group_id='gapply')
+    db.add_prediction(detection_id=det_b, species='Azure Jay', confidence=0.8,
+                      model='test-model', category='new', group_id='gapply')
+    pred_a = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?", (det_a,)
+    ).fetchone()['id']
+    pred_b = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?", (det_b,)
+    ).fetchone()['id']
+    ws = db._active_workspace_id
+
+    client = app.test_client()
+    resp = client.post('/api/predictions/group/apply', json={
+        'picks': [pick], 'rejects': [reject], 'removed': [], 'species': '',
+    })
+    assert resp.status_code == 200
+    assert db.get_review_status(pred_a, ws) == 'accepted'
+    assert db.get_review_status(pred_b, ws) == 'rejected'
+
+    # The lock was released, so a following decision goes through.
+    fresh, _ = _one_prediction(db, species='Plush-crested Jay')
+    assert client.post(f'/api/predictions/{fresh}/reject').status_code == 200

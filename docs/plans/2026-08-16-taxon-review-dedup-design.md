@@ -1368,13 +1368,15 @@ therefore distinguishes two request shapes, keyed on the **render
 decision** the client already made under "Active-filter detection"
 above, not on the raw predicate values: (i) **merged-card view**
 (the client rendered a merged card — neither arm of the fallback
-trigger fired) — carries `card_id` with the seven-entry scope tuple
-populated as the GET sent it, client-applied entries included at
-their **actual values** rather than forced to `null`, and the server
-resolves the full component *within that scoped row set* (an
-active-but-quiet client-applied entry — non-default sentinel but
-matching every returned row — simply removes no rows on the
-intersection, which is why it is safe to send under this shape); (ii)
+trigger fired, which in particular means every client-applied
+predicate was at its no-filter sentinel, since a non-default
+sentinel — active-but-quiet or not — trips arm (a) on its own and
+routes render and mutation to (ii)) — carries `card_id` with the
+seven-entry scope tuple populated as the GET sent it, and the server
+resolves the full component *within that scoped row set* (which under
+this shape can only ever be the three server-applied entries narrowing
+it, since the client-applied entries are all at their no-filter
+sentinels by construction of the trigger); (ii)
 **fallback view** (the client rendered per-node cards — at least one
 arm of the trigger fired) — carries `node_id` (the encoded node
 identity tuple, same base64url-of-JSON encoding as `card_id` for
@@ -1764,6 +1766,40 @@ union**, not just the clicked group's photos:
   status* granularity — accepting one card tags the photo, accepting the
   other is a status-only idempotent no-op on the keyword, and rejecting
   one leaves the other's tag in place through the liveness clause.
+- **The group-siblings loop is bounded by `member_prediction_ids`, not
+  by `(group_id, classifier_model)` alone.** `accept_prediction`'s
+  built-in group loop (`db.py:17503-17515`) enumerates its siblings by
+  `WHERE pr_rev.group_id = ? AND pr.classifier_model = ?`, but the
+  node identity §2 splits cards on is the four-tuple `(classifier_model,
+  labels_fingerprint, group_id, species_key)`. For a **legacy `group_id`
+  collision** — pre-Phase-0 rows where two bursts happen to share
+  `group_id` and `classifier_model` but disagree on `labels_fingerprint`
+  or `species_key` — those bursts render as **two separate cards** (§2,
+  "legacy-collision split"), yet the two-column loop above would still
+  reach every row in the shared bucket. If the card mutation invoked
+  `accept_prediction` on the anchor without narrowing the loop, one
+  card's accept would silently accept the sibling card's rows too,
+  defeating the split. The frozen `member_prediction_ids` closes this
+  hole exactly the way it closes the cross-model widening: the card
+  mutation restricts the group loop to `WHERE pr.id IN
+  member_prediction_ids` in addition to the model/group columns —
+  equivalently, drives the accept by iterating
+  `member_prediction_ids` directly and calling `_accept_for_photo`
+  per row rather than delegating to `accept_prediction`'s implicit
+  group expansion. Either shape is admissible; the invariant is that
+  no card mutation writes a row outside `member_prediction_ids ∩
+  scope`, however the primitives underneath are stitched. The same
+  bound applies verbatim to reject's group loop. Under a `node_id`
+  request the bound is trivially tighter (the node's own rows are the
+  entire mutation set by definition, §3), so this rule is only
+  load-bearing for `card_id` requests over legacy collisions — but
+  stating it once here means any future refactor that reintroduces
+  `accept_prediction(anchor_id)` as the driver still cannot re-open
+  the hole. Phase 3 gains a **legacy-collision cross-card fixture**:
+  two nodes share `(group_id, classifier_model)` but differ on
+  `species_key`, they render as two separate cards, and accepting the
+  first card touches **only** its `member_prediction_ids` — the
+  second card's rows in the same bucket remain untouched.
 - Taxon keys are computed in Python via §1's helper (the candidate set —
   the card's member rows on its union photos, in any status — is bounded
   by the card size), so no SQL-side taxonomy join is needed.
@@ -2173,11 +2209,52 @@ Precedence, then:
    silently reuse an *unrelated* keyword. Precedence-1 lookup therefore
    resolves through `taxa.inat_id` first:
    `SELECT id FROM taxa WHERE inat_id = ?` with the row's iNat id,
-   and only then `SELECT id FROM keywords WHERE taxon_id = ?` with
-   that local `taxa.id`. If the taxa row is absent (an unknown iNat
+   and only then a taxon-scoped lookup against `keywords` with that
+   local `taxa.id`. If the taxa row is absent (an unknown iNat
    id, or a payload that predates the taxa refresh), precedence-1
    yields no match and step 2 runs. For `name:`-keyed rows (no
    resolved taxon), precedence-1 is skipped entirely.
+
+   **Prefer a taxon-matched keyword already attached to the accepted
+   row's photo, then fall back deterministically.** `keywords.taxon_id`
+   is indexed but *not* unique (`db.py` schema; the design also
+   explicitly admits taxon-duplicate keywords as a residual — see the
+   "No retroactive rename" note below and the Keywords-page follow-up).
+   Two synonym keywords ("Blue Tit" and "Eurasian Blue Tit") can
+   therefore both point at the same local `taxa.id`, and an unordered
+   `SELECT id FROM keywords WHERE taxon_id = ?` may return either — so
+   an accept against a photo already carrying "Eurasian Blue Tit" could
+   pick "Blue Tit" from the same taxon bucket, attach it too, and
+   produce the very fragmentation this precedence exists to prevent.
+   The lookup is therefore two-step, in this exact order:
+
+   1. **Photo-attached first.** Restrict candidates to keywords already
+      attached to *this accepted row's photo* via `photo_keywords`:
+      `SELECT k.id FROM keywords k JOIN photo_keywords pk ON
+      pk.keyword_id = k.id WHERE k.taxon_id = ? AND pk.photo_id = ?`.
+      If any row survives, reuse it — its name is what gets written,
+      and by construction the accept is a status-only no-op on the
+      keyword. When multiple taxon-matched keywords are *all* already
+      attached (a pre-existing duplicate the follow-up merge tool
+      hasn't cleaned up yet), pick the deterministic fallback ordering
+      below among them so the choice is stable across accepts on the
+      same photo.
+   2. **Deterministic global fallback.** Only if step (i) finds
+      nothing, widen to `SELECT id FROM keywords WHERE taxon_id = ?`
+      **`ORDER BY id ASC LIMIT 1`** — the lowest-id keyword pointing at
+      the taxon. `keywords.id` is monotonically assigned by
+      `add_keyword` on first sight, so the oldest keyword for the taxon
+      wins; this is stable across accepts, across workspaces (keywords
+      are global), and independent of insertion order in the taxon
+      bucket. It matches what a first-accept would have converged on
+      before duplicates accumulated, so accepts on photos with no prior
+      tag still converge on the same keyword as accepts on photos that
+      already carry one.
+
+   Both steps run under the ID-space translation above (through
+   `taxa.inat_id` first, then by local `taxa.id`). For `name:`-keyed
+   rows the whole two-step block is skipped exactly as before —
+   `name:` rows have no `taxa.id` to key on.
 2. Otherwise, create/use **the taxon's preferred common name** — again
    the taxon's, not the row's raw `species`. This is what makes the
    *first* accept of an agreeing pair safe: before any keyword exists

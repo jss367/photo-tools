@@ -14420,6 +14420,267 @@ def test_retire_builtin_wildlife_detaches_associations_and_queues_flat_removal(t
     ).fetchone() is not None
 
 
+@pytest.mark.parametrize(
+    ("concurrent_change", "expected_retired"),
+    [
+        ("promote_candidate", 0),
+        ("retype_candidate", 0),
+        ("accept_changed_sidecar", 0),
+        ("add_workspace_owner", 1),
+        ("add_same_name_survivor", 1),
+        ("add_survivor_with_manual_sidecar", 1),
+        ("remove_survivor_with_manual_sidecar", 1),
+    ],
+)
+def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
+    tmp_path, monkeypatch, concurrent_change, expected_retired,
+):
+    """Catalog changes racing the XMP scan must be revalidated."""
+    import xml.etree.ElementTree as ET
+
+    from db import Database
+
+    db_path = str(tmp_path / "test.db")
+    photos_dir = tmp_path / "photos"
+    photos_dir.mkdir()
+    if concurrent_change in {
+        "add_survivor_with_manual_sidecar",
+        "remove_survivor_with_manual_sidecar",
+    }:
+        from xmp import write_sidecar
+
+        write_sidecar(
+            str(photos_dir / "p1.xmp"),
+            flat_keywords={"Wildlife"},
+            hierarchical_keywords=set(),
+        )
+    else:
+        (photos_dir / "p1.xmp").write_text(
+            "<x:xmpmeta xmlns:x='adobe:ns:meta/'/>", encoding="utf-8",
+        )
+
+    db = Database(db_path)
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photos_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    photo_id = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(photo_id, species_id)
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) "
+        "VALUES (?, ?, ?)",
+        (photo_id, wildlife_id, "generated"),
+    )
+    survivor_id = None
+    if concurrent_change == "remove_survivor_with_manual_sidecar":
+        survivor_id = db.conn.execute(
+            "INSERT INTO keywords (name, type) "
+            "VALUES ('Wildlife', 'individual')"
+        ).lastrowid
+        db.tag_photo(
+            photo_id, survivor_id, source="manual", _commit=False,
+        )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    original_parse = ET.parse
+    promoted = False
+    new_ws_id = None
+
+    def promote_during_parse(path, *args, **kwargs):
+        nonlocal promoted, survivor_id, new_ws_id
+        if not promoted:
+            promoted = True
+            concurrent_db = Database(db_path, initialize_schema=False)
+            if concurrent_change == "promote_candidate":
+                concurrent_db.tag_photo(
+                    photo_id, wildlife_id, source="manual",
+                )
+            elif concurrent_change == "retype_candidate":
+                concurrent_db.update_keyword(
+                    wildlife_id, type="individual",
+                )
+            elif concurrent_change == "accept_changed_sidecar":
+                concurrent_db.conn.execute(
+                    "UPDATE photos SET xmp_mtime = ? WHERE id = ?",
+                    (2.0, photo_id),
+                )
+                concurrent_db.conn.commit()
+            elif concurrent_change == "add_workspace_owner":
+                new_ws_id = concurrent_db.create_workspace("new owner")
+                concurrent_db.add_workspace_folder(new_ws_id, fid)
+            elif concurrent_change == "remove_survivor_with_manual_sidecar":
+                concurrent_db.untag_photo(
+                    photo_id, survivor_id, _commit=False,
+                )
+                concurrent_db.queue_change(
+                    photo_id,
+                    "keyword_remove",
+                    "Wildlife",
+                    workspace_id=ws,
+                    _commit=False,
+                )
+                concurrent_db.conn.commit()
+            else:
+                survivor_id = concurrent_db.conn.execute(
+                    "INSERT INTO keywords (name, type) "
+                    "VALUES ('Wildlife', 'individual')"
+                ).lastrowid
+                concurrent_db.tag_photo(
+                    photo_id, survivor_id, source="manual",
+                )
+            concurrent_db.close()
+        return original_parse(path, *args, **kwargs)
+
+    monkeypatch.setattr(ET, "parse", promote_during_parse)
+
+    assert db.retire_builtin_wildlife_genre() == expected_retired
+    genre_association = db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (photo_id, wildlife_id),
+    ).fetchone()
+    if concurrent_change == "promote_candidate":
+        assert genre_association is not None
+        assert genre_association["source"] == "manual"
+    elif concurrent_change == "retype_candidate":
+        assert genre_association is not None
+        assert db.conn.execute(
+            "SELECT type FROM keywords WHERE id = ?",
+            (wildlife_id,),
+        ).fetchone()["type"] == "individual"
+    elif concurrent_change == "accept_changed_sidecar":
+        assert genre_association is not None
+        assert db.get_photo(photo_id)["xmp_mtime"] == 2.0
+        assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "0"
+    elif concurrent_change == "add_workspace_owner":
+        assert genre_association is None
+        queued_ws_ids = {
+            row["workspace_id"]
+            for row in db.conn.execute(
+                """SELECT workspace_id FROM pending_changes
+                   WHERE photo_id = ?
+                     AND change_type = 'keyword_remove_flat'
+                     AND value = 'Wildlife' COLLATE NOCASE""",
+                (photo_id,),
+            ).fetchall()
+        }
+        assert queued_ws_ids == {ws, new_ws_id}
+    elif concurrent_change == "remove_survivor_with_manual_sidecar":
+        assert genre_association is None
+        assert db.conn.execute(
+            "SELECT 1 FROM photo_keywords "
+            "WHERE photo_id = ? AND keyword_id = ?",
+            (photo_id, survivor_id),
+        ).fetchone() is None
+        pending_types = {
+            row["change_type"]
+            for row in db.conn.execute(
+                "SELECT change_type FROM pending_changes WHERE photo_id = ?",
+                (photo_id,),
+            ).fetchall()
+        }
+        assert pending_types == {"keyword_remove"}
+    else:
+        assert genre_association is None
+        assert db.conn.execute(
+            "SELECT source FROM photo_keywords "
+            "WHERE photo_id = ? AND keyword_id = ?",
+            (photo_id, survivor_id),
+        ).fetchone()["source"] == "manual"
+    if concurrent_change not in {
+        "add_workspace_owner",
+        "remove_survivor_with_manual_sidecar",
+    }:
+        assert db.conn.execute(
+            "SELECT 1 FROM pending_changes WHERE photo_id = ?",
+            (photo_id,),
+        ).fetchone() is None
+    db.close()
+
+
+def test_retire_builtin_wildlife_retries_photo_that_becomes_eligible_during_scan(
+    tmp_path, monkeypatch,
+):
+    """A species added after the initial query must keep the marker unset."""
+    import xml.etree.ElementTree as ET
+
+    from db import Database
+
+    db_path = str(tmp_path / "test.db")
+    photos_dir = tmp_path / "photos"
+    photos_dir.mkdir()
+    (photos_dir / "eligible.xmp").write_text(
+        "<x:xmpmeta xmlns:x='adobe:ns:meta/'/>", encoding="utf-8",
+    )
+
+    db = Database(db_path)
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photos_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    eligible_id = db.add_photo(
+        folder_id=fid, filename="eligible.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    newly_eligible_id = db.add_photo(
+        folder_id=fid, filename="later.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    first_species_id = db.add_keyword("House Sparrow", is_species=True)
+    later_species_id = db.add_keyword("Song Sparrow", is_species=True)
+    db.tag_photo(eligible_id, first_species_id)
+    db.conn.executemany(
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) "
+        "VALUES (?, ?, 'generated')",
+        [
+            (eligible_id, wildlife_id),
+            (newly_eligible_id, wildlife_id),
+        ],
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    original_parse = ET.parse
+    added_species = False
+
+    def add_species_during_parse(path, *args, **kwargs):
+        nonlocal added_species
+        if not added_species:
+            added_species = True
+            concurrent_db = Database(db_path, initialize_schema=False)
+            concurrent_db.tag_photo(
+                newly_eligible_id, later_species_id, source="manual",
+            )
+            concurrent_db.close()
+        return original_parse(path, *args, **kwargs)
+
+    monkeypatch.setattr(ET, "parse", add_species_during_parse)
+
+    assert db.retire_builtin_wildlife_genre() == 1
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "0"
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (newly_eligible_id, wildlife_id),
+    ).fetchone() is not None
+
+    assert db.retire_builtin_wildlife_genre() == 1
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (newly_eligible_id, wildlife_id),
+    ).fetchone() is None
+
+
 def test_retire_builtin_wildlife_preserves_manual_tag_during_mixed_cleanup(tmp_path):
     """A standalone Wildlife genre may be user-authored metadata."""
     from db import Database
@@ -15502,14 +15763,17 @@ def test_retire_builtin_wildlife_attributes_flat_term_to_nested_survivor(tmp_pat
 
 
 def test_retire_builtin_wildlife_handles_photo_counts_over_bind_limit(tmp_path):
-    """Retirement must chunk the DELETE so a large upgraded library still opens.
+    """Retirement must chunk the DELETE for large upgraded libraries.
 
-    ``retire_builtin_wildlife_genre`` runs synchronously during startup, so a
-    single DELETE binding every photo id exceeds ``SQLITE_MAX_VARIABLE_NUMBER``
-    (999 on legacy builds) and prevents the DB from opening. This asserts the
-    call succeeds when the retired-photo set spans more than one chunk.
+    A single DELETE binding every photo id exceeds
+    ``SQLITE_MAX_VARIABLE_NUMBER`` (999 on legacy builds). This asserts the
+    background upgrade pass succeeds when its photo set spans multiple chunks.
     """
-    from db import _SQLITE_PARAM_CHUNK_SIZE, Database
+    from db import (
+        _SQLITE_PARAM_CHUNK_SIZE,
+        _WILDLIFE_RETIREMENT_WRITE_CHUNK_SIZE,
+        Database,
+    )
     db = Database(str(tmp_path / "test.db"))
     ws = db.create_workspace("ws")
     db.set_active_workspace(ws)
@@ -15539,7 +15803,18 @@ def test_retire_builtin_wildlife_handles_photo_counts_over_bind_limit(tmp_path):
     db.conn.commit()
     db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
 
+    traced_statements = []
+    db.conn.set_trace_callback(traced_statements.append)
     assert db.retire_builtin_wildlife_genre() == total
+    db.conn.set_trace_callback(None)
+
+    writer_chunks = [
+        statement for statement in traced_statements
+        if statement == "BEGIN IMMEDIATE"
+    ]
+    assert len(writer_chunks) == 1 + (
+        total + _WILDLIFE_RETIREMENT_WRITE_CHUNK_SIZE - 1
+    ) // _WILDLIFE_RETIREMENT_WRITE_CHUNK_SIZE
 
     remaining = db.conn.execute(
         "SELECT COUNT(*) AS c FROM photo_keywords WHERE keyword_id = ?",

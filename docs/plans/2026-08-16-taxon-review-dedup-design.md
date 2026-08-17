@@ -621,14 +621,16 @@ Four corollaries, each binding on one site:
    set.** That is both `POST /api/predictions/card` ("Card detail
    endpoint" below) and the accept/reject POST (§3, step 1). Neither may
    delegate to a route that cannot enforce the scope, and neither may
-   act on more than the membership the card had when it was rendered —
-   "when they clicked" is part of the invariant, so a component that
-   grew between the GET and the click (taxonomy cache resolution, a new
-   classify run) is *found* by the rebuild but not *acted on*. Nor may
-   the mutation act on **less**: a card that split under the user cannot
-   satisfy the click at all, so the mutation refuses it outright and
-   says so rather than resolving whichever members are left (§2,
-   "Shrinkage is a stale click, not a smaller click").
+   act on a row set that differs *in either direction* from the
+   membership the card had when it was rendered — "when they clicked" is
+   part of the invariant. A component that grew between the GET and the
+   click (taxonomy cache resolution, a new classify run) and a card that
+   split under the user are one event as far as the server can tell, and
+   both refuse the click outright and say so, rather than absorbing the
+   newcomers or resolving whichever members are left. The row set the
+   mutation writes is always the server's own recomputation; the client's
+   frozen membership is the precondition it is checked against, never the
+   selector (§2, "Shrinkage is a stale click, not a smaller click").
 4. **A card's status, badge and actions are an aggregate over all its
    members**, never whichever row won the dedup sort — and **an action
    the card offers applies to every one of those members**, whatever
@@ -854,21 +856,26 @@ build on it.
 
 The endpoint takes the card's frozen membership in the same body
 (`member_prediction_ids` — the identical field name and shape the
-mutation POST carries) and intersects with it exactly as the mutation
-does (§3 step 1). A detail view is not destructive, but a card that
+mutation POST carries) and compares it against its own recomputed
+`server_members` exactly as the mutation does (§3 step 1) — but, being a
+read, it *renders* the intersection and discloses the difference rather
+than refusing. A detail view is not destructive, but a card that
 opens onto a group the user never saw in it — because the taxonomy
 cache resolved between the grid render and the click — is the same
 "covers more than the user could see" failure one surface earlier, and
 the modal is where the user decides whether to accept. Absent
 `member_prediction_ids`, the endpoint returns the whole scoped component
 (the legacy shape) and flags `"expanded"` so the client can say so.
-It intersects the same way in the *other* direction too — frozen
-members the current component or scope no longer covers — but it does
-**not** inherit the mutation's 409 there: the read returns the
-survivors with `"departed"`, `departed_prediction_ids` and
-`current_cards`, and the modal disables its action buttons. §2,
-"Shrinkage is a stale click, not a smaller click", states why the read
-and the write diverge on exactly this point.
+It reports divergence in the *other* direction too — frozen members the
+current component or scope no longer covers — and it does **not**
+inherit the mutation's 409 in either direction: the read returns the
+survivors with `"departed"`, `departed_prediction_ids`,
+`joined_prediction_ids` and `current_cards`, and the modal disables its
+action buttons whenever either list is non-empty (they would 409
+anyway). §2, "Shrinkage is a stale click, not a smaller click", states
+why the read and the write diverge on exactly this point: a read that
+shows the wrong rows can be corrected by looking again, a write that
+touches them cannot.
 
 **Why the membership is not on the URL.** An earlier revision put it
 there (`&rows=<prediction_id>,…`), and that does not survive contact
@@ -1003,19 +1010,23 @@ POST the server:
    and POST therefore canonicalize over the same scoped set and cannot
    disagree about a key except through a cache transition, which step 5
    bounds.
-5. **Intersects that component with the frozen membership the POST
-   carried** (`member_prediction_ids`, §3 step 1), and bounds the
-   sibling scan by the same set (§3 step 3). The component is how the
-   server *finds* the card and enumerates each member's rows; the
-   frozen membership is what the card actually *was* when the user
-   clicked. Only their intersection is mutated — and before mutating,
-   the server requires the frozen membership to be a **subset** of
-   `resolved component ∩ scope`; a frozen row that landed elsewhere, or
-   that the re-applied scope now excludes, means the card the user
-   clicked no longer exists as one card, and step 5 returns 409
-   `card_changed` instead of writing a partial. See "Shrinkage is a
-   stale click, not a smaller click" below for the split-component case
-   that motivates the check and for what the user is told.
+5. **Checks the frozen membership the POST carried
+   (`member_prediction_ids`, §3 step 1) against that component**, and
+   mutates the component — not the client's list. `server_members =
+   resolved component ∩ scope` is the row set written, and the sibling
+   scan is bounded by the same set (§3 step 3). The component is how the
+   server *finds* the card, enumerates each member's rows, and defines
+   the write; the frozen membership is the client's claim about what the
+   card *was* when the user clicked, and its only job is to license or
+   refuse the write. The two must be **equal as sets**: a frozen row that
+   landed elsewhere or that the re-applied scope now excludes, and
+   equally a row the server finds that the client did not name, both mean
+   the card the user clicked is no longer the card the server would act
+   on, and step 5 returns 409 `card_changed` instead of writing a
+   partial. Checking the client's list against a set the client did not
+   help build is the whole point — see "Shrinkage is a stale click, not a
+   smaller click" below, and "The precondition is verified against a set
+   the client did not help build" within it.
 
 The intended cache-transition sequence is: GET emits a `name:blue tit`
 card with anchor `A`, `card_id` = base64url(JSON([`A`])), and
@@ -1030,30 +1041,32 @@ whole reason `taxon_key` is not baked into `card_id`.
 What the transition must **not** do is grow the click. The new key can
 pull in a group `B` from another model that already resolved to
 `taxon:13094` and therefore rendered as its own separate card at GET
-time. `B`'s rows are not in `member_prediction_ids`, so they are excluded
-from the mutation — by step 5's intersection *and* by the same bound on
-the per-photo sibling scan, which would otherwise rediscover them
-through the photo `B` shares with a frozen member and reported back as `"expanded": 1`; the user's accept
-resolves exactly the card they clicked, and `B` stays pending and
-visible as its own card until the next Review load merges the two for
-real. Reapplying the filter scope does not substitute for this —
-`B` satisfies the same scope — and neither does any property of the
-anchor: the anchor is an identity, not a membership. Only the frozen
-membership carries "what the card was".
+time. `B`'s rows land in `server_members` but not in
+`member_prediction_ids`, so the two sets disagree and the POST is
+**refused with 409 `card_changed`**, naming `B`'s rows in
+`joined_prediction_ids`; nothing is written, `B` stays pending, and the
+next Review load draws the merged card for real. An earlier revision
+instead excluded `B` and let the click proceed with `"expanded": 1`.
+That is no longer available, and the reason is not `B` — it is that
+"the client's list is short because the card grew" and "the client's
+list is short because the client dropped a member" are the same
+observation to the server ("The precondition is verified against a set
+the client did not help build", below). Reapplying the filter scope does
+not substitute for the membership check — `B` satisfies the same scope —
+and neither does any property of the anchor: the anchor is an identity,
+not a membership. Only the comparison of the frozen membership against
+the server's own recomputation carries "is this still the card the user
+saw".
 
-**Shrinkage is a stale click, not a smaller click.** The intersection
-in step 5 is a defense against growth and is safe against growth by
-construction — the mutation covers exactly the frozen membership,
-never more. It is *not* symmetrically safe against a component that
-lost members between the GET and the POST, and the two shrink
-sub-cases split on a bright line: is every frozen row still in the
-anchor's component?
+**Shrinkage is a stale click, not a smaller click.** Step 5's check
+splits the shrink direction on a bright line: is every frozen row still
+in the anchor's component?
 
 - **Yes, only the anchor moved.** The transition changed which member
   is the smallest, but every frozen row still resolves into the same
-  component. The intersection is a no-op, the mutation applies to the
-  whole frozen membership, and the click resolves the card the user
-  clicked. This sub-case needs nothing extra.
+  component. `server_members` and the frozen membership are equal, the
+  mutation applies to the whole card, and the click resolves the card
+  the user clicked. This sub-case needs nothing extra.
 - **No, the component split.** A new classify run, or any other
   request-scope input that flips §1's per-label resolution for one
   label but not another, can move part of the card into a different
@@ -1071,12 +1084,12 @@ anchor's component?
   keyword effect" below), arriving through a different route. "Accept
   all" cannot mean "accept the survivors of a card the user never saw".
 
-Step 5's subset check is exactly this bright line, and it is stated
-over the *mutated* set rather than the component alone, because a
-frozen row can leave by either route:
+Step 5's check is exactly this bright line, and it is stated over the
+*mutated* set rather than the component alone, because a frozen row can
+leave by either route:
 
-> **Completeness precondition.** Every id in `member_prediction_ids`
-> must appear in `resolved component ∩ scope`.
+> **Completeness precondition.** `member_prediction_ids` must equal
+> `resolved component ∩ scope` — as sets, in both directions.
 
 The component half catches the split above. The scope half catches the
 other way a frozen member departs, which has nothing to do with
@@ -1087,6 +1100,83 @@ narrow just as invisibly. From the user's side the two are one event —
 the card they clicked is no longer the card the server can act on — so
 they get one rule and one response.
 
+**The precondition is verified against a set the client did not help
+build.** An earlier revision stated this check as *"the mutation runs
+only when `resolved component ∩ member_prediction_ids ∩ scope` equals
+`member_prediction_ids` in full"* — and that is not a precondition at
+all, because both sides of it are downstream of the same client input.
+Drop a displayed member from the payload and the intersection shrinks to
+match, the equality holds, and the server performs a partial "Accept
+all" on a card the user never saw. A condition the caller can satisfy by
+lying is decoration. What follows is the correction; it is a change of
+*which set is authoritative*, not an extra guard bolted on top.
+
+*What the server knows by itself.* `card_id` is not a client-minted
+token the server takes on trust: it decodes to an anchor node key, and
+step 1 of §3 then rebuilds everything else from stored state plus the
+scope tuple — the scoped row set the GET saw, current taxon keys under
+§1's per-label resolution, the card graph, and the component containing
+the anchor. Name that set
+
+```text
+server_members = resolved component ∩ scope
+```
+
+(for a `node_id` request, the named node's own rows ∩ scope). Every term
+in it is server-derived. `member_prediction_ids` appears nowhere in its
+construction, which is precisely what makes it usable as the thing the
+client's claim is checked against.
+
+*The inversion.* `server_members` **is** the mutation boundary — the row
+set that gets written. `member_prediction_ids` is **not a row selector**;
+it is an If-Match assertion about what the client rendered, and its only
+effect is to permit or refuse the mutation. Verified by set equality
+against `server_members`:
+
+| Client's list vs. `server_members` | Meaning | Result |
+| --- | --- | --- |
+| equal | the card is still the card | mutate `server_members` |
+| client ⊊ server | rows joined the component or the client under-reported — **the server cannot tell which** | 409, `joined_prediction_ids` |
+| client ⊋ server | the card split, or a member left the scope | 409, `departed_prediction_ids` |
+| neither | both at once | 409, both lists |
+
+*Why equality and not a subset check in the safe direction.* The earlier
+revision argued the two directions were asymmetric — "growth's extra
+rows were never part of the click, so exclude them and report
+`expanded`; shrinkage's missing rows *were*, so refuse". That asymmetry
+is real in the user's intent and invisible from the server's position:
+growth and under-reporting present as the identical relation
+`member_prediction_ids ⊊ server_members`, and separating them would
+require knowing which cards the *previous* taxonomy cache state would
+have drawn — state the server does not keep. So the two collapse into
+one rule, and the cost is bounded and stated: the rare cache-transition
+merge now refuses the click instead of accepting the clicked half and
+reporting `"expanded": N`. That is the same trade this section already
+made for the split direction, applied in the direction it was skipped.
+
+*What tampering can still buy, stated honestly.* A forged payload that
+happens to equal `server_members` passes. That is not an escalation: the
+mutation writes `server_members` either way, so the most a forgery buys
+is *suppressing the 409* an honest client would have received —
+behaving as though the user had reloaded and clicked. It can never reach
+a row outside `component ∩ scope`, because it names no rows at all. The
+earlier text claimed "the intersection is what makes a tampered
+membership harmless"; that was right about widening and silent about
+narrowing, which is the half that mattered.
+
+*Why not a signed digest or a persisted snapshot.* Both were considered
+and both are redundant here. An HMAC over the GET's membership
+authenticates *provenance*, not *freshness* — a correctly signed digest
+from a GET thirty seconds ago is still a valid statement about a card
+that has since split, so the server must recompute and compare anyway;
+and once it recomputes, the signature adds nothing, because any list
+that matches the recomputation is by construction the server's own set.
+A server-side snapshot per rendered card buys the same answer for a
+per-GET write, a TTL and an eviction policy, in a single-user local app
+where the "attacker" is the user's own browser. The rebuild the mutation
+already performs for anchor resolution *is* the authentication; the bug
+was using it to filter the client's list instead of to replace it.
+
 The precondition is evaluated **before the transaction opens** and
 before any Phase-A write ("A card mutation writes every member status
 before it decides any keyword effect" below). On failure the server
@@ -1096,14 +1186,23 @@ writes nothing at all and returns **409**:
 {
   "error": "card_changed",
   "departed_prediction_ids": [1235, 1236],
+  "joined_prediction_ids": [],
   "member_count": 8,
   "departed_count": 2,
+  "joined_count": 0,
   "current_cards": [
     {"card_id": "…", "prediction_ids": [1234, 1237]},
     {"card_id": "…", "prediction_ids": [1235, 1236]}
   ]
 }
 ```
+
+Both lists are always present, and both are computed against
+`server_members`: `departed` is `member_prediction_ids \ server_members`,
+`joined` is `server_members \ member_prediction_ids`. The client's
+inline notice reads from whichever is non-empty ("this card split — 2
+predictions moved" / "2 more predictions joined this card"); the
+recovery is the same reload either way.
 
 **409, not the 400 the anchor-gone case uses**, and the distinction is
 load-bearing rather than pedantic. 400 means the handle names rows the
@@ -1114,10 +1213,10 @@ decomposition, and the client has something specific to say. Reusing
 the 400 shape would force the client to distinguish the two by
 inspecting the body anyway, and would make "the anchor is gone" and
 "your card split in two" indistinguishable in logs and in fixtures.
-Growth is excluded and reported (`"expanded": N`) because the excluded
-rows were never part of the click; shrinkage is refused because the
-missing rows *were*. The two directions are not symmetric, and treating
-them as such is what let the split case escape.
+Both divergence directions land on this same 409, for the reason given
+under "The precondition is verified against a set the client did not
+help build": the server cannot separate growth from an under-reporting
+client, so it does not try.
 
 **Why refuse rather than act on the survivors and report the losses.**
 The nearer repo precedent points the other way and is worth stating
@@ -1171,16 +1270,20 @@ card is the unit of the promise, a run is a bag of independent
 promises.
 
 **The read discloses; only the write refuses.** `POST
-/api/predictions/card` intersects with the frozen membership exactly as
+/api/predictions/card` compares against the frozen membership exactly as
 the mutation does ("Card detail endpoint", §2) and so observes the same
-departure — but it must **not** inherit the 409. A detail view that
-refuses leaves the user staring at nothing while the grid still shows
-the card, and a read protects nobody by declining to render. It returns
-the surviving members plus `"departed": <n>`, `departed_prediction_ids`
+divergence, in either direction — but it must **not** inherit the 409. A
+detail view that refuses leaves the user staring at nothing while the
+grid still shows the card, and a read protects nobody by declining to
+render. It returns the intersection of the two — the members the user
+saw that are still there — plus `"departed": <n>`,
+`departed_prediction_ids`, `"expanded": <n>`, `joined_prediction_ids`
 and the same `current_cards` decomposition, and the modal renders the
 card-changed notice with its Accept / Reject buttons **disabled** —
 they would 409 anyway, and a button that cannot fire is its own small
-black box.
+black box. The read may show a subset because a read that shows too
+little is corrected by looking again; the write may not act on one
+because a write that acts on too little is not correctable at all.
 
 The one shrink this cannot even reach step 5 through is when the
 anchor node's rows are gone entirely (bucket rewrite, deletion) —
@@ -1489,69 +1592,71 @@ union**, not just the clicked group's photos:
    a hit between the GET and the POST — the anchor is still findable
    and the component still resolves under the new key.
 
-   **The POST also carries the card's frozen membership**, and the
-   mutation is the *intersection* of the two. Alongside `card_id`, the
-   client sends `member_prediction_ids` — the ids of every prediction
-   row the card it clicked was built from. It has them: the server
-   returns each row individually and the client keeps them all rather
-   than collapsing them (§2, "Payload changes"), so the displayed
-   membership is literally enumerable client-side. The mutated row set
-   is then
+   **The POST also carries the card's frozen membership, and the server
+   checks it rather than obeying it.** Alongside `card_id`, the client
+   sends `member_prediction_ids` — the ids of every prediction row the
+   card it clicked was built from. It has them: the server returns each
+   row individually and the client keeps them all rather than collapsing
+   them (§2, "Payload changes"), so the displayed membership is literally
+   enumerable client-side. The row set that gets **written** is the
+   server's own recomputation,
 
    ```text
-   resolved component ∩ member_prediction_ids ∩ scope
+   server_members = resolved component ∩ scope
    ```
 
-   Rebuilding the component is still required — it resolves the anchor
-   and validates the request — and the intersection can only ever
-   *shrink* the frozen membership, never add to it. But a shrink that
-   actually loses a frozen row is not a smaller write, it is a stale
-   click: the anchor's own component and one of the card's other members'
-   component are no longer the same component, and "Accept all" on the
-   card the user saw is not the same call as "Accept all" on the anchor's
-   surviving half. The mutation is only run when the intersection equals
-   `member_prediction_ids` **in full** — not `member_prediction_ids ∩
-   scope`, which would let a scope departure narrow the click as
-   silently as a split does; anything less is refused with a 409
-   `card_changed` (see §2, "Shrinkage is a stale click, not a smaller
-   click"). The two guards do different jobs and both are needed: the
-   intersection is what makes a tampered or replayed membership
-   harmless, and the completeness check is what keeps an *honest*
-   membership from turning "Accept all" into "accept some". On every
-   mutation that does proceed the mutated set is therefore exactly
-   `member_prediction_ids` — the formula above is the definition, and
-   the precondition is what collapses it to the row set the user was
-   looking at.
+   which contains no client input beyond the `card_id` handle and the
+   scope tuple, and the mutation runs **only if**
+
+   ```text
+   member_prediction_ids == server_members    (as sets)
+   ```
+
+   otherwise 409 `card_changed`. `member_prediction_ids` is therefore an
+   If-Match precondition, not a row selector: it decides *whether* the
+   mutation happens and never *which rows* it touches.
+
+   An earlier revision had this the other way round — the mutated set was
+   `resolved component ∩ member_prediction_ids ∩ scope`, gated on that
+   intersection equalling `member_prediction_ids` in full. That gate is
+   vacuous, because both of its sides are downstream of the client's
+   list: omit a displayed member and the intersection shrinks to match,
+   the equality holds, and "Accept all" quietly becomes "accept some" on
+   a card the user never saw. §2, "The precondition is verified against a
+   set the client did not help build", works through the correction, the
+   table of the three divergence cases, why the check is now symmetric,
+   and why a signed digest or a persisted GET-time snapshot would add
+   nothing over the rebuild the mutation already performs. The short
+   version: the mutation boundary must be something the server derived,
+   and it already derives one.
 
    **Freezing rows, not nodes.** An earlier revision froze
    `member_node_ids`. Node identity is immutable, but a node's *row set*
    is not fixed relative to a scope: between the GET and the POST a
    photo can join the selected collection, or a row's status can change
    into the active tab, and the rebuilt node then contains rows that
-   were never displayed — admitted by a node-level intersection because
+   were never displayed — admitted by a node-level comparison because
    the node id matches. Node ids name a *bucket*; the invariant is about
    *rows*. Prediction ids are the exact granularity the promise is made
    at, they are already unique (`db.py:866`), and they need no encoding.
-   For a `node_id` request the same rule applies: the mutation is that
-   node's rows **as displayed**, so `member_prediction_ids` travels on
-   that shape too and the node id names which card was clicked rather
+   For a `node_id` request the same rule applies with `server_members` =
+   the named node's own rows ∩ scope: `member_prediction_ids` travels on
+   that shape too, and the node id names which card was clicked rather
    than which rows to write.
 
-   Without the intersection the cache transition below silently widens
+   Without the equality check the cache transition below silently widens
    the click: if the resolver resolves `name:blue tit` → `taxon:13094`
    between the GET and the POST, a group `B` that was already
    `taxon:13094`-keyed rendered as its **own separate card**, and a POST
    that mutated the newly-merged component would accept or reject `B`'s
    rows — rows the user could see on screen, but not as part of the card
    they clicked. That is corollary 1 violated in the time dimension, and
-   the invariant wins: growth discovered at mutation time is
-   **excluded**, not silently absorbed. When the server drops rows this
-   way it reports the count in the response so the client can tell the
-   user duplicates appeared and offer a reload (`"expanded": 1`), rather
-   than leaving a card that looks resolved next to a duplicate that is
-   not. Membership can only shrink the mutation, so a tampered or
-   replayed `member_prediction_ids` cannot widen it either — the
-   component and the scope tuple still bound it.
+   the invariant wins: `B` makes `server_members` differ from the frozen
+   membership, so the click is **refused** with `B`'s rows named in
+   `joined_prediction_ids` and nothing is written. The client tells the
+   user duplicates appeared and offers a reload, rather than leaving a
+   card that looks resolved next to a duplicate that is not — and rather
+   than proceeding on a short list it cannot distinguish from a lie.
 
    For a `node_id` request the server resolves exactly the named single
    node under the scope tuple, without any component expansion —
@@ -1592,28 +1697,32 @@ union**, not just the clicked group's photos:
      model that was in scope for the GET (i.e., predictions the user's
      filter would have surfaced), restricted per model to its latest
      `labels_fingerprint` (reuse the latest-fingerprint subquery from
-     `accept_subject_species`), **and then intersected with the frozen
-     `member_prediction_ids`** before anything is written; each survivor
-     is accepted via the existing `_accept_for_photo` primitive. This is
+     `accept_subject_species`), **and then intersected with
+     `server_members`** before anything is written; each survivor is
+     accepted via the existing `_accept_for_photo` primitive. This is
      what closes the BioCLIP-vs-iNat21 duplicate on the motivating case
      and carries acceptance across A→B→C in a transitive component.
 
-     The intersection is not belt-and-braces here, it is load-bearing.
-     The scan's predicate is "same taxon, on a card photo, in scope",
-     and that predicate is evaluated against the *current* taxonomy
-     cache — so the group `B` that step 1's membership intersection
-     excluded after a `name:`→`taxon:` transition would be rediscovered
-     by this scan through the photo it shares with a frozen member, and
-     accepted anyway. Excluding a node from the component and then
-     re-admitting its rows by photo is the same widening arriving one
-     step later. Bounding the scan by the frozen row ids closes it, and
-     it costs nothing that matters: every row the scan legitimately
-     wants is a row the card displayed, so it is in
-     `member_prediction_ids` by construction. What the scan is *for*,
-     stated exactly: it enumerates the card's members from the server's
-     own data so the mutation never depends on the client's list being
-     complete; the frozen membership makes sure it never depends on it
-     being *stale*, either. Neither may extend the card (§2, card axis).
+     The intersection is not belt-and-braces here, it is load-bearing —
+     and note which set it is against. The scan's predicate is "same
+     taxon, on a card photo, in scope", which is *nearly* the component
+     edge rule but not identical to it, so bounding it by
+     `server_members` is what keeps the scan a member-enumerator rather
+     than a second, looser definition of the card. It may only ever
+     confirm rows the rebuild already put in the component; it may never
+     introduce one. An earlier revision bounded it by
+     `member_prediction_ids` instead, which was the right instinct
+     applied to the wrong set: the client's list is a claim, not a fact,
+     and a mutation step must not take its row bounds from a claim (§2,
+     "The precondition is verified against a set the client did not help
+     build"). The `name:`→`taxon:` case this bound was introduced for —
+     group `B` rediscovered through a photo it shares with a member —
+     never reaches the scan now, because `B`'s presence in
+     `server_members` already made step 1 refuse the POST with 409.
+     Neither the scan nor the client may extend the card (§2, card
+     axis), and since equality has already been checked,
+     `server_members` and the frozen membership are the same set by the
+     time the scan runs.
 
      **The scan is not restricted to `pending` rows** — that is
      corollary 4's second half. An earlier revision filtered the sibling
@@ -1754,7 +1863,9 @@ union**, not just the clicked group's photos:
   from the clicked row's — never within the run. Within the clicked row's
   own run, the group-siblings loop `accept_prediction` already runs
   (`pr.classifier_model = ?` on the clicked row's own `group_id`)
-  continues to be the only same-run reach, so the classifier's own
+  remains the only same-run reach — **bounded to the resolved node, per
+  the next bullet; "preserved" here means preserved in *reach*, not in
+  its two-column `WHERE`** — so the classifier's own
   similarity-grouping decision — one real Blue Tit box in `group_id` A,
   one false-positive Blue Tit box in `group_id` B — is preserved: the two
   remain separately reviewable cards and one accept does not resolve the
@@ -1766,40 +1877,70 @@ union**, not just the clicked group's photos:
   status* granularity — accepting one card tags the photo, accepting the
   other is a status-only idempotent no-op on the keyword, and rejecting
   one leaves the other's tag in place through the liveness clause.
-- **The group-siblings loop is bounded by `member_prediction_ids`, not
-  by `(group_id, classifier_model)` alone.** `accept_prediction`'s
-  built-in group loop (`db.py:17503-17515`) enumerates its siblings by
-  `WHERE pr_rev.group_id = ? AND pr.classifier_model = ?`, but the
-  node identity §2 splits cards on is the four-tuple `(classifier_model,
-  labels_fingerprint, group_id, species_key)`. For a **legacy `group_id`
-  collision** — pre-Phase-0 rows where two bursts happen to share
-  `group_id` and `classifier_model` but disagree on `labels_fingerprint`
-  or `species_key` — those bursts render as **two separate cards** (§2,
-  "legacy-collision split"), yet the two-column loop above would still
-  reach every row in the shared bucket. If the card mutation invoked
-  `accept_prediction` on the anchor without narrowing the loop, one
-  card's accept would silently accept the sibling card's rows too,
-  defeating the split. The frozen `member_prediction_ids` closes this
-  hole exactly the way it closes the cross-model widening: the card
-  mutation restricts the group loop to `WHERE pr.id IN
-  member_prediction_ids` in addition to the model/group columns —
-  equivalently, drives the accept by iterating
-  `member_prediction_ids` directly and calling `_accept_for_photo`
-  per row rather than delegating to `accept_prediction`'s implicit
-  group expansion. Either shape is admissible; the invariant is that
-  no card mutation writes a row outside `member_prediction_ids ∩
-  scope`, however the primitives underneath are stitched. The same
-  bound applies verbatim to reject's group loop. Under a `node_id`
-  request the bound is trivially tighter (the node's own rows are the
-  entire mutation set by definition, §3), so this rule is only
-  load-bearing for `card_id` requests over legacy collisions — but
-  stating it once here means any future refactor that reintroduces
-  `accept_prediction(anchor_id)` as the driver still cannot re-open
-  the hole. Phase 3 gains a **legacy-collision cross-card fixture**:
-  two nodes share `(group_id, classifier_model)` but differ on
+- **The group-siblings loop is constrained to the resolved node — it is
+  bounded by `server_members`, not by `(group_id, classifier_model)`
+  alone.** `accept_prediction`'s built-in group loop enumerates its
+  siblings by `WHERE pr_rev.group_id = ? AND pr.classifier_model = ?`,
+  but the node identity §2 splits cards on is the four-tuple
+  `(classifier_model, labels_fingerprint, group_id, species_key)`. For a
+  **legacy `group_id` collision** — pre-Phase-0 rows where two bursts
+  happen to share `group_id` and `classifier_model` but disagree on
+  `labels_fingerprint` or `species_key` — those bursts render as **two
+  separate cards** (§2, "legacy-collision split"), yet the two-column
+  loop above would still reach every row in the shared bucket. If the
+  card mutation invoked `accept_prediction` on the anchor without
+  narrowing the loop, one card's accept would silently accept the
+  sibling card's rows too, defeating the split. Note that the loop is
+  the *only* remaining same-run reach precisely because it is bounded;
+  the preceding bullet's "preserved" is about which rows the classifier's
+  own grouping decision makes reachable, not about leaving the query
+  unconstrained.
+
+  **The primitive for this already exists — PR #1489 added it.** That PR
+  gave `accept_prediction` a `prediction_ids` scope list and moved the
+  group expansion behind an `_in_scope(photo_id, pred_id)` check that
+  tests row membership *independently* of photo membership ("a group
+  member's photo being in scope does not make every row that member
+  carries in scope"). The card mutation therefore does not need a new
+  code path: it calls `accept_prediction(anchor_id,
+  prediction_ids=server_members)` and the expansion is confined to the
+  resolved node's rows by construction. Two consequences worth pinning,
+  because they are interlocks rather than coincidences:
+
+  1. #1489 also made expansion skip rows whose status is in
+     `Database.DECIDED_PREDICTION_STATUSES`, which on its own would
+     break corollary 4 — a card accept over a `{pending, rejected}`
+     card must reconcile the rejected member, and expansion-discovery
+     would skip it. It does not break, because #1489 exempts *rows the
+     caller named*, and under this design the caller names the entire
+     membership. Passing `server_members` is what makes the card
+     mutation's reconciling semantics and #1489's
+     don't-resurrect-a-rejected-sibling rule both hold at once; a future
+     change that stopped passing the full membership would silently lose
+     the reconciliation.
+  2. #1489's undecided-only narrowing is *necessary but not sufficient*
+     here. It stops expansion from re-flipping decided rows; it does not
+     stop it from reaching an **undecided** row belonging to the other
+     half of a legacy `group_id` collision. Only the explicit
+     `prediction_ids` bound closes that, which is why this design
+     requires it rather than relying on #1489's status filter.
+
+  Driving the accept by iterating `server_members` directly and calling
+  `_accept_for_photo` per row is equally admissible; the invariant is
+  that no card mutation writes a row outside `server_members`, however
+  the primitives underneath are stitched. The same bound applies
+  verbatim to reject's group loop. Under a `node_id` request the bound
+  is trivially tighter (the node's own rows are the entire mutation set
+  by definition, §3), so this rule is only load-bearing for `card_id`
+  requests over legacy collisions — but stating it once here means any
+  future refactor that reintroduces an unscoped
+  `accept_prediction(anchor_id)` as the driver still cannot re-open the
+  hole. Phase 3 gains a **legacy-collision cross-card fixture**: two
+  nodes share `(group_id, classifier_model)` but differ on
   `species_key`, they render as two separate cards, and accepting the
-  first card touches **only** its `member_prediction_ids` — the
-  second card's rows in the same bucket remain untouched.
+  first card touches **only** its members — the second card's rows in
+  the same bucket remain untouched, including any that are still
+  `pending` and therefore invisible to #1489's status filter.
 - Taxon keys are computed in Python via §1's helper (the candidate set —
   the card's member rows on its union photos, in any status — is bounded
   by the card size), so no SQL-side taxonomy join is needed.
@@ -1811,9 +1952,12 @@ union**, not just the clicked group's photos:
   push that introduces a *new* group after accept fires does not retroactively
   join this card; that new group appears as a fresh pending card on the next
   Review load, which is the intended behavior. A group that joins the
-  component *between* the GET and the click is treated the same way —
-  found by the rebuild, excluded by the frozen membership, reported as
-  `"expanded"`, and merged for real on the next load (step 1).
+  component *between* the GET and the click does **not** get that
+  treatment, because there the user has a click in flight against a card
+  that no longer exists: the rebuild finds it, the membership check
+  fails, the POST is refused 409 with the newcomer in
+  `joined_prediction_ids`, and the merge lands on the next load
+  (step 1).
 - **Undo:** every member accept goes through `_accept_for_photo`, whose
   `affected` entries — including status-only no-ops — feed the
   edit-history/undo machinery, and the accept additionally snapshots the
@@ -1868,14 +2012,20 @@ algorithm above and from the numbered implementation phases below:
 these two are halves of one mutation, at runtime.)
 
 - **Phase A — statuses.** Write the new status of *every* row in the
-  mutated set (`resolved component ∩ member_prediction_ids ∩ scope`,
-  step 1 — equal to `member_prediction_ids` on any request that got
-  this far, since step 1's completeness precondition already 409'd the
-  ones where it was not), reconciling flips included. No keyword is
-  written or removed and no keyword-related predicate is evaluated.
+  mutated set (`server_members = resolved component ∩ scope`, step 1 —
+  equal to `member_prediction_ids` on any request that got this far,
+  since step 1's completeness precondition already 409'd the ones where
+  it was not), reconciling flips included. No keyword is written or
+  removed and no keyword-related predicate is evaluated.
 - **Phase B — keyword effects.** Only after the last Phase-A write:
-  evaluate the retraction predicate, perform the untag or tag, and
-  compute the disclosure counts — all against the post-Phase-A state.
+  resolve the card's single keyword over the union of member photos (§4,
+  "Resolved once per mutation, not once per photo"), evaluate the
+  retraction predicate, perform the untag or tag, and compute the
+  disclosure counts — all against the post-Phase-A state. The keyword
+  resolution belongs in Phase B for the same reason the retraction
+  predicate does: it reads which member photos already carry a
+  taxon-matched keyword, and on a reconciling accept that set is only
+  final once every member's status is written.
 
 Without the split, a row-at-a-time loop evaluates each keyword decision
 against a state the same click is about to invalidate. The concrete
@@ -2255,6 +2405,49 @@ Precedence, then:
    `taxa.inat_id` first, then by local `taxa.id`). For `name:`-keyed
    rows the whole two-step block is skipped exactly as before —
    `name:` rows have no `taxa.id` to key on.
+
+   **Resolved once per mutation, not once per photo — a card accept
+   writes at most one keyword string.** The two steps above are stated
+   per accepted row, and run that way they are not stable across a card:
+   a member photo already carrying "Eurasian Blue Tit" takes step (i)
+   and reuses it, while an untagged member photo falls to step (ii) and
+   takes the globally oldest "Blue Tit". One click would then attach two
+   spellings of one taxon across one card — fragmentation created by the
+   mechanism that exists to prevent it, and a card note naming either
+   string would be false about the other half. The resolution is
+   therefore hoisted to the **mutation** and evaluated once over the
+   union of member photos:
+
+   1. **Some member photo already carries a taxon-matched keyword, and
+      they all carry the same one.** That keyword is the card's keyword.
+      Every already-tagged photo is a status-only no-op and every
+      untagged photo converges on the spelling the card already uses.
+   2. **Member photos carry two or more *different* taxon-matched
+      keywords** (pre-existing fragmentation the merge follow-up hasn't
+      cleaned up). No single string can be written everywhere without
+      adding a synonym to a photo that already has one, so the card does
+      the strictly non-destructive thing: already-tagged photos keep
+      what they have, untouched, and the card's keyword — the one
+      *written*, to untagged member photos — is the lowest-`id` keyword
+      **among those already present on the card**, not the global
+      lowest-id. Restricting to the card's own spellings is what keeps
+      the accept from introducing a *third* spelling into a photo set
+      that already disagrees.
+   3. **No member photo carries any taxon-matched keyword.** Step (ii)'s
+      deterministic global fallback, once, for the whole card.
+
+   The resulting invariant is exact and is what the card can honestly
+   promise: **a card accept writes at most one keyword string; it may
+   leave other synonyms already on member photos in place, and it never
+   adds a spelling that no member photo had.** Single-photo callers are
+   unaffected by construction — Compare's `accept_subject_species` and
+   the legacy per-prediction accept have a one-photo union, so the
+   card-scoped rule degenerates to exactly today's photo-first
+   behaviour, which is why hoisting it does not disturb the
+   accepted-row-keyed precedence those callers rely on. That is also the
+   phasing: the per-row precedence is Phase 4, the hoist is Phase 5, and
+   nothing is left un-canonicalized in between because Phase 4 has no
+   multi-photo caller to hoist for.
 2. Otherwise, create/use **the taxon's preferred common name** — again
    the taxon's, not the row's raw `species`. This is what makes the
    *first* accept of an agreeing pair safe: before any keyword exists
@@ -2270,6 +2463,29 @@ Precedence, then:
 accept will write differs from the card's display name, the card says so —
 e.g. a subdued `tags as "Eurasian Blue Tit"` note under the title. The card
 must answer "what will accepting this do", not just "what species is this".
+
+The note is truthful because the rule above made it possible to be
+truthful: there is exactly one written string per card accept, so
+`tags as "…"` has a single well-defined value rather than a
+representative one. Case 2 above is the one where a single string is
+still not the whole story — some member photos keep a different synonym
+— and the note says both halves rather than naming the winner and
+staying quiet:
+
+```text
+tags as "Blue Tit" — 2 photos keep "Eurasian Blue Tit"
+```
+
+Naming only the written string there would answer "what gets written"
+while the user reads it as "what this card's photos will be tagged", and
+those differ; that is the substitution the no-black-boxes rule forbids.
+Rendering per-photo outcomes was the other option and is rejected: it
+scales with card size, it puts a table under a grid card, and it says
+nothing case 2's one extra clause does not, since the retained spellings
+are a set of at most a handful of strings, not a per-photo fact. The
+retained-synonym clause is also the in-context surface for the
+Keywords-page merge follow-up below — it is exactly the state that tool
+cleans up, named at the moment the user is looking at it.
 
 No retroactive rename of existing keywords. Follow-up (out of scope):
 surface taxon-duplicate keywords ("2 keywords resolve to *Cyanistes
@@ -2656,15 +2872,24 @@ Each phase lands as its own PR and is independently useful.
    — the same transition, but a previously-separate BioCLIP-2.5 group
    `B` that already carried `taxon:13094` joins the resolved component
    between the GET and the POST: the POST's `member_prediction_ids` does
-   not name `B`'s rows, so `B`'s rows stay **pending** (they were their own card on
-   screen), the clicked card's own members all resolve, and the response
-   reports `"expanded": 1`. Two negative variants: the same POST with
-   the membership omitted mutates `B` and fails; and a build where the
-   frozen set bounds only the component intersection but **not** the
-   per-photo sibling scan re-admits `B`'s row through the photo it
-   shares with a frozen member and also fails — the regression guard
-   for §3 step 3's intersection, since excluding a node and then
-   rediscovering its rows by photo is the same widening one step later.
+   not name `B`'s rows, so it no longer equals `server_members`, and the
+   POST is refused **409 `card_changed`** with `joined_prediction_ids`
+   naming `B`'s rows — **nothing at all is written**, the clicked card's
+   own members stay pending too, and a reload draws the merged card.
+   Three negative variants, each a build that would have passed the
+   earlier revisions of this rule: (a) a build whose precondition is the
+   old one-sided *"intersection equals `member_prediction_ids`"*, given a
+   payload that simply **omits one displayed member** — it proceeds and
+   half-accepts the card, which is the vacuous-precondition regression;
+   (b) a build that excludes `B` and proceeds with `"expanded": 1` — it
+   now fails, because growth and under-reporting are the same
+   observation and both must refuse; (c) a build where the bound applies
+   to the component resolution but **not** to the per-photo sibling scan,
+   which re-admits `B`'s row through a shared photo. A fourth,
+   positive: a payload naming exactly `server_members` after the merge
+   succeeds and writes exactly those rows, pinning the stated residual —
+   a forged membership can suppress the 409, and can reach nothing
+   outside `component ∩ scope`.
    A **cache-transition split-component fixture** — the same GET as
    the frozen-membership fixture, but between the GET and the POST a
    new classify run adds a conflicting `scientific_name` for exactly
@@ -2711,13 +2936,21 @@ Each phase lands as its own PR and is independently useful.
    between the GET and the POST a photo of a *frozen* node joins the
    selected collection (and, in a second variant, a row of that node
    changes into the active status tab), so the rebuilt node legitimately
-   contains a row that was never displayed. The mutation must leave that
-   row untouched; a node-level freeze admits it (the node id matches)
-   and fails, which is why membership is frozen at prediction-id
-   granularity. A **frozen-membership tampering fixture** — a POST
-   naming prediction ids outside the resolved component or outside the
-   scope tuple mutates nothing extra, since membership can only
-   intersect; a
+   contains a row that was never displayed. The mutation must not write
+   that row: it appears in `server_members`, the equality check fails,
+   and the POST 409s with it in `joined_prediction_ids`. A node-level
+   freeze admits it silently (the node id matches) and fails the fixture,
+   which is why membership is compared at prediction-id granularity. A
+   **frozen-membership tampering fixture** — a POST naming prediction
+   ids outside the resolved component or outside the scope tuple is
+   refused 409 with those ids in `departed_prediction_ids` and writes
+   nothing; a build that instead intersects them away and proceeds fails,
+   because it would silently narrow the click on any honest client whose
+   card really did split. A **short-payload fixture** — a POST naming a
+   strict subset of the displayed members is refused 409 and writes
+   nothing; a build that accepts the subset fails. Together these two
+   pin that `member_prediction_ids` is a precondition, never a selector,
+   in both directions. A
    **card-detail frozen-membership fixture** — the same transition
    against a card-detail POST whose body carries `id` plus
    `member_prediction_ids` returns the clicked card's members only, and
@@ -2806,7 +3039,15 @@ Each phase lands as its own PR and is independently useful.
    **no-card-caller fixture** — the same convergence holds when the
    accept is driven by Compare's `accept_subject_species`, which has
    no card, confirming the canonicalization is keyed on the row's
-   taxon rather than on a card (§4, "Keyword written on accept").
+   taxon rather than on a card (§4, "Keyword written on accept"). The
+   *mutation-scoped* half of §4 ("Resolved once per mutation, not once
+   per photo") is **not** in this phase and cannot be: it needs a
+   multi-photo mutation, and the first one is Phase 5's card accept.
+   Phase 4 ships the per-row precedence, which is already the whole rule
+   for every caller that exists at Phase 4 — all of them are
+   single-photo, so their union is one photo and the two formulations
+   coincide. The hoist and its fixtures land with the card mutation
+   below.
 5. **Merged-card rendering + cross-model accept/reject** + undo
    coverage. This phase turns the client over to `card_id`: the
    `getVisibleItems` dedup, merged-card rendering, the aggregate/`mixed`
@@ -2820,9 +3061,10 @@ Each phase lands as its own PR and is independently useful.
    in the same phase, because a routed path left on the legacy endpoint
    for one release would half-accept merged cards for that release. The
    409 `card_changed` handling lands with them — the card-level inline
-   notice naming the departed count, the disabled modal actions on a
-   `departed` detail read, and the toolbar rollup's worse-outcome
-   summary (§2, "Shrinkage is a stale click, not a smaller click"). It
+   notice naming the departed **or joined** count, the disabled modal
+   actions on a `departed`/`expanded` detail read, and the toolbar
+   rollup's worse-outcome summary (§2, "Shrinkage is a stale click, not
+   a smaller click"). It
    is not a follow-up: shipping the server precondition without the
    notice converts a silent partial accept into a silently *ignored*
    click, which is the same failure wearing the other hat. The
@@ -2831,12 +3073,30 @@ Each phase lands as its own PR and is independently useful.
    being live so that the per-row keyword write resolves to the
    canonical keyword — otherwise the sibling loop across "Blue Tit" /
    "Eurasian Blue Tit" rows would tag both synonyms on the same photo,
-   the exact fragmentation §3's "Ordering constraint" describes. DB
+   the exact fragmentation §3's "Ordering constraint" describes. It also
+   carries the mutation-scoped half of §4 — the card's keyword resolved
+   **once** over the union of member photos, and the two-part
+   `tags as "…" — N photos keep "…"` disclosure — because this is the
+   phase in which a mutation first spans more than one photo. DB
    tests: accepting the merged card (unfiltered — POST carries
    `card_id`) flips both models' rows; undo restores both; reject
    mirrors; Compare's `accept_subject_species` matches across name
    variants and writes exactly one keyword per photo (asserting the
-   Phase 4 dependency actually holds end-to-end);
+   Phase 4 dependency actually holds end-to-end); a
+   **one-spelling-per-card fixture** — a card spanning photo 1 (already
+   tagged "Eurasian Blue Tit") and photo 2 (untagged), where a global
+   "Blue Tit" keyword with a lower `keywords.id` also exists: the accept
+   writes **"Eurasian Blue Tit"** to photo 2 and nothing to photo 1, so
+   exactly one spelling is written across the card. A build that resolves
+   per photo picks the global lowest-id for photo 2 and fails — the
+   regression guard for §4's "Resolved once per mutation". A second
+   variant covers case 2: photo 1 carries "Eurasian Blue Tit", photo 2
+   carries "Blue Tit", photo 3 is untagged, and a third global synonym
+   with a still-lower id exists — photos 1 and 2 are untouched, photo 3
+   gets the lowest-id spelling **present on the card**, the third
+   synonym is never written, and the disclosure names both the written
+   string and the retained one; a build that names only the written
+   string fails the disclosure assertion;
    **transitive-component accept fixture** — accepting the A-B-C card
    (POST carries `card_id`, no filter scope) flips every pending row on
    photos 1-4 for the matching taxon and leaves other taxa untouched;
@@ -2965,8 +3225,8 @@ Each phase lands as its own PR and is independently useful.
    mutation writes every member status before it decides any keyword
    effect". Its mirror is the load-bearing half and rules out the
    over-broad repair: a third same-taxon row on that photo which the
-   mutation does **not** touch (excluded by the scope tuple, or absent
-   from `member_prediction_ids`) stays pending, and the keyword must be
+   mutation does **not** touch (excluded by the scope tuple, so outside
+   `server_members`) stays pending, and the keyword must be
    **kept**, with the "still predicted on 1 photo" disclosure — so the
    rule is "evaluate after the writes", not "ignore every sibling". A
    third variant asserts the client-side half of the closure clause:

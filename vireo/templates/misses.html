@@ -497,6 +497,11 @@ var CATEGORY_LABELS = {
 };
 var missesData = { no_subject: [], clipped: [], oof: [] };
 var missConfig = null;
+// The detector floor the currently rendered cards were actually derived
+// with. Preview and recompute return their effective config alongside the
+// rows, which may differ from the saved missConfig while the slider is
+// unsaved — cards must quote the floor that produced them.
+var activeMissFloor = null;
 var originalMissConfig = null;
 var previewTimer = null;
 var previewActive = false;
@@ -1061,6 +1066,9 @@ function resetMissThresholds() {
 }
 
 function applyMissesPayload(data) {
+  activeMissFloor = (data.config && data.config.detector_confidence != null)
+    ? Number(data.config.detector_confidence)
+    : null;
   missesData = {
     no_subject: sortPhotos(data.no_subject || []),
     clipped:    sortPhotos(data.clipped || []),
@@ -1205,7 +1213,14 @@ function renderCard(cat, p, idx) {
   var bbox = parseDetectionBox(p.detection_box);
   var bboxHtml = '';
   if (!bbox && cat === 'no_subject') {
-    bboxHtml = '<div class="no-subject-frame">No subject detected</div>';
+    var floor = p.detector_confidence_threshold != null
+      ? Number(p.detector_confidence_threshold)
+      : (activeMissFloor != null
+          ? activeMissFloor
+          : (missConfig && missConfig.detector_confidence != null
+              ? Number(missConfig.detector_confidence) : 0.20));
+    bboxHtml = '<div class="no-subject-frame">No detection above ' +
+      Math.round(floor * 100) + '%</div>';
   }
 
   var meta = '';
@@ -1215,6 +1230,8 @@ function renderCard(cat, p, idx) {
     meta = 'r=' + (p.subject_tenengrad / p.bg_tenengrad).toFixed(2);
   } else if (cat === 'no_subject' && p.detection_conf != null) {
     meta = 'c=' + Number(p.detection_conf).toFixed(2);
+  } else if (cat === 'no_subject' && p.raw_detection_conf != null) {
+    meta = 'best candidate ' + Math.round(Number(p.raw_detection_conf) * 100) + '%';
   }
 
   var ariaLabel = escapeAttr(

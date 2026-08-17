@@ -20177,7 +20177,10 @@ class Database:
         linked to the active workspace. ``detection_box`` and
         ``detection_conf`` are sourced from the primary (highest-confidence)
         row in the ``detections`` table — the legacy ``photos`` columns are
-        not populated by normal pipeline runs. Ordered by timestamp DESC.
+        not populated by normal pipeline runs. ``raw_detection_conf`` exposes
+        the best animal candidate even when it is below the effective detector
+        floor so the Misses UI can explain the decision. Ordered by timestamp
+        DESC.
         """
         ws_id = self._ws_id()
         if category is None:
@@ -20231,6 +20234,7 @@ class Database:
         # ``OperationalError: too many SQL variables``.
         CHUNK = 500
         primary = {}
+        raw_primary = {}
         for i in range(0, len(photo_ids), CHUNK):
             chunk = photo_ids[i:i + CHUNK]
             placeholders = ",".join("?" * len(chunk))
@@ -20238,14 +20242,23 @@ class Database:
                 f"SELECT photo_id, box_x, box_y, box_w, box_h, "
                 f"       detector_confidence "
                 f"FROM detections "
-                f"WHERE detector_confidence >= ? AND photo_id IN ({placeholders}) "
+                f"WHERE photo_id IN ({placeholders}) "
+                f"  AND (detector_model IS NULL OR detector_model != 'full-image') "
+                f"  AND COALESCE(category, 'animal') = 'animal' "
                 f"ORDER BY photo_id, detector_confidence DESC",
-                [min_conf, *chunk],
+                chunk,
             ).fetchall()
             for d in det_rows:
-                primary.setdefault(d["photo_id"], d)
+                raw_primary.setdefault(d["photo_id"], d)
+                if d["detector_confidence"] >= min_conf:
+                    primary.setdefault(d["photo_id"], d)
         for p in photos:
             d = primary.get(p["id"])
+            raw = raw_primary.get(p["id"])
+            p["raw_detection_conf"] = (
+                raw["detector_confidence"] if raw is not None else None
+            )
+            p["detector_confidence_threshold"] = min_conf
             if d is not None:
                 p["detection_box"] = _json.dumps({
                     "x": d["box_x"], "y": d["box_y"],

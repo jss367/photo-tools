@@ -229,6 +229,501 @@ def test_postprocess_transposed_format():
     assert result[0]["category"] == "animal"
 
 
+def test_tiled_windows_cover_center_and_edges_without_duplicates():
+    import detector
+
+    windows = list(detector._tile_windows(1000, 500))
+
+    assert len(windows) == 9
+    assert windows[0] == (200, 0, 800, 300)
+    assert (0, 0, 600, 300) in windows
+    assert (400, 200, 1000, 500) in windows
+    # Windows 2..5 are the four corner crops. Windows 6..8 are the three
+    # remaining edge-center crops that fill the internal seams the corner
+    # crops leave behind under _map_tile_detection's clipping rejection.
+    assert set(windows[2:6]) == {
+        (0, 0, 600, 300),
+        (400, 0, 1000, 300),
+        (0, 200, 600, 500),
+        (400, 200, 1000, 500),
+    }
+    assert set(windows[6:]) == {
+        (0, 100, 600, 400),
+        (400, 100, 1000, 400),
+        (200, 200, 800, 500),
+    }
+    assert len(set(windows)) == len(windows)
+
+
+def test_every_tile_window_is_the_sole_interior_window_for_some_subject():
+    """No window in the grid is redundant, so no crop subset is seam-safe.
+
+    The sibling tests above pin the crop *count*; this one pins the reason
+    the count cannot be lowered. Pixel-area coverage is not usable coverage
+    because ``_map_tile_detection`` discards any proposal clipped by an
+    internal crop boundary, so a subject only counts as covered by a window
+    that holds it as an interior box. For each of the nine windows there is
+    a subject that survives in that window and nowhere else -- which is why
+    an early stop after any prefix of the grid silently drops subjects, and
+    why gating one on the found detection's distance from a seam would not
+    help either (a strong hit says nothing about a different animal
+    elsewhere in the frame).
+    """
+    import detector
+
+    width, height = 1000, 500
+    windows = list(detector._tile_windows(width, height))
+
+    # Bands interior to exactly one of the three start positions per axis.
+    x_bands = {0: (0.05, 0.15), 200: (0.35, 0.65), 400: (0.85, 0.95)}
+    y_bands = {0: (0.05, 0.15), 100: (0.35, 0.65), 200: (0.85, 0.95)}
+
+    for target in windows:
+        left, top = target[0], target[1]
+        x1, x2 = x_bands[left]
+        y1, y2 = y_bands[top]
+
+        survivors = []
+        for window in windows:
+            w_left, w_top, w_right, w_bottom = window
+            tile_w = w_right - w_left
+            tile_h = w_bottom - w_top
+            # What the model can see in this crop: the subject clipped to
+            # the crop's own bounds.
+            tx1 = max(0.0, (x1 * width - w_left) / tile_w)
+            tx2 = min(1.0, (x2 * width - w_left) / tile_w)
+            ty1 = max(0.0, (y1 * height - w_top) / tile_h)
+            ty2 = min(1.0, (y2 * height - w_top) / tile_h)
+            if tx2 <= tx1 or ty2 <= ty1:
+                continue  # subject lies entirely outside this crop
+            proposal = {
+                "box": {"x": tx1, "y": ty1, "w": tx2 - tx1, "h": ty2 - ty1},
+                "confidence": 0.5,
+                "category": "animal",
+            }
+            if detector._map_tile_detection(
+                proposal, window, width, height,
+            ) is not None:
+                survivors.append(window)
+
+        assert survivors == [target], (
+            f"subject x={x1}-{x2} y={y1}-{y2} survives in {survivors}; "
+            f"window {target} must be the only one that keeps it"
+        )
+
+
+def test_map_tile_detection_rejects_internal_seams_and_maps_interior_box():
+    import detector
+
+    window = (200, 0, 800, 300)
+    seam_box = {
+        "box": {"x": 0.0, "y": 0.2, "w": 0.3, "h": 0.4},
+        "confidence": 0.9,
+        "category": "animal",
+    }
+    assert detector._map_tile_detection(seam_box, window, 1000, 500) is None
+
+    interior = {
+        "box": {"x": 0.25, "y": 0.2, "w": 0.5, "h": 0.4},
+        "confidence": 0.8,
+        "category": "animal",
+    }
+    mapped = detector._map_tile_detection(interior, window, 1000, 500)
+    assert mapped is not None
+    assert mapped["box"]["x"] == pytest.approx(0.35)
+    assert mapped["box"]["y"] == pytest.approx(0.12)
+    assert mapped["box"]["w"] == pytest.approx(0.30)
+    assert mapped["box"]["h"] == pytest.approx(0.24)
+
+
+def test_merge_detections_does_not_truncate_full_frame_subjects():
+    import detector
+
+    full_frame = [
+        {
+            "box": {"x": i / 100, "y": 0.1, "w": 0.005, "h": 0.01},
+            "confidence": 0.01 + i / 1000,
+            "category": "animal",
+        }
+        for i in range(21)
+    ]
+    tiled = [{
+        "box": {"x": 0.8, "y": 0.8, "w": 0.1, "h": 0.1},
+        "confidence": 0.9,
+        "category": "animal",
+    }]
+
+    merged = detector._merge_detections(full_frame, tiled)
+
+    assert len(merged) == 22
+    assert all(detection in merged for detection in full_frame)
+    assert tiled[0] in merged
+
+
+def test_merge_detections_upgrades_overlapping_full_frame_subject():
+    import detector
+
+    weak = {
+        "box": {"x": 0.2, "y": 0.2, "w": 0.1, "h": 0.1},
+        "confidence": 0.05,
+        "category": "animal",
+    }
+    strong = {
+        "box": {"x": 0.2, "y": 0.2, "w": 0.1, "h": 0.1},
+        "confidence": 0.9,
+        "category": "animal",
+    }
+
+    assert detector._merge_detections([weak], [strong]) == [strong]
+
+
+def test_merge_detections_caps_tiled_additions_per_category():
+    import detector
+
+    tiled = [
+        {
+            "box": {"x": i / 100, "y": 0.1, "w": 0.005, "h": 0.01},
+            "confidence": 0.99 - i / 1000,
+            "category": "person",
+        }
+        for i in range(21)
+    ]
+    animal = {
+        "box": {"x": 0.8, "y": 0.8, "w": 0.1, "h": 0.1},
+        "confidence": 0.3,
+        "category": "animal",
+    }
+    tiled.append(animal)
+
+    merged = detector._merge_detections([], tiled)
+
+    assert animal in merged
+    assert sum(d["category"] == "person" for d in merged) == 20
+
+
+def test_detect_animals_runs_tiled_fallback_after_weak_full_pass(
+    monkeypatch, tmp_path,
+):
+    from unittest.mock import MagicMock
+
+    import detector
+
+    fake_session = MagicMock()
+    fake_session.get_inputs.return_value = [MagicMock(name="images")]
+    weak = np.array(
+        [[[320, 320, 100, 100, 0.05, 0.0, 0.0]]], dtype=np.float32,
+    )
+    strong = np.array(
+        [[[320, 320, 100, 100, 0.90, 0.0, 0.0]]], dtype=np.float32,
+    )
+    empty = np.zeros((1, 0, 7), dtype=np.float32)
+    outputs = [weak, weak, strong, *([empty] * 8)]
+    fake_session.run.side_effect = lambda *_args, **_kwargs: [outputs.pop(0)]
+    monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
+
+    img_path = tmp_path / "small-bird.jpg"
+    from PIL import Image
+    Image.new("RGB", (1000, 500), color="green").save(img_path)
+
+    detections = detector.detect_animals(str(img_path))
+
+    # One full-frame pass plus every seam-safe tile. Even a strong tile
+    # detection must not short-circuit the remaining edge-center crops:
+    # _map_tile_detection rejects proposals clipped by an internal crop
+    # boundary, so the edge-center crops are the only ones that catch a
+    # second subject straddling two corner crops' shared seam.
+    # Preview full-frame + source-rendition full-frame + all nine tiles.
+    assert fake_session.run.call_count == 11
+    assert detections[0]["confidence"] == pytest.approx(0.9)
+    assert detections[0]["category"] == "animal"
+    assert detections[0]["box"]["w"] < 0.2
+
+
+def test_detect_animals_keeps_running_after_strong_early_tile(
+    monkeypatch, tmp_path,
+):
+    """A strong hit in an early crop must not skip the seam-fixing crops.
+
+    ``_map_tile_detection`` rejects boxes clipped by an internal crop
+    boundary, so pixel coverage across the first six center+corner crops is
+    not equivalent to usable detection coverage: a second animal that lies
+    along an internal seam only appears interior in one of the three
+    remaining edge-center crops.  A previous version of ``_tiled_fallback``
+    early-stopped after those first six crops and silently dropped such
+    subjects; keep the coverage invariant by asserting every crop still runs
+    even when the very first tile already returns a strong animal.
+    """
+    from unittest.mock import MagicMock
+
+    import detector
+
+    fake_session = MagicMock()
+    fake_session.get_inputs.return_value = [MagicMock(name="images")]
+    # Weak full-frame, then strong (0.90) at the first tile, six empties
+    # for the corner/center coverage subset, then a strong (0.90) hit in
+    # one of the three edge-center crops.  With the previous early-stop
+    # after the sixth crop, ``run.call_count`` would have been 7 and only
+    # one tiled subject would have survived.
+    weak = np.array(
+        [[[320, 320, 100, 100, 0.05, 0.0, 0.0]]], dtype=np.float32,
+    )
+    strong = np.array(
+        [[[320, 320, 50, 50, 0.90, 0.0, 0.0]]], dtype=np.float32,
+    )
+    empty = np.zeros((1, 0, 7), dtype=np.float32)
+    outputs = [weak, weak, strong, *([empty] * 5), strong, empty, empty]
+    fake_session.run.side_effect = lambda *_args, **_kwargs: [outputs.pop(0)]
+    monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
+
+    img_path = tmp_path / "two-birds.jpg"
+    from PIL import Image
+    Image.new("RGB", (1000, 500), color="green").save(img_path)
+
+    detections = detector.detect_animals(str(img_path))
+
+    assert fake_session.run.call_count == 11
+    strong_animals = [
+        d for d in detections
+        if d["category"] == "animal" and d["confidence"] >= 0.5
+    ]
+    assert len(strong_animals) == 2, [d["confidence"] for d in detections]
+    # Different windows map to distinct full-image regions, so both hits
+    # survive as independent subjects.  A stale early stop would have
+    # dropped whichever animal only appeared in a post-sixth window.
+    ys = sorted(d["box"]["y"] for d in strong_animals)
+    assert ys[1] - ys[0] > 0.1, ys
+
+
+def _crop_detection_output(crop_w, crop_h, box, confidence):
+    """Build a fake YOLOv8 output placing ``box`` (crop-normalized) in a crop.
+
+    Inverts ``_preprocess``'s letterbox so ``_postprocess`` recovers exactly
+    the crop-relative box requested.
+    """
+    import detector
+
+    _, info = detector._preprocess(
+        np.zeros((crop_h, crop_w, 3), dtype=np.uint8)
+    )
+    scale, pad_x, pad_y, _, _ = info
+    x1 = box[0] * crop_w * scale + pad_x
+    y1 = box[1] * crop_h * scale + pad_y
+    x2 = box[2] * crop_w * scale + pad_x
+    y2 = box[3] * crop_h * scale + pad_y
+    return np.array(
+        [[[
+            (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1,
+            confidence, 0.0, 0.0,
+        ]]],
+        dtype=np.float32,
+    )
+
+
+def test_tiled_fallback_recovers_a_seam_straddling_subject_from_the_last_crop(
+    monkeypatch, tmp_path,
+):
+    """The reviewer's exact scenario, end to end through ``detect_animals``.
+
+    The sibling test asserts that all nine crops run. This one asserts the
+    consequence that matters: a second animal in the bottom band that
+    straddles the vertical center line is clipped by the right seam of the
+    bottom-left crop and the left seam of the bottom-right crop, so
+    ``_map_tile_detection`` rejects it in every window except the
+    bottom-center crop -- which runs last. The test pins that premise
+    directly rather than trusting crop ordering, so it fails if an early
+    stop is ever reintroduced or if the window schedule stops covering this
+    seam.
+    """
+    from unittest.mock import MagicMock
+
+    import detector
+
+    width, height = 1000, 500
+    crop_w, crop_h = 600, 300
+    windows = list(detector._tile_windows(width, height))
+    bottom_center = (200, 200, 800, 500)
+    assert windows[-1] == bottom_center
+
+    # Full-image normalized box for the seam-straddling second animal:
+    # wider than the corner crops' shared overlap, low in the frame.
+    seam_box = (0.35, 0.85, 0.65, 0.95)
+
+    # Premise: every window except the last rejects or cannot see it.
+    for window in windows[:-1]:
+        w_left, w_top, w_right, w_bottom = window
+        tile_w = w_right - w_left
+        tile_h = w_bottom - w_top
+        tx1 = max(0.0, (seam_box[0] * width - w_left) / tile_w)
+        tx2 = min(1.0, (seam_box[2] * width - w_left) / tile_w)
+        ty1 = max(0.0, (seam_box[1] * height - w_top) / tile_h)
+        ty2 = min(1.0, (seam_box[3] * height - w_top) / tile_h)
+        if tx2 <= tx1 or ty2 <= ty1:
+            continue  # outside this crop entirely
+        clipped = {
+            "box": {"x": tx1, "y": ty1, "w": tx2 - tx1, "h": ty2 - ty1},
+            "confidence": 0.55,
+            "category": "animal",
+        }
+        assert detector._map_tile_detection(
+            clipped, window, width, height,
+        ) is None, f"expected seam rejection in {window}"
+
+    tile_box = (
+        (seam_box[0] * width - bottom_center[0]) / crop_w,
+        (seam_box[1] * height - bottom_center[1]) / crop_h,
+        (seam_box[2] * width - bottom_center[0]) / crop_w,
+        (seam_box[3] * height - bottom_center[1]) / crop_h,
+    )
+
+    fake_session = MagicMock()
+    fake_session.get_inputs.return_value = [MagicMock(name="images")]
+    weak = np.array(
+        [[[320, 320, 100, 100, 0.05, 0.0, 0.0]]], dtype=np.float32,
+    )
+    strong = np.array(
+        [[[320, 320, 100, 100, 0.90, 0.0, 0.0]]], dtype=np.float32,
+    )
+    empty = np.zeros((1, 0, 7), dtype=np.float32)
+    seam_output = _crop_detection_output(crop_w, crop_h, tile_box, 0.55)
+    # Fast-path full frame, the full-frame re-run on the larger array, a
+    # strong animal in the very first crop, seven quiet crops, then the seam
+    # subject in the final bottom-center crop.
+    outputs = [weak, weak, strong, *([empty] * 7), seam_output]
+    fake_session.run.side_effect = lambda *_args, **_kwargs: [outputs.pop(0)]
+    monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
+
+    img_path = tmp_path / "two-birds.jpg"
+    from PIL import Image
+    Image.new("RGB", (width, height), color="green").save(img_path)
+
+    detections = detector.detect_animals(str(img_path))
+
+    assert fake_session.run.call_count == 2 + len(windows)
+    seam_hits = [
+        d for d in detections
+        if d["category"] == "animal" and abs(d["confidence"] - 0.55) < 1e-4
+    ]
+    assert seam_hits, [d["confidence"] for d in detections]
+    found = seam_hits[0]["box"]
+    assert found["x"] == pytest.approx(seam_box[0], abs=1e-3)
+    assert found["y"] == pytest.approx(seam_box[1], abs=1e-3)
+    assert found["w"] == pytest.approx(seam_box[2] - seam_box[0], abs=1e-3)
+    assert found["h"] == pytest.approx(seam_box[3] - seam_box[1], abs=1e-3)
+
+
+def test_tiled_fallback_retains_detections_between_raw_floor_and_trigger(
+    monkeypatch, tmp_path,
+):
+    """A crop finding an animal between RAW_CONF_FLOOR and the trigger must be
+    kept in the artifact so a workspace with a lower confidence threshold can
+    surface it at read time. Filtering at write time would defeat the global
+    detector cache — matching the invariant the full-frame pass already
+    guarantees via RAW_CONF_FLOOR postprocessing.
+    """
+    from unittest.mock import MagicMock
+
+    import detector
+
+    assert (
+        detector.RAW_CONF_FLOOR
+        < 0.15
+        < detector.TILED_FALLBACK_TRIGGER_CONFIDENCE
+    )
+
+    fake_session = MagicMock()
+    fake_session.get_inputs.return_value = [MagicMock(name="images")]
+    weak = np.array(
+        [[[320, 320, 100, 100, 0.05, 0.0, 0.0]]], dtype=np.float32,
+    )
+    mid = np.array(
+        [[[320, 320, 100, 100, 0.15, 0.0, 0.0]]], dtype=np.float32,
+    )
+    empty = np.zeros((1, 0, 7), dtype=np.float32)
+    outputs = [weak, weak, mid, *([empty] * 8)]
+    fake_session.run.side_effect = lambda *_args, **_kwargs: [outputs.pop(0)]
+    monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
+
+    img_path = tmp_path / "small-bird.jpg"
+    from PIL import Image
+    Image.new("RGB", (1000, 500), color="green").save(img_path)
+
+    detections = detector.detect_animals(str(img_path))
+
+    # Every crop plus the full-frame pass ran; the tiled fallback runs
+    # every seam-safe window unconditionally so the middle-of-image edge
+    # seams are always covered.
+    assert fake_session.run.call_count == 11
+    animals = [d for d in detections if d["category"] == "animal"]
+    mid_boxes = [d for d in animals if abs(d["confidence"] - 0.15) < 1e-4]
+    assert mid_boxes, [d["confidence"] for d in animals]
+
+
+def test_weak_raw_reruns_full_frame_on_tiled_rendition(monkeypatch):
+    from unittest.mock import MagicMock
+
+    import detector
+    import image_loader
+    from PIL import Image
+
+    fake_session = MagicMock()
+    fake_session.get_inputs.return_value = [MagicMock(name="images")]
+    monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
+
+    preview = Image.new("RGB", (1000, 500), color="green")
+    source = Image.new("RGB", (1200, 1200), color="green")
+    loads = [preview, source]
+    monkeypatch.setattr(image_loader, "load_image", lambda *_args, **_kwargs: loads.pop(0))
+
+    calls = []
+    preview_detection = {
+        "box": {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1},
+        "confidence": 0.05,
+        "category": "animal",
+    }
+    source_detection = {
+        "box": {"x": 0.2, "y": 0.2, "w": 0.1, "h": 0.1},
+        "confidence": 0.06,
+        "category": "animal",
+    }
+
+    def fake_infer(_session, _input_name, image_array, _floor):
+        calls.append(image_array.shape[:2])
+        return [preview_detection] if len(calls) == 1 else [source_detection]
+
+    monkeypatch.setattr(detector, "_infer_array", fake_infer)
+    monkeypatch.setattr(detector, "_tiled_fallback", lambda *_args: [])
+
+    detections = detector.detect_animals("different-renditions.nef")
+
+    assert calls == [(500, 1000), (1200, 1200)]
+    assert detections == [source_detection]
+
+
+def test_detect_animals_skips_tiled_fallback_after_strong_full_pass(
+    monkeypatch, tmp_path,
+):
+    from unittest.mock import MagicMock
+
+    import detector
+
+    fake_session = MagicMock()
+    fake_session.get_inputs.return_value = [MagicMock(name="images")]
+    strong = np.array(
+        [[[320, 320, 100, 100, 0.90, 0.0, 0.0]]], dtype=np.float32,
+    )
+    fake_session.run.return_value = [strong]
+    monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
+
+    img_path = tmp_path / "large-bird.jpg"
+    from PIL import Image
+    Image.new("RGB", (1000, 500), color="green").save(img_path)
+
+    detections = detector.detect_animals(str(img_path))
+
+    assert fake_session.run.call_count == 1
+    assert detections[0]["confidence"] == pytest.approx(0.9)
+
+
 def test_get_primary_detection():
     """get_primary_detection must return highest-confidence animal."""
     from detector import get_primary_detection

@@ -2451,22 +2451,80 @@ have a `prediction_review` row. Liveness must be derived from the label
 — which is precisely why the scoping problem attaches here and not to
 the enumeration.
 
-*Cost, since the whole point was affordability.* `Taxa(L)` is
-workspace-independent, so it is computed once per retraction and
-memoized for the request, however many workspaces contain the photo: the
-rejected option's cost was per workspace, this one's is per label. The
-candidate labels are the distinct folded labels of the affected photo's
-own prediction rows — one or two in practice. Each costs a single
-`SELECT DISTINCT species, scientific_name FROM predictions WHERE species
-IN (…)` over that label's rows, with the fold applied in Python as
-everywhere else in §1 (SQL matches raw spellings, so its result is a
-superset the fold narrows). It wants a covering index on
-`predictions(species, scientific_name)` to stay index-only — additive,
-and per §1's `user_version` caveat created behind a `db_meta` marker or
-a PRAGMA check rather than a version-gated migration. A label whose
-catalog-wide scientific names genuinely conflict yields two taxa in
-`Taxa(L)` and so a wider claim set, which is the conservative direction
-again rather than an exception to it.
+*The label predicate cannot live in SQL, so it does not.* "Any row
+labelled `L`" is membership in `_species_match_key`'s equivalence class,
+and that fold is NFKC normalization, whitespace collapse, edge-quote
+strip, apostrophe fold **and** an ASCII case fold
+(`keyword_normalization.py:100-144`, `classify_job.py:40-66`). A
+`WHERE species IN (…)` over the affected photo's raw spellings matches
+none of those: `predictions.species` is plain `TEXT` with no
+`COLLATE NOCASE` (`db.py:865-883` — the only collation-free spelling in
+the identity tuple), so a case-equivalent or apostrophe-variant live row
+on some *other* photo is silently absent from `Taxa(L)`. That is not a
+tolerable narrowing. It is the one thing this relation may not do: the
+whole safety argument above is that the relation is a **superset** of
+every scoped one, and a lookup that can miss a live row inverts the
+error direction from *keeping* a tag nobody claims to *stripping* one a
+live card still asserts. Patching the predicate to
+`species COLLATE NOCASE IN (…)` fixes only the last of the five fold
+steps and is therefore still not a superset — and it buys nothing
+anyway, because a `NOCASE` comparison cannot use the `BINARY`-collated
+index and degrades to a full index scan (`EXPLAIN QUERY PLAN`:
+`SCAN predictions USING COVERING INDEX …`), which is the cost of
+projecting the whole vocabulary without the correctness.
+
+*So project the whole vocabulary once and fold it in Python, as §1 does
+everywhere else.* The query loses its `WHERE` clause on `species`
+entirely:
+
+```sql
+SELECT DISTINCT species, scientific_name
+  FROM predictions
+ WHERE species IS NOT NULL
+```
+
+Fold each returned `species` in Python and bucket by fold key; the
+result is the *complete* fold-key → distinct-`scientific_name` map for
+the catalog, from which every candidate label's `Taxa(L)` is read off
+directly. Because one pass answers every label, the memo is now the
+whole map per request rather than one entry per label — strictly less
+work than the per-label version it replaces, not more.
+
+*Cost, since the whole point was affordability.* The map is
+workspace-independent, so it is built once per retraction however many
+workspaces contain the photo — the rejected per-workspace option's cost
+was per workspace, this one's is once, full stop. It stays affordable
+because the row count is not the vocabulary size: on the development
+catalog, 162,640 prediction rows carry 4,408 distinct
+`(species, scientific_name)` pairs across 3,145 distinct spellings, so
+SQL dedups two orders of magnitude away before Python folds anything.
+Measured cold on that catalog *without* the index — a full table scan
+plus a temp b-tree for `DISTINCT` — the query is ~37 ms; the covering
+index on `predictions(species, scientific_name)` removes both, since the
+index order already satisfies the `DISTINCT` (`EXPLAIN QUERY PLAN`:
+`SEARCH predictions USING COVERING INDEX … (species>?)`, with no
+`USE TEMP B-TREE FOR DISTINCT`). That index is the one the previous
+draft asked for and it is still the right one — but note it now earns
+its keep by making an *unbounded* projection index-only, not by making a
+seek fast, so it is required rather than an optimization. Additive, and
+per §1's `user_version` caveat created behind a `db_meta` marker or a
+PRAGMA check rather than a version-gated migration. Asserting the plan
+shape in a test is cheap and worth it: a regression that drops the index
+turns every reject into a table scan.
+
+*Rejected: persist the fold as a `predictions.species_key` column.* It
+would restore an exact index seek and make the superset property
+structural rather than argued. It is not chosen because it puts a
+schema change, a write-path change in `add_prediction`, and a backfill
+of every existing row on the critical path of a phase that otherwise
+touches no prediction storage — to speed up an operation that happens
+once per reject click and already costs less than the request's own
+overhead. Worth revisiting only if profiling contradicts the numbers
+above; the query above is a drop-in for it.
+
+A label whose catalog-wide scientific names genuinely conflict yields
+two taxa in `Taxa(L)` and so a wider claim set, which is the
+conservative direction again rather than an exception to it.
 
 *The consequence — retraction is rare on shared photos — is correct,
 not a number to tune.* If a photo is visible in five workspaces and the
@@ -2775,10 +2833,18 @@ Until #1488 lands and Phase 4 starts writing `'accept'`, every row is
 `NULL`- or `'manual'`-source and every reconciling reject takes the
 disclosure path — correct, just chattier, which is the right failure
 direction for a metadata write. **Sequencing:** Phase 4 depends on
-#1488's column being merged. If Phase 4 would otherwise start first, it
-adds the column under the identical name, type and `'manual'` semantics
-so the two converge rather than collide; it must not introduce a second
-provenance column or a second spelling of "a person did this".
+**both #1488 and #1489**. On #1488: its column must be merged first; if
+Phase 4 would otherwise start first, it adds the column under the
+identical name, type and `'manual'` semantics so the two converge rather
+than collide, and it must not introduce a second provenance column or a
+second spelling of "a person did this". On #1489: Phase 4 carries §4's
+mutation-scoped hoist, which needs the call's target set materialized
+*before* the keyword is resolved — the order #1489 introduces and `main`
+does not (`db.py:17947` vs `18276` on `main`; `18159` vs `18205` on
+`predictions-panel-in-browse`). The two dependencies fail differently
+and that is worth keeping straight: without #1488 Phase 4 is merely
+chattier, while without #1489 it silently fragments synonyms across a
+burst. Only the first is safe to ship ahead of its dependency.
 
 **Compare.** `accept_subject_species` swaps its
 `lower(trim(species))` equality for the same taxon-key helper. Its
@@ -2985,9 +3051,10 @@ Precedence, then:
    rows the whole two-step block is skipped exactly as before —
    `name:` rows have no `taxa.id` to key on.
 
-   **Resolved once per mutation, not once per photo — a card accept
-   writes at most one keyword string.** The two steps above are stated
-   per accepted row, and run that way they are not stable across a card:
+   **Resolved once per mutation, not once per photo — one accept writes
+   at most one keyword string.** The two steps above are stated
+   per accepted row, and run that way they are not stable across any
+   mutation that spans photos — a grouped accept or a card:
    a member photo already carrying "Eurasian Blue Tit" takes step (i)
    and reuses it, while an untagged member photo falls to step (ii) and
    takes the globally oldest "Blue Tit". One click would then attach two
@@ -3018,15 +3085,53 @@ Precedence, then:
    The resulting invariant is exact and is what the card can honestly
    promise: **a card accept writes at most one keyword string; it may
    leave other synonyms already on member photos in place, and it never
-   adds a spelling that no member photo had.** Single-photo callers are
-   unaffected by construction — Compare's `accept_subject_species` and
-   the legacy per-prediction accept have a one-photo union, so the
-   card-scoped rule degenerates to exactly today's photo-first
-   behaviour, which is why hoisting it does not disturb the
-   accepted-row-keyed precedence those callers rely on. That is also the
-   phasing: the per-row precedence is Phase 4, the hoist is Phase 5, and
-   nothing is left un-canonicalized in between because Phase 4 has no
-   multi-photo caller to hoist for.
+   adds a spelling that no member photo had.**
+
+   **The unit the union is taken over is the call's resolved target set,
+   and a card is not the first thing to have more than one photo in
+   it.** An earlier draft said the hoist could wait for Phase 5 because
+   "all existing callers are single-photo, so their union is one photo".
+   That is true of exactly one of them. Compare's
+   `accept_subject_species` really is single-photo — it passes
+   `photo_ids=[target["photo_id"]]` on every delegated call precisely so
+   that accepting a subject cannot tag the rest of a burst
+   (`db.py:18360-18364`). The legacy per-prediction accept is not:
+   `accept_prediction` on a grouped row expands to every in-scope group
+   member and calls `_accept_for_photo` once per member photo
+   (`db.py:18276-18290`). Run the per-row precedence inside that loop and
+   one *existing* click fragments synonyms across a burst — member photo
+   1 already carrying "Eurasian Blue Tit" takes step (i), member photo 2
+   falls to step (ii) and takes the globally oldest "Blue Tit" — which
+   is a regression introduced by Phase 4 and not repaired until Phase 5.
+   Today's code does not have this bug only because it resolves one
+   `add_keyword(species)` for the whole call and writes that string
+   everywhere; Phase 4 is what makes the resolution photo-dependent, so
+   Phase 4 is what owes the hoist.
+
+   **The hoist is therefore Phase 4, over the grouped accept's target
+   set.** The rule is unchanged in substance — cases 1–3 above, evaluated
+   once over the union of the photos the call will actually tag, which is
+   `targets` after both scope limits and the undecided-only narrowing
+   have settled, *not* the raw group. Phase 5 then reuses it verbatim for
+   a card, whose union spans photos from more than one group; that is a
+   wider union, not a new mechanism, which is why Phase 5's fixtures
+   below still carry the multi-photo assertions.
+
+   **This adds a dependency on PR #1489, for a structural reason and not
+   a stylistic one.** On `main` the union does not exist at the point the
+   keyword is chosen: `add_keyword` runs at `db.py:17947` and the group
+   is not expanded until `db.py:18276`, so there is literally no target
+   photo set to consult when the keyword is resolved. #1489 already
+   reorders exactly this — it materializes the in-scope target list
+   first (`db.py:18159` on `predictions-panel-in-browse`) and resolves
+   the keyword after (`db.py:18205`) — which is the shape the hoist
+   needs. Phase 4 therefore lands after #1489, or repeats that
+   reordering itself; it must not do it a second, divergent way. #1489
+   also narrows what the union contains: its undecided-only expansion
+   drops already-decided members, and its `prediction_ids` limit is
+   stricter than `photo_ids`. Stating the union as "the rows this call
+   will tag" rather than "the group's photos" is what makes the rule
+   correct under either merge order.
 2. Otherwise, create/use **the taxon's preferred common name** — again
    the taxon's, not the row's raw `species`. This is what makes the
    *first* accept of an agreeing pair safe: before any keyword exists
@@ -3639,13 +3744,27 @@ Each phase lands as its own PR and is independently useful.
    no card, confirming the canonicalization is keyed on the row's
    taxon rather than on a card (§4, "Keyword written on accept"). The
    *mutation-scoped* half of §4 ("Resolved once per mutation, not once
-   per photo") is **not** in this phase and cannot be: it needs a
-   multi-photo mutation, and the first one is Phase 5's card accept.
-   Phase 4 ships the per-row precedence, which is already the whole rule
-   for every caller that exists at Phase 4 — all of them are
-   single-photo, so their union is one photo and the two formulations
-   coincide. The hoist and its fixtures land with the card mutation
-   below.
+   per photo") ships **in this phase, not Phase 5**: a multi-photo
+   mutation already exists — `accept_prediction` on a grouped row tags
+   every in-scope member photo (`db.py:18276-18290`) — so leaving the
+   precedence per-photo would make Phase 4 fragment synonyms across a
+   burst that today gets one string. Only Compare's
+   `accept_subject_species` is genuinely single-photo (`db.py:18360-18364`).
+   Phase 4 therefore ships cases 1–3 evaluated once over the call's
+   resolved target set, plus a **grouped-accept convergence fixture**:
+   a burst where member photo 1 already carries "Eurasian Blue Tit",
+   member photo 2 is untagged, and a lower-`id` global "Blue Tit" exists
+   — accepting the grouped row writes "Eurasian Blue Tit" to photo 2 and
+   nothing to photo 1, and a build that resolves per photo writes both
+   spellings and fails. **Depends on PR #1489** in addition to #1488:
+   on `main` the keyword is created (`db.py:17947`) before the group is
+   expanded (`db.py:18276`), so there is no target set to take a union
+   over; #1489 already reorders these (`db.py:18159` / `18205` on
+   `predictions-panel-in-browse`). Phase 4 lands after #1489 or repeats
+   that reordering itself — see §4, "This adds a dependency on PR #1489".
+   What is left for Phase 5 is only the *wider* union — photos drawn
+   from more than one group — and the two-part disclosure that names
+   both the written and the retained spelling.
 5. **Merged-card rendering + cross-model accept/reject** + undo
    coverage. This phase turns the client over to `card_id`: the
    `getVisibleItems` dedup, merged-card rendering, the aggregate/`mixed`
@@ -3672,10 +3791,10 @@ Each phase lands as its own PR and is independently useful.
    canonical keyword — otherwise the sibling loop across "Blue Tit" /
    "Eurasian Blue Tit" rows would tag both synonyms on the same photo,
    the exact fragmentation §3's "Ordering constraint" describes. It also
-   carries the mutation-scoped half of §4 — the card's keyword resolved
-   **once** over the union of member photos, and the two-part
-   `tags as "…" — N photos keep "…"` disclosure — because this is the
-   phase in which a mutation first spans more than one photo. The
+   widens the mutation-scoped half of §4 — the same cases 1–3 Phase 4
+   already resolves once per call, now over a union whose photos come
+   from more than one group — and adds the two-part
+   `tags as "…" — N photos keep "…"` disclosure. The
    `sync.py` half of the retraction rule lands here rather than as a
    follow-up, because this is the phase that first queues a keyword
    delta in a workspace other than the acting one: the apply-time

@@ -31309,6 +31309,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     @app.route("/api/jobs")
     def api_jobs_list():
+        from embedding_cache import get_embedding_cache_diagnostics
         from resource_ledger import get_resource_ledger
 
         runner = app._job_runner
@@ -31325,6 +31326,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # rather than silent — see CORE_PHILOSOPHY "no black boxes".
             "keeping_awake": app._job_runner.sleep_blocker.active,
             "resource_budget": get_resource_ledger().snapshot(),
+            "workload_metrics": {
+                "embedding_cache": get_embedding_cache_diagnostics(),
+            },
             "active_workspace_id": db._active_workspace_id,
             "workspace_names": ws_names,
         })

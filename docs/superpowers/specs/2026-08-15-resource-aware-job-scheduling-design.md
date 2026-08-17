@@ -931,6 +931,9 @@ No scheduler unit test should depend on `sleep()` to establish ordering.
 
 Create an opt-in benchmark scenario modeled on the observed incident:
 
+The read-only collector and run instructions are documented in
+[`resource-workload-measurement.md`](../../resource-workload-measurement.md).
+
 - one multi-folder in-place import from a throttled storage fixture;
 - one broad pipeline;
 - one overlapping narrow pipeline;

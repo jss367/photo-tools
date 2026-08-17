@@ -28,6 +28,20 @@ _identity_lock = threading.Lock()
 _manifest_lock = threading.Lock()
 _flights_lock = threading.Lock()
 
+_diagnostics = {
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "producer_starts": 0,
+    "producer_publications": 0,
+    "producer_failures": 0,
+    "waiter_joins": 0,
+    # This is an invariant counter rather than an expected operating metric.
+    # It remains visible so a workload replay can prove that equal-key callers
+    # joined instead of doing duplicate text inference.
+    "single_flight_violations": 0,
+    "max_concurrent_producers_per_key": 0,
+}
+
 
 @dataclass
 class _Flight:
@@ -37,6 +51,22 @@ class _Flight:
 
 
 _flights: dict[tuple[str, str], _Flight] = {}
+_active_producers: dict[tuple[str, str], int] = {}
+
+
+def get_embedding_cache_diagnostics():
+    """Return process-lifetime counters for workload diagnostics.
+
+    These counters intentionally contain no cache keys, label names, or file
+    paths.  Consumers take before/after snapshots and report deltas for one
+    benchmark window; no timing-sensitive production behavior depends on
+    them.
+    """
+    with _flights_lock:
+        return {
+            **_diagnostics,
+            "active_producers": sum(_active_producers.values()),
+        }
 
 
 class EmbeddingComputationError(RuntimeError):
@@ -276,11 +306,14 @@ class EmbeddingCache:
             value = self._load(
                 initial_digest, label_count, embedding_dim=embedding_dim,
             )
+            with _flights_lock:
+                _diagnostics["cache_hits"] += 1
             if cancel_check and cancel_check():
                 raise EmbeddingWaitCancelled("classification cancelled")
             return value, identity
         except (EOFError, OSError, ValueError):
-            pass
+            with _flights_lock:
+                _diagnostics["cache_misses"] += 1
 
         flight_key = (self.cache_dir, initial_digest)
         with _flights_lock:
@@ -288,8 +321,18 @@ class EmbeddingCache:
             if flight is None:
                 flight = _Flight()
                 _flights[flight_key] = flight
+                _diagnostics["producer_starts"] += 1
+                producer_count = _active_producers.get(flight_key, 0) + 1
+                _active_producers[flight_key] = producer_count
+                _diagnostics["max_concurrent_producers_per_key"] = max(
+                    _diagnostics["max_concurrent_producers_per_key"],
+                    producer_count,
+                )
+                if producer_count > 1:
+                    _diagnostics["single_flight_violations"] += 1
                 producer = True
             else:
+                _diagnostics["waiter_joins"] += 1
                 producer = False
 
         if not producer:
@@ -370,10 +413,14 @@ class EmbeddingCache:
                     actual_digest[:12],
                 )
             flight.published_digest = actual_digest
+            with _flights_lock:
+                _diagnostics["producer_publications"] += 1
             log.info("EmbeddingCache: published key=%s", actual_digest[:12])
             return value, actual_identity
         except BaseException as exc:
             flight.error = exc
+            with _flights_lock:
+                _diagnostics["producer_failures"] += 1
             raise
         finally:
             # Remove only the registry lookup before waking waiters. Existing
@@ -382,6 +429,11 @@ class EmbeddingCache:
             with _flights_lock:
                 if _flights.get(flight_key) is flight:
                     del _flights[flight_key]
+                producer_count = _active_producers.get(flight_key, 0) - 1
+                if producer_count > 0:
+                    _active_producers[flight_key] = producer_count
+                else:
+                    _active_producers.pop(flight_key, None)
             flight.event.set()
 
     def _load(self, digest, label_count, embedding_dim=None):

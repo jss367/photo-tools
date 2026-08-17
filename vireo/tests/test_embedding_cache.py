@@ -17,6 +17,7 @@ from embedding_cache import (
     EmbeddingWaitCancelled,
     build_embedding_identity,
     canonicalize_labels,
+    get_embedding_cache_diagnostics,
     identity_digest,
 )
 
@@ -108,6 +109,7 @@ def test_pinned_install_does_not_rehash_large_encoder_files(
 
 
 def test_equal_key_callers_compute_once_and_waiter_rereads_disk(tmp_path):
+    diagnostics_before = get_embedding_cache_diagnostics()
     cache = EmbeddingCache(tmp_path / "cache")
     identity = _identity()
     producer_started = threading.Event()
@@ -134,6 +136,11 @@ def test_equal_key_callers_compute_once_and_waiter_rereads_disk(tmp_path):
     assert calls == 1
     assert np.array_equal(first_value, second_value)
     assert first_value is not second_value
+    diagnostics_after = get_embedding_cache_diagnostics()
+    assert diagnostics_after["producer_starts"] - diagnostics_before["producer_starts"] == 1
+    assert diagnostics_after["producer_publications"] - diagnostics_before["producer_publications"] == 1
+    assert diagnostics_after["waiter_joins"] - diagnostics_before["waiter_joins"] == 1
+    assert diagnostics_after["single_flight_violations"] == 0
 
 
 def test_producer_cancellation_wakes_waiter_and_waiter_takes_over(tmp_path):

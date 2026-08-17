@@ -14335,11 +14335,26 @@ def test_highlights_scope_workspace_blends_folders(app_and_db):
     assert data["buckets"][0]["photo_count"] == 2
 
 
-def test_api_import_folder_preview(app_and_db, tmp_path):
-    """POST /api/import/folder-preview returns file discovery results."""
+def _sse_frames(resp):
+    """Parse the data frames out of a drained SSE response body."""
+    frames = []
+    for chunk in resp.get_data(as_text=True).split("\n\n"):
+        if chunk.startswith("data: "):
+            frames.append(json.loads(chunk[len("data: "):]))
+    return frames
+
+
+def _scan_order(frames):
+    return [
+        (f["type"], f["path"]) for f in frames
+        if f["type"] in ("folder_started", "folder_done")
+    ]
+
+
+def test_api_import_folder_preview_stream(app_and_db, tmp_path):
+    """The shared traversal narrates the walk and ends with the payload."""
     app, db = app_and_db
 
-    # Create test images in a temp folder
     source = tmp_path / "source_photos"
     source.mkdir()
     from PIL import Image
@@ -14349,142 +14364,174 @@ def test_api_import_folder_preview(app_and_db, tmp_path):
     (source / "readme.txt").write_text("ignore me")
 
     client = app.test_client()
-    resp = client.post("/api/import/folder-preview", json={
+    resp = client.post("/api/import/folder-preview-stream", json={
         "folders": [str(source)],
         "file_types": [".jpg", ".jpeg", ".png"],
     })
     assert resp.status_code == 200
-    data = resp.get_json()
+    assert resp.mimetype == "text/event-stream"
+    frames = _sse_frames(resp)
 
-    assert data["total_count"] == 3
-    assert data["total_size"] > 0
-    assert ".jpg" in data["type_breakdown"]
-    assert data["type_breakdown"][".jpg"] == 2
-    assert data["type_breakdown"][".png"] == 1
-    assert len(data["files"]) == 3
-    assert data["duplicate_count"] == 0
+    assert frames[0]["type"] == "policy"
+    assert frames[0]["sources"] == [{
+        "path": str(source),
+        "storage": frames[0]["sources"][0]["storage"],
+        "position": 1,
+        "total": 1,
+    }]
+    assert frames[0]["sources"][0]["storage"] in (
+        "local", "network", "removable", "unknown")
 
-
-def test_api_import_folder_preview_duplicate_count_deferred(app_and_db, tmp_path):
-    """Folder preview returns duplicate_count=0 (duplicate detection deferred)."""
-    app, db = app_and_db
-
-    source = tmp_path / "source_dupes"
-    source.mkdir()
-    from PIL import Image
-    Image.new("RGB", (100, 100)).save(str(source / "bird1.jpg"))
-    Image.new("RGB", (100, 100)).save(str(source / "newbird.jpg"))
-
-    client = app.test_client()
-    resp = client.post("/api/import/folder-preview", json={
-        "folders": [str(source)],
-        "file_types": [".jpg", ".jpeg"],
-    })
-    assert resp.status_code == 200
-    data = resp.get_json()
-    assert data["total_count"] == 2
-    assert data["duplicate_count"] == 0
-
-
-def test_api_import_folder_preview_summary_only_omits_file_rows(app_and_db, tmp_path):
-    """Summary-only folder preview keeps count cheap for import source rows."""
-    app, _ = app_and_db
-
-    source = tmp_path / "source_summary"
-    source.mkdir()
-    from PIL import Image
-    Image.new("RGB", (100, 100)).save(str(source / "bird1.jpg"))
-    Image.new("RGB", (100, 100)).save(str(source / "bird2.jpg"))
-    (source / "notes.txt").write_text("ignore me")
-
-    client = app.test_client()
-    resp = client.post("/api/import/folder-preview", json={
-        "folders": [str(source)],
-        "file_types": "both",
-        "summary_only": True,
-    })
-    assert resp.status_code == 200
-    data = resp.get_json()
-    assert data["total_count"] == 2
-    assert data["type_breakdown"][".jpg"] == 2
-    assert data["files"] == []
-    assert data["source_counts"] == {str(source): 2}
-
-
-def test_api_import_source_scan_policy(app_and_db, monkeypatch):
-    """Import scan policy exposes only the bounded per-volume decision."""
-    import source_scan_policy
-
-    app, _ = app_and_db
-    monkeypatch.setattr(
-        source_scan_policy,
-        "classify_sources",
-        lambda paths: [
-            {
-                "path": path,
-                "volume_key": "volume-a",
-                "storage": "network",
-                "max_parallel": 1,
-            }
-            for path in paths
-        ],
-    )
-
-    resp = app.test_client().post(
-        "/api/import/source-scan-policy",
-        json={"folders": ["/photos/a", "/photos/b"]},
-    )
-    assert resp.status_code == 200
-    assert resp.get_json()["sources"] == [
-        {
-            "path": "/photos/a",
-            "volume_key": "volume-a",
-            "storage": "network",
-            "max_parallel": 1,
-        },
-        {
-            "path": "/photos/b",
-            "volume_key": "volume-a",
-            "storage": "network",
-            "max_parallel": 1,
-        },
+    assert _scan_order(frames) == [
+        ("folder_started", str(source)),
+        ("folder_done", str(source)),
     ]
+    folder_done = [f for f in frames if f["type"] == "folder_done"][0]
+    assert folder_done["count"] == 3
+    assert folder_done["error"] is False
+
+    final = frames[-1]
+    assert final["type"] == "done"
+    assert final["total_count"] == 3
+    assert final["total_size"] > 0
+    assert final["type_breakdown"][".jpg"] == 2
+    assert final["type_breakdown"][".png"] == 1
+    assert len(final["files"]) == 3
+    assert final["duplicate_count"] == 0
+    assert final["source_counts"] == {str(source): 3}
 
 
-def test_api_import_source_scan_policy_validates_folders(app_and_db):
+def test_api_import_folder_preview_stream_validates_folders(app_and_db):
     app, _ = app_and_db
     client = app.test_client()
     assert client.post(
-        "/api/import/source-scan-policy", json={"folders": []},
+        "/api/import/folder-preview-stream", json={},
     ).status_code == 400
     assert client.post(
-        "/api/import/source-scan-policy", json={"folders": [7]},
+        "/api/import/folder-preview-stream", json={"folders": []},
+    ).status_code == 400
+    assert client.post(
+        "/api/import/folder-preview-stream", json={"folders": [7]},
     ).status_code == 400
 
 
-def test_api_import_folder_preview_no_folders(app_and_db):
-    """Folder preview returns error when no folders provided."""
+def test_api_import_folder_preview_stream_flags_unavailable_folder(app_and_db):
+    """A missing source streams an error folder_done, not an HTTP failure."""
     app, _ = app_and_db
     client = app.test_client()
-    resp = client.post("/api/import/folder-preview", json={})
-    assert resp.status_code == 400
-
-
-def test_api_import_folder_preview_nonexistent(app_and_db):
-    """Folder preview returns error for non-existent folder."""
-    app, _ = app_and_db
-    client = app.test_client()
-    resp = client.post("/api/import/folder-preview", json={
+    resp = client.post("/api/import/folder-preview-stream", json={
         "folders": ["/nonexistent/path/xyz"],
         "file_types": [".jpg"],
     })
     assert resp.status_code == 200
-    data = resp.get_json()
-    assert data["total_count"] == 0
+    frames = _sse_frames(resp)
+    assert [f for f in frames if f["type"] == "folder_done"] == [{
+        "type": "folder_done",
+        "path": "/nonexistent/path/xyz",
+        "count": 0,
+        "error": True,
+    }]
+    assert frames[-1]["total_count"] == 0
+    assert frames[-1]["source_counts"] == {"/nonexistent/path/xyz": 0}
 
 
-def test_api_import_folder_preview_subfolders(app_and_db, tmp_path):
-    """Folder preview groups files by subfolder."""
+def test_api_import_folder_preview_stream_emits_walk_progress(
+        app_and_db, tmp_path):
+    """Large folders stream within-folder progress, not just start/done."""
+    app, _ = app_and_db
+    source = tmp_path / "big"
+    source.mkdir()
+    # Empty files are enough: discovery filters on suffix + is_file only.
+    for i in range(600):
+        (source / f"img_{i:04d}.jpg").touch()
+
+    resp = app.test_client().post("/api/import/folder-preview-stream", json={
+        "folders": [str(source)],
+        "file_types": [".jpg"],
+    })
+    frames = _sse_frames(resp)
+    progress = [f for f in frames if f["type"] == "folder_progress"]
+    assert progress, "expected folder_progress frames for a 600-file folder"
+    assert all(f["path"] == str(source) for f in progress)
+    assert any(f["checked"] >= 500 for f in progress)
+    assert frames[-1]["total_count"] == 600
+
+
+def test_api_import_folder_preview_stream_serializes_network_volume(
+        app_and_db, tmp_path, monkeypatch):
+    """Folders sharing a serial volume scan one at a time, in order."""
+    import source_scan_policy
+
+    app, _ = app_and_db
+    from PIL import Image
+    card_a = tmp_path / "card_a"
+    card_b = tmp_path / "card_b"
+    card_a.mkdir()
+    card_b.mkdir()
+    Image.new("RGB", (100, 100)).save(str(card_a / "a.jpg"))
+    Image.new("RGB", (100, 100)).save(str(card_b / "b.jpg"))
+    monkeypatch.setattr(source_scan_policy, "classify_sources", lambda paths: [
+        {
+            "path": path,
+            "volume_key": "nas",
+            "storage": "network",
+            "max_parallel": 1,
+        }
+        for path in paths
+    ])
+
+    resp = app.test_client().post("/api/import/folder-preview-stream", json={
+        "folders": [str(card_a), str(card_b)],
+        "file_types": [".jpg"],
+    })
+    frames = _sse_frames(resp)
+    assert _scan_order(frames) == [
+        ("folder_started", str(card_a)),
+        ("folder_done", str(card_a)),
+        ("folder_started", str(card_b)),
+        ("folder_done", str(card_b)),
+    ]
+    started = [f for f in frames if f["type"] == "folder_started"]
+    assert all(f["storage"] == "network" for f in started)
+    assert frames[-1]["source_counts"] == {str(card_a): 1, str(card_b): 1}
+
+
+def test_api_import_folder_preview_stream_overlaps_local_volume(
+        app_and_db, tmp_path, monkeypatch):
+    """A known-local volume gets bounded parallelism, not serialization."""
+    import source_scan_policy
+
+    app, _ = app_and_db
+    from PIL import Image
+    card_a = tmp_path / "card_a"
+    card_b = tmp_path / "card_b"
+    card_a.mkdir()
+    card_b.mkdir()
+    Image.new("RGB", (100, 100)).save(str(card_a / "a.jpg"))
+    Image.new("RGB", (100, 100)).save(str(card_b / "b.jpg"))
+    monkeypatch.setattr(source_scan_policy, "classify_sources", lambda paths: [
+        {
+            "path": path,
+            "volume_key": "ssd",
+            "storage": "local",
+            "max_parallel": 2,
+        }
+        for path in paths
+    ])
+
+    resp = app.test_client().post("/api/import/folder-preview-stream", json={
+        "folders": [str(card_a), str(card_b)],
+        "file_types": [".jpg"],
+    })
+    order = _scan_order(_sse_frames(resp))
+    # Both scans launch before either finishes: the scheduler fills every
+    # free lane on the volume before draining completion events.
+    assert order[0] == ("folder_started", str(card_a))
+    assert order[1] == ("folder_started", str(card_b))
+
+
+def test_api_import_folder_preview_stream_subfolders(app_and_db, tmp_path):
+    """Preview files carry subfolder grouping info."""
     app, _ = app_and_db
 
     source = tmp_path / "nested"
@@ -14496,21 +14543,18 @@ def test_api_import_folder_preview_subfolders(app_and_db, tmp_path):
     Image.new("RGB", (100, 100)).save(str(source / "sub2" / "b.jpg"))
 
     client = app.test_client()
-    resp = client.post("/api/import/folder-preview", json={
+    resp = client.post("/api/import/folder-preview-stream", json={
         "folders": [str(source)],
         "file_types": [".jpg", ".jpeg"],
     })
-    data = resp.get_json()
-    assert data["total_count"] == 3
-
-    # Files should have subfolder info
-    subfolders = set()
-    for f in data["files"]:
-        subfolders.add(f["subfolder"])
+    final = _sse_frames(resp)[-1]
+    assert final["total_count"] == 3
+    subfolders = {f["subfolder"] for f in final["files"]}
     assert len(subfolders) == 3  # root, sub1, sub2
 
 
-def test_api_import_folder_preview_multi_source_same_basename(app_and_db, tmp_path):
+def test_api_import_folder_preview_stream_multi_source_same_basename(
+        app_and_db, tmp_path):
     """Multi-source preview disambiguates folders with same basename."""
     app, _ = app_and_db
 
@@ -14524,15 +14568,15 @@ def test_api_import_folder_preview_multi_source_same_basename(app_and_db, tmp_pa
     Image.new("RGB", (100, 100)).save(str(card_b / "100CANON" / "b.jpg"))
 
     client = app.test_client()
-    resp = client.post("/api/import/folder-preview", json={
+    resp = client.post("/api/import/folder-preview-stream", json={
         "folders": [str(card_a), str(card_b)],
         "file_types": [".jpg", ".jpeg"],
     })
-    data = resp.get_json()
-    assert data["total_count"] == 2
+    final = _sse_frames(resp)[-1]
+    assert final["total_count"] == 2
 
     # Subfolders must be distinct even though both have 100CANON
-    subfolders = {f["subfolder"] for f in data["files"]}
+    subfolders = {f["subfolder"] for f in final["files"]}
     assert len(subfolders) == 2
     # Should use parent to disambiguate: cardA/DCIM/100CANON vs cardB/DCIM/100CANON
     for sf in subfolders:

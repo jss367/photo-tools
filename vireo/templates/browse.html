@@ -2326,6 +2326,13 @@ var collectionLoadGen = 0;
 var collectionLoadStates = {};
 var collectionRenderDecisionGen = 0;
 var browseFolderRows = [];
+// The workspace ID whose folder tree is currently reflected in the DOM.
+// Captured from /api/browse/init and refreshed on every successful
+// loadFolders() so ``removeWorkspaceRootFromBrowse`` can bind its DELETE
+// to the workspace the user actually saw. Trusting ``/api/workspaces/active``
+// at click time would let a cross-tab workspace switch redirect the
+// destructive call to the wrong workspace (Codex review r3798912101).
+var browseWorkspaceId = null;
 var collectionsById = {};
 var browseCompareIds = [];
 var browseCompareOffset = 0;
@@ -3298,6 +3305,9 @@ async function bootstrapBrowse() {
       // The sidebar trees are scope-independent, so render them even if a
       // newer load owns the grid — otherwise a sort change during init would
       // leave Browse with no folder/keyword/collection lists at all.
+      if (data.active_workspace_id != null) {
+        browseWorkspaceId = Number(data.active_workspace_id);
+      }
       renderFolderTree(data.folders || []);
       renderKeywordTree(data.keywords || []);
       renderCollectionList(data.collections || []);
@@ -3575,7 +3585,13 @@ function reconcileFolderLoadRenders() {
     if (state.status === 'success') {
       var shouldRender = !state.shouldRender || state.shouldRender();
       folderRenderDecisionGen = gen;
-      if (shouldRender) renderFolderTree(state.data);
+      if (shouldRender) {
+        // Update browseWorkspaceId in lockstep with the rendered rows so
+        // the destructive Remove action always targets the workspace the
+        // user actually sees.
+        if (state.workspaceId != null) browseWorkspaceId = state.workspaceId;
+        renderFolderTree(state.data);
+      }
       Object.keys(folderLoadStates).forEach(function(key) {
         if (Number(key) <= folderLoadGen) delete folderLoadStates[key];
       });
@@ -3592,11 +3608,23 @@ async function loadFolders(opts) {
     shouldRender: opts && opts.shouldRender
   };
   try {
-    var data = await safeFetch('/api/folders', {}, { toast: false });
+    // Fetch the active workspace alongside the tree so browseWorkspaceId
+    // moves in lockstep with browseFolderRows. Losing the id (network
+    // hiccup, brand-new install) is not fatal — the tree still renders;
+    // the destructive Remove action just refuses to run until it can pin
+    // a workspace (Codex review r3798912101).
+    var results = await Promise.all([
+      safeFetch('/api/folders', {}, { toast: false }),
+      safeFetch('/api/workspaces/active', {}, { toast: false })
+        .catch(function() { return null; }),
+    ]);
+    var data = results[0];
     var state = folderLoadStates[myGen];
     if (!state) return data;
     state.status = 'success';
     state.data = data;
+    state.workspaceId = (results[1] && results[1].id != null)
+      ? Number(results[1].id) : null;
     reconcileFolderLoadRenders();
     return data;
   } catch(e) {
@@ -10623,6 +10651,20 @@ async function removeWorkspaceRootFromBrowse(fid) {
   });
   if (!folder || !folder.is_workspace_root) return;
 
+  // Bind the DELETE to the workspace this tree was rendered against, not
+  // whatever ``/api/workspaces/active`` returns at click time. Workspace
+  // activation is persisted globally, so another tab switching workspaces
+  // after render would otherwise redirect the destructive call at the
+  // wrong workspace (Codex review r3798912101).
+  var wsId = browseWorkspaceId;
+  if (wsId == null) {
+    showToast(
+      'Cannot remove the folder yet — the workspace context is still loading. Try again in a moment.',
+      'error'
+    );
+    return;
+  }
+
   var path = folder.path || folder.name || 'this folder';
   var msg = 'Remove "' + path + '" from this workspace?\n\n' +
     'Photos in this folder and its subfolders will no longer appear in this workspace, ' +
@@ -10631,10 +10673,38 @@ async function removeWorkspaceRootFromBrowse(fid) {
   if (!confirm(msg)) return;
 
   try {
-    var active = await safeFetch('/api/workspaces/active', {}, { toast: false });
-    await safeFetch('/api/workspaces/' + active.id + '/folders/' + fid, {
+    // Verify the workspace the tree was rendered against is still the
+    // globally-active one. If another tab has switched workspaces since
+    // render, refuse the DELETE and reload — running it silently against
+    // the render-time workspace would then leave this tab holding a mixed
+    // view (deleted folder gone from workspace A but the rest of the page
+    // still showing A's data while the app is globally on B).
+    var active = await safeFetch(
+      '/api/workspaces/active', {}, { toast: false }
+    );
+    if (active && Number(active.id) !== Number(wsId)) {
+      showToast(
+        'The active workspace changed in another window. Reloading to sync.',
+        'info'
+      );
+      window.location.reload();
+      return;
+    }
+
+    await safeFetch('/api/workspaces/' + wsId + '/folders/' + fid, {
       method: 'DELETE',
     });
+
+    // Refresh the authoritative local-folder payload before rebuilding
+    // the tree. Without this, ``window.vireoLocalFolderData`` still
+    // carries the removed root when ``renderFolderTree`` runs, so
+    // ``folderLocalStatuses`` synthesizes a phantom top-level row for it
+    // and leaves the removed folder visible until the next blocker poll
+    // (Codex review r3798912105).
+    if (window.vireoLocalFolders &&
+        typeof window.vireoLocalFolders.load === 'function') {
+      await window.vireoLocalFolders.load();
+    }
 
     var loaded = await Promise.all([
       loadFolders(),

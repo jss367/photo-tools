@@ -6182,6 +6182,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "folder_health_version": folder_health_version,
                 "focus_index": focus_index,
                 "focus_page": focus_page,
+                # The workspace this tree was scoped to. Browse pins it to
+                # the destructive folder-removal call so a cross-tab
+                # workspace switch between render and click cannot redirect
+                # the DELETE at another workspace.
+                "active_workspace_id": db._ws_id(),
             }
         )
         # End the read transaction after every value in the response has been

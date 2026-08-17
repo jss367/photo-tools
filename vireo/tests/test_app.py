@@ -15459,6 +15459,22 @@ def test_browse_init_flags_degraded_without_counting(app_and_db, monkeypatch):
     assert by_id[bad]["count_error"] is True
 
 
+def test_browse_init_returns_active_workspace_id(app_and_db):
+    """/api/browse/init must include the workspace this response was
+    scoped to. Browse pins the destructive workspace-folder removal to
+    this id so a cross-tab workspace switch between render and click
+    cannot redirect the DELETE at another workspace (Codex review
+    r3798912101).
+    """
+    app, db = app_and_db
+    client = app.test_client()
+
+    resp = client.get("/api/browse/init")
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["active_workspace_id"] == db._active_workspace_id
+
+
 def test_collections_list_surfaces_non_rule_failures(app_and_db, monkeypatch):
     """The count_error path is for rule-validation failures only. If
     count_collection_photos raises a genuine infrastructure error (locked or

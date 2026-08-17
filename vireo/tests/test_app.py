@@ -9184,8 +9184,8 @@ def test_batch_keyword_route_chunks_large_existing_keyword_lookup(app_and_db):
     assert resp.get_json()["updated"] == len(ids)
 
 
-def test_create_app_retires_builtin_wildlife_synchronously(tmp_path, monkeypatch):
-    """The old generated genre is gone before the HTTP app is returned."""
+def test_create_app_defers_builtin_wildlife_retirement(tmp_path, monkeypatch):
+    """A catalog-wide sidecar scan must not block HTTP app construction."""
     from db import Database
 
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -9232,12 +9232,23 @@ def test_create_app_retires_builtin_wildlife_synchronously(tmp_path, monkeypatch
     assert app is not None
 
     db2 = Database(db_path, initialize_schema=False)
+    assert db2.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) is None
+    assert db2.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (photo_id, wildlife_id),
+    ).fetchone() is not None
+    db2.close()
+
+    assert app._retire_wildlife_genre() == 1
+
+    db2 = Database(db_path, initialize_schema=False)
     assert db2.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
     assert db2.conn.execute(
         "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
         (photo_id, wildlife_id),
     ).fetchone() is None
     db2.close()
+    app._cleanup_app_resources()
 
 
 def test_create_app_repairs_duplicate_species_after_taxonomy_marking(

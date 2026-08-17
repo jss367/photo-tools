@@ -5035,12 +5035,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     # tags or stale XMP. The method is idempotent (db_meta-gated) so
     # subsequent boots are a cheap SELECT.
     init_db.normalize_keyword_data()
-    retired_wildlife = init_db.retire_builtin_wildlife_genre()
-    if retired_wildlife:
-        log.info(
-            "Retired the built-in Wildlife genre from %d photo(s)",
-            retired_wildlife,
-        )
     repaired_location_ancestors = init_db.repair_misclassified_location_ancestors()
     if repaired_location_ancestors:
         log.info(
@@ -5223,6 +5217,41 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     # background. Wildlife classification eligibility is stored separately
     # on photos; species marking no longer materializes a Wildlife keyword.
     import threading
+
+    def _retire_wildlife_genre():
+        """Run the catalog-wide XMP migration outside startup readiness.
+
+        Large upgraded catalogs can require tens of thousands of sidecar
+        reads here. Keeping that work on create_app's calling thread prevents
+        the HTTP listener from binding and makes the desktop launcher report
+        a false startup failure when its readiness deadline expires.
+        """
+        retirement_db = None
+        started_at = time.time()
+        try:
+            retirement_db = Database(db_path)
+            retired = retirement_db.retire_builtin_wildlife_genre()
+            if retired:
+                log.info(
+                    "Retired the built-in Wildlife genre from %d photo(s)",
+                    retired,
+                )
+            log.info(
+                "Wildlife genre retirement finished in %.2fs",
+                time.time() - started_at,
+            )
+            return retired
+        except Exception:
+            log.exception("Wildlife genre retirement failed")
+            return 0
+        finally:
+            if retirement_db is not None:
+                retirement_db.close()
+
+    # Tests and one-shot tools can invoke the pass deterministically without
+    # enabling production timers. Production schedules it only after every
+    # route has been registered, immediately before create_app returns.
+    app._retire_wildlife_genre = _retire_wildlife_genre
 
     def _mark_species_and_repair(db, log_label):
         """Load taxonomy, mark species keywords, and repair duplicates."""
@@ -37822,6 +37851,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             view_func=view,
             methods=methods,
         )
+
+    if not os.environ.get("VIREO_DISABLE_STARTUP_BACKFILL_TIMERS"):
+        # Give the main thread enough time to return from create_app and bind
+        # the HTTP listener before this potentially multi-minute XMP scan
+        # starts competing for filesystem and interpreter time.
+        _wildlife_retirement_timer = threading.Timer(
+            1.0, _retire_wildlife_genre,
+        )
+        _wildlife_retirement_timer.daemon = True
+        _wildlife_retirement_timer.start()
 
     return app
 

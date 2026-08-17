@@ -3718,9 +3718,32 @@ class Database:
             )
             self.conn.commit()
 
+        # From this point through the final commit, serialize with interactive
+        # keyword writes. The sidecar scan above can take minutes on a large
+        # catalog; a person may explicitly re-add Wildlife while it runs.
+        # Re-read durable provenance only after taking the writer lock so an
+        # association promoted to ``manual`` is neither queued for removal
+        # nor deleted. A later user add waits for this transaction, then the
+        # route's normal add path cancels the migration's flat removal.
+        self.conn.execute("BEGIN IMMEDIATE")
+        still_retirable = {}
         for photo_id, entry in photo_workspaces.items():
+            candidate_ids = {
+                keyword_id
+                for keyword_id in entry["candidate_keyword_ids"]
+                if self.conn.execute(
+                    """SELECT 1 FROM photo_keywords
+                       WHERE photo_id = ? AND keyword_id = ?
+                         AND (source IS NULL OR source <> 'manual')""",
+                    (photo_id, keyword_id),
+                ).fetchone() is not None
+            }
+            if candidate_ids:
+                still_retirable[photo_id] = (entry, candidate_ids)
+
+        for photo_id, (entry, candidate_ids) in still_retirable.items():
             has_preserved_genre = (
-                len(entry["candidate_keyword_ids"])
+                len(candidate_ids)
                 < entry["wildlife_genre_count"]
             )
             if entry["survivor"] or has_preserved_genre:
@@ -3754,11 +3777,11 @@ class Database:
                         _commit=False,
                     )
 
-        retired_photo_ids = list(photo_workspaces.keys())
+        retired_photo_ids = list(still_retirable.keys())
         retired_associations = [
             (photo_id, keyword_id)
-            for photo_id, entry in photo_workspaces.items()
-            for keyword_id in entry["candidate_keyword_ids"]
+            for photo_id, (_entry, candidate_ids) in still_retirable.items()
+            for keyword_id in candidate_ids
         ]
         if retired_associations:
             # Delete the exact candidate associations. A catalog can contain
@@ -3767,7 +3790,9 @@ class Database:
             # matching genre from a candidate photo would erase a duplicate
             # association that the manual-history predicates preserved.
             self.conn.executemany(
-                "DELETE FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+                """DELETE FROM photo_keywords
+                   WHERE photo_id = ? AND keyword_id = ?
+                     AND (source IS NULL OR source <> 'manual')""",
                 retired_associations,
             )
         # Only stamp the completion marker if every candidate photo was

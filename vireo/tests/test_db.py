@@ -14420,6 +14420,71 @@ def test_retire_builtin_wildlife_detaches_associations_and_queues_flat_removal(t
     ).fetchone() is not None
 
 
+def test_retire_builtin_wildlife_preserves_manual_add_during_sidecar_scan(
+    tmp_path, monkeypatch,
+):
+    """A manual add racing the long XMP scan must win before final deletion."""
+    import xml.etree.ElementTree as ET
+
+    from db import Database
+
+    db_path = str(tmp_path / "test.db")
+    photos_dir = tmp_path / "photos"
+    photos_dir.mkdir()
+    (photos_dir / "p1.xmp").write_text(
+        "<x:xmpmeta xmlns:x='adobe:ns:meta/'/>", encoding="utf-8",
+    )
+
+    db = Database(db_path)
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photos_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    photo_id = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(photo_id, species_id)
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) "
+        "VALUES (?, ?, ?)",
+        (photo_id, wildlife_id, "generated"),
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    original_parse = ET.parse
+    promoted = False
+
+    def promote_during_parse(path, *args, **kwargs):
+        nonlocal promoted
+        if not promoted:
+            promoted = True
+            concurrent_db = Database(db_path, initialize_schema=False)
+            concurrent_db.tag_photo(photo_id, wildlife_id, source="manual")
+            concurrent_db.close()
+        return original_parse(path, *args, **kwargs)
+
+    monkeypatch.setattr(ET, "parse", promote_during_parse)
+
+    assert db.retire_builtin_wildlife_genre() == 0
+    association = db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (photo_id, wildlife_id),
+    ).fetchone()
+    assert association is not None
+    assert association["source"] == "manual"
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?",
+        (photo_id,),
+    ).fetchone() is None
+    db.close()
+
+
 def test_retire_builtin_wildlife_preserves_manual_tag_during_mixed_cleanup(tmp_path):
     """A standalone Wildlife genre may be user-authored metadata."""
     from db import Database
@@ -15502,12 +15567,11 @@ def test_retire_builtin_wildlife_attributes_flat_term_to_nested_survivor(tmp_pat
 
 
 def test_retire_builtin_wildlife_handles_photo_counts_over_bind_limit(tmp_path):
-    """Retirement must chunk the DELETE so a large upgraded library still opens.
+    """Retirement must chunk the DELETE for large upgraded libraries.
 
-    ``retire_builtin_wildlife_genre`` runs synchronously during startup, so a
-    single DELETE binding every photo id exceeds ``SQLITE_MAX_VARIABLE_NUMBER``
-    (999 on legacy builds) and prevents the DB from opening. This asserts the
-    call succeeds when the retired-photo set spans more than one chunk.
+    A single DELETE binding every photo id exceeds
+    ``SQLITE_MAX_VARIABLE_NUMBER`` (999 on legacy builds). This asserts the
+    background upgrade pass succeeds when its photo set spans multiple chunks.
     """
     from db import _SQLITE_PARAM_CHUNK_SIZE, Database
     db = Database(str(tmp_path / "test.db"))

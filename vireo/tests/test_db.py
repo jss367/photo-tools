@@ -14426,13 +14426,14 @@ def test_retire_builtin_wildlife_detaches_associations_and_queues_flat_removal(t
         ("promote_candidate", 0),
         ("retype_candidate", 0),
         ("accept_changed_sidecar", 0),
+        ("add_workspace_owner", 1),
         ("add_same_name_survivor", 1),
     ],
 )
 def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
     tmp_path, monkeypatch, concurrent_change, expected_retired,
 ):
-    """Manual candidate/survivor changes racing the XMP scan must win."""
+    """Catalog changes racing the XMP scan must be revalidated."""
     import xml.etree.ElementTree as ET
 
     from db import Database
@@ -14469,9 +14470,10 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
     original_parse = ET.parse
     promoted = False
     survivor_id = None
+    new_ws_id = None
 
     def promote_during_parse(path, *args, **kwargs):
-        nonlocal promoted, survivor_id
+        nonlocal promoted, survivor_id, new_ws_id
         if not promoted:
             promoted = True
             concurrent_db = Database(db_path, initialize_schema=False)
@@ -14489,6 +14491,9 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
                     (2.0, photo_id),
                 )
                 concurrent_db.conn.commit()
+            elif concurrent_change == "add_workspace_owner":
+                new_ws_id = concurrent_db.create_workspace("new owner")
+                concurrent_db.add_workspace_folder(new_ws_id, fid)
             else:
                 survivor_id = concurrent_db.conn.execute(
                     "INSERT INTO keywords (name, type) "
@@ -14519,6 +14524,20 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
     elif concurrent_change == "accept_changed_sidecar":
         assert genre_association is not None
         assert db.get_photo(photo_id)["xmp_mtime"] == 2.0
+        assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "0"
+    elif concurrent_change == "add_workspace_owner":
+        assert genre_association is None
+        queued_ws_ids = {
+            row["workspace_id"]
+            for row in db.conn.execute(
+                """SELECT workspace_id FROM pending_changes
+                   WHERE photo_id = ?
+                     AND change_type = 'keyword_remove_flat'
+                     AND value = 'Wildlife' COLLATE NOCASE""",
+                (photo_id,),
+            ).fetchall()
+        }
+        assert queued_ws_ids == {ws, new_ws_id}
     else:
         assert genre_association is None
         assert db.conn.execute(
@@ -14526,10 +14545,11 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
             "WHERE photo_id = ? AND keyword_id = ?",
             (photo_id, survivor_id),
         ).fetchone()["source"] == "manual"
-    assert db.conn.execute(
-        "SELECT 1 FROM pending_changes WHERE photo_id = ?",
-        (photo_id,),
-    ).fetchone() is None
+    if concurrent_change != "add_workspace_owner":
+        assert db.conn.execute(
+            "SELECT 1 FROM pending_changes WHERE photo_id = ?",
+            (photo_id,),
+        ).fetchone() is None
     db.close()
 
 

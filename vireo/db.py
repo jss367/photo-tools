@@ -3530,7 +3530,6 @@ class Database:
 
         rows = self.conn.execute(
             f"""SELECT DISTINCT pk.photo_id, pk.keyword_id, pk.source,
-                       wf.workspace_id,
                        p.filename, p.xmp_mtime, f.path AS folder_path,
                        (
                            SELECT COUNT(*)
@@ -3556,7 +3555,6 @@ class Database:
                 FROM photo_keywords pk
                 JOIN photos p ON p.id = pk.photo_id
                 JOIN folders f ON f.id = p.folder_id
-                LEFT JOIN workspace_folders wf ON wf.folder_id = p.folder_id
                 WHERE pk.keyword_id IN ({placeholders})
                   -- Authorship was latched above, so one durable predicate
                   -- replaces the pending/history/discard evidence hunt.
@@ -3573,12 +3571,8 @@ class Database:
             [*keyword_ids, *keyword_ids, *keyword_ids],
         ).fetchall()
 
-        # Group owning workspaces per photo. get_pending_changes() and the
-        # sync panel are per-workspace, so if a photo's folder belongs to
-        # multiple workspaces the sidecar cleanup must be queued in each
-        # of them or the stale term stays in XMP for the unqueued owners
-        # even after the migration marks itself complete. Also carry the
-        # per-photo "same-name survivor" flag so photos whose flat subject
+        # Group candidates per photo. Also carry the per-photo "same-name
+        # survivor" flag so photos whose flat subject
         # is still needed by another top-level Wildlife keyword skip the
         # sidecar removal while their generated genre association is still
         # detached from the DB.
@@ -3590,7 +3584,7 @@ class Database:
         # distinguished from metadata imported with write_xmp=False).
         sidecar_verdict_by_photo = {}
         sidecar_manual_pairs = []
-        deferred_unavailable_sidecar = False
+        deferred_sidecar = False
         for row in rows:
             pid = row["photo_id"]
             survivor = bool(row["has_same_name_survivor"])
@@ -3608,7 +3602,7 @@ class Database:
                     # after the volume comes back online.
                     if row["xmp_mtime"] is not None:
                         sidecar_verdict_by_photo[pid] = "defer"
-                        deferred_unavailable_sidecar = True
+                        deferred_sidecar = True
                     else:
                         sidecar_verdict_by_photo[pid] = "absent"
                 else:
@@ -3627,7 +3621,7 @@ class Database:
                             xmp_path,
                         )
                         sidecar_verdict_by_photo[pid] = "defer"
-                        deferred_unavailable_sidecar = True
+                        deferred_sidecar = True
                     except Exception:
                         log.warning(
                             "Could not read sidecar %s during Wildlife retirement; deferring",
@@ -3635,7 +3629,7 @@ class Database:
                             exc_info=True,
                         )
                         sidecar_verdict_by_photo[pid] = "defer"
-                        deferred_unavailable_sidecar = True
+                        deferred_sidecar = True
                     else:
                         try:
                             from xmp import read_keywords
@@ -3655,7 +3649,7 @@ class Database:
                                 exc_info=True,
                             )
                             sidecar_verdict_by_photo[pid] = "defer"
-                            deferred_unavailable_sidecar = True
+                            deferred_sidecar = True
             verdict = sidecar_verdict_by_photo[pid]
             preserve_unknown_without_sidecar = (
                 verdict == "absent" and row["source"] is None
@@ -3694,11 +3688,9 @@ class Database:
                 continue
             if verdict == "defer":
                 continue
-            ws = row["workspace_id"]
             entry = photo_workspaces.setdefault(
                 pid,
                 {
-                    "ws_ids": set(),
                     "candidate_keyword_ids": set(),
                     "wildlife_genre_count": int(row["wildlife_genre_count"]),
                     "survivor": bool(row["has_same_name_survivor"]),
@@ -3706,8 +3698,6 @@ class Database:
                 },
             )
             entry["candidate_keyword_ids"].add(row["keyword_id"])
-            if ws is not None:
-                entry["ws_ids"].add(ws)
 
         if sidecar_manual_pairs:
             self.conn.executemany(
@@ -3738,6 +3728,20 @@ class Database:
             try:
                 still_retirable = {}
                 for photo_id, entry in photo_chunk:
+                    current_photo = self.conn.execute(
+                        "SELECT xmp_mtime FROM photos WHERE id = ?",
+                        (photo_id,),
+                    ).fetchone()
+                    if (
+                        current_photo is not None
+                        and current_photo["xmp_mtime"] != entry["xmp_mtime"]
+                    ):
+                        # An XMP-to-DB reconciliation won the race with the
+                        # sidecar scan. Preserve this association and leave
+                        # the marker unset so the next startup inspects the
+                        # newly accepted sidecar state.
+                        deferred_sidecar = True
+                        continue
                     candidate_ids = {
                         keyword_id
                         for keyword_id in entry["candidate_keyword_ids"]
@@ -3746,8 +3750,6 @@ class Database:
                                FROM photo_keywords candidate_pk
                                JOIN keywords candidate_k
                                  ON candidate_k.id = candidate_pk.keyword_id
-                               JOIN photos candidate_p
-                                 ON candidate_p.id = candidate_pk.photo_id
                                WHERE candidate_pk.photo_id = ?
                                  AND candidate_pk.keyword_id = ?
                                  AND (candidate_pk.source IS NULL
@@ -3755,9 +3757,8 @@ class Database:
                                  AND candidate_k.name
                                      = 'Wildlife' COLLATE NOCASE
                                  AND candidate_k.type = 'genre'
-                                 AND candidate_k.parent_id IS NULL
-                                 AND candidate_p.xmp_mtime IS ?""",
-                            (photo_id, keyword_id, entry["xmp_mtime"]),
+                                 AND candidate_k.parent_id IS NULL""",
+                            (photo_id, keyword_id),
                         ).fetchone() is not None
                     }
                     if candidate_ids:
@@ -3784,7 +3785,7 @@ class Database:
                         )
 
                 for photo_id, (
-                    entry,
+                    _entry,
                     _candidate_ids,
                     has_current_same_name_survivor,
                 ) in still_retirable.items():
@@ -3794,7 +3795,21 @@ class Database:
                         # Keep its sidecar term while detaching the generated
                         # genre association below.
                         continue
-                    ws_ids = entry["ws_ids"]
+                    # Workspace links may also change while the sidecar scan
+                    # is running. Re-read every current owner under this
+                    # chunk's writer lock so each workspace's independent
+                    # pending queue receives the cleanup.
+                    ws_ids = {
+                        row["workspace_id"]
+                        for row in self.conn.execute(
+                            """SELECT wf.workspace_id
+                               FROM photos p
+                               JOIN workspace_folders wf
+                                 ON wf.folder_id = p.folder_id
+                               WHERE p.id = ?""",
+                            (photo_id,),
+                        ).fetchall()
+                    }
                     target_ws_ids = (
                         ws_ids
                         if ws_ids
@@ -3849,11 +3864,10 @@ class Database:
                 self.conn.rollback()
                 raise
         # Only stamp the completion marker if every candidate photo was
-        # actually inspected. When a previously-imported sidecar is offline
-        # we cannot tell whether its Wildlife association is generated or
-        # user-authored, so leave the marker unset and let the next startup
-        # re-inspect once the volume returns.
-        if not deferred_unavailable_sidecar:
+        # inspected against its current sidecar state. When a sidecar is
+        # unavailable/corrupt or an XMP reconciliation changes its version
+        # during the scan, leave the marker unset so the next startup retries.
+        if not deferred_sidecar:
             self.set_meta(
                 self._RETIRED_WILDLIFE_GENRE_KEY, "1", _commit=False,
             )

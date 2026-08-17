@@ -193,14 +193,18 @@ def test_fixed_browse_view_key_is_reserved_from_navigation(live_server, page):
     assert "dashboard" not in navigation_names
 
 
-def test_fixed_global_keys_are_reserved_from_navigation(live_server, page):
-    """Help and universal-filter keys must take precedence over navigation."""
+def test_non_letter_bare_keys_are_reserved_from_navigation(live_server, page):
+    """Bare navigation cannot replace fixed controls or browser focus traversal."""
     page.route(
         "**/api/config",
         lambda route: route.fulfill(
             json={
                 "keyboard_shortcuts": {
-                    "navigation": {"dashboard": "f1", "workspace": "\\"}
+                    "navigation": {
+                        "dashboard": "f1",
+                        "workspace": "\\",
+                        "id_conflicts": "tab",
+                    }
                 }
             }
         ),
@@ -216,6 +220,7 @@ def test_fixed_global_keys_are_reserved_from_navigation(live_server, page):
     """)
     assert "dashboard" not in navigation_names
     assert "workspace" not in navigation_names
+    assert "id_conflicts" not in navigation_names
 
 
 def test_unreserved_bare_navigation_shortcut_navigates(live_server, page):

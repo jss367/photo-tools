@@ -19720,6 +19720,305 @@ def test_browse_review_deep_link_clears_persisted_filters(app_and_db):
     assert review_resp.status_code == 200
 
 
+# Browse's prediction panels are inline JS, so the only honest way to check
+# what they emit for a given species name is to run them. Everything these
+# helpers execute is lifted verbatim from the shipped template and
+# vireo-utils.js; the harness supplies only the DOM surface those functions
+# touch and stubs for the calls under assertion.
+_PANEL_DOM_STUB = """
+var __list = {
+  innerHTML: '',
+  _handlers: {},
+  addEventListener: function(type, fn) { __list._handlers[type] = fn; },
+};
+var document = {
+  getElementById: function(id) {
+    return id === 'detailPredictions' ? __list : null;
+  },
+  createElement: function() {
+    return {
+      _text: '',
+      appendChild: function(node) { this._text += node.text; },
+      get innerHTML() {
+        return this._text
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      },
+    };
+  },
+  createTextNode: function(text) { return { text: String(text) }; },
+};
+// Declared in browse.html above the panel code, outside the slice below.
+var PREDICTION_COLLAPSE_AT = 5;
+var detailPredictionsExpanded = false;
+var _detailPredictionData = null;
+var detailPredictionGroups = [];
+var detailPredictionGroupsPhotoId = null;
+// The calls the panel is supposed to make, captured instead of made.
+var __calls = [];
+function acceptDetailPredictions(ids, photoId, species) {
+  __calls.push(
+    {fn: 'accept', ids: ids, photoId: photoId, species: species},
+  );
+}
+function rejectDetailPredictions(ids, photoId) {
+  __calls.push({fn: 'reject', ids: ids, photoId: photoId});
+}
+function openPredictionInReview(photoId) {
+  __calls.push({fn: 'review', photoId: photoId});
+}
+"""
+
+_PANEL_DRIVER = """
+var __input = JSON.parse(process.argv[3] || '{}');
+renderDetailPredictions(__input.data, __input.photoId);
+if (process.argv[2] === 'render') {
+  process.stdout.write(JSON.stringify({html: __list.innerHTML}));
+} else {
+  var __attrs = __input.attrs || {};
+  var __el = {
+    getAttribute: function(name) {
+      return Object.prototype.hasOwnProperty.call(__attrs, name)
+        ? __attrs[name] : null;
+    },
+  };
+  __el.closest = function() {
+    return __attrs['data-prediction-action'] ? __el : null;
+  };
+  var __handler = __list._handlers.click;
+  if (!__handler) {
+    process.stdout.write(JSON.stringify({error: 'no delegated click listener'}));
+  } else {
+    __handler({target: __el});
+    process.stdout.write(JSON.stringify({calls: __calls}));
+  }
+}
+"""
+
+
+def _run_node(source, args):
+    """Execute a JS snippet under node and return its parsed JSON stdout."""
+    import json as _json
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    import pytest
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to execute Browse's inline panel JS")
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "panel.js"
+        script.write_text(source, encoding="utf-8")
+        proc = subprocess.run(
+            [node, str(script), *args], capture_output=True, text=True,
+        )
+    assert proc.returncode == 0, proc.stderr
+    return _json.loads(proc.stdout)
+
+
+def _browse_escape_helpers():
+    """The real ``escapeHtml`` / ``escapeAttr`` from the shared static file."""
+    from pathlib import Path
+
+    src = Path(__file__).parent.parent / "static" / "vireo-utils.js"
+    text = src.read_text(encoding="utf-8")
+    start = text.find("function escapeHtml(")
+    end = text.find("var VireoTextInputs")
+    assert start != -1 and end > start, "vireo-utils.js escape helpers moved"
+    return text[start:end]
+
+
+def _run_detail_prediction_panel(html, mode, payload):
+    """Run Browse's single-photo prediction renderer for real."""
+    start = html.find("function predictionIsAmbiguous(")
+    end = html.find("function openPredictionInReview(")
+    assert start != -1 and end > start, (
+        "browse.html's detail prediction panel could not be located"
+    )
+    source = "\n".join([
+        _PANEL_DOM_STUB, _browse_escape_helpers(), html[start:end],
+        _PANEL_DRIVER,
+    ])
+    import json as _json
+
+    return _run_node(source, [mode, _json.dumps(payload)])
+
+
+_APOSTROPHE_SPECIES = "Say's Phoebe"
+
+
+def _apostrophe_panel_payload():
+    """One pending, unambiguous prediction whose species has an apostrophe."""
+    return {
+        "photoId": 44,
+        "data": {
+            "predictions": [{
+                "id": 12, "photo_id": 44,
+                "species": _APOSTROPHE_SPECIES,
+                "consensus_species": _APOSTROPHE_SPECIES,
+                "status": "pending", "confidence": 0.91,
+                "model": "test-classifier", "effective_category": "new",
+                "alternatives": [],
+            }],
+            "photo_states": {"44": {
+                "threshold": 0, "detector_ran": True, "classifier_ran": True,
+            }},
+        },
+    }
+
+
+def _parse_elements(markup):
+    """Every (tag, attrs) the browser would see, via the stdlib parser.
+
+    Attribute-level assertions are the point: a species name that escaped
+    into markup shows up here as extra attributes on the button, which is
+    exactly what a browser would do with it.
+    """
+    from html.parser import HTMLParser
+
+    found = []
+
+    class _Collector(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            found.append((tag, dict(attrs)))
+
+    parser = _Collector(convert_charrefs=True)
+    parser.feed(markup)
+    parser.close()
+    return found
+
+
+def test_browse_detail_prediction_buttons_survive_apostrophe_species(
+    app_and_db,
+):
+    """Say's Phoebe must get a working Accept button.
+
+    Codex P2 (browse.html:6996). The panel used to build its buttons as
+    ``onclick='acceptDetailPredictions([12],44,"Say's Phoebe")'`` — a
+    single-quoted attribute holding a JSON string. The apostrophe closed the
+    attribute, so the browser kept a truncated handler and parsed the rest of
+    the species as stray attributes: Accept and Reject were broken outright
+    for Say's Phoebe, Cooper's Hawk, Steller's Jay, Bewick's Wren, Swainson's
+    Hawk and every other possessive common name, which is a large share of
+    the North American birds this app exists to organise.
+
+    The fix keeps row data out of markup entirely — the buttons carry an
+    index and a delegated listener reads ids and species back out of
+    ``detailPredictionGroups`` — so this test asserts on the parsed markup
+    (no species anywhere in any attribute) and then on the round trip (the
+    handler still receives the exact species, apostrophe intact).
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    payload = _apostrophe_panel_payload()
+
+    rendered = _run_detail_prediction_panel(html, "render", payload)["html"]
+    elements = _parse_elements(rendered)
+    accepts = [
+        attrs for tag, attrs in elements
+        if tag == "button" and attrs.get("class") == "prediction-accept"
+    ]
+    rejects = [
+        attrs for tag, attrs in elements
+        if tag == "button" and attrs.get("class") == "prediction-reject"
+    ]
+    assert len(accepts) == 1, f"expected one Accept button, got {elements}"
+    assert len(rejects) == 1
+    # The exact attribute set, not just "the ones we want are present":
+    # the old bug manifested as *extra* attributes split out of the species.
+    assert set(accepts[0]) == {
+        "class", "data-prediction-action", "data-prediction-group", "title",
+    }
+    assert accepts[0]["data-prediction-action"] == "accept"
+    assert accepts[0]["data-prediction-group"] == "0"
+    assert set(rejects[0]) == {
+        "class", "data-prediction-action", "data-prediction-group", "title",
+    }
+    # No fragment of the species reaches any attribute of any element — the
+    # name belongs in text, where escapeHtml already handles it.
+    for tag, attrs in elements:
+        for name, value in attrs.items():
+            assert "Phoebe" not in name, (tag, name)
+            assert "Phoebe" not in (value or ""), (tag, name, value)
+    # It is still displayed, and displayed correctly.
+    assert "Say&#x27;s Phoebe" in rendered or "Say's Phoebe" in rendered
+
+    # The round trip: clicking the rendered button calls the accept path
+    # with the species the row named, apostrophe and all.
+    clicked = _run_detail_prediction_panel(
+        html, "click", {**payload, "attrs": accepts[0]},
+    )
+    assert clicked.get("error") is None, clicked
+    assert clicked["calls"] == [{
+        "fn": "accept", "ids": [12], "photoId": 44,
+        "species": _APOSTROPHE_SPECIES,
+    }]
+
+    rejected = _run_detail_prediction_panel(
+        html, "click", {**payload, "attrs": rejects[0]},
+    )
+    assert rejected.get("error") is None, rejected
+    assert rejected["calls"] == [
+        {"fn": "reject", "ids": [12], "photoId": 44},
+    ]
+
+
+def test_browse_reject_toast_names_workspace_detach_skips(app_and_db):
+    """A reject that skipped a detached photo has to say so.
+
+    Codex P2 (browse.html:7212). ``batch-reject`` filters photos whose folder
+    left the workspace between the payload check and the decision lock and
+    returns ``skipped_out_of_workspace``, exactly as ``batch-accept`` does.
+    The reject reporter ignored the counter, so the response
+    ``{rejected: 0, skipped_out_of_workspace: 1}`` produced no toast at all:
+    a click that did nothing and said nothing, which is the silence this
+    PR's skip reporting exists to remove.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    body = _browse_js_function_body(html, "function _reportSkippedRejects(")
+    import json as _json
+
+    source = (
+        "var __toasts = [];\n"
+        "function showToast(message) { __toasts.push(message); }\n"
+        + body
+        + "\n_reportSkippedRejects(JSON.parse(process.argv[2]));\n"
+        "process.stdout.write(JSON.stringify({toasts: __toasts}));\n"
+    )
+    detached_only = _run_node(source, [_json.dumps({
+        "ok": True, "rejected": 0, "already_decided": 0,
+        "skipped_superseded": 0, "skipped_out_of_workspace": 1,
+    })])["toasts"]
+    assert len(detached_only) == 1, (
+        "a reject that skipped a detached photo must not be silent"
+    )
+    assert "no longer in this workspace" in detached_only[0]
+    assert detached_only[0].startswith("Nothing rejected")
+
+    # And it is named alongside the other reasons, not instead of them.
+    mixed = _run_node(source, [_json.dumps({
+        "ok": True, "rejected": 2, "already_decided": 1,
+        "skipped_superseded": 0, "skipped_out_of_workspace": 3,
+    })])["toasts"]
+    assert len(mixed) == 1
+    assert "Rejected 2" in mixed[0]
+    assert "1 already decided elsewhere" in mixed[0]
+    assert "3 no longer in this workspace" in mixed[0]
+
+    # Nothing skipped stays quiet: a toast on every clean reject would be
+    # noise, and the accept side behaves the same way.
+    clean = _run_node(source, [_json.dumps({
+        "ok": True, "rejected": 2, "already_decided": 0,
+        "skipped_superseded": 0, "skipped_out_of_workspace": 0,
+    })])["toasts"]
+    assert clean == []
+
+
 def _seed_pending_prediction(db, filename, species):
     """One pending prediction on a fresh photo — the starting state every
     reviewed-status test then transitions from through
@@ -20038,40 +20337,38 @@ def test_browse_panel_treats_reviewed_status_as_decided(app_and_db):
     )
 
 
-def test_browse_detail_accept_button_escapes_species_apostrophes(app_and_db):
-    """Codex P2 (browse.html:6990): species like "Smith's Longspur" break the
-    Accept button.
+def test_browse_detail_panel_keeps_row_data_out_of_markup(app_and_db):
+    """No prediction row's data may be interpolated into an attribute.
 
-    The inline ``onclick`` for the detail-panel Accept/Reject buttons is
-    single-quoted, and ``JSON.stringify(g.species)`` preserves the apostrophe.
-    Without HTML-escaping, the attribute closes at the ``'`` in ``Say's`` and
-    the handler payload becomes malformed JS — clicking Accept does nothing
-    for a valid species. escapeAttr re-encodes the ``'`` as ``&#39;`` so the
-    browser hands the JS parser the intended source.
+    The escaping bug this replaces was possible because the panel built
+    inline handlers by string concatenation. Escaping fixed the one line;
+    this asserts the idiom itself is gone from the renderer, so the next
+    button added here cannot reintroduce it — the buttons carry an index
+    into ``detailPredictionGroups`` and a delegated listener reads the ids
+    and species back out.
 
-    Structural rather than end-to-end because the failure is in the rendered
-    HTML: pytest cannot execute the inline handler, but it can verify the
-    escape is applied before the string ever reaches the DOM.
+    ``test_browse_detail_prediction_buttons_survive_apostrophe_species``
+    proves the resulting markup and click round trip actually work; this
+    one guards the shape that keeps them working.
     """
     app, _ = app_and_db
     client = app.test_client()
     html = client.get("/browse").get_data(as_text=True)
     body = _browse_js_function_body(html, "function renderDetailPredictions(")
     assert body, "renderDetailPredictions must exist in browse.html"
-    # Both handler arguments live inside a single-quoted attribute, so both
-    # must go through escapeAttr. Checking the assignments rather than the
-    # onclick literal keeps this insensitive to formatting churn.
-    assert "escapeAttr(JSON.stringify(g.species))" in body, (
-        "species argument must be HTML-escaped before embedding in an "
-        "onclick attribute — otherwise Smith's Longspur closes the attribute"
+    assert "onclick" not in body, (
+        "the detail prediction panel must wire its buttons through the "
+        "delegated listener, not inline handlers built by concatenation"
     )
-    assert "escapeAttr(JSON.stringify(g.ids))" in body, (
-        "prediction-ids argument shares the same attribute and must use the "
-        "same escape — future non-numeric IDs would otherwise inherit the bug"
+    assert "JSON.stringify(g.species)" not in body
+    assert 'data-prediction-action="accept"' in body
+    assert "detailPredictionGroups = shown;" in body
+    handler = _browse_js_function_body(
+        html, "function handleDetailPredictionClick(",
     )
-    # And confirm the bare, unescaped form is gone — otherwise a stray
-    # JSON.stringify(g.species) that skipped escapeAttr would still ship.
-    assert "onclick=\\'acceptDetailPredictions(' + JSON.stringify" not in body
+    assert "detailPredictionGroups[" in handler, (
+        "the handler must resolve the row's data from the side table"
+    )
 
 
 def test_browse_reject_reporter_names_workspace_detach_skips(app_and_db):

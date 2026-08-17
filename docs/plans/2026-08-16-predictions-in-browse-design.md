@@ -295,6 +295,28 @@ Predictions below the workspace `classifier_confidence` are not silently
 dropped. A collapsed line — `2 below threshold (0.35)` — keeps them
 visible without cluttering.
 
+**No row data reaches the markup.** Every button this panel renders carries
+integers only — an index into `detailPredictionGroups` and a photo id — and a
+single delegated `click` listener on the panel container
+(`handleDetailPredictionClick`) reads the ids and the species back out of that
+array. The panel originally built inline handlers by interpolation:
+
+```js
+onclick='acceptDetailPredictions([12],44,"Say\'s Phoebe")'
+```
+
+The apostrophe closes the single-quoted attribute, so the browser kept a
+truncated handler and parsed `s Phoebe")'` as two stray attributes: Accept and
+Reject were broken outright for Say's Phoebe, Cooper's Hawk, Steller's Jay,
+Bewick's Wren, Swainson's Hawk, Wilson's Warbler — possessive common names are
+ordinary in North American birds, which is most of what this app is pointed
+at. Escaping that interpolation would have fixed that one line; keeping data
+out of markup is what stops the next button added here from reintroducing it,
+and it matches what the multi-select panel has always done
+(`selectionPredictionAcceptableById` / `selectionPredictionSpeciesByIdx`).
+Species names still reach the DOM as *text*, through `escapeHtml`, and status
+tooltips through `escapeAttr`.
+
 ### Multi-select
 
 A **Predictions** section above the existing Keywords section in
@@ -658,7 +680,13 @@ Two consequences at the caller:
   a decided row needs nothing, an ambiguous one needs Review, a superseded or
   out-of-workspace row is simply replaced by the refresh, and a
   species-drifted row is a caller-side re-render (the row was still there,
-  its label just moved).
+  its label just moved). `_reportSkippedRejects` does the same for
+  `batch-reject`'s counters — `already_decided`, `skipped_superseded` and
+  `skipped_out_of_workspace` — using the same wording for the same fact. A
+  reject whose photo detached mid-flight comes back `rejected: 0,
+  skipped_out_of_workspace: 1`, and reporting nothing for it would be a click
+  that visibly did nothing: precisely the silence this section exists to
+  remove.
 - The undo toast is gated on `accepted`. A payload whose rows have all been
   decided or turned ambiguous returns `accepted: 0` and records no undoable
   edit, so an unconditional toast would advertise — and Ctrl+Z would
@@ -759,6 +787,21 @@ it has no ambiguity check because there is no winner to pick.
   early returns) and in a `vireo:edit-history-changed` listener, so the
   coverage is structural rather than per-call-site.
 - "Open in Review" sends an explicit empty `filters` handoff.
+- `test_browse_detail_prediction_buttons_survive_apostrophe_species` — the
+  panel's real renderer is executed under `node` (its own functions, lifted
+  from the served page, plus the real `escapeHtml`/`escapeAttr`) for a
+  prediction on `Say's Phoebe`. The emitted markup is parsed with the stdlib
+  HTML parser and the Accept and Reject buttons must carry *exactly* their
+  four expected attributes — the old bug showed up as extra attributes split
+  out of the species — with no fragment of the name in any attribute
+  anywhere. Then the rendered button's attributes are fed back through the
+  delegated listener, which must call `acceptDetailPredictions` with the
+  species intact. Asserting the markup alone would pass on a panel whose
+  buttons no longer do anything.
+- `test_browse_reject_toast_names_workspace_detach_skips` — the same node
+  harness runs `_reportSkippedRejects`: a `skipped_out_of_workspace` reject
+  produces exactly one toast naming it, it appears alongside the other
+  reasons rather than replacing them, and a clean reject stays silent.
 
 Plus a Playwright pass driving the real panel — selecting photos, accepting,
 confirming the Review queue drains.

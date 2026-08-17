@@ -2221,6 +2221,21 @@ var selectionPredictionAcceptableById = {};
 // consensus has drifted from what the panel rendered (see
 // _species_drifted_prediction_ids in app.py).
 var selectionPredictionSpeciesByIdx = {};
+// The single-photo panel's rendered rows, in render order, so its buttons can
+// carry a bare index instead of the row's data. The selection panel has kept
+// its ids and species in a side table since it shipped
+// (selectionPredictionAcceptableById above); the detail panel now matches it,
+// for a reason worth stating: it used to interpolate the species straight
+// into an inline handler attribute —
+// `onclick='acceptDetailPredictions([12],44,"Say\'s Phoebe")'` — and the
+// apostrophe closed the attribute. Accept was broken outright for Say's
+// Phoebe, Cooper's Hawk, Steller's Jay, Bewick's Wren, Swainson's Hawk,
+// Wilson's Warbler: possessive common names are ordinary in North American
+// birds, which is most of what this app is pointed at. Escaping that one
+// interpolation would have fixed that one line; keeping row data out of the
+// markup is what stops the next button added here from reintroducing it.
+var detailPredictionGroups = [];
+var detailPredictionGroupsPhotoId = null;
 var showDetectionBoxes = false;
 var cardFields = ["filename", "location_status", "rating", "flag", "color_label", "sharpness"]; // default, overridden by config
 var inatSubmitted = {};  // {photo_id: true}
@@ -6895,9 +6910,53 @@ function toggleDetailPredictions() {
   }
 }
 
+// Every button this panel renders is wired through here, by one delegated
+// listener on the panel container, and its markup carries integers only: an
+// index into `detailPredictionGroups` and a photo id. See the comment on
+// `detailPredictionGroups` for what interpolating a species name into an
+// inline handler attribute did to Say's Phoebe.
+function handleDetailPredictionClick(ev) {
+  var btn = ev.target && ev.target.closest
+    ? ev.target.closest('[data-prediction-action]') : null;
+  if (!btn) return;
+  var action = btn.getAttribute('data-prediction-action');
+  if (action === 'toggle') { toggleDetailPredictions(); return; }
+  if (action === 'review') {
+    openPredictionInReview(Number(btn.getAttribute('data-photo-id')));
+    return;
+  }
+  // The array is rebuilt on every render alongside the markup that indexes
+  // into it, so a missing entry means the panel repainted under the click.
+  // Doing nothing is the honest outcome: the row the user aimed at is gone.
+  var group = detailPredictionGroups[
+    Number(btn.getAttribute('data-prediction-group'))
+  ];
+  if (!group) return;
+  if (action === 'accept') {
+    acceptDetailPredictions(
+      group.ids, detailPredictionGroupsPhotoId, group.species,
+    );
+  } else if (action === 'reject') {
+    rejectDetailPredictions(group.ids, detailPredictionGroupsPhotoId);
+  }
+}
+
+var detailPredictionsClickBound = false;
+
 function renderDetailPredictions(data, photoId) {
   var list = document.getElementById('detailPredictions');
   if (!list) return;
+  // The container is static in the template and only its children are
+  // replaced, so one delegated listener outlives every repaint.
+  if (!detailPredictionsClickBound) {
+    detailPredictionsClickBound = true;
+    list.addEventListener('click', handleDetailPredictionClick);
+  }
+  // Cleared before any early return: buttons from the previous render are
+  // about to be replaced, and a leftover table would let a click resolve to
+  // a row this render decided not to show.
+  detailPredictionGroups = [];
+  detailPredictionGroupsPhotoId = photoId;
   _detailPredictionData = { data: data, photoId: photoId };
   var state = (data.photo_states || {})[String(photoId)] || null;
   var threshold = state && state.threshold ? state.threshold : 0;
@@ -6965,8 +7024,12 @@ function renderDetailPredictions(data, photoId) {
     : groups.slice(0, PREDICTION_COLLAPSE_AT);
   var collapsed = groups.length - shown.length;
 
+  // The rows the markup will index into. Set before the loop so the index
+  // each button carries is the index the handler resolves.
+  detailPredictionGroups = shown;
+
   var html = '';
-  shown.forEach(function(g) {
+  shown.forEach(function(g, idx) {
     // A group is only safely acceptable if none of its rows is ambiguous —
     // otherwise one Accept would silently swallow a decision the user should
     // be making in Review.
@@ -6984,21 +7047,22 @@ function renderDetailPredictions(data, photoId) {
         escapeAttr(predictionStatusExplanation(g.status)) + '">' +
         escapeHtml(g.status) + '</span>';
     } else if (ambiguous) {
-      actions = '<button class="prediction-review-link" onclick="openPredictionInReview(' +
-        photoId + ')" title="This prediction needs Review\'s full decision UI">Open in Review</button>';
+      actions = '<button class="prediction-review-link"' +
+        ' data-prediction-action="review" data-photo-id="' + photoId + '"' +
+        ' title="This prediction needs Review\'s full decision UI">Open in Review</button>';
     } else {
-      // JSON.stringify keeps apostrophes literal, so a species like
-      // "Smith's Longspur" or "Say's Phoebe" would close the single-quoted
-      // onclick attribute early and leave the handler malformed — the button
-      // then does nothing for a valid species. escapeAttr re-encodes ' and "
-      // as HTML entities so the browser hands JS the intended source.
-      var idsArg = escapeAttr(JSON.stringify(g.ids));
-      var speciesArg = escapeAttr(JSON.stringify(g.species));
+      // Only the row index reaches the markup. The ids and the species the
+      // Accept will apply — passed to the server as `expected_species` so it
+      // can refuse a row whose grouping drifted after this render — are read
+      // back out of `detailPredictionGroups[idx]` by the click handler, so no
+      // species name is ever parsed as HTML.
       actions =
-        '<button class="prediction-accept" onclick=\'acceptDetailPredictions(' + idsArg + ',' + photoId +
-        ',' + speciesArg + ')\' title="Accept this species and add the keyword">Accept</button>' +
-        '<button class="prediction-reject" onclick=\'rejectDetailPredictions(' + idsArg + ',' + photoId +
-        ')\' title="Reject this prediction">Reject</button>';
+        '<button class="prediction-accept" data-prediction-action="accept"' +
+        ' data-prediction-group="' + idx + '"' +
+        ' title="Accept this species and add the keyword">Accept</button>' +
+        '<button class="prediction-reject" data-prediction-action="reject"' +
+        ' data-prediction-group="' + idx + '"' +
+        ' title="Reject this prediction">Reject</button>';
     }
     html += '<div class="' + cls + '">' +
       '<div style="min-width:0;">' +
@@ -7014,11 +7078,11 @@ function renderDetailPredictions(data, photoId) {
   // be mistaken for the whole answer.
   if (collapsed > 0) {
     var weakest = groups[shown.length].best.confidence;
-    html += '<button class="prediction-toggle" onclick="toggleDetailPredictions()">Show ' +
+    html += '<button class="prediction-toggle" data-prediction-action="toggle">Show ' +
       collapsed + ' weaker species (' + formatPredictionConfidence(weakest) +
       ' and below)</button>';
   } else if (detailPredictionsExpanded && groups.length > PREDICTION_COLLAPSE_AT) {
-    html += '<button class="prediction-toggle" onclick="toggleDetailPredictions()">Show fewer</button>';
+    html += '<button class="prediction-toggle" data-prediction-action="toggle">Show fewer</button>';
   }
   if (hidden) {
     html += '<div class="prediction-below-threshold">' + hidden +
@@ -7213,9 +7277,10 @@ function _reportSkippedRejects(data) {
       ' replaced by a newer classification run');
   }
   // Same workspace-detach race as the accept side: the photo left the active
-  // workspace between the parse-time ownership check and the batch's lock.
-  // Named separately for the same reason — a silent "Nothing rejected" would
-  // leave the user hunting for a broken button.
+  // workspace between the parse-time ownership check and the batch's lock, so
+  // the response is `rejected: 0, skipped_out_of_workspace: 1`. Named
+  // separately for the same reason — silence here is a click that visibly
+  // did nothing, and the user hunting for a broken button.
   if (data.skipped_out_of_workspace) {
     parts.push(data.skipped_out_of_workspace +
       ' no longer in this workspace');

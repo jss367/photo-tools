@@ -6667,8 +6667,11 @@ function lightboxSetFlagAction(flag) {
   if (_lightboxCurrentId == null) return;
   var pid = _lightboxCurrentId;
   // Clicking the button for the photo's current state clears it, so the pair
-  // covers flag/reject/unflag without a third button.
-  var current = _lbNormalizeFlag(_lbConfirmedFlagFor(pid)) || 'none';
+  // covers flag/reject/unflag without a third button. Match against the
+  // *displayed* flag (which includes provisional edits, e.g. Group Review
+  // stages picks/rejects before Apply) so a second click on an already-lit
+  // button clears the shown state instead of re-applying the same edit.
+  var current = _lbNormalizeFlag(_lbDisplayedFlagFor(pid)) || 'none';
   var target = (current === flag) ? 'none' : flag;
   // Same dispatch order as the keyboard shortcuts: the misses page intercepts
   // flag writes to keep its local model in sync.

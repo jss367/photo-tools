@@ -23,13 +23,14 @@ class PhotoReviewRepository:
             verify_workspace=verify_workspace,
         )
 
-    def set_flag(self, photo_id, flag, *, verify_workspace=True):
+    def set_flag(self, photo_id, flag, *, verify_workspace=True, _commit=True):
         if verify_workspace:
             self._verify_photo(photo_id)
         self.conn.execute(
             "UPDATE photos SET flag = ? WHERE id = ?", (flag, photo_id)
         )
-        self.conn.commit()
+        if _commit:
+            self.conn.commit()
 
     def set_flags(self, photo_ids, flag, *, verify_workspace=True):
         self._set_many(

@@ -2911,6 +2911,52 @@ def test_id_conflicts_page(app_and_db):
     assert resp.status_code == 200
 
 
+def test_id_conflicts_batch_treats_group_expanded_409_as_success(app_and_db):
+    """A per-photo Accept in id-conflicts' batch loop can hit a 409 from
+    its own earlier iteration: when two selected photos belong to the
+    same burst/model, ``accept_prediction`` fans the first accept across
+    every pending row in the group, and the second call receives
+    ``prediction already accepted; cannot accept``. Counting that as
+    "not applied" mis-reports a batch that actually did exactly what
+    the user asked for — the same silent-drift class the whole flow
+    exists to close.
+
+    The fix keeps the wording precise: only a 409 whose message names
+    the same terminal status this action drives toward counts as
+    in-batch success. Any other 409 (e.g. accept against a row a second
+    tab already rejected) still surfaces as refused so the user sees
+    the actual disagreement.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get('/id-conflicts').get_data(as_text=True)
+    assert 'function _isAlreadyInTargetState(' in html, (
+        'the batch loop must have a helper for "already in target state"'
+    )
+    # accept/accept_subject/replace all route through accept_prediction
+    # server-side and land the row in ``accepted``; reject lands
+    # ``rejected``. Missing any of these mappings would silently make
+    # the batch report grouped-accept survivors as refusals.
+    for action, target in (
+        ("accept", "accepted"),
+        ("accept_subject", "accepted"),
+        ("replace", "accepted"),
+        ("reject", "rejected"),
+        ("reviewed", "reviewed"),
+    ):
+        assert f"{action}: '{target}'" in html, (
+            f"missing target-state mapping for {action}"
+        )
+    batch_at = html.find('async function batchAction(')
+    assert batch_at != -1
+    # Grab enough of batchAction to see the catch branch.
+    batch = html[batch_at: batch_at + 3000]
+    assert '_isAlreadyInTargetState(action, e)' in batch, (
+        'batchAction must consult _isAlreadyInTargetState before treating '
+        'a 409 as refused'
+    )
+
+
 def test_compare_legacy_redirect(app_and_db):
     """GET /compare redirects to the renamed /id-conflicts page."""
     app, _ = app_and_db

@@ -1609,6 +1609,41 @@ function endpointForAction(action) {
   return 'reviewed';
 }
 
+// The terminal status each action drives a row toward. Used to tell "this
+// row is already in the state we wanted to leave it in" from "this row is
+// in some other terminal state that blocks the action". Accept, replace,
+// and accept-subject all route through ``accept_prediction`` on the server
+// and land ``accepted``.
+var _TARGET_STATUS_FOR_ACTION = {
+  accept: 'accepted',
+  accept_subject: 'accepted',
+  replace: 'accepted',
+  reject: 'rejected',
+  reviewed: 'reviewed',
+};
+
+// A 409 that reports the row is already in the state this action would put
+// it in is a success for this batch, not a refusal. The one path that
+// produces this in-batch is grouped/burst expansion: ``accept_prediction``
+// (called by accept, replace, and accept-subject) fans a single accept out
+// across every pending row in the burst group, so a later per-photo call
+// against a sibling gets 409 "already accepted" from the write our own
+// earlier iteration committed. The user's intent — accept this row — has
+// been satisfied, and reporting it as "N of M not applied" is exactly the
+// silent-drift-in-the-error-direction ``CORE_PHILOSOPHY.md`` forbids.
+//
+// The server's 409 message is a Python f-string of a fixed shape:
+// ``prediction already <status>; cannot <verb>`` where ``<status>`` is
+// ``accepted``, ``rejected``, or ``reviewed``. Matching the substring is
+// enough — status names are drawn from a fixed enum and cannot collide.
+function _isAlreadyInTargetState(action, err) {
+  if (!err || err.status !== 409) return false;
+  var target = _TARGET_STATUS_FOR_ACTION[action];
+  if (!target) return false;
+  return typeof err.message === 'string' &&
+    err.message.indexOf('already ' + target) !== -1;
+}
+
 async function batchAction(action) {
   var ids = Array.from(selectedRows);
   var photos = (compareData.photos || []).filter(function(photo) {
@@ -1624,6 +1659,13 @@ async function batchAction(action) {
     try {
       await jsonFetch('/api/predictions/' + pred.id + '/' + endpointForAction(action), { method: 'POST' });
     } catch (e) {
+      // A 409 saying the row is already in the state THIS action would put
+      // it in — reached in-batch when accept_prediction fanned the previous
+      // iteration's accept across every pending row in the same burst —
+      // is a success for this batch, not a refusal. See
+      // _isAlreadyInTargetState above. Any other 409 (e.g. accept against a
+      // row a second tab already rejected) still counts as refused.
+      if (_isAlreadyInTargetState(action, e)) continue;
       // One already-settled row must not abandon the rest of the batch, but
       // the count has to be named — a batch that quietly did less than the
       // selection implies is the gap this whole flow exists to close. The

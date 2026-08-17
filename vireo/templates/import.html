@@ -1449,6 +1449,15 @@ async function runSourceCountQueue() {
 
 function pumpSourceCountQueue() {
   const globalLimit = 4;
+  // Restart the clock if we still have work to pump. An earlier scan may
+  // have finished while runSourceCountQueue() was awaiting the policy fetch,
+  // and that completion's pump saw an empty queue (the newly queued sources
+  // hadn't been assigned to sourceCountPending yet) and stopped the clock.
+  // Without this, the elapsed timer on the newly starting scan would freeze
+  // at whatever value the row rendered with.
+  if (sourceCountInflight.size || sourceCountPending.length) {
+    ensureSourceCountClock();
+  }
   while (sourceCountInflight.size < globalLimit && sourceCountPending.length) {
     const nextIndex = sourceCountPending.findIndex(path => {
       const policy = sourceCountPolicies[path] ||

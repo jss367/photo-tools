@@ -201,6 +201,103 @@ def test_import_source_counts_overlap_on_known_local_storage(live_server, page):
         "2 folders counted · 7 photos found")
 
 
+def test_source_count_clock_restarts_when_pump_starts_new_work(
+        live_server, page):
+    """Adding a folder mid-scan must not freeze the elapsed clock.
+
+    Scenario: folder A is being counted (clock ticking). The user adds
+    folder B, which enters runSourceCountQueue and awaits a fresh policy
+    fetch that includes A. While that fetch is pending, A finishes; its
+    completion pump sees no queued or in-flight work (B is only assigned
+    to sourceCountPending after the await returns) and stops the clock.
+    When the policy resolves and pump starts B, the clock must be
+    re-established so B's row and the summary keep advancing instead of
+    freezing at the elapsed value computed on first render.
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+    page.evaluate(
+        """
+        () => {
+          window.__policyRequests = 0;
+          window.__policyResolvers = [];
+          window.__countRequests = [];
+          window.__countResolvers = [];
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const target = typeof input === 'string' ? input : input.url;
+            if (target && target.indexOf('/api/import/source-scan-policy') === 0) {
+              window.__policyRequests += 1;
+              const paths = JSON.parse(init.body).folders;
+              return new Promise((resolve) => {
+                window.__policyResolvers.push(() => resolve(new Response(
+                  JSON.stringify({
+                    sources: paths.map((path) => ({
+                      path: path, volume_key: 'local-a', storage: 'local',
+                      max_parallel: 2,
+                    })),
+                  }), {status: 200, headers: {'Content-Type': 'application/json'}}
+                )));
+              });
+            }
+            if (target && target.indexOf('/api/import/folder-preview') === 0) {
+              window.__countRequests.push(JSON.parse(init.body).folders[0]);
+              return new Promise((resolve) => {
+                window.__countResolvers.push((count) => resolve(new Response(
+                  JSON.stringify({total_count: count, files: []}),
+                  {status: 200, headers: {'Content-Type': 'application/json'}}
+                )));
+              });
+            }
+            return originalFetch(input, init);
+          };
+        }
+        """
+    )
+
+    # Only the LAST policy fetch is live (earlier ones are superseded when a
+    # follow-up refreshSourceCounts bumps sourceCountRequestSeq). initImportPage
+    # itself calls refreshSourceCounts once with empty sources during startup,
+    # and the async config load can push a second call in after addSourcePath
+    # -- so this test drains resolvers via a helper that always fires the most
+    # recently registered one.
+    def resolve_latest_policy():
+        page.wait_for_function("() => window.__policyResolvers.length >= 1")
+        page.evaluate(
+            "() => { const r = window.__policyResolvers.pop(); r(); }")
+
+    page.evaluate("() => addSourcePath('/tmp/card-a')")
+    metas = page.locator("#sourceList .source-meta")
+    expect(metas.nth(0)).to_contain_text("Waiting")
+    # Drain any stale policy fetches so the next resolve targets the live one.
+    resolve_latest_policy()
+    expect(metas.nth(0)).to_contain_text("Scanning")
+    page.wait_for_function("() => window.__countResolvers.length === 1")
+
+    baseline_policy_count = page.evaluate("() => window.__policyRequests")
+    page.evaluate("() => addSourcePath('/tmp/card-b')")
+    page.wait_for_function(
+        f"() => window.__policyRequests > {baseline_policy_count}")
+
+    # A finishes while B's policy fetch is still pending. Its completion
+    # pump stops the clock because sourceCountPending is empty (B is still
+    # in the local `toSchedule` inside the awaiting runSourceCountQueue).
+    page.evaluate("() => window.__countResolvers[0](3)")
+    expect(metas.nth(0)).to_have_text("3 photos")
+
+    # Now resolve B's policy. Pump starts B's scan; the clock must have been
+    # re-established so the elapsed counter can tick past zero.
+    resolve_latest_policy()
+    page.wait_for_function("() => window.__countResolvers.length === 2")
+
+    page.wait_for_function(
+        "() => /\\b[1-9]\\d*s elapsed/.test("
+        "document.getElementById('sourceCountProgress').textContent)",
+        timeout=8000,
+    )
+
+
 def test_completed_preview_retires_redundant_source_count_scans(
         live_server, page):
     """The full preview's per-source totals stop slower duplicate walks."""

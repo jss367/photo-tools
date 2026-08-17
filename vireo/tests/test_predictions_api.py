@@ -1343,6 +1343,75 @@ def test_group_apply_treats_regenerated_predictions_as_stale(app_and_db):
     assert db.get_photo(photo_b)['flag'] == 'rejected'
 
 
+def test_group_apply_treats_deleted_observed_predictions_as_stale(app_and_db):
+    """A reclassify that deletes the observed row makes the photo stale.
+
+    Follow-up to ``test_group_apply_treats_regenerated_predictions_as_stale``.
+    The production reclassify path (``classify_job.py``) calls
+    ``clear_predictions(model=..., collection_photo_ids=[photo])`` — which
+    deletes existing prediction rows for the photo/model before writing
+    replacements. That leaves the observed row missing rather than merely
+    superseded, so the join in ``_stale_group_apply_photos`` returns no row
+    for its id and the earlier status/superseded checks never fire; the
+    apply would then proceed and ``update_predictions_status_by_photo``
+    would still touch every prediction on the photo — including whatever
+    the reclassify inserted. The client-provided ``observed_photos``
+    mapping is what lets the server invalidate the photo without querying
+    a row that no longer exists.
+    """
+    app, db = app_and_db
+    (pred_a, photo_a), (pred_b, photo_b) = _seed_burst_group(db, 'gdeleted')
+    ws = db._active_workspace_id
+    client = app.test_client()
+
+    # Reclassify on photo A between render and click: the old prediction
+    # row is deleted, then a fresh row is inserted with the modal never
+    # having seen it. This mirrors ``classify_job.py``'s
+    # ``clear_predictions(model=..., collection_photo_ids=[photo])`` +
+    # ``add_prediction`` pattern.
+    det_a = db.conn.execute(
+        "SELECT detection_id FROM predictions WHERE id = ?", (pred_a,)
+    ).fetchone()['detection_id']
+    db.conn.execute("DELETE FROM predictions WHERE id = ?", (pred_a,))
+    db.conn.commit()
+    db.add_prediction(
+        detection_id=det_a, species='Verdin', confidence=0.7,
+        model='test-model', category='new',
+        labels_fingerprint='reclassified-fresh',
+    )
+    new_pred_a = db.conn.execute(
+        """SELECT id FROM predictions
+             WHERE detection_id = ? AND classifier_model = ? AND species = ?""",
+        (det_a, 'test-model', 'Verdin'),
+    ).fetchone()['id']
+    assert new_pred_a != pred_a
+    flag_before = db.get_photo(photo_a)['flag'] or 'none'
+
+    resp = client.post('/api/predictions/group/apply', json={
+        'picks': [photo_a],
+        'rejects': [photo_b],
+        'removed': [],
+        'species': 'Azure Jay',
+        # The modal observed the pre-delete pred_a; only the client still
+        # knows which photo that id lived on.
+        'observed': {str(pred_a): 'pending', str(pred_b): 'pending'},
+        'observed_photos': {str(pred_a): photo_a, str(pred_b): photo_b},
+    })
+    assert resp.status_code == 200
+    assert resp.get_json()['already_decided'] == 1
+
+    # Photo A is untouched — including the reclassify's new row that the
+    # blind per-photo write would otherwise have flipped to ``accepted`` and
+    # tagged with the modal's stale species.
+    assert db.get_review_status(new_pred_a, ws) == 'pending'
+    assert (db.get_photo(photo_a)['flag'] or 'none') == flag_before
+    assert 'Azure Jay' not in {k['name'] for k in db.get_photo_keywords(photo_a)}
+
+    # Photo B, whose observed row still exists, still applies.
+    assert db.get_review_status(pred_b, ws) == 'rejected'
+    assert db.get_photo(photo_b)['flag'] == 'rejected'
+
+
 def test_group_apply_rejects_a_malformed_baseline(app_and_db):
     """``observed`` is validated rather than silently ignored.
 
@@ -1361,6 +1430,18 @@ def test_group_apply_rejects_a_malformed_baseline(app_and_db):
         })
         assert resp.status_code == 400, bad
 
+    # ``observed_photos`` gets the same treatment — a malformed mapping is
+    # not silently dropped, since a route that quietly forgot the deletion
+    # baseline would be exactly the stale-write hole this check exists to
+    # close.
+    for bad in (['x'], {'not-an-id': 1}, {'1': 'not-a-photo-id'}, {'1': True}):
+        resp = client.post('/api/predictions/group/apply', json={
+            'picks': [photo_a], 'rejects': [], 'removed': [], 'species': '',
+            'observed': {str(pred_a): 'pending'},
+            'observed_photos': bad,
+        })
+        assert resp.status_code == 400, bad
+
 
 def test_group_apply_client_sends_the_observed_baseline(app_and_db):
     """Review's burst modal must send what it displayed.
@@ -1371,6 +1452,11 @@ def test_group_apply_client_sends_the_observed_baseline(app_and_db):
     reason ``test_browse_panel_treats_reviewed_status_as_decided`` is: the
     guarantee is a property of the pair, and a server-side test alone would
     stay green while the modal quietly stopped participating.
+
+    ``observed_photos`` is asserted alongside because a reclassify that
+    deletes an observed row leaves the server with no way to recover the
+    photo from ``pr.id`` — the deletion-shape stale check depends on the
+    client-provided mapping.
     """
     app, _ = app_and_db
     html = app.test_client().get('/review').get_data(as_text=True)
@@ -1380,4 +1466,11 @@ def test_group_apply_client_sends_the_observed_baseline(app_and_db):
     )
     assert 'observed: observed,' in html, (
         "the burst modal must send its baseline to /api/predictions/group/apply"
+    )
+    assert 'observedPhotos[it.id] = it.photo_id;' in html, (
+        "the burst modal must record photo_id alongside status so a deleted "
+        "observed row can still name its photo"
+    )
+    assert 'observed_photos: observedPhotos,' in html, (
+        "the burst modal must send observed_photos to /api/predictions/group/apply"
     )

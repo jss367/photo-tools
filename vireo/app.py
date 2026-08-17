@@ -17496,8 +17496,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Validate ``/api/predictions/group/apply``'s render-time baseline.
 
         The burst modal sends ``observed``: the status it displayed for each
-        group member when it loaded (``{prediction_id: status}``). Returns
-        ``(observed, None)`` or ``(None, error_response)``.
+        group member when it loaded (``{prediction_id: status}``), plus
+        ``observed_photos`` (``{prediction_id: photo_id}``) so the server can
+        recover the photo of an observed row that was deleted between render
+        and apply — a case where the ``predictions``-table join alone returns
+        no row and would otherwise let the stale apply through. Returns
+        ``(observed, observed_photos, None)`` or ``(None, None, error_response)``.
 
         Absent or empty means "no baseline", and the route then applies
         unconditionally — the server can only refuse what the client claims to
@@ -17509,9 +17513,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """
         raw = body.get("observed")
         if raw is None:
-            return {}, None
+            return {}, {}, None
         if not isinstance(raw, dict):
-            return None, json_error(
+            return None, None, json_error(
                 "observed must be an object mapping prediction id to status"
             )
         observed = {}
@@ -17519,17 +17523,42 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             try:
                 pred_id = int(key)
             except (TypeError, ValueError):
-                return None, json_error(
+                return None, None, json_error(
                     "observed keys must be prediction ids"
                 )
             if not isinstance(value, str):
-                return None, json_error(
+                return None, None, json_error(
                     "observed values must be status strings"
                 )
             observed[pred_id] = value
-        return observed, None
+        raw_photos = body.get("observed_photos")
+        observed_photos = {}
+        if raw_photos is None:
+            # Optional to keep existing callers working; without it, deletion
+            # staleness cannot be detected for the affected observed row (the
+            # server has no way to recover the photo_id once the prediction is
+            # gone). The one production caller sends it — see
+            # ``test_group_apply_client_sends_the_observed_baseline``.
+            return observed, observed_photos, None
+        if not isinstance(raw_photos, dict):
+            return None, None, json_error(
+                "observed_photos must be an object mapping prediction id to photo id"
+            )
+        for key, value in raw_photos.items():
+            try:
+                pred_id = int(key)
+            except (TypeError, ValueError):
+                return None, None, json_error(
+                    "observed_photos keys must be prediction ids"
+                )
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None, None, json_error(
+                    "observed_photos values must be photo ids"
+                )
+            observed_photos[pred_id] = value
+        return observed, observed_photos, None
 
-    def _stale_group_apply_photos(db, observed):
+    def _stale_group_apply_photos(db, observed, observed_photos):
         """Photos whose group member was decided or regenerated since the modal rendered.
 
         Group apply is the one decision route where "already decided" is *not*
@@ -17545,8 +17574,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         So the precondition is compare-and-swap against what the modal
         actually displayed: skip a photo only when the picture the modal saw
-        has moved. Two shapes of "moved" invalidate a photo, in the same
-        pass so the check cannot narrow to one and miss the other:
+        has moved. Three shapes of "moved" invalidate a photo, in the same
+        pass so the check cannot narrow to one and miss the others:
 
         1. **Status drift on an observed row.** An observed row's stored
            status is no longer the one the client displayed — a decision that
@@ -17562,6 +17591,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
            not respect the observed set: it rewrites every prediction on the
            photo, including the newly inserted rows the modal never saw, and
            applies the modal's stale species to them.
+        3. **Deleted observed row.** ``clear_predictions()`` — the production
+           reclassify path (see ``classify_job.py`` where ``reclassify`` is
+           set) — removes the old prediction rows before the new ones land.
+           An observed row deleted in that window is missing from the
+           ``predictions`` join here, so the row-status and superseded checks
+           above never fire for it, and the write below still targets every
+           prediction on the photo — including the newly generated ones the
+           modal never saw. Recover its photo from ``observed_photos`` (the
+           client-provided baseline that carries the mapping the deleted row
+           can no longer supply) and invalidate that photo the same way the
+           other two shapes do.
 
         Photo-level because the write is: ``update_predictions_status_by_photo``
         restates every prediction of the photo, so one stale member
@@ -17577,6 +17617,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return set()
         ws = db._ws_id()
         stale = set()
+        found = set()
         for chunk in _chunked(list(observed)):
             placeholders = ",".join("?" for _ in chunk)
             for row in db.conn.execute(
@@ -17597,9 +17638,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                      WHERE pr.id IN ({placeholders})""",
                 (ws, *chunk),
             ):
+                found.add(row["prediction_id"])
                 if (row["status"] != observed[row["prediction_id"]]
                         or row["is_superseded"]):
                     stale.add(row["photo_id"])
+        # Shape 3: any observed row missing from the join was deleted between
+        # render and apply. Use the client-supplied photo to invalidate the
+        # photo — without the mapping, ``pr.id`` alone cannot recover it.
+        for pred_id in observed:
+            if pred_id in found:
+                continue
+            photo_id = observed_photos.get(pred_id)
+            if photo_id is not None:
+                stale.add(photo_id)
         return stale
 
     # Every route that records a prediction decision, and therefore every
@@ -18383,7 +18434,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         rejects = body.get("rejects", [])  # list of photo_ids
         removed = body.get("removed", [])  # list of prediction_ids to ungroup
         species = body.get("species", "")
-        observed, observed_err = _parse_observed_statuses(body)
+        observed, observed_photos, observed_err = _parse_observed_statuses(body)
         if observed_err is not None:
             return observed_err
 
@@ -18410,7 +18461,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # window — nothing can decide between this read and the writes
             # below, so a photo we skip here cannot silently be flagged or
             # keyworded on the other side of the transaction.
-            stale_photos = _stale_group_apply_photos(db, observed)
+            stale_photos = _stale_group_apply_photos(db, observed, observed_photos)
             actionable_picks = [pid for pid in picks if pid not in stale_photos]
             actionable_rejects = [
                 pid for pid in rejects if pid not in stale_photos

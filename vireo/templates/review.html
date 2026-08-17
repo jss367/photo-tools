@@ -3348,8 +3348,16 @@ async function grmApply() {
     // was already applied, change the split, apply — the observed status
     // still matches, so the change goes through.
     var observed = {};
+    // Parallel photo mapping: if a reclassify path deletes an observed row
+    // between render and click, the server can no longer recover its photo
+    // from the deleted ``pr.id`` alone, and the row would silently miss the
+    // stale check. Sending the mapping lets ``_stale_group_apply_photos``
+    // invalidate the photo the same way it does for status drift and a
+    // superseded fingerprint.
+    var observedPhotos = {};
     (grmState.items || []).forEach(function(it) {
       observed[it.id] = it.status || 'pending';
+      observedPhotos[it.id] = it.photo_id;
     });
     var applyResp = await safeFetch('/api/predictions/group/apply', {
       method: 'POST',
@@ -3360,6 +3368,7 @@ async function grmApply() {
         removed: Array.from(grmState.removed),
         species: species,
         observed: observed,
+        observed_photos: observedPhotos,
       }),
     });
 

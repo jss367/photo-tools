@@ -17925,6 +17925,12 @@ def test_selection_prediction_suggestions_drops_bucket_carried_only_by_borrowed_
     # box — the row was suppressed for a different reason.
     assert data["below_threshold_count"] == 0
     assert data["threshold"] == 0.80
+    # The suppressed row is counted on its own field so the panel's empty
+    # state can name why it is empty. Without this, the panel would show
+    # "No pending predictions on the selected photos" even though the
+    # pending row exists and was dropped for a specific reason
+    # (``CORE_PHILOSOPHY.md``: no black boxes).
+    assert data["suppressed_borrowed_count"] == 1
 
 
 def test_selection_prediction_suggestions_keeps_bucket_when_matching_row_above_threshold(
@@ -17974,7 +17980,8 @@ def test_selection_prediction_suggestions_keeps_bucket_when_matching_row_above_t
         json={"photo_ids": [robin_frame, sparrow_frame]},
     )
     assert resp.status_code == 200, resp.get_data(as_text=True)
-    predictions = resp.get_json()["predictions"]
+    data = resp.get_json()
+    predictions = data["predictions"]
     assert {p["species"] for p in predictions} == {"Robin"}
     robin = predictions[0]
     # Both photos aggregate under Robin — the Sparrow row's borrowed
@@ -17984,6 +17991,9 @@ def test_selection_prediction_suggestions_keeps_bucket_when_matching_row_above_t
     assert robin["predicted_count"] == 2
     assert robin["acceptable_photo_count"] == 2
     assert robin["max_confidence"] == 0.90
+    # Nothing was suppressed here: Robin has a real matching-consensus
+    # contributor. The counter must not fire on legitimate buckets.
+    assert data["suppressed_borrowed_count"] == 0
 
 
 def test_predictions_api_exposes_consensus_species_for_burst(app_and_db):
@@ -18057,6 +18067,47 @@ def test_browse_detail_panel_groups_by_consensus_species(app_and_db):
     html = client.get("/browse").get_data(as_text=True)
     # The rendered grouping key uses the consensus species when present.
     assert "p.consensus_species || p.species" in html
+
+
+def test_browse_detail_panel_suppresses_borrowed_only_buckets(app_and_db):
+    """The single-photo panel drops buckets that only borrowed evidence.
+
+    The row-level threshold filter (``rows.filter((p) => p.confidence >=
+    threshold)``) sees the raw per-frame score. In a legacy mixed-
+    consensus burst, a 95% Sparrow row survives an 80% floor and then
+    gets grouped under Robin (consensus) with ``g.confidence == null``
+    because the credit gate refuses to attribute the 95% to Robin. The
+    result is a "Robin · confidence unknown" row with an active Accept —
+    the identical bug the server-side aggregator's bucket guard fixed
+    for the multi-select panel. The detail renderer must do the same.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    # The filter that mirrors the server-side bucket guard runs after
+    # grouping and only when the workspace has a floor active.
+    assert "suppressedBorrowedRows" in html
+    assert "if (threshold > 0)" in html
+    # The suppressed rows get counted out loud — the pending row
+    # exists, and a blank spot in the list would be a black box.
+    assert "consensus-attributable score above your confidence threshold" in html
+
+
+def test_browse_selection_panel_renders_suppressed_borrowed_count(app_and_db):
+    """The selection panel surfaces the server's suppressed_borrowed_count.
+
+    Without this, a selection whose only pending bucket was borrowed-
+    evidence-only reads as "No pending predictions on the selected
+    photos" even though the pending row exists and was deliberately
+    suppressed — the empty state would collapse two different facts.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    assert "meta.suppressed_borrowed_count" in html
+    # The empty-state message must distinguish "genuinely no pending"
+    # from "pending, but every bucket was suppressed".
+    assert "No actionable predictions on the selected photos." in html
 
 
 def test_selection_prediction_suggestions_flips_status_on_already_keyworded_photo(

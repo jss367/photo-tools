@@ -7039,6 +7039,45 @@ function renderDetailPredictions(data, photoId) {
     return bConf - aConf;
   });
 
+  // Bucket-level suppression parallel to the server side
+  // (api_selection_prediction_suggestions). A pending bucket whose every
+  // credit-eligible row failed the row-vs-consensus match has
+  // ``confidence == null``: it only exists because a minority frame's
+  // raw score cleared the row filter. Rendering an Accept beside its
+  // "confidence unknown" line would let the user tag the consensus
+  // species on evidence they were never shown for it. Under
+  // ``threshold == 0`` no floor is active, so no borrowed row can have
+  // cleared one; the "confidence unknown" render remains honest and the
+  // bucket stays.
+  var suppressedBorrowedRows = 0;
+  if (threshold > 0) {
+    groups = groups.filter(function(g) {
+      if (g.decided || g.confidence != null) return true;
+      suppressedBorrowedRows += g.count;
+      return false;
+    });
+  }
+
+  if (!groups.length) {
+    var suppressedNote = suppressedBorrowedRows
+      ? '<div class="prediction-below-threshold">' +
+        suppressedBorrowedRows +
+        (suppressedBorrowedRows === 1 ? ' prediction' : ' predictions') +
+        ' had no consensus-attributable score above your confidence threshold (' +
+        formatPredictionConfidence(threshold) + '). Review has the burst context.</div>'
+      : '';
+    var belowNote = hidden
+      ? '<div class="prediction-below-threshold">' + hidden +
+        (hidden === 1 ? ' prediction' : ' predictions') +
+        ' below your confidence threshold (' +
+        formatPredictionConfidence(threshold) + ').</div>'
+      : '';
+    list.innerHTML = '<div class="selection-empty">' +
+      escapeHtml(predictionEmptyMessage(state, hidden)) + '</div>' +
+      belowNote + suppressedNote;
+    return;
+  }
+
   var shown = detailPredictionsExpanded
     ? groups
     : groups.slice(0, PREDICTION_COLLAPSE_AT);
@@ -7116,6 +7155,16 @@ function renderDetailPredictions(data, photoId) {
     html += '<div class="prediction-below-threshold">' + hidden +
       (hidden === 1 ? ' more prediction is' : ' more predictions are') +
       ' below your confidence threshold (' + formatPredictionConfidence(threshold) + ').</div>';
+  }
+  if (suppressedBorrowedRows) {
+    // Counted rather than dropped silently: the row cleared the raw-score
+    // floor but its bucket had no consensus-attributable evidence, and a
+    // blank spot in the list would be another black box. Review has the
+    // burst context to sort these out.
+    html += '<div class="prediction-below-threshold">' + suppressedBorrowedRows +
+      (suppressedBorrowedRows === 1 ? ' more prediction' : ' more predictions') +
+      ' had no consensus-attributable score above your confidence threshold (' +
+      formatPredictionConfidence(threshold) + '). Review has the burst context.</div>';
   }
   list.innerHTML = html;
 }
@@ -7431,8 +7480,29 @@ function renderSelectionPredictions(predictions, selectedCount, meta) {
       ' below your confidence threshold (' +
       formatPredictionConfidence(meta.threshold || 0) + ').</div>'
     : '';
+  // Buckets the server dropped because their only above-threshold rows
+  // borrowed evidence from a different raw species. Reported separately
+  // from ``below_threshold_count`` because the pending row itself did
+  // clear the floor — the "no consensus-attributable score" reason is a
+  // different fact and would mis-describe the row if folded into the
+  // below-threshold count.
+  var suppressed = meta.suppressed_borrowed_count || 0;
+  var suppressedNote = suppressed
+    ? '<div class="prediction-below-threshold">' + suppressed +
+      (suppressed === 1 ? ' prediction' : ' predictions') +
+      ' had no consensus-attributable score above your confidence threshold (' +
+      formatPredictionConfidence(meta.threshold || 0) + '). Review has the burst context.</div>'
+    : '';
   if (!predictions.length) {
-    list.innerHTML = '<div class="selection-empty">No pending predictions on the selected photos.</div>' + hiddenNote;
+    // Distinguish "genuinely no pending" from "pending, but every bucket
+    // was suppressed as borrowed evidence" so the user is not left
+    // wondering why a photo they know has a pending prediction shows
+    // nothing here.
+    var emptyText = suppressed
+      ? 'No actionable predictions on the selected photos.'
+      : 'No pending predictions on the selected photos.';
+    list.innerHTML = '<div class="selection-empty">' + emptyText + '</div>' +
+      hiddenNote + suppressedNote;
     return;
   }
 
@@ -7519,7 +7589,7 @@ function renderSelectionPredictions(predictions, selectedCount, meta) {
   } else if (selectionPredictionsExpanded && predictions.length > PREDICTION_COLLAPSE_AT) {
     html += '<button class="prediction-toggle" onclick="toggleSelectionPredictions()">Show fewer</button>';
   }
-  list.innerHTML = html + hiddenNote;
+  list.innerHTML = html + hiddenNote + suppressedNote;
 }
 
 async function acceptSelectionPrediction(idx) {

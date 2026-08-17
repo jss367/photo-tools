@@ -10474,6 +10474,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             kid_by_key.setdefault(keyword_match_key(row["name"]), row["id"])
 
         results = []
+        # Counter for pending rows dropped by the borrowed-evidence bucket
+        # guard below. Reported alongside ``below_threshold_count`` so a
+        # panel emptied only by this suppression can name its own reason
+        # instead of reading as "no pending predictions" — the row exists,
+        # it just has no consensus-attributable score to license an
+        # actionable button. ``CORE_PHILOSOPHY.md``: a blank panel that
+        # collapses two different facts into one is the black box the
+        # UI-transparency rule forbids.
+        suppressed_borrowed_count = 0
         for key, entry in by_key.items():
             # A bucket whose every contributing row is a burst-minority
             # frame credited to a different species has no
@@ -10495,6 +10504,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # filtered, so no borrowed row cleared a floor and the
             # "confidence unknown" render is still honest.
             if threshold > 0 and not entry["confidences"]:
+                suppressed_borrowed_count += sum(
+                    len(photo_entry["ids"])
+                    for photo_entry in entry["rows_by_photo"].values()
+                )
                 continue
             predicted_ids = sorted(entry["rows_by_photo"], key=lambda p: order[p])
             kid = kid_by_key.get(key)
@@ -10583,6 +10596,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "predictions": results,
             "threshold": threshold,
             "below_threshold_count": below_threshold_count,
+            # Pending rows the aggregator dropped because their bucket had
+            # no consensus-attributable score above the floor — a separate
+            # fact from ``below_threshold_count`` (the row itself passed
+            # the raw-score floor). Reported so the panel's empty state
+            # can distinguish "nothing pending" from "pending, but
+            # suppressed" instead of collapsing them into one blank box.
+            "suppressed_borrowed_count": suppressed_borrowed_count,
         })
 
     @app.route("/api/selection/wildlife-state", methods=["POST"])

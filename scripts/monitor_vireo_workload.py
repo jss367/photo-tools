@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ipaddress
 import json
 import math
 import os
 import platform
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -70,13 +72,20 @@ def _number_summary(values):
     }
 
 
+# URLs — cover before path patterns so "http://…" isn't split by the path REs.
+_URL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s]+")
 # Absolute unix paths ("/foo/bar") anchored to a start-of-string or whitespace so
-# fractions such as "1/3" in job phase strings are not misread as paths.
-_UNIX_PATH_RE = re.compile(r"(?:(?<=\s)|^)(?:/[A-Za-z0-9._~%\-]+)+/?")
-# Windows drive-letter paths ("C:\Users\...").
-_WIN_PATH_RE = re.compile(r"\b[A-Za-z]:\\[A-Za-z0-9._\\\-]+")
+# fractions such as "1/3" in job phase strings are not misread as paths.  The
+# body accepts any non-delimiter character so unicode segments (``/家族/写真``)
+# and library names with spaces (``/My Photos``) redact instead of leaking.
+_UNIX_PATH_RE = re.compile(r"(?:(?<=\s)|^)/[^:\r\n\"']+")
+# Windows drive-letter paths ("C:\Users\..." or "C:/Users/..."), also accepting
+# any non-delimiter character in the body so unicode and spaced segments match.
+_WIN_PATH_RE = re.compile(r"\b[A-Za-z]:[\\/][^:\r\n\"']+")
 # Filenames with a common-shaped extension (`name.ext`, extension starts with a
 # letter and is 2-8 chars long) so numeric fragments like "1.2" are ignored.
+# `\w` is unicode-aware in Python 3, so `写真.raw` is redacted the same way as
+# `capture.nef`.
 _FILENAME_RE = re.compile(r"\b[\w\-]+\.[A-Za-z][A-Za-z0-9]{1,7}\b")
 
 
@@ -86,13 +95,15 @@ def _sanitize_phase(phase):
     `vireo/app.py` builds phase text such as ``"Scanning root 1 of 2:
     /private/photos"`` and ``"Downloading 1/3: capture.nef..."``.  Reports
     promise to exclude filenames and full paths, so before including a phase
-    in the sanitized report we redact any path or filename tokens it contains.
+    in the sanitized report we redact any URL, path, or filename tokens it
+    contains — including unicode segments and paths that carry spaces.
     Returns ``None`` when the sanitized value would be empty.
     """
     if not isinstance(phase, str):
         return None
-    sanitized = _UNIX_PATH_RE.sub("[path]", phase)
+    sanitized = _URL_RE.sub("[url]", phase)
     sanitized = _WIN_PATH_RE.sub("[path]", sanitized)
+    sanitized = _UNIX_PATH_RE.sub("[path]", sanitized)
     sanitized = _FILENAME_RE.sub("[file]", sanitized)
     sanitized = sanitized.strip()
     return sanitized or None
@@ -438,6 +449,7 @@ def _scenario_summary(jobs):
 
 def build_summary(baseline, samples):
     successful = [sample for sample in samples if sample["api"].get("status") == 200]
+    api_failure_count = len(samples) - len(successful)
     api_latencies = [sample["api"]["latency_seconds"] for sample in successful]
     process_cpu = [sample["process"]["cpu_percent"] for sample in samples]
     process_rss = [sample["process"]["rss_bytes"] for sample in samples]
@@ -478,7 +490,7 @@ def build_summary(baseline, samples):
     )
     return {
         "sample_count": len(samples),
-        "api_failure_count": len(samples) - len(successful),
+        "api_failure_count": api_failure_count,
         "vireo_process_tree_cpu_percent": _number_summary(process_cpu),
         "vireo_process_tree_rss_bytes": {
             **(_number_summary(process_rss) or {}),
@@ -492,8 +504,14 @@ def build_summary(baseline, samples):
         "embedding_cache_delta": embedding_delta,
         "cpu_capacity_burst_samples": cpu_cap_violations,
         "targets": {
+            # Failed requests (timeouts, non-200) are excluded from the p95
+            # calculation, so a run with one fast success and many long
+            # timeouts would otherwise report the gate as met.  Require zero
+            # API failures for the responsiveness gate to pass.
             "jobs_api_p95_below_500ms": (
-                latency_summary is not None and latency_summary["p95"] < 0.5
+                latency_summary is not None
+                and latency_summary["p95"] < 0.5
+                and api_failure_count == 0
             ),
             "system_idle_cpu_p05_at_least_10_percent": (
                 idle_summary is not None and idle_summary["p05"] >= 10.0
@@ -586,7 +604,45 @@ def _is_vireo_process(process, *, psutil_module):
     return "vireo-server" in f"{name} {cmdline}".lower()
 
 
-def _process_owns_port(process, port, *, psutil_module):
+def _resolve_hostname(hostname, *, resolver=socket.getaddrinfo):
+    try:
+        infos = resolver(hostname, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return frozenset()
+    return frozenset(info[4][0] for info in infos if info and info[4])
+
+
+def _listener_reachable_via(host, listener_ip, *, resolver=socket.getaddrinfo):
+    """Return True if a connection to ``host`` would reach ``listener_ip``.
+
+    A listener bound to ``0.0.0.0``/``::`` accepts any local address, so
+    loopback URLs are considered reachable; a listener bound to a specific
+    address requires the URL to resolve to that same address (loopback
+    hostnames also match loopback listeners).
+    """
+    resolved = _resolve_hostname(host, resolver=resolver)
+    if not resolved:
+        return False
+    all_bind = listener_ip in {"0.0.0.0", "::"}
+    try:
+        listener_addr = ipaddress.ip_address(listener_ip)
+    except ValueError:
+        listener_addr = None
+    for addr_str in resolved:
+        try:
+            addr = ipaddress.ip_address(addr_str)
+        except ValueError:
+            continue
+        if addr.is_loopback:
+            if all_bind or (listener_addr is not None and listener_addr.is_loopback):
+                return True
+            continue
+        if not all_bind and addr_str == listener_ip:
+            return True
+    return False
+
+
+def _process_owns_url(process, port, host, *, psutil_module, resolver=socket.getaddrinfo):
     candidates = [process]
     with contextlib.suppress(OSError, psutil_module.Error):
         candidates.extend(process.children(recursive=True))
@@ -598,12 +654,20 @@ def _process_owns_port(process, port, *, psutil_module):
         for connection in connections:
             if connection.status != psutil_module.CONN_LISTEN:
                 continue
-            if connection.laddr.port == port:
+            if connection.laddr.port != port:
+                continue
+            if _listener_reachable_via(host, connection.laddr.ip, resolver=resolver):
                 return candidate
     return None
 
 
-def discover_server(*, requested_pid=None, requested_url=None, psutil_module=psutil):
+def discover_server(
+    *,
+    requested_pid=None,
+    requested_url=None,
+    psutil_module=psutil,
+    resolver=socket.getaddrinfo,
+):
     if psutil_module is None:
         raise RuntimeError(
             "psutil is required; install the Vireo development dependencies"
@@ -617,13 +681,21 @@ def discover_server(*, requested_pid=None, requested_url=None, psutil_module=psu
         except psutil_module.Error as exc:
             raise RuntimeError(f"Vireo PID {requested_pid} is not running") from exc
         # Verify the PID (or a descendant) actually owns the URL's listening
-        # port and looks like vireo-server; otherwise samples could be mixed
-        # from two processes and silently corrupt the workload comparison.
-        owner = _process_owns_port(process, parsed.port, psutil_module=psutil_module)
+        # port *and* is reachable via the URL's host; otherwise samples could
+        # be mixed from two processes (or two hosts on the same port) and
+        # silently corrupt the workload comparison.
+        owner = _process_owns_url(
+            process,
+            parsed.port,
+            parsed.hostname,
+            psutil_module=psutil_module,
+            resolver=resolver,
+        )
         if owner is None:
             raise RuntimeError(
                 f"PID {requested_pid} does not own {requested_url}: no process "
-                f"in its tree is listening on port {parsed.port}"
+                f"in its tree is listening on port {parsed.port} at an address "
+                f"reachable via {parsed.hostname!r}"
             )
         if not _is_vireo_process(owner, psutil_module=psutil_module):
             raise RuntimeError(

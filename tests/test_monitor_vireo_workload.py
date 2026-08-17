@@ -166,6 +166,54 @@ def test_collect_workload_builds_deltas_targets_and_job_summary():
     assert summary["jobs"][0]["observed_resource_wait_seconds"] == 2.5
 
 
+def test_latency_target_fails_when_api_samples_fail():
+    """A run with one fast success and one long timeout used to report
+    ``jobs_api_p95_below_500ms: true`` because failed requests were excluded
+    from the percentile — the responsiveness gate must not pass when any
+    API call failed.
+    """
+    clock = _FakeClock()
+    api = _SequenceApi([
+        _api_sample(  # baseline
+            latency=0.001, wait_count=0, wait_seconds=0.0,
+            producer_starts=0, waiter_joins=0,
+        ),
+        _api_sample(
+            latency=0.010, wait_count=0, wait_seconds=0.0,
+            producer_starts=0, waiter_joins=0,
+        ),
+        {"status": None, "latency_seconds": 5.0, "error": "timeout"},
+    ])
+    process = _SequenceSampler(
+        [
+            {"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True},
+            {"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True},
+        ],
+        {"pid": 123, "executable_exists": True},
+    )
+    system = _SequenceSampler(
+        [{"cpu_idle_percent": 50.0}, {"cpu_idle_percent": 50.0}],
+        {"logical_cpu_count": 16},
+    )
+
+    report = collect_workload(
+        duration=2.0,
+        interval=1.0,
+        api_client=api,
+        process_sampler=process,
+        system_sampler=system,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    summary = report["summary"]
+    assert summary["api_failure_count"] == 1
+    # Only the successful 10ms response is in the percentile — p95 is well
+    # under 500ms — but the target still has to fail because of the timeout.
+    assert summary["jobs_api_latency_seconds"]["p95"] == 0.01
+    assert summary["targets"]["jobs_api_p95_below_500ms"] is False
+
+
 def test_compact_jobs_payload_removes_paths_configs_results_and_filenames():
     compact = compact_jobs_payload({
         "active": [{
@@ -202,6 +250,55 @@ def test_compact_jobs_payload_removes_paths_configs_results_and_filenames():
         "total": 10,
         "phase": "Detecting",
     }
+
+
+def test_compact_jobs_payload_sanitizes_unicode_spaced_and_windows_paths_from_phase():
+    """Real-world job phase strings may embed unicode segments (``/家族/写真``),
+    library paths with spaces (``/My Photos``), and Windows drive paths — none
+    of which can be allowed to leak into the sanitized report.
+    """
+    compact = compact_jobs_payload({
+        "active": [
+            {
+                "id": "unicode-scan",
+                "type": "scan",
+                "status": "running",
+                "progress": {"phase": "Scanning root 1 of 2: /家族/写真"},
+            },
+            {
+                "id": "spaces-scan",
+                "type": "scan",
+                "status": "running",
+                "progress": {"phase": "Scanning root 1 of 2: /My Photos/Family"},
+            },
+            {
+                "id": "win-scan",
+                "type": "scan",
+                "status": "running",
+                "progress": {"phase": "Scanning C:\\Program Files\\Vireo\\lib"},
+            },
+            {
+                "id": "unicode-file",
+                "type": "scan",
+                "status": "running",
+                "progress": {"phase": "Downloading 写真.raw..."},
+            },
+        ],
+        "history": [],
+        "resource_budget": {"waiters": 0},
+    })
+
+    encoded = json.dumps(compact, ensure_ascii=False)
+    assert "家族" not in encoded
+    assert "My Photos" not in encoded
+    assert "Family" not in encoded
+    assert "Program Files" not in encoded
+    assert "写真.raw" not in encoded
+
+    assert compact["jobs"][0]["progress"]["phase"] == "Scanning root 1 of 2: [path]"
+    assert compact["jobs"][1]["progress"]["phase"] == "Scanning root 1 of 2: [path]"
+    assert compact["jobs"][2]["progress"]["phase"] == "Scanning [path]"
+    assert compact["jobs"][3]["progress"]["phase"] == "Downloading [file]..."
 
 
 def test_compact_jobs_payload_sanitizes_paths_and_filenames_from_phase():
@@ -302,24 +399,36 @@ def test_api_client_establishes_browser_cookie_before_reading_jobs():
 
 
 class _FakeConn:
-    def __init__(self, port, *, status="LISTEN"):
+    def __init__(self, port, *, ip="127.0.0.1", status="LISTEN"):
         self.status = status
-        self.laddr = type("Addr", (), {"port": port, "ip": "127.0.0.1"})()
+        self.laddr = type("Addr", (), {"port": port, "ip": ip})()
 
 
 class _FakeProc:
-    def __init__(self, pid, *, name="vireo-server", cmdline=None, port=None, children=None):
+    def __init__(
+        self,
+        pid,
+        *,
+        name="vireo-server",
+        cmdline=None,
+        port=None,
+        listener_ip="127.0.0.1",
+        children=None,
+    ):
         self.pid = pid
         self._name = name
         self._cmdline = cmdline if cmdline is not None else [name]
         self._port = port
+        self._listener_ip = listener_ip
         self._children = list(children or [])
 
     def as_dict(self, attrs=None):
         return {"name": self._name, "cmdline": list(self._cmdline)}
 
     def net_connections(self, kind="tcp"):
-        return [_FakeConn(self._port)] if self._port is not None else []
+        if self._port is None:
+            return []
+        return [_FakeConn(self._port, ip=self._listener_ip)]
 
     def children(self, recursive=False):
         return list(self._children)
@@ -338,6 +447,18 @@ class _FakePsutil:
         return self._processes[pid]
 
 
+def _fake_resolver(host_to_ips):
+    def resolver(host, _port, type=None):
+        ips = host_to_ips.get(host, [])
+        if not ips:
+            raise OSError(f"unknown host {host}")
+        return [(0, 0, 0, "", (ip, 0)) for ip in ips]
+    return resolver
+
+
+_LOOPBACK_RESOLVER = _fake_resolver({"127.0.0.1": ["127.0.0.1"]})
+
+
 def test_explicit_server_accepted_when_pid_owns_url_port():
     proc = _FakeProc(4242, port=50222)
     fake = _FakePsutil([proc])
@@ -346,6 +467,7 @@ def test_explicit_server_accepted_when_pid_owns_url_port():
         requested_pid=4242,
         requested_url="http://127.0.0.1:50222",
         psutil_module=fake,
+        resolver=_LOOPBACK_RESOLVER,
     )
 
     assert server == {"pid": 4242, "url": "http://127.0.0.1:50222"}
@@ -360,6 +482,21 @@ def test_explicit_server_accepted_when_child_process_owns_port():
         requested_pid=4242,
         requested_url="http://127.0.0.1:50222",
         psutil_module=fake,
+        resolver=_LOOPBACK_RESOLVER,
+    )
+
+    assert server == {"pid": 4242, "url": "http://127.0.0.1:50222"}
+
+
+def test_explicit_server_accepted_when_listener_binds_all_interfaces():
+    proc = _FakeProc(4242, port=50222, listener_ip="0.0.0.0")
+    fake = _FakePsutil([proc])
+
+    server = discover_server(
+        requested_pid=4242,
+        requested_url="http://127.0.0.1:50222",
+        psutil_module=fake,
+        resolver=_LOOPBACK_RESOLVER,
     )
 
     assert server == {"pid": 4242, "url": "http://127.0.0.1:50222"}
@@ -378,6 +515,26 @@ def test_explicit_server_rejected_when_pid_does_not_own_url_port():
             requested_pid=4242,
             requested_url="http://127.0.0.1:50222",
             psutil_module=fake,
+            resolver=_LOOPBACK_RESOLVER,
+        )
+
+
+def test_explicit_server_rejected_when_url_host_does_not_match_listener_ip():
+    """The URL host may resolve to a different machine even when the port
+    matches, so the local PID's CPU/RSS would be paired with API samples
+    from an unrelated server on the LAN.  The listener bound to loopback
+    must not be accepted for a URL that resolves off-loopback.
+    """
+    proc = _FakeProc(4242, port=50222, listener_ip="127.0.0.1")
+    fake = _FakePsutil([proc])
+    resolver = _fake_resolver({"otherhost.local": ["192.168.1.5"]})
+
+    with pytest.raises(RuntimeError, match="does not own"):
+        discover_server(
+            requested_pid=4242,
+            requested_url="http://otherhost.local:50222",
+            psutil_module=fake,
+            resolver=resolver,
         )
 
 
@@ -390,4 +547,5 @@ def test_explicit_server_rejected_when_owning_process_is_not_vireo():
             requested_pid=4242,
             requested_url="http://127.0.0.1:50222",
             psutil_module=fake,
+            resolver=_LOOPBACK_RESOLVER,
         )

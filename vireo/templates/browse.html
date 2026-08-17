@@ -7004,19 +7004,39 @@ function renderDetailPredictions(data, photoId) {
     if (!g) {
       g = groupByKey[key] = {
         species: displaySpecies, status: decided ? p.status : 'pending',
-        decided: decided, ids: [], models: {}, ambiguous: [], best: null, count: 0,
+        decided: decided, ids: [], models: {}, ambiguous: [], confidence: null, count: 0,
       };
       groups.push(g);
     }
     g.count++;
     g.ids.push(p.id);
     if (p.model) g.models[p.model] = true;
-    if (!g.best || (p.confidence || 0) > (g.best.confidence || 0)) g.best = p;
+    // Credit ``p.confidence`` to the bucket only when the row's own raw
+    // label agrees with the consensus. A Sparrow-labelled frame in a
+    // Robin-majority burst is stored with ``p.species == "Sparrow"`` and
+    // its 0.95 score is evidence for Sparrow, not Robin — pooling it here
+    // would render "Robin · 95%" beside a bucket in which nothing scored
+    // Robin at 95%, and let the sort float that bucket above genuine
+    // Robin evidence. Mirrors the server-side aggregator's rule in
+    // ``api_selection_prediction_suggestions``; a bucket with no
+    // contributing row keeps ``confidence == null`` and renders as
+    // "confidence unknown" via ``formatPredictionConfidence``.
+    if (asciiCaseFoldKey(p.species || '') === asciiCaseFoldKey(g.species)
+        && p.confidence != null
+        && (g.confidence == null || p.confidence > g.confidence)) {
+      g.confidence = p.confidence;
+    }
     if (!decided && predictionIsAmbiguous(p)) g.ambiguous.push(p);
   });
   groups.sort(function(a, b) {
     if (a.decided !== b.decided) return a.decided ? 1 : -1;
-    return (b.best.confidence || 0) - (a.best.confidence || 0);
+    // Buckets whose only rows are minority-frame borrowers (confidence ==
+    // null) sink below any bucket carrying real evidence, so a legacy
+    // Robin bucket with no Robin-labelled row does not rank above a
+    // 60% bucket that does.
+    var aConf = a.confidence == null ? -1 : a.confidence;
+    var bConf = b.confidence == null ? -1 : b.confidence;
+    return bConf - aConf;
   });
 
   var shown = detailPredictionsExpanded
@@ -7035,7 +7055,7 @@ function renderDetailPredictions(data, photoId) {
     // be making in Review.
     var ambiguous = !g.decided && g.ambiguous.length > 0;
     var cls = 'prediction-row' + (g.decided ? ' decided' : '') + (ambiguous ? ' ambiguous' : '');
-    var meta = formatPredictionConfidence(g.best.confidence) +
+    var meta = formatPredictionConfidence(g.confidence) +
       ' · ' + Object.keys(g.models).join(', ');
     if (g.count > 1) meta += ' · on ' + g.count + ' detections';
     var actions;
@@ -7077,10 +7097,18 @@ function renderDetailPredictions(data, photoId) {
   // Name what is collapsed and how weak it is, so the shortened list can never
   // be mistaken for the whole answer.
   if (collapsed > 0) {
-    var weakest = groups[shown.length].best.confidence;
+    var weakest = groups[shown.length].confidence;
+    // "N weaker species (X% and below)" is only truthful when the first
+    // collapsed bucket carries evidence of its own species. Legacy burst
+    // groups whose only rows are minority-frame borrowers land here with
+    // ``confidence == null``; ranking them as "weaker" or claiming an
+    // "X% and below" bound they never had would be the same borrowed-
+    // score problem the meta line was just fixed to avoid.
+    var weakestLabel = weakest == null
+      ? 'confidence unknown'
+      : formatPredictionConfidence(weakest) + ' and below';
     html += '<button class="prediction-toggle" data-prediction-action="toggle">Show ' +
-      collapsed + ' weaker species (' + formatPredictionConfidence(weakest) +
-      ' and below)</button>';
+      collapsed + ' weaker species (' + weakestLabel + ')</button>';
   } else if (detailPredictionsExpanded && groups.length > PREDICTION_COLLAPSE_AT) {
     html += '<button class="prediction-toggle" data-prediction-action="toggle">Show fewer</button>';
   }

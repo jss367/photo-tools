@@ -20107,6 +20107,96 @@ def test_browse_detail_prediction_buttons_survive_apostrophe_species(
     ]
 
 
+def test_browse_detail_panel_scores_consensus_species_from_matching_row(
+    app_and_db,
+):
+    """Codex P2 (browse.html:7038): borrowed confidence for the consensus.
+
+    ``renderDetailPredictions`` groups burst rows under their
+    ``consensus_species`` — a Robin/Robin/Sparrow burst aggregates under
+    Robin from every frame, including the Sparrow-labelled minority — but
+    the pre-fix rendering then ranked the group by whichever row's raw
+    ``p.confidence`` was highest. Sparrow at 95% in a Robin-majority
+    burst was rendered as ``Robin · 95%`` even though nothing scored
+    Robin at 95%, and the sort could float that bucket above genuine
+    Robin evidence at a real 60%.
+
+    Reachability is legacy: the classifier since #1165 stores
+    ``group_id = NULL`` when the frames disagree, but rows written before
+    that are still pending in the catalog and carry a mixed-consensus
+    ``group_id``. The single-photo panel used to display and rank them
+    on a borrowed score.
+
+    Mirrors the server-side fix in
+    ``api_selection_prediction_suggestions``: credit ``p.confidence``
+    only when the raw label agrees with the consensus, and a bucket with
+    no contributing row reports confidence unknown and sinks below any
+    bucket carrying real evidence.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+
+    def _pred(pid, raw, consensus, confidence):
+        return {
+            "id": pid, "photo_id": 44,
+            "species": raw, "consensus_species": consensus,
+            "status": "pending", "confidence": confidence,
+            "model": "burst-classifier", "effective_category": "new",
+            "alternatives": [],
+        }
+
+    def _render(preds):
+        return _run_detail_prediction_panel(html, "render", {
+            "photoId": 44,
+            "data": {
+                "predictions": preds,
+                "photo_states": {"44": {
+                    "threshold": 0,
+                    "detector_ran": True,
+                    "classifier_ran": True,
+                }},
+            },
+        })["html"]
+
+    # Two rows, both aggregated under Robin (their ``consensus_species``).
+    # The minority Sparrow frame scores 0.95 — evidence for Sparrow, not
+    # Robin. The Robin-labelled frame scores 0.60 — the only real Robin
+    # evidence in the bucket. The rendered meta line must credit Robin
+    # at 60% (its own evidence), never at Sparrow's 95%.
+    mixed = _render([
+        _pred(1, "Sparrow", "Robin", 0.95),
+        _pred(2, "Robin", "Robin", 0.60),
+    ])
+    assert "60%" in mixed, mixed
+    assert "95%" not in mixed, (
+        "the Sparrow frame's 0.95 was for Sparrow — the Robin bucket must "
+        "not rank or display on a borrowed score"
+    )
+
+    # Only-minority bucket: every row in the Robin bucket is a Sparrow
+    # frame, so no row carries Robin evidence and the confidence is
+    # unknown, not a fabricated 95%.
+    only_minority = _render([_pred(1, "Sparrow", "Robin", 0.95)])
+    assert "confidence unknown" in only_minority, only_minority
+    assert "95%" not in only_minority
+
+    # Sort: a bucket with real 60% Cormorant evidence still ranks above
+    # one whose only rows borrow from another species (null confidence).
+    # Document order is DOM order, which is what the user reads.
+    ranked = _render([
+        _pred(1, "Sparrow", "Robin", 0.95),
+        _pred(2, "Cormorant", "Cormorant", 0.60),
+    ])
+    cormorant_at = ranked.find("Cormorant")
+    robin_at = ranked.find("Robin")
+    assert cormorant_at != -1 and robin_at != -1
+    assert cormorant_at < robin_at, (
+        "a bucket with genuine 60% evidence must rank above one whose "
+        "only rows borrow from another species"
+    )
+
+
 def test_browse_reject_toast_names_workspace_detach_skips(app_and_db):
     """A reject that skipped a detached photo has to say so.
 

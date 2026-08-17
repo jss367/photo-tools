@@ -1145,6 +1145,75 @@ def test_group_apply_allows_a_deliberate_re_decision(app_and_db):
     assert db.get_review_status(pred_b, ws) == 'accepted'
 
 
+def test_group_apply_writes_every_side_effect_in_one_transaction(
+    app_and_db, monkeypatch,
+):
+    """A burst apply is one decision, so it is one transaction.
+
+    This is the structural property that makes a single staleness check
+    sufficient. The route used to check the baseline twice — once before the
+    flag/keyword writes and once at the status write — with those writes
+    committing on their own in between. A decision landing in that gap made
+    the second check skip the status update for a photo whose flag, keyword,
+    pending change and history rows had already committed: flagged and tagged
+    with a species whose prediction reads rejected.
+
+    The test drives the same boundary from the side that can be forced
+    deterministically. A photo leaves the workspace part-way through the
+    apply, which is the one mid-flight failure the route can hit for real
+    (its pre-lock membership check runs before ``BEGIN IMMEDIATE``). Every
+    write made for the *earlier* photo has to be gone. Under the old shape
+    they were already committed and stayed — which is why "the flag and
+    keyword writes are not review state" was never a safe reason to leave
+    them outside.
+    """
+    from repositories.photo_review import PhotoReviewRepository
+
+    app, db = app_and_db
+    (pred_a, photo_a), (pred_b, photo_b) = _seed_burst_group(db, 'gatomic')
+    ws = db._active_workspace_id
+    client = app.test_client()
+
+    # Photo B detaches from the workspace after the route's pre-lock check
+    # passed — detected at the first write that touches it.
+    original_verify = PhotoReviewRepository._verify_photo
+
+    def detached_for_b(self, photo_id):
+        if photo_id == photo_b:
+            raise ValueError(
+                f"Photo {photo_id} does not belong to the active workspace"
+            )
+        return original_verify(self, photo_id)
+
+    monkeypatch.setattr(
+        PhotoReviewRepository, "_verify_photo", detached_for_b,
+    )
+
+    history_before = len(db.get_edit_history(limit=100))
+    resp = client.post('/api/predictions/group/apply', json={
+        'picks': [photo_a, photo_b],
+        'rejects': [],
+        'removed': [],
+        'species': 'Azure Jay',
+        'observed': {str(pred_a): 'pending', str(pred_b): 'pending'},
+    })
+    assert resp.status_code == 403
+
+    # Nothing was written for photo A, which the loop reached first.
+    assert (db.get_photo(photo_a)['flag'] or 'none') == 'none'
+    assert 'Azure Jay' not in {k['name'] for k in db.get_photo_keywords(photo_a)}
+    assert db.get_review_status(pred_a, ws) == 'pending'
+    assert not [
+        c for c in db.get_pending_changes() if c['photo_id'] == photo_a
+    ]
+    assert len(db.get_edit_history(limit=100)) == history_before
+    # Not even the keyword row: ``add_keyword`` runs inside the same
+    # transaction, so a refused burst leaves no orphan species behind.
+    assert db.conn.execute(
+        "SELECT 1 FROM keywords WHERE name = 'Azure Jay'"
+    ).fetchone() is None
+
+
 def test_group_apply_rejects_a_malformed_baseline(app_and_db):
     """``observed`` is validated rather than silently ignored.
 

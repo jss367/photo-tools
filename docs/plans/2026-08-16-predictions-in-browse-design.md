@@ -116,6 +116,31 @@ and each row accepts as its own species.
 so the display fix stays a defence rather than the only thing standing
 between the user and a mislabelled Accept.
 
+That invariant is younger than the catalog, though. `group_reviewable`
+arrived in #1165 (2026-07-10); before it, every multi-frame burst stored a
+`group_id` with a multi-species `individual`, and those rows are still in the
+database. For them the consensus genuinely differs from the row's own label,
+which matters for the **confidence** the panel prints: `predictions.confidence`
+is the score of the frame's own label, so folding a 95%-scored minority frame
+into the consensus bucket would report a number belonging to a different
+species than the one named, and float that bucket up the strength-ordered
+list on evidence that was never for it. The aggregator therefore only counts
+a row's confidence toward the bucket it names when the row's own label *is*
+that species. The row still belongs to the bucket — accepting it does apply
+the consensus — it simply carries no evidence for it. A bucket left with no
+contributing row reports `min_confidence`/`max_confidence` as `null`, which
+`formatPredictionConfidence` renders as "confidence unknown": the honest
+answer, rather than a percentage the user would read as the classifier's
+confidence in a species it never scored.
+
+The threshold filter deliberately still uses the row's own confidence. That
+floor decides whether a prediction row is worth surfacing at all, and the
+row's score is a true statement about the row; what was wrong was attributing
+it to a species, and attribution is now a separate step. Filtering the row out
+instead would hide a real pending prediction with no accurate wording for why
+— `below_threshold_count` says "below your confidence threshold", which such a
+row is not.
+
 ### One size limit, two endpoints
 
 One bound, one unit, one constant: `_MAX_SELECTION_PHOTOS = 1000` **photos**,
@@ -641,18 +666,85 @@ instead of inferred from a button's existence. A deliberate re-decision passes
 (observed `accepted` still matches current `accepted`); an accept or reject
 that landed from Browse or a second tab does not.
 
-The check runs twice, for two different jobs. Once before any writes, so a
-stale photo takes no flag and no keyword either — the status guard alone would
-still have tagged a photo it then refused to mark accepted, arriving at
-keyword-on-a-dismissed-row from the other side. Once again inside the lock,
-which is what makes the decision write itself atomic rather than merely
-ordered. Skipped photos come back as `already_decided`, counted in photos (the
-unit the modal works in), and the modal names them in a toast and reloads
-rather than patching its local statuses. An absent `observed` means no baseline
-and applies unconditionally — the server can only refuse what the client claims
-to have seen — so
-`test_group_apply_client_sends_the_observed_baseline` asserts the rendered page
-still sends it, the same pairing as the panel's decided-status test.
+The check runs **once**, with the writer lock already held, and every write
+the route makes happens after it and inside the same transaction. Getting
+there took four passes, each of which moved one write across the boundary and
+left the next one behind:
+
+1. reads were hoisted above the writes they described;
+2. the writes were serialized with `BEGIN IMMEDIATE`;
+3. the route sweep found the decision routes that took no lock at all;
+4. group apply's status tail moved under the lock — leaving the flag, keyword,
+   pending-change and history writes committing outside it.
+
+That fourth shape is why one check is not enough and two are worse than they
+look. With a pre-lock check *and* an in-lock recheck, a decision committing
+between them made the recheck skip only the status write, while the writes
+already committed stayed: the photo ends up flagged and tagged with a species
+whose prediction reads `rejected` — exactly the contradiction the precondition
+exists to prevent, reached from the remaining side. Splitting a decision into
+"the part under the lock" and "the part beside it" recreates the race no
+matter which part moves. "These writes are not review state" was the reasoning
+that kept them outside; it was never a reason they could be *decided*
+separately.
+
+So the whole body of `_apply_group_decisions` is the decision. Enumerated,
+because "which side of the boundary is this on" is the question that kept
+being answered one write at a time:
+
+| Side effect | Inside the lock | After the staleness decision |
+| --- | --- | --- |
+| `add_keyword` (species row) | yes | yes |
+| `update_photo_flag` — picks and rejects | yes | yes |
+| `tag_photo` (species keyword) | yes | yes |
+| `queue_change` `keyword_add` (XMP sync) | yes | yes |
+| `record_edit` `keyword_add` (history) | yes | yes |
+| `queue_flag_change_if_enabled` (XMP sync) | yes | yes |
+| `record_edit` `flag` (history) | yes | yes |
+| `update_predictions_status_by_photo` | yes | yes |
+| `ungroup_prediction` (`removed`) | yes | deliberately not gated |
+| `_prune_edit_history` | after the commit | n/a |
+
+Two entries are deliberately not symmetric. Ungrouping is inside the
+transaction but not gated on the baseline: it changes which rows the modal
+shows together, not what any of them means, and a rolled-back apply must not
+leave a surviving ungroup behind. Pruning history runs after the commit
+because `record_edit(_commit=False)` defers it — the same shape the batch
+endpoints use.
+
+Every write passes `_commit=False`; a helper committing halfway would release
+the writer lock in the middle of the decision. `update_photo_flag` (and
+`PhotoReviewRepository.set_flag` beneath it) gained that parameter for this.
+Its workspace verification still runs, and it is the first write for both
+picks and rejects, so a photo that detached from the workspace after the
+route's pre-lock check raises before it can be tagged or have
+workspace-scoped review state written — and because that now happens inside
+the transaction, the resulting 403 leaves *nothing* written instead of a
+half-applied burst.
+`test_group_apply_writes_every_side_effect_in_one_transaction` drives exactly
+that path and asserts the earlier photo's flag, keyword, pending change,
+history entry and even the created keyword row are all absent.
+
+Skipped photos come back as `already_decided`, counted in photos (the unit the
+modal works in), and the modal names them in a toast and reloads rather than
+patching its local statuses. An absent `observed` means no baseline and
+applies unconditionally — the server can only refuse what the client claims to
+have seen — so `test_group_apply_client_sends_the_observed_baseline` asserts
+the rendered page still sends it, the same pairing as the panel's
+decided-status test.
+
+**Known remaining gap: undo/redo replay.** `api_undo` and `api_redo` take the
+decision lock (pass 3 above put them on the list), but
+`Database.undo_last_edit` → `_apply_undo` calls helpers that commit per item —
+`update_photo_rating`, `update_photo_flag`, `set_color_label`,
+`set_photo_edit_recipe`, `untag_photo`, and an explicit commit in the
+`prediction_accept` branch. The first of those releases the writer lock
+mid-replay, so an undo spanning several items is ordered but not atomic
+against a concurrent decision. It is strictly better than the pre-PR state
+(no lock at all) and it is the same class as the four passes above. Closing it
+means threading `_commit` through eight more `Database` helpers and
+re-auditing `_apply_redo`, which is a change to undo/redo rather than to
+Browse's prediction panel — recorded here rather than folded into this PR.
 
 **The endpoint's contract.** Every row `batch-accept` accepts is one that is
 still undecided, still unambiguous, still from the current label set, still

@@ -37,9 +37,12 @@ RAW_CONF_FLOOR = 0.01
 # useful pixels.  When that pass has no ordinary-confidence animal, retry on a
 # small overlapping crop grid.  Keeping these values detector-owned (rather
 # than workspace config) makes a cached detector artifact mean the same thing
-# in every workspace.
+# in every workspace.  Tiled crops themselves are postprocessed at
+# ``RAW_CONF_FLOOR`` (not the trigger threshold) so that a workspace lowering
+# its user-visible confidence threshold can still surface small-subject boxes
+# that the crop grid found — matching the full-frame pass and preserving the
+# read-time-filter contract of the global detection cache.
 TILED_FALLBACK_TRIGGER_CONFIDENCE = 0.20
-TILED_FALLBACK_MIN_CONFIDENCE = 0.20
 TILED_EARLY_STOP_CONFIDENCE = 0.30
 TILED_COVERAGE_CROP_COUNT = 6
 TILED_CROP_FRACTION = 0.60
@@ -508,7 +511,7 @@ def _tiled_fallback(session, input_name, image_array):
         left, top, right, bottom = window
         crop = image_array[top:bottom, left:right]
         detections = _infer_array(
-            session, input_name, crop, TILED_FALLBACK_MIN_CONFIDENCE,
+            session, input_name, crop, RAW_CONF_FLOOR,
         )
         for detection in detections:
             mapped = _map_tile_detection(

@@ -345,6 +345,49 @@ def test_detect_animals_runs_tiled_fallback_after_weak_full_pass(
     assert detections[0]["box"]["w"] < 0.2
 
 
+def test_tiled_fallback_retains_detections_between_raw_floor_and_trigger(
+    monkeypatch, tmp_path,
+):
+    """A crop finding an animal between RAW_CONF_FLOOR and the trigger must be
+    kept in the artifact so a workspace with a lower confidence threshold can
+    surface it at read time. Filtering at write time would defeat the global
+    detector cache — matching the invariant the full-frame pass already
+    guarantees via RAW_CONF_FLOOR postprocessing.
+    """
+    from unittest.mock import MagicMock
+
+    import detector
+
+    assert 0.15 > detector.RAW_CONF_FLOOR
+    assert 0.15 < detector.TILED_FALLBACK_TRIGGER_CONFIDENCE
+
+    fake_session = MagicMock()
+    fake_session.get_inputs.return_value = [MagicMock(name="images")]
+    weak = np.array(
+        [[[320, 320, 100, 100, 0.05, 0.0, 0.0]]], dtype=np.float32,
+    )
+    mid = np.array(
+        [[[320, 320, 100, 100, 0.15, 0.0, 0.0]]], dtype=np.float32,
+    )
+    empty = np.zeros((1, 0, 7), dtype=np.float32)
+    outputs = [weak, mid, *([empty] * 8)]
+    fake_session.run.side_effect = lambda *_args, **_kwargs: [outputs.pop(0)]
+    monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
+
+    img_path = tmp_path / "small-bird.jpg"
+    from PIL import Image
+    Image.new("RGB", (1000, 500), color="green").save(img_path)
+
+    detections = detector.detect_animals(str(img_path))
+
+    # Every crop plus the full-frame pass ran; nothing early-stopped because
+    # the mid-confidence detection is below TILED_EARLY_STOP_CONFIDENCE.
+    assert fake_session.run.call_count == 10
+    animals = [d for d in detections if d["category"] == "animal"]
+    mid_boxes = [d for d in animals if abs(d["confidence"] - 0.15) < 1e-4]
+    assert mid_boxes, [d["confidence"] for d in animals]
+
+
 def test_detect_animals_skips_tiled_fallback_after_strong_full_pass(
     monkeypatch, tmp_path,
 ):

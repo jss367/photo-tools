@@ -124,7 +124,6 @@ def megadetector_runtime_fingerprint(weights_path=None):
         TILED_CROP_FRACTION,
         TILED_EARLY_STOP_CONFIDENCE,
         TILED_EDGE_MARGIN,
-        TILED_FALLBACK_MIN_CONFIDENCE,
         TILED_FALLBACK_TRIGGER_CONFIDENCE,
         TILED_MAX_ADDITIONS,
         TILED_NMS_IOU,
@@ -140,13 +139,12 @@ def megadetector_runtime_fingerprint(weights_path=None):
         "weights_sha256": sha256_file(weights_path),
         "input_recipe": "vireo-detector-source-v1",
         "preprocess": {
-            "version": 2,
+            "version": 3,
             "input_size": INPUT_SIZE,
             "resize": "Pillow.BILINEAR-letterbox",
             "padding": 114,
             "tiled_fallback": {
                 "trigger_confidence": TILED_FALLBACK_TRIGGER_CONFIDENCE,
-                "minimum_confidence": TILED_FALLBACK_MIN_CONFIDENCE,
                 "early_stop_confidence": TILED_EARLY_STOP_CONFIDENCE,
                 "coverage_crop_count": TILED_COVERAGE_CROP_COUNT,
                 "crop_fraction": TILED_CROP_FRACTION,

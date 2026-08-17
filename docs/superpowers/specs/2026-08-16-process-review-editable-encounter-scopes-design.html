@@ -1,0 +1,2801 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Process Review page: complete product and interaction design</title>
+  <style>
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+
+ul.task-list[class]{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+font-size: inherit;
+width: 0.8em;
+margin: 0 0.8em 0.2em -1.6em;
+vertical-align: middle;
+}
+.display.math{display: block; text-align: center; margin: 0.5rem auto;}
+
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { display: inline-block; text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+{ counter-reset: source-line 0; }
+pre.numberSource code > span
+{ position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+{ content: counter(source-line);
+position: relative; left: -1em; text-align: right; vertical-align: baseline;
+border: none; display: inline-block;
+-webkit-touch-callout: none; -webkit-user-select: none;
+-khtml-user-select: none; -moz-user-select: none;
+-ms-user-select: none; user-select: none;
+padding: 0 4px; width: 4em;
+color: #aaaaaa;
+}
+pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa; padding-left: 4px; }
+div.sourceCode
+{ }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+code span.al { color: #ff0000; font-weight: bold; }
+code span.an { color: #60a0b0; font-weight: bold; font-style: italic; }
+code span.at { color: #7d9029; }
+code span.bn { color: #40a070; }
+code span.bu { color: #008000; }
+code span.cf { color: #007020; font-weight: bold; }
+code span.ch { color: #4070a0; }
+code span.cn { color: #880000; }
+code span.co { color: #60a0b0; font-style: italic; }
+code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; }
+code span.do { color: #ba2121; font-style: italic; }
+code span.dt { color: #902000; }
+code span.dv { color: #40a070; }
+code span.er { color: #ff0000; font-weight: bold; }
+code span.ex { }
+code span.fl { color: #40a070; }
+code span.fu { color: #06287e; }
+code span.im { color: #008000; font-weight: bold; }
+code span.in { color: #60a0b0; font-weight: bold; font-style: italic; }
+code span.kw { color: #007020; font-weight: bold; }
+code span.op { color: #666666; }
+code span.ot { color: #007020; }
+code span.pp { color: #bc7a00; }
+code span.sc { color: #4070a0; }
+code span.ss { color: #bb6688; }
+code span.st { color: #4070a0; }
+code span.va { color: #19177c; }
+code span.vs { color: #4070a0; }
+code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; }
+</style>
+  <style type="text/css">:root {
+color-scheme: light;
+--page: #fafcf9;
+--surface: #ffffff;
+--ink: #26362e;
+--muted: #687970;
+--line: #e1e9e3;
+--accent: #3a7d62;
+--accent-soft: #edf7f1;
+--code: #f4f7f5;
+--quote: #f7fbf8;
+--blue-soft: #eaf3ff;
+--amber-soft: #fff4d8;
+--violet-soft: #f2edfb;
+}
+* { box-sizing: border-box; }
+html {
+background: var(--page);
+color: var(--ink);
+}
+body {
+display: grid;
+grid-template-columns: 260px minmax(0, 780px);
+column-gap: 64px;
+align-items: start;
+max-width: 1168px;
+margin: 0 auto;
+padding: 52px 32px 96px;
+color: var(--ink);
+font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont,
+"Segoe UI", sans-serif;
+font-size: 17px;
+line-height: 1.68;
+overflow-wrap: break-word;
+text-rendering: optimizeLegibility;
+}
+body > * {
+grid-column: 2;
+min-width: 0;
+}
+header {
+margin: 0 0 32px;
+text-align: left;
+}
+header::before {
+content: "Vireo product design";
+display: block;
+margin-bottom: 10px;
+color: var(--accent);
+font-size: 0.75rem;
+font-weight: 750;
+letter-spacing: 0.12em;
+text-transform: uppercase;
+}
+header .title {
+max-width: 760px;
+margin: 0;
+font-size: clamp(2.25rem, 5vw, 3.6rem);
+line-height: 1.04;
+letter-spacing: -0.045em;
+}
+body > h1 { display: none; }
+body > h1 + p {
+margin: 0 0 52px;
+padding: 20px 22px;
+border: 1px solid var(--line);
+border-radius: 14px;
+background: var(--surface);
+color: var(--muted);
+box-shadow: 0 10px 30px rgba(47, 82, 64, 0.04);
+}
+body > h1 + p strong { color: var(--ink); }
+#TOC {
+grid-column: 1;
+position: fixed;
+left: max(24px, calc(50vw - 552px));
+top: 24px;
+width: 260px;
+max-height: calc(100vh - 48px);
+overflow: auto;
+padding: 18px 16px 20px;
+border: 1px solid var(--line);
+border-radius: 14px;
+background: rgba(255, 255, 255, 0.94);
+box-shadow: 0 12px 30px rgba(47, 82, 64, 0.05);
+backdrop-filter: blur(14px);
+font-size: 0.79rem;
+line-height: 1.35;
+scrollbar-width: thin;
+}
+#TOC::before {
+content: "Contents";
+display: block;
+margin: 0 8px 10px;
+color: var(--muted);
+font-size: 0.7rem;
+font-weight: 750;
+letter-spacing: 0.1em;
+text-transform: uppercase;
+}
+#TOC > ul > li > a { display: none; }
+#TOC ul, #TOC > ul, #TOC > ul > li > ul { margin: 0; padding: 0; }
+#TOC ul ul ul { display: none; }
+#TOC li { margin: 1px 0; list-style: none; }
+#TOC a {
+display: block;
+padding: 6px 8px;
+border-radius: 7px;
+color: var(--muted);
+text-decoration: none;
+}
+#TOC a:hover, #TOC a:focus-visible {
+background: var(--accent-soft);
+color: var(--accent);
+outline: none;
+}
+h2 {
+margin: 68px 0 18px;
+padding-top: 20px;
+border-top: 1px solid var(--line);
+font-size: 1.75rem;
+line-height: 1.2;
+letter-spacing: -0.025em;
+}
+h3 {
+margin: 42px 0 12px;
+color: #315043;
+font-size: 1.22rem;
+line-height: 1.3;
+letter-spacing: -0.01em;
+}
+h4 {
+margin: 30px 0 10px;
+color: var(--accent);
+font-size: 1.02rem;
+}
+h2 + p, h3 + p, h4 + p { margin-top: 0; }
+p { margin: 0.9em 0; }
+a { color: var(--accent); text-underline-offset: 0.16em; }
+a:visited { color: #435e51; }
+strong { font-weight: 720; }
+ol, ul { padding-left: 1.55em; }
+li { margin: 0.38em 0; padding-left: 0.2em; }
+blockquote {
+margin: 22px 0;
+padding: 14px 18px;
+border: 1px solid #d7e8dd;
+border-left: 5px solid var(--accent);
+border-radius: 0 10px 10px 0;
+background: var(--quote);
+color: #496157;
+}
+blockquote p { margin: 0.2em 0; }
+code {
+padding: 0.1em 0.32em;
+border-radius: 5px;
+background: #eef4f0;
+color: #264f3d;
+font-family: Menlo, Monaco, Consolas, monospace;
+font-size: 0.84em;
+}
+div.sourceCode, pre {
+margin: 22px 0;
+overflow: auto;
+border: 1px solid var(--line);
+border-radius: 12px;
+background: var(--code);
+box-shadow: 0 8px 24px rgba(47, 82, 64, 0.05);
+}
+pre { padding: 18px 20px; }
+div.sourceCode pre { margin: 0; padding: 18px 20px; border: 0; box-shadow: none; }
+pre code, div.sourceCode code {
+padding: 0;
+background: transparent;
+color: #294338;
+font-size: 0.82rem;
+line-height: 1.55;
+white-space: pre;
+}
+table {
+display: table;
+width: 100%;
+margin: 24px 0;
+overflow: hidden;
+border: 1px solid var(--line);
+border-collapse: separate;
+border-spacing: 0;
+border-radius: 10px;
+background: var(--surface);
+font-size: 0.92rem;
+font-variant-numeric: tabular-nums;
+}
+th {
+border: 0;
+border-bottom: 1px solid var(--line);
+padding: 11px 14px;
+background: var(--accent-soft);
+color: #264f3d;
+text-align: left;
+vertical-align: top;
+}
+td {
+border: 0;
+border-bottom: 1px solid #edf0ed;
+padding: 11px 14px;
+vertical-align: top;
+}
+tr:last-child td { border-bottom: 0; }
+::selection { background: #c9e8d7; }
+.design-diagram {
+margin: 30px 0 38px;
+border: 1px solid var(--line);
+border-radius: 16px;
+overflow: hidden;
+background: var(--surface);
+box-shadow: 0 14px 36px rgba(47, 82, 64, 0.06);
+}
+.diagram-scroll {
+overflow-x: auto;
+padding: 20px;
+background: linear-gradient(180deg, #ffffff 0%, #f8fbf8 100%);
+}
+.design-diagram svg {
+display: block;
+width: 100%;
+min-width: 720px;
+height: auto;
+}
+.design-diagram figcaption {
+padding: 14px 18px 16px;
+border-top: 1px solid var(--line);
+color: var(--muted);
+font-size: 0.88rem;
+line-height: 1.5;
+}
+.design-diagram figcaption strong { color: var(--ink); }
+.diagram-surface { fill: #ffffff; stroke: #dbe6df; stroke-width: 2; }
+.diagram-panel { fill: #f4f8f5; stroke: #cfddd4; stroke-width: 2; }
+.diagram-accent { fill: #e3f3e9; stroke: #70a98b; stroke-width: 2; }
+.diagram-blue { fill: #eaf3ff; stroke: #82a9d3; stroke-width: 2; }
+.diagram-amber { fill: #fff4d8; stroke: #d2a950; stroke-width: 2; }
+.diagram-violet { fill: #f2edfb; stroke: #a58cc9; stroke-width: 2; }
+.diagram-context { fill: #f3f5f4; stroke: #aebbb4; stroke-width: 2; stroke-dasharray: 6 5; }
+.diagram-match { fill: #dff2e7; stroke: #4d9470; stroke-width: 3; }
+.diagram-photo { fill: #ffffff; stroke: #9eb1a6; stroke-width: 2; }
+.diagram-line { fill: none; stroke: #71857a; stroke-width: 2.5; }
+.diagram-line-accent { fill: none; stroke: #3a7d62; stroke-width: 3; }
+.diagram-divider { stroke: #d7e2db; stroke-width: 2; }
+.diagram-text { fill: #2d4036; font: 600 15px Inter, ui-sans-serif, sans-serif; }
+.diagram-small { fill: #5f7468; font: 500 13px Inter, ui-sans-serif, sans-serif; }
+.diagram-label { fill: #3a7d62; font: 750 13px Inter, ui-sans-serif, sans-serif; letter-spacing: 0.04em; }
+.diagram-title { fill: #26362e; font: 750 19px Inter, ui-sans-serif, sans-serif; }
+.diagram-number { fill: #ffffff; font: 750 13px Inter, ui-sans-serif, sans-serif; text-anchor: middle; dominant-baseline: middle; }
+.diagram-number-circle { fill: #3a7d62; }
+@media (max-width: 980px) {
+body {
+display: flex;
+flex-direction: column;
+align-items: stretch;
+max-width: 820px;
+padding: 32px 24px 80px;
+}
+header { order: -3; }
+body > h1 { order: -2; }
+body > h1 + p { order: -1; }
+#TOC { position: static; width: auto; max-height: none; margin: 0 0 36px; }
+}
+@media (max-width: 600px) {
+html, body { max-width: 100%; overflow-x: hidden; }
+body { padding: 24px 16px 64px; font-size: 16px; }
+header .title { font-size: clamp(2rem, 10vw, 2.3rem); overflow-wrap: anywhere; }
+body > h1 + p { margin-bottom: 38px; padding: 16px; }
+h2 { margin-top: 52px; font-size: 1.5rem; }
+table { display: block; overflow-x: auto; }
+}
+@media print {
+body { display: block; max-width: none; padding: 0; font-size: 12pt; }
+#TOC { position: static; max-height: none; margin-bottom: 32px; box-shadow: none; }
+#TOC ul ul ul { display: block; }
+body > h1 + p, div.sourceCode, pre { box-shadow: none; }
+.design-diagram { break-inside: avoid; page-break-inside: avoid; box-shadow: none; }
+.diagram-scroll { overflow: visible; padding: 10px; }
+.design-diagram svg { width: 100%; min-width: 0; }
+h2, h3, h4 { break-after: avoid; }
+}
+</style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Process Review page: complete product and interaction
+design</h1>
+</header>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#process-review-page-complete-product-and-interaction-design" id="toc-process-review-page-complete-product-and-interaction-design">Process
+Review page: complete product and interaction design</a>
+<ul>
+<li><a href="#summary" id="toc-summary">Summary</a></li>
+<li><a href="#problem" id="toc-problem">Problem</a></li>
+<li><a href="#goals" id="toc-goals">Goals</a></li>
+<li><a href="#non-goals" id="toc-non-goals">Non-goals</a></li>
+<li><a href="#product-principles-and-terminology" id="toc-product-principles-and-terminology">Product principles and
+terminology</a>
+<ul>
+<li><a href="#product-principles" id="toc-product-principles">Product
+principles</a></li>
+<li><a href="#object-hierarchy" id="toc-object-hierarchy">Object
+hierarchy</a></li>
+<li><a href="#structural-verbs" id="toc-structural-verbs">Structural
+verbs</a></li>
+</ul></li>
+<li><a href="#core-concepts" id="toc-core-concepts">Core concepts</a>
+<ul>
+<li><a href="#process-result" id="toc-process-result">Process
+result</a></li>
+<li><a href="#review-view" id="toc-review-view">Review view</a></li>
+<li><a href="#complete-encounter" id="toc-complete-encounter">Complete
+encounter</a></li>
+</ul></li>
+<li><a href="#page-structure" id="toc-page-structure">Page structure</a>
+<ul>
+<li><a href="#page-header-and-destinations" id="toc-page-header-and-destinations">Page header and
+destinations</a></li>
+<li><a href="#coverage-summary" id="toc-coverage-summary">Coverage
+summary</a></li>
+<li><a href="#summary-strip" id="toc-summary-strip">Summary
+strip</a></li>
+<li><a href="#pending-sidecar-synchronization" id="toc-pending-sidecar-synchronization">Pending sidecar
+synchronization</a></li>
+<li><a href="#review-toolbar" id="toc-review-toolbar">Review
+toolbar</a></li>
+<li><a href="#advanced-controls-sidebar" id="toc-advanced-controls-sidebar">Advanced controls sidebar</a></li>
+<li><a href="#encounter-card" id="toc-encounter-card">Encounter
+card</a></li>
+<li><a href="#burst-row" id="toc-burst-row">Burst row</a></li>
+<li><a href="#photo-card" id="toc-photo-card">Photo card</a></li>
+<li><a href="#paged-encounter-list" id="toc-paged-encounter-list">Paged
+encounter list</a></li>
+</ul></li>
+<li><a href="#encounter-matching" id="toc-encounter-matching">Encounter
+matching</a>
+<ul>
+<li><a href="#example" id="toc-example">Example</a></li>
+<li><a href="#combining-filters" id="toc-combining-filters">Combining
+filters</a></li>
+<li><a href="#explaining-the-view" id="toc-explaining-the-view">Explaining the view</a></li>
+</ul></li>
+<li><a href="#species-evidence-and-disagreement" id="toc-species-evidence-and-disagreement">Species evidence and
+disagreement</a>
+<ul>
+<li><a href="#evidence-hierarchy" id="toc-evidence-hierarchy">Evidence
+hierarchy</a></li>
+<li><a href="#prediction-source-identity" id="toc-prediction-source-identity">Prediction source identity</a></li>
+<li><a href="#taxon-normalization-and-compatible-predictions" id="toc-taxon-normalization-and-compatible-predictions">Taxon
+normalization and compatible predictions</a></li>
+<li><a href="#label-list-coverage" id="toc-label-list-coverage">Label-list coverage</a></li>
+<li><a href="#exclusive-alternatives-and-multi-label-presence" id="toc-exclusive-alternatives-and-multi-label-presence">Exclusive
+alternatives and multi-label presence</a></li>
+<li><a href="#combining-label-lists-from-the-same-model" id="toc-combining-label-lists-from-the-same-model">Combining label lists
+from the same model</a></li>
+<li><a href="#combining-different-models-for-one-subject" id="toc-combining-different-models-for-one-subject">Combining different
+models for one subject</a></li>
+<li><a href="#multiple-subjects-and-multiple-species-in-one-photo" id="toc-multiple-subjects-and-multiple-species-in-one-photo">Multiple
+subjects and multiple species in one photo</a></li>
+<li><a href="#species-variation-across-a-burst-or-encounter" id="toc-species-variation-across-a-burst-or-encounter">Species variation
+across a burst or encounter</a></li>
+<li><a href="#species-confirmation-model" id="toc-species-confirmation-model">Species confirmation model</a></li>
+<li><a href="#completion-state" id="toc-completion-state">Completion
+state</a></li>
+<li><a href="#species-evidence-interface" id="toc-species-evidence-interface">Species evidence interface</a></li>
+</ul></li>
+<li><a href="#editing-behavior" id="toc-editing-behavior">Editing
+behavior</a>
+<ul>
+<li><a href="#action-targets" id="toc-action-targets">Action
+targets</a></li>
+<li><a href="#automated-recommendations-and-manual-triage" id="toc-automated-recommendations-and-manual-triage">Automated
+recommendations and manual triage</a></li>
+<li><a href="#species-confirmation" id="toc-species-confirmation">Species confirmation</a></li>
+<li><a href="#flags-and-quality-decisions" id="toc-flags-and-quality-decisions">Flags and quality
+decisions</a></li>
+<li><a href="#structural-editing" id="toc-structural-editing">Structural
+editing</a></li>
+<li><a href="#group-review" id="toc-group-review">Group Review</a></li>
+<li><a href="#species-evidence-panel" id="toc-species-evidence-panel">Species evidence panel</a></li>
+<li><a href="#photo-detail-fallback" id="toc-photo-detail-fallback">Photo detail fallback</a></li>
+<li><a href="#undo-and-redo" id="toc-undo-and-redo">Undo and
+redo</a></li>
+<li><a href="#pending-concurrency-and-failure-behavior" id="toc-pending-concurrency-and-failure-behavior">Pending, concurrency,
+and failure behavior</a></li>
+<li><a href="#view-movement-after-an-edit" id="toc-view-movement-after-an-edit">View movement after an
+edit</a></li>
+</ul></li>
+<li><a href="#grouping-and-scoring-controls" id="toc-grouping-and-scoring-controls">Grouping and scoring
+controls</a></li>
+<li><a href="#navigation-focus-and-shortcuts" id="toc-navigation-focus-and-shortcuts">Navigation, focus, and
+shortcuts</a></li>
+<li><a href="#primary-workflows" id="toc-primary-workflows">Primary
+workflows</a>
+<ul>
+<li><a href="#enter-or-resume-review" id="toc-enter-or-resume-review">Enter or resume review</a></li>
+<li><a href="#narrow-a-large-review-while-preserving-encounters" id="toc-narrow-a-large-review-while-preserving-encounters">Narrow a
+large review while preserving encounters</a></li>
+<li><a href="#triage-a-burst" id="toc-triage-a-burst">Triage a
+burst</a></li>
+<li><a href="#resolve-a-species-disagreement" id="toc-resolve-a-species-disagreement">Resolve a species
+disagreement</a></li>
+<li><a href="#confirm-several-species-in-one-image" id="toc-confirm-several-species-in-one-image">Confirm several species in
+one image</a></li>
+<li><a href="#correct-grouping" id="toc-correct-grouping">Correct
+grouping</a></li>
+<li><a href="#finish-or-leave" id="toc-finish-or-leave">Finish or
+leave</a></li>
+</ul></li>
+<li><a href="#downstream-effects-and-page-boundaries" id="toc-downstream-effects-and-page-boundaries">Downstream effects and
+page boundaries</a></li>
+<li><a href="#data-and-api-design" id="toc-data-and-api-design">Data and
+API design</a>
+<ul>
+<li><a href="#stable-identities-and-revisions" id="toc-stable-identities-and-revisions">Stable identities and
+revisions</a></li>
+<li><a href="#species-evidence-contract" id="toc-species-evidence-contract">Species evidence contract</a></li>
+<li><a href="#view-query" id="toc-view-query">View query</a></li>
+<li><a href="#pagination" id="toc-pagination">Pagination</a></li>
+<li><a href="#mutation-response" id="toc-mutation-response">Mutation
+response</a></li>
+<li><a href="#persistence-model" id="toc-persistence-model">Persistence
+model</a></li>
+</ul></li>
+<li><a href="#loading-empty-and-error-states" id="toc-loading-empty-and-error-states">Loading, empty, and error
+states</a></li>
+<li><a href="#performance-requirements" id="toc-performance-requirements">Performance requirements</a></li>
+<li><a href="#accessibility-and-input-behavior" id="toc-accessibility-and-input-behavior">Accessibility and input
+behavior</a></li>
+<li><a href="#migration-and-delivery" id="toc-migration-and-delivery">Migration and delivery</a></li>
+<li><a href="#alternatives-considered" id="toc-alternatives-considered">Alternatives considered</a>
+<ul>
+<li><a href="#remove-the-read-only-guard" id="toc-remove-the-read-only-guard">Remove the read-only guard</a></li>
+<li><a href="#filter-the-existing-full-result-only-in-the-browser" id="toc-filter-the-existing-full-result-only-in-the-browser">Filter the
+existing full result only in the browser</a></li>
+<li><a href="#continue-regrouping-each-collection" id="toc-continue-regrouping-each-collection">Continue regrouping each
+collection</a></li>
+<li><a href="#offer-a-matching-photos-only-mode" id="toc-offer-a-matching-photos-only-mode">Offer a “matching photos
+only” mode</a></li>
+<li><a href="#label-the-control-keep-encounters-intact" id="toc-label-the-control-keep-encounters-intact">Label the control
+“Keep encounters intact”</a></li>
+</ul></li>
+<li><a href="#acceptance-criteria" id="toc-acceptance-criteria">Acceptance criteria</a></li>
+<li><a href="#testing" id="toc-testing">Testing</a>
+<ul>
+<li><a href="#backend" id="toc-backend">Backend</a></li>
+<li><a href="#browser-integration" id="toc-browser-integration">Browser
+integration</a></li>
+<li><a href="#performance" id="toc-performance">Performance</a></li>
+</ul></li>
+<li><a href="#open-implementation-decisions" id="toc-open-implementation-decisions">Open implementation
+decisions</a></li>
+</ul></li>
+</ul>
+</nav>
+<h1 id="process-review-page-complete-product-and-interaction-design">Process
+Review page: complete product and interaction design</h1>
+<p><strong>Date:</strong> 2026-08-16<br />
+<strong>Status:</strong> Draft for product and maintainer review<br />
+<strong>Scope:</strong> Define the complete Process Review page,
+including its layout, views, encounter and burst structure, triage,
+species evidence, multi-model and multi-species decisions, comparison
+tools, structural editing, persistence, performance, accessibility, and
+failure behavior. Large review sets can be narrowed without creating
+alternate groupings or disabling edits; complete encounters remain
+intact in every view.</p>
+<h2 id="summary">Summary</h2>
+<p>Process Review has one canonical set of results: the output of the
+latest Process run. Collections, triage filters, species-review filters,
+and search are views over those results. They never recompute, trim, or
+replace the canonical encounters.</p>
+<p>When a photo-based view is active, the user chooses how complete
+encounters qualify:</p>
+<ul>
+<li><strong>Any photo</strong> — include the complete encounter when at
+least one of its photos matches.</li>
+<li><strong>Every photo</strong> — include the complete encounter only
+when all of its photos match.</li>
+</ul>
+<p>Both modes render the full encounter, including all bursts and
+photos. Matching photos are identified visually so the reason an
+encounter is present remains clear. Every view is editable; there is no
+read-only Workspace or Collection mode.</p>
+<p>The page loads and renders complete encounters incrementally.
+Mutations target stable encounter, burst, or photo identities and return
+only changed data. Neither page navigation nor a single review action
+transfers, clones, or saves the full review result.</p>
+<h2 id="problem">Problem</h2>
+<p>Process Review currently conflates two different operations:</p>
+<ol type="1">
+<li>defining which photos are analyzed and grouped; and</li>
+<li>choosing which existing results the user wants to see.</li>
+</ol>
+<p>Selecting Workspace or Collection currently calls the live regrouping
+endpoint with a different photo set. That produces an alternate set of
+encounters. An encounter crossing the collection boundary can be
+truncated, split, merged differently, or assigned a different array
+index. Because several mutations rewrite the saved pipeline cache or
+address groups by array index, the page then blocks editing to avoid
+replacing the saved review with the scoped subset.</p>
+<p>This is safe but not useful: Vireo offers views in which the primary
+review actions cannot be performed.</p>
+<p>The same design scales poorly. A process run containing 15,418 photos
+currently produces a roughly 43 MB serialized cache. A species
+confirmation reloads and rewrites that cache, returns the full encounter
+list, and the browser deep-clones the full result again. The page also
+builds one large HTML string and replaces the entire encounter
+container. In a real review this produced consistent 1.7–2.1 second
+confirmation requests and a multi-gigabyte WebKit content process.</p>
+<h2 id="goals">Goals</h2>
+<ul>
+<li>Make every Process Review view fully editable.</li>
+<li>Preserve the canonical encounter and burst context while narrowing
+the view.</li>
+<li>Let the user choose inclusive or strict encounter matching.</li>
+<li>Make the reason each encounter matched visible and
+understandable.</li>
+<li>Represent species evidence without collapsing different subjects,
+photos, models, or label lists into one misleading prediction.</li>
+<li>Support more than one species in a photo or encounter while
+retaining a fast confirmation path for the common single-species
+case.</li>
+<li>Keep work proportional to the encounters on screen, not the complete
+run.</li>
+<li>Prevent a scoped view or stale browser from overwriting unrelated
+results.</li>
+<li>Preserve review state when switching views, sorting, searching, or
+loading additional pages.</li>
+<li>Keep existing photo-, burst-, and encounter-level workflows
+available.</li>
+</ul>
+<h2 id="non-goals">Non-goals</h2>
+<ul>
+<li>Changing how Process initially computes encounters or bursts.</li>
+<li>Making a Collection view run missing classification, detection, or
+grouping work. Photos not present in the latest process result remain
+outside that review.</li>
+<li>Allowing a view filter to create a new saved process result.</li>
+<li>Splitting a single encounter across pages or virtualized
+windows.</li>
+<li>Replacing the dedicated Rapid Review page.</li>
+<li>Retraining or changing the inference behavior of classifier models.
+This design does change how their evidence is retained, combined, and
+reviewed.</li>
+<li>Redesigning the quality-scoring or grouping algorithms.</li>
+</ul>
+<h2 id="product-principles-and-terminology">Product principles and
+terminology</h2>
+<p>This document is the product contract for the complete Process Review
+page, not only its filtering or persistence layer. An implementation is
+incomplete if the data model is correct but a control, state, or
+workflow described here is absent or behaves differently without an
+explicit design revision.</p>
+<h3 id="product-principles">Product principles</h3>
+<ol type="1">
+<li><strong>Preserve context.</strong> Narrowing a view never hides
+members from inside an included encounter.</li>
+<li><strong>Make targets explicit.</strong> Every action names whether
+it affects subjects, photos, a burst, an encounter, matching photos, or
+all photos in shown encounters.</li>
+<li><strong>Separate evidence from decisions.</strong> Model output
+remains immutable and explainable; human review creates separate
+assertions and triage decisions.</li>
+<li><strong>Never restructure implicitly.</strong> Species confirmation,
+filtering, and triage do not change burst or encounter membership.
+Structural changes use dedicated commands with a preview.</li>
+<li><strong>Keep the fast path fast.</strong> A consistent
+single-species burst can be triaged and confirmed with a few keys or one
+action, while disagreement and multi-species cases remain fully
+inspectable.</li>
+<li><strong>Scale by what is visible.</strong> Loading, rendering, and
+mutations are proportional to the current page and action target, not
+the full Process result.</li>
+<li><strong>Allow recovery.</strong> Every review mutation is durable,
+auditable, and undoable until superseded by an incompatible new Process
+run.</li>
+</ol>
+<h3 id="object-hierarchy">Object hierarchy</h3>
+<ul>
+<li><strong>Process run:</strong> one computation snapshot and its
+initial grouping of a defined set of photos.</li>
+<li><strong>Encounter:</strong> one continuous photographic event or
+sighting. It contains one or more bursts and is the indivisible display
+and pagination unit.</li>
+<li><strong>Burst:</strong> a chronologically ordered comparison and
+culling unit within an encounter, usually a rapid sequence of similar
+frames.</li>
+<li><strong>Photo:</strong> one library image. It belongs to exactly one
+burst and one encounter in a review revision.</li>
+<li><strong>Subject:</strong> one detected biological subject or one
+user-created subject target inside a photo. A photo may contain several
+subjects.</li>
+<li><strong>Prediction source:</strong> one classifier-model and
+label-list version, plus its declared exclusive or multi-label
+behavior.</li>
+<li><strong>Review assertion:</strong> a human decision about a subject
+or photo, such as a confirmed species, Not identifiable, or False
+detection.</li>
+<li><strong>Triage state:</strong> the effective Keep, Review, or Reject
+decision for a photo. It is distinct from the automated recommendation
+that suggested it.</li>
+<li><strong>Review view:</strong> an editable projection of complete
+encounters from the canonical Process result.</li>
+</ul>
+<h3 id="structural-verbs">Structural verbs</h3>
+<p>The interface uses one verb for one effect. Labels may include the
+affected counts, but must not substitute “split” and “detach” for one
+another.</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Exact effect</th>
+<th style="text-align: right;">Encounter changes?</th>
+<th style="text-align: right;">Burst changes?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Split burst here</strong></td>
+<td>Cut one burst at the selected gap into the photos before and after
+that gap</td>
+<td style="text-align: right;">No</td>
+<td style="text-align: right;">One burst becomes two</td>
+</tr>
+<tr>
+<td><strong>Extract photos to new burst</strong></td>
+<td>Remove an arbitrary selected set from its burst and create one or
+more new bursts in the same encounter</td>
+<td style="text-align: right;">No</td>
+<td style="text-align: right;">Membership changes</td>
+</tr>
+<tr>
+<td><strong>Merge adjacent bursts</strong></td>
+<td>Combine two neighboring bursts in the same encounter, preserving
+chronological photo order</td>
+<td style="text-align: right;">No</td>
+<td style="text-align: right;">Two bursts become one</td>
+</tr>
+<tr>
+<td><strong>Split encounter here</strong></td>
+<td>Cut one encounter at a burst boundary; the selected burst and every
+later burst form a new encounter</td>
+<td style="text-align: right;">One becomes two</td>
+<td style="text-align: right;">No</td>
+</tr>
+<tr>
+<td><strong>Separate burst as encounter</strong></td>
+<td>Remove exactly one complete burst and make it a standalone
+encounter</td>
+<td style="text-align: right;">One gains a sibling</td>
+<td style="text-align: right;">No</td>
+</tr>
+<tr>
+<td><strong>Merge encounters</strong></td>
+<td>Combine explicitly selected encounters and retain their bursts in
+chronological order</td>
+<td style="text-align: right;">Several become one</td>
+<td style="text-align: right;">No</td>
+</tr>
+</tbody>
+</table>
+<figure class="design-diagram" aria-labelledby="structural-ops-caption">
+<div class="diagram-scroll">
+<svg viewBox="0 0 960 700" role="img" aria-labelledby="structural-ops-title structural-ops-desc">
+  <title id="structural-ops-title">Structural editing operations</title>
+  <desc id="structural-ops-desc">Before and after examples distinguish operations that change burst boundaries within one encounter from operations that create or combine encounters.</desc>
+  <text class="diagram-title" x="28" y="34">Change bursts inside one encounter</text>
+  <rect class="diagram-accent" x="22" y="50" width="448" height="420" rx="16" />
+  <text class="diagram-label" x="44" y="82">SPLIT BURST HERE</text>
+  <rect class="diagram-surface" x="42" y="96" width="174" height="78" rx="10" />
+  <rect class="diagram-blue" x="54" y="112" width="150" height="46" rx="8" />
+  <text class="diagram-small" x="72" y="140">A · B · C · D</text>
+  <path class="diagram-line-accent" d="M226 135 L270 135" /><path d="M262 127 L272 135 L262 143" fill="none" stroke="#3a7d62" stroke-width="3" />
+  <rect class="diagram-surface" x="282" y="96" width="166" height="78" rx="10" />
+  <rect class="diagram-blue" x="294" y="112" width="66" height="46" rx="8" />
+  <rect class="diagram-blue" x="370" y="112" width="66" height="46" rx="8" />
+  <text class="diagram-small" x="307" y="140">A · B</text><text class="diagram-small" x="383" y="140">C · D</text>
+  <text class="diagram-small" x="44" y="194">One burst becomes two. The encounter is unchanged.</text>
+
+  <line class="diagram-divider" x1="42" y1="218" x2="448" y2="218"></line>
+  <text class="diagram-label" x="44" y="250">EXTRACT PHOTOS TO NEW BURST</text>
+  <rect class="diagram-surface" x="42" y="264" width="174" height="104" rx="10" />
+  <rect class="diagram-blue" x="54" y="280" width="150" height="54" rx="8" />
+  <rect class="diagram-amber" x="98" y="286" width="62" height="42" rx="7" />
+  <text class="diagram-small" x="66" y="352">select C + D</text>
+  <path class="diagram-line-accent" d="M226 316 L270 316" /><path d="M262 308 L272 316 L262 324" fill="none" stroke="#3a7d62" stroke-width="3" />
+  <rect class="diagram-surface" x="282" y="264" width="166" height="104" rx="10" />
+  <rect class="diagram-blue" x="294" y="280" width="42" height="48" rx="7" />
+  <rect class="diagram-amber" x="346" y="280" width="42" height="48" rx="7" />
+  <rect class="diagram-blue" x="398" y="280" width="38" height="48" rx="7" />
+  <text class="diagram-small" x="299" y="350">AB</text><text class="diagram-small" x="351" y="350">CD</text><text class="diagram-small" x="402" y="350">EF</text>
+  <text class="diagram-small" x="44" y="392">Selected and unselected chronological runs become bursts.</text>
+  <rect class="diagram-panel" x="44" y="414" width="402" height="36" rx="8" />
+  <text class="diagram-small" x="62" y="438">Merge adjacent bursts is the explicit inverse boundary operation.</text>
+  <text class="diagram-title" x="506" y="34">Change encounter boundaries</text>
+  <rect class="diagram-blue" x="490" y="50" width="448" height="420" rx="16" />
+  <text class="diagram-label" x="512" y="82">SPLIT ENCOUNTER HERE</text>
+  <rect class="diagram-surface" x="510" y="96" width="174" height="78" rx="10" />
+  <rect class="diagram-accent" x="522" y="112" width="150" height="46" rx="8" />
+  <text class="diagram-small" x="538" y="140">B1 · B2 · B3</text>
+  <path class="diagram-line-accent" d="M694 135 L738 135" /><path d="M730 127 L740 135 L730 143" fill="none" stroke="#3a7d62" stroke-width="3" />
+  <rect class="diagram-surface" x="750" y="96" width="166" height="78" rx="10" />
+  <rect class="diagram-accent" x="762" y="112" width="54" height="46" rx="8" />
+  <rect class="diagram-accent" x="826" y="112" width="78" height="46" rx="8" />
+  <text class="diagram-small" x="778" y="140">B1</text><text class="diagram-small" x="842" y="140">B2 · B3</text>
+  <text class="diagram-small" x="512" y="194">A boundary cut creates two encounters.</text>
+
+  <line class="diagram-divider" x1="510" y1="218" x2="916" y2="218"></line>
+  <text class="diagram-label" x="512" y="250">SEPARATE BURST AS ENCOUNTER</text>
+  <rect class="diagram-surface" x="510" y="264" width="174" height="104" rx="10" />
+  <rect class="diagram-accent" x="522" y="280" width="150" height="54" rx="8" />
+  <rect class="diagram-amber" x="572" y="286" width="46" height="42" rx="7" />
+  <text class="diagram-small" x="538" y="352">choose middle B2</text>
+  <path class="diagram-line-accent" d="M694 316 L738 316" /><path d="M730 308 L740 316 L730 324" fill="none" stroke="#3a7d62" stroke-width="3" />
+  <rect class="diagram-surface" x="750" y="264" width="166" height="104" rx="10" />
+  <rect class="diagram-accent" x="762" y="280" width="86" height="48" rx="8" />
+  <rect class="diagram-amber" x="858" y="280" width="46" height="48" rx="8" />
+  <text class="diagram-small" x="778" y="350">B1 · B3</text><text class="diagram-small" x="870" y="350">B2</text>
+  <text class="diagram-small" x="512" y="392">One complete burst becomes its own encounter; it is not split.</text>
+  <rect class="diagram-panel" x="512" y="414" width="402" height="36" rx="8" />
+  <text class="diagram-small" x="530" y="438">Merge encounters combines selected encounters without merging bursts.</text>
+
+  <rect class="diagram-surface" x="22" y="494" width="916" height="178" rx="16" />
+  <text class="diagram-label" x="48" y="526">INVARIANT ACROSS EVERY STRUCTURAL COMMAND</text>
+  <circle class="diagram-number-circle" cx="62" cy="558" r="13"></circle><text class="diagram-number" x="62" y="558">1</text>
+  <text class="diagram-text" x="86" y="563">No photos or evidence are discarded</text>
+  <circle class="diagram-number-circle" cx="62" cy="600" r="13"></circle><text class="diagram-number" x="62" y="600">2</text>
+  <text class="diagram-text" x="86" y="605">Species and triage stay with subjects/photos</text>
+  <circle class="diagram-number-circle" cx="510" cy="558" r="13"></circle><text class="diagram-number" x="510" y="558">3</text>
+  <text class="diagram-text" x="534" y="563">Derived summaries are recomputed</text>
+  <circle class="diagram-number-circle" cx="510" cy="600" r="13"></circle><text class="diagram-number" x="510" y="600">4</text>
+  <text class="diagram-text" x="534" y="605">Preview first, then apply with undo</text>
+</svg>
+</div>
+<figcaption id="structural-ops-caption"><strong>Structural operations.</strong> Split and Extract change burst structure inside an encounter. Split encounter and Separate burst change encounter membership. Merge is always explicit and preserves the lower-level objects unless the user is specifically merging them.</figcaption>
+</figure>
+
+<p>“Detach photo” is replaced in visible copy by <strong>Extract to new
+burst</strong>. “Detach burst” is replaced by <strong>Separate as
+encounter</strong>. The command and event names in the implementation
+should follow the visible semantics rather than preserving the current
+ambiguous names.</p>
+<p>Structural changes never discard photos, species assertions, triage
+state, or model evidence. They only change membership and derived
+summaries. The page previews the before/after structure, names inherited
+state, and supports undo.</p>
+<h2 id="core-concepts">Core concepts</h2>
+<h3 id="process-result">Process result</h3>
+<p>The latest completed Process run creates a canonical result with a
+stable <code>review_run_id</code> and monotonically increasing
+<code>revision</code>. It defines:</p>
+<ul>
+<li>the photos included in that run;</li>
+<li>encounter and burst boundaries;</li>
+<li>computed classifications and quality recommendations; and</li>
+<li>the configuration and feature versions used to compute them.</li>
+</ul>
+<p>The result may cover the whole workspace or only the scope selected
+on the Process page. Process Review must state this coverage, but it
+must not silently expand it by recomputing against other workspace
+photos.</p>
+<p>Only these operations may intentionally change canonical
+grouping:</p>
+<ul>
+<li>completing a new Process run;</li>
+<li>applying grouping settings to the canonical result; or</li>
+<li>an explicit structural review action such as splitting, extracting,
+merging, or separating a group.</li>
+</ul>
+<p>Changing a view never changes canonical grouping.</p>
+<h3 id="review-view">Review view</h3>
+<p>A review view is a query over the canonical result. It contains:</p>
+<ul>
+<li>an optional collection;</li>
+<li>a photo-status filter: All, Keep, Review, Reject, or Species
+conflicts;</li>
+<li>species-review state filtering;</li>
+<li>species or filename search;</li>
+<li>encounter match mode: Any photo or Every photo;</li>
+<li>encounter sort; and</li>
+<li>a paging cursor.</li>
+</ul>
+<p>The view is ephemeral. It may be represented in the URL and restored
+on reload, but it is never saved as a pipeline result.</p>
+<h3 id="complete-encounter">Complete encounter</h3>
+<p>An encounter is the indivisible unit of display and pagination. When
+an encounter qualifies, the response and page contain:</p>
+<ul>
+<li>every photo in the encounter;</li>
+<li>every burst and its complete membership;</li>
+<li>the encounter and burst species evidence;</li>
+<li>current confirmation and flag state; and</li>
+<li>the trace and metadata needed by visible review controls.</li>
+</ul>
+<p>A filter may identify matching photos inside the encounter, but it
+must not remove the nonmatching photos. Explicit structural commands are
+the only review interactions that change group membership.</p>
+<h2 id="page-structure">Page structure</h2>
+<p>On a desktop-width window, Process Review has a collapsible left
+sidebar and a single primary reading column. The primary column is
+ordered as follows:</p>
+<ol type="1">
+<li>page header and navigation;</li>
+<li>process coverage and health;</li>
+<li>canonical and current-view summary counts;</li>
+<li>sticky review toolbar and active-filter summary;</li>
+<li>paged encounter list;</li>
+<li>page-loading sentinel or end-of-view summary; and</li>
+<li>nonblocking mutation and undo notifications.</li>
+</ol>
+<p>The Species evidence panel, Group Review, structural preview, and
+photo detail views appear as overlays or drawers without replacing the
+current view state. Returning from any overlay restores the originating
+encounter, scroll position, expanded state, selection, and keyboard
+focus.</p>
+<p>On a narrow window, the sidebar becomes an <strong>Advanced
+controls</strong> drawer and toolbar filters become a <strong>Refine
+view</strong> sheet. The encounter hierarchy and available actions do
+not change. Horizontal clipping is never required for ordinary review;
+wide evidence matrices may scroll within their own panel.</p>
+<figure class="design-diagram" aria-labelledby="page-anatomy-caption">
+<div class="diagram-scroll">
+<svg viewBox="0 0 960 570" role="img" aria-labelledby="page-anatomy-title page-anatomy-desc">
+  <title id="page-anatomy-title">Process Review page anatomy</title>
+  <desc id="page-anatomy-desc">A desktop layout with advanced controls on the left and, on the right, the page header, summary, review toolbar, complete encounter cards, burst rows, and photo cards.</desc>
+  <rect class="diagram-panel" x="20" y="22" width="218" height="522" rx="16" />
+  <text class="diagram-label" x="44" y="55">ADVANCED CONTROLS</text>
+  <rect class="diagram-surface" x="42" y="76" width="174" height="78" rx="10" />
+  <text class="diagram-text" x="58" y="104">View explanation</text>
+  <text class="diagram-small" x="58" y="128">Matches + context</text>
+  <rect class="diagram-surface" x="42" y="170" width="174" height="88" rx="10" />
+  <text class="diagram-text" x="58" y="199">Scoring suggestions</text>
+  <text class="diagram-small" x="58" y="223">Preview before apply</text>
+  <rect class="diagram-surface" x="42" y="274" width="174" height="106" rx="10" />
+  <text class="diagram-text" x="58" y="303">Grouping settings</text>
+  <text class="diagram-small" x="58" y="327">Preview regrouping</text>
+  <text class="diagram-small" x="58" y="350">Complete result only</text>
+  <rect class="diagram-surface" x="42" y="396" width="174" height="122" rx="10" />
+  <text class="diagram-text" x="58" y="425">Focused trace</text>
+  <path class="diagram-line-accent" d="M62 484 L94 454 L126 470 L158 438 L194 458" />
+
+  <rect class="diagram-blue" x="266" y="22" width="674" height="76" rx="16" />
+  <circle class="diagram-number-circle" cx="292" cy="48" r="13"></circle><text class="diagram-number" x="292" y="48">1</text>
+  <text class="diagram-title" x="318" y="53">Process Review</text>
+  <text class="diagram-small" x="318" y="77">Coverage · run health · destinations · run details</text>
+
+  <rect class="diagram-surface" x="266" y="114" width="674" height="68" rx="12" />
+  <circle class="diagram-number-circle" cx="292" cy="138" r="13"></circle><text class="diagram-number" x="292" y="138">2</text>
+  <text class="diagram-text" x="318" y="143">Process totals</text>
+  <text class="diagram-small" x="318" y="166">Triage · species review · current view · pending sidecars</text>
+
+  <rect class="diagram-accent" x="266" y="198" width="674" height="82" rx="12" />
+  <circle class="diagram-number-circle" cx="292" cy="223" r="13"></circle><text class="diagram-number" x="292" y="223">3</text>
+  <text class="diagram-text" x="318" y="228">Editable review toolbar</text>
+  <text class="diagram-small" x="318" y="253">Triage · species · collection · Any/Every · search · sort · display</text>
+
+  <rect class="diagram-surface" x="266" y="296" width="674" height="226" rx="16" />
+  <circle class="diagram-number-circle" cx="292" cy="322" r="13"></circle><text class="diagram-number" x="292" y="322">4</text>
+  <text class="diagram-title" x="318" y="328">Complete encounter</text>
+  <text class="diagram-small" x="760" y="328">8 photos · 2 bursts · 3 match</text>
+  <line class="diagram-divider" x1="286" y1="348" x2="920" y2="348"></line>
+  <text class="diagram-label" x="292" y="374">BURST 1</text>
+  <rect class="diagram-match" x="292" y="391" width="92" height="68" rx="9" />
+  <rect class="diagram-context" x="396" y="391" width="92" height="68" rx="9" />
+  <rect class="diagram-match" x="500" y="391" width="92" height="68" rx="9" />
+  <text class="diagram-small" x="314" y="482">Match</text>
+  <text class="diagram-small" x="413" y="482">Context</text>
+  <text class="diagram-small" x="522" y="482">Match</text>
+  <rect class="diagram-panel" x="620" y="370" width="286" height="126" rx="12" />
+  <text class="diagram-label" x="642" y="397">BURST 2</text>
+  <rect class="diagram-photo" x="642" y="414" width="70" height="52" rx="8" />
+  <rect class="diagram-photo" x="724" y="414" width="70" height="52" rx="8" />
+  <rect class="diagram-photo" x="806" y="414" width="70" height="52" rx="8" />
+
+  <rect class="diagram-panel" x="266" y="536" width="674" height="18" rx="9" />
+</svg>
+</div>
+<figcaption id="page-anatomy-caption"><strong>Page anatomy.</strong> Advanced computation controls stay out of the routine review path. The main column moves from run context to view controls to complete encounter cards; overlays preserve the user&#39;s place.</figcaption>
+</figure>
+
+<h3 id="page-header-and-destinations">Page header and destinations</h3>
+<p>The page title is <strong>Process Review</strong>. The header
+includes:</p>
+<ul>
+<li><strong>Back to Process</strong>, which returns to Process
+configuration without discarding completed review work;</li>
+<li><strong>Rapid Review</strong>, for the separate one-photo-at-a-time
+workflow;</li>
+<li><strong>Review misses</strong>, shown with a count only when
+missed-subject candidates exist; and</li>
+<li>the latest Process completion time and a <strong>Run
+details</strong> disclosure showing the run ID, configuration name,
+input scope, model/list-pair inventory, and feature availability.</li>
+</ul>
+<p>The page does not use “Pipeline Review” in visible copy. Process is
+the user-facing workflow name; pipeline and cache identifiers remain
+diagnostic implementation terms only.</p>
+<h3 id="coverage-summary">Coverage summary</h3>
+<p>The top of the page describes the canonical result rather than the
+current view. Examples:</p>
+<blockquote>
+<p>Latest process result · 15,418 photos · completed August 15 at 10:16
+PM</p>
+</blockquote>
+<p>For a partial process run:</p>
+<blockquote>
+<p>Latest process result includes 2,140 of 15,418 workspace photos ·
+Processed from collection “August shorebirds”</p>
+</blockquote>
+<p>If a selected collection contains photos outside the process result,
+the view reports the intersection explicitly:</p>
+<blockquote>
+<p>380 collection photos match this process result · 24 collection
+photos were not part of the latest process run</p>
+</blockquote>
+<p>The user may return to Process to include those photos. Process
+Review does not compute them implicitly.</p>
+<p>If optional enhancing stages were unavailable, the coverage area
+shows one dismissible health banner such as:</p>
+<blockquote>
+<p>Review is available, but 420 photos have no species predictions and
+18 have no subject masks. Re-run missing stages from Process.</p>
+</blockquote>
+<p>The banner names which features are affected and which page
+capabilities are degraded. It never describes missing model evidence as
+a negative prediction.</p>
+<h3 id="summary-strip">Summary strip</h3>
+<p>The summary strip separates canonical totals from the current
+view:</p>
+<ul>
+<li><strong>Process result:</strong> total photos, encounters, and
+bursts in the run;</li>
+<li><strong>Triage:</strong> effective Keep, Review, Reject, and
+protected-photo counts;</li>
+<li><strong>Species review:</strong> resolved subjects or photo-level
+targets, unresolved targets, active disagreements, and multi-species
+photos; and</li>
+<li><strong>Current view:</strong> matching photos, complete encounters,
+and context photos.</li>
+</ul>
+<p>Canonical counts remain stable as filters change, except after a
+mutation. View counts update for the active query. Every number has a
+label and tooltip that states its unit; the page never displays a bare
+“42 confirmed” when the number could refer to photos, subjects, bursts,
+or encounters.</p>
+<h3 id="pending-sidecar-synchronization">Pending sidecar
+synchronization</h3>
+<p>When committed review changes have not yet been written to Extensible
+Metadata Platform (XMP) sidecar files, a nonblocking banner appears
+below the summary:</p>
+<blockquote>
+<p>18 saved Vireo changes are waiting to be written to sidecar files</p>
+</blockquote>
+<p><strong>Review sidecar changes</strong> opens a preview grouped by
+photo and change type, including keyword additions/removals, triage
+flags, ratings, locations, and other pending metadata. Each row shows
+the current sidecar value and the value Vireo will write. Thumbnail size
+and change-type filters affect the preview only.</p>
+<p><strong>Write sidecars</strong> starts an asynchronous job for all
+pending changes. <strong>Write selected change types</strong> writes
+only the visible checked types. Progress reports photos completed and
+the current filename; closing the preview does not cancel the job. A
+failure retains unsynchronized entries and offers retry.</p>
+<p>The current label “Discard” is not used because it can sound like
+undoing the review decision. <strong>Keep only in Vireo</strong> removes
+a selected pending sidecar write after confirming that the saved Vireo
+triage/species decision remains. Undoing the decision itself must happen
+through Edit history. Sidecar synchronization is never required before
+continuing review or leaving the page.</p>
+<h3 id="review-toolbar">Review toolbar</h3>
+<p>The sticky toolbar has two rows on wide screens.</p>
+<p>The first row defines work to review:</p>
+<ul>
+<li><strong>Triage:</strong> All, Keep, Review, or Reject.</li>
+<li><strong>Species review:</strong> All, Needs review, Resolved, or
+Conflicts.</li>
+<li><strong>Collection:</strong> All processed photos or one
+collection.</li>
+<li><strong>Encounter match:</strong> Any photo or Every photo.</li>
+<li><strong>Search:</strong> species, scientific name, filename, model
+name, label-list name, or photo ID. Match-case and whole-word options
+live inside the search menu.</li>
+</ul>
+<p>The second row controls presentation:</p>
+<ul>
+<li><strong>Sort:</strong> chronological, newest first, oldest first,
+most/fewest photos, most bursts, unresolved first, or conflict
+severity;</li>
+<li><strong>Thumbnail size:</strong> a persistent compact-to-large
+control;</li>
+<li><strong>Prediction threshold:</strong> a display-only minimum
+confidence control that never changes stored model evidence or
+resolution state;</li>
+<li><strong>Show automated triage labels:</strong> off by default when
+manual decisions are present, so recommendations cannot be mistaken for
+decisions; and</li>
+<li><strong>Collapse all / Expand loaded:</strong> changes only loaded
+encounter cards.</li>
+</ul>
+<p>“Latest review,” “Workspace,” and “Collection” are removed as
+mutually exclusive analysis scopes. “All processed photos” is the
+unfiltered view of the latest canonical result; Collection is an
+optional view filter.</p>
+<p>The encounter-match choice is a two-option segmented control rather
+than a checkbox named “Keep encounters intact,” because both choices
+preserve encounters. If the platform requires a checkbox, use
+<strong>Require every photo in the encounter to match</strong>;
+unchecked means Any photo.</p>
+<p>The setting defaults to <strong>Any photo</strong>, persists as a
+Process Review view preference, and remains visible whenever a
+photo-based filter is active.</p>
+<p>Active criteria appear as removable chips below the toolbar, followed
+by one <strong>Clear view filters</strong> action. The current view
+definition is encoded in the URL and restored on reload. Display-only
+preferences such as thumbnail size and sidebar state are stored
+separately and do not alter a shared URL.</p>
+<p>Changing a filter keeps the old list visible with an updating
+treatment until the first new page arrives. The page does not blank,
+jump to the top, or lose the user&#39;s focused encounter unless that
+encounter no longer qualifies.</p>
+<h3 id="advanced-controls-sidebar">Advanced controls sidebar</h3>
+<p>The sidebar is collapsed by default for routine review and remembers
+its state. It has three sections.</p>
+<p><strong>View explanation</strong> shows why the focused encounter is
+present, which photos matched the current query, and which were included
+as context. It also shows the focused encounter&#39;s grouping trace when
+trace data is current.</p>
+<p><strong>Scoring recommendations</strong> adjusts how automated Keep,
+Review, and Reject recommendations are derived. Controls include
+hard-reject floors for crop completeness, focus, clipped highlights, and
+composite quality, plus the quality-versus-diversity balance and maximum
+selected photos for burst- and encounter-level selection. Changes affect
+recommendations across the complete canonical result, never just the
+current view. Manual triage decisions remain untouched. <strong>Reset
+recommendations</strong> restores the run settings;
+<strong>Apply</strong> previews changed recommendation counts before
+committing.</p>
+<p><strong>Grouping settings</strong> exposes the advanced encounter and
+burst parameters used by Process: time, subject-similarity,
+whole-image-similarity, species, and capture-metadata weights; hard and
+soft encounter-cut thresholds; adjacent encounter merge thresholds; and
+burst time/similarity thresholds. Each control has a plain-language
+explanation, current value, run value, and valid range. Changing these
+settings does nothing until <strong>Preview regrouping</strong> is
+selected. The preview reports encounters and bursts added, removed,
+split, or merged. <strong>Apply regrouping to complete result</strong>
+creates a new canonical revision after confirmation. <strong>Save as
+Process defaults</strong> is a separate action and never occurs
+implicitly.</p>
+<p>If the focused encounter was manually restructured, the grouping
+trace labels the computed boundaries and manual overrides separately. It
+never presents an outdated trace as the explanation for current
+membership.</p>
+<h3 id="encounter-card">Encounter card</h3>
+<p>Every loaded encounter is one collapsible card. Its header remains
+visible when the body is collapsed and contains:</p>
+<ul>
+<li>expand/collapse control and view-local encounter ordinal;</li>
+<li>time range, location when available, photo count, and burst
+count;</li>
+<li>confirmed species roster or unresolved suggestion summary;</li>
+<li>subject/photo resolution progress;</li>
+<li>badges for model disagreement, label-list disagreement, multiple
+species, group variation, missing evidence, missing timestamps, or
+protected photos;</li>
+<li><code>N of M photos match view</code> when context photos are
+present;</li>
+<li><strong>Review species</strong> or the eligible one-click
+confirmation action;</li>
+<li>an effective triage summary and explicit <strong>Reject all
+photos</strong> or <strong>Clear rejects</strong> action; and</li>
+<li>an overflow menu containing structural actions and <strong>Copy
+encounter ID</strong>.</li>
+</ul>
+<p>Clicking the chevron or noninteractive header background expands the
+card. Clicking a badge opens the relevant explanation. Clicking an
+action never also toggles expansion. Long encounter cards repeat the
+decision summary in a compact footer so the user need not scroll back to
+the header.</p>
+<p>The expanded body renders every burst in chronological order. Context
+photos that did not match the view remain fully interactive and carry a
+text-and-icon <strong>Context</strong> badge. Matching photos may carry
+a <strong>Matches view</strong> badge. Neither state is communicated by
+opacity alone.</p>
+<h3 id="burst-row">Burst row</h3>
+<p>Each burst row contains:</p>
+<ul>
+<li>stable burst label, chronological position, time span, and photo
+count;</li>
+<li>resolved species roster or suggestion and its model support;</li>
+<li>triage counts for its member photos;</li>
+<li>active disagreement or multi-species badges;</li>
+<li><strong>Review burst</strong>, which opens Group Review;</li>
+<li><strong>Reject burst</strong> or <strong>Clear rejects</strong>
+using every member photo; and</li>
+<li>an overflow menu with Split burst, Extract photos, Merge with
+previous/next, Separate as encounter, and Split encounter before/after
+when eligible.</li>
+</ul>
+<p>Unavailable structural actions remain absent rather than disabled
+without an explanation. For example, the first burst has no Split
+encounter before action if that would create an empty encounter, and a
+one-photo burst has no internal split point.</p>
+<h3 id="photo-card">Photo card</h3>
+<p>A photo card contains the thumbnail and only decision-relevant
+overlays:</p>
+<ul>
+<li>filename and capture time on demand;</li>
+<li>effective manual Keep or Reject state;</li>
+<li>optional automated triage recommendation;</li>
+<li>composite quality score and protected-photo reason when
+available;</li>
+<li>matching/context marker;</li>
+<li>species roster or primary suggestion, subject count, and active
+conflict;</li>
+<li>species-representative marker; and</li>
+<li>missing-file or unavailable-preview state.</li>
+</ul>
+<p>Clicking a photo opens Group Review for its complete burst with that
+photo selected. Right-click or the overflow button offers <strong>Open
+in Browse</strong>, <strong>Highlight for species</strong>, <strong>Set
+as species representative</strong>, <strong>Extract to new
+burst</strong>, and photo-level triage actions. Destructive-looking
+<code>×</code> controls are not used for structural edits because they
+do not communicate where the photo will go.</p>
+<p>Thumbnail loading is lazy. A missing thumbnail does not remove the
+photo card or its actions. The card shows filename, metadata, and
+<strong>Locate file</strong> when the underlying library item is
+unavailable.</p>
+<h3 id="paged-encounter-list">Paged encounter list</h3>
+<p>The page requests whole encounters. Skeletons reserve approximate
+card height only for the next page; they never mimic partial encounter
+content. An end marker reports:</p>
+<blockquote>
+<p>End of view · 94 complete encounters · 612 photos shown</p>
+</blockquote>
+<p>The page may evict distant expanded bodies to bound memory, but
+retains a lightweight placeholder with stable height, expansion state,
+and current revision so back-scrolling does not jump.</p>
+<h2 id="encounter-matching">Encounter matching</h2>
+<p>Let <code>S</code> be the set of photos in the canonical process
+result that satisfy the active photo-based criteria, and let
+<code>E</code> be the complete member set of one canonical
+encounter.</p>
+<ul>
+<li><strong>Any photo:</strong> include the encounter when
+<code>E ∩ S</code> is not empty.</li>
+<li><strong>Every photo:</strong> include the encounter when
+<code>E</code> is a subset of <code>S</code>.</li>
+</ul>
+<p>The complete set <code>E</code> is returned and rendered in either
+case.</p>
+<h3 id="example">Example</h3>
+<p>An encounter contains photos A, B, C, and D. A collection contains B
+and C.</p>
+<table>
+<thead>
+<tr>
+<th>Encounter match</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Any photo</td>
+<td>Show A, B, C, and D; identify B and C as matches</td>
+</tr>
+<tr>
+<td>Every photo</td>
+<td>Do not show the encounter</td>
+</tr>
+</tbody>
+</table>
+<p>If the collection later contains all four photos, both modes show the
+same complete encounter.</p>
+<figure class="design-diagram" aria-labelledby="encounter-match-caption">
+<div class="diagram-scroll">
+<svg viewBox="0 0 960 390" role="img" aria-labelledby="encounter-match-title encounter-match-desc">
+  <title id="encounter-match-title">Any photo and Every photo encounter matching</title>
+  <desc id="encounter-match-desc">An encounter contains photos A through D, while only B and C match the filter. Any photo includes the complete encounter with A and D as context. Every photo excludes the encounter because not every member matches.</desc>
+  <text class="diagram-label" x="34" y="34">CANONICAL ENCOUNTER</text>
+  <rect class="diagram-panel" x="28" y="50" width="904" height="92" rx="14" />
+  <rect class="diagram-context" x="178" y="68" width="112" height="56" rx="9" />
+  <rect class="diagram-match" x="306" y="68" width="112" height="56" rx="9" />
+  <rect class="diagram-match" x="434" y="68" width="112" height="56" rx="9" />
+  <rect class="diagram-context" x="562" y="68" width="112" height="56" rx="9" />
+  <text class="diagram-text" x="226" y="102">A</text>
+  <text class="diagram-text" x="354" y="102">B</text>
+  <text class="diagram-text" x="482" y="102">C</text>
+  <text class="diagram-text" x="610" y="102">D</text>
+  <text class="diagram-small" x="704" y="91">B + C match filter</text>
+  <text class="diagram-small" x="704" y="113">A + D are context</text>
+
+  <path class="diagram-line-accent" d="M352 146 L264 188" />
+  <path class="diagram-line" d="M608 146 L704 188" />
+
+  <rect class="diagram-accent" x="28" y="188" width="430" height="172" rx="16" />
+  <text class="diagram-title" x="52" y="220">Any photo</text>
+  <text class="diagram-small" x="52" y="244">At least one member matches → include all four</text>
+  <rect class="diagram-context" x="52" y="266" width="80" height="52" rx="8" />
+  <rect class="diagram-match" x="144" y="266" width="80" height="52" rx="8" />
+  <rect class="diagram-match" x="236" y="266" width="80" height="52" rx="8" />
+  <rect class="diagram-context" x="328" y="266" width="80" height="52" rx="8" />
+  <text class="diagram-text" x="84" y="298">A</text><text class="diagram-text" x="176" y="298">B</text>
+  <text class="diagram-text" x="268" y="298">C</text><text class="diagram-text" x="360" y="298">D</text>
+  <text class="diagram-label" x="52" y="342">SHOWN · COMPLETE + EDITABLE</text>
+
+  <rect class="diagram-surface" x="486" y="188" width="446" height="172" rx="16" />
+  <text class="diagram-title" x="510" y="220">Every photo</text>
+  <text class="diagram-small" x="510" y="244">A and D do not match → exclude the encounter</text>
+  <rect class="diagram-context" x="510" y="266" width="86" height="52" rx="8" />
+  <rect class="diagram-match" x="608" y="266" width="86" height="52" rx="8" />
+  <rect class="diagram-match" x="706" y="266" width="86" height="52" rx="8" />
+  <rect class="diagram-context" x="804" y="266" width="86" height="52" rx="8" />
+  <line x1="510" y1="258" x2="890" y2="326" stroke="#bd6b63" stroke-width="4"></line>
+  <text class="diagram-label" x="510" y="342">NOT SHOWN · NEVER PARTIALLY RENDERED</text>
+</svg>
+</div>
+<figcaption id="encounter-match-caption"><strong>Encounter matching.</strong> Any photo is inclusive and adds context; Every photo is strict. Neither mode removes individual photos from an encounter that is shown.</figcaption>
+</figure>
+
+<h3 id="combining-filters">Combining filters</h3>
+<p>Photo-based criteria are combined first to form <code>S</code>. For
+example, Collection “August shorebirds” plus Status “Review” means
+photos that are both in the collection and currently marked Review. The
+encounter match rule is then applied once to that combined set.</p>
+<p>Species and filename search includes a complete encounter when the
+query matches any visible encounter label, burst label, qualifying
+prediction, or filename. Search does not trim the encounter. Search
+options such as case matching and whole-word matching retain their
+current meaning.</p>
+<p>Species-review filtering operates at the encounter level:</p>
+<ul>
+<li><strong>Needs review</strong> includes encounters with at least one
+unresolved evidence target and renders the complete encounter, including
+resolved subjects and bursts.</li>
+<li><strong>Resolved</strong> includes encounters with no unresolved
+evidence targets.</li>
+</ul>
+<p>It never removes resolved bursts from inside a mixed encounter. That
+would fragment the context the design is intended to preserve.</p>
+<h3 id="explaining-the-view">Explaining the view</h3>
+<p>The toolbar reports both the query match and expanded context:</p>
+<blockquote>
+<p>273 photos matched · 94 complete encounters · 612 photos shown with
+context</p>
+</blockquote>
+<p>In Any photo mode, matching photos receive a subtle “Matches view”
+treatment. Nonmatching context photos remain fully interactive and are
+not presented as disabled. The treatment must not rely on color
+alone.</p>
+<p>In Every photo mode, every photo matches, so per-photo match
+decoration is unnecessary.</p>
+<h2 id="species-evidence-and-disagreement">Species evidence and
+disagreement</h2>
+<p>Process Review must preserve where every species claim came from. A
+runner-up from one classifier, two classifiers disagreeing about one
+subject, two different animals in one image, and two species appearing
+in different photos of an encounter are four different situations. They
+must not be flattened into one confidence-weighted species list.</p>
+<figure class="design-diagram" aria-labelledby="species-flow-caption">
+<div class="diagram-scroll">
+<svg viewBox="0 0 960 650" role="img" aria-labelledby="species-flow-title species-flow-desc">
+  <title id="species-flow-title">Species evidence from subjects and prediction sources to human assertions</title>
+  <desc id="species-flow-desc">Subject and photo-level evidence remain separate. Multiple label lists from one model consolidate into one vote. Independent models can disagree. Multi-label photo predictions are evaluated per taxon. Human resolution creates assertions without deleting model evidence.</desc>
+  <text class="diagram-label" x="24" y="34">1 · EVIDENCE TARGETS</text>
+  <text class="diagram-label" x="252" y="34">2 · MODEL / LABEL-LIST SOURCES</text>
+  <text class="diagram-label" x="570" y="34">3 · CONSOLIDATE</text>
+  <text class="diagram-label" x="766" y="34">4 · REVIEW DECISION</text>
+
+  <rect class="diagram-blue" x="20" y="52" width="198" height="518" rx="16" />
+  <text class="diagram-title" x="42" y="86">Photo 812</text>
+  <rect class="diagram-surface" x="42" y="108" width="154" height="154" rx="12" />
+  <rect class="diagram-accent" x="58" y="126" width="58" height="96" rx="10" />
+  <rect class="diagram-amber" x="126" y="148" width="52" height="72" rx="10" />
+  <text class="diagram-small" x="58" y="246">Two subject boxes</text>
+  <rect class="diagram-surface" x="42" y="286" width="154" height="72" rx="10" />
+  <text class="diagram-text" x="58" y="316">Subject 1</text>
+  <text class="diagram-small" x="58" y="340">single animal</text>
+  <rect class="diagram-surface" x="42" y="374" width="154" height="72" rx="10" />
+  <text class="diagram-text" x="58" y="404">Subject 2</text>
+  <text class="diagram-small" x="58" y="428">separate animal</text>
+  <rect class="diagram-violet" x="42" y="462" width="154" height="82" rx="10" />
+  <text class="diagram-text" x="58" y="493">Photo-level target</text>
+  <text class="diagram-small" x="58" y="517">no subject association</text>
+
+  <path class="diagram-line" d="M218 320 L246 126" />
+  <path class="diagram-line" d="M218 320 L246 222" />
+  <path class="diagram-line" d="M218 320 L246 318" />
+  <path class="diagram-line" d="M218 500 L246 450" />
+
+  <rect class="diagram-panel" x="246" y="52" width="294" height="518" rx="16" />
+  <rect class="diagram-accent" x="266" y="74" width="254" height="78" rx="10" />
+  <text class="diagram-text" x="282" y="104">Model A · Birds list</text>
+  <text class="diagram-small" x="282" y="130">Subject 1 → Robin · 0.91</text>
+  <rect class="diagram-accent" x="266" y="168" width="254" height="78" rx="10" />
+  <text class="diagram-text" x="282" y="198">Model A · Vertebrates list</text>
+  <text class="diagram-small" x="282" y="224">Subject 1 → Robin · 0.88</text>
+  <path d="M526 84 L534 84 L534 236 L526 236" fill="none" stroke="#3a7d62" stroke-width="3" />
+  <text class="diagram-small" x="382" y="263">same independence group</text>
+  <rect class="diagram-amber" x="266" y="278" width="254" height="78" rx="10" />
+  <text class="diagram-text" x="282" y="308">Model B · Birds list</text>
+  <text class="diagram-small" x="282" y="334">Subject 1 → Sparrow · 0.82</text>
+  <rect class="diagram-violet" x="266" y="386" width="254" height="134" rx="10" />
+  <text class="diagram-text" x="282" y="416">Model C · multi-label image</text>
+  <text class="diagram-small" x="282" y="443">Photo → Robin present · 0.89</text>
+  <text class="diagram-small" x="282" y="469">Photo → Mallard present · 0.86</text>
+  <text class="diagram-small" x="282" y="498">Independent presence claims</text>
+  <path class="diagram-line-accent" d="M540 154 L564 154" /><path d="M556 146 L566 154 L556 162" fill="none" stroke="#3a7d62" stroke-width="3" />
+  <path class="diagram-line-accent" d="M540 316 L564 316" /><path d="M556 308 L566 316 L556 324" fill="none" stroke="#3a7d62" stroke-width="3" />
+  <path class="diagram-line-accent" d="M540 452 L564 452" /><path d="M556 444 L566 452 L556 460" fill="none" stroke="#3a7d62" stroke-width="3" />
+
+  <rect class="diagram-surface" x="566" y="52" width="176" height="518" rx="16" />
+  <rect class="diagram-accent" x="584" y="82" width="140" height="104" rx="10" />
+  <text class="diagram-text" x="600" y="112">Model A</text>
+  <text class="diagram-small" x="600" y="138">one Robin vote</text>
+  <text class="diagram-small" x="600" y="162">not two votes</text>
+  <rect class="diagram-amber" x="584" y="210" width="140" height="86" rx="10" />
+  <text class="diagram-text" x="600" y="240">Model B</text>
+  <text class="diagram-small" x="600" y="266">one Sparrow vote</text>
+  <rect class="diagram-violet" x="584" y="326" width="140" height="158" rx="10" />
+  <text class="diagram-text" x="600" y="356">Photo presence</text>
+  <text class="diagram-small" x="600" y="384">Robin: supported</text>
+  <text class="diagram-small" x="600" y="410">Mallard: supported</text>
+  <text class="diagram-small" x="600" y="444">evaluated per taxon</text>
+  <text class="diagram-small" x="600" y="468">no subject invented</text>
+  <text class="diagram-small" x="586" y="532">No cross-model</text>
+  <text class="diagram-small" x="586" y="552">confidence average</text>
+  <path class="diagram-line-accent" d="M742 150 L762 150" /><path d="M754 142 L764 150 L754 158" fill="none" stroke="#3a7d62" stroke-width="3" />
+  <path class="diagram-line-accent" d="M742 404 L762 404" /><path d="M754 396 L764 404 L754 412" fill="none" stroke="#3a7d62" stroke-width="3" />
+
+  <rect class="diagram-panel" x="764" y="52" width="176" height="518" rx="16" />
+  <rect class="diagram-amber" x="782" y="82" width="140" height="112" rx="10" />
+  <text class="diagram-text" x="798" y="112">Subject 1</text>
+  <text class="diagram-small" x="798" y="138">Model split</text>
+  <text class="diagram-small" x="798" y="162">explicit review</text>
+  <rect class="diagram-accent" x="782" y="218" width="140" height="102" rx="10" />
+  <text class="diagram-text" x="798" y="248">Human assertion</text>
+  <text class="diagram-small" x="798" y="274">Subject 1 = Robin</text>
+  <text class="diagram-small" x="798" y="298">dissent retained</text>
+  <rect class="diagram-violet" x="782" y="344" width="140" height="122" rx="10" />
+  <text class="diagram-text" x="798" y="374">Photo assertions</text>
+  <text class="diagram-small" x="798" y="400">Robin present</text>
+  <text class="diagram-small" x="798" y="426">Mallard present</text>
+  <rect class="diagram-blue" x="782" y="490" width="140" height="54" rx="10" />
+  <text class="diagram-text" x="798" y="522">2-species roster</text>
+</svg>
+</div>
+<figcaption id="species-flow-caption"><strong>Species evidence flow.</strong> Evidence stays attached to a subject or the photo. Label lists from one underlying model cannot multiply its vote; independent models may split; multi-label image evidence can support several taxa without inventing subjects. Human assertions resolve work while preserving dissent for audit.</figcaption>
+</figure>
+
+<h3 id="evidence-hierarchy">Evidence hierarchy</h3>
+<p>Species evidence has four explicit levels:</p>
+<ol type="1">
+<li><strong>Subject</strong> — one detected subject in one photo,
+identified by its detection ID and bounding box. A photo with no usable
+detections may instead have one photo-level evidence target.</li>
+<li><strong>Prediction source</strong> — one classifier model and
+label-list version applied to that subject. Its identity is the pair
+<code>(classifier_model, labels_fingerprint)</code>. User-facing copy
+uses the model and label list display names; raw fingerprints appear
+only in diagnostics.</li>
+<li><strong>Photo</strong> — the set of resolved or suggested species
+across that photo&#39;s subjects. More than one subject may produce more
+than one species.</li>
+<li><strong>Burst or encounter</strong> — a coverage summary over its
+photos and subjects, not a new independent prediction.</li>
+</ol>
+<p>The serialized review contract preserves subject ID,
+prediction-source ID, candidate rank, confidence, taxon identity, and
+label-list coverage. The current flattened <code>species_top5</code>
+shape may be read during migration, but it is not sufficient as the
+canonical contract because it loses subject and label list identity and
+caps rows across otherwise independent sources.</p>
+<p>Each source also declares its prediction mode. An
+<strong>exclusive</strong> source returns ranked alternatives for one
+biological subject; only one incompatible leaf taxon can be correct. A
+<strong>multi-label presence</strong> source returns independently
+qualified taxon-presence claims for a photo or region and may support
+several species at once. Process Review must not infer the mode from the
+shape of a top-k response.</p>
+<h3 id="prediction-source-identity">Prediction source identity</h3>
+<p>A label list is part of the prediction source, not incidental
+metadata. The same model run against “North American birds” and “All
+vertebrates” produces two model/list-pair sources. The process result
+snapshots the exact source inventory used for that run:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;source_id&quot;</span><span class="fu">:</span> <span class="st">&quot;source-17&quot;</span><span class="fu">,</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;classifier_model&quot;</span><span class="fu">:</span> <span class="st">&quot;timm-inat21-eva02-l&quot;</span><span class="fu">,</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;model_display_name&quot;</span><span class="fu">:</span> <span class="st">&quot;iNaturalist EVA-02 Large&quot;</span><span class="fu">,</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;labels_fingerprint&quot;</span><span class="fu">:</span> <span class="st">&quot;7f83b165...&quot;</span><span class="fu">,</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;labels_display_name&quot;</span><span class="fu">:</span> <span class="st">&quot;North American birds&quot;</span><span class="fu">,</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;label_count&quot;</span><span class="fu">:</span> <span class="dv">1240</span><span class="fu">,</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;prediction_mode&quot;</span><span class="fu">:</span> <span class="st">&quot;exclusive&quot;</span><span class="fu">,</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;independence_group&quot;</span><span class="fu">:</span> <span class="st">&quot;timm-inat21-eva02-l&quot;</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>Only sources explicitly included in the canonical Process run
+contribute to that review. Stale predictions from an older label
+fingerprint do not appear, and a source that failed or did not run is
+reported as missing evidence rather than treated as a vote against a
+species.</p>
+<p>The default independence group is the underlying classifier model.
+Multiple label lists applied to the same model do not create multiple
+independent model votes. A saved Process definition may supply explicit
+source weights or a different independence grouping, but Process Review
+displays that policy; it does not silently infer independence from the
+number of prediction rows.</p>
+<h3 id="taxon-normalization-and-compatible-predictions">Taxon
+normalization and compatible predictions</h3>
+<p>Predictions are compared by canonical taxon ID when available, not
+display spelling. Common names, scientific names, aliases, and hierarchy
+leaves that refer to the same taxon agree.</p>
+<p>Ancestor/descendant predictions are <strong>compatible
+refinements</strong>, not direct conflicts. For example, “warbler” and
+“Yellow Warbler” may support a shared lineage while differing in
+specificity. The UI shows the most specific well-supported suggestion
+and discloses that another source stopped at a broader rank. Predictions
+on incompatible taxonomy branches are disagreements. Unmapped free-text
+labels can agree by normalized text but are marked as less certain than
+taxon-linked evidence.</p>
+<h3 id="label-list-coverage">Label-list coverage</h3>
+<p>A prediction source can only disagree about a taxon its label list
+was capable of choosing. If a list does not contain a taxon or a
+compatible ancestor, that source <strong>abstains</strong> for that
+comparison; it contributes neither a zero score nor a negative vote.</p>
+<p>This distinction is visible:</p>
+<ul>
+<li><strong>Agrees</strong> — the source could express the candidate and
+selected it or a compatible refinement.</li>
+<li><strong>Disagrees</strong> — the source could express the competing
+taxa and credibly selected an incompatible one.</li>
+<li><strong>Not covered</strong> — the label list could not express the
+candidate.</li>
+<li><strong>Uncertain</strong> — the source ran but did not clear its
+confidence and margin requirements.</li>
+<li><strong>Unavailable</strong> — the configured source did not produce
+a usable result.</li>
+</ul>
+<p>The label fingerprint registry therefore needs queryable taxon
+coverage, not only a display name and label count. Coverage may be
+stored as a normalized taxon set or a reference to the immutable
+label-list manifest used by the run.</p>
+<h3 id="exclusive-alternatives-and-multi-label-presence">Exclusive
+alternatives and multi-label presence</h3>
+<p>An exclusive prediction source returns a ranked candidate list for
+one subject. Only a qualified leading candidate participates in
+automatic consensus. Lower-ranked candidates communicate uncertainty and
+remain selectable during manual review; they are never interpreted as
+additional animals or additional species present in the photo.</p>
+<p>A leading candidate is qualified using that source&#39;s configured
+confidence and margin requirements. Model-specific calibration may
+override global defaults. Raw confidence values from different models or
+different label lists are shown but are not averaged into a probability
+unless those sources have an explicit shared calibration.</p>
+<p>A source explicitly configured as multi-label presence may emit more
+than one qualified taxon for a photo or multi-subject region. Those taxa
+become separate presence suggestions, each with its own score and
+threshold result. They do not claim how many subjects are present and do
+not create subject assignments. A qualified absence counts against a
+taxon only when the source covers that taxon and has a versioned,
+calibrated negative threshold; otherwise the source abstains.</p>
+<p>When a multi-label source is attached to a box known to contain
+exactly one subject, incompatible qualified taxa are treated as
+disagreement about that subject, not as proof that the subject has
+multiple species. When the region may contain several subjects, the
+suggestions remain photo- or region-level until a user associates them
+with subjects or confirms photo-level presence.</p>
+<h3 id="combining-label-lists-from-the-same-model">Combining label lists
+from the same model</h3>
+<p>For one subject, sources in the same independence group are
+consolidated before cross-model consensus:</p>
+<ol type="1">
+<li>Discard candidates below their source-specific confidence or margin
+floor.</li>
+<li>Normalize candidates to canonical taxa and determine whether their
+label lists make them mutually comparable.</li>
+<li>If all comparable, qualified sources agree or are compatible
+refinements, the model contributes one vote for the most specific
+supported taxon.</li>
+<li>If comparable sources select incompatible taxa, mark
+<strong>Label-list disagreement</strong> and make that model abstain
+from the automatic consensus.</li>
+<li>If sources cover disjoint taxonomic areas and cannot be compared,
+show <strong>Different label coverage</strong> and do not manufacture a
+winner. A configured routing rule from the Process definition may select
+the applicable source; absent such a rule, the model abstains.</li>
+</ol>
+<p>This prevents running the same model against three overlapping lists
+from outvoting a genuinely independent second model.</p>
+<p>For multi-label presence sources, consolidation runs independently
+for each taxon. One independence group contributes at most one support,
+calibrated negative, or abstention for that taxon, even when several
+overlapping label lists include it. Qualified presence claims for
+different taxa may coexist; they are not forced through the exclusive
+single-winner rule.</p>
+<h3 id="combining-different-models-for-one-subject">Combining different
+models for one subject</h3>
+<p>After same-model sources are consolidated, each independence group
+contributes at most one vote for the subject.</p>
+<ul>
+<li><strong>Unanimous suggestion:</strong> every non-abstaining model
+agrees or gives a compatible refinement.</li>
+<li><strong>Majority suggestion:</strong> a strict majority agrees, with
+dissent shown.</li>
+<li><strong>Model split:</strong> no strict majority exists. In
+particular, two models that choose different species produce no
+automatic winner.</li>
+<li><strong>Single-model suggestion:</strong> only one model supplies
+qualified evidence. It may be offered as a suggestion but is labeled as
+single-model evidence.</li>
+<li><strong>Insufficient evidence:</strong> every model abstains or is
+unavailable.</li>
+</ul>
+<p>The interface reports votes and abstentions—for example, “2 of 3
+models agree; 1 uncertain”—alongside each source&#39;s original confidence.
+It does not display an opaque aggregate percentage that implies the
+models are calibrated or independent.</p>
+<p>For photo- or multi-subject-region multi-label evidence, cross-model
+consensus also runs per taxon. Several taxa can each receive
+supported-presence suggestions. Incompatible taxa at this level do not
+conflict merely because they differ: multiple species can share an
+image. A disagreement exists when models provide qualified opposing
+evidence about the same taxon&#39;s presence, or when incompatible
+predictions have been assigned to one subject known to represent a
+single animal.</p>
+<p>A majority suggestion is eligible for the fast confirmation action,
+but any dissent remains visible. A model split, same-model label-list
+disagreement, or incompatible high-confidence alternative requires
+explicit review and is included by the Species conflicts filter while
+unresolved.</p>
+<h3 id="multiple-subjects-and-multiple-species-in-one-photo">Multiple
+subjects and multiple species in one photo</h3>
+<p>Each detected subject retains its own prediction-source matrix. The
+photo inspector and Group Review modal show subject chips and bounding
+boxes; choosing a subject updates the evidence panel for that
+subject.</p>
+<p>Two credible subjects supporting different taxa mean <strong>multiple
+species in the photo</strong>, not model disagreement. The photo
+displays a species roster such as:</p>
+<blockquote>
+<p>American Wigeon · subject 1, 2 models<br />
+Mallard · subject 2, 2 models</p>
+</blockquote>
+<p>Two subjects supporting the same taxon display one species with “2
+subjects.” Overlapping duplicate detections must be reconciled by
+detector identity or a deduplication rule before they can inflate
+subject or species counts.</p>
+<p>A whole-image classifier result with no subject association is
+photo-level evidence. An exclusive source contributes alternatives for
+the image. A true multi-label presence source may contribute several
+species suggestions, but it cannot establish subject count or associate
+a species with a particular box. When subject-specific and photo-level
+evidence disagree, subject-specific evidence is shown first and the
+photo-level result is labeled as contextual evidence.</p>
+<h3 id="species-variation-across-a-burst-or-encounter">Species variation
+across a burst or encounter</h3>
+<p>Burst and encounter summaries aggregate resolved subject evidence by
+taxon and report coverage rather than averaging every candidate row.
+Each species row includes:</p>
+<ul>
+<li>confirmed and suggested subject counts;</li>
+<li>number of photos and bursts containing that species;</li>
+<li>agreeing, dissenting, abstaining, and unavailable model counts;
+and</li>
+<li>whether the evidence is subject-specific or photo-level only.</li>
+</ul>
+<p>Different taxa across different photos are <strong>group
+variation</strong>. The page distinguishes likely explanations:</p>
+<ul>
+<li>Species occur on different subjects in the same frames: present a
+multi-species encounter roster.</li>
+<li>Species align with different complete bursts: show a prominent
+<strong>Possible split by species</strong> action at the burst
+boundary.</li>
+<li>A credible species appears only in isolated photos: mark those
+photos and require review; do not silently erase the minority
+evidence.</li>
+<li>The disagreement is only taxonomic specificity: show compatible
+refinement, not a split warning.</li>
+</ul>
+<p>An encounter may still show a primary suggestion for speed, but its
+label is a summary such as “American Robin on 8 of 10 photos,” never an
+assertion that the other two photos agree. Additional credible species
+appear beside it rather than being hidden under a single winner.</p>
+<h3 id="species-confirmation-model">Species confirmation model</h3>
+<p>Confirmation is a positive species-presence assertion, not an
+exclusive single-species field.</p>
+<ul>
+<li><strong>Subject confirmation</strong> assigns one canonical taxon to
+one detected subject.</li>
+<li><strong>Photo confirmation</strong> confirms that a taxon is present
+in a photo when no reliable subject target exists.</li>
+<li><strong>Burst or encounter confirmation</strong> confirms that a
+taxon is present across the explicitly named target photos. It does not
+remove other confirmed species from those photos.</li>
+<li><strong>Replace species</strong> is a separate, explicit action that
+names the old and new assignments and previews removals.</li>
+<li><strong>Not identifiable</strong> resolves a subject without
+assigning a taxon.</li>
+<li><strong>False detection</strong> resolves and excludes a detected
+subject.</li>
+</ul>
+<p>Effective photo keywords are the union of confirmed subject- and
+photo-level species assertions. This naturally permits several species
+keywords on one photo. A group-level confirmation expands to auditable
+per-photo assertions so later splitting, undo, and partial replacement
+remain precise.</p>
+<p>For the common case—one consistent species across one subject per
+photo—the header retains a one-click <strong>Confirm [species] for
+encounter</strong> action. It shows the exact number of photos and
+unresolved subjects it will affect. When credible multi-species evidence
+or a material disagreement exists, the header uses <strong>Review
+species</strong> instead of presenting a misleading one-click
+winner.</p>
+<h3 id="completion-state">Completion state</h3>
+<p>Confirmation is tracked per reviewable subject or photo-level
+evidence target, not by one <code>species_confirmed</code> boolean on
+the encounter.</p>
+<p>A subject is resolved when it has a confirmed taxon, is marked Not
+identifiable, or is marked False detection. A photo is resolved when all
+of its reviewable subjects are resolved and any material photo-level
+conflict has been acknowledged. A burst or encounter is resolved when
+all member photos are resolved.</p>
+<p>Resolving a disagreement never edits or deletes the model outputs.
+Confirming a taxon records the human assertion and marks the target
+resolved; dissenting evidence remains visible under <strong>Resolved
+disagreement</strong> with the reviewer, time, and command provenance.
+The default Species conflicts view contains unresolved material
+conflicts. A secondary <strong>Include resolved disagreements</strong>
+option supports auditing without returning adjudicated encounters to the
+active work queue.</p>
+<p>The Needs review view includes a complete encounter when any member
+is unresolved. Resolved includes encounters with no unresolved members.
+This definition supports multi-species photos and prevents confirming
+one dominant species from hiding unresolved minority subjects.</p>
+<h3 id="species-evidence-interface">Species evidence interface</h3>
+<p>The collapsed encounter header shows only decision-relevant
+information:</p>
+<ul>
+<li>confirmed species roster, or the primary suggestion plus
+additional-species count;</li>
+<li>photo coverage, such as “8 of 10 photos”;</li>
+<li>model support, such as “2 of 3 models”; and</li>
+<li>badges for Model split, Label-list disagreement, Multiple species,
+Group variation, or Insufficient evidence.</li>
+</ul>
+<p>Expanding the species control reveals a matrix organized by subject
+and source. Rows are subjects or photo-level targets; columns are
+prediction sources labeled with both model and label list. Cells show
+the leading taxon, confidence, and state (agrees, disagrees, not
+covered, uncertain, unavailable). Selecting a cell reveals lower-ranked
+alternatives and source diagnostics.</p>
+<p>The Group Review modal keeps its per-photo strip. Multi-subject
+photos expose subject chips and boxes, while the evidence panel shows
+the selected subject&#39;s source matrix and the burst-level species
+coverage summary. Users can select subjects or photos and assign,
+confirm, reject, or mark evidence unresolved in bulk.</p>
+<h2 id="editing-behavior">Editing behavior</h2>
+<p>There are no read-only review views. The current message “Collection
+scope is view-only. Switch to Latest review to make changes.” is removed
+once all mutations below use canonical identities.</p>
+<h3 id="action-targets">Action targets</h3>
+<ul>
+<li>A photo action affects that photo.</li>
+<li>A burst action affects every photo in the complete displayed
+burst.</li>
+<li>An encounter action affects every photo in the complete displayed
+encounter.</li>
+<li>A bulk action must say whether it targets <strong>matching
+photos</strong> or <strong>all photos in shown encounters</strong>. It
+may not infer that distinction from which cards happened to be
+rendered.</li>
+</ul>
+<p>Because Any photo mode intentionally includes context outside the
+collection or status match, encounter- and burst-level controls can
+affect context photos. Their labels and confirmations must use complete
+target counts, for example:</p>
+<blockquote>
+<p>Reject encounter · 8 photos</p>
+</blockquote>
+<p>Matching-only bulk actions are allowed when explicitly named, for
+example:</p>
+<blockquote>
+<p>Reject 14 matching photos</p>
+</blockquote>
+<p>The default target for an action physically located on an encounter
+or burst is the complete object, even in Any photo mode. Page-level bulk
+actions have no default and require an explicit target choice in their
+confirmation sheet. The sheet previews matching photos, context photos,
+protected photos, and any photos whose current manual decision would be
+replaced.</p>
+<h3 id="automated-recommendations-and-manual-triage">Automated
+recommendations and manual triage</h3>
+<p>Process produces an automated Keep, Review, or Reject recommendation.
+Review creates an effective manual decision:</p>
+<ul>
+<li><strong>Keep</strong> protects the photo from rejection and marks it
+as selected.</li>
+<li><strong>Review</strong> clears a manual Keep or Reject decision and
+returns the photo to a neutral review state. It does not mean “accept
+the automated Review label.”</li>
+<li><strong>Reject</strong> marks the photo for rejection in downstream
+workflows.</li>
+</ul>
+<p>The UI always distinguishes <strong>Recommended: Reject</strong> from
+<strong>Rejected</strong>. A manual decision wins over the
+recommendation until explicitly cleared. Recomputing scores may change
+the recommendation but never overwrites manual triage.</p>
+<p>Photo actions apply immediately and optimistically, then reconcile
+with the server. <code>P</code> sets Keep, <code>X</code> sets Reject,
+and <code>Space</code> clears to Review when focus is in a review
+surface and not in a text field.</p>
+<p>Burst and encounter actions use complete membership:</p>
+<ul>
+<li><strong>Reject burst · N photos</strong> rejects every member not
+already rejected;</li>
+<li><strong>Clear rejects · N photos</strong> clears only rejected
+members and never clears a Keep decision;</li>
+<li><strong>Keep selected · N photos</strong> is offered from Group
+Review, not as an indiscriminate keep-entire-encounter action; and</li>
+<li>protected photos require an explicit second confirmation before
+Reject can replace their Keep/protected state.</li>
+</ul>
+<p>The page-level bulk menu offers <strong>Set matching photos to
+Keep/Review/Reject</strong> and <strong>Set all photos in shown
+encounters to Keep/Review/Reject</strong>. The chosen target appears in
+the action label, confirmation, progress message, undo message, and
+audit record.</p>
+<h3 id="species-confirmation">Species confirmation</h3>
+<p>Species confirmation uses the assertion model above. The request
+names the target subjects or photos, taxon, operation (add, replace, Not
+identifiable, or False detection), canonical run, and expected revision.
+The server returns the changed photos and encounters, updated completion
+and summary counts, and the new revision. It does not return the
+complete encounter list.</p>
+<p>Confirmation never changes structure merely because another species
+is present: multi-species photos and encounters are valid. When credible
+species variation aligns with burst boundaries, the interface may
+suggest <strong>Split encounter here</strong> or <strong>Separate burst
+as encounter</strong>, but the user must preview and request that
+structural command separately.</p>
+<h3 id="flags-and-quality-decisions">Flags and quality decisions</h3>
+<p>Photo flags remain database-backed and update optimistically.
+Encounter and burst flag controls submit explicit complete member IDs
+resolved from the canonical group. Their responses contain changed photo
+state and updated counts only.</p>
+<h3 id="structural-editing">Structural editing</h3>
+<p>Every structural action opens a preview with a compact before/after
+diagram, photo and burst counts, affected species summaries, and the
+resulting position in chronological order. The user may cancel without
+mutation. Apply uses the canonical run, expected revision, stable target
+IDs, and an explicit ordered membership result; it never uses a
+filtered-array index.</p>
+<h4 id="split-burst-here">Split burst here</h4>
+<p>The user chooses a gap between two chronologically adjacent photos.
+The left photos remain in the original burst and the right photos form a
+new adjacent burst in the same encounter. Neither side may be empty.
+Photo triage, subject assertions, photo assertions, and evidence stay
+attached to their photos. Burst summaries are derived again from each
+side.</p>
+<p>If the original burst carried a legacy burst-level species decision,
+the preview expands it into the auditable photo/subject assertions it
+represents before splitting. No hidden exclusive burst field is copied
+onto both sides.</p>
+<h4 id="extract-photos-to-new-burst">Extract photos to new burst</h4>
+<p>The user selects one or more photos from one source burst. Selected
+photos are removed from that burst and placed into new burst membership
+inside the same encounter. The source sequence is partitioned into
+maximal selected and unselected chronological runs, and every run
+becomes a burst. For example, extracting two middle photos from a
+six-photo burst produces an unselected two-photo burst, an extracted
+two-photo burst, and a final unselected two-photo burst. Disjoint
+selections therefore create separate extracted bursts and do not create
+overlapping time ranges. Resulting bursts are ordered by first capture
+time, with deterministic filename/ID fallback for missing
+timestamps.</p>
+<p>Extracting every photo is invalid because it would only rename the
+burst. A one-photo source burst offers Separate as encounter or Merge,
+not Extract. This operation replaces the current ambiguous “Detach
+photo” action.</p>
+<h4 id="merge-adjacent-bursts">Merge adjacent bursts</h4>
+<p>Only adjacent bursts in the same encounter can be merged directly.
+Their photos are placed in chronological order and their source IDs are
+recorded in the command provenance. Conflicting human species assertions
+remain attached to their subjects/photos and therefore produce a
+multi-species or disagreement summary rather than being overwritten. The
+preview warns if the merged burst will no longer have a single eligible
+quick-confirm action.</p>
+<h4 id="split-encounter-here">Split encounter here</h4>
+<p>The user chooses a boundary between bursts. Bursts before the
+boundary remain in the original encounter; the selected burst and later
+bursts form a new encounter. Both sides must contain at least one burst.
+Burst membership is unchanged. Encounter summaries, time ranges, and
+view qualification are recomputed.</p>
+<h4 id="separate-burst-as-encounter">Separate burst as encounter</h4>
+<p>The selected complete burst is removed from its encounter and becomes
+a new one-burst encounter. This is useful when a middle burst is
+unrelated and a simple boundary split would put neighboring bursts on
+the wrong side. The command does not split the burst and does not
+silently merge it into a nearby encounter, even when species and time
+appear compatible. This operation replaces the current ambiguous “Detach
+burst” action.</p>
+<p>Separating the sole burst of an encounter is a no-op and is not
+offered.</p>
+<h4 id="merge-encounters">Merge encounters</h4>
+<p>The user selects two or more encounters. The default chooser offers
+adjacent encounters in chronological order; an advanced search may
+target a nonadjacent encounter but requires a warning because it can
+create a discontinuous event. Existing bursts remain intact and are
+ordered chronologically. Confirmed species and triage decisions are
+preserved. The result may legitimately be a multi-species encounter.</p>
+<h4 id="structural-results">Structural results</h4>
+<p>A successful command returns removed, added, and updated
+encounter/burst records plus the new revision. The page re-evaluates the
+current view. If a new encounter does not match, the success message
+still states where it went and offers <strong>Show result</strong>.
+Structural changes invalidate only affected cursors and group traces
+where possible; a canonical regroup may invalidate all cursors.</p>
+<h3 id="group-review">Group Review</h3>
+<p>The Group Review modal always opens a complete canonical burst. It
+remains editable from every view. Applying changes sends command data
+for that burst; it never posts the page&#39;s complete
+<code>pipelineResults</code> object back to the server.</p>
+<p>Group Review is the primary high-resolution comparison surface. It
+contains:</p>
+<ol type="1">
+<li><strong>Picks, Candidates, and Rejects lanes.</strong> Every burst
+photo appears exactly once unless staged for extraction. Lane state
+reflects live manual triage, not a stale Process snapshot.</li>
+<li><strong>Large comparison preview.</strong> The selected photo is
+shown at a selectable preview resolution with fit, 1:1, and up-to-5×
+zoom. Hovering or locking a location compares the same region across
+selected frames.</li>
+<li><strong>Photo controls.</strong> Thumbnail size, per-photo pan
+offsets, reset offsets, selected-region sharpness, subject chips/boxes,
+mask visibility, and image metadata.</li>
+<li><strong>Species evidence.</strong> The selected subject&#39;s source
+matrix, photo-level evidence, burst coverage summary, lower-ranked
+exclusive alternatives, and multi-label presence suggestions.</li>
+<li><strong>Commit footer.</strong> Staged triage count, staged
+structural count, species resolution count, and one <strong>Apply
+changes</strong> button whose label and tooltip enumerate the
+writes.</li>
+</ol>
+<p>Single click selects one photo. Command-click toggles photos and
+Shift-click selects a chronological range. Right-click keeps the
+selection and opens the photo menu. The active selected photo drives the
+large preview; multi-photo actions target the selected set.</p>
+<p>Inside Group Review:</p>
+<ul>
+<li><code>P</code> moves selected photos to Picks;</li>
+<li><code>X</code> moves them to Rejects;</li>
+<li><code>Space</code> moves them to Candidates/Review;</li>
+<li>Up and Down move one lane at a time;</li>
+<li>Left and Right change the active photo;</li>
+<li><code>Z</code> toggles the preview between fit and 1:1;</li>
+<li>Delete stages <strong>Extract photos to new burst</strong>, never
+deletion from the library; and</li>
+<li>Escape requests close, warning first when staged changes exist.</li>
+</ul>
+<p>The footer has independently reviewable sections for <strong>Apply
+triage</strong>, <strong>Apply species decisions</strong>, and
+<strong>Apply structural changes</strong>. A section with changes is
+selected automatically but may be deselected before Apply. The button
+preview states consequences such as:</p>
+<blockquote>
+<p>Keep 2 photos, reject 4, confirm American Wigeon on 3 subjects, and
+extract 1 photo to a new burst</p>
+</blockquote>
+<p>Closing without Apply discards staged modal changes only. It never
+reverses previously committed page actions. While Apply is pending, the
+modal remains open, targets are locked, and retry is possible without
+duplicating commands.</p>
+<h3 id="species-evidence-panel">Species evidence panel</h3>
+<p>The panel can open from an encounter, burst, photo, subject, or
+conflict badge. It preserves that target in the URL while open. The left
+side lists photo and subject targets; the right side shows prediction
+sources and human assertions. Changing subjects updates highlighted
+boxes in the photo preview. Filters can show all sources, dissent only,
+unavailable sources, or resolved disagreements.</p>
+<p>The panel supports Confirm, Replace, Not identifiable, False
+detection, acknowledge photo-level conflict, and undo. For a multi-label
+photo suggestion, each taxon has an independent Confirm presence action.
+The panel never turns a runner-up from an exclusive classifier into a
+presence checkbox.</p>
+<h3 id="photo-detail-fallback">Photo detail fallback</h3>
+<p>Photos with burst membership open Group Review. A legacy photo with
+no burst opens a photo detail drawer containing its preview, masks,
+effective and recommended triage, rejection reasons, quality-score
+components, species evidence, encounter filmstrip, and raw diagnostic
+features. The fallback is a migration aid, not a separate long-term
+review experience.</p>
+<h3 id="undo-and-redo">Undo and redo</h3>
+<p>Undo and redo operate on server-recorded review commands. They return
+the same changed-record envelope as the original mutation. The browser
+is not the source of truth for restoring a previous full cache
+snapshot.</p>
+<p>After a mutation, a persistent notification states the effect and
+offers Undo. The page also exposes an <strong>Edit history</strong>
+panel with ordered commands, actor, time, target, and affected counts.
+Undo creates a compensating command; redo reapplies an undone command
+only when its expected targets still exist. If a later structural edit
+makes exact reversal impossible, history explains why instead of
+offering a destructive approximation.</p>
+<p>Keyboard Command-Z and Shift-Command-Z invoke page undo and redo only
+when a text field or native editing surface is not active.</p>
+<h3 id="pending-concurrency-and-failure-behavior">Pending, concurrency,
+and failure behavior</h3>
+<p>Actions show pending state within 100 ms. Overlapping writes to the
+same photo, subject, burst, or encounter are serialized. Unrelated
+actions may continue. Double activation sends one idempotent command ID
+and cannot duplicate a split, assertion, or keyword.</p>
+<p>On a network failure, optimistic state rolls back and the page
+retains focus. On <code>409 Conflict</code>, the page fetches changed
+target records, explains that the review revision advanced, and asks the
+user to retry after showing the updated target. It never silently
+retargets by position. Offline mode is read-only only because
+persistence is unavailable, not because of the selected view; the page
+labels this as <strong>Offline—changes cannot be saved</strong>.</p>
+<h3 id="view-movement-after-an-edit">View movement after an edit</h3>
+<p>An edit may cause an encounter to stop matching the current view—for
+example, resolving the last unresolved subject while viewing Needs
+review. Apply the change immediately, briefly retain the updated
+encounter with a completion state, then remove it after the normal
+success feedback. Focus moves to the next encounter without jumping to
+the top of the page.</p>
+<h2 id="grouping-and-scoring-controls">Grouping and scoring
+controls</h2>
+<p>Scoring changes that do not alter encounter membership apply to the
+canonical result and return changed labels/counts. The current view is
+then re-evaluated.</p>
+<p>Grouping changes can alter every encounter in the canonical result.
+They are therefore explicit full-result operations:</p>
+<ul>
+<li>The sidebar states <strong>Applies to the complete latest process
+result</strong>.</li>
+<li>While a grouping change runs, structural review actions are disabled
+and the current view remains visible with a progress state.</li>
+<li>Completion installs a new canonical revision and reapplies the
+current view.</li>
+<li>A collection filter never causes grouping to run on only that
+collection.</li>
+</ul>
+<p>If live grouping cannot meet the page&#39;s responsiveness and durability
+requirements at large scale, replace automatic slider requests with an
+Apply button. Do not solve that problem by producing an ephemeral
+collection-only grouping.</p>
+<h2 id="navigation-focus-and-shortcuts">Navigation, focus, and
+shortcuts</h2>
+<p>The page has one visible focus target. A focused encounter has a
+non-color-only outline and supplies the grouping trace. Within an
+expanded encounter, focus may move to a burst or photo without changing
+the focused encounter.</p>
+<p>Outside a text field or overlay:</p>
+<ul>
+<li><code>J</code> and <code>K</code> move to the next and previous
+loaded encounter;</li>
+<li>Right Arrow expands the focused encounter and Left Arrow collapses
+it;</li>
+<li><code>Enter</code> opens the focused burst or photo in Group
+Review;</li>
+<li><code>P</code>, <code>X</code>, and Space apply Keep, Reject, and
+Review to the focused photo;</li>
+<li>Shift with <code>P</code>, <code>X</code>, or Space targets the
+focused complete burst after a labeled confirmation;</li>
+<li><code>F</code> moves focus to Search;</li>
+<li><code>C</code> opens the Collection chooser;</li>
+<li><code>E</code> opens the Species evidence panel for the focused
+target;</li>
+<li><code>?</code> opens the shortcut reference; and</li>
+<li>Escape closes the topmost menu, drawer, or overlay before changing
+page focus.</li>
+</ul>
+<p>Encounter cards and pages that load later participate in the same
+logical order. Shortcuts resolve stable target IDs at activation time.
+They never act on an array position remembered before filtering,
+sorting, or structural edits. Shortcut hints are discoverable from
+buttons and can be disabled in preferences.</p>
+<h2 id="primary-workflows">Primary workflows</h2>
+<h3 id="enter-or-resume-review">Enter or resume review</h3>
+<ol type="1">
+<li>Open Process Review from a completed Process run.</li>
+<li>See the shell, coverage, health, and canonical counts
+immediately.</li>
+<li>Restore the previous URL-defined view and personal display
+preferences.</li>
+<li>Load the first page of complete encounters and focus the first
+unresolved encounter, or the previously focused encounter when it still
+qualifies.</li>
+<li>Resume editing without an explicit save step; every committed action
+is already durable.</li>
+</ol>
+<p>If a newer Process run exists, the page does not silently replace an
+open review. It offers <strong>Open newer result</strong> and explains
+which run the current URL references. Opening it installs the new
+canonical result and attempts to carry forward photo/subject decisions
+that still map unambiguously.</p>
+<h3 id="narrow-a-large-review-while-preserving-encounters">Narrow a
+large review while preserving encounters</h3>
+<ol type="1">
+<li>Choose a Collection, Triage state, Species review state, and/or
+Search.</li>
+<li>Leave Encounter match at Any photo to see complete context around
+any matching member, or choose Every photo for a strict all-members
+condition.</li>
+<li>Read matching, encounter, and context counts before acting.</li>
+<li>Inspect <strong>Matches view</strong> and <strong>Context</strong>
+markers inside each complete encounter.</li>
+<li>Perform any photo, burst, encounter, species, or structural action
+normally.</li>
+</ol>
+<p>Changing or clearing the view never recomputes grouping and never
+creates a read-only page.</p>
+<h3 id="triage-a-burst">Triage a burst</h3>
+<ol type="1">
+<li>Open <strong>Review burst</strong> or click one of its photos.</li>
+<li>Compare frames in Group Review at the needed resolution.</li>
+<li>Move photos among Picks, Candidates, and Rejects by keyboard or
+pointer.</li>
+<li>Optionally calculate sharpness for the same selected region across
+frames.</li>
+<li>Review the exact staged counts and Apply triage.</li>
+<li>Continue to the next unresolved burst without returning to the top
+of the encounter.</li>
+</ol>
+<h3 id="resolve-a-species-disagreement">Resolve a species
+disagreement</h3>
+<ol type="1">
+<li>Open a conflict badge or <strong>Review species</strong>.</li>
+<li>Select the disputed subject or photo-level target.</li>
+<li>Compare each model/list-pair prediction, coverage state, confidence,
+alternatives, and independence group.</li>
+<li>Confirm one taxon, choose a lower-ranked alternative, search for
+another taxon, mark Not identifiable/False detection, or leave
+unresolved.</li>
+<li>Review which subject/photo assertions will be added or
+replaced.</li>
+<li>Apply. Dissenting evidence remains under Resolved disagreement for
+audit.</li>
+</ol>
+<h3 id="confirm-several-species-in-one-image">Confirm several species in
+one image</h3>
+<ol type="1">
+<li>Select each subject box and confirm its taxon independently.</li>
+<li>When a credible species has no reliable subject box, confirm
+photo-level presence instead.</li>
+<li>Treat qualified multi-label results as separate presence
+suggestions; do not treat exclusive runner-ups as additional
+species.</li>
+<li>Verify the photo roster and unresolved-target count.</li>
+<li>Apply without removing species already confirmed on other
+subjects.</li>
+</ol>
+<h3 id="correct-grouping">Correct grouping</h3>
+<p>Use the smallest structural operation that expresses the
+correction:</p>
+<ul>
+<li>wrong boundary inside one burst → Split burst here;</li>
+<li>outlier photos inside a burst → Extract photos to new burst;</li>
+<li>two artificial neighboring bursts → Merge adjacent bursts;</li>
+<li>encounter boundary belongs between two bursts → Split encounter
+here;</li>
+<li>one unrelated middle burst → Separate burst as encounter; or</li>
+<li>two encounters are one event → Merge encounters.</li>
+</ul>
+<p>The preview is part of the workflow, not an optional diagnostic.
+After Apply, the page highlights resulting objects and offers Undo and
+Show result.</p>
+<h3 id="finish-or-leave">Finish or leave</h3>
+<p>There is no page-wide Save button. The summary strip reports
+unresolved targets and active conflicts. <strong>Review next
+unresolved</strong> moves through the current view; <strong>Review
+unresolved across all processed photos</strong> clears only the view
+criteria necessary to expose remaining work, after confirmation.</p>
+<p>Leaving the page while a mutation is pending warns and waits or
+cancels the navigation. Leaving with no pending request is safe. Staged,
+unapplied Group Review changes require confirmation; committed actions
+do not.</p>
+<h2 id="downstream-effects-and-page-boundaries">Downstream effects and
+page boundaries</h2>
+<ul>
+<li>Keep, Review, and Reject update the library&#39;s effective triage
+state. Reject marks a photo for downstream culling; Process Review never
+deletes a file.</li>
+<li>Confirmed species assertions update effective taxonomy keywords
+through a provenance-bearing operation. Removing or replacing a species
+assertion removes only keyword attachment owned by that assertion when
+no other source still requires it.</li>
+<li>Library decisions are durable before sidecar synchronization.
+Writing XMP sidecars exports pending metadata; choosing Keep only in
+Vireo suppresses that export without reverting the underlying
+decision.</li>
+<li>Subject boxes, prediction evidence, and review resolution belong to
+Process Review state. They do not alter original image pixels or
+classifier output.</li>
+<li>Burst and encounter structure belongs to the canonical review
+revision. It does not move files, alter collection membership, or modify
+capture times.</li>
+<li><strong>Open in Browse</strong> navigates to the same photo and
+current library decisions. Changes made in Browse are reflected when
+Process Review next reads the affected records.</li>
+<li>Rapid Review and Process Review operate on the same run, revisions,
+triage, and species assertions. Neither keeps a private browser-owned
+copy that can overwrite the other.</li>
+<li>Review misses is a separate workflow for likely missed subjects.
+Returning to Process Review preserves the view and focus when
+possible.</li>
+<li>Starting a new Process run is the only path that recomputes models
+and the initial grouping. Review controls do not start classification
+implicitly.</li>
+</ul>
+<h2 id="data-and-api-design">Data and API design</h2>
+<h3 id="stable-identities-and-revisions">Stable identities and
+revisions</h3>
+<p>Every canonical review result has:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;review_run_id&quot;</span><span class="fu">:</span> <span class="st">&quot;pipeline-1786837933532-107&quot;</span><span class="fu">,</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;revision&quot;</span><span class="fu">:</span> <span class="dv">42</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>Every encounter and burst has an opaque stable ID. IDs survive
+labels, flags, sorting, filtering, and pagination. A structural regroup
+may replace IDs; manual structural commands preserve unaffected IDs and
+create IDs for new groups.</p>
+<p>Mutation requests include <code>review_run_id</code>, the expected
+<code>revision</code>, and the target IDs. If a new Process run or
+another structural mutation has made the page stale, the server returns
+<code>409 Conflict</code> with the current run and revision. The page
+refreshes its view and explains that the review changed; it never
+applies a command to whichever group now occupies an old array
+index.</p>
+<h3 id="species-evidence-contract">Species evidence contract</h3>
+<p>The process snapshot stores the source inventory once and references
+compact source IDs from subject evidence. A representative loaded photo
+is:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="dv">812</span><span class="fu">,</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;subjects&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;subject_id&quot;</span><span class="fu">:</span> <span class="st">&quot;detection-4401&quot;</span><span class="fu">,</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;box&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;x&quot;</span><span class="fu">:</span> <span class="dv">0</span><span class="er">.</span><span class="dv">12</span><span class="fu">,</span> <span class="dt">&quot;y&quot;</span><span class="fu">:</span> <span class="dv">0</span><span class="er">.</span><span class="dv">18</span><span class="fu">,</span> <span class="dt">&quot;w&quot;</span><span class="fu">:</span> <span class="dv">0</span><span class="er">.</span><span class="dv">31</span><span class="fu">,</span> <span class="dt">&quot;h&quot;</span><span class="fu">:</span> <span class="dv">0</span><span class="er">.</span><span class="dv">52</span><span class="fu">},</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;evidence&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>        <span class="fu">{</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;source_id&quot;</span><span class="fu">:</span> <span class="st">&quot;source-17&quot;</span><span class="fu">,</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;state&quot;</span><span class="fu">:</span> <span class="st">&quot;available&quot;</span><span class="fu">,</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;candidates&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>            <span class="fu">{</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>              <span class="dt">&quot;taxon_id&quot;</span><span class="fu">:</span> <span class="dv">144814</span><span class="fu">,</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>              <span class="dt">&quot;name&quot;</span><span class="fu">:</span> <span class="st">&quot;American Wigeon&quot;</span><span class="fu">,</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>              <span class="dt">&quot;rank&quot;</span><span class="fu">:</span> <span class="dv">1</span><span class="fu">,</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>              <span class="dt">&quot;confidence&quot;</span><span class="fu">:</span> <span class="dv">0</span><span class="er">.</span><span class="dv">91</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>            <span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>            <span class="fu">{</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>              <span class="dt">&quot;taxon_id&quot;</span><span class="fu">:</span> <span class="dv">6930</span><span class="fu">,</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>              <span class="dt">&quot;name&quot;</span><span class="fu">:</span> <span class="st">&quot;Mallard&quot;</span><span class="fu">,</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>              <span class="dt">&quot;rank&quot;</span><span class="fu">:</span> <span class="dv">2</span><span class="fu">,</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>              <span class="dt">&quot;confidence&quot;</span><span class="fu">:</span> <span class="dv">0</span><span class="er">.06</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>            <span class="fu">}</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>          <span class="ot">]</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>        <span class="fu">}</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>      <span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;consensus&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;state&quot;</span><span class="fu">:</span> <span class="st">&quot;majority&quot;</span><span class="fu">,</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;taxon_id&quot;</span><span class="fu">:</span> <span class="dv">144814</span><span class="fu">,</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;agreeing_models&quot;</span><span class="fu">:</span> <span class="dv">2</span><span class="fu">,</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;voting_models&quot;</span><span class="fu">:</span> <span class="dv">3</span><span class="fu">,</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;abstaining_models&quot;</span><span class="fu">:</span> <span class="dv">1</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>      <span class="fu">},</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;resolution&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;state&quot;</span><span class="fu">:</span> <span class="st">&quot;unresolved&quot;</span><span class="fu">}</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>  <span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;confirmed_taxa&quot;</span><span class="fu">:</span> <span class="ot">[]</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>The response also includes the referenced source records and
+label-list coverage metadata. Derived consensus is returned for display
+and query performance, but the underlying source candidates remain
+available so the UI can explain and audit it.</p>
+<p>Species resolution records are separate from classifier predictions.
+A representative assertion contains:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;assertion_id&quot;</span><span class="fu">:</span> <span class="st">&quot;species-assertion-88&quot;</span><span class="fu">,</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;photo_id&quot;</span><span class="fu">:</span> <span class="dv">812</span><span class="fu">,</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;subject_id&quot;</span><span class="fu">:</span> <span class="st">&quot;detection-4401&quot;</span><span class="fu">,</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;taxon_id&quot;</span><span class="fu">:</span> <span class="dv">144814</span><span class="fu">,</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;state&quot;</span><span class="fu">:</span> <span class="st">&quot;confirmed&quot;</span><span class="fu">,</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;origin&quot;</span><span class="fu">:</span> <span class="st">&quot;manual&quot;</span><span class="fu">,</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;command_id&quot;</span><span class="fu">:</span> <span class="st">&quot;review-command-301&quot;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>Photo-level assertions use a null subject ID. Not identifiable and
+False detection resolutions have no taxon ID. Assertions retain command
+provenance so group confirmation, replacement, undo, and redo can
+reconstruct exactly which photo/subject assignments changed.</p>
+<h3 id="view-query">View query</h3>
+<p>A dedicated query accepts the complete view definition. A
+representative request is:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;review_run_id&quot;</span><span class="fu">:</span> <span class="st">&quot;pipeline-1786837933532-107&quot;</span><span class="fu">,</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;collection_id&quot;</span><span class="fu">:</span> <span class="dv">197</span><span class="fu">,</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;status&quot;</span><span class="fu">:</span> <span class="st">&quot;REVIEW&quot;</span><span class="fu">,</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;species_review&quot;</span><span class="fu">:</span> <span class="st">&quot;needs_review&quot;</span><span class="fu">,</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;encounter_match&quot;</span><span class="fu">:</span> <span class="st">&quot;any&quot;</span><span class="fu">,</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;search&quot;</span><span class="fu">:</span> <span class="st">&quot;sandpiper&quot;</span><span class="fu">,</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;search_options&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;match_case&quot;</span><span class="fu">:</span> <span class="kw">false</span><span class="fu">,</span> <span class="dt">&quot;whole_word&quot;</span><span class="fu">:</span> <span class="kw">false</span><span class="fu">},</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;sort&quot;</span><span class="fu">:</span> <span class="st">&quot;chronological&quot;</span><span class="fu">,</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;cursor&quot;</span><span class="fu">:</span> <span class="kw">null</span><span class="fu">,</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;page_budget&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;encounters&quot;</span><span class="fu">:</span> <span class="dv">40</span><span class="fu">,</span> <span class="dt">&quot;photos&quot;</span><span class="fu">:</span> <span class="dv">600</span><span class="fu">}</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>The server resolves collection membership and intersects it with the
+canonical process result. It returns:</p>
+<ul>
+<li>canonical run and revision;</li>
+<li>process-coverage counts;</li>
+<li>match, encounter, context-photo, and confirmation counts;</li>
+<li>a page of complete encounters;</li>
+<li>only photo records referenced by those encounters;</li>
+<li>matching photo IDs for explanation/highlighting; and</li>
+<li>an opaque next cursor.</li>
+</ul>
+<p>Collection membership is evaluated on the server. The browser must
+not fetch a large collection ID list and intersect it with a second
+large result payload.</p>
+<h3 id="pagination">Pagination</h3>
+<p>Pagination is encounter-based and uses an opaque cursor tied to the
+run, revision, sort, and filter fingerprint. The server observes both a
+target encounter count and a soft target photo count:</p>
+<ul>
+<li>never split an encounter;</li>
+<li>return at least one encounter even when it exceeds the photo
+target;</li>
+<li>otherwise stop before adding an encounter that would exceed the soft
+photo target; and</li>
+<li>invalidate the cursor when the structural revision or query
+changes.</li>
+</ul>
+<p>The client loads the next page as the user approaches the end of the
+current window. Already loaded pages may be virtualized or discarded
+outside a bounded window, provided focus, selection, and scroll
+restoration remain correct. Collapsed encounter bodies should not create
+photo-card DOM until expanded. Thumbnail loading remains lazy.</p>
+<h3 id="mutation-response">Mutation response</h3>
+<p>All review mutations use a common delta envelope:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;ok&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;review_run_id&quot;</span><span class="fu">:</span> <span class="st">&quot;pipeline-1786837933532-107&quot;</span><span class="fu">,</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;revision&quot;</span><span class="fu">:</span> <span class="dv">43</span><span class="fu">,</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;updated_encounters&quot;</span><span class="fu">:</span> <span class="ot">[]</span><span class="fu">,</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;removed_encounter_ids&quot;</span><span class="fu">:</span> <span class="ot">[]</span><span class="fu">,</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;updated_photos&quot;</span><span class="fu">:</span> <span class="ot">[]</span><span class="fu">,</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;summary_delta&quot;</span><span class="fu">:</span> <span class="fu">{},</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;view_may_have_changed&quot;</span><span class="fu">:</span> <span class="kw">true</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>The client applies the delta to normalized maps keyed by stable IDs.
+It does not replace or deep-clone the complete review result.</p>
+<h3 id="persistence-model">Persistence model</h3>
+<p>Computed pipeline output and mutable review state must not require a
+complete JSON rewrite for every click.</p>
+<p>The intended separation is:</p>
+<ul>
+<li>an immutable or infrequently replaced computation snapshot for photo
+features, source inventory, subject-level ranked predictions,
+recommendations, original grouping, and trace data; and</li>
+<li>transactional mutable review records for flags, subject/photo
+species assertions, evidence resolutions, burst overrides, manual
+structure changes, and edit history.</li>
+</ul>
+<p>The mutable layer may be normalized database tables or a compact
+revisioned overlay, but it must support atomic command application and
+proportional responses. The server composes the canonical view from the
+computation snapshot and mutable state.</p>
+<p>The existing full JSON cache can remain as a migration input and a
+rebuildable derived artifact. It is no longer accepted from the browser
+as authoritative state.</p>
+<h2 id="loading-empty-and-error-states">Loading, empty, and error
+states</h2>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Required presentation and action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Initial load</td>
+<td>Render the page shell and lightweight run/coverage summary, then
+skeleton whole-encounter rows until the first page arrives</td>
+</tr>
+<tr>
+<td>Process currently running</td>
+<td>Show stage, progress, and <strong>Open running Process</strong>;
+retain the latest completed review as a clearly labeled older result
+when one exists</td>
+</tr>
+<tr>
+<td>No completed Process result</td>
+<td>Explain that Process Review needs a completed run and offer
+<strong>Open Process</strong></td>
+</tr>
+<tr>
+<td>Process failed</td>
+<td>Show the last successful review separately from the failed run and
+link to its failure details</td>
+</tr>
+<tr>
+<td>Optional feature missing</td>
+<td>Keep review available, name affected photos/features, and offer to
+run the missing stage</td>
+</tr>
+<tr>
+<td>View updating</td>
+<td>Retain the prior list with an updating treatment until the first new
+page arrives; ignore stale responses by query generation</td>
+</tr>
+<tr>
+<td>No matches</td>
+<td>Say <strong>No encounters match this view</strong>, list active
+criteria, and offer <strong>Clear view filters</strong></td>
+</tr>
+<tr>
+<td>Collection outside run</td>
+<td>State how many collection photos fall outside the Process result and
+offer <strong>Open Process</strong>; do not compute implicitly</td>
+</tr>
+<tr>
+<td>Invalid/deleted collection</td>
+<td>Remove only that filter, announce the reset, and keep the canonical
+review available</td>
+</tr>
+<tr>
+<td>Empty or missing burst member</td>
+<td>Preserve the encounter shell, label the missing record, and offer
+repair diagnostics; never silently renumber targets</td>
+</tr>
+<tr>
+<td>Missing image file or thumbnail</td>
+<td>Keep its card and metadata; show <strong>Locate file</strong> or
+library diagnostics</td>
+</tr>
+<tr>
+<td>Encounter larger than page budget</td>
+<td>Return that one complete encounter, warn that expansion may be
+slower, and virtualize its burst/photo content without splitting
+pagination</td>
+</tr>
+<tr>
+<td>Page request failed</td>
+<td>Keep already loaded encounters, show an inline retry at the failed
+boundary, and do not duplicate prior pages</td>
+</tr>
+<tr>
+<td>Mutation failed</td>
+<td>Roll back optimistic state, retain selection/focus, explain the
+affected action, and offer retry</td>
+</tr>
+<tr>
+<td>Stale revision</td>
+<td>Refresh affected targets, show the intervening change, and require
+explicit retry</td>
+</tr>
+<tr>
+<td>Offline</td>
+<td>Keep loaded data readable, disable mutation controls with an offline
+explanation, and retry connectivity without changing the view</td>
+</tr>
+<tr>
+<td>End of view</td>
+<td>Report complete encounter and shown-photo totals; do not use an
+infinite spinner</td>
+</tr>
+</tbody>
+</table>
+<h2 id="performance-requirements">Performance requirements</h2>
+<p>For a canonical result of at least 15,000 photos and 1,000 encounters
+on a supported local Mac:</p>
+<ul>
+<li>first useful encounter content should appear without downloading the
+full result;</li>
+<li>a typical first page should stay below 2 MB serialized;</li>
+<li>the document must not contain photo cards for unloaded or collapsed
+encounters;</li>
+<li>changing a view must not serialize or clone the full canonical
+result;</li>
+<li>a normal photo, burst, encounter, or species mutation must have
+payload and response sizes proportional to its target, not total review
+size;</li>
+<li>visible pending feedback appears within 100 ms of an action;
+and</li>
+<li>mutation acknowledgement should target under 500 ms at the 95th
+percentile when no external storage operation is required;</li>
+<li>opening Group Review should show its shell and cached thumbnails
+within 150 ms, with live decisions and higher-resolution previews
+filling in incrementally; and</li>
+<li>keyboard navigation and lane movement should remain within a 16 ms
+frame budget for the loaded burst.</li>
+</ul>
+<p>Automated performance coverage records response bytes, first-page
+encounter and photo counts, mutation bytes, and browser DOM node counts.
+Timing thresholds that are too host-sensitive for blocking tests are
+still recorded in a repeatable benchmark.</p>
+<h2 id="accessibility-and-input-behavior">Accessibility and input
+behavior</h2>
+<ul>
+<li>The encounter-match control has a visible label and
+keyboard-operable radio semantics.</li>
+<li>Page regions use landmarks for navigation, advanced controls, review
+tools, encounter results, and notifications. The page has one
+descriptive H1.</li>
+<li>Every encounter, burst, photo, subject, and overlay has a
+programmatic name containing its object type and useful count or
+filename.</li>
+<li>Match highlighting includes text or an icon with an accessible label
+and does not rely on color alone.</li>
+<li>Keep, Review, Reject, Context, Matches view, conflicts, protection,
+and resolution states never rely on color or hover alone.</li>
+<li>Collapsible controls expose <code>aria-expanded</code> and their
+controlled region.</li>
+<li>Segmented filters use radio semantics; toggle buttons expose pressed
+state; multi-selection exposes selected state and count.</li>
+<li>Group Review lanes have descriptive names and keyboard operations
+that do not require drag and drop. Dragging is an enhancement only.</li>
+<li>Subject boxes have corresponding list controls, so precise pointer
+placement is not required to choose a subject.</li>
+<li>The loupe, masks, and score visualizations have text equivalents.
+Raw confidence and quality values remain available.</li>
+<li>Pending, success, error, view-count, and focus-movement messages use
+appropriately polite live regions and do not repeatedly announce every
+thumbnail load.</li>
+<li>Loading additional pages does not steal keyboard focus.</li>
+<li>When an edited encounter leaves the view, focus moves predictably to
+the next encounter and is announced.</li>
+<li>Existing keyboard shortcuts act on the focused canonical target, not
+an array position inferred from the current page.</li>
+<li>Focus is trapped only inside modal dialogs, returns to the invoking
+control, and remains visible against every state background.</li>
+<li>All actions remain usable at 200% zoom and in a 320 CSS-pixel-wide
+viewport.</li>
+<li>Motion for card removal, regroup previews, and success feedback
+respects the reduced-motion preference.</li>
+<li>Thumbnail and preview images use meaningful filename/position
+alternatives where the image contributes to navigation; decorative
+duplicates use empty alternatives.</li>
+</ul>
+<h2 id="migration-and-delivery">Migration and delivery</h2>
+<p>Implement behind one internal feature boundary and expose it only
+when the complete editable flow is ready. Do not ship another read-only
+scoped mode as an intermediate state.</p>
+<ol type="1">
+<li><strong>Canonical identity:</strong> add run/revision metadata and
+stable encounter and burst identities; migrate existing caches when
+loaded.</li>
+<li><strong>Species evidence:</strong> replace the flattened review
+contract with subject-level predictions keyed by model/list-pair source;
+snapshot source inventory and label-list taxon coverage; add
+multi-species assertions and resolution state. Legacy predictions remain
+readable during migration.</li>
+<li><strong>Projection query:</strong> implement server-side
+collection/status matching, Any photo and Every photo semantics,
+complete-encounter responses, counts, and cursors.</li>
+<li><strong>Incremental page state:</strong> normalize client records,
+render paged complete encounters, remove full-result cloning, and
+persist the view definition.</li>
+<li><strong>Command mutations:</strong> move triage, species, Split
+burst, Extract photos, Merge bursts, Split encounter, Separate burst,
+Merge encounters, Group Review, undo, and redo paths to stable targets
+and delta responses.</li>
+<li><strong>Mutable persistence:</strong> remove full-cache writes from
+per-click paths and retire browser-authoritative
+<code>/api/pipeline/save-cache</code> usage.</li>
+<li><strong>Toolbar cutover:</strong> replace
+Latest/Workspace/Collection modes with the editable view controls and
+remove all scoped-view guards and read-only copy.</li>
+<li><strong>Grouping cutover:</strong> make grouping an explicit
+canonical-result operation that reapplies, rather than redefines, the
+current view.</li>
+<li><strong>Complete page cutover:</strong> install the specified
+header, summaries, toolbar, card hierarchy, Group Review, Species
+evidence panel, structural previews, keyboard model, empty/error states,
+and responsive drawers as one coherent workflow.</li>
+</ol>
+<p>Existing endpoint behavior used by other pages, including
+collection-scoped pipeline analysis for Cull, may remain. Process Review
+stops using those analysis endpoints for view filtering.</p>
+<h2 id="alternatives-considered">Alternatives considered</h2>
+<h3 id="remove-the-read-only-guard">Remove the read-only guard</h3>
+<p>Rejected. Current scoped results contain alternate encounter arrays
+and can be posted back as the complete cache. Enabling edits without
+changing mutation identity and persistence risks silent loss of
+out-of-scope results.</p>
+<h3 id="filter-the-existing-full-result-only-in-the-browser">Filter the
+existing full result only in the browser</h3>
+<p>Rejected as the final architecture. It could preserve encounters, but
+the page would still download, parse, clone, retain, and repeatedly scan
+the full result. It does not solve the observed large-review performance
+problem.</p>
+<h3 id="continue-regrouping-each-collection">Continue regrouping each
+collection</h3>
+<p>Rejected for Process Review. It changes encounter boundaries at the
+moment the user is trying to review them and makes edits ambiguous.
+Collection-scoped analysis can remain a processing workflow
+elsewhere.</p>
+<h3 id="offer-a-matching-photos-only-mode">Offer a “matching photos
+only” mode</h3>
+<p>Rejected from this design. Removing individual photos from a
+displayed encounter hides the context needed to assess species, burst
+quality, and group structure. Users can inspect or act on matching
+photos while the complete encounter remains visible.</p>
+<h3 id="label-the-control-keep-encounters-intact">Label the control
+“Keep encounters intact”</h3>
+<p>Rejected because it implies the other choice fragments encounters.
+The actual choice is whether any or every member must match; encounter
+integrity is an invariant in both modes.</p>
+<h2 id="acceptance-criteria">Acceptance criteria</h2>
+<ul>
+<li>Selecting a collection never calls live regrouping and never changes
+an encounter&#39;s membership.</li>
+<li>Every Collection, status, species-review-state, and search view
+remains editable.</li>
+<li>Any photo mode includes the complete encounter when one member
+matches and identifies the matching member.</li>
+<li>Every photo mode excludes an encounter when even one member does not
+match; qualifying encounters remain complete.</li>
+<li>Combining Collection and Status applies the encounter-match rule to
+their intersection.</li>
+<li>Species-review filtering never removes an individual burst from a
+displayed mixed encounter.</li>
+<li>The toolbar reports matching photos, complete encounters, and total
+context photos separately.</li>
+<li>Photos outside the latest Process run are reported and never
+silently computed or grouped by a view change.</li>
+<li>Photo, burst, encounter, species-confirmation, every named
+structural command, Group Review, undo, and redo work from a
+collection-filtered view.</li>
+<li>Page header destinations, Process health/coverage, canonical summary
+counts, current-view counts, and active filters are visible and use
+unambiguous units.</li>
+<li>Pending sidecar synchronization is presented as an export of already
+saved decisions; Keep only in Vireo cannot be mistaken for undo.</li>
+<li>Encounter cards, burst rows, and photo cards expose the content and
+actions defined by this document without ambiguous <code>×</code>
+structural controls.</li>
+<li>Automated recommendations and effective manual triage are visibly
+distinct; recomputing recommendations never replaces manual
+decisions.</li>
+<li>Group Review opens a complete burst, exposes live triage and species
+state, supports multi-selection and comparison, previews every staged
+write, and does not commit unchecked sections.</li>
+<li>Split burst changes only a burst boundary; Extract photos creates
+burst membership in the same encounter; Separate burst creates a new
+encounter.</li>
+<li>Merge burst and encounter operations preserve photo decisions,
+assertions, evidence, and chronological order.</li>
+<li>Prediction evidence retains detection/subject, classifier model,
+label-list fingerprint, candidate rank, confidence, and canonical taxon
+identity.</li>
+<li>A model run against multiple label lists contributes at most one
+independent model vote by default; repeated lists cannot outvote another
+model.</li>
+<li>A source whose label list cannot express a candidate is shown as Not
+covered and is not counted as disagreement or zero support.</li>
+<li>Compatible ancestor/descendant predictions are shown as refinements;
+only incompatible credible taxa count as disagreement.</li>
+<li>Two models that credibly choose incompatible taxa produce Model
+split and no automatic winner; a strict majority may produce a
+suggestion while retaining visible dissent.</li>
+<li>Lower-ranked alternatives from one source are never counted as
+additional species present in a photo.</li>
+<li>A source must declare exclusive or multi-label presence semantics;
+qualified multi-label photo predictions may suggest several species
+without inventing subject assignments.</li>
+<li>Different credible taxa on different subjects are shown as a
+multi-species photo and can be confirmed independently.</li>
+<li>Human adjudication resolves the target without deleting dissenting
+model evidence; resolved disagreements remain available for audit.</li>
+<li>Confirming one species never removes another species assertion
+unless the user explicitly chooses Replace species.</li>
+<li>An encounter is Resolved only when every reviewable subject or
+photo-level evidence target is resolved; confirming a dominant species
+cannot hide an unresolved minority subject.</li>
+<li>Species variation across bursts offers an explicit split but never
+changes grouping automatically.</li>
+<li>Encounter- and burst-level actions name and mutate the complete
+target; matching-only bulk actions are explicitly labeled.</li>
+<li>Mutation endpoints reject stale run or revision targets rather than
+applying them by array index.</li>
+<li>No review action accepts or returns the complete canonical review
+payload.</li>
+<li>No encounter is split across pages or virtualized windows.</li>
+<li>The 15,000-photo performance requirements are covered by an
+automated fixture and benchmark.</li>
+<li>Existing supported triage, inspection, species, and Group Review
+workflows remain correct for small results, and Rapid Review observes
+the same canonical revisions without a private cache.</li>
+</ul>
+<h2 id="testing">Testing</h2>
+<h3 id="backend">Backend</h3>
+<ul>
+<li>Any photo and Every photo truth tables, including mixed
+collection/status criteria.</li>
+<li>Collection intersection with partial canonical process
+coverage.</li>
+<li>Complete encounter and burst membership in every returned page.</li>
+<li>Cursor stability and invalidation after structural revisions.</li>
+<li>Stable-ID targeting for every mutation type.</li>
+<li>Stale run and stale revision conflict responses.</li>
+<li>Delta correctness for single-species and multi-species
+confirmation.</li>
+<li>Membership, derived-summary, provenance, revision, and undo truth
+tables for Split burst, Extract photos, Merge adjacent bursts, Split
+encounter, Separate burst as encounter, and Merge encounters.</li>
+<li>Empty-side, all-photo extraction, sole-burst separation, nonadjacent
+merge, missing-timestamp ordering, protected-photo, and stale-target
+validation.</li>
+<li>Source inventory snapshotting and exclusion of stale label
+fingerprints.</li>
+<li>Model/list-pair coverage states: agrees, disagrees, not covered,
+uncertain, and unavailable.</li>
+<li>Same-model overlapping-list agreement and disagreement, ensuring the
+model contributes no more than one independent vote.</li>
+<li>Cross-model unanimous, strict-majority, two-way split, single-model,
+and all-abstain consensus cases.</li>
+<li>Exclusive top-k versus multi-label presence behavior, including
+calibrated negative evidence and a multi-label result with several
+qualified taxa.</li>
+<li>Canonical-taxon alias agreement, compatible ancestor refinement, and
+incompatible branch conflict.</li>
+<li>Multi-subject same-species, multi-subject multi-species,
+photo-level-only, and duplicate-detection cases.</li>
+<li>Positive add versus explicit replacement semantics for photos
+already carrying one or more confirmed species.</li>
+<li>Resolution rollups from subject to photo, burst, and encounter.</li>
+<li>Transactional undo and redo of structural and nonstructural
+changes.</li>
+<li>Existing collection-scoped regrouping tests remain green for
+non-review consumers.</li>
+</ul>
+<h3 id="browser-integration">Browser integration</h3>
+<ul>
+<li>Switching collections and match modes does not call live
+regrouping.</li>
+<li>Matching decoration and the three distinct counts are correct.</li>
+<li>All review actions work in a collection-filtered view.</li>
+<li>Any photo shows context photos; Every photo drops partially matching
+encounters.</li>
+<li>A mutation that removes the current encounter from the view
+preserves scroll position and moves focus predictably.</li>
+<li>Infinite loading and back-scrolling preserve complete encounters and
+current state.</li>
+<li>Keyboard shortcuts target stable visible entities after sorting and
+paging.</li>
+<li>Page-level and Group Review shortcuts have identical target
+semantics and do not fire from text inputs or assistive controls.</li>
+<li>No scoped-view warning or disabled review action remains.</li>
+<li>Structural previews show the correct before/after membership, and
+Split burst, Extract, Separate, and Merge lead to observably different
+results.</li>
+<li>Group Review close warns about staged changes, Apply enumerates
+selected sections, failure is retryable, and a successful apply
+preserves focus.</li>
+<li>Sidecar preview groups accurate before/after changes, filters write
+targets, reports progress, retains failed entries, and keeps Vireo
+decisions when an export entry is suppressed.</li>
+<li>The species evidence matrix labels both model and label list,
+exposes alternatives on demand, and differentiates disagreement from
+missing coverage.</li>
+<li>Resolving a model split removes it from the active conflict queue
+while preserving a visible, auditable Resolved disagreement state.</li>
+<li>Multi-subject photos expose independently selectable subject boxes
+and retain several confirmed species on the same photo.</li>
+<li>Model split, Label-list disagreement, Multiple species, Group
+variation, and Insufficient evidence badges route to the relevant
+evidence.</li>
+</ul>
+<h3 id="performance">Performance</h3>
+<ul>
+<li>Seed at least 15,000 photos across more than 1,000 encounters.</li>
+<li>Assert bounded first-page response size and DOM card count.</li>
+<li>Assert a species confirmation returns only changed entities.</li>
+<li>Assert filter changes do not trigger a full-result transfer or deep
+clone.</li>
+<li>Assert Group Review shell/thumbnail latency and 60-frame-per-second
+keyboard lane movement with a representative large burst.</li>
+<li>Record first useful content, view-change, and mutation timings.</li>
+</ul>
+<h2 id="open-implementation-decisions">Open implementation
+decisions</h2>
+<ul>
+<li>Whether mutable structural overrides live in normalized database
+tables or a compact revisioned overlay.</li>
+<li>Whether loaded encounter pages use DOM virtualization or bounded
+page eviction; either is acceptable if accessibility and scroll
+restoration meet this design.</li>
+<li>Whether scoring changes can be expressed as per-photo deltas cheaply
+enough for live sliders or require an explicit Apply action.</li>
+<li>The exact first-page encounter/photo budgets after measuring
+representative small, medium, and unusually large encounters.</li>
+<li>Where immutable label-list taxon coverage and taxonomy-version
+mappings are stored and how they are indexed for comparison
+queries.</li>
+<li>How confidence, margin, and calibrated negative thresholds are
+versioned for each prediction source so an older review remains
+reproducible.</li>
+<li>Which detector identity, overlap, and embedding rules reconcile
+duplicate detections before subject-level evidence is aggregated.</li>
+<li>Which advanced Process configurations may override default model
+independence groups or source weights, and what validation prevents one
+underlying model from being accidentally counted several times.</li>
+</ul>
+</body>
+</html>

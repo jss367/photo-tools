@@ -20127,12 +20127,16 @@ def _run_node(source, args):
     with tempfile.TemporaryDirectory() as tmp:
         script = Path(tmp) / "panel.js"
         script.write_text(source, encoding="utf-8")
+        # Windows CI's cold Node start (antivirus scanning node.exe and the
+        # freshly written script) can spike well past 30s on a busy runner,
+        # timing out a script that would otherwise finish in milliseconds.
+        # The pytest-level --timeout=120 still bounds a genuinely hung run.
         proc = subprocess.run(
             [node, str(script), *args],
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=30,
+            timeout=120,
         )
     assert proc.returncode == 0, proc.stderr
     return _json.loads(proc.stdout)

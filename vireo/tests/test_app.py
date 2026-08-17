@@ -18937,15 +18937,17 @@ def test_batch_accept_skips_row_whose_consensus_drifted(app_and_db):
     assert status == "pending"
 
 
-def test_batch_accept_without_expected_species_skips_drift_check(app_and_db):
+def test_batch_accept_without_expected_species_still_accepts(app_and_db):
     """Older callers that pass no ``expected_species`` keep working.
 
     The drift check is optional so single-species callers, tests, and any
     caller that already restricts each submission to one bucket keep the
-    endpoint's pre-existing contract. Ungrouping a row here changes the
-    consensus, but with no expected label to compare against the accept
-    still lands — the "all resolve to one species" precondition in the loop
-    below carries the invariant instead.
+    endpoint's pre-existing contract. With no expected label to compare
+    against, ``skipped_species_drifted`` is always zero — the "all resolve
+    to one species" precondition in the loop below carries the single-
+    species invariant instead. This test covers only the happy path of that
+    older contract; the drift path itself is exercised by the tests that
+    pass ``expected_species``.
     """
     import json as _json
 
@@ -19927,7 +19929,10 @@ def _run_node(source, args):
         script = Path(tmp) / "panel.js"
         script.write_text(source, encoding="utf-8")
         proc = subprocess.run(
-            [node, str(script), *args], capture_output=True, text=True,
+            [node, str(script), *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
     assert proc.returncode == 0, proc.stderr
     return _json.loads(proc.stdout)

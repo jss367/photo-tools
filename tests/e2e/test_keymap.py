@@ -173,6 +173,26 @@ def test_legacy_bare_navigation_shortcut_is_ignored(live_server, page):
     assert page.url.endswith("/cull"), f"Expected to stay on /cull, got {page.url}"
 
 
+def test_fixed_browse_view_key_is_reserved_from_navigation(live_server, page):
+    """Browse's fixed E action must take precedence over a bare nav binding."""
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(
+            json={"keyboard_shortcuts": {"navigation": {"dashboard": "e"}}}
+        ),
+    )
+    url = live_server["url"]
+    page.goto(f"{url}/browse", timeout=15000)
+    page.wait_for_load_state("networkidle")
+
+    navigation_names = page.evaluate("""
+        window.Keymap.shortcutsForScope('global')
+            .filter(s => s.category === 'Navigation')
+            .map(s => s.name)
+    """)
+    assert "dashboard" not in navigation_names
+
+
 def test_unreserved_bare_navigation_shortcut_navigates(live_server, page):
     """An otherwise-unused bare letter remains available for navigation."""
     page.route(

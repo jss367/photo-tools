@@ -1140,6 +1140,100 @@ against `server_members`:
 | client ⊋ server | the card split, or a member left the scope | 409, `departed_prediction_ids` |
 | neither | both at once | 409, both lists |
 
+**What is frozen is the card's rendered state, not just its
+membership.** The equality above compares *ids*, and a card can change
+under the user without any id moving. `server_members` is
+`resolved component ∩ scope`, and on the unfiltered `all` tab `status`
+is not one of the scope predicates at all — so a member that Compare
+accepted while the Review grid sat open leaves the component, the scope
+and therefore both sides of the check identical. The `∩ scope` half
+catches status drift only when it crosses an *active* status tab, which
+is the one case where the user had a filter on; the ordinary case
+passes.
+
+What passes with it is the failure this section exists to forbid,
+arriving on the status axis instead of the membership axis: the user
+reads a `pending` card, clicks its ordinary **Reject**, and the click
+silently reverses an acceptance they never saw — flipping that member
+out of `accepted`, retracting its keyword through the reconciling-reject
+rule (§3, Phase B), and recording the flip as a **non-undoable**
+`prediction_reject` (`_NON_UNDOABLE`, `db.py:18756`). The card never
+rendered `mixed`, never labelled its buttons "Accept all" / "Reject
+all", and never disclosed a destructive click. Corollary 4 and the
+`mixed` badge exist precisely so a reconciling click is stated before it
+happens; a stale render routes around both.
+
+So the frozen object is the pair. The mutation POST carries
+**`observed`** — a map from prediction id to the status the client
+rendered for that row — and `member_prediction_ids` **is its key set**,
+not a second field alongside it: one field carries both halves, so they
+cannot disagree. The name and shape are #1489's, which already sends
+`observed` from the burst modal for the same reason. The precondition is
+then one comparison against the server's own recomputation:
+
+```text
+observed == { p: COALESCE(pr_rev.status, 'pending') for p in server_members }
+```
+
+as maps. The key-set half is the completeness precondition above,
+unchanged, with its `departed`/`joined` lists; the value half adds
+`changed_prediction_ids`, each entry naming `from` and `to`. Both halves
+land on the same 409 `card_changed`, because from the user's side they
+are one event — the card they clicked is not the card the server can act
+on. The card *detail* endpoint takes no baseline and is unaffected: it
+renders current statuses and refuses nothing, and the mutation its modal
+then issues carries the statuses **that modal** rendered.
+
+*Compare-and-swap, not "still undecided".* The precondition is that each
+member is what the client displayed, **not** that it is pending.
+Refusing decided members would break corollary 4 outright: "Reject all"
+on an `{accepted, pending}` card is a deliberate re-decision of an
+`accepted` member, and it is the only route Review offers for revising
+an accept-vs-reject contradiction. #1489 drew exactly this distinction
+for the burst modal — a re-decision the client saw passes, while "a
+decision that landed from Browse or a second tab after the modal opened
+does not" — and this is that rule at card granularity.
+
+*Why 409 rather than #1489's skip-and-report.* #1489 skips the moved
+unit and applies the rest; it also chose its unit deliberately,
+escalating from the row to the **photo** because
+`update_predictions_status_by_photo` "restates every prediction of the
+photo, so one stale member invalidates the whole photo's write, not just
+its own row". The rule to carry across is that one, not the verb: **the
+precondition's granularity is the write's granularity.** A card
+mutation's write unit is the whole card — Phase A writes every member's
+status and Phase B then derives *one* keyword effect from all of them
+(§3) — so skipping a moved member would leave the card partially
+resolved *and* compute the keyword decision over a membership the user
+never saw. One stale member invalidates the card's write for the same
+reason one stale member invalidated #1489's photo. This is also the
+membership rule's own answer, one axis over: a row is its own decision,
+a card is one claim.
+
+*Two narrower repairs, both rejected.* Comparing the card's **folded
+badge** rather than the member vector is lossy in the place it matters:
+the badge is a total function of the member statuses, so
+`{accepted, pending, rejected}` and `{accepted, rejected, rejected}`
+both render `mixed`, while *which* members are accepted decides which
+keywords Phase B retracts and what the prior-status snapshot restores on
+undo. And exempting drift that agrees with the requested outcome — the
+member is already `accepted` and the click is "Accept all" — makes the
+precondition action-dependent, and is wrong even on its own terms: the
+history entry discloses what the click overrode ("Accepted 3 predictions
+(1 previously rejected)") and undo restores each row's prior status, so
+a status the client never saw changes both. Strict equality, no
+exemptions.
+
+*Where it is read.* #1489 puts every prediction-decision route under a
+writer lock taken **before its first precondition read**
+(`_begin_prediction_decision`; the route list `_PREDICTION_DECISION_ROUTES`
+is checked against `create_app`'s own call graph by a route-contract
+test, so a new deciding route fails until it is listed and locked). The
+card mutation is such a route and joins that list, which is what makes
+the compare-and-swap a compare-and-swap: the membership rebuild, the
+status comparison, Phase A and Phase B all sit in one serialized
+section, and no decision can land between the check and the write.
+
 *Why equality and not a subset check in the safe direction.* The earlier
 revision argued the two directions were asymmetric — "growth's extra
 rows were never part of the click, so exclude them and report
@@ -1177,19 +1271,22 @@ where the "attacker" is the user's own browser. The rebuild the mutation
 already performs for anchor resolution *is* the authentication; the bug
 was using it to filter the client's list instead of to replace it.
 
-The precondition is evaluated **before the transaction opens** and
-before any Phase-A write ("A card mutation writes every member status
-before it decides any keyword effect" below). On failure the server
-writes nothing at all and returns **409**:
+The precondition is evaluated **inside the serialized section
+`_begin_prediction_decision` opens** (above) and before any Phase-A
+write ("A card mutation writes every member status before it decides
+any keyword effect" below). On failure the server writes nothing at all
+and returns **409**:
 
 ```json
 {
   "error": "card_changed",
   "departed_prediction_ids": [1235, 1236],
   "joined_prediction_ids": [],
+  "changed_prediction_ids": {"1234": {"from": "pending", "to": "accepted"}},
   "member_count": 8,
   "departed_count": 2,
   "joined_count": 0,
+  "changed_count": 1,
   "current_cards": [
     {"card_id": "…", "prediction_ids": [1234, 1237]},
     {"card_id": "…", "prediction_ids": [1235, 1236]}
@@ -1197,12 +1294,14 @@ writes nothing at all and returns **409**:
 }
 ```
 
-Both lists are always present, and both are computed against
+All three are always present, and all three are computed against
 `server_members`: `departed` is `member_prediction_ids \ server_members`,
-`joined` is `server_members \ member_prediction_ids`. The client's
-inline notice reads from whichever is non-empty ("this card split — 2
-predictions moved" / "2 more predictions joined this card"); the
-recovery is the same reload either way.
+`joined` is `server_members \ member_prediction_ids`, and `changed`
+covers the members present in both whose current status is not the one
+`observed` recorded. The client's inline notice reads from whichever is
+non-empty ("this card split — 2 predictions moved" / "2 more predictions
+joined this card" / "1 of its 8 predictions was decided elsewhere while
+this card was open"); the recovery is the same reload either way.
 
 **409, not the 400 the anchor-gone case uses**, and the distinction is
 load-bearing rather than pedantic. 400 means the handle names rows the
@@ -1592,14 +1691,17 @@ union**, not just the clicked group's photos:
    a hit between the GET and the POST — the anchor is still findable
    and the component still resolves under the new key.
 
-   **The POST also carries the card's frozen membership, and the server
+   **The POST also carries the card's frozen state, and the server
    checks it rather than obeying it.** Alongside `card_id`, the client
-   sends `member_prediction_ids` — the ids of every prediction row the
-   card it clicked was built from. It has them: the server returns each
-   row individually and the client keeps them all rather than collapsing
-   them (§2, "Payload changes"), so the displayed membership is literally
-   enumerable client-side. The row set that gets **written** is the
-   server's own recomputation,
+   sends `observed` — a map from prediction id to the status it rendered,
+   covering every prediction row the card it clicked was built from, so
+   that `member_prediction_ids` is exactly its key set rather than a
+   second field that could disagree with it. It has both halves: the
+   server returns each row individually and the client keeps them all
+   rather than collapsing them (§2, "Payload changes"), so the displayed
+   membership *and* the displayed statuses are literally enumerable
+   client-side. The row set that gets **written** is the server's own
+   recomputation,
 
    ```text
    server_members = resolved component ∩ scope
@@ -1609,12 +1711,19 @@ union**, not just the clicked group's photos:
    scope tuple, and the mutation runs **only if**
 
    ```text
-   member_prediction_ids == server_members    (as sets)
+   observed == { p: COALESCE(pr_rev.status, 'pending') for p in server_members }
    ```
 
-   otherwise 409 `card_changed`. `member_prediction_ids` is therefore an
-   If-Match precondition, not a row selector: it decides *whether* the
-   mutation happens and never *which rows* it touches.
+   as maps — the key-set half being `member_prediction_ids ==
+   server_members` — otherwise 409 `card_changed`. `observed` is
+   therefore an If-Match precondition, not a row selector: it decides
+   *whether* the mutation happens and never *which rows* it touches. §2,
+   "What is frozen is the card's rendered state, not just its
+   membership", works through why the membership half alone lets a click
+   silently reverse an acceptance the card never showed, why the answer
+   is 409 rather than #1489's row-level skip-and-report, and why the
+   comparison is against the rendered status rather than against
+   "undecided".
 
    An earlier revision had this the other way round — the mutated set was
    `resolved component ∩ member_prediction_ids ∩ scope`, gated on that
@@ -2018,9 +2127,10 @@ these two are halves of one mutation, at runtime.)
 
 - **Phase A — statuses.** Write the new status of *every* row in the
   mutated set (`server_members = resolved component ∩ scope`, step 1 —
-  equal to `member_prediction_ids` on any request that got this far,
-  since step 1's completeness precondition already 409'd the ones where
-  it was not), reconciling flips included. No keyword is written or
+  equal to `member_prediction_ids`, and holding the statuses `observed`
+  recorded, on any request that got this far — step 1's precondition
+  already 409'd the ones where either was untrue), reconciling flips
+  included. No keyword is written or
   removed and no keyword-related predicate is evaluated.
 - **Phase B — keyword effects.** Only after the last Phase-A write:
   resolve the card's single keyword over the union of member photos (§4,
@@ -2149,11 +2259,12 @@ rejected, so they no longer count as live. One rule, no list.
 runs, so it is worth pinning down: a row in
 `predictions`/`prediction_review` on that photo, in **any workspace
 that contains the photo — not just the active one** (see the
-cross-workspace note below), whose §1 key **claims the association
-being retracted** (the relation defined by the two enumeration clauses
-above — for an assertion sharing the card's key this reads simply as
-"its key equals the card's"; the cross-key case is two paragraphs
-down) and
+cross-workspace note below) whose **claim candidates include the
+association being retracted** (the relation defined by the two
+enumeration clauses above, evaluated scope-free — "The key those pairs
+are matched on cannot be §1's", below; for an assertion sharing the
+card's key this reads simply as "its key equals the card's", and the
+cross-key case is two paragraphs down) and
 whose **post-Phase-A** status is `pending` or `accepted`. Both
 `rejected` and `alternative` are excluded, and for the same reason:
 only top-level, still-in-play assertions can keep an accept-owned tag
@@ -2200,7 +2311,9 @@ time along the key axis rather than the mutation-order axis or the
 workspace axis. So the unit of the question is the association, not
 the card: a claimed row is retracted only when **no** live assertion
 anywhere claims it, where each assertion claims rows under its *own*
-§1 key by the relation above. This is the second reason the rule is
+candidates by the relation above — which the cross-workspace rule below
+then has to make scope-free, since another workspace's key is not
+computable from here. This is the second reason the rule is
 stated over card identity — a taxon-keyed formulation cannot even
 express half of the set it is obliged to check — and it is the reason
 the two enumeration clauses had to be folded into one relation rather
@@ -2249,9 +2362,9 @@ shared photo.
 
 The liveness set is built the way `get_predictions` builds its status
 column, one level up. Enumerate the candidate pairs *first*: the
-same-taxon `predictions` rows on the affected photo (§1's key, computed
-in Python over the request's row set) crossed with every workspace whose
-`workspace_folders` make that photo visible — the join
+`predictions` rows on the affected photo whose **claim candidates**
+(next) include the association being retracted, crossed with every
+workspace whose `workspace_folders` make that photo visible — the join
 `_photo_in_workspace` performs at `db.py:2121-2129`, generalized from
 "the active workspace" to "every workspace containing this photo".
 Then `LEFT JOIN prediction_review pr_rev ON pr_rev.prediction_id = p.id
@@ -2262,6 +2375,98 @@ what the other workspace shows. Phase A's writes are already in the
 transaction, so the mutation's own members read `rejected` here exactly
 as the phase-ordering rule requires. Retraction happens only when no
 pair is live.
+
+*The key those pairs are matched on cannot be §1's, and must not try to
+be.* §1 deliberately makes a label's key a function of the label **and
+of the row set it is resolved over**: `S(L)` is collected from the
+request's rows for `L`, and two of its members resolving to different
+taxa abandon the ladder for `('name', L)`. So the key another
+workspace's Review is displaying depends on *that* workspace's rows, and
+a resolution over the affected photo's rows alone reproduces neither it
+nor the card's. Concretely, in the destructive direction: every row on
+the affected photo labelled `L` carries `scientific_name = NULL` — the
+ordinary state for a run made with no taxonomy file installed (§1) — so
+photo-locally `L` falls to `('name', L)` and claims only fold-equal
+keyword rows; workspace B's row set also holds a row labelled `L` on a
+*different* photo whose stored `scientific_name` resolves to `T`, so B
+renders a `('taxon', T)` card, and that card claims the
+`source = 'accept'` synonym "Eurasian Blue Tit" this reject is about to
+strip out from under it. The mirror — photo-local `('taxon', T)` while B
+sees a conflict and keys `('name', L)` — retains a keyword no live card
+claims. One defect, both directions.
+
+*Rebuilding each workspace's applicable row set is rejected, and not on
+cost.* It is not well defined. A workspace's Review row set is shaped by
+**client-applied** predicates — `minConfidence` and the status tab, two
+entries of §3 step 1's own scope tuple — which live in whichever browser
+tab that workspace is open in and are persisted nowhere. The mutation
+reproduces its *own* card key exactly only because the client forwards
+its scope tuple with the POST; there is no such channel from another
+workspace, and no query can invent one. An unfiltered workspace-wide
+rebuild would therefore answer for a filter state B may not be in, while
+costing a scan of every prediction row in every containing workspace on
+every retraction. Wrong answer at a high price — worth saying plainly
+rather than specifying and quietly never building.
+
+*So liveness takes the other option: an association-level relation that
+does not move with query scope, and is deliberately a superset of every
+scoped one.* Replace "the assertion's §1 key" with the assertion's
+**claim candidates**. A live assertion `A` — a `predictions` row with
+folded label `L` on the affected photo, paired with a workspace
+containing that photo, post-Phase-A status `pending` or `accepted` —
+claims a `photo_keywords` row `X` on that photo when **either**
+
+- `fold(X.keyword.name) == L` (the fold §1 builds `('name', L)` with), or
+- `X.keyword.taxon_id ∈ Taxa(L)`,
+
+where `Taxa(L)` is the catalog-wide candidate set for the label: every
+taxon `Taxonomy.lookup` returns for a distinct non-`NULL`
+`scientific_name` carried by **any** row labelled `L`, plus rung 2–3's
+result for `L` itself. The relation picks no key; it is the union of the
+claims of every key §1 could assign `L` under any scope. That it
+contains every scoped relation is immediate — a scoped `S(L)` is a
+subset of the catalog-wide one, so §1 returns either `('name', L)`,
+clause 1, or `('taxon', T)` with `T` drawn from that subset, clause 2.
+The card's *own* key is untouched and stays exact, because the mutation
+knows its own scope: the client forwarded it. Two questions, two keys,
+and what separates them is that one scope is known and the others are
+unknowable.
+
+*The asymmetry is chosen, not tolerated.* A superset relation errs only
+toward **keeping** a keyword, and the two errors are not comparable. A
+keyword kept when nothing really claims it is announced in the sentence
+the retraction rule already writes — "kept 'Blue Tit' — still predicted
+in 2 other workspaces (Birds 2024, Archive)" — and the user can remove
+it from the Keywords page. A keyword stripped while a live card claims
+it is a silent write to a shared sidecar, surfacing in a workspace the
+user was not looking at, and it is the failure this whole rule exists to
+prevent. Conservatism has a direction here, and this is it.
+
+*Persisting the claim instead cannot answer this one.* Recording which
+association each accept wrote is already rejected for the *enumeration*
+(above); for liveness it is not merely smaller but inapplicable. Most
+live assertions are `pending`, a pending assertion has written nothing
+to link to, and under the implicit-pending rule above it does not even
+have a `prediction_review` row. Liveness must be derived from the label
+— which is precisely why the scoping problem attaches here and not to
+the enumeration.
+
+*Cost, since the whole point was affordability.* `Taxa(L)` is
+workspace-independent, so it is computed once per retraction and
+memoized for the request, however many workspaces contain the photo: the
+rejected option's cost was per workspace, this one's is per label. The
+candidate labels are the distinct folded labels of the affected photo's
+own prediction rows — one or two in practice. Each costs a single
+`SELECT DISTINCT species, scientific_name FROM predictions WHERE species
+IN (…)` over that label's rows, with the fold applied in Python as
+everywhere else in §1 (SQL matches raw spellings, so its result is a
+superset the fold narrows). It wants a covering index on
+`predictions(species, scientific_name)` to stay index-only — additive,
+and per §1's `user_version` caveat created behind a `db_meta` marker or
+a PRAGMA check rather than a version-gated migration. A label whose
+catalog-wide scientific names genuinely conflict yields two taxa in
+`Taxa(L)` and so a wider claim set, which is the conservative direction
+again rather than an exception to it.
 
 *The consequence — retraction is rare on shared photos — is correct,
 not a number to tune.* If a photo is visible in five workspaces and the
@@ -2612,7 +2817,7 @@ correctness requirement, not a round-trip optimization.
 
 | entry point | code today | what changes |
 | --- | --- | --- |
-| Per-card Accept / Reject | `acceptPrediction` / `rejectPrediction` (`review.html:1576`, `1591`) | POST the card mutation with the displayed `card_id` (or `node_id` under a filter), frozen `member_prediction_ids`, and the scope tuple. This is the happy path §2/§3 specify. |
+| Per-card Accept / Reject | `acceptPrediction` / `rejectPrediction` (`review.html:1576`, `1591`) | POST the card mutation with the displayed `card_id` (or `node_id` under a filter), the frozen `observed` map (member ids → the statuses this render displayed), and the scope tuple. This is the happy path §2/§3 specify. |
 | Toolbar **Accept All** | `acceptAllPending` (`review.html:1618-1633`) — filters `predictions` to raw `status === 'pending'` rows and POSTs `/api/predictions/<id>/accept` per row | Iterates the **displayed cards** from `getVisibleItems()`, not raw rows, and issues one card mutation per card with that card's own frozen membership and the same scope tuple. Without this, "Accept All" on a `{pending, rejected}` card accepts the pending member and leaves the rejected one rejected — i.e. it *creates* a `mixed` card out of the click that was supposed to resolve it, and it does so bypassing the reconciling-reject retraction rule above. A card whose mutation comes back **409 `card_changed`** (§2) is skipped, not retried and not fatal to the run: the loop continues, that card keeps its own inline notice, and the run's summary reports the worse outcome — "Accepted 12 of 13 cards — 1 card changed and was skipped; nothing was changed on it" — rather than a plain completion. |
 | Toolbar button label and visibility | `renderButtons` (`review.html:1258-1273`) — counts raw pending rows for "Accept All (N)" and hides the button when that count is 0 | Counts **actionable cards** (status `pending` or `mixed`, per §2's table) and labels accordingly. Counting rows would promise "Accept All (7)" over 4 cards, and — worse — would *hide* the button on a view whose only cards are `{accepted, rejected}` mixed, which are exactly the cards that need reconciling. Same rule as the badge: the number the user reads must be the number of things the click acts on. |
 | Keyboard `A` / `S` | keydown handler (`review.html:1638-1655`), currently `acceptPrediction(pending[0].id)` over `getVisibleItems()` rows | Targets the first visible **card** and issues that card's mutation. The handler already reads `getVisibleItems()` "because the toolbar hint promises *first visible card*" — after §2 that function returns cards, so this is a one-line follow-through, but it is listed because leaving it on row ids would silently half-accept the first card. |
@@ -3324,7 +3529,26 @@ Each phase lands as its own PR and is independently useful.
    strict subset of the displayed members is refused 409 and writes
    nothing; a build that accepts the subset fails. Together these two
    pin that `member_prediction_ids` is a precondition, never a selector,
-   in both directions. A
+   in both directions. A **stale-status fixture** — no membership
+   movement at all: ids and scope identical, but between the GET and the
+   POST Compare accepts one member of a card rendered on the unfiltered
+   `all` tab. The POST's `observed` still names that row `pending`, so
+   the click is refused **409 `card_changed`** with
+   `changed_prediction_ids` naming it and its `from`/`to`, and nothing is
+   written — the accepted member stays accepted, no keyword is retracted,
+   and no non-undoable `prediction_reject` is recorded. Three negative
+   variants: a membership-only build (the earlier rule) passes the check
+   and silently reverses the unseen acceptance, which is the regression
+   guard; a build that skips the moved member and applies the rest fails,
+   because it leaves the card partially resolved and computes Phase B's
+   single keyword effect over a membership the user never saw; and a
+   build that compares only the card's folded badge fails on
+   `{accepted, pending, rejected}` versus
+   `{accepted, rejected, rejected}`, which badge identically while
+   retracting different keywords. A positive variant pins
+   compare-and-swap rather than an is-it-decided check: "Reject all" on a
+   card whose `accepted` member was *rendered* accepted proceeds and
+   reconciles it. A
    **card-detail frozen-membership fixture** — the same transition
    against a card-detail POST whose body carries `id` plus
    `member_prediction_ids` returns the clicked card's members only, and
@@ -3639,6 +3863,25 @@ Each phase lands as its own PR and is independently useful.
    photo but has no `photo_keywords` row on P1 or P2, which is
    untouched — enumeration is per affected photo, not per taxon-scoped
    keyword; a
+   **scope-divergent liveness fixture** — the case a photo-local key
+   cannot see. Photo P is shared by workspaces A and B; every prediction
+   row on P labelled `L` carries `scientific_name = NULL`, while B's row
+   set also holds a `pending` row labelled `L` on a *different* photo
+   whose `scientific_name` resolves to taxon `T`, so B renders that card
+   `taxon:T`-keyed. In A, "Reject all" on the card owning P's
+   `source = 'accept'` "Eurasian Blue Tit" row — a synonym only a taxon
+   key claims — must **keep** the keyword and disclose that B still
+   asserts it. A build that resolves the liveness key from P's rows alone
+   gets `('name', L)`, finds no claim, strips the keyword and fails,
+   leaving B's Review rendering a pending card over a photo that lost its
+   tag: the regression guard for §3, "the key those pairs are matched on
+   cannot be §1's". Mirror variant asserting the superset direction
+   rather than assuming it: a catalog-wide conflict on `L` (two rows, two
+   taxa) puts both taxa in `Taxa(L)`, so both taxa's synonym rows on P
+   count as claimed and are kept. Third variant keeps the rule from
+   degenerating into "never retract": once B's row is `rejected` too and
+   nothing claims the association under either clause, the keyword *is*
+   retracted; a
    **cross-workspace liveness fixture** — a photo P appears in
    workspaces A and B (both have `workspace_folders` rows for P's
    folder), each carrying its own `prediction_review` row for a

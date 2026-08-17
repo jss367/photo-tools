@@ -19952,6 +19952,7 @@ def _run_node(source, args):
             [node, str(script), *args],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=30,
         )
     assert proc.returncode == 0, proc.stderr

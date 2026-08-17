@@ -2911,52 +2911,6 @@ def test_id_conflicts_page(app_and_db):
     assert resp.status_code == 200
 
 
-def test_id_conflicts_batch_treats_group_expanded_409_as_success(app_and_db):
-    """A per-photo Accept in id-conflicts' batch loop can hit a 409 from
-    its own earlier iteration: when two selected photos belong to the
-    same burst/model, ``accept_prediction`` fans the first accept across
-    every pending row in the group, and the second call receives
-    ``prediction already accepted; cannot accept``. Counting that as
-    "not applied" mis-reports a batch that actually did exactly what
-    the user asked for — the same silent-drift class the whole flow
-    exists to close.
-
-    The fix keeps the wording precise: only a 409 whose message names
-    the same terminal status this action drives toward counts as
-    in-batch success. Any other 409 (e.g. accept against a row a second
-    tab already rejected) still surfaces as refused so the user sees
-    the actual disagreement.
-    """
-    app, _ = app_and_db
-    client = app.test_client()
-    html = client.get('/id-conflicts').get_data(as_text=True)
-    assert 'function _isAlreadyInTargetState(' in html, (
-        'the batch loop must have a helper for "already in target state"'
-    )
-    # accept/accept_subject/replace all route through accept_prediction
-    # server-side and land the row in ``accepted``; reject lands
-    # ``rejected``. Missing any of these mappings would silently make
-    # the batch report grouped-accept survivors as refusals.
-    for action, target in (
-        ("accept", "accepted"),
-        ("accept_subject", "accepted"),
-        ("replace", "accepted"),
-        ("reject", "rejected"),
-        ("reviewed", "reviewed"),
-    ):
-        assert f"{action}: '{target}'" in html, (
-            f"missing target-state mapping for {action}"
-        )
-    batch_at = html.find('async function batchAction(')
-    assert batch_at != -1
-    # Grab enough of batchAction to see the catch branch.
-    batch = html[batch_at: batch_at + 3000]
-    assert '_isAlreadyInTargetState(action, e)' in batch, (
-        'batchAction must consult _isAlreadyInTargetState before treating '
-        'a 409 as refused'
-    )
-
-
 def test_compare_legacy_redirect(app_and_db):
     """GET /compare redirects to the renamed /id-conflicts page."""
     app, _ = app_and_db
@@ -20203,6 +20157,116 @@ def test_browse_reject_toast_names_workspace_detach_skips(app_and_db):
         "skipped_superseded": 0, "skipped_out_of_workspace": 0,
     })])["toasts"]
     assert clean == []
+
+
+# ID Conflicts' batch accept is inline JS with no server of its own, so the
+# only honest way to check what its rollup claims is to run it against a
+# miniature of the real one: a decision on any row of a burst settles every
+# member of that burst, and a settled row answers 409. Everything under
+# assertion is lifted verbatim from the shipped template.
+_ID_CONFLICTS_BATCH_STUB = """
+var __input = JSON.parse(process.argv[2]);
+var __status = __input.status;   // {predId: 'pending' | terminal status}
+var __groups = __input.groups;   // {predId: [every row one decision settles]}
+var __requests = [];
+async function jsonFetch(url) {
+  var predId = Number(url.split('/')[3]);
+  __requests.push(predId);
+  if (__status[predId] !== 'pending') {
+    var err = new Error(
+      'prediction already ' + __status[predId] + '; cannot accept');
+    err.status = 409;
+    err.answered = true;
+    throw err;
+  }
+  var members = __groups[predId] || [predId];
+  members.forEach(function(m) { __status[m] = 'accepted'; });
+  return {ok: true, prediction_ids: members};
+}
+var __toasts = [];
+function showToast(message, kind) { __toasts.push({message: message, kind: kind}); }
+var compareData = {photos: __input.photos};
+var selectedRows = new Set(__input.photos.map(function(p) { return p.photo_id; }));
+function bestPrediction(photo) { return photo.prediction; }
+async function loadComparison() {}
+"""
+
+_ID_CONFLICTS_BATCH_DRIVER = """
+batchAction('accept').then(function() {
+  process.stdout.write(JSON.stringify({
+    toasts: __toasts, requests: __requests, status: __status,
+  }));
+});
+"""
+
+
+def _run_id_conflicts_batch(html, payload):
+    """Run ID Conflicts' real ``batchAction`` against the stub server."""
+    start = html.find("function endpointForAction(")
+    # ``rfind``: the threshold control is also *called* earlier in the page,
+    # and only the last occurrence is the bootstrap line that follows
+    # ``batchAction``.
+    end = html.rfind("updateConflictThresholdControl();")
+    assert start != -1 and end > start, (
+        "id_conflicts.html's batch action code could not be located"
+    )
+    import json as _json
+
+    source = "\n".join([
+        _ID_CONFLICTS_BATCH_STUB, html[start:end], _ID_CONFLICTS_BATCH_DRIVER,
+    ])
+    return _run_node(source, [_json.dumps(payload)])
+
+
+def test_id_conflicts_batch_accept_reports_group_expanded_rows_as_applied(
+    app_and_db,
+):
+    """A burst the server settles in one write must not be reported as failed.
+
+    Codex P2 (id_conflicts.html:1645). Select two photos of one burst and the
+    loop's first accept expands through ``accept_prediction`` and decides both
+    rows; the second request then meets the terminal-status 409 this PR added.
+    Counting that as "not applied" is a false claim about the database, and
+    about work this very batch performed — the exact failure the rest of this
+    flow exists to remove.
+
+    The fix reads the ids the accept says it wrote and skips them, so the
+    second request is never sent. That keeps the distinction that matters
+    intact, which the second half asserts: a row settled by somebody *else*
+    is not in that list, still 409s, and is still reported as a refusal.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/id-conflicts").get_data(as_text=True)
+    photos = [
+        {"photo_id": 1, "prediction": {"id": 11}},
+        {"photo_id": 2, "prediction": {"id": 12}},
+    ]
+
+    burst = _run_id_conflicts_batch(html, {
+        "photos": photos,
+        "status": {"11": "pending", "12": "pending"},
+        "groups": {"11": [11, 12], "12": [11, 12]},
+    })
+    assert burst["requests"] == [11], (
+        "the second photo's row was already decided by the first request"
+    )
+    assert burst["status"] == {"11": "accepted", "12": "accepted"}
+    assert burst["toasts"] == [], (
+        "both rows were accepted, so nothing may be reported as not applied"
+    )
+
+    # Control: same two photos, no group, and the second row was decided
+    # elsewhere. That 409 is a real conflict and has to stay one.
+    stale = _run_id_conflicts_batch(html, {
+        "photos": photos,
+        "status": {"11": "pending", "12": "rejected"},
+        "groups": {},
+    })
+    assert stale["requests"] == [11, 12]
+    assert [t["message"] for t in stale["toasts"]] == [
+        "1 of 2 not applied — prediction already rejected; cannot accept",
+    ]
 
 
 def _seed_pending_prediction(db, filename, species):

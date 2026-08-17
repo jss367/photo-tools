@@ -16963,7 +16963,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 _commit=False,
             )
             db.conn.commit()
-            return jsonify({"ok": True})
+            # Same reason as ``api_accept_prediction``: replace goes through
+            # the same grouped expansion, so a looping caller needs the rows
+            # this transaction decided rather than the one it asked about.
+            return jsonify({
+                "ok": True,
+                "prediction_ids": result["accepted_prediction_ids"],
+            })
         except Exception:
             db.conn.rollback()
             raise
@@ -17994,7 +18000,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     items, is_batch=is_batch, _commit=False,
                 )
             db.conn.commit()
-            return jsonify({"ok": True})
+            # Name every row this call decided, not just the one in the URL.
+            # A grouped accept expands through the burst, so a caller looping
+            # over a selection can have its next row already decided *by this
+            # response* — and would otherwise meet the 409 above and report a
+            # decision that did land as "not applied". Reporting the ids is
+            # the only version of that answer the caller can trust: it is what
+            # this transaction wrote, not an inference from a later status
+            # read that cannot say who wrote it. Matches the shape
+            # ``accept-subject`` already returns.
+            return jsonify({
+                "ok": True,
+                "prediction_ids": (
+                    result["accepted_prediction_ids"] if result else []
+                ),
+            })
         except Exception:
             db.conn.rollback()
             raise

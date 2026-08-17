@@ -107,6 +107,72 @@ def test_accept_prediction(app_and_db):
     assert 'Blue Jay' in kw_names
 
 
+def _burst_pair(db, group_id, species, photo_indexes=(0, 1)):
+    """Two photos of one burst carrying the same species from one model."""
+    photos = db.get_photos()
+    pred_ids = []
+    for offset, index in enumerate(photo_indexes):
+        det = _make_detection(db, photos[index]['id'])
+        db.add_prediction(detection_id=det, species=species,
+                          confidence=0.95 - 0.05 * offset, model='test-model',
+                          category='new', group_id=group_id)
+        pred_ids.append(db.conn.execute(
+            "SELECT id FROM predictions WHERE detection_id = ?", (det,)
+        ).fetchone()['id'])
+    return [photos[i]['id'] for i in photo_indexes], pred_ids
+
+
+def test_grouped_accept_names_every_row_it_decided(app_and_db):
+    """The accept response lists the burst rows it settled, not just the URL's.
+
+    ID Conflicts' batch accept loops this single-row route once per selected
+    photo. Two selected photos of one burst are a single grouped decision on
+    the server: the first request accepts both rows, and the second meets the
+    terminal-status 409 for work that demonstrably landed. Without an explicit
+    list of what the write covered, the client has no truthful way to tell
+    that 409 apart from a row somebody else decided, so it reports an applied
+    decision as "not applied" — a claim about the database that is false.
+
+    The list has to come from the transaction that wrote it. Inferring it
+    instead from an "already accepted" status echoed back in the 409 would
+    call *any* prior accept this batch's own success, including one made in
+    another tab under different scope.
+    """
+    app, db = app_and_db
+    _, (pred_a, pred_b) = _burst_pair(db, 'gburst', 'Steller Jay')
+    ws = db._active_workspace_id
+    client = app.test_client()
+
+    resp = client.post(f'/api/predictions/{pred_a}/accept')
+    assert resp.status_code == 200
+    assert sorted(resp.get_json()['prediction_ids']) == sorted([pred_a, pred_b])
+    assert db.get_review_status(pred_b, ws) == 'accepted'
+
+    # The request the loop would otherwise send next. It is a genuine refusal
+    # — the row is settled — which is exactly why the client must skip it
+    # rather than classify it after the fact.
+    assert client.post(f'/api/predictions/{pred_b}/accept').status_code == 409
+
+
+def test_grouped_replace_names_every_row_it_decided(app_and_db):
+    """Replace expands through the burst too, so it reports the same list.
+
+    Replace is the case that rules out reading idempotence off the 409's
+    status: a replace answering "already accepted" may be sitting on a plain
+    accept that never stripped the old species keywords, so treating it as
+    success would report a replacement that never happened.
+    """
+    app, db = app_and_db
+    _, (pred_a, pred_b) = _burst_pair(db, 'greplace', 'Scrub Jay')
+    ws = db._active_workspace_id
+    client = app.test_client()
+
+    resp = client.post(f'/api/predictions/{pred_a}/replace-keywords')
+    assert resp.status_code == 200
+    assert sorted(resp.get_json()['prediction_ids']) == sorted([pred_a, pred_b])
+    assert db.get_review_status(pred_b, ws) == 'accepted'
+
+
 def test_reject_prediction(app_and_db):
     """POST reject marks prediction as rejected."""
     app, db = app_and_db

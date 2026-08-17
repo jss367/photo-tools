@@ -815,6 +815,40 @@ refusal as a refusal and anything else as "could not confirm the decision", and
 `batchAction` counts the two classes separately in its toast. Both paths reload
 afterwards, which is what actually resolves the ambiguity.
 
+**The 409 the batch caused itself.** That accounting still had one row it could
+not name honestly. `batchAction` loops the single-row route once per selected
+photo, and accept, replace and accept-subject expand through the burst group —
+so two selected photos of one burst are *one* decision on the server. The first
+request settles both rows; the second meets the terminal-status 409 and was
+counted as "not applied" for work that had just landed, under this batch's own
+hand. Both directions of the same rule are wrong there: it is a false claim
+about the database, and it is a false claim about a write the caller performed.
+
+The fix is on the write, not on the refusal. `/accept` and `/replace-keywords`
+now return `prediction_ids` — the rows that transaction actually decided, taken
+straight from `accept_prediction`'s existing `accepted_prediction_ids`, in the
+shape `/accept-subject` already returned. `batchAction` collects them and skips
+a later photo whose row is in the set, counting it in the denominator and
+against no failure bucket. Nothing is deduplicated in advance from client-side
+group membership, which would skip on a belief about the burst rather than on
+what was written.
+
+The rejected alternative — and it was briefly the shipped one, in `4d0d723c`,
+which this replaces — was to read the row's current status off the 409 and let
+the client treat "already `<what you asked for>`" as success, either from a
+status field added to `json_error` or by substring-matching the refusal text.
+It answers the wrong question. The server cannot say *who* settled a row, so an
+accept the user made in another tab is scored as this batch's success. For
+replace it is worse than imprecise: a replace answering "already accepted" may
+be sitting on a plain accept that never stripped the old species keywords, so
+reporting the replacement as done is the same false claim pointing the other
+way — the failure mode swapped for its mirror rather than removed. And the
+match itself was a client-side parse of a Python f-string, which makes the
+message wording load-bearing without saying so anywhere near it. The version
+carried on the write has none of that: a row settled by anyone else still 409s
+and is still reported as a refusal, which is what the second half of the
+regression test pins.
+
 This is where the alternative-row contract stated above lands: because the
 check keys on `(detection, classifier_model)`, neither a row with an
 `alternative` sibling nor an `alternative` row itself can be accepted through
@@ -883,6 +917,19 @@ it has no ambiguity check because there is no winner to pick.
   terminal on the single-row routes (409, state and history untouched),
   counted as `already_decided` by the batch pair, and invisible to grouped
   expansion.
+- `test_id_conflicts_batch_accept_reports_group_expanded_rows_as_applied`
+  (`test_app.py`) — the real `batchAction`, lifted from the rendered page and
+  run under Node against a stub server that expands a decision through the
+  burst exactly as `accept_prediction` does. Two photos of one burst produce
+  one request and no failure toast; the control case, where the second row was
+  settled by somebody else, still sends both and still reports "1 of 2 not
+  applied". Verified to fail against the pre-fix template.
+- `test_grouped_accept_names_every_row_it_decided` and
+  `test_grouped_replace_names_every_row_it_decided`
+  (`test_predictions_api.py`) — the server half: both routes return the full
+  set of burst rows the write settled, and the second row's own request is
+  still a 409, which is why the client skips it rather than classifying it
+  afterwards.
 - `test_decision_routes_leave_no_transaction_open`,
   `test_undo_of_an_accept_still_works_under_the_decision_lock` and
   `test_group_apply_records_decisions_under_the_lock` — the newly locked

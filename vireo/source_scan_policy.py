@@ -174,20 +174,49 @@ def _linux_policies(paths, mountinfo_path):
     return policies
 
 
+def _unc_volume_key(unc_path):
+    normalized = ntpath.normpath(unc_path or "")
+    if not normalized.startswith("\\\\"):
+        return None
+    parts = normalized.strip("\\").split("\\")
+    if len(parts) < 2:
+        return None
+    return "windows:unc:" + parts[0].casefold() + "/" + parts[1].casefold()
+
+
 def _windows_volume(path):
     normalized = ntpath.normpath(path)
     if normalized.startswith("\\\\"):
-        parts = normalized.strip("\\").split("\\")
-        if len(parts) >= 2:
+        unc_key = _unc_volume_key(normalized)
+        if unc_key is not None:
+            parts = normalized.strip("\\").split("\\")
             root = f"\\\\{parts[0]}\\{parts[1]}\\"
-            return root, "windows:unc:" + parts[0].casefold() + "/" + parts[1].casefold()
+            return root, unc_key
     drive = ntpath.splitdrive(ntpath.abspath(normalized))[0]
     if drive:
         return drive + "\\", "windows:drive:" + drive.casefold()
     return None, "unknown-volume"
 
 
-def _windows_policies(paths, get_drive_type=None):
+def _windows_remote_share(local_name):
+    # WNetGetConnectionW reads the redirector's local connection table; it
+    # does not touch the share itself, so a stale NAS mount can't block it.
+    try:
+        wnet_get_connection = ctypes.windll.mpr.WNetGetConnectionW
+    except (AttributeError, OSError):
+        return None
+    length = ctypes.c_ulong(1024)
+    buffer = ctypes.create_unicode_buffer(length.value)
+    try:
+        result = wnet_get_connection(
+            ctypes.c_wchar_p(local_name), buffer, ctypes.byref(length),
+        )
+    except OSError:
+        return None
+    return buffer.value if result == 0 else None
+
+
+def _windows_policies(paths, get_drive_type=None, get_remote_share=None):
     if get_drive_type is None:
         try:
             win_get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
@@ -196,6 +225,8 @@ def _windows_policies(paths, get_drive_type=None):
 
         def get_drive_type(root):
             return win_get_drive_type(ctypes.c_wchar_p(root))
+    if get_remote_share is None:
+        get_remote_share = _windows_remote_share
     policies = []
     for path in paths:
         root, volume_key = _windows_volume(path)
@@ -207,6 +238,18 @@ def _windows_policies(paths, get_drive_type=None):
         except (OSError, TypeError, ValueError):
             drive_type = 0
         if drive_type == 4:  # DRIVE_REMOTE
+            # A mapped drive (Z:\) and the UNC spelling of the same share
+            # (\\nas\share) must land in one lane, or selecting both defeats
+            # the per-share serialization the network policy exists for.
+            # Group them under the share's UNC identity, like the Darwin
+            # branch groups aliases by mount source.
+            if len(root) == 3 and root[1] == ":":
+                try:
+                    remote_key = _unc_volume_key(get_remote_share(root[:2]))
+                except (OSError, TypeError, ValueError):
+                    remote_key = None
+                if remote_key is not None:
+                    volume_key = remote_key
             policies.append(_policy(path, volume_key, "network", 1))
         elif drive_type in {3, 6}:  # DRIVE_FIXED, DRIVE_RAMDISK
             policies.append(_policy(path, volume_key, "local", 2))
@@ -220,6 +263,7 @@ def _windows_policies(paths, get_drive_type=None):
 def classify_sources(
     paths, *, platform=None, run=subprocess.run,
     mountinfo_path="/proc/self/mountinfo", get_drive_type=None,
+    get_remote_share=None,
 ):
     """Return a conservative per-volume concurrency policy for ``paths``."""
     clean_paths = [path for path in paths if isinstance(path, str) and path]
@@ -229,5 +273,8 @@ def classify_sources(
     if platform.startswith("linux"):
         return _linux_policies(clean_paths, mountinfo_path)
     if platform == "win32":
-        return _windows_policies(clean_paths, get_drive_type=get_drive_type)
+        return _windows_policies(
+            clean_paths, get_drive_type=get_drive_type,
+            get_remote_share=get_remote_share,
+        )
     return _unknown(clean_paths)

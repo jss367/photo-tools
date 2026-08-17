@@ -17553,16 +17553,19 @@ class Database:
         decision lock (``app.py``'s ``_under_prediction_decision_lock``) fold
         these writes into that transaction.
 
-        Rows already in a decided status (``DECIDED_PREDICTION_STATUSES``)
-        are preserved: burst group apply — the only caller — runs at photo
-        granularity, so a stale ``rejects`` list would otherwise overwrite
-        an ``accepted`` that a single-row Accept, batch-accept, or an
-        earlier group apply committed under the same decision lock. The
-        keyword the accept added stays on the photo either way, so the
-        overwrite left status and keywords contradicting each other with no
-        UI cue pointing at the mismatch. The lock orders the two writers;
-        this ON CONFLICT guard is what keeps the second one from silently
-        flipping the first's decision.
+        Deliberately unconditional. The stale-overwrite this method used to
+        enable — a group apply flipping an ``accepted`` row to ``rejected``
+        while the keyword the accept added stays on the photo — is guarded
+        one level up, in ``api_prediction_group_apply``, against the statuses
+        the burst modal displayed (``_stale_group_apply_photos``). A
+        ``WHERE status NOT IN DECIDED_PREDICTION_STATUSES`` clause on the
+        ``ON CONFLICT`` below was tried first and removed: it cannot tell a
+        stale payload from the user re-opening an applied burst and changing
+        the split, which is a reachable flow (Review's default tab is "All",
+        and every grouped card there renders "Review Burst Group"), so it
+        silently froze the statuses while the flag and keyword writes above
+        it — which run before this call and outside the lock — went ahead
+        anyway. Guarding here is both too strict and too late.
         """
         ws = self._ws_id()
         rows = self.conn.execute(
@@ -17571,18 +17574,15 @@ class Database:
                WHERE d.photo_id = ?""",
             (photo_id,),
         ).fetchall()
-        decided_ph = ",".join("?" for _ in self.DECIDED_PREDICTION_STATUSES)
         for r in rows:
             self.conn.execute(
-                f"""INSERT INTO prediction_review
-                      (prediction_id, workspace_id, status, reviewed_at)
-                    VALUES (?, ?, ?, datetime('now'))
-                    ON CONFLICT(prediction_id, workspace_id)
-                    DO UPDATE SET status = excluded.status,
-                                  reviewed_at = excluded.reviewed_at
-                      WHERE prediction_review.status
-                            NOT IN ({decided_ph})""",
-                (r["id"], ws, status, *self.DECIDED_PREDICTION_STATUSES),
+                """INSERT INTO prediction_review
+                     (prediction_id, workspace_id, status, reviewed_at)
+                   VALUES (?, ?, ?, datetime('now'))
+                   ON CONFLICT(prediction_id, workspace_id)
+                   DO UPDATE SET status = excluded.status,
+                                 reviewed_at = excluded.reviewed_at""",
+                (r["id"], ws, status),
             )
         if _commit:
             self.conn.commit()

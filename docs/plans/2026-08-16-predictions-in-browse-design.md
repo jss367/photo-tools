@@ -566,7 +566,7 @@ take is not a lock, so the set is now enumerated:
 | `/api/predictions/<id>/reject` | Review per-row reject |
 | `/api/predictions/<id>/reviewed` | ID Conflicts "mark reviewed" |
 | `/api/predictions/<id>/replace-keywords` | Review replace-keyword accept |
-| `/api/predictions/group/apply` | Burst group pick/reject (status tail only — the flag and keyword writes above it are not review state) |
+| `/api/predictions/group/apply` | Burst group pick/reject (status tail only — the flag and keyword writes above it are not review state; its precondition is the render-time baseline described below, not "already decided") |
 | `/api/highlights/confirm` | Highlight confirm, via `accept_prediction` |
 | `/api/highlights/relabel` | Rejects each photo's top prediction |
 | `/api/undo`, `/api/redo` | Replay `prediction_review` statuses out of edit history |
@@ -600,6 +600,38 @@ written, rather than falling back to a non-atomic path.
 payload shape and workspace ownership, which is not the state these
 preconditions race against, and it can walk a 1,000-photo selection.
 
+**Group apply compares against a baseline, not against "decided".** Every other
+decision route treats an already-decided row as untouchable, and can, because
+its buttons only exist on pending rows: if the row is decided, somebody else
+decided it. The burst modal breaks that inference. It opens from any card
+carrying a `group_id` — including one this same user applied a minute ago — and
+`loadGroupData` re-derives picks and rejects from quality scores rather than
+from the stored statuses. Refusing every decided row there would block a real
+flow (re-open the burst, change the split, apply) *and* would report the user's
+own prior decision as somebody else's, which is the mis-description
+`CORE_PHILOSOPHY.md` rules out.
+
+So `grmApply` sends `observed`: the status it displayed for each member when it
+loaded. `_stale_group_apply_photos` skips a photo only when its member no
+longer holds the status the modal showed — the same rule as everywhere else in
+this PR ("decided after the payload was rendered"), stated against a baseline
+instead of inferred from a button's existence. A deliberate re-decision passes
+(observed `accepted` still matches current `accepted`); an accept or reject
+that landed from Browse or a second tab does not.
+
+The check runs twice, for two different jobs. Once before any writes, so a
+stale photo takes no flag and no keyword either — the status guard alone would
+still have tagged a photo it then refused to mark accepted, arriving at
+keyword-on-a-dismissed-row from the other side. Once again inside the lock,
+which is what makes the decision write itself atomic rather than merely
+ordered. Skipped photos come back as `already_decided`, counted in photos (the
+unit the modal works in), and the modal names them in a toast and reloads
+rather than patching its local statuses. An absent `observed` means no baseline
+and applies unconditionally — the server can only refuse what the client claims
+to have seen — so
+`test_group_apply_client_sends_the_observed_baseline` asserts the rendered page
+still sends it, the same pairing as the panel's decided-status test.
+
 **The endpoint's contract.** Every row `batch-accept` accepts is one that is
 still undecided, still unambiguous, still from the current label set, still
 in the caller's workspace, AND — when the caller passed one — still resolves
@@ -631,6 +663,16 @@ Two consequences at the caller:
   decided or turned ambiguous returns `accepted: 0` and records no undoable
   edit, so an unconditional toast would advertise — and Ctrl+Z would
   reverse — some older, unrelated edit.
+
+The same standard applies to a failure the caller cannot see the inside of. ID
+Conflicts surfaces the new 409s, and "not applied" is a claim about the
+database that only holds when the server answered: these routes commit inside
+`BEGIN IMMEDIATE`, so a dropped connection or a 5xx leaves an outcome this end
+genuinely cannot distinguish. `jsonFetch` therefore carries the response status
+on the error (`err.status`, `err.answered`), the single-row handler reports a
+refusal as a refusal and anything else as "could not confirm the decision", and
+`batchAction` counts the two classes separately in its toast. Both paths reload
+afterwards, which is what actually resolves the ambiguity.
 
 This is where the alternative-row contract stated above lands: because the
 check keys on `(detection, classifier_model)`, neither a row with an
@@ -705,6 +747,14 @@ it has no ambiguity check because there is no winner to pick.
   `test_group_apply_records_decisions_under_the_lock` — the newly locked
   routes still do what they did, and no refusal or empty path strands the
   writer lock: each ends with a decision that must still succeed.
+- `test_group_apply_skips_photos_decided_since_the_modal_rendered`,
+  `test_group_apply_allows_a_deliberate_re_decision`,
+  `test_group_apply_rejects_a_malformed_baseline` and
+  `test_group_apply_client_sends_the_observed_baseline` — the baseline
+  precondition in all four directions: the stale photo keeps its decision and
+  takes no flag or keyword while the rest of the burst applies, the user's own
+  re-decision still goes through, an unreadable baseline is a 400 rather than
+  a silent reversion to overwriting, and the modal still sends one.
 - The panels' invalidation lives in `_refreshBrowseKeywordState` (before its
   early returns) and in a `vireo:edit-history-changed` listener, so the
   coverage is structural rather than per-call-site.

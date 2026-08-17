@@ -562,7 +562,16 @@ async function jsonFetch(url, options) {
   var resp = await fetch(url, options || {});
   var data = await resp.json().catch(function() { return {}; });
   if (!resp.ok || data.error) {
-    throw new Error(data.error || ('Request failed: ' + resp.status));
+    var err = new Error(data.error || ('Request failed: ' + resp.status));
+    // Keep the outcome class on the error, not just its text. A 4xx (or any
+    // response carrying an `error` body) is the server *answering* — it
+    // refused, and wrote nothing. A 5xx or a thrown fetch is an unknown
+    // outcome: the decision routes commit inside BEGIN IMMEDIATE, so a
+    // failure after that commit is indistinguishable from one before it at
+    // this end. Callers must not report the second as "not applied".
+    err.status = resp.status;
+    err.answered = resp.status >= 400 && resp.status < 500;
+    throw err;
   }
   return data;
 }
@@ -1571,7 +1580,18 @@ async function predictionAction(predId, action) {
     // page sat open. The buttons here are disabled for non-pending rows, so
     // reaching this means the page is stale: say so and reload, rather than
     // swallowing the click, which would look like the action succeeded.
-    showToast(e.message || 'Could not apply that decision', 'error');
+    //
+    // Only a server that answered lets us say the decision was not applied.
+    // For a dropped connection or a 5xx the request may well have committed,
+    // so the honest report is that we cannot confirm it — the reload below
+    // shows which it was either way.
+    if (e && e.answered) {
+      showToast(e.message || 'Could not apply that decision', 'error');
+    } else {
+      showToast('Could not confirm the decision (' +
+        (e && e.message ? e.message : 'the request failed') +
+        ') — reloading to show the current state.', 'error');
+    }
   }
   await loadComparison();
 }
@@ -1590,7 +1610,8 @@ async function batchAction(action) {
     return ids.indexOf(photo.photo_id) >= 0;
   });
   var attempted = 0;
-  var failures = [];
+  var refused = [];
+  var unconfirmed = 0;
   for (var i = 0; i < photos.length; i++) {
     var pred = bestPrediction(photos[i]);
     if (!pred) continue;
@@ -1603,12 +1624,28 @@ async function batchAction(action) {
       // selection implies is the gap this whole flow exists to close. The
       // denominator is what was actually attempted, not the selection: rows
       // with no usable prediction were never sent.
-      failures.push(e.message || 'request failed');
+      //
+      // Split by outcome class rather than lumping every failure under "not
+      // applied": that phrasing is a claim about the database, and it is only
+      // true when the server answered. A lost response leaves the decision
+      // possibly committed, and saying otherwise is the same kind of
+      // convenient fiction the rest of this flow exists to remove.
+      if (e && e.answered) refused.push(e.message || 'refused');
+      else unconfirmed++;
     }
   }
-  if (failures.length) {
-    showToast(failures.length + ' of ' + attempted + ' not applied — ' +
-      failures[0], 'error');
+  var reportParts = [];
+  if (refused.length) {
+    reportParts.push(refused.length + ' of ' + attempted + ' not applied — ' +
+      refused[0]);
+  }
+  if (unconfirmed) {
+    reportParts.push(unconfirmed + ' of ' + attempted +
+      ' could not be confirmed (the request failed with no answer from the ' +
+      'server) — the reload below shows whether they landed');
+  }
+  if (reportParts.length) {
+    showToast(reportParts.join('; '), 'error');
   }
   selectedRows.clear();
   await loadComparison();

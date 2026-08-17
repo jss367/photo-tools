@@ -6837,7 +6837,13 @@ function predictionIsDecided(p) {
 // self-explanatory in Browse — it is written from ID Conflicts — so the tag
 // says what it means rather than leaving a bare word where two buttons were.
 function predictionStatusExplanation(status) {
-  if (status === 'accepted') return 'Accepted — the species keyword was added.';
+  // "was confirmed", not "the keyword was added": accepting a prediction for
+  // a photo that already carries the species writes no tag at all
+  // (``accept_prediction`` returns ``changed_tag=false`` for it), and this
+  // tooltip is rendered from the row's stored status — long after the accept,
+  // in a session that never saw that flag. Naming the decision is true in
+  // both cases; naming the write would be a guess dressed as a fact.
+  if (status === 'accepted') return 'Accepted — this species was confirmed for the photo.';
   if (status === 'rejected') return 'Rejected — this prediction was dismissed.';
   if (status === 'reviewed') {
     return 'Marked reviewed in ID Conflicts — settled without accepting or ' +

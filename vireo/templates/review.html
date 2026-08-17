@@ -3304,7 +3304,19 @@ function grmUpdateApplyLabel() {
 async function grmApply() {
   var species = document.getElementById('grmSpecies').value.trim();
   try {
-    await safeFetch('/api/predictions/group/apply', {
+    // The statuses this modal displayed when it loaded. The server applies a
+    // photo's decision only while its member still holds the status shown
+    // here, so a decision that landed from Browse or a second tab after the
+    // burst was opened is left alone instead of being overwritten. Sending
+    // the baseline (rather than letting the server refuse every decided row)
+    // is what keeps a deliberate re-decision working: re-open a burst that
+    // was already applied, change the split, apply — the observed status
+    // still matches, so the change goes through.
+    var observed = {};
+    (grmState.items || []).forEach(function(it) {
+      observed[it.id] = it.status || 'pending';
+    });
+    var applyResp = await safeFetch('/api/predictions/group/apply', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
@@ -3312,8 +3324,23 @@ async function grmApply() {
         rejects: Array.from(grmState.rejects),
         removed: Array.from(grmState.removed),
         species: species,
+        observed: observed,
       }),
     });
+
+    if (applyResp && applyResp.already_decided) {
+      // Say what was left undone and reload rather than patching statuses
+      // locally: the local patch below assumes every pick/reject landed, and
+      // the page's own copy of these rows is now the stale one.
+      var n = applyResp.already_decided;
+      showToast(n + (n === 1 ? ' photo was' : ' photos were') +
+        ' decided elsewhere after this burst was opened — ' +
+        (n === 1 ? 'its prediction was' : 'their predictions were') +
+        ' left as they are.', 'error');
+      closeGroupReview();
+      await loadPredictions();
+      return;
+    }
 
     // Update local prediction status immediately so cards reflect the
     // change — mirroring what the backend just did: picks become accepted,

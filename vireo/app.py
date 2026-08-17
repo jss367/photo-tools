@@ -17431,6 +17431,91 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
         return found
 
+    def _parse_observed_statuses(body):
+        """Validate ``/api/predictions/group/apply``'s render-time baseline.
+
+        The burst modal sends ``observed``: the status it displayed for each
+        group member when it loaded (``{prediction_id: status}``). Returns
+        ``(observed, None)`` or ``(None, error_response)``.
+
+        Absent or empty means "no baseline", and the route then applies
+        unconditionally — the server can only refuse what the client claims to
+        have seen. That is not a hole a caller can pick its way through so
+        much as the honest limit of the check; the one caller
+        (``review.html``'s ``grmApply``) always sends it, and
+        ``test_group_apply_client_sends_the_observed_baseline`` fails if that
+        stops being true.
+        """
+        raw = body.get("observed")
+        if raw is None:
+            return {}, None
+        if not isinstance(raw, dict):
+            return None, json_error(
+                "observed must be an object mapping prediction id to status"
+            )
+        observed = {}
+        for key, value in raw.items():
+            try:
+                pred_id = int(key)
+            except (TypeError, ValueError):
+                return None, json_error(
+                    "observed keys must be prediction ids"
+                )
+            if not isinstance(value, str):
+                return None, json_error(
+                    "observed values must be status strings"
+                )
+            observed[pred_id] = value
+        return observed, None
+
+    def _stale_group_apply_photos(db, observed):
+        """Photos whose group member was decided since the modal rendered.
+
+        Group apply is the one decision route where "already decided" is *not*
+        the right precondition. The single-row and batch endpoints can use it
+        because their buttons only exist on pending rows, so a decided row can
+        only have been decided by someone else. The burst modal is different:
+        it opens on any card carrying a ``group_id`` — including one whose
+        members this same user accepted a minute ago — and
+        ``loadGroupData`` re-derives picks/rejects from quality scores rather
+        than from the stored statuses. Refusing every decided row would block
+        a legitimate flow (re-open the burst, change the split, apply) *and*
+        would describe the user's own prior decision as somebody else's.
+
+        So the precondition is compare-and-swap against what the modal
+        actually displayed: skip a photo only when its member's status is no
+        longer the one the client saw. A deliberate re-decision passes
+        (observed ``accepted`` still matches current ``accepted``); a decision
+        that landed from Browse or a second tab after the modal opened does
+        not. That is the same rule the rest of this PR enforces — "decided
+        after the payload was rendered" — expressed against a baseline
+        instead of inferred from the button's existence.
+
+        Photo-level because the write is: ``update_predictions_status_by_photo``
+        restates every prediction of the photo, so one stale member
+        invalidates the whole photo's write, not just its own row.
+        """
+        if not observed:
+            return set()
+        ws = db._ws_id()
+        stale = set()
+        for chunk in _chunked(list(observed)):
+            placeholders = ",".join("?" for _ in chunk)
+            for row in db.conn.execute(
+                f"""SELECT pr.id AS prediction_id, d.photo_id AS photo_id,
+                           COALESCE(pr_rev.status, 'pending') AS status
+                      FROM predictions pr
+                      JOIN detections d ON d.id = pr.detection_id
+                      LEFT JOIN prediction_review pr_rev
+                        ON pr_rev.prediction_id = pr.id
+                       AND pr_rev.workspace_id = ?
+                     WHERE pr.id IN ({placeholders})""",
+                (ws, *chunk),
+            ):
+                if row["status"] != observed[row["prediction_id"]]:
+                    stale.add(row["photo_id"])
+        return stale
+
     # Every route that records a prediction decision, and therefore every
     # route that must take the writer lock below.
     #
@@ -18198,11 +18283,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         rejects = body.get("rejects", [])  # list of photo_ids
         removed = body.get("removed", [])  # list of prediction_ids to ungroup
         species = body.get("species", "")
+        observed, observed_err = _parse_observed_statuses(body)
+        if observed_err is not None:
+            return observed_err
 
         # Pre-validate all photo IDs against workspace before any mutations
         for pid in picks + rejects:
             if not db._photo_in_workspace(pid):
                 return json_error(f"Photo {pid} is not in the active workspace", 403)
+
+        # Drop photos whose prediction was decided since the modal rendered,
+        # before anything is written for them. Doing it here rather than only
+        # in the locked tail is what keeps the outcome internally consistent:
+        # the flag and keyword writes below are not under the lock, so filtering
+        # only at the status write would still tag a photo whose prediction we
+        # then refuse to mark accepted — the keyword-on-a-rejected-row state
+        # this precondition exists to prevent, arrived at from the other side.
+        # The tail re-checks under the lock for the window this read leaves open.
+        stale_photos = _stale_group_apply_photos(db, observed)
+        if stale_photos:
+            picks = [pid for pid in picks if pid not in stale_photos]
+            rejects = [pid for pid in rejects if pid not in stale_photos]
 
         # Capture old flag values before mutation
         all_flag_pids = picks + rejects
@@ -18277,21 +18378,42 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # transaction earlier would hold the database's single writer lock
         # across work that is not a decision.
         def _apply_group_decisions():
+            # The same baseline check again, now that the writer lock is held.
+            # The pre-lock pass above kept the flag/keyword writes consistent;
+            # this one is what makes the decision write itself atomic, closing
+            # the read-then-write window that a serialized-but-unconditional
+            # update would leave wide open: a decision committed while this
+            # request was assembling would otherwise be overwritten cleanly
+            # rather than not at all.
+            late = _stale_group_apply_photos(db, observed)
+
             # Mark all predictions in this group as accepted/rejected
             for pid in picks:
+                if pid in late:
+                    continue
                 db.update_predictions_status_by_photo(
                     pid, 'accepted', _commit=False,
                 )
             for pid in rejects:
+                if pid in late:
+                    continue
                 db.update_predictions_status_by_photo(
                     pid, 'rejected', _commit=False,
                 )
 
-            # Remove predictions from group
+            # Remove predictions from group. Ungrouping is not a decision — it
+            # changes which rows the burst modal shows together, not what any
+            # of them means — so it is not gated on the baseline.
             for pred_id in removed:
                 db.ungroup_prediction(pred_id, _commit=False)
             db.conn.commit()
-            return jsonify({"ok": True})
+            skipped = stale_photos | {
+                pid for pid in picks + rejects if pid in late
+            }
+            # Counted in photos, which is the unit the modal works in and the
+            # unit the toast names. Reported even when zero so the client can
+            # tell "nothing was stale" from an older server that never checked.
+            return jsonify({"ok": True, "already_decided": len(skipped)})
 
         return _under_prediction_decision_lock(db, _apply_group_decisions)
 

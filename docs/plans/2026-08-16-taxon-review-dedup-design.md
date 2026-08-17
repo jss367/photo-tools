@@ -2001,7 +2001,12 @@ and recorded as an ordinary **`keyword_remove`** history entry —
 separate from the non-undoable `prediction_reject` status entry, so the
 destructive half of a reconciling reject is undoable even though the
 status flip is not. Rejecting a pending member is unchanged: nothing
-was tagged, nothing is retracted.
+was tagged, nothing is retracted. `remove_pending_changes` defaults to
+the **active workspace only** (`db.py:18630-18649`), so the call above is
+written cross-workspace — see "The pending queue is workspace-scoped and
+the association is not", below, for why a workspace-local cancellation
+lets another workspace's stale queue write the retracted keyword back to
+the sidecar.
 
 **A card mutation writes every member status before it decides any
 keyword effect.** This is a general rule about card mutations, not a
@@ -2141,12 +2146,65 @@ of zero live assertions when B has several — the same
 badge-disagrees-with-metadata failure the retraction rule exists to
 prevent, this time arriving through the workspace axis rather than
 the mutation-order axis. The predicate therefore evaluates over every
-workspace that contains the affected photo — joining
-`prediction_review` back to `predictions` and through
-`workspace_folders` (as `_photo_in_workspace` does at
-`db.py:2121-2129`, generalized from "the active workspace" to
-"every workspace containing this photo") — and retraction happens
-only when the set of live assertions is empty catalog-wide. The
+workspace that contains the affected photo, and **the unit it
+evaluates is the `(prediction, workspace)` pair, not the
+`prediction_review` row**.
+
+That distinction is the whole rule, because in this schema *pending
+state is represented by absence.* `add_prediction` writes no
+`prediction_review` row at all unless the caller supplies something
+beyond the defaults — `has_review_state` gates the insert
+(`db.py:15905-15918`) under the comment "Keeping pending rows out of
+`prediction_review` is intentional: absence == pending" — which is why
+every read path spells the status `COALESCE(pr_rev.status, 'pending')`
+(`db.py:16204`, `16236`, `16634`, `17149`, and a dozen more, including
+the `get_predictions` query Review itself renders from). A liveness
+query that starts `FROM prediction_review` therefore finds nothing in
+workspace B for a prediction B has never been clicked in, and concludes
+B holds no live assertion — while B's Review page is at that moment
+displaying that prediction as `pending`. That is the **ordinary** case,
+not the edge one: most workspaces have never touched most predictions,
+so a row-started query under-counts live assertions in nearly every
+workspace, and the retraction it is guarding would fire on nearly every
+shared photo.
+
+The liveness set is built the way `get_predictions` builds its status
+column, one level up. Enumerate the candidate pairs *first*: the
+same-taxon `predictions` rows on the affected photo (§1's key, computed
+in Python over the request's row set) crossed with every workspace whose
+`workspace_folders` make that photo visible — the join
+`_photo_in_workspace` performs at `db.py:2121-2129`, generalized from
+"the active workspace" to "every workspace containing this photo".
+Then `LEFT JOIN prediction_review pr_rev ON pr_rev.prediction_id = p.id
+AND pr_rev.workspace_id = w.id` and test
+`COALESCE(pr_rev.status, 'pending') IN ('pending', 'accepted')` — the
+identical convention, on the identical column, as the query that decides
+what the other workspace shows. Phase A's writes are already in the
+transaction, so the mutation's own members read `rejected` here exactly
+as the phase-ordering rule requires. Retraction happens only when no
+pair is live.
+
+*The consequence — retraction is rare on shared photos — is correct,
+not a number to tune.* If a photo is visible in five workspaces and the
+user has only ever reviewed in one, rejecting there leaves four implicit
+`pending` assertions standing and the keyword is kept. That is what the
+other four workspaces are in fact asserting, and stripping the tag would
+contradict what each of them displays. It does mean the disclosure has
+to say *where* the surviving assertions are, in the user's terms:
+"kept 'Blue Tit' — still predicted in 2 other workspaces (Birds 2024,
+Archive)", not the same-workspace wording "still predicted on 2 photos".
+A bare count would answer "why was this kept" with a number the user
+cannot reconcile against the workspace in front of them — the cheap
+proxy the transparency rule forbids — and naming the workspaces is also
+the only affordance that tells them where to go to finish the job.
+
+*Rejected alternative: count only workspaces that hold an explicit
+`prediction_review` row.* That is the failing query with a
+rationalization attached. It makes a destructive metadata decision turn
+on whether some unrelated workspace happens to have *written a row* —
+a fact invisible in both workspaces, unrelated to whether either asserts
+the taxon, and flipped by unrelated actions like a group-id backfill that
+sets `has_review_state` without changing any status. The other
 alternative — giving `photo_keywords` its own `workspace_id` column
 and duplicating each taxon keyword per workspace — is rejected for the
 same reason §4 precedence-1 reuses a taxon-matched keyword globally in
@@ -2157,6 +2215,83 @@ workspace, both of which break the "one tag per photo per taxon"
 invariant the tagging pipeline is built on. The cross-workspace check
 preserves that global rule and lets retraction stay per-photo, which
 is the same shape the Phase-B enumeration above uses.
+
+*The pending queue is workspace-scoped and the association is not.*
+The liveness fix above decides **whether** to retract; this decides
+what "retract" has to touch, and it is the same asymmetry one table
+over. `pending_changes` carries a `workspace_id` (`db.py:810-818`) and every
+accessor is scoped to it — `get_pending_changes` and
+`count_pending_changes` filter on `self._ws_id()`, and both
+`queue_change` (`db.py:18587`) and `remove_pending_changes`
+(`db.py:18630`) take an optional `workspace_id` that **defaults to the
+active workspace**. And the queue is a *delta* list, not a desired-state
+one: `sync.py:155-243` writes exactly the queued `keyword_add` /
+`keyword_remove` values into the sidecar rather than re-deriving the
+photo's keyword set from the DB. So an accept in workspace A both writes
+the global `photo_keywords` row *and* queues A's own `keyword_add`; a
+reconciling reject issued from workspace B that deletes the global row
+and cancels only B's queue leaves A's add sitting there. The next time A
+syncs, it writes into the sidecar a keyword that no prediction anywhere
+still asserts and that the DB no longer contains — disk contradicting
+the catalog, which is the failure this section exists to prevent,
+arriving after the click that was supposed to fix it and in a workspace
+the user was not looking at.
+
+A retraction is therefore global in both halves, matching the table it
+is retracting from:
+
+- **Cancel every matching pending `keyword_add` for that
+  `(photo_id, keyword name)` in every workspace**, not just the active
+  one — `remove_pending_changes` already takes `workspace_id`, so this
+  is a loop over the workspaces holding such a row (equivalently, the
+  same delete with the `workspace_id` clause omitted), not a new
+  method. Deliberately keyed on the row's own `(photo_id, value)` rather
+  than on the workspaces currently containing the photo: folder
+  visibility can change after an add is queued, and a stale add in a
+  workspace that no longer sees the photo still writes the sidecar.
+- **Queue the `keyword_remove` in every workspace that contains the
+  photo**, deduplicated by `queue_change`'s existing already-pending
+  check (`db.py:18608-18613`, which returns `None` rather than inserting
+  a duplicate). Queuing it only in the acting workspace is the tempting
+  smaller fix and it strands the removal: the association was global,
+  the sidecar is one file, and because sync is delta-driven, a removal
+  sitting in a workspace the user never syncs never reaches disk — so
+  the tag survives in the one place every workspace reads it from. The
+  sidecar removal is idempotent (`remove_keywords` on a term the file
+  does not contain is a no-op), so whichever workspace syncs first
+  strips the term and the rest cost one no-op write, and meanwhile each
+  workspace's pending list truthfully shows a removal that is in fact
+  happening to a photo it displays.
+- **Do not lift `_queue_keyword_remove`'s cancel-instead-of-queue
+  shortcut to the global rule.** Within one workspace, `app.py:8234-8250`
+  queues a `keyword_remove` only when no matching pending `keyword_add`
+  was cancelled — sound there, because a surviving add means that
+  workspace never synced it, so there is nothing on disk to remove.
+  Read globally, "some workspace's add was cancelled, therefore skip the
+  removal" is false: A can accept, sync (clearing A's row, writing the
+  term to the sidecar), and *then* B can accept the same taxon on the
+  same photo from a different card and queue its own add. Cancelling B's
+  add and skipping the removal leaves the term on disk permanently. The
+  global rule cancels unconditionally and queues unconditionally; the
+  cost of the extra no-op is a write, and the cost of the shortcut is a
+  wrong sidecar.
+
+**This cancellation is not a second retraction rule — it is downstream
+of the first, and inherits #1488's lattice by construction.** It runs
+only for the `(photo, keyword)` pairs the retraction predicate below
+actually retracted: rows whose folded `photo_keywords.source` is
+`'accept'`, no live assertion left catalog-wide. It never inspects
+`pending_changes.value` to make a provenance judgement of its own — it
+could not, since a queued change records a keyword string and nothing
+about who asked for it. The case that makes the distinction load-bearing:
+an accept in A stamps `'accept'` and queues an add, then the user
+hand-tags the same keyword in workspace B, whose `tag_photo` folds the
+row up the lattice to `'manual'`. A later reject retracts nothing —
+so it cancels nothing, and A's queued add still writes a keyword the
+user explicitly asked for. A parallel "cancel pending adds for the
+rejected taxon" rule, written beside the retraction rule instead of
+under it, would have cancelled that add and silently dropped the user's
+own keyword from the sidecar. One decision, two effects.
 
 **Retraction requires provenance, and provenance cannot live in the
 edit log.** Stripping a keyword is only safe if we know the *accept*
@@ -2260,7 +2395,10 @@ to. Two rules, split by what is actually knowable:
   quietly in disagreement, which is the property this whole section is
   protecting. The same disclosure covers the "kept because another live
   prediction still asserts it" case ("kept 'Blue Tit' — still predicted
-  on 2 photos").
+  on 2 photos"), and takes the workspace-naming form above when the
+  surviving assertions are in another workspace rather than on another
+  photo of this one — the user cannot act on a count of assertions they
+  cannot see from here.
 
 Until #1488 lands and Phase 4 starts writing `'accept'`, every row is
 `NULL`- or `'manual'`-source and every reconciling reject takes the
@@ -3309,13 +3447,44 @@ Each phase lands as its own PR and is independently useful.
    "Reject all" on the card containing A's row: A's `prediction_review`
    status flips to `rejected`, but the keyword (accept-owned from an
    earlier click) **stays** on P because B's row is still a live
-   assertion catalog-wide, and A's disclosure reads "kept 'Blue Tit'
-   — still predicted on 1 photo" naming the cross-workspace count
-   rather than zero. A build whose liveness query filters by
-   `workspace_id = active` strips the keyword and fails. Symmetric
-   variant: once B also rejects, the keyword is retracted on the
-   *second* reject, from B's workspace, because the catalog-wide live
-   set is now empty; a
+   assertion catalog-wide, and A's disclosure names the workspace it
+   survives in — "kept 'Blue Tit' — still predicted in 1 other
+   workspace (B)" — rather than a bare count or zero. A build whose
+   liveness query filters by `workspace_id = active` strips the
+   keyword and fails. Symmetric variant: once B also rejects, the
+   keyword is retracted on the *second* reject, from B's workspace,
+   because the catalog-wide live set is now empty. **Implicit-pending
+   variant, and the load-bearing one:** the same build with **no
+   `prediction_review` row for B at all** — the ordinary state, since
+   `add_prediction` writes no row for a pending prediction
+   (`db.py:15909-15918`) and B has simply never been clicked in. B's
+   Review still renders the prediction `pending` through
+   `COALESCE(pr_rev.status, 'pending')`, so A's reject must keep the
+   keyword exactly as in the explicit-row case. A build whose liveness
+   query starts `FROM prediction_review` — rather than crossing
+   `predictions` with the photo's workspaces and left-joining — sees an
+   empty live set, strips the keyword, and fails. Third variant pinning
+   the other direction so the rule cannot be satisfied by "never
+   retract": B holds an explicit `rejected` row and every other
+   workspace containing P holds one too, so the live set really is
+   empty and the keyword *is* retracted; a
+   **cross-workspace pending-add fixture** — an accept in workspace A
+   tags P (`source = 'accept'`) and queues A's `keyword_add "Blue Tit"`,
+   unsynced. The final live assertion is then rejected from workspace B.
+   Assert three things: the global `photo_keywords` row is gone, **A's
+   pending `keyword_add` is gone**, and a `keyword_remove` is queued in
+   both A and B. A build that calls `remove_pending_changes` on its
+   default (active) workspace leaves A's add in place; driving A's sync
+   afterwards then writes "Blue Tit" back into P's sidecar, and the
+   fixture fails on the sidecar contents, not just the queue. Negative
+   variant tying the cancellation to the lattice rather than to a
+   parallel rule: between the accept and the reject, the user hand-tags
+   "Blue Tit" on P from workspace B, folding the row's `source` up to
+   `'manual'`. The reject now retracts nothing — so it must cancel
+   nothing, and A's queued add survives to write the keyword the user
+   asked for. A build that cancels pending adds for the rejected taxon
+   independently of the retraction decision drops the user's own keyword
+   from the sidecar and fails; a
    **two-phase-ordering fixture** — "Reject all" on an
    `{accepted, pending}` card whose two members assert the **same taxon
    on the same photo**, the accepted one having tagged it

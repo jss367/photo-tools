@@ -193,6 +193,31 @@ def test_fixed_browse_view_key_is_reserved_from_navigation(live_server, page):
     assert "dashboard" not in navigation_names
 
 
+def test_fixed_global_keys_are_reserved_from_navigation(live_server, page):
+    """Help and universal-filter keys must take precedence over navigation."""
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(
+            json={
+                "keyboard_shortcuts": {
+                    "navigation": {"dashboard": "f1", "workspace": "\\"}
+                }
+            }
+        ),
+    )
+    url = live_server["url"]
+    page.goto(f"{url}/browse", timeout=15000)
+    page.wait_for_load_state("networkidle")
+
+    navigation_names = page.evaluate("""
+        window.Keymap.shortcutsForScope('global')
+            .filter(s => s.category === 'Navigation')
+            .map(s => s.name)
+    """)
+    assert "dashboard" not in navigation_names
+    assert "workspace" not in navigation_names
+
+
 def test_unreserved_bare_navigation_shortcut_navigates(live_server, page):
     """An otherwise-unused bare letter remains available for navigation."""
     page.route(

@@ -17866,6 +17866,126 @@ def test_selection_prediction_suggestions_confidence_unknown_without_consensus_r
     assert robin["max_confidence"] is None
 
 
+def test_selection_prediction_suggestions_drops_bucket_carried_only_by_borrowed_confidence(
+    app_and_db,
+):
+    """The threshold prefilter must not let a borrowed row carry a bucket.
+
+    A row's ``p.confidence`` is the classifier's score for that row's
+    own per-frame label. In a burst whose consensus is a different
+    species, the raw score reflects evidence for the minority species —
+    pooling it into the consensus bucket lets a 95% Sparrow row keep a
+    Robin bucket alive under an 80% floor. The credit gate inside the
+    aggregator refuses to credit the 95% to Robin, but without a
+    parallel bucket-level guard the endpoint would still emit
+    "Accept on 1" on that borrowed evidence. Drop the bucket entirely:
+    the pending row remains visible in the per-photo panel and in
+    Review, which has the burst context to sort it out.
+    """
+    import json as _json
+
+    app, db = app_and_db
+    # 0.80 floor lets Sparrow's raw 0.95 through — but no Robin-labelled
+    # row exists in the selection to give Robin's bucket any attributable
+    # evidence above threshold.
+    ws_id = db.get_workspaces()[0]["id"]
+    db.update_workspace(ws_id, config_overrides={"classifier_confidence": 0.80})
+
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="borrowed-only-above-threshold.jpg",
+        extension=".jpg", file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    db.add_prediction(
+        det_id, "Sparrow", 0.95, "bioclip",
+        group_id="burst-borrowed-above-threshold",
+        individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
+    )
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    data = resp.get_json()
+    # No bucket at all — the Sparrow row's 0.95 does not license an
+    # actionable Robin bucket, even though it cleared the raw-score
+    # prefilter. Suppression matches the ``row_matches_consensus``
+    # credit gate on the aggregate side.
+    assert data["predictions"] == []
+    # The row is not counted as below-threshold either: it did pass the
+    # raw-score floor. Naming it below-threshold would be its own black
+    # box — the row was suppressed for a different reason.
+    assert data["below_threshold_count"] == 0
+    assert data["threshold"] == 0.80
+
+
+def test_selection_prediction_suggestions_keeps_bucket_when_matching_row_above_threshold(
+    app_and_db,
+):
+    """A borrowed row alongside a matching-consensus row still surfaces the bucket.
+
+    Only the ``no consensus-attributable evidence above threshold`` case
+    is suppressed. When the burst has a Robin-labelled frame that also
+    clears the floor, the Robin bucket is legitimate and stays actionable
+    — the borrowed Sparrow row can still ride along in the batch accept
+    because ``accept_prediction`` uses the burst consensus (Robin) for
+    every frame anyway.
+    """
+    import json as _json
+
+    app, db = app_and_db
+    ws_id = db.get_workspaces()[0]["id"]
+    db.update_workspace(ws_id, config_overrides={"classifier_confidence": 0.80})
+
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_burst_photo(name, species, confidence):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(
+            det_id, species, confidence, "bioclip",
+            group_id="burst-mixed-above-threshold",
+            individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
+        )
+        return photo_id
+
+    robin_frame = _seed_burst_photo("burst-robin-above.jpg", "Robin", 0.90)
+    sparrow_frame = _seed_burst_photo("burst-sparrow-above.jpg", "Sparrow", 0.95)
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [robin_frame, sparrow_frame]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    predictions = resp.get_json()["predictions"]
+    assert {p["species"] for p in predictions} == {"Robin"}
+    robin = predictions[0]
+    # Both photos aggregate under Robin — the Sparrow row's borrowed
+    # confidence does not count for Robin's max, but the row still
+    # participates in the acceptable set because acceptance flips to the
+    # burst consensus.
+    assert robin["predicted_count"] == 2
+    assert robin["acceptable_photo_count"] == 2
+    assert robin["max_confidence"] == 0.90
+
+
 def test_predictions_api_exposes_consensus_species_for_burst(app_and_db):
     """/api/predictions surfaces the accept-time species as consensus_species.
 

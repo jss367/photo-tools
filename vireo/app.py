@@ -10475,6 +10475,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         results = []
         for key, entry in by_key.items():
+            # A bucket whose every contributing row is a burst-minority
+            # frame credited to a different species has no
+            # consensus-attributable evidence: ``entry["confidences"]``
+            # only fills from rows where the raw label matches the
+            # consensus (see the credit gate above). With the workspace
+            # threshold active, an empty ``confidences`` list means the
+            # bucket exists because a non-matching row's raw score cleared
+            # the prefilter — a 95% Sparrow row keeping a Robin bucket
+            # alive under an 80% floor. The credit gate correctly refuses
+            # to credit that 95% to Robin, but without this parallel
+            # bucket-level guard the endpoint would still emit an
+            # "Accept on N" that acts on evidence the user has never been
+            # shown for the species the accept path applies. Drop the
+            # bucket in that case; the pending rows remain visible in the
+            # per-photo panel and in Review, where the burst context is
+            # available. ``threshold == 0`` preserves the display-only
+            # behavior established by the credit gate — nothing was
+            # filtered, so no borrowed row cleared a floor and the
+            # "confidence unknown" render is still honest.
+            if threshold > 0 and not entry["confidences"]:
+                continue
             predicted_ids = sorted(entry["rows_by_photo"], key=lambda p: order[p])
             kid = kid_by_key.get(key)
             keyworded = (

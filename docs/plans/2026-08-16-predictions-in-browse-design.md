@@ -116,27 +116,95 @@ and each row accepts as its own species.
 so the display fix stays a defence rather than the only thing standing
 between the user and a mislabelled Accept.
 
-That invariant is younger than the catalog, though. `group_reviewable`
+That invariant used to be younger than the catalog. `group_reviewable`
 arrived in #1165 (2026-07-10); before it, every multi-frame burst stored a
-`group_id` with a multi-species `individual`, and those rows are still in the
-database. For them the consensus genuinely differs from the row's own label,
-which matters for the **confidence** the panel prints: `predictions.confidence`
-is the score of the frame's own label, so folding a 95%-scored minority frame
-into the consensus bucket would report a number belonging to a different
-species than the one named, and float that bucket up the strength-ordered
-list on evidence that was never for it. The aggregator therefore only counts
-a row's confidence toward the bucket it names when the row's own label *is*
-that species. The row still belongs to the bucket — accepting it does apply
-the consensus — it simply carries no evidence for it. A bucket left with no
-contributing row reports `min_confidence`/`max_confidence` as `null`, which
-`formatPredictionConfidence` renders as "confidence unknown": the honest
-answer, rather than a percentage the user would read as the classifier's
-confidence in a species it never scored.
+`group_id` with an unconditional multi-species `individual`, and those rows
+were still in the database. For them the consensus genuinely differed from
+the row's own label — which is not a rendering problem but a correctness one,
+because `accept_prediction` reads the species it applies out of that vote
+dict. Measured read-only on the live catalog before the repair: **41,746**
+review rows carried a genuinely multi-species `individual` (all of them
+grouped), **12,191** of those resolved to a species other than the row's own
+(12,114 still pending) across **8,381** photos. Real pairs included
+`Purple Finch → Cassin's Finch` and `Allen's Hummingbird → Rufous
+Hummingbird`. A panel could label such a row `Purple Finch` and tag
+`Cassin's Finch` on click.
+
+### The legacy repair
+
+`Database.repair_mixed_species_prediction_groups` (`db.py`) removes that
+state instead of rendering around it. For every `prediction_review` row whose
+`individual` holds more than one distinct `species_match_key` it clears
+`group_id`, `individual`, `vote_count` and `total_votes` — the row then reads
+exactly as the current classifier would have written it, and accepts as its
+own species. `status` is untouched (a decision the user already made stays
+made) and nothing in `predictions` is read or written: no prediction is
+deleted, retitled or rescored.
+
+- **The fold runs in Python, not SQL.** `species_match_key` (moved to
+  `keyword_normalization` so `db` and `classify_job` cannot drift apart)
+  collapses okina, typographic-apostrophe and case variants, so
+  `{"Hawai'i 'Amakihi": 4, "Hawai’i ’Amakihi": 2}` is one species spelled
+  twice and stays grouped. SQLite's `lower()` does not apply that
+  normalization and would ungroup it.
+- **Marker, not `PRAGMA user_version`.** This repo has known `user_version`
+  drift between branches, and a version-gated migration silently skips on a
+  database whose number already ran ahead. `db_meta` key
+  `prediction_review_mixed_species_groups_v1`.
+- **Cheap after the first run**, and cheap on a clean database too: a
+  single-species vote dict is `{"Robin": 4}` — one JSON member, no comma — so
+  `individual LIKE '%,%'` short-circuits on the first candidate, and a
+  catalog with none stamps the marker after one scan rather than decoding
+  every blob. Post-marker cost is one indexed `db_meta` lookup.
+- **All workspaces.** `prediction_review` is keyed by
+  `(prediction_id, workspace_id)`, and the legacy classify runs wrote into
+  whichever workspaces were active. The repair deliberately does not go
+  through `_ws_id()`.
+- **One transaction**, marker included: a stamped marker over a half-cleared
+  table would strand the remainder forever. Writes are chunked only to bound
+  `executemany`'s parameter list.
+- **It logs its totals** (rows cleared, photos affected) at INFO. 12k rows
+  changing under the user silently would be exactly the black box
+  `CORE_PHILOSOPHY.md` forbids.
+
+Called from `create_app` before the first request, so no page can render a
+row it is about to change and no accept can act on one.
+
+#### What the repair let us retire
+
+Rounds 13–19 added several guards whose only job was to render legacy
+divergence correctly. With the state gone, keeping them means carrying code
+and — worse — user-facing vocabulary for a case that can no longer occur.
+
+**Retired:** the bucket-level *suppression*. `api_selection_prediction_suggestions`
+used to drop a bucket whose `confidences` list came out empty under an active
+threshold, report the drop as `suppressed_borrowed_count`, and have the panel
+render a second empty state ("No actionable predictions...") and a second
+below-the-list note. `renderDetailPredictions` mirrored all of it. That list
+can only be empty when *every* contributing row is labelled with a species
+other than the one the accept path applies — precisely the shape the repair
+clears. The cost of keeping it was two vocabularies for an empty panel, one
+of which is now unreachable.
+
+**Kept:** the confidence **credit gate**, on both sides. A row's confidence
+counts toward the bucket it names only when the row's own label *is* that
+species; a bucket with no contributing row reports `null`, which
+`formatPredictionConfidence` renders as "confidence unknown", and the sort
+treats `null` as `-1` so it sinks rather than floats. This is four lines, it
+computes a number rather than hiding a row, and the invariant it rests on is
+held by construction in one function — not by a database constraint. If that
+function ever regressed, the gate degrades to "confidence unknown" instead of
+quoting one species' score beside another's name.
+
+**Kept:** `_species_drifted_prediction_ids`. It is a check-then-write race
+guard, not a legacy renderer: `/api/predictions/group/apply` and
+`ungroup_prediction` can still change a row's grouping between the moment
+Browse renders "Accept on 38 Bald Eagle" and the moment the user clicks it.
 
 The threshold filter deliberately still uses the row's own confidence. That
 floor decides whether a prediction row is worth surfacing at all, and the
 row's score is a true statement about the row; what was wrong was attributing
-it to a species, and attribution is now a separate step. Filtering the row out
+it to a species, and attribution is a separate step. Filtering the row out
 instead would hide a real pending prediction with no accurate wording for why
 — `below_threshold_count` says "below your confidence threshold", which such a
 row is not.
@@ -1010,3 +1078,35 @@ it has no ambiguity check because there is no winner to pick.
 
 Plus a Playwright pass driving the real panel — selecting photos, accepting,
 confirming the Review queue drains.
+
+### Legacy repair coverage
+
+- `test_mixed_species_group_repair_clears_grouping_but_keeps_the_prediction`
+  — the grouping columns go to NULL, `status` stays `pending`, and the
+  `predictions` row keeps its species, confidence and model.
+- `test_mixed_species_group_repair_preserves_a_decided_status` — a rejected
+  row stays rejected; the repair fixes what the classifier wrote, not what
+  the user decided.
+- `test_mixed_species_group_repair_keeps_a_burst_that_folds_to_one_species`
+  — `{"Hawai'i 'Amakihi": 4, "Hawai’i ’Amakihi": 2}` stays grouped with its
+  vote counts intact. This is the case a SQL `lower()` fold would destroy.
+- `test_mixed_species_group_repair_leaves_single_species_groups_alone` — the
+  ordinary post-#1165 shape is untouched.
+- `test_mixed_species_group_repair_runs_across_every_workspace` — two
+  workspaces holding review rows for the same prediction are both cleared.
+- `test_mixed_species_group_repair_is_idempotent` — the second run clears
+  nothing and changes nothing, *and* a row re-grouped afterwards (a fresh
+  classify run) is not re-cleared: the marker means "the legacy write is
+  gone", not "grouping is forbidden".
+- `test_mixed_species_group_repair_stamps_marker_on_a_clean_database` — the
+  `LIKE '%,%'` probe stamps the marker so a clean catalog does not re-scan
+  every boot, and the short-circuit is not mistaken for "clear everything".
+- `test_mixed_species_group_repair_runs_on_app_startup` — `create_app`
+  performs it before serving.
+- `test_selection_prediction_suggestions_offers_repaired_legacy_burst_as_own_species`
+  — the endpoint case the retired suppression existed for. The same seeded
+  row now surfaces as a plain 95% Sparrow bucket, actionable, with no
+  suppression field in the response.
+- `test_browse_prediction_panels_carry_no_borrowed_suppression` — pins the
+  retirement as an absence in both panels, while asserting the credit gate
+  is still present so the cleanup could not quietly take it along.

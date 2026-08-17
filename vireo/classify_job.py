@@ -33,37 +33,19 @@ except ImportError:
 
 from db import AUTO_MATCH_REVIEW_MARKER, Database, commit_with_retry
 from keyword_normalization import _ASCII_LOWER_TABLE, normalize_keyword_display
+from keyword_normalization import folded_species_key as _folded_species_key
+from keyword_normalization import species_match_key as _species_match_key
 from models import get_active_model, get_models
 from resource_ledger import ResourceWaitCancelled
 
-
-def _folded_species_key(species):
-    """Return the string ``add_prediction`` uses to key ``predictions.species``.
-
-    Mirrors the normalization branch in ``Database.add_prediction``: fold when
-    the result is non-empty, otherwise keep the original. Callers use this to
-    dedupe alternatives against a primary before writing prediction_review
-    rows, so the key must match exactly what ends up in the UNIQUE column.
-    """
-    if species is None:
-        return None
-    folded = normalize_keyword_display(species)
-    return folded if folded else species
-
-
-def _species_match_key(species):
-    """Return the equivalence key used to dedupe species names.
-
-    Mirrors ``keyword_match_key`` / SQLite ``COLLATE NOCASE``: strip and
-    ASCII-only case fold. Python's ``str.lower()`` folds non-ASCII pairs
-    such as ``É``/``é`` and ``Maße``/``masse`` that SQLite treats as
-    distinct, so using it here would silently drop a legitimate second
-    prediction row or collapse two distinct-per-DB burst species into
-    one consensus vote.
-    """
-    return (_folded_species_key(species) or "").strip().translate(
-        _ASCII_LOWER_TABLE,
-    )
+# ``_folded_species_key`` / ``_species_match_key`` used to be defined here.
+# They moved to ``keyword_normalization`` when ``db`` needed the same fold
+# for ``repair_mixed_species_prediction_groups`` — the repair's job is to
+# reproduce the grouping decision ``_store_grouped_predictions`` makes
+# below, so the two must not be able to drift. ``classify_job`` imports
+# ``db``, so the shared home has to be a module both can import. The
+# private aliases are kept because the grouping code and its tests read
+# better with the leading underscore signalling "this module's rule".
 
 try:
     from classifier import ClassificationCancelled, Classifier

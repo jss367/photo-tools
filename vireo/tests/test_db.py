@@ -25492,3 +25492,311 @@ def test_universal_filter_has_species_matches_taxonomy_type_keyword(tmp_path):
     assert count([{"field": "has_species", "op": "is", "value": 1}]) == 2
     assert count([{"field": "has_species", "op": "is", "value": 0}]) == 1
     _ = p_none  # keep the untagged photo alive for the negative branch.
+
+
+# ---------------------------------------------------------------------------
+# repair_mixed_species_prediction_groups
+# ---------------------------------------------------------------------------
+
+
+def _mixed_group_repair_db(tmp_path, name="mixed-groups.db"):
+    """A database with one folder, ready to hang bursts off."""
+    from db import Database
+    db = Database(str(tmp_path / name))
+    fid = db.add_folder(str(tmp_path / "photos"), name="photos")
+    return db, fid
+
+
+def _seed_burst_frame(db, folder_id, filename, species, individual,
+                      group_id="legacy-burst", confidence=0.9,
+                      vote_count=2, total_votes=3):
+    """Write one review row in the pre-#1165 shape and return its ids.
+
+    ``add_prediction`` is the only writer that will stamp ``group_id`` and
+    ``individual`` from arbitrary arguments, which is exactly what the old
+    classifier did unconditionally. Current ``_store_grouped_predictions``
+    cannot produce a multi-species ``individual`` at all — that is the point
+    of the repair.
+    """
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename=filename, extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    db.add_prediction(
+        det_id, species, confidence, "bioclip",
+        group_id=group_id,
+        vote_count=vote_count,
+        total_votes=total_votes,
+        individual=individual,
+    )
+    pred_id = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?", (det_id,)
+    ).fetchone()["id"]
+    return photo_id, pred_id
+
+
+def _review_row(db, prediction_id, workspace_id=None):
+    ws = workspace_id if workspace_id is not None else db._ws_id()
+    return db.conn.execute(
+        """SELECT status, group_id, individual, vote_count, total_votes
+           FROM prediction_review
+           WHERE prediction_id = ? AND workspace_id = ?""",
+        (prediction_id, ws),
+    ).fetchone()
+
+
+def test_mixed_species_group_repair_clears_grouping_but_keeps_the_prediction(
+    tmp_path,
+):
+    """A legacy mixed-consensus row is ungrouped; the prediction survives.
+
+    Pre-#1165 the classifier stamped a ``group_id`` and a vote dict on every
+    burst frame whether or not the frames agreed. ``accept_prediction``
+    derives the species it applies from that dict, so the row below displays
+    "Purple Finch" and would tag "Cassin's Finch". The repair clears only the
+    grouping metadata, leaving a row that means what it says.
+    """
+    import json
+
+    db, fid = _mixed_group_repair_db(tmp_path)
+    _photo, pred_id = _seed_burst_frame(
+        db, fid, "legacy-frame.jpg", "Purple Finch",
+        json.dumps({"Cassin's Finch": 4, "Purple Finch": 1}),
+    )
+    before = _review_row(db, pred_id)
+    assert before["group_id"] == "legacy-burst"
+    assert before["individual"] is not None
+
+    assert db.repair_mixed_species_prediction_groups() == 1
+
+    after = _review_row(db, pred_id)
+    assert after["group_id"] is None
+    assert after["individual"] is None
+    assert after["vote_count"] is None
+    assert after["total_votes"] is None
+    # The decision is the user's, not the repair's: status is untouched.
+    assert after["status"] == "pending"
+    # And the prediction itself is intact — species, confidence, model.
+    pred = db.conn.execute(
+        "SELECT species, confidence, classifier_model FROM predictions WHERE id = ?",
+        (pred_id,),
+    ).fetchone()
+    assert pred["species"] == "Purple Finch"
+    assert pred["confidence"] == 0.9
+    assert pred["classifier_model"] == "bioclip"
+
+
+def test_mixed_species_group_repair_preserves_a_decided_status(tmp_path):
+    """A row the user already accepted or rejected keeps that decision.
+
+    The repair fixes what the classifier wrote, not what the user decided.
+    Flipping a rejected row back to pending would resurrect work the user
+    has already finished.
+    """
+    import json
+
+    db, fid = _mixed_group_repair_db(tmp_path)
+    _photo, pred_id = _seed_burst_frame(
+        db, fid, "decided-frame.jpg", "Purple Finch",
+        json.dumps({"Cassin's Finch": 4, "Purple Finch": 1}),
+    )
+    db.conn.execute(
+        "UPDATE prediction_review SET status = 'rejected' WHERE prediction_id = ?",
+        (pred_id,),
+    )
+    db.conn.commit()
+
+    assert db.repair_mixed_species_prediction_groups() == 1
+
+    after = _review_row(db, pred_id)
+    assert after["status"] == "rejected"
+    assert after["group_id"] is None
+    assert after["individual"] is None
+
+
+def test_mixed_species_group_repair_keeps_a_burst_that_folds_to_one_species(
+    tmp_path,
+):
+    """Several spellings of one species is a unanimous burst — leave it grouped.
+
+    ``species_match_key`` collapses typographic apostrophes, okina and case,
+    so ``{"Hawai'i 'Amakihi": 4, "Hawai’i ’Amakihi": 2}`` is six votes
+    for one bird written two ways. SQLite's ``lower()`` does not apply that
+    normalization and would read two species here, which is why the fold runs
+    in Python. Ungrouping this row would destroy a legitimate burst.
+    """
+    import json
+
+    db, fid = _mixed_group_repair_db(tmp_path)
+    _photo, pred_id = _seed_burst_frame(
+        db, fid, "okina-frame.jpg", "Hawai'i 'Amakihi",
+        json.dumps({"Hawai'i 'Amakihi": 4, "Hawai’i ’Amakihi": 2}),
+    )
+
+    assert db.repair_mixed_species_prediction_groups() == 0
+
+    after = _review_row(db, pred_id)
+    assert after["group_id"] == "legacy-burst"
+    assert after["individual"] is not None
+    assert after["vote_count"] == 2
+    assert after["total_votes"] == 3
+
+
+def test_mixed_species_group_repair_leaves_single_species_groups_alone(tmp_path):
+    """The ordinary post-#1165 shape — one species in the dict — is untouched."""
+    import json
+
+    db, fid = _mixed_group_repair_db(tmp_path)
+    _photo, pred_id = _seed_burst_frame(
+        db, fid, "unanimous-frame.jpg", "Robin", json.dumps({"Robin": 3}),
+    )
+
+    assert db.repair_mixed_species_prediction_groups() == 0
+
+    after = _review_row(db, pred_id)
+    assert after["group_id"] == "legacy-burst"
+    assert after["individual"] == json.dumps({"Robin": 3})
+
+
+def test_mixed_species_group_repair_runs_across_every_workspace(tmp_path):
+    """``prediction_review`` is workspace-scoped; the repair is not.
+
+    The same legacy classify run wrote rows into whichever workspaces were
+    active at the time. A repair that only cleaned the active workspace would
+    leave the divergence live in every other one, and the user would meet it
+    again on the next workspace switch.
+    """
+    import json
+
+    db, fid = _mixed_group_repair_db(tmp_path)
+    home_ws = db._ws_id()
+    other_ws = db.create_workspace("Other")
+    db.set_active_workspace(other_ws)
+    db.add_workspace_folder(other_ws, fid)
+    _photo, pred_id = _seed_burst_frame(
+        db, fid, "cross-ws-frame.jpg", "Purple Finch",
+        json.dumps({"Cassin's Finch": 4, "Purple Finch": 1}),
+    )
+    # Give the home workspace its own review row for the same prediction,
+    # in the same legacy shape.
+    db.conn.execute(
+        """INSERT INTO prediction_review
+               (prediction_id, workspace_id, status, individual, group_id,
+                vote_count, total_votes)
+           VALUES (?, ?, 'pending', ?, 'legacy-burst', 4, 5)""",
+        (pred_id, home_ws,
+         json.dumps({"Cassin's Finch": 4, "Purple Finch": 1})),
+    )
+    db.conn.commit()
+
+    assert db.repair_mixed_species_prediction_groups() == 2
+
+    for ws in (home_ws, other_ws):
+        row = _review_row(db, pred_id, ws)
+        assert row["group_id"] is None, ws
+        assert row["individual"] is None, ws
+        assert row["vote_count"] is None, ws
+        assert row["total_votes"] is None, ws
+
+
+def test_mixed_species_group_repair_is_idempotent(tmp_path):
+    """Second run is a no-op: it clears nothing and touches nothing.
+
+    Gated by a ``db_meta`` marker rather than ``PRAGMA user_version``, which
+    drifts between branches in this repo and would let a version-gated
+    migration silently skip.
+    """
+    import json
+
+    db, fid = _mixed_group_repair_db(tmp_path)
+    _photo, pred_id = _seed_burst_frame(
+        db, fid, "idempotent-frame.jpg", "Purple Finch",
+        json.dumps({"Cassin's Finch": 4, "Purple Finch": 1}),
+    )
+
+    assert db.repair_mixed_species_prediction_groups() == 1
+    assert db.get_meta(db._MIXED_SPECIES_GROUP_REPAIR_KEY) == "1"
+    first = dict(_review_row(db, pred_id))
+
+    assert db.repair_mixed_species_prediction_groups() == 0
+    assert dict(_review_row(db, pred_id)) == first
+
+    # A row re-grouped after the repair (a fresh classify run, or a user
+    # regrouping in Review) is NOT re-cleared: the marker means "the legacy
+    # write is gone", and re-running must not fight current behaviour.
+    db.conn.execute(
+        """UPDATE prediction_review
+              SET group_id = 'new-burst', individual = ?
+            WHERE prediction_id = ?""",
+        (json.dumps({"Robin": 3, "Sparrow": 1}), pred_id),
+    )
+    db.conn.commit()
+    assert db.repair_mixed_species_prediction_groups() == 0
+    assert _review_row(db, pred_id)["group_id"] == "new-burst"
+
+
+def test_mixed_species_group_repair_stamps_marker_on_a_clean_database(tmp_path):
+    """A catalog with no multi-vote rows stamps the marker after one probe.
+
+    The probe is ``individual LIKE '%,%'`` — a single-species vote dict has
+    one JSON member and therefore no comma. Without stamping here, every boot
+    of a clean database would re-scan ``prediction_review`` forever.
+    """
+    import json
+
+    db, fid = _mixed_group_repair_db(tmp_path)
+    _photo, pred_id = _seed_burst_frame(
+        db, fid, "clean-frame.jpg", "Robin", json.dumps({"Robin": 3}),
+    )
+
+    assert db.repair_mixed_species_prediction_groups() == 0
+    assert db.get_meta(db._MIXED_SPECIES_GROUP_REPAIR_KEY) == "1"
+    # The grouped row is still grouped — the probe short-circuit must not be
+    # mistaken for "clear everything".
+    assert _review_row(db, pred_id)["group_id"] == "legacy-burst"
+
+
+def test_mixed_species_group_repair_runs_on_app_startup(tmp_path, monkeypatch):
+    """create_app performs the repair before serving any request.
+
+    A page rendered against an unrepaired row would show one species beside
+    an Accept that applies another — the state the repair exists to remove.
+    """
+    import json
+
+    import config as cfg
+    from app import create_app
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    monkeypatch.setenv("VIREO_DISABLE_STARTUP_BACKFILL_TIMERS", "1")
+
+    db_path = str(tmp_path / "startup.db")
+    db, fid = _mixed_group_repair_db(tmp_path, name="startup.db")
+    _photo, pred_id = _seed_burst_frame(
+        db, fid, "startup-frame.jpg", "Purple Finch",
+        json.dumps({"Cassin's Finch": 4, "Purple Finch": 1}),
+    )
+    db.close()
+
+    create_app(db_path, str(tmp_path / "thumbs"))
+
+    from db import Database
+    reopened = Database(db_path)
+    try:
+        row = reopened.conn.execute(
+            "SELECT group_id, individual FROM prediction_review WHERE prediction_id = ?",
+            (pred_id,),
+        ).fetchone()
+        assert row["group_id"] is None
+        assert row["individual"] is None
+        assert reopened.get_meta(
+            Database._MIXED_SPECIES_GROUP_REPAIR_KEY
+        ) == "1"
+    finally:
+        reopened.close()

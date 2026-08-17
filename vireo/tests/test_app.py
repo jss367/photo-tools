@@ -17866,28 +17866,28 @@ def test_selection_prediction_suggestions_confidence_unknown_without_consensus_r
     assert robin["max_confidence"] is None
 
 
-def test_selection_prediction_suggestions_drops_bucket_carried_only_by_borrowed_confidence(
+def test_selection_prediction_suggestions_offers_repaired_legacy_burst_as_own_species(
     app_and_db,
 ):
-    """The threshold prefilter must not let a borrowed row carry a bucket.
+    """A repaired legacy row becomes an ordinary, honest bucket.
 
-    A row's ``p.confidence`` is the classifier's score for that row's
-    own per-frame label. In a burst whose consensus is a different
-    species, the raw score reflects evidence for the minority species —
-    pooling it into the consensus bucket lets a 95% Sparrow row keep a
-    Robin bucket alive under an 80% floor. The credit gate inside the
-    aggregator refuses to credit the 95% to Robin, but without a
-    parallel bucket-level guard the endpoint would still emit
-    "Accept on 1" on that borrowed evidence. Drop the bucket entirely:
-    the pending row remains visible in the per-photo panel and in
-    Review, which has the burst context to sort it out.
+    This is the shape the endpoint used to suppress. A lone Sparrow-
+    labelled frame at 0.95, stamped by the pre-#1165 classifier with a
+    ``group_id`` and a Robin-winning vote dict, cleared an 0.80 floor on
+    its own raw score and then aggregated under Robin — an "Accept on 1"
+    for a species with no evidence above the floor. The endpoint answered
+    that by dropping the bucket and reporting the drop.
+
+    ``repair_mixed_species_prediction_groups`` removes the cause instead.
+    The row is ungrouped, so it means what it says: a 95% Sparrow
+    prediction. It surfaces as Sparrow at 0.95, actionable, and accepting
+    it tags Sparrow — nothing is hidden and nothing needs explaining.
     """
     import json as _json
 
     app, db = app_and_db
-    # 0.80 floor lets Sparrow's raw 0.95 through — but no Robin-labelled
-    # row exists in the selection to give Robin's bucket any attributable
-    # evidence above threshold.
+    # 0.80 floor: high enough that the pre-repair Robin bucket would have
+    # rested entirely on Sparrow's borrowed 0.95.
     ws_id = db.get_workspaces()[0]["id"]
     db.update_workspace(ws_id, config_overrides={"classifier_confidence": 0.80})
 
@@ -17909,41 +17909,48 @@ def test_selection_prediction_suggestions_drops_bucket_carried_only_by_borrowed_
         individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
     )
 
+    # The fixture's create_app already ran the repair against an empty
+    # catalog and stamped its one-shot marker. Clear the marker so the row
+    # above is met the way an upgrade meets it: written before the boot that
+    # repairs it.
+    db.conn.execute(
+        "DELETE FROM db_meta WHERE key = ?",
+        (type(db)._MIXED_SPECIES_GROUP_REPAIR_KEY,),
+    )
+    db.conn.commit()
+    assert db.repair_mixed_species_prediction_groups() == 1
+
     resp = client.post(
         "/api/selection/prediction-suggestions",
         json={"photo_ids": [photo_id]},
     )
     assert resp.status_code == 200, resp.get_data(as_text=True)
     data = resp.get_json()
-    # No bucket at all — the Sparrow row's 0.95 does not license an
-    # actionable Robin bucket, even though it cleared the raw-score
-    # prefilter. Suppression matches the ``row_matches_consensus``
-    # credit gate on the aggregate side.
-    assert data["predictions"] == []
-    # The row is not counted as below-threshold either: it did pass the
-    # raw-score floor. Naming it below-threshold would be its own black
-    # box — the row was suppressed for a different reason.
+    predictions = data["predictions"]
+    assert [p["species"] for p in predictions] == ["Sparrow"]
+    sparrow = predictions[0]
+    # The score is the row's own, credited to the row's own species — the
+    # attribution problem is gone because the misattribution is gone.
+    assert sparrow["max_confidence"] == 0.95
+    assert sparrow["acceptable_photo_count"] == 1
     assert data["below_threshold_count"] == 0
     assert data["threshold"] == 0.80
-    # The suppressed row is counted on its own field so the panel's empty
-    # state can name why it is empty. Without this, the panel would show
-    # "No pending predictions on the selected photos" even though the
-    # pending row exists and was dropped for a specific reason
-    # (``CORE_PHILOSOPHY.md``: no black boxes).
-    assert data["suppressed_borrowed_count"] == 1
+    # No second empty-state vocabulary: nothing is suppressed, so the
+    # endpoint has no suppression to report.
+    assert "suppressed_borrowed_count" not in data
 
 
 def test_selection_prediction_suggestions_keeps_bucket_when_matching_row_above_threshold(
     app_and_db,
 ):
-    """A borrowed row alongside a matching-consensus row still surfaces the bucket.
+    """A genuinely unanimous burst keeps every frame in one actionable bucket.
 
-    Only the ``no consensus-attributable evidence above threshold`` case
-    is suppressed. When the burst has a Robin-labelled frame that also
-    clears the floor, the Robin bucket is legitimate and stays actionable
-    — the borrowed Sparrow row can still ride along in the batch accept
-    because ``accept_prediction`` uses the burst consensus (Robin) for
-    every frame anyway.
+    The credit gate is an attribution rule, not a filter: a row whose raw
+    label differs from the consensus still belongs to the bucket and still
+    rides along in the batch accept, because ``accept_prediction`` applies
+    the burst consensus to every frame. Only its *confidence* is withheld
+    from the aggregate. Pinned so a future tightening of the gate does not
+    turn it into row-membership filtering.
     """
     import json as _json
 
@@ -17991,9 +17998,6 @@ def test_selection_prediction_suggestions_keeps_bucket_when_matching_row_above_t
     assert robin["predicted_count"] == 2
     assert robin["acceptable_photo_count"] == 2
     assert robin["max_confidence"] == 0.90
-    # Nothing was suppressed here: Robin has a real matching-consensus
-    # contributor. The counter must not fire on legitimate buckets.
-    assert data["suppressed_borrowed_count"] == 0
 
 
 def test_predictions_api_exposes_consensus_species_for_burst(app_and_db):
@@ -18069,71 +18073,38 @@ def test_browse_detail_panel_groups_by_consensus_species(app_and_db):
     assert "p.consensus_species || p.species" in html
 
 
-def test_browse_detail_panel_suppresses_borrowed_only_buckets(app_and_db):
-    """The single-photo panel drops buckets that only borrowed evidence.
+def test_browse_prediction_panels_carry_no_borrowed_suppression(app_and_db):
+    """The borrowed-evidence suppression is gone from both Browse panels.
 
-    The row-level threshold filter (``rows.filter((p) => p.confidence >=
-    threshold)``) sees the raw per-frame score. In a legacy mixed-
-    consensus burst, a 95% Sparrow row survives an 80% floor and then
-    gets grouped under Robin (consensus) with ``g.confidence == null``
-    because the credit gate refuses to attribute the 95% to Robin. The
-    result is a "Robin · confidence unknown" row with an active Accept —
-    the identical bug the server-side aggregator's bucket guard fixed
-    for the multi-select panel. The detail renderer must do the same.
+    Two mirrored suppressions used to live here: ``renderDetailPredictions``
+    dropped pending buckets left with ``confidence == null`` under an active
+    threshold, and ``renderSelectionPredictions`` rendered the server's
+    ``suppressed_borrowed_count`` as a second empty state ("No actionable
+    predictions..."), with ``predictionEmptyMessage`` carrying a third
+    branch to name the suppression as the reason a panel was empty. All of
+    it existed only to handle legacy mixed-consensus burst rows, which
+    ``repair_mixed_species_prediction_groups`` now clears from the catalog
+    at startup — so ``predictionEmptyMessage``'s two surviving branches are
+    exhaustive again.
+
+    Pinned as an absence because the cost of keeping them was the user-
+    facing one: two vocabularies for an empty panel, one of which could no
+    longer occur. The credit gate that computes the confidence honestly is
+    a separate thing and stays — asserted here so retiring the suppression
+    cannot quietly take it along.
     """
     app, _ = app_and_db
     client = app.test_client()
     html = client.get("/browse").get_data(as_text=True)
-    # The filter that mirrors the server-side bucket guard runs after
-    # grouping and only when the workspace has a floor active.
-    assert "suppressedBorrowedRows" in html
-    assert "if (threshold > 0)" in html
-    # The suppressed rows get counted out loud — the pending row
-    # exists, and a blank spot in the list would be a black box.
-    assert "consensus-attributable score above your confidence threshold" in html
-
-
-def test_browse_detail_empty_message_names_borrowed_suppression(app_and_db):
-    """When every bucket was dropped for borrowed evidence, the empty
-    message must name the suppression rather than the classifier or the
-    threshold.
-
-    The bug: ``predictionEmptyMessage(state, hidden)`` took only the
-    below-threshold count. When the suppression guard emptied the panel
-    but no row was dropped for being under the floor, ``hidden`` was
-    zero and the message read "Classification ran and produced no
-    species" — a claim contradicted by the ``suppressedNote`` rendered
-    right beside it. When rows *were* also below the floor, the message
-    said "every prediction is below your confidence floor", which does
-    not fit the suppressed subset. The empty message needs to know
-    which filter emptied the panel.
-    """
-    app, _ = app_and_db
-    client = app.test_client()
-    html = client.get("/browse").get_data(as_text=True)
-    # The function accepts a third arg for the suppressed count and
-    # branches on it before either of the other two facts.
-    assert "function predictionEmptyMessage(state, hiddenCount, suppressedCount)" in html
-    assert "if (suppressedCount) return 'Pending predictions exist but were suppressed" in html
-    # The call site in the borrowed-suppression branch passes the count.
-    assert "predictionEmptyMessage(state, hidden, suppressedBorrowedRows)" in html
-
-
-def test_browse_selection_panel_renders_suppressed_borrowed_count(app_and_db):
-    """The selection panel surfaces the server's suppressed_borrowed_count.
-
-    Without this, a selection whose only pending bucket was borrowed-
-    evidence-only reads as "No pending predictions on the selected
-    photos" even though the pending row exists and was deliberately
-    suppressed — the empty state would collapse two different facts.
-    """
-    app, _ = app_and_db
-    client = app.test_client()
-    html = client.get("/browse").get_data(as_text=True)
-    assert "meta.suppressed_borrowed_count" in html
-    # The empty-state message must distinguish "genuinely no pending"
-    # from "pending, but every bucket was suppressed".
-    assert "No actionable predictions on the selected photos." in html
+    assert "suppressedBorrowedRows" not in html
+    assert "meta.suppressed_borrowed_count" not in html
+    assert "consensus-attributable score above your confidence threshold" not in html
+    assert "No actionable predictions on the selected photos." not in html
+    assert "suppressedCount" not in html
+    assert "Pending predictions exist but were suppressed" not in html
+    # The credit gate itself is untouched: a row only contributes its
+    # confidence to the bucket whose species it actually names.
+    assert "asciiCaseFoldKey(p.species || '') === asciiCaseFoldKey(g.species)" in html
 
 
 def test_selection_prediction_suggestions_flips_status_on_already_keyworded_photo(

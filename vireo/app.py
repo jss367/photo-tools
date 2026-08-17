@@ -5047,6 +5047,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "Restored %d location hierarchy nodes misclassified as taxonomy",
             repaired_location_ancestors,
         )
+    # Ungroup legacy bursts whose stored votes span more than one species.
+    # Those rows display one species and, through accept_prediction's
+    # vote-winner lookup, tag another; the repair makes them read as the
+    # current classifier would have written them. Runs before the first
+    # request so no page can render a row this is about to change, and
+    # before any accept can act on one. Depends on no taxonomy or config,
+    # so unlike the duplicate-species repair it needs no deferral: it is
+    # db_meta-gated and self-logging, and later boots pay one marker
+    # lookup. Method logs its own totals — the counts are the point, per
+    # CORE_PHILOSOPHY.md.
+    init_db.repair_mixed_species_prediction_groups()
 
     # Parsing taxonomy.json is expensive for a full iNaturalist download.
     # Cache the startup instance so overlapping one-time migrations and the
@@ -10474,41 +10485,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             kid_by_key.setdefault(keyword_match_key(row["name"]), row["id"])
 
         results = []
-        # Counter for pending rows dropped by the borrowed-evidence bucket
-        # guard below. Reported alongside ``below_threshold_count`` so a
-        # panel emptied only by this suppression can name its own reason
-        # instead of reading as "no pending predictions" — the row exists,
-        # it just has no consensus-attributable score to license an
-        # actionable button. ``CORE_PHILOSOPHY.md``: a blank panel that
-        # collapses two different facts into one is the black box the
-        # UI-transparency rule forbids.
-        suppressed_borrowed_count = 0
+        # A bucket-level suppression used to sit here: when the threshold was
+        # active and ``entry["confidences"]`` came out empty, the bucket was
+        # dropped and counted into a ``suppressed_borrowed_count`` the panel
+        # rendered as its own empty state. Both are gone, because the state
+        # they described is gone. ``confidences`` can only be empty when
+        # *every* contributing row's raw label disagrees with the consensus
+        # the accept path applies, and that is precisely the legacy shape
+        # ``Database.repair_mixed_species_prediction_groups`` clears at
+        # startup: after the repair a grouped row's consensus is its own
+        # species, so every surviving row credits its own bucket. Keeping a
+        # filter plus a second piece of empty-state vocabulary for an
+        # unreachable case is its own transparency cost — the user would be
+        # asked to learn a distinction the data can no longer produce.
+        #
+        # The credit gate above stays. It is four lines, it computes the
+        # right number rather than hiding a row, and if the invariant it
+        # rests on ever regressed it degrades to "confidence unknown"
+        # instead of quoting one species' score beside another's name.
         for key, entry in by_key.items():
-            # A bucket whose every contributing row is a burst-minority
-            # frame credited to a different species has no
-            # consensus-attributable evidence: ``entry["confidences"]``
-            # only fills from rows where the raw label matches the
-            # consensus (see the credit gate above). With the workspace
-            # threshold active, an empty ``confidences`` list means the
-            # bucket exists because a non-matching row's raw score cleared
-            # the prefilter — a 95% Sparrow row keeping a Robin bucket
-            # alive under an 80% floor. The credit gate correctly refuses
-            # to credit that 95% to Robin, but without this parallel
-            # bucket-level guard the endpoint would still emit an
-            # "Accept on N" that acts on evidence the user has never been
-            # shown for the species the accept path applies. Drop the
-            # bucket in that case; the pending rows remain visible in the
-            # per-photo panel and in Review, where the burst context is
-            # available. ``threshold == 0`` preserves the display-only
-            # behavior established by the credit gate — nothing was
-            # filtered, so no borrowed row cleared a floor and the
-            # "confidence unknown" render is still honest.
-            if threshold > 0 and not entry["confidences"]:
-                suppressed_borrowed_count += sum(
-                    len(photo_entry["ids"])
-                    for photo_entry in entry["rows_by_photo"].values()
-                )
-                continue
             predicted_ids = sorted(entry["rows_by_photo"], key=lambda p: order[p])
             kid = kid_by_key.get(key)
             keyworded = (
@@ -10596,13 +10591,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "predictions": results,
             "threshold": threshold,
             "below_threshold_count": below_threshold_count,
-            # Pending rows the aggregator dropped because their bucket had
-            # no consensus-attributable score above the floor — a separate
-            # fact from ``below_threshold_count`` (the row itself passed
-            # the raw-score floor). Reported so the panel's empty state
-            # can distinguish "nothing pending" from "pending, but
-            # suppressed" instead of collapsing them into one blank box.
-            "suppressed_borrowed_count": suppressed_borrowed_count,
         })
 
     @app.route("/api/selection/wildlife-state", methods=["POST"])

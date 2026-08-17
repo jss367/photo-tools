@@ -10,7 +10,11 @@ import unicodedata
 import uuid
 from datetime import datetime
 
-from keyword_normalization import keyword_match_key, normalize_keyword_display
+from keyword_normalization import (
+    keyword_match_key,
+    normalize_keyword_display,
+    species_match_key,
+)
 from new_images import get_shared_cache
 
 log = logging.getLogger(__name__)
@@ -17591,6 +17595,141 @@ class Database:
             )
         if _commit:
             self.conn.commit()
+
+    _MIXED_SPECIES_GROUP_REPAIR_KEY = "prediction_review_mixed_species_groups_v1"
+
+    def repair_mixed_species_prediction_groups(self):
+        """Ungroup legacy bursts whose stored votes span more than one species.
+
+        ``classify_job._store_grouped_predictions`` only stamps ``group_id``
+        and ``individual`` when every frame in the burst folds to a single
+        ``species_match_key`` — ``group_reviewable``. That gate arrived in
+        #1165; bursts stored before it got a ``group_id`` and an
+        unconditional multi-species vote dict regardless of whether the
+        frames agreed.
+
+        Those rows are actively wrong, not merely stale. ``accept_prediction``
+        derives the species it applies from the vote dict, so a legacy row
+        displays its own ``predictions.species`` and tags the vote winner:
+        accepting a frame labelled ``Purple Finch`` writes ``Cassin's
+        Finch``. That is the black box ``CORE_PHILOSOPHY.md`` forbids, and no
+        amount of careful rendering fixes it — the button would still have to
+        name one species and apply another.
+
+        So repair the data rather than the symptom: for every review row
+        whose ``individual`` holds more than one distinct species key, clear
+        ``group_id``, ``individual``, ``vote_count`` and ``total_votes``.
+        The row then reads exactly as the current classifier would have
+        written it — an ungrouped prediction that accepts as its own species.
+        ``status`` is untouched (a decision the user already made stays
+        made), and nothing in ``predictions`` is read or written: no
+        prediction is deleted, retitled or rescored, only the burst-grouping
+        metadata that was never valid.
+
+        Rows whose ``individual`` has several JSON keys that fold to *one*
+        species are left grouped. ``species_match_key`` collapses okina,
+        typographic-apostrophe and case variants, so ``{"Hawai'i 'Amakihi":
+        4, "Hawai’i ’Amakihi": 2}`` is a unanimous burst spelled two
+        ways and its grouping is legitimate. This is why the fold runs in
+        Python: SQLite's ``lower()`` does not apply that normalization and
+        would ungroup those rows.
+
+        Not workspace-scoped. ``prediction_review`` is keyed by
+        ``(prediction_id, workspace_id)`` and the same legacy classify run
+        wrote rows in whichever workspaces were active at the time, so this
+        deliberately runs across every workspace rather than through
+        ``_ws_id()``.
+
+        Idempotent and gated by a ``db_meta`` marker rather than
+        ``PRAGMA user_version``: this repo has known ``user_version`` drift
+        between branches, and a version-gated migration silently skips on a
+        database whose number already ran ahead. After the first run the cost
+        is one indexed ``db_meta`` lookup.
+
+        Returns the number of review rows cleared.
+        """
+        if self.get_meta(self._MIXED_SPECIES_GROUP_REPAIR_KEY) == "1":
+            return 0
+        # A single-species vote dict is ``{"Robin": 4}`` — one JSON member,
+        # no comma. Any row that could hold two species therefore contains a
+        # comma, so this probe both short-circuits on the first candidate
+        # (immediate on a catalog that has any) and lets a database with no
+        # legacy groups stamp its marker after one scan instead of decoding
+        # every ``individual`` blob in the table. A species name containing a
+        # comma would pass the probe and then be left alone by the fold
+        # below; the probe only has to avoid false negatives.
+        try:
+            candidate = self.conn.execute(
+                """SELECT 1 FROM prediction_review
+                   WHERE individual LIKE '%,%' LIMIT 1"""
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # Schema older than prediction_review (or a connection opened
+            # with initialize_schema=False before it exists). Leave the
+            # marker unset so a later boot retries.
+            return 0
+        if candidate is None:
+            self.set_meta(self._MIXED_SPECIES_GROUP_REPAIR_KEY, "1")
+            log.info(
+                "Skipped mixed-species prediction-group repair: "
+                "no multi-vote burst rows"
+            )
+            return 0
+
+        rows = self.conn.execute(
+            """SELECT pr.prediction_id, pr.workspace_id, pr.individual,
+                      d.photo_id
+               FROM prediction_review pr
+               JOIN predictions p ON p.id = pr.prediction_id
+               JOIN detections d ON d.id = p.detection_id
+               WHERE pr.individual LIKE '%,%'"""
+        ).fetchall()
+        targets = []
+        photo_ids = set()
+        for row in rows:
+            try:
+                votes = json.loads(row["individual"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(votes, dict) or len(votes) < 2:
+                continue
+            if len({species_match_key(name) for name in votes}) < 2:
+                continue
+            targets.append((row["prediction_id"], row["workspace_id"]))
+            photo_ids.add(row["photo_id"])
+
+        # One transaction for the whole repair, marker included. Partway
+        # through is the one state that must not be reachable: a stamped
+        # marker over a half-cleared table would strand the rest forever,
+        # and cleared rows without the marker would re-scan on every boot.
+        # The writes are chunked only to keep executemany's parameter list
+        # bounded — ~42k two-column updates on the live catalog is well
+        # inside what SQLite holds in a single transaction.
+        for chunk in _chunks(targets):
+            self.conn.executemany(
+                """UPDATE prediction_review
+                      SET group_id = NULL,
+                          individual = NULL,
+                          vote_count = NULL,
+                          total_votes = NULL
+                    WHERE prediction_id = ? AND workspace_id = ?""",
+                chunk,
+            )
+        self.set_meta(self._MIXED_SPECIES_GROUP_REPAIR_KEY, "1", _commit=False)
+        commit_with_retry(self.conn)
+        if targets:
+            log.info(
+                "Ungrouped %d legacy prediction review row(s) across %d "
+                "photo(s) whose burst votes spanned more than one species; "
+                "these now accept as their own species",
+                len(targets), len(photo_ids),
+            )
+        else:
+            log.info(
+                "Mixed-species prediction-group repair found nothing to "
+                "clear: every multi-vote burst folds to one species"
+            )
+        return len(targets)
 
     def ungroup_prediction(self, prediction_id, _commit=True):
         """Remove a prediction from its group in the active workspace.

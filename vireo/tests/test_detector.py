@@ -336,7 +336,7 @@ def test_detect_animals_runs_tiled_fallback_after_weak_full_pass(
         [[[320, 320, 100, 100, 0.90, 0.0, 0.0]]], dtype=np.float32,
     )
     empty = np.zeros((1, 0, 7), dtype=np.float32)
-    outputs = [weak, strong, *([empty] * 8)]
+    outputs = [weak, weak, strong, *([empty] * 8)]
     fake_session.run.side_effect = lambda *_args, **_kwargs: [outputs.pop(0)]
     monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
 
@@ -351,7 +351,8 @@ def test_detect_animals_runs_tiled_fallback_after_weak_full_pass(
     # _map_tile_detection rejects proposals clipped by an internal crop
     # boundary, so the edge-center crops are the only ones that catch a
     # second subject straddling two corner crops' shared seam.
-    assert fake_session.run.call_count == 10
+    # Preview full-frame + source-rendition full-frame + all nine tiles.
+    assert fake_session.run.call_count == 11
     assert detections[0]["confidence"] == pytest.approx(0.9)
     assert detections[0]["category"] == "animal"
     assert detections[0]["box"]["w"] < 0.2
@@ -389,7 +390,7 @@ def test_detect_animals_keeps_running_after_strong_early_tile(
         [[[320, 320, 50, 50, 0.90, 0.0, 0.0]]], dtype=np.float32,
     )
     empty = np.zeros((1, 0, 7), dtype=np.float32)
-    outputs = [weak, strong, *([empty] * 5), strong, empty, empty]
+    outputs = [weak, weak, strong, *([empty] * 5), strong, empty, empty]
     fake_session.run.side_effect = lambda *_args, **_kwargs: [outputs.pop(0)]
     monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
 
@@ -399,7 +400,7 @@ def test_detect_animals_keeps_running_after_strong_early_tile(
 
     detections = detector.detect_animals(str(img_path))
 
-    assert fake_session.run.call_count == 10
+    assert fake_session.run.call_count == 11
     strong_animals = [
         d for d in detections
         if d["category"] == "animal" and d["confidence"] >= 0.5
@@ -440,7 +441,7 @@ def test_tiled_fallback_retains_detections_between_raw_floor_and_trigger(
         [[[320, 320, 100, 100, 0.15, 0.0, 0.0]]], dtype=np.float32,
     )
     empty = np.zeros((1, 0, 7), dtype=np.float32)
-    outputs = [weak, mid, *([empty] * 8)]
+    outputs = [weak, weak, mid, *([empty] * 8)]
     fake_session.run.side_effect = lambda *_args, **_kwargs: [outputs.pop(0)]
     monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
 
@@ -453,10 +454,51 @@ def test_tiled_fallback_retains_detections_between_raw_floor_and_trigger(
     # Every crop plus the full-frame pass ran; the tiled fallback runs
     # every seam-safe window unconditionally so the middle-of-image edge
     # seams are always covered.
-    assert fake_session.run.call_count == 10
+    assert fake_session.run.call_count == 11
     animals = [d for d in detections if d["category"] == "animal"]
     mid_boxes = [d for d in animals if abs(d["confidence"] - 0.15) < 1e-4]
     assert mid_boxes, [d["confidence"] for d in animals]
+
+
+def test_weak_raw_reruns_full_frame_on_tiled_rendition(monkeypatch):
+    from unittest.mock import MagicMock
+
+    import detector
+    import image_loader
+    from PIL import Image
+
+    fake_session = MagicMock()
+    fake_session.get_inputs.return_value = [MagicMock(name="images")]
+    monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
+
+    preview = Image.new("RGB", (1000, 500), color="green")
+    source = Image.new("RGB", (1200, 1200), color="green")
+    loads = [preview, source]
+    monkeypatch.setattr(image_loader, "load_image", lambda *_args, **_kwargs: loads.pop(0))
+
+    calls = []
+    preview_detection = {
+        "box": {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1},
+        "confidence": 0.05,
+        "category": "animal",
+    }
+    source_detection = {
+        "box": {"x": 0.2, "y": 0.2, "w": 0.1, "h": 0.1},
+        "confidence": 0.06,
+        "category": "animal",
+    }
+
+    def fake_infer(_session, _input_name, image_array, _floor):
+        calls.append(image_array.shape[:2])
+        return [preview_detection] if len(calls) == 1 else [source_detection]
+
+    monkeypatch.setattr(detector, "_infer_array", fake_infer)
+    monkeypatch.setattr(detector, "_tiled_fallback", lambda *_args: [])
+
+    detections = detector.detect_animals("different-renditions.nef")
+
+    assert calls == [(500, 1000), (1200, 1200)]
+    assert detections == [source_detection]
 
 
 def test_detect_animals_skips_tiled_fallback_after_strong_full_pass(

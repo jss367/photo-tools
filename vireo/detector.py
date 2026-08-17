@@ -583,6 +583,14 @@ def detect_animals(image_path):
                 np.array(tiled_img.convert("RGB"))
                 if tiled_img is not None else img_array
             )
+            # RAW loaders may use an embedded preview for the 1280px pass but
+            # demosaic the sensor for the larger request. Those renditions can
+            # have different crops or aspect ratios, so their normalized boxes
+            # are not safely mergeable. Re-run the full frame from the exact
+            # array used for tiling and discard the preview-rendition boxes.
+            detections = _infer_array(
+                session, input_name, tiled_array, RAW_CONF_FLOOR,
+            )
             tiled = _tiled_fallback(session, input_name, tiled_array)
             if tiled:
                 detections = _merge_detections(detections, tiled)

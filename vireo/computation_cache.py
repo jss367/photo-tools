@@ -137,7 +137,7 @@ def megadetector_runtime_fingerprint(weights_path=None):
         "weights_sha256": sha256_file(weights_path),
         "input_recipe": "vireo-detector-source-v1",
         "preprocess": {
-            "version": 4,
+            "version": 5,
             "input_size": INPUT_SIZE,
             "resize": "Pillow.BILINEAR-letterbox",
             "padding": 114,

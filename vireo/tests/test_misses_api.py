@@ -477,6 +477,32 @@ def test_api_misses_preview_uses_classifier_rescue_override(tmp_path, monkeypatc
     assert row["miss_computed_at"] is None
 
 
+def test_api_misses_preview_ignores_non_animal_detection_confidence(
+    client, db_with_misses,
+):
+    _, db, ids = db_with_misses
+    db.save_detections(
+        ids["no_subject"],
+        [{
+            "box": {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.4},
+            "confidence": 0.95,
+            "category": "person",
+        }],
+        detector_model="megadetector-v6",
+    )
+
+    r = client.post(
+        "/api/misses/preview",
+        data=json.dumps({"detector_confidence": 0.2}),
+        content_type="application/json",
+    )
+
+    assert r.status_code == 200
+    assert ids["no_subject"] in {
+        photo["id"] for photo in r.get_json()["no_subject"]
+    }
+
+
 def test_api_misses_recompute_reports_unsaved_detector_floor(
     client, db_with_misses,
 ):

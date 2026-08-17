@@ -238,6 +238,12 @@ def test_tiled_windows_cover_center_and_edges_without_duplicates():
     assert windows[0] == (200, 0, 800, 300)
     assert (0, 0, 600, 300) in windows
     assert (400, 200, 1000, 500) in windows
+    assert set(windows[2:detector.TILED_COVERAGE_CROP_COUNT]) == {
+        (0, 0, 600, 300),
+        (400, 0, 1000, 300),
+        (0, 200, 600, 500),
+        (400, 200, 1000, 500),
+    }
     assert len(set(windows)) == len(windows)
 
 
@@ -263,6 +269,47 @@ def test_map_tile_detection_rejects_internal_seams_and_maps_interior_box():
     assert mapped["box"]["y"] == pytest.approx(0.12)
     assert mapped["box"]["w"] == pytest.approx(0.30)
     assert mapped["box"]["h"] == pytest.approx(0.24)
+
+
+def test_merge_detections_does_not_truncate_full_frame_subjects():
+    import detector
+
+    full_frame = [
+        {
+            "box": {"x": i / 100, "y": 0.1, "w": 0.005, "h": 0.01},
+            "confidence": 0.01 + i / 1000,
+            "category": "animal",
+        }
+        for i in range(21)
+    ]
+    tiled = [{
+        "box": {"x": 0.8, "y": 0.8, "w": 0.1, "h": 0.1},
+        "confidence": 0.9,
+        "category": "animal",
+    }]
+
+    merged = detector._merge_detections(full_frame, tiled)
+
+    assert len(merged) == 22
+    assert all(detection in merged for detection in full_frame)
+    assert tiled[0] in merged
+
+
+def test_merge_detections_upgrades_overlapping_full_frame_subject():
+    import detector
+
+    weak = {
+        "box": {"x": 0.2, "y": 0.2, "w": 0.1, "h": 0.1},
+        "confidence": 0.05,
+        "category": "animal",
+    }
+    strong = {
+        "box": {"x": 0.2, "y": 0.2, "w": 0.1, "h": 0.1},
+        "confidence": 0.9,
+        "category": "animal",
+    }
+
+    assert detector._merge_detections([weak], [strong]) == [strong]
 
 
 def test_detect_animals_runs_tiled_fallback_after_weak_full_pass(
@@ -291,7 +338,8 @@ def test_detect_animals_runs_tiled_fallback_after_weak_full_pass(
 
     detections = detector.detect_animals(str(img_path))
 
-    assert fake_session.run.call_count == 2
+    # One full-frame pass plus enough tiles to cover every part of the photo.
+    assert fake_session.run.call_count == 7
     assert detections[0]["confidence"] == pytest.approx(0.9)
     assert detections[0]["category"] == "animal"
     assert detections[0]["box"]["w"] < 0.2

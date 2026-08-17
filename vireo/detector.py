@@ -41,11 +41,12 @@ RAW_CONF_FLOOR = 0.01
 TILED_FALLBACK_TRIGGER_CONFIDENCE = 0.20
 TILED_FALLBACK_MIN_CONFIDENCE = 0.20
 TILED_EARLY_STOP_CONFIDENCE = 0.30
+TILED_COVERAGE_CROP_COUNT = 6
 TILED_CROP_FRACTION = 0.60
 TILED_SOURCE_MAX_SIZE = 2560
 TILED_EDGE_MARGIN = 0.01
 TILED_NMS_IOU = 0.45
-TILED_MAX_DETECTIONS = 20
+TILED_MAX_ADDITIONS = 20
 
 
 def ensure_megadetector_weights(progress_callback=None):
@@ -345,11 +346,11 @@ def _tile_windows(width, height):
         (center_x, center_y),
         (0, 0),
         (xs[-1], 0),
+        (0, ys[-1]),
+        (xs[-1], ys[-1]),
         (0, center_y),
         (xs[-1], center_y),
-        (0, ys[-1]),
         (center_x, ys[-1]),
-        (xs[-1], ys[-1]),
     ]
     seen = set()
     for x, y in windows:
@@ -400,15 +401,47 @@ def _map_tile_detection(detection, window, full_width, full_height):
     }
 
 
-def _merge_detections(detections):
-    """Class-aware NMS for combined full-frame and tiled detections."""
+def _box_iou(first, second):
+    """Return intersection-over-union for two normalized detection boxes."""
+    first_box = first["box"]
+    second_box = second["box"]
+    first_right = first_box["x"] + first_box["w"]
+    first_bottom = first_box["y"] + first_box["h"]
+    second_right = second_box["x"] + second_box["w"]
+    second_bottom = second_box["y"] + second_box["h"]
+    intersection_w = max(
+        0.0,
+        min(first_right, second_right) - max(first_box["x"], second_box["x"]),
+    )
+    intersection_h = max(
+        0.0,
+        min(first_bottom, second_bottom) - max(first_box["y"], second_box["y"]),
+    )
+    intersection = intersection_w * intersection_h
+    union = (
+        first_box["w"] * first_box["h"]
+        + second_box["w"] * second_box["h"]
+        - intersection
+    )
+    return intersection / union if union > 0 else 0.0
+
+
+def _merge_detections(full_frame, tiled):
+    """Merge tiled detections without dropping full-frame subjects.
+
+    Tiled NMS removes duplicate crop proposals.  A stronger tiled box may
+    replace an overlapping full-frame box for the same subject, while novel
+    tiled subjects are capped independently.  The cap must never truncate
+    unrelated full-frame detections because those raw boxes are reused by
+    workspaces with lower read-time confidence thresholds.
+    """
     from onnx_runtime import nms
 
-    merged = []
-    categories = sorted({d.get("category", "animal") for d in detections})
+    tiled_after_nms = []
+    categories = sorted({d.get("category", "animal") for d in tiled})
     for category in categories:
         candidates = [
-            d for d in detections
+            d for d in tiled
             if d.get("category", "animal") == category
         ]
         boxes = np.asarray([
@@ -423,12 +456,38 @@ def _merge_detections(detections):
         scores = np.asarray(
             [d["confidence"] for d in candidates], dtype=np.float32,
         )
-        merged.extend(
+        tiled_after_nms.extend(
             candidates[index]
             for index in nms(boxes, scores, iou_threshold=TILED_NMS_IOU)
         )
+    tiled_after_nms.sort(
+        key=lambda d: float(d["confidence"]), reverse=True,
+    )
+
+    merged = list(full_frame)
+    additions = 0
+    for candidate in tiled_after_nms:
+        overlaps = [
+            index
+            for index, existing in enumerate(merged)
+            if existing.get("category", "animal")
+            == candidate.get("category", "animal")
+            and _box_iou(existing, candidate) >= TILED_NMS_IOU
+        ]
+        if overlaps:
+            closest = max(
+                overlaps,
+                key=lambda index: _box_iou(merged[index], candidate),
+            )
+            if candidate["confidence"] > merged[closest]["confidence"]:
+                merged[closest] = candidate
+            continue
+        if additions < TILED_MAX_ADDITIONS:
+            merged.append(candidate)
+            additions += 1
+
     merged.sort(key=lambda d: float(d["confidence"]), reverse=True)
-    return merged[:TILED_MAX_DETECTIONS]
+    return merged
 
 
 def _infer_array(session, input_name, image_array, confidence_threshold):
@@ -445,7 +504,7 @@ def _tiled_fallback(session, input_name, image_array):
     """Run overlapping high-effective-resolution crops for a weak full pass."""
     height, width = image_array.shape[:2]
     tiled = []
-    for window in _tile_windows(width, height):
+    for crop_index, window in enumerate(_tile_windows(width, height), start=1):
         left, top, right, bottom = window
         crop = image_array[top:bottom, left:right]
         detections = _infer_array(
@@ -457,7 +516,7 @@ def _tiled_fallback(session, input_name, image_array):
             )
             if mapped is not None:
                 tiled.append(mapped)
-        if any(
+        if crop_index >= TILED_COVERAGE_CROP_COUNT and any(
             d.get("category", "animal") == "animal"
             and d["confidence"] >= TILED_EARLY_STOP_CONFIDENCE
             for d in tiled
@@ -526,7 +585,7 @@ def detect_animals(image_path):
             )
             tiled = _tiled_fallback(session, input_name, tiled_array)
             if tiled:
-                detections = _merge_detections([*detections, *tiled])
+                detections = _merge_detections(detections, tiled)
         return detections
     except ResourceWaitCancelled:
         raise

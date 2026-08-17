@@ -166,6 +166,79 @@ def test_collect_workload_builds_deltas_targets_and_job_summary():
     assert summary["jobs"][0]["observed_resource_wait_seconds"] == 2.5
 
 
+def test_job_summary_tracks_history_only_jobs_and_ignores_baseline_history():
+    """A short job (e.g. a cached embedding request) may start and finish
+    between two polling intervals, appearing only in `history`.  Such jobs
+    must be tracked so the scenario reflects the full workload, but jobs
+    already terminal at baseline predate the monitoring window and must
+    not appear in the per-job outcomes.
+    """
+    clock = _FakeClock()
+    pre_existing = {
+        "id": "pre-existing",
+        "type": "pipeline",
+        "status": "completed",
+        "source": "history",
+        "workspace_id": 1,
+        "started_at": "2026-08-17T11:00:00+00:00",
+        "finished_at": "2026-08-17T11:00:10+00:00",
+        "duration": 10.0,
+    }
+    short_lived = {
+        "id": "short-lived",
+        "type": "embedding_prep",
+        "status": "completed",
+        "source": "history",
+        "workspace_id": 1,
+        "started_at": "2026-08-17T12:00:00.500+00:00",
+        "finished_at": "2026-08-17T12:00:00.800+00:00",
+        "duration": 0.3,
+    }
+    empty_metrics = {"embedding_cache": {}}
+    baseline_payload = {
+        "status": 200,
+        "latency_seconds": 0.001,
+        "resource_budget": {"waiters": 0},
+        "workload_metrics": empty_metrics,
+        "jobs": [pre_existing],
+    }
+    poll_payload = {
+        "status": 200,
+        "latency_seconds": 0.002,
+        "resource_budget": {"waiters": 0},
+        "workload_metrics": empty_metrics,
+        "jobs": [pre_existing, short_lived],
+    }
+    api = _SequenceApi([baseline_payload, poll_payload])
+    process = _SequenceSampler(
+        [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True}],
+        {"pid": 123, "executable_exists": True},
+    )
+    system = _SequenceSampler(
+        [{"cpu_idle_percent": 50.0}],
+        {"logical_cpu_count": 16},
+    )
+
+    report = collect_workload(
+        duration=1.0,
+        interval=1.0,
+        api_client=api,
+        process_sampler=process,
+        system_sampler=system,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    job_ids = [job["id"] for job in report["summary"]["jobs"]]
+    assert job_ids == ["short-lived"]
+    scenario = report["summary"]["scenario"]
+    assert scenario["observed_job_count"] == 1
+    assert scenario["terminal_job_count"] == 1
+    assert scenario["all_observed_jobs_terminal"] is True
+    # Makespan is derived from the short-lived job's own timestamps.
+    assert scenario["workload_makespan_seconds"] == 0.3
+
+
 def test_latency_target_fails_when_api_samples_fail():
     """A run with one fast success and one long timeout used to report
     ``jobs_api_p95_below_500ms: true`` because failed requests were excluded
@@ -250,6 +323,36 @@ def test_compact_jobs_payload_removes_paths_configs_results_and_filenames():
         "total": 10,
         "phase": "Detecting",
     }
+
+
+def test_compact_jobs_payload_omits_user_derived_step_labels():
+    """For local-folder/sync/discard jobs, `step.label` is built from
+    `root_names[root_id]` (e.g. "Copy <folder> locally").  Copying it
+    verbatim would leak user folder names into every sanitized sample.
+    """
+    compact = compact_jobs_payload({
+        "active": [{
+            "id": "local-folder-1",
+            "type": "local_folder_copy",
+            "status": "running",
+            "steps": [{
+                "id": "copy",
+                "label": "Copy My Vacation 2024 locally",
+                "status": "running",
+                "progress": {"current": 3, "total": 10},
+            }],
+        }],
+        "history": [],
+        "resource_budget": {"waiters": 0},
+    })
+
+    step = compact["jobs"][0]["running_steps"][0]
+    assert step == {
+        "id": "copy",
+        "status": "running",
+        "progress": {"current": 3, "total": 10},
+    }
+    assert "My Vacation 2024" not in json.dumps(compact)
 
 
 def test_compact_jobs_payload_sanitizes_unicode_spaced_and_windows_paths_from_phase():

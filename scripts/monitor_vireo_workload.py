@@ -148,9 +148,13 @@ def _compact_job(job, source):
     for step in job.get("steps") or job.get("tree") or []:
         if step.get("status") != "running":
             continue
+        # Deliberately omit `label`: for local-folder, sync, and discard
+        # jobs the label is built from `root_names[root_id]` (e.g.
+        # "Copy <folder> locally"), so copying it verbatim would leak
+        # user folder names into every sample.  The `id` is enough for
+        # correlating steps across polls.
         running_steps.append({
             "id": step.get("id"),
-            "label": step.get("label"),
             "status": step.get("status"),
             "progress": _compact_progress(step.get("progress")),
         })
@@ -385,11 +389,23 @@ def _resource_delta(first, last):
 
 
 def _job_summary(observations):
+    # The first observation is the baseline: any job that appears there
+    # as `history` completed before monitoring began and is not part of
+    # the workload.  Everything else — including jobs that start and
+    # finish between two polling intervals and therefore appear only in
+    # `history` — must be tracked so per-job outcomes and the scenario
+    # makespan reflect the full workload, not just the active-view slice.
+    baseline_history_ids = set()
+    if observations:
+        _elapsed0, baseline_sample = observations[0]
+        for job in baseline_sample.get("jobs", []):
+            if job.get("source") == "history" and job.get("id"):
+                baseline_history_ids.add(job["id"])
     tracked_ids = {
         job.get("id")
         for _elapsed, api_sample in observations
         for job in api_sample.get("jobs", [])
-        if job.get("source") == "active" and job.get("id")
+        if job.get("id") and job["id"] not in baseline_history_ids
     }
     jobs = {}
     for elapsed, api_sample in observations:

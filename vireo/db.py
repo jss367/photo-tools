@@ -9129,15 +9129,20 @@ class Database:
             photo_ids, rating, verify_workspace=verify_workspace
         )
 
-    def update_photo_flag(self, photo_id, flag, verify_workspace=True):
+    def update_photo_flag(self, photo_id, flag, verify_workspace=True, _commit=True):
         """Set photo flag ('none', 'flagged', 'rejected').
 
         Args:
             verify_workspace: when True (the default), raises ValueError if
                 the photo is not in the active workspace's folders.
+            _commit: If False, skip the internal commit (caller is responsible
+                     for committing the transaction). Callers that hold
+                     ``BEGIN IMMEDIATE`` — the prediction decision lock, for
+                     example — must pass False so the writer lock is not
+                     released mid-decision.
         """
         self._photo_review_repository().set_flag(
-            photo_id, flag, verify_workspace=verify_workspace
+            photo_id, flag, verify_workspace=verify_workspace, _commit=_commit
         )
 
     def update_photo_wildlife_excluded(self, photo_id, excluded, verify_workspace=True):

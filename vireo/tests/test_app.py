@@ -17751,6 +17751,121 @@ def test_selection_prediction_suggestions_uses_burst_consensus_species(app_and_d
         assert "Sparrow" not in names
 
 
+def test_selection_prediction_suggestions_ignores_minority_frame_confidence(
+    app_and_db,
+):
+    """Confidence in the panel must come from the consensus species itself.
+
+    A burst frame's ``confidence`` is the classifier's score for that
+    frame's own per-label vote — a Sparrow-labelled frame at 95% inside a
+    Robin-majority burst is 95% *for Sparrow*, not for Robin. Pooling it
+    into the Robin bucket would rank Robin above genuine higher-confidence
+    Robin results (and, when combined with the earlier threshold filter,
+    keep Robin actionable on the strength of a vote for a different
+    species). The aggregate must credit only rows whose raw label agrees
+    with the consensus.
+    """
+    import json as _json
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_burst_photo(name, species, confidence):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        # Same burst, same vote count blob — Robin wins the consensus (2)
+        # over Sparrow (1) even on the Sparrow-labelled frame.
+        db.add_prediction(
+            det_id, species, confidence, "bioclip",
+            group_id="burst-mixed-conf",
+            individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
+        )
+        return photo_id
+
+    robin_a = _seed_burst_photo("burst-robin-a.jpg", "Robin", 0.40)
+    robin_b = _seed_burst_photo("burst-robin-b.jpg", "Robin", 0.45)
+    sparrow_frame = _seed_burst_photo("burst-sparrow.jpg", "Sparrow", 0.95)
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [robin_a, robin_b, sparrow_frame]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    predictions = resp.get_json()["predictions"]
+    assert {p["species"] for p in predictions} == {"Robin"}
+    robin = predictions[0]
+    # All three photos still aggregate under the consensus, and all three
+    # remain acceptable — the fix touches confidence attribution, not row
+    # membership.
+    assert robin["predicted_count"] == 3
+    assert robin["acceptable_photo_count"] == 3
+    # Confidence is derived from the two Robin-labelled frames only; the
+    # Sparrow frame's 0.95 must not surface as Robin's aggregate max.
+    assert robin["min_confidence"] == 0.40
+    assert robin["max_confidence"] == 0.45
+
+
+def test_selection_prediction_suggestions_confidence_unknown_without_consensus_rows(
+    app_and_db,
+):
+    """When only minority-frame rows survive, confidence is reported as unknown.
+
+    The selection may hold just the Sparrow-labelled frame of a Robin-
+    majority burst. The row still routes to Robin (that is what the
+    Accept would apply), but there is no evidence for Robin in the
+    selection itself — no Robin-labelled row contributes a confidence.
+    Rather than inventing a 0% or letting Sparrow's score stand in as
+    Robin's, the endpoint returns ``null`` and the panel renders it as
+    "confidence unknown". A silent 0.95 in Robin's bucket is exactly the
+    misattribution ``CORE_PHILOSOPHY.md`` forbids.
+    """
+    import json as _json
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="burst-sparrow-only.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    db.add_prediction(
+        det_id, "Sparrow", 0.95, "bioclip",
+        group_id="burst-consensus-only-minority",
+        individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
+    )
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    predictions = resp.get_json()["predictions"]
+    assert {p["species"] for p in predictions} == {"Robin"}
+    robin = predictions[0]
+    assert robin["predicted_count"] == 1
+    # No Robin-labelled row contributed a confidence, so the aggregate is
+    # explicitly unknown — not 0.0 (which would falsely imply "we measured
+    # zero"), and not 0.95 (which would misattribute Sparrow's evidence).
+    assert robin["min_confidence"] is None
+    assert robin["max_confidence"] is None
+
+
 def test_predictions_api_exposes_consensus_species_for_burst(app_and_db):
     """/api/predictions surfaces the accept-time species as consensus_species.
 

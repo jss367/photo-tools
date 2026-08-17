@@ -10424,7 +10424,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "confidences": [],
             })
             entry["models"].add(row["model"])
-            entry["confidences"].append(row["confidence"] or 0.0)
+            # ``row["confidence"]`` is the classifier's confidence in the
+            # row's own per-frame label. For a burst whose consensus differs
+            # from that label — a Sparrow-labelled frame in a Robin-majority
+            # burst — the raw score reflects Sparrow evidence, not Robin,
+            # and pooling it under Robin would rank the bucket at Sparrow's
+            # 95% and let the earlier threshold filter keep Robin actionable
+            # on the strength of a vote for someone else. Only credit
+            # confidence when the raw label agrees with the consensus.
+            raw_species = row["species"]
+            row_matches_consensus = bool(
+                raw_species
+                and (keyword_match_key(raw_species) or raw_species.casefold())
+                == key
+            )
+            if row_matches_consensus:
+                entry["confidences"].append(row["confidence"] or 0.0)
             ambiguous = row["id"] in ambiguous_row_ids
             # One photo can hold several detections of the same species, or
             # the same detection classified by several models. Keep every
@@ -10441,12 +10456,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             photo_entry["ids"].append((row["confidence"] or 0, row["id"]))
             if ambiguous:
                 photo_entry["ambiguous"] = True
-            conf = row["confidence"] or 0
-            if (
-                photo_entry["max_confidence"] is None
-                or conf > photo_entry["max_confidence"]
-            ):
-                photo_entry["max_confidence"] = conf
+            if row_matches_consensus:
+                conf = row["confidence"] or 0
+                if (
+                    photo_entry["max_confidence"] is None
+                    or conf > photo_entry["max_confidence"]
+                ):
+                    photo_entry["max_confidence"] = conf
 
         # Resolve "already carries this species" against linked taxa, not
         # spelling, so a hierarchical Birds|Verdin tag counts as keyworded.
@@ -10520,8 +10536,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "acceptable_photo_count": acceptable_photo_count,
                 "ambiguous_prediction_ids": ambiguous_ids,
                 "ambiguous_photo_ids": ambiguous_photos,
-                "min_confidence": min(entry["confidences"]),
-                "max_confidence": max(entry["confidences"]),
+                # ``confidences`` can be empty when every credit-eligible row
+                # was a minority frame whose raw label disagreed with the
+                # consensus (see above). ``None`` renders as
+                # ``formatPredictionConfidence(null)`` → "confidence unknown"
+                # rather than inventing a 0% or misattributing a minority
+                # frame's score to the consensus species.
+                "min_confidence": (
+                    min(entry["confidences"]) if entry["confidences"] else None
+                ),
+                "max_confidence": (
+                    max(entry["confidences"]) if entry["confidences"] else None
+                ),
             })
         # Breadth first, then strength: the panel collapses to the top few, so
         # a species predicted on every selected photo at 100% must outrank one
@@ -18292,111 +18318,123 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if not db._photo_in_workspace(pid):
                 return json_error(f"Photo {pid} is not in the active workspace", 403)
 
-        # Drop photos whose prediction was decided since the modal rendered,
-        # before anything is written for them. Doing it here rather than only
-        # in the locked tail is what keeps the outcome internally consistent:
-        # the flag and keyword writes below are not under the lock, so filtering
-        # only at the status write would still tag a photo whose prediction we
-        # then refuse to mark accepted — the keyword-on-a-rejected-row state
-        # this precondition exists to prevent, arrived at from the other side.
-        # The tail re-checks under the lock for the window this read leaves open.
-        stale_photos = _stale_group_apply_photos(db, observed)
-        if stale_photos:
-            picks = [pid for pid in picks if pid not in stale_photos]
-            rejects = [pid for pid in rejects if pid not in stale_photos]
-
-        # Capture old flag values before mutation
-        all_flag_pids = picks + rejects
-        old_flags = {}
-        for pid in all_flag_pids:
-            old = db.get_photo(pid)
-            if old:
-                old_flags[pid] = old["flag"] or "none"
-
-        # Flag picks and add species keyword
-        try:
-            if species:
-                kid = db.add_keyword(species, is_species=True)
-                # Queue/record the stored spelling (see api_add_keyword).
-                stored = db.conn.execute(
-                    "SELECT name FROM keywords WHERE id = ?", (kid,)
-                ).fetchone()
-                if stored and stored["name"]:
-                    species = stored["name"]
-                already_has_species = db.get_photos_with_equivalent_species(
-                    picks, kid
-                )
-                added_picks = []
-                for pid in picks:
-                    db.update_photo_flag(pid, "flagged")
-                    if pid in already_has_species:
-                        continue
-                    db.tag_photo(pid, kid, source="manual")
-                    db.queue_change(pid, "keyword_add", species)
-                    added_picks.append(pid)
-
-                # Record keyword_add history for picks
-                kw_items = [
-                    {'photo_id': pid, 'old_value': '', 'new_value': str(kid)}
-                    for pid in added_picks
-                ]
-                if kw_items:
-                    db.record_edit('keyword_add',
-                                   f'Added "{species}" to {len(added_picks)} photos (group prediction)',
-                                   str(kid), kw_items, is_batch=len(added_picks) > 1)
-            else:
-                # No species — still flag picks
-                for pid in picks:
-                    db.update_photo_flag(pid, "flagged")
-
-            # Reject rejects
-            for pid in rejects:
-                db.update_photo_flag(pid, "rejected")
-        except ValueError as e:
-            return json_error(str(e), 403)
-
-        # Record flag history for all picks + rejects
-        flag_items = []
-        for pid in picks:
-            if pid in old_flags:
-                flag_items.append({'photo_id': pid, 'old_value': old_flags[pid], 'new_value': 'flagged'})
-        for pid in rejects:
-            if pid in old_flags:
-                flag_items.append({'photo_id': pid, 'old_value': old_flags[pid], 'new_value': 'rejected'})
-        if flag_items:
-            for item in flag_items:
-                db.queue_flag_change_if_enabled(
-                    item["photo_id"], item["new_value"], _commit=False
-                )
-            db.conn.commit()
-            desc = f'Group prediction: flagged {len(picks)}, rejected {len(rejects)}'
-            db.record_edit('flag', desc, 'group_apply', flag_items, is_batch=True)
-
-        # The prediction decisions themselves, under the lock every decision
-        # route takes. Only this tail is wrapped: the flag and keyword writes
-        # above commit on their own and are not review state, so opening the
-        # transaction earlier would hold the database's single writer lock
-        # across work that is not a decision.
+        # Everything below — the stale filter, the keyword/flag writes, and
+        # the prediction status writes — runs under the single decision lock
+        # in one transaction. An earlier version filtered stale photos and
+        # committed the flag/keyword writes *before* taking the lock and then
+        # re-checked staleness inside it; a decision that landed in that
+        # window would leave the photo flagged and keyworded while the
+        # in-lock recheck refused to update its prediction status, so the
+        # keyword-on-a-rejected-row split this precondition exists to
+        # prevent came back as a narrower race. The fix is to hold the write
+        # lock across the read that governs the writes.
         def _apply_group_decisions():
-            # The same baseline check again, now that the writer lock is held.
-            # The pre-lock pass above kept the flag/keyword writes consistent;
-            # this one is what makes the decision write itself atomic, closing
-            # the read-then-write window that a serialized-but-unconditional
-            # update would leave wide open: a decision committed while this
-            # request was assembling would otherwise be overwritten cleanly
-            # rather than not at all.
-            late = _stale_group_apply_photos(db, observed)
+            # Stale filter under the lock: a decision that committed since
+            # the modal rendered wins over this apply, so those photos are
+            # dropped before any of *this* apply's writes land. Doing the
+            # check inside ``BEGIN IMMEDIATE`` closes the check-then-write
+            # window — nothing can decide between this read and the writes
+            # below, so a photo we skip here cannot silently be flagged or
+            # keyworded on the other side of the transaction.
+            stale_photos = _stale_group_apply_photos(db, observed)
+            actionable_picks = [pid for pid in picks if pid not in stale_photos]
+            actionable_rejects = [
+                pid for pid in rejects if pid not in stale_photos
+            ]
+
+            # Capture old flag values before mutation
+            all_flag_pids = actionable_picks + actionable_rejects
+            old_flags = {}
+            for pid in all_flag_pids:
+                old = db.get_photo(pid)
+                if old:
+                    old_flags[pid] = old["flag"] or "none"
+
+            local_species = species
+            # Flag picks and add species keyword — every write uses
+            # ``_commit=False`` because the enclosing ``BEGIN IMMEDIATE`` owns
+            # the transaction and an intermediate commit would release the
+            # writer lock mid-decision.
+            try:
+                if local_species:
+                    kid = db.add_keyword(
+                        local_species, is_species=True, _commit=False,
+                    )
+                    # Queue/record the stored spelling (see api_add_keyword).
+                    stored = db.conn.execute(
+                        "SELECT name FROM keywords WHERE id = ?", (kid,)
+                    ).fetchone()
+                    if stored and stored["name"]:
+                        local_species = stored["name"]
+                    already_has_species = db.get_photos_with_equivalent_species(
+                        actionable_picks, kid
+                    )
+                    added_picks = []
+                    for pid in actionable_picks:
+                        db.update_photo_flag(pid, "flagged", _commit=False)
+                        if pid in already_has_species:
+                            continue
+                        db.tag_photo(pid, kid, source="manual", _commit=False)
+                        db.queue_change(
+                            pid, "keyword_add", local_species, _commit=False,
+                        )
+                        added_picks.append(pid)
+
+                    # Record keyword_add history for picks
+                    kw_items = [
+                        {'photo_id': pid, 'old_value': '', 'new_value': str(kid)}
+                        for pid in added_picks
+                    ]
+                    if kw_items:
+                        db.record_edit(
+                            'keyword_add',
+                            f'Added "{local_species}" to {len(added_picks)} photos (group prediction)',
+                            str(kid), kw_items,
+                            is_batch=len(added_picks) > 1,
+                            _commit=False,
+                        )
+                else:
+                    # No species — still flag picks
+                    for pid in actionable_picks:
+                        db.update_photo_flag(pid, "flagged", _commit=False)
+
+                # Reject rejects
+                for pid in actionable_rejects:
+                    db.update_photo_flag(pid, "rejected", _commit=False)
+            except ValueError as e:
+                # ``_under_prediction_decision_lock``'s finally will roll back
+                # the still-open transaction; returning here just short-circuits
+                # the rest of the writes.
+                return json_error(str(e), 403)
+
+            # Record flag history for all picks + rejects
+            flag_items = []
+            for pid in actionable_picks:
+                if pid in old_flags:
+                    flag_items.append({'photo_id': pid, 'old_value': old_flags[pid], 'new_value': 'flagged'})
+            for pid in actionable_rejects:
+                if pid in old_flags:
+                    flag_items.append({'photo_id': pid, 'old_value': old_flags[pid], 'new_value': 'rejected'})
+            if flag_items:
+                for item in flag_items:
+                    db.queue_flag_change_if_enabled(
+                        item["photo_id"], item["new_value"], _commit=False
+                    )
+                desc = (
+                    f'Group prediction: flagged {len(actionable_picks)}, '
+                    f'rejected {len(actionable_rejects)}'
+                )
+                db.record_edit(
+                    'flag', desc, 'group_apply', flag_items,
+                    is_batch=True, _commit=False,
+                )
 
             # Mark all predictions in this group as accepted/rejected
-            for pid in picks:
-                if pid in late:
-                    continue
+            for pid in actionable_picks:
                 db.update_predictions_status_by_photo(
                     pid, 'accepted', _commit=False,
                 )
-            for pid in rejects:
-                if pid in late:
-                    continue
+            for pid in actionable_rejects:
                 db.update_predictions_status_by_photo(
                     pid, 'rejected', _commit=False,
                 )
@@ -18407,13 +18445,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             for pred_id in removed:
                 db.ungroup_prediction(pred_id, _commit=False)
             db.conn.commit()
-            skipped = stale_photos | {
-                pid for pid in picks + rejects if pid in late
-            }
+            # ``record_edit`` skips its prune under ``_commit=False``; run it
+            # once the decision is durable so history stays bounded — same
+            # shape the batch endpoints use.
+            db._prune_edit_history()
             # Counted in photos, which is the unit the modal works in and the
             # unit the toast names. Reported even when zero so the client can
             # tell "nothing was stale" from an older server that never checked.
-            return jsonify({"ok": True, "already_decided": len(skipped)})
+            return jsonify({"ok": True, "already_decided": len(stale_photos)})
 
         return _under_prediction_decision_lock(db, _apply_group_decisions)
 

@@ -177,23 +177,32 @@ body {
 .crop-box::after {
   content: "";
   position: absolute;
+  inset: 0;
   pointer-events: none;
 }
 .crop-box::before {
-  left: 33.333%;
-  top: 0;
-  bottom: 0;
-  width: 33.333%;
-  border-left: 1px solid rgba(255,255,255,0.45);
-  border-right: 1px solid rgba(255,255,255,0.45);
+  background: linear-gradient(to right,
+    transparent 0,
+    transparent calc(33.333333% - 0.5px),
+    rgba(255,255,255,0.45) calc(33.333333% - 0.5px),
+    rgba(255,255,255,0.45) calc(33.333333% + 0.5px),
+    transparent calc(33.333333% + 0.5px),
+    transparent calc(66.666667% - 0.5px),
+    rgba(255,255,255,0.45) calc(66.666667% - 0.5px),
+    rgba(255,255,255,0.45) calc(66.666667% + 0.5px),
+    transparent calc(66.666667% + 0.5px));
 }
 .crop-box::after {
-  top: 33.333%;
-  left: 0;
-  right: 0;
-  height: 33.333%;
-  border-top: 1px solid rgba(255,255,255,0.45);
-  border-bottom: 1px solid rgba(255,255,255,0.45);
+  background: linear-gradient(to bottom,
+    transparent 0,
+    transparent calc(33.333333% - 0.5px),
+    rgba(255,255,255,0.45) calc(33.333333% - 0.5px),
+    rgba(255,255,255,0.45) calc(33.333333% + 0.5px),
+    transparent calc(33.333333% + 0.5px),
+    transparent calc(66.666667% - 0.5px),
+    rgba(255,255,255,0.45) calc(66.666667% - 0.5px),
+    rgba(255,255,255,0.45) calc(66.666667% + 0.5px),
+    transparent calc(66.666667% + 0.5px));
 }
 .crop-handle {
   position: absolute;

@@ -229,6 +229,99 @@ def test_postprocess_transposed_format():
     assert result[0]["category"] == "animal"
 
 
+def test_tiled_windows_cover_center_and_edges_without_duplicates():
+    import detector
+
+    windows = list(detector._tile_windows(1000, 500))
+
+    assert len(windows) == 9
+    assert windows[0] == (200, 0, 800, 300)
+    assert (0, 0, 600, 300) in windows
+    assert (400, 200, 1000, 500) in windows
+    assert len(set(windows)) == len(windows)
+
+
+def test_map_tile_detection_rejects_internal_seams_and_maps_interior_box():
+    import detector
+
+    window = (200, 0, 800, 300)
+    seam_box = {
+        "box": {"x": 0.0, "y": 0.2, "w": 0.3, "h": 0.4},
+        "confidence": 0.9,
+        "category": "animal",
+    }
+    assert detector._map_tile_detection(seam_box, window, 1000, 500) is None
+
+    interior = {
+        "box": {"x": 0.25, "y": 0.2, "w": 0.5, "h": 0.4},
+        "confidence": 0.8,
+        "category": "animal",
+    }
+    mapped = detector._map_tile_detection(interior, window, 1000, 500)
+    assert mapped is not None
+    assert mapped["box"]["x"] == pytest.approx(0.35)
+    assert mapped["box"]["y"] == pytest.approx(0.12)
+    assert mapped["box"]["w"] == pytest.approx(0.30)
+    assert mapped["box"]["h"] == pytest.approx(0.24)
+
+
+def test_detect_animals_runs_tiled_fallback_after_weak_full_pass(
+    monkeypatch, tmp_path,
+):
+    from unittest.mock import MagicMock
+
+    import detector
+
+    fake_session = MagicMock()
+    fake_session.get_inputs.return_value = [MagicMock(name="images")]
+    weak = np.array(
+        [[[320, 320, 100, 100, 0.05, 0.0, 0.0]]], dtype=np.float32,
+    )
+    strong = np.array(
+        [[[320, 320, 100, 100, 0.90, 0.0, 0.0]]], dtype=np.float32,
+    )
+    empty = np.zeros((1, 0, 7), dtype=np.float32)
+    outputs = [weak, strong, *([empty] * 8)]
+    fake_session.run.side_effect = lambda *_args, **_kwargs: [outputs.pop(0)]
+    monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
+
+    img_path = tmp_path / "small-bird.jpg"
+    from PIL import Image
+    Image.new("RGB", (1000, 500), color="green").save(img_path)
+
+    detections = detector.detect_animals(str(img_path))
+
+    assert fake_session.run.call_count == 2
+    assert detections[0]["confidence"] == pytest.approx(0.9)
+    assert detections[0]["category"] == "animal"
+    assert detections[0]["box"]["w"] < 0.2
+
+
+def test_detect_animals_skips_tiled_fallback_after_strong_full_pass(
+    monkeypatch, tmp_path,
+):
+    from unittest.mock import MagicMock
+
+    import detector
+
+    fake_session = MagicMock()
+    fake_session.get_inputs.return_value = [MagicMock(name="images")]
+    strong = np.array(
+        [[[320, 320, 100, 100, 0.90, 0.0, 0.0]]], dtype=np.float32,
+    )
+    fake_session.run.return_value = [strong]
+    monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
+
+    img_path = tmp_path / "large-bird.jpg"
+    from PIL import Image
+    Image.new("RGB", (1000, 500), color="green").save(img_path)
+
+    detections = detector.detect_animals(str(img_path))
+
+    assert fake_session.run.call_count == 1
+    assert detections[0]["confidence"] == pytest.approx(0.9)
+
+
 def test_get_primary_detection():
     """get_primary_detection must return highest-confidence animal."""
     from detector import get_primary_detection

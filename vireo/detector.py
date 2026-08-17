@@ -33,6 +33,20 @@ CLASS_NAMES = {0: "animal", 1: "person", 2: "vehicle"}
 # photo would otherwise need separate detector runs.
 RAW_CONF_FLOOR = 0.01
 
+# A single 640px letterboxed pass can shrink a small bird to only a handful of
+# useful pixels.  When that pass has no ordinary-confidence animal, retry on a
+# small overlapping crop grid.  Keeping these values detector-owned (rather
+# than workspace config) makes a cached detector artifact mean the same thing
+# in every workspace.
+TILED_FALLBACK_TRIGGER_CONFIDENCE = 0.20
+TILED_FALLBACK_MIN_CONFIDENCE = 0.20
+TILED_EARLY_STOP_CONFIDENCE = 0.30
+TILED_CROP_FRACTION = 0.60
+TILED_SOURCE_MAX_SIZE = 2560
+TILED_EDGE_MARGIN = 0.01
+TILED_NMS_IOU = 0.45
+TILED_MAX_DETECTIONS = 20
+
 
 def ensure_megadetector_weights(progress_callback=None):
     """Ensure MegaDetector V6 ONNX weights are present on disk.
@@ -312,6 +326,146 @@ def _postprocess(outputs, preprocess_info, confidence_threshold):
     return detections
 
 
+def _tile_starts(length, crop_length):
+    """Return overlapping start positions covering both edges and center."""
+    last = max(0, length - crop_length)
+    return sorted({0, last // 2, last})
+
+
+def _tile_windows(width, height):
+    """Yield center-first fallback crop windows as ``(x1, y1, x2, y2)``."""
+    crop_w = max(1, min(width, round(width * TILED_CROP_FRACTION)))
+    crop_h = max(1, min(height, round(height * TILED_CROP_FRACTION)))
+    xs = _tile_starts(width, crop_w)
+    ys = _tile_starts(height, crop_h)
+    center_x = xs[len(xs) // 2]
+    center_y = ys[len(ys) // 2]
+    windows = [
+        (center_x, 0),
+        (center_x, center_y),
+        (0, 0),
+        (xs[-1], 0),
+        (0, center_y),
+        (xs[-1], center_y),
+        (0, ys[-1]),
+        (center_x, ys[-1]),
+        (xs[-1], ys[-1]),
+    ]
+    seen = set()
+    for x, y in windows:
+        window = (x, y, x + crop_w, y + crop_h)
+        if window not in seen:
+            seen.add(window)
+            yield window
+
+
+def _map_tile_detection(detection, window, full_width, full_height):
+    """Map one tile-relative box to the full image, rejecting seam boxes.
+
+    A proposal clipped by an *internal* crop boundary is ambiguous and often
+    comes from the artificial tile edge.  Overlap gives the same real subject
+    another tile where it is interior, so discard the clipped copy.  Boxes on
+    the actual outer image boundary remain valid.
+    """
+    left, top, right, bottom = window
+    tile_w = right - left
+    tile_h = bottom - top
+    box = detection["box"]
+    x1 = float(box["x"])
+    y1 = float(box["y"])
+    x2 = x1 + float(box["w"])
+    y2 = y1 + float(box["h"])
+    margin = TILED_EDGE_MARGIN
+    if (
+        (left > 0 and x1 <= margin)
+        or (top > 0 and y1 <= margin)
+        or (right < full_width and x2 >= 1.0 - margin)
+        or (bottom < full_height and y2 >= 1.0 - margin)
+    ):
+        return None
+
+    mapped_x1 = (left + x1 * tile_w) / full_width
+    mapped_y1 = (top + y1 * tile_h) / full_height
+    mapped_x2 = (left + x2 * tile_w) / full_width
+    mapped_y2 = (top + y2 * tile_h) / full_height
+    return {
+        "box": {
+            "x": float(mapped_x1),
+            "y": float(mapped_y1),
+            "w": float(mapped_x2 - mapped_x1),
+            "h": float(mapped_y2 - mapped_y1),
+        },
+        "confidence": float(detection["confidence"]),
+        "category": detection.get("category", "animal"),
+    }
+
+
+def _merge_detections(detections):
+    """Class-aware NMS for combined full-frame and tiled detections."""
+    from onnx_runtime import nms
+
+    merged = []
+    categories = sorted({d.get("category", "animal") for d in detections})
+    for category in categories:
+        candidates = [
+            d for d in detections
+            if d.get("category", "animal") == category
+        ]
+        boxes = np.asarray([
+            [
+                d["box"]["x"],
+                d["box"]["y"],
+                d["box"]["x"] + d["box"]["w"],
+                d["box"]["y"] + d["box"]["h"],
+            ]
+            for d in candidates
+        ], dtype=np.float32)
+        scores = np.asarray(
+            [d["confidence"] for d in candidates], dtype=np.float32,
+        )
+        merged.extend(
+            candidates[index]
+            for index in nms(boxes, scores, iou_threshold=TILED_NMS_IOU)
+        )
+    merged.sort(key=lambda d: float(d["confidence"]), reverse=True)
+    return merged[:TILED_MAX_DETECTIONS]
+
+
+def _infer_array(session, input_name, image_array, confidence_threshold):
+    """Run one preprocessed image array under the shared inference lease."""
+    input_tensor, preprocess_info = _preprocess(image_array)
+    from pipeline_locks import acquire_inference_resources
+
+    with acquire_inference_resources(session):
+        outputs = session.run(None, {input_name: input_tensor})
+    return _postprocess(outputs, preprocess_info, confidence_threshold)
+
+
+def _tiled_fallback(session, input_name, image_array):
+    """Run overlapping high-effective-resolution crops for a weak full pass."""
+    height, width = image_array.shape[:2]
+    tiled = []
+    for window in _tile_windows(width, height):
+        left, top, right, bottom = window
+        crop = image_array[top:bottom, left:right]
+        detections = _infer_array(
+            session, input_name, crop, TILED_FALLBACK_MIN_CONFIDENCE,
+        )
+        for detection in detections:
+            mapped = _map_tile_detection(
+                detection, window, width, height,
+            )
+            if mapped is not None:
+                tiled.append(mapped)
+        if any(
+            d.get("category", "animal") == "animal"
+            and d["confidence"] >= TILED_EARLY_STOP_CONFIDENCE
+            for d in tiled
+        ):
+            break
+    return tiled
+
+
 def detect_animals(image_path):
     """Detect animals in an image using MegaDetector.
 
@@ -348,17 +502,32 @@ def detect_animals(image_path):
             return None
         img_array = np.array(img.convert("RGB"))
 
-        input_tensor, preprocess_info = _preprocess(img_array)
-
         input_name = session.get_inputs()[0].name
-        # Coordinate only the inference call, not image I/O, decoding, or
-        # postprocessing. CPU sessions take their configured permits and
-        # cpu_ml lane; accelerator sessions take the per-batch GPU semaphore.
-        from pipeline_locks import acquire_inference_resources
-        with acquire_inference_resources(session):
-            outputs = session.run(None, {input_name: input_tensor})
-
-        return _postprocess(outputs, preprocess_info, RAW_CONF_FLOOR)
+        detections = _infer_array(
+            session, input_name, img_array, RAW_CONF_FLOOR,
+        )
+        best_animal = max(
+            (
+                d["confidence"] for d in detections
+                if d.get("category", "animal") == "animal"
+            ),
+            default=0.0,
+        )
+        if best_animal < TILED_FALLBACK_TRIGGER_CONFIDENCE:
+            # Reload only weak photos at a larger source size. Cropping the
+            # already-downsampled 1280px fast-path image merely enlarges the
+            # same pixels and does not recover fine bird detail.
+            tiled_img = load_image(
+                str(image_path), max_size=TILED_SOURCE_MAX_SIZE,
+            )
+            tiled_array = (
+                np.array(tiled_img.convert("RGB"))
+                if tiled_img is not None else img_array
+            )
+            tiled = _tiled_fallback(session, input_name, tiled_array)
+            if tiled:
+                detections = _merge_detections([*detections, *tiled])
+        return detections
     except ResourceWaitCancelled:
         raise
     except Exception:

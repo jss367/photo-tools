@@ -120,6 +120,14 @@ def megadetector_runtime_fingerprint(weights_path=None):
         INPUT_SIZE,
         MEGADETECTOR_ONNX_PATH,
         RAW_CONF_FLOOR,
+        TILED_CROP_FRACTION,
+        TILED_EARLY_STOP_CONFIDENCE,
+        TILED_EDGE_MARGIN,
+        TILED_FALLBACK_MIN_CONFIDENCE,
+        TILED_FALLBACK_TRIGGER_CONFIDENCE,
+        TILED_MAX_DETECTIONS,
+        TILED_NMS_IOU,
+        TILED_SOURCE_MAX_SIZE,
     )
 
     weights_path = weights_path or MEGADETECTOR_ONNX_PATH
@@ -131,16 +139,27 @@ def megadetector_runtime_fingerprint(weights_path=None):
         "weights_sha256": sha256_file(weights_path),
         "input_recipe": "vireo-detector-source-v1",
         "preprocess": {
-            "version": 1,
+            "version": 2,
             "input_size": INPUT_SIZE,
             "resize": "Pillow.BILINEAR-letterbox",
             "padding": 114,
+            "tiled_fallback": {
+                "trigger_confidence": TILED_FALLBACK_TRIGGER_CONFIDENCE,
+                "minimum_confidence": TILED_FALLBACK_MIN_CONFIDENCE,
+                "early_stop_confidence": TILED_EARLY_STOP_CONFIDENCE,
+                "crop_fraction": TILED_CROP_FRACTION,
+                "source_max_size": TILED_SOURCE_MAX_SIZE,
+                "grid": "edge-center-edge",
+                "internal_edge_margin": TILED_EDGE_MARGIN,
+            },
         },
         "postprocess": {
-            "version": 1,
+            "version": 2,
             "nms_iou": 0.45,
             "raw_confidence_floor": RAW_CONF_FLOOR,
             "categories": [[key, CLASS_NAMES[key]] for key in sorted(CLASS_NAMES)],
+            "tiled_nms_iou": TILED_NMS_IOU,
+            "tiled_max_detections": TILED_MAX_DETECTIONS,
         },
         "comparison_policy": "provider-tolerance-experimental-v1",
     })

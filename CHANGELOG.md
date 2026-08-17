@@ -28,6 +28,12 @@ All notable changes to Vireo are documented in this file.
   updater, and uninstall-preservation gates before publication.
 
 ### Fixed
+- Wildlife detection now retries weak full-frame MegaDetector results on
+  overlapping higher-resolution crops. Small or unusually posed birds that
+  were previously labeled "No subject" can clear the normal confidence floor
+  without lowering it globally; cached detector results are versioned so the
+  improved pass is not skipped. Miss cards now state the applicable threshold
+  and show the best below-threshold candidate confidence.
 - Freeing card space now verifies only archive copies that match the selected
   card instead of re-hashing the entire workspace, refreshes the preview
   automatically, and reads each card file only once at deletion.

@@ -59,6 +59,15 @@ def db_with_misses(tmp_path, monkeypatch):
         "WHERE id=?", (p_oof,),
     )
     db.conn.commit()
+    db.save_detections(
+        p_ns,
+        [{
+            "box": {"x": 0.2, "y": 0.2, "w": 0.3, "h": 0.3},
+            "confidence": 0.1,
+            "category": "animal",
+        }],
+        detector_model="megadetector-v6",
+    )
 
     for pid in (p_ns, p_clip, p_oof):
         Image.new("RGB", (100, 100)).save(os.path.join(thumb_dir, f"{pid}.jpg"))
@@ -88,6 +97,9 @@ def test_api_misses_returns_grouped_counts(client, db_with_misses):
     assert len(data["no_subject"]) == 1
     assert len(data["clipped"]) == 1
     assert len(data["oof"]) == 1
+    no_subject = data["no_subject"][0]
+    assert no_subject["raw_detection_conf"] == pytest.approx(0.1)
+    assert no_subject["detector_confidence_threshold"] == pytest.approx(0.2)
 
 
 def test_api_misses_filter_by_category(client, db_with_misses):

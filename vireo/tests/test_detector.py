@@ -238,11 +238,19 @@ def test_tiled_windows_cover_center_and_edges_without_duplicates():
     assert windows[0] == (200, 0, 800, 300)
     assert (0, 0, 600, 300) in windows
     assert (400, 200, 1000, 500) in windows
-    assert set(windows[2:detector.TILED_COVERAGE_CROP_COUNT]) == {
+    # Windows 2..5 are the four corner crops. Windows 6..8 are the three
+    # remaining edge-center crops that fill the internal seams the corner
+    # crops leave behind under _map_tile_detection's clipping rejection.
+    assert set(windows[2:6]) == {
         (0, 0, 600, 300),
         (400, 0, 1000, 300),
         (0, 200, 600, 500),
         (400, 200, 1000, 500),
+    }
+    assert set(windows[6:]) == {
+        (0, 100, 600, 400),
+        (400, 100, 1000, 400),
+        (200, 200, 800, 500),
     }
     assert len(set(windows)) == len(windows)
 
@@ -338,11 +346,70 @@ def test_detect_animals_runs_tiled_fallback_after_weak_full_pass(
 
     detections = detector.detect_animals(str(img_path))
 
-    # One full-frame pass plus enough tiles to cover every part of the photo.
-    assert fake_session.run.call_count == 7
+    # One full-frame pass plus every seam-safe tile. Even a strong tile
+    # detection must not short-circuit the remaining edge-center crops:
+    # _map_tile_detection rejects proposals clipped by an internal crop
+    # boundary, so the edge-center crops are the only ones that catch a
+    # second subject straddling two corner crops' shared seam.
+    assert fake_session.run.call_count == 10
     assert detections[0]["confidence"] == pytest.approx(0.9)
     assert detections[0]["category"] == "animal"
     assert detections[0]["box"]["w"] < 0.2
+
+
+def test_detect_animals_keeps_running_after_strong_early_tile(
+    monkeypatch, tmp_path,
+):
+    """A strong hit in an early crop must not skip the seam-fixing crops.
+
+    ``_map_tile_detection`` rejects boxes clipped by an internal crop
+    boundary, so pixel coverage across the first six center+corner crops is
+    not equivalent to usable detection coverage: a second animal that lies
+    along an internal seam only appears interior in one of the three
+    remaining edge-center crops.  A previous version of ``_tiled_fallback``
+    early-stopped after those first six crops and silently dropped such
+    subjects; keep the coverage invariant by asserting every crop still runs
+    even when the very first tile already returns a strong animal.
+    """
+    from unittest.mock import MagicMock
+
+    import detector
+
+    fake_session = MagicMock()
+    fake_session.get_inputs.return_value = [MagicMock(name="images")]
+    # Weak full-frame, then strong (0.90) at the first tile, six empties
+    # for the corner/center coverage subset, then a strong (0.90) hit in
+    # one of the three edge-center crops.  With the previous early-stop
+    # after the sixth crop, ``run.call_count`` would have been 7 and only
+    # one tiled subject would have survived.
+    weak = np.array(
+        [[[320, 320, 100, 100, 0.05, 0.0, 0.0]]], dtype=np.float32,
+    )
+    strong = np.array(
+        [[[320, 320, 50, 50, 0.90, 0.0, 0.0]]], dtype=np.float32,
+    )
+    empty = np.zeros((1, 0, 7), dtype=np.float32)
+    outputs = [weak, strong, *([empty] * 5), strong, empty, empty]
+    fake_session.run.side_effect = lambda *_args, **_kwargs: [outputs.pop(0)]
+    monkeypatch.setattr(detector, "_get_session", lambda: fake_session)
+
+    img_path = tmp_path / "two-birds.jpg"
+    from PIL import Image
+    Image.new("RGB", (1000, 500), color="green").save(img_path)
+
+    detections = detector.detect_animals(str(img_path))
+
+    assert fake_session.run.call_count == 10
+    strong_animals = [
+        d for d in detections
+        if d["category"] == "animal" and d["confidence"] >= 0.5
+    ]
+    assert len(strong_animals) == 2, [d["confidence"] for d in detections]
+    # Different windows map to distinct full-image regions, so both hits
+    # survive as independent subjects.  A stale early stop would have
+    # dropped whichever animal only appeared in a post-sixth window.
+    ys = sorted(d["box"]["y"] for d in strong_animals)
+    assert ys[1] - ys[0] > 0.1, ys
 
 
 def test_tiled_fallback_retains_detections_between_raw_floor_and_trigger(
@@ -383,8 +450,9 @@ def test_tiled_fallback_retains_detections_between_raw_floor_and_trigger(
 
     detections = detector.detect_animals(str(img_path))
 
-    # Every crop plus the full-frame pass ran; nothing early-stopped because
-    # the mid-confidence detection is below TILED_EARLY_STOP_CONFIDENCE.
+    # Every crop plus the full-frame pass ran; the tiled fallback runs
+    # every seam-safe window unconditionally so the middle-of-image edge
+    # seams are always covered.
     assert fake_session.run.call_count == 10
     animals = [d for d in detections if d["category"] == "animal"]
     mid_boxes = [d for d in animals if abs(d["confidence"] - 0.15) < 1e-4]

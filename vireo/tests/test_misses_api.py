@@ -424,10 +424,28 @@ def test_api_misses_preview_uses_classifier_rescue_override(tmp_path, monkeypatc
     assert default_r.status_code == 200
     default_payload = default_r.get_json()
     assert [p["id"] for p in default_payload["no_subject"]] == [pid]
-    assert default_payload["no_subject"][0]["detection_conf"] == pytest.approx(0.04)
-    assert json.loads(default_payload["no_subject"][0]["detection_box"]) == {
+    # The lone detection (0.04) is below the default 0.20 floor, so the
+    # preview card must report no qualifying box — matching what the
+    # persisted /api/misses view shows for the same photo — and carry the
+    # floor that produced it plus the best below-threshold candidate.
+    default_card = default_payload["no_subject"][0]
+    assert default_card["detection_box"] is None
+    assert default_card["detection_conf"] is None
+    assert default_card["raw_detection_conf"] == pytest.approx(0.04)
+    assert default_card["detector_confidence_threshold"] == pytest.approx(0.20)
+
+    lowered_r = client.post(
+        "/api/misses/preview",
+        data=json.dumps({"detector_confidence": 0.02}),
+        content_type="application/json",
+    )
+    assert lowered_r.status_code == 200
+    lowered_card = lowered_r.get_json()["no_subject"][0]
+    assert lowered_card["detection_conf"] == pytest.approx(0.04)
+    assert json.loads(lowered_card["detection_box"]) == {
         "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4,
     }
+    assert lowered_card["detector_confidence_threshold"] == pytest.approx(0.02)
 
     rescued_r = client.post(
         "/api/misses/preview",
@@ -442,6 +460,51 @@ def test_api_misses_preview_uses_classifier_rescue_override(tmp_path, monkeypatc
     ).fetchone()
     assert row["miss_no_subject"] is None
     assert row["miss_computed_at"] is None
+
+
+def test_api_misses_recompute_reports_unsaved_detector_floor(
+    client, db_with_misses,
+):
+    """Recompute cards must quote the floor they were derived with.
+
+    A recompute that does not save defaults leaves the workspace config
+    untouched, so the page's saved missConfig still holds the old floor.
+    The returned rows have to carry the live value or the "No detection
+    above N%" card would name a threshold that produced nothing on screen.
+    """
+    _, db, ids = db_with_misses
+
+    r = client.post(
+        "/api/misses/recompute",
+        data=json.dumps({"detector_confidence": 0.5}),
+        content_type="application/json",
+    )
+    assert r.status_code == 200
+    data = r.get_json()
+    assert data["saved_defaults"] is False
+
+    cards = [
+        p
+        for cat in ("no_subject", "clipped", "oof")
+        for p in data[cat]
+    ]
+    assert cards
+    assert all(
+        p["detector_confidence_threshold"] == pytest.approx(0.5) for p in cards
+    ), [p["detector_confidence_threshold"] for p in cards]
+
+    # The saved workspace default is untouched, which is exactly why the
+    # rows had to carry the override themselves.
+    import config as cfg
+    assert db.get_effective_config(cfg.load())[
+        "detector_confidence"
+    ] == pytest.approx(0.2)
+
+    ns_cards = [p for p in data["no_subject"] if p["id"] == ids["no_subject"]]
+    if ns_cards:
+        # Its only detection is 0.1, below the 0.5 override.
+        assert ns_cards[0]["detection_box"] is None
+        assert ns_cards[0]["raw_detection_conf"] == pytest.approx(0.1)
 
 
 def test_api_misses_recompute_can_save_workspace_defaults(tmp_path, monkeypatch):

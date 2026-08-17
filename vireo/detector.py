@@ -41,10 +41,13 @@ RAW_CONF_FLOOR = 0.01
 # ``RAW_CONF_FLOOR`` (not the trigger threshold) so that a workspace lowering
 # its user-visible confidence threshold can still surface small-subject boxes
 # that the crop grid found — matching the full-frame pass and preserving the
-# read-time-filter contract of the global detection cache.
+# read-time-filter contract of the global detection cache.  Every seam-safe
+# window is always run: ``_map_tile_detection`` rejects proposals clipped by
+# internal crop boundaries, so pixel coverage alone is not enough — a subject
+# whose bounding box crosses two corner crops' shared internal seam is only
+# recovered by the edge-center crop that contains it as an interior box.  An
+# early stop after the corner subset would silently blind those seams.
 TILED_FALLBACK_TRIGGER_CONFIDENCE = 0.20
-TILED_EARLY_STOP_CONFIDENCE = 0.30
-TILED_COVERAGE_CROP_COUNT = 6
 TILED_CROP_FRACTION = 0.60
 TILED_SOURCE_MAX_SIZE = 2560
 TILED_EDGE_MARGIN = 0.01
@@ -507,7 +510,7 @@ def _tiled_fallback(session, input_name, image_array):
     """Run overlapping high-effective-resolution crops for a weak full pass."""
     height, width = image_array.shape[:2]
     tiled = []
-    for crop_index, window in enumerate(_tile_windows(width, height), start=1):
+    for window in _tile_windows(width, height):
         left, top, right, bottom = window
         crop = image_array[top:bottom, left:right]
         detections = _infer_array(
@@ -519,12 +522,6 @@ def _tiled_fallback(session, input_name, image_array):
             )
             if mapped is not None:
                 tiled.append(mapped)
-        if crop_index >= TILED_COVERAGE_CROP_COUNT and any(
-            d.get("category", "animal") == "animal"
-            and d["confidence"] >= TILED_EARLY_STOP_CONFIDENCE
-            for d in tiled
-        ):
-            break
     return tiled
 
 

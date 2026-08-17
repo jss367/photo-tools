@@ -2327,9 +2327,10 @@ var collectionLoadStates = {};
 var collectionRenderDecisionGen = 0;
 var browseFolderRows = [];
 // The workspace ID whose folder tree is currently reflected in the DOM.
-// Captured from /api/browse/init and refreshed on every successful
-// loadFolders() so ``removeWorkspaceRootFromBrowse`` can bind its DELETE
-// to the workspace the user actually saw. Trusting ``/api/workspaces/active``
+// Captured atomically with the tree from /api/browse/init and refreshed
+// from the same server snapshot on every /api/folders?with_workspace=1
+// response, so ``removeWorkspaceRootFromBrowse`` can bind its DELETE to
+// the workspace the user actually saw. Trusting ``/api/workspaces/active``
 // at click time would let a cross-tab workspace switch redirect the
 // destructive call to the wrong workspace (Codex review r3798912101).
 var browseWorkspaceId = null;
@@ -3608,23 +3609,24 @@ async function loadFolders(opts) {
     shouldRender: opts && opts.shouldRender
   };
   try {
-    // Fetch the active workspace alongside the tree so browseWorkspaceId
-    // moves in lockstep with browseFolderRows. Losing the id (network
-    // hiccup, brand-new install) is not fatal — the tree still renders;
-    // the destructive Remove action just refuses to run until it can pin
-    // a workspace (Codex review r3798912101).
-    var results = await Promise.all([
-      safeFetch('/api/folders', {}, { toast: false }),
-      safeFetch('/api/workspaces/active', {}, { toast: false })
-        .catch(function() { return null; }),
-    ]);
-    var data = results[0];
+    // One request returns both the tree and the workspace it was scoped
+    // to, so ``browseWorkspaceId`` moves in lockstep with
+    // ``browseFolderRows`` no matter what another tab does in between.
+    // A parallel ``/api/workspaces/active`` call would leave a window
+    // where /api/folders and /api/workspaces/active can disagree (Codex
+    // review r3799038685); it would also drag the expensive per-root
+    // workspace_photo_count query into every sidebar refresh (Codex
+    // review r3799038688).
+    var payload = await safeFetch(
+      '/api/folders?with_workspace=1', {}, { toast: false }
+    );
+    var data = (payload && payload.folders) || [];
     var state = folderLoadStates[myGen];
     if (!state) return data;
     state.status = 'success';
     state.data = data;
-    state.workspaceId = (results[1] && results[1].id != null)
-      ? Number(results[1].id) : null;
+    state.workspaceId = (payload && payload.active_workspace_id != null)
+      ? Number(payload.active_workspace_id) : null;
     reconcileFolderLoadRenders();
     return data;
   } catch(e) {
@@ -10996,6 +10998,11 @@ async function _runPhotoDeepLink(photoId) {
           initData.folder_health_version);
         if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
         if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
+      }
+      // Pin the workspace this tree came from so a later Remove action
+      // targets the same workspace even on the deep-link entry point.
+      if (initData.active_workspace_id != null) {
+        browseWorkspaceId = Number(initData.active_workspace_id);
       }
       renderFolderTree(initData.folders || []);
       renderKeywordTree(initData.keywords || []);

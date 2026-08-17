@@ -20036,3 +20036,67 @@ def test_browse_panel_treats_reviewed_status_as_decided(app_and_db):
     assert "var decided = predictionIsDecided(p);" in html, (
         "the panel's row grouping must use the shared decided-status check"
     )
+
+
+def test_browse_detail_accept_button_escapes_species_apostrophes(app_and_db):
+    """Codex P2 (browse.html:6990): species like "Smith's Longspur" break the
+    Accept button.
+
+    The inline ``onclick`` for the detail-panel Accept/Reject buttons is
+    single-quoted, and ``JSON.stringify(g.species)`` preserves the apostrophe.
+    Without HTML-escaping, the attribute closes at the ``'`` in ``Say's`` and
+    the handler payload becomes malformed JS — clicking Accept does nothing
+    for a valid species. escapeAttr re-encodes the ``'`` as ``&#39;`` so the
+    browser hands the JS parser the intended source.
+
+    Structural rather than end-to-end because the failure is in the rendered
+    HTML: pytest cannot execute the inline handler, but it can verify the
+    escape is applied before the string ever reaches the DOM.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    body = _browse_js_function_body(html, "function renderDetailPredictions(")
+    assert body, "renderDetailPredictions must exist in browse.html"
+    # Both handler arguments live inside a single-quoted attribute, so both
+    # must go through escapeAttr. Checking the assignments rather than the
+    # onclick literal keeps this insensitive to formatting churn.
+    assert "escapeAttr(JSON.stringify(g.species))" in body, (
+        "species argument must be HTML-escaped before embedding in an "
+        "onclick attribute — otherwise Smith's Longspur closes the attribute"
+    )
+    assert "escapeAttr(JSON.stringify(g.ids))" in body, (
+        "prediction-ids argument shares the same attribute and must use the "
+        "same escape — future non-numeric IDs would otherwise inherit the bug"
+    )
+    # And confirm the bare, unescaped form is gone — otherwise a stray
+    # JSON.stringify(g.species) that skipped escapeAttr would still ship.
+    assert "onclick=\\'acceptDetailPredictions(' + JSON.stringify" not in body
+
+
+def test_browse_reject_reporter_names_workspace_detach_skips(app_and_db):
+    """Codex P2 (browse.html:7206): silent Reject when the photo was detached.
+
+    ``batch-reject`` returns ``skipped_out_of_workspace`` for the same
+    parse-vs-lock race the accept path handles, but ``_reportSkippedRejects``
+    was only reading ``already_decided`` and ``skipped_superseded`` — a Reject
+    that skipped every row for a detach would return success with no toast at
+    all, leaving the user hunting for a broken button.
+
+    Structural: the field's client-side rendering is what was missing, and
+    the server-side count already has coverage in
+    ``test_batch_reject_skips_out_of_workspace``.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    body = _browse_js_function_body(html, "function _reportSkippedRejects(")
+    assert body, "_reportSkippedRejects must exist in browse.html"
+    assert "skipped_out_of_workspace" in body, (
+        "the reject reporter must surface skipped_out_of_workspace the same "
+        "way _reportSkippedAccepts does — silence would be a black box"
+    )
+    # And the accept reporter still names the same field, so the two panels
+    # cannot drift back apart on this one signal.
+    accept_body = _browse_js_function_body(html, "function _reportSkippedAccepts(")
+    assert "skipped_out_of_workspace" in accept_body

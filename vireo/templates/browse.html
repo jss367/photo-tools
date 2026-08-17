@@ -6987,10 +6987,13 @@ function renderDetailPredictions(data, photoId) {
       actions = '<button class="prediction-review-link" onclick="openPredictionInReview(' +
         photoId + ')" title="This prediction needs Review\'s full decision UI">Open in Review</button>';
     } else {
-      var idsArg = JSON.stringify(g.ids);
-      // Pass the species the button will apply so the server can catch a
-      // grouping change that landed after this markup was rendered.
-      var speciesArg = JSON.stringify(g.species);
+      // JSON.stringify keeps apostrophes literal, so a species like
+      // "Smith's Longspur" or "Say's Phoebe" would close the single-quoted
+      // onclick attribute early and leave the handler malformed — the button
+      // then does nothing for a valid species. escapeAttr re-encodes ' and "
+      // as HTML entities so the browser hands JS the intended source.
+      var idsArg = escapeAttr(JSON.stringify(g.ids));
+      var speciesArg = escapeAttr(JSON.stringify(g.species));
       actions =
         '<button class="prediction-accept" onclick=\'acceptDetailPredictions(' + idsArg + ',' + photoId +
         ',' + speciesArg + ')\' title="Accept this species and add the keyword">Accept</button>' +
@@ -7208,6 +7211,14 @@ function _reportSkippedRejects(data) {
   if (data.skipped_superseded) {
     parts.push(data.skipped_superseded +
       ' replaced by a newer classification run');
+  }
+  // Same workspace-detach race as the accept side: the photo left the active
+  // workspace between the parse-time ownership check and the batch's lock.
+  // Named separately for the same reason — a silent "Nothing rejected" would
+  // leave the user hunting for a broken button.
+  if (data.skipped_out_of_workspace) {
+    parts.push(data.skipped_out_of_workspace +
+      ' no longer in this workspace');
   }
   if (!parts.length) return;
   var rejected = data.rejected || 0;

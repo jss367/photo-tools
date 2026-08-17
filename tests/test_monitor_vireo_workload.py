@@ -1,7 +1,8 @@
 import json
-import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
 
 from scripts.monitor_vireo_workload import (
     VireoApiClient,
@@ -203,6 +204,60 @@ def test_compact_jobs_payload_removes_paths_configs_results_and_filenames():
     }
 
 
+def test_compact_jobs_payload_sanitizes_paths_and_filenames_from_phase():
+    """`progress.phase` carries strings like ``Scanning root 1 of 2:
+    /private/photos``; the sanitized report must not leak that path.
+    """
+    compact = compact_jobs_payload({
+        "active": [
+            {
+                "id": "scan-1",
+                "type": "scan",
+                "status": "running",
+                "progress": {
+                    "current": 5,
+                    "total": 10,
+                    "phase": "Scanning root 1 of 2: /private/photos",
+                },
+                "steps": [{
+                    "id": "walk",
+                    "label": "Walk",
+                    "status": "running",
+                    "progress": {
+                        "current": 3,
+                        "total": 5,
+                        "phase": "Downloading 1/3: capture.nef...",
+                    },
+                }],
+            },
+            {
+                "id": "scan-2",
+                "type": "scan",
+                "status": "running",
+                "progress": {
+                    "current": 1,
+                    "total": 4,
+                    "phase": "Retrying secret.raw in 3s ...",
+                },
+            },
+        ],
+        "history": [],
+        "resource_budget": {"waiters": 0},
+    })
+
+    encoded = json.dumps(compact)
+    assert "/private" not in encoded
+    assert "capture.nef" not in encoded
+    assert "secret.raw" not in encoded
+
+    scan1_phase = compact["jobs"][0]["progress"]["phase"]
+    assert scan1_phase == "Scanning root 1 of 2: [path]"
+    step_phase = compact["jobs"][0]["running_steps"][0]["progress"]["phase"]
+    # "1/3" is a fraction, not a path, and must survive the sanitizer.
+    assert step_phase == "Downloading 1/3: [file]..."
+    assert compact["jobs"][1]["progress"]["phase"] == "Retrying [file] in 3s ..."
+
+
 def test_api_client_establishes_browser_cookie_before_reading_jobs():
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -246,13 +301,93 @@ def test_api_client_establishes_browser_cookie_before_reading_jobs():
     assert sample["resource_budget"] == {"waiters": 0}
 
 
-def test_explicit_server_identity_does_not_require_socket_discovery():
+class _FakeConn:
+    def __init__(self, port, *, status="LISTEN"):
+        self.status = status
+        self.laddr = type("Addr", (), {"port": port, "ip": "127.0.0.1"})()
+
+
+class _FakeProc:
+    def __init__(self, pid, *, name="vireo-server", cmdline=None, port=None, children=None):
+        self.pid = pid
+        self._name = name
+        self._cmdline = cmdline if cmdline is not None else [name]
+        self._port = port
+        self._children = list(children or [])
+
+    def as_dict(self, attrs=None):
+        return {"name": self._name, "cmdline": list(self._cmdline)}
+
+    def net_connections(self, kind="tcp"):
+        return [_FakeConn(self._port)] if self._port is not None else []
+
+    def children(self, recursive=False):
+        return list(self._children)
+
+
+class _FakePsutil:
+    Error = RuntimeError
+    CONN_LISTEN = "LISTEN"
+
+    def __init__(self, processes):
+        self._processes = {p.pid: p for p in processes}
+
+    def Process(self, pid):
+        if pid not in self._processes:
+            raise self.Error(f"no process with PID {pid}")
+        return self._processes[pid]
+
+
+def test_explicit_server_accepted_when_pid_owns_url_port():
+    proc = _FakeProc(4242, port=50222)
+    fake = _FakePsutil([proc])
+
     server = discover_server(
-        requested_pid=os.getpid(),
-        requested_url="http://127.0.0.1:54321",
+        requested_pid=4242,
+        requested_url="http://127.0.0.1:50222",
+        psutil_module=fake,
     )
 
-    assert server == {
-        "pid": os.getpid(),
-        "url": "http://127.0.0.1:54321",
-    }
+    assert server == {"pid": 4242, "url": "http://127.0.0.1:50222"}
+
+
+def test_explicit_server_accepted_when_child_process_owns_port():
+    child = _FakeProc(4243, port=50222)
+    parent = _FakeProc(4242, port=None, children=[child])
+    fake = _FakePsutil([parent, child])
+
+    server = discover_server(
+        requested_pid=4242,
+        requested_url="http://127.0.0.1:50222",
+        psutil_module=fake,
+    )
+
+    assert server == {"pid": 4242, "url": "http://127.0.0.1:50222"}
+
+
+def test_explicit_server_rejected_when_pid_does_not_own_url_port():
+    """A stale/typo'd PID that happens to name a live process must not be
+    accepted: process CPU/memory would come from one server while API samples
+    would come from another, silently corrupting every workload comparison.
+    """
+    proc = _FakeProc(4242, port=60000)
+    fake = _FakePsutil([proc])
+
+    with pytest.raises(RuntimeError, match="does not own"):
+        discover_server(
+            requested_pid=4242,
+            requested_url="http://127.0.0.1:50222",
+            psutil_module=fake,
+        )
+
+
+def test_explicit_server_rejected_when_owning_process_is_not_vireo():
+    proc = _FakeProc(4242, name="postgres", cmdline=["postgres", "-D", "/db"], port=50222)
+    fake = _FakePsutil([proc])
+
+    with pytest.raises(RuntimeError, match="not a vireo-server"):
+        discover_server(
+            requested_pid=4242,
+            requested_url="http://127.0.0.1:50222",
+            psutil_module=fake,
+        )

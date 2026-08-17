@@ -15,6 +15,7 @@ import json
 import math
 import os
 import platform
+import re
 import sys
 import time
 import urllib.error
@@ -69,14 +70,46 @@ def _number_summary(values):
     }
 
 
+# Absolute unix paths ("/foo/bar") anchored to a start-of-string or whitespace so
+# fractions such as "1/3" in job phase strings are not misread as paths.
+_UNIX_PATH_RE = re.compile(r"(?:(?<=\s)|^)(?:/[A-Za-z0-9._~%\-]+)+/?")
+# Windows drive-letter paths ("C:\Users\...").
+_WIN_PATH_RE = re.compile(r"\b[A-Za-z]:\\[A-Za-z0-9._\\\-]+")
+# Filenames with a common-shaped extension (`name.ext`, extension starts with a
+# letter and is 2-8 chars long) so numeric fragments like "1.2" are ignored.
+_FILENAME_RE = re.compile(r"\b[\w\-]+\.[A-Za-z][A-Za-z0-9]{1,7}\b")
+
+
+def _sanitize_phase(phase):
+    """Strip filesystem paths and filenames from a job phase string.
+
+    `vireo/app.py` builds phase text such as ``"Scanning root 1 of 2:
+    /private/photos"`` and ``"Downloading 1/3: capture.nef..."``.  Reports
+    promise to exclude filenames and full paths, so before including a phase
+    in the sanitized report we redact any path or filename tokens it contains.
+    Returns ``None`` when the sanitized value would be empty.
+    """
+    if not isinstance(phase, str):
+        return None
+    sanitized = _UNIX_PATH_RE.sub("[path]", phase)
+    sanitized = _WIN_PATH_RE.sub("[path]", sanitized)
+    sanitized = _FILENAME_RE.sub("[file]", sanitized)
+    sanitized = sanitized.strip()
+    return sanitized or None
+
+
 def _compact_progress(progress):
     if not isinstance(progress, dict):
         return {}
-    return {
+    compact = {
         key: progress[key]
-        for key in ("current", "total", "phase", "stage_id", "rate")
+        for key in ("current", "total", "stage_id", "rate")
         if progress.get(key) is not None
     }
+    phase = _sanitize_phase(progress.get("phase"))
+    if phase is not None:
+        compact["phase"] = phase
+    return compact
 
 
 def _compact_job(job, source):
@@ -543,6 +576,33 @@ def collect_workload(
     }
 
 
+def _is_vireo_process(process, *, psutil_module):
+    try:
+        info = process.as_dict(attrs=["name", "cmdline"])
+    except (OSError, psutil_module.Error):
+        return False
+    name = info.get("name") or ""
+    cmdline = " ".join(info.get("cmdline") or [])
+    return "vireo-server" in f"{name} {cmdline}".lower()
+
+
+def _process_owns_port(process, port, *, psutil_module):
+    candidates = [process]
+    with contextlib.suppress(OSError, psutil_module.Error):
+        candidates.extend(process.children(recursive=True))
+    for candidate in candidates:
+        try:
+            connections = candidate.net_connections(kind="tcp")
+        except (OSError, psutil_module.Error):
+            continue
+        for connection in connections:
+            if connection.status != psutil_module.CONN_LISTEN:
+                continue
+            if connection.laddr.port == port:
+                return candidate
+    return None
+
+
 def discover_server(*, requested_pid=None, requested_url=None, psutil_module=psutil):
     if psutil_module is None:
         raise RuntimeError(
@@ -553,9 +613,23 @@ def discover_server(*, requested_pid=None, requested_url=None, psutil_module=psu
         if parsed.scheme not in {"http", "https"} or not parsed.hostname or not parsed.port:
             raise RuntimeError("--url must include http(s), a host, and a port")
         try:
-            psutil_module.Process(requested_pid)
+            process = psutil_module.Process(requested_pid)
         except psutil_module.Error as exc:
             raise RuntimeError(f"Vireo PID {requested_pid} is not running") from exc
+        # Verify the PID (or a descendant) actually owns the URL's listening
+        # port and looks like vireo-server; otherwise samples could be mixed
+        # from two processes and silently corrupt the workload comparison.
+        owner = _process_owns_port(process, parsed.port, psutil_module=psutil_module)
+        if owner is None:
+            raise RuntimeError(
+                f"PID {requested_pid} does not own {requested_url}: no process "
+                f"in its tree is listening on port {parsed.port}"
+            )
+        if not _is_vireo_process(owner, psutil_module=psutil_module):
+            raise RuntimeError(
+                f"PID {requested_pid} owns port {parsed.port} but the listening "
+                f"process is not a vireo-server"
+            )
         return {"pid": requested_pid, "url": requested_url.rstrip("/")}
     requested_port = None
     if requested_url:

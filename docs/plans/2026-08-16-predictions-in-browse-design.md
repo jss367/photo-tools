@@ -506,6 +506,35 @@ row in its place. Counting it under `skipped_ambiguous` would send the user
 hunting for a keyword conflict that does not exist. It is checked *before*
 ambiguity so the two counts stay disjoint.
 
+**Workspace re-checked under the lock.** `_parse_prediction_ids` verifies
+workspace ownership before `BEGIN IMMEDIATE`, but a folder detach is itself a
+write — in WAL another connection can acquire the writer lock, delete the row
+from `workspace_folders`, and commit in the window between parse and lock
+succeeding. So `_out_of_workspace_prediction_ids(db, pred_ids)` runs under
+the lock on both endpoints, skipping rows whose photo left the workspace mid-
+flight and counting them back as `skipped_out_of_workspace`. Its own name for
+the same reason `skipped_superseded` is: the user's next step is a panel
+refresh, not Review, and folding it into any other count would misname the
+problem. Reject shares this filter with accept — a workspace-scoped
+`prediction_review` row for a now-foreign photo is the same class of leak the
+accept side closes.
+
+**Species pinned to what the button named.** Both accept panels group by
+species and label the button "Accept on 38 Bald Eagle". If the row's grouping
+changes between render and click, `accept_prediction` will apply a different
+species than the button named: `/api/predictions/group/apply` in another tab
+ungroups a burst member (clearing `individual` votes so
+`_prediction_consensus_species` falls back to the raw per-frame label), or
+per-vote edits shift the winner. Browse now sends `expected_species` with
+every accept and `_species_drifted_prediction_ids` skips rows whose current
+consensus does not match, reporting them as `skipped_species_drifted`. The
+existing "all resolve to one species" 400 in the loop below is not enough on
+its own: it catches a mixed-outcome drift but not a batch where *every* row
+drifted to the same new species. Accept-only — reject applies to whatever
+detection carried the row regardless of the species label, so drift is a
+functional no-op there. Optional on the wire so older callers keep working;
+Browse always passes it.
+
 **Atomicity, and who it covers.** A precondition that is not atomic with the
 write it guards only narrows the race. Every prediction-decision route
 therefore opens one `BEGIN IMMEDIATE` transaction
@@ -572,26 +601,32 @@ payload shape and workspace ownership, which is not the state these
 preconditions race against, and it can walk a 1,000-photo selection.
 
 **The endpoint's contract.** Every row `batch-accept` accepts is one that is
-still undecided, still unambiguous, AND still from the current label set *at
-the moment of the write* — literally that moment, since the checks and the
-write share one transaction. All three are judged against the database rather
-than against whatever the caller's panel believed. Rows failing any of them are
-skipped — never accepted — and counted back as `already_decided`,
-`skipped_superseded` and `skipped_ambiguous`. A stale
-payload can accept *less* than the caller asked for, never something the
-caller was not shown as acceptable. Skipping beats a 400: the rest of the
-batch is still exactly what the user asked for, and failing the whole call
-would strand 34 honest accepts on one row that moved.
+still undecided, still unambiguous, still from the current label set, still
+in the caller's workspace, AND — when the caller passed one — still resolves
+to the species the button named, all judged *at the moment of the write*
+(literally that moment, since the checks and the write share one
+transaction). Every check runs against the database rather than against
+whatever the caller's panel believed. Rows failing any of them are skipped —
+never accepted — and counted back as `already_decided`, `skipped_superseded`,
+`skipped_ambiguous`, `skipped_out_of_workspace` and
+`skipped_species_drifted`. A stale payload can accept *less* than the caller
+asked for, never something the caller was not shown as acceptable. Skipping
+beats a 400: the rest of the batch is still exactly what the user asked for,
+and failing the whole call would strand 34 honest accepts on one row that
+moved.
 
 Two consequences at the caller:
 
 - Browse names the gap. `_reportSkippedAccepts` turns a non-zero
-  `already_decided` / `skipped_ambiguous` / `skipped_superseded` into a toast,
+  `already_decided` / `skipped_ambiguous` / `skipped_superseded` /
+  `skipped_out_of_workspace` / `skipped_species_drifted` into a toast,
   because the distance
   between "Accept on 35" and 33 accepts has to be spoken, not left for the
   user to spot. The counts stay separate because the next step differs —
-  a decided row needs nothing, an ambiguous one needs Review, a superseded one
-  is simply replaced by the refresh.
+  a decided row needs nothing, an ambiguous one needs Review, a superseded or
+  out-of-workspace row is simply replaced by the refresh, and a
+  species-drifted row is a caller-side re-render (the row was still there,
+  its label just moved).
 - The undo toast is gated on `accepted`. A payload whose rows have all been
   decided or turned ambiguous returns `accepted: 0` and records no undoable
   edit, so an unconditional toast would advertise — and Ctrl+Z would

@@ -2216,6 +2216,11 @@ var _detailPredictionData = null;
 var _selectionPredictionData = null;
 var selectionPredictionKey = '';
 var selectionPredictionAcceptableById = {};
+// Parallel to selectionPredictionAcceptableById, so the accept call can pass
+// the species the button named — the server refuses a row whose current
+// consensus has drifted from what the panel rendered (see
+// _species_drifted_prediction_ids in app.py).
+var selectionPredictionSpeciesByIdx = {};
 var showDetectionBoxes = false;
 var cardFields = ["filename", "location_status", "rating", "flag", "color_label", "sharpness"]; // default, overridden by config
 var inatSubmitted = {};  // {photo_id: true}
@@ -6331,6 +6336,7 @@ function updateSelectionPanel(ids) {
     // has just collapsed back to a single photo.
     selectionPredictionKey = '';
     selectionPredictionAcceptableById = {};
+    selectionPredictionSpeciesByIdx = {};
     selectionPredictionSeq++;
     var predList = document.getElementById('selectionPredictions');
     if (predList) predList.innerHTML = '';
@@ -6380,6 +6386,7 @@ function updateSelectionPanel(ids) {
     selectionPredictionKey = selectionIdsKey(ids);
     selectionPredictionSeq++;
     selectionPredictionAcceptableById = {};
+    selectionPredictionSpeciesByIdx = {};
     var predList = document.getElementById('selectionPredictions');
     if (predList) {
       predList.innerHTML = '<div class="selection-empty">Predictions are available for selections of 1,000 photos or fewer.</div>';
@@ -6975,9 +6982,12 @@ function renderDetailPredictions(data, photoId) {
         photoId + ')" title="This prediction needs Review\'s full decision UI">Open in Review</button>';
     } else {
       var idsArg = JSON.stringify(g.ids);
+      // Pass the species the button will apply so the server can catch a
+      // grouping change that landed after this markup was rendered.
+      var speciesArg = JSON.stringify(g.species);
       actions =
         '<button class="prediction-accept" onclick=\'acceptDetailPredictions(' + idsArg + ',' + photoId +
-        ')\' title="Accept this species and add the keyword">Accept</button>' +
+        ',' + speciesArg + ')\' title="Accept this species and add the keyword">Accept</button>' +
         '<button class="prediction-reject" onclick=\'rejectDetailPredictions(' + idsArg + ',' + photoId +
         ')\' title="Reject this prediction">Reject</button>';
     }
@@ -7135,6 +7145,21 @@ function _reportSkippedAccepts(data) {
     parts.push(data.skipped_superseded +
       ' replaced by a newer classification run');
   }
+  // Photo left the workspace between the parse-time ownership check and the
+  // batch's lock (folder moved to another workspace, etc.). Its own name
+  // because the user's next step is neither Review nor a re-run — a panel
+  // refresh drops the photo from view.
+  if (data.skipped_out_of_workspace) {
+    parts.push(data.skipped_out_of_workspace +
+      ' no longer in this workspace');
+  }
+  // Another tab ungrouped or edited the row, so its current consensus
+  // species is not the one this button labelled. Reported so the gap between
+  // "Accept on 35 Bald Eagle" and 33 accepts is spoken, not swallowed.
+  if (data.skipped_species_drifted) {
+    parts.push(data.skipped_species_drifted +
+      ' species changed since the panel loaded');
+  }
   if (!parts.length) return;
   var accepted = data.accepted || 0;
   showToast((accepted ? 'Accepted ' + accepted + ' photo' +
@@ -7142,14 +7167,20 @@ function _reportSkippedAccepts(data) {
     parts.join(', '));
 }
 
-async function acceptDetailPredictions(predictionIds, photoId) {
+async function acceptDetailPredictions(predictionIds, photoId, expectedSpecies) {
   if (!predictionIds || !predictionIds.length) return;
   var data;
   try {
     data = await safeFetch('/api/predictions/batch-accept', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({prediction_ids: predictionIds}),
+      body: JSON.stringify({
+        prediction_ids: predictionIds,
+        // The species the button labelled — passed so the server can refuse
+        // rows whose grouping (and therefore consensus) drifted after the
+        // panel rendered but before the accept lands.
+        expected_species: expectedSpecies || null,
+      }),
     });
   } catch(e) { return; }
   await _afterPredictionMutation(
@@ -7251,6 +7282,7 @@ function renderSelectionPredictions(predictions, selectedCount, meta) {
     predictions: predictions, selectedCount: selectedCount, meta: meta,
   };
   selectionPredictionAcceptableById = {};
+  selectionPredictionSpeciesByIdx = {};
   // The floor is the user's own setting, so hidden rows get counted out loud
   // rather than vanishing into an empty-looking panel.
   var hidden = meta.below_threshold_count || 0;
@@ -7285,6 +7317,11 @@ function renderSelectionPredictions(predictions, selectedCount, meta) {
       ? p.acceptable_photo_count
       : acceptable.length;
     selectionPredictionAcceptableById[idx] = acceptable;
+    // The species the button will apply, sent back with the Accept so the
+    // server can refuse rows whose consensus has drifted from what the panel
+    // rendered (another tab ungrouping the burst, per-vote edits shifting
+    // the winner). See _species_drifted_prediction_ids in app.py.
+    selectionPredictionSpeciesByIdx[idx] = p.species;
 
     var rowMeta = 'Predicted on ' + p.predicted_count + ' of ' + selectedCount;
     if (p.keyworded_count) rowMeta += ', already keyworded on ' + p.keyworded_count;
@@ -7349,13 +7386,21 @@ function renderSelectionPredictions(predictions, selectedCount, meta) {
 async function acceptSelectionPrediction(idx) {
   var ids = selectionPredictionAcceptableById[idx] || [];
   if (!ids.length) return;
+  var expectedSpecies = selectionPredictionSpeciesByIdx[idx];
   var selection = getActiveSelection();
   var data;
   try {
     data = await safeFetch('/api/predictions/batch-accept', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({prediction_ids: ids}),
+      body: JSON.stringify({
+        prediction_ids: ids,
+        // Name the species the button will apply. If another tab shifted
+        // the row's consensus after this panel rendered, the server skips
+        // the drifted row rather than tagging with something the user was
+        // never shown.
+        expected_species: expectedSpecies || null,
+      }),
     });
   } catch(e) { return; }
   await _afterPredictionMutation(

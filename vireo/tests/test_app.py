@@ -18545,6 +18545,326 @@ def test_batch_reject_resolves_alternative_rows(app_and_db):
     assert app is not None
 
 
+def _patch_begin_prediction_decision(app, view_name, replacement):
+    """Swap the endpoint's captured ``_begin_prediction_decision`` closure.
+
+    The helpers in ``create_app`` are captured as free variables of every
+    view function that uses them, so a module-level patch never reaches the
+    live handler. This walks the view's closure cells and rebinds the one
+    holding ``_begin_prediction_decision`` to ``replacement`` — matching how
+    the endpoint would call it. Returns True when the swap landed, so tests
+    can assert on rewire rather than on the hook silently missing.
+    """
+    view = app.view_functions[view_name]
+    for cell in view.__closure__ or ():
+        try:
+            candidate = cell.cell_contents
+        except ValueError:
+            continue
+        if (
+            callable(candidate)
+            and getattr(candidate, "__name__", "") == "_begin_prediction_decision"
+        ):
+            cell.cell_contents = replacement
+            return True
+    return False
+
+
+def test_batch_accept_skips_rows_whose_photo_left_the_workspace(app_and_db):
+    """A folder detach in the parse→lock window must not tag a foreign photo.
+
+    ``_parse_prediction_ids`` verifies workspace ownership before
+    ``BEGIN IMMEDIATE``, but a folder detach is itself a write — in WAL
+    another connection can acquire the writer lock, delete the row from
+    ``workspace_folders``, and commit in exactly that window. Without the
+    in-lock re-check the batch would tag the now-foreign photo and record a
+    workspace-scoped ``prediction_review`` row for a photo the workspace no
+    longer owns.
+
+    Exercised deterministically by rebinding
+    ``_begin_prediction_decision`` in the endpoint's closure: right before
+    the endpoint takes the lock, the hook detaches the photo's folder on a
+    competing connection so the in-lock check must catch it.
+    """
+    import sqlite3
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(
+        db, "detached.jpg", "TestDetachAlpha", 0.9,
+    )
+    pred_id = _prediction_id(db, photo_id, "TestDetachAlpha")
+    ws_id = db._ws_id()
+    folder_id = db.conn.execute(
+        "SELECT folder_id FROM photos WHERE id = ?", (photo_id,),
+    ).fetchone()["folder_id"]
+    db_file = _db_file(db)
+
+    fired = []
+
+    def _detach_before_lock(target_db):
+        # Runs after ``_parse_prediction_ids`` has already validated ownership
+        # but before the endpoint's ``BEGIN IMMEDIATE`` — the exact window
+        # the race lives in. Committed via a separate connection so this
+        # detach is a real WAL write, not a scoped test fixture.
+        if not fired:
+            fired.append(True)
+            side = sqlite3.connect(db_file, timeout=5.0)
+            try:
+                side.execute(
+                    "DELETE FROM workspace_folders "
+                    "WHERE workspace_id = ? AND folder_id = ?",
+                    (ws_id, folder_id),
+                )
+                side.commit()
+            finally:
+                side.close()
+        return None
+
+    assert _patch_begin_prediction_decision(
+        app, "api_batch_accept_predictions", _detach_before_lock,
+    )
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert fired, "the pre-lock hook never ran, so nothing was exercised"
+    assert body["accepted"] == 0
+    assert body["skipped_out_of_workspace"] == 1
+    assert body["already_decided"] == 0
+    assert body["skipped_ambiguous"] == 0
+    assert body["skipped_superseded"] == 0
+    # Nothing on the photo: no keyword, no workspace-scoped review row for a
+    # folder that no longer belongs to this workspace.
+    names = {k["name"] for k in db.get_photo_keywords(photo_id)}
+    assert "TestDetachAlpha" not in names
+    status = db.conn.execute(
+        """SELECT COALESCE(pr_rev.status, 'pending') AS status
+           FROM predictions pr
+           LEFT JOIN prediction_review pr_rev
+             ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+           WHERE pr.id = ?""",
+        (ws_id, pred_id),
+    ).fetchone()["status"]
+    assert status == "pending"
+    # Batch reported no accepts, so no undo entry landed either.
+    assert db.get_edit_history(limit=5) == []
+
+
+def test_batch_reject_skips_rows_whose_photo_left_the_workspace(app_and_db):
+    """Reject shares the workspace re-check with accept — same helper.
+
+    A stale reject writes no keyword, but a workspace-scoped
+    ``prediction_review`` row for a now-foreign photo is the same class of
+    leak the accept side closes. Both endpoints filter through
+    ``_out_of_workspace_prediction_ids`` for the reason they share
+    ``_decided_prediction_ids``: a rule with two implementations drifts.
+    """
+    import sqlite3
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(
+        db, "detached-reject.jpg", "TestDetachBeta", 0.9,
+    )
+    pred_id = _prediction_id(db, photo_id, "TestDetachBeta")
+    ws_id = db._ws_id()
+    folder_id = db.conn.execute(
+        "SELECT folder_id FROM photos WHERE id = ?", (photo_id,),
+    ).fetchone()["folder_id"]
+    db_file = _db_file(db)
+
+    fired = []
+
+    def _detach_before_lock(target_db):
+        if not fired:
+            fired.append(True)
+            side = sqlite3.connect(db_file, timeout=5.0)
+            try:
+                side.execute(
+                    "DELETE FROM workspace_folders "
+                    "WHERE workspace_id = ? AND folder_id = ?",
+                    (ws_id, folder_id),
+                )
+                side.commit()
+            finally:
+                side.close()
+        return None
+
+    assert _patch_begin_prediction_decision(
+        app, "api_batch_reject_predictions", _detach_before_lock,
+    )
+
+    resp = client.post(
+        "/api/predictions/batch-reject",
+        json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert fired, "the pre-lock hook never ran, so nothing was exercised"
+    assert body["rejected"] == 0
+    assert body["skipped_out_of_workspace"] == 1
+    status = db.conn.execute(
+        """SELECT COALESCE(pr_rev.status, 'pending') AS status
+           FROM predictions pr
+           LEFT JOIN prediction_review pr_rev
+             ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+           WHERE pr.id = ?""",
+        (ws_id, pred_id),
+    ).fetchone()["status"]
+    assert status == "pending"
+    assert db.get_edit_history(limit=5) == []
+
+
+def test_batch_accept_skips_row_whose_consensus_drifted(app_and_db):
+    """A grouping change after render must not tag with the wrong species.
+
+    The panel groups by species and labels the button "Accept on N
+    <species>". If another tab dissolves the burst grouping between render
+    and click — ``/api/predictions/group/apply`` ungrouping a member so
+    ``individual`` votes are cleared — ``accept_prediction`` will apply the
+    raw per-frame label instead of the consensus the button named. Browse
+    now sends ``expected_species`` and the endpoint skips rows whose current
+    consensus does not match.
+
+    The mid-flight change is delivered by hooking
+    ``_begin_prediction_decision``: right before the lock, the hook clears
+    the row's ``individual`` votes so ``_prediction_consensus_species``
+    falls back to the raw label "Sparrow" — different from the "Robin"
+    label the caller passed as ``expected_species``.
+    """
+    import json as _json
+    import sqlite3
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="drift.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    # Raw species column is "Sparrow" (the minority per-frame label), but the
+    # burst consensus is "Robin" (2 votes). At render time the panel offered
+    # an "Accept on 1 Robin" button; the click submits with expected="Robin".
+    db.add_prediction(
+        det_id, "Sparrow", 0.9, "bioclip",
+        group_id="drift-burst-1",
+        individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
+    )
+    pred_id = _prediction_id(db, photo_id, "Sparrow")
+    ws_id = db._ws_id()
+    db_file = _db_file(db)
+
+    fired = []
+
+    def _clear_group_before_lock(target_db):
+        # Another tab's group-apply lands right before this request takes
+        # the writer lock. Committed on a separate connection so the write
+        # is a real WAL write, not a scoped test fixture. ``individual`` and
+        # ``group_id`` live on ``prediction_review`` (workspace-scoped
+        # state), not on the base ``predictions`` row.
+        if not fired:
+            fired.append(True)
+            side = sqlite3.connect(db_file, timeout=5.0)
+            try:
+                side.execute(
+                    """UPDATE prediction_review
+                       SET individual = NULL, group_id = NULL
+                       WHERE prediction_id = ? AND workspace_id = ?""",
+                    (pred_id, ws_id),
+                )
+                side.commit()
+            finally:
+                side.close()
+        return None
+
+    assert _patch_begin_prediction_decision(
+        app, "api_batch_accept_predictions", _clear_group_before_lock,
+    )
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={
+            "prediction_ids": [pred_id],
+            "expected_species": "Robin",
+        },
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert fired
+    assert body["accepted"] == 0
+    assert body["skipped_species_drifted"] == 1
+    assert body["skipped_ambiguous"] == 0
+    assert body["already_decided"] == 0
+    # The photo carries neither the raw label the row would have tagged with
+    # nor the consensus the button named — a drift is a caller-side refresh,
+    # not a "close enough, tag anyway" decision.
+    names = {k["name"] for k in db.get_photo_keywords(photo_id)}
+    assert "Robin" not in names
+    assert "Sparrow" not in names
+    status = db.conn.execute(
+        """SELECT COALESCE(pr_rev.status, 'pending') AS status
+           FROM predictions pr
+           LEFT JOIN prediction_review pr_rev
+             ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+           WHERE pr.id = ?""",
+        (ws_id, pred_id),
+    ).fetchone()["status"]
+    assert status == "pending"
+
+
+def test_batch_accept_without_expected_species_skips_drift_check(app_and_db):
+    """Older callers that pass no ``expected_species`` keep working.
+
+    The drift check is optional so single-species callers, tests, and any
+    caller that already restricts each submission to one bucket keep the
+    endpoint's pre-existing contract. Ungrouping a row here changes the
+    consensus, but with no expected label to compare against the accept
+    still lands — the "all resolve to one species" precondition in the loop
+    below carries the invariant instead.
+    """
+    import json as _json
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="no-expected.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    db.add_prediction(
+        det_id, "Warbler", 0.9, "bioclip",
+        group_id="no-expected-burst",
+        individual=_json.dumps({"Warbler": 3}),
+    )
+    pred_id = _prediction_id(db, photo_id, "Warbler")
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["accepted"] == 1
+    assert body["skipped_species_drifted"] == 0
+    names = {k["name"] for k in db.get_photo_keywords(photo_id)}
+    assert "Warbler" in names
+
+
 def test_predictions_api_effective_category_reflects_current_keywords(
     app_and_db,
 ):
@@ -18728,7 +19048,9 @@ def test_batch_accept_dedup_still_rejects_skipped_detection_alternatives(
     assert declined.status_code == 200, declined.get_data(as_text=True)
     assert declined.get_json() == {
         "ok": True, "accepted": 0, "already_decided": 0,
-        "skipped_ambiguous": 2, "skipped_superseded": 0, "species": None,
+        "skipped_ambiguous": 2, "skipped_superseded": 0,
+        "skipped_out_of_workspace": 0, "skipped_species_drifted": 0,
+        "species": None,
     }
 
     db.accept_prediction(pred_ids[0], prediction_ids=set(pred_ids))

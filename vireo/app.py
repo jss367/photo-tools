@@ -17002,9 +17002,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if err is not None:
             return err
 
+        # ``expected_species`` is the species the button in Browse names —
+        # what "Accept on 38 Bald Eagle" would tag. Passed through so the
+        # endpoint can refuse to accept a row whose grouping (and therefore
+        # ``accept_prediction``'s applied species) drifted after the panel
+        # rendered but before the lock. Optional so single-species callers
+        # that already know they only submit one bucket at a time keep
+        # working unchanged; when omitted, the drift check is skipped and
+        # the endpoint's older contract holds.
+        raw_expected = body.get("expected_species")
+        expected_species = (
+            raw_expected.strip() if isinstance(raw_expected, str) else None
+        ) or None
+
         # Everything from here to the commit is one transaction, taken with
         # the writer lock held from the first read (see
-        # ``_begin_prediction_decision``). The three preconditions below are
+        # ``_begin_prediction_decision``). The preconditions below are
         # only worth what their atomicity with the write is worth: read them
         # outside the transaction and a second overlapping request can pass the
         # same checks against the same pre-write state.
@@ -17012,17 +17025,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # ``_parse_prediction_ids`` stays outside deliberately — it validates
         # the payload's shape and workspace ownership, which is not the state
         # these preconditions race against, and it can walk a 1,000-photo
-        # selection. The lock is held for the decision, not for parsing.
+        # selection. The lock is held for the decision, not for parsing. The
+        # in-lock ``_out_of_workspace_prediction_ids`` filter re-checks the
+        # workspace half so a folder detach that lands in the window between
+        # parse and lock cannot tag a now-foreign photo.
         lock_err = _begin_prediction_decision(db)
         if lock_err is not None:
             return lock_err
         try:
-            return _batch_accept_under_lock(db, pred_ids)
+            return _batch_accept_under_lock(db, pred_ids, expected_species)
         except Exception:
             db.conn.rollback()
             raise
 
-    def _batch_accept_under_lock(db, pred_ids):
+    def _batch_accept_under_lock(db, pred_ids, expected_species=None):
         """The checks and writes of ``batch-accept``, inside its transaction.
 
         Split out only so the transaction's boundaries are impossible to
@@ -17080,6 +17096,31 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             db, _load_prediction_rows(db, pred_ids),
         )
         pred_ids = [pid for pid in pred_ids if pid not in ambiguous_ids]
+
+        # A folder detach — itself a write — can happen between
+        # ``_parse_prediction_ids`` and ``BEGIN IMMEDIATE``. Re-check
+        # workspace ownership here so a batch cannot tag a photo that left
+        # the workspace in that window (and cannot write workspace-scoped
+        # ``prediction_review`` state for a row it no longer owns). Skipped
+        # rather than 403 for the same reason ``already_decided`` is: the
+        # rest of the batch is still exactly what the user asked for, and
+        # failing the whole call would strand honest accepts on one row that
+        # moved.
+        out_of_workspace_ids = _out_of_workspace_prediction_ids(db, pred_ids)
+        pred_ids = [pid for pid in pred_ids if pid not in out_of_workspace_ids]
+
+        # The button in Browse names one species and the endpoint should
+        # apply exactly that species. Consensus can drift after render:
+        # another tab ungrouping the burst clears ``individual`` votes so
+        # ``accept_prediction`` falls back to the raw per-frame label, and
+        # per-vote edits can shift the winner. Skip rows whose current
+        # consensus no longer matches. No-op when the caller passes no
+        # species (older tests, single-species callers that never render a
+        # multi-species button).
+        drifted_ids = _species_drifted_prediction_ids(
+            db, _load_prediction_rows(db, pred_ids), expected_species,
+        )
+        pred_ids = [pid for pid in pred_ids if pid not in drifted_ids]
 
         # Confine the whole batch to the rows the caller actually submitted.
         # ``accept_prediction`` otherwise expands a grouped (burst) accept to
@@ -17197,6 +17238,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # count folded into ``skipped_ambiguous`` would send them hunting
             # for a keyword conflict that does not exist.
             "skipped_superseded": len(superseded_ids),
+            # Rows whose photo left the workspace between parse and lock. A
+            # panel refresh drops the photo from view, so the user's next
+            # step is neither Review nor a re-run — just the refresh — and
+            # folding it into any of the other counts would misname it.
+            "skipped_out_of_workspace": len(out_of_workspace_ids),
+            # Rows whose current consensus species no longer matches the one
+            # the button named — another tab ungrouped the burst, or per-vote
+            # edits shifted the winner. Only computed when the caller passed
+            # ``expected_species``; older callers see 0 here.
+            "skipped_species_drifted": len(drifted_ids),
             "species": species,
         })
 
@@ -17414,6 +17465,91 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         "api_redo",
     )
 
+    def _out_of_workspace_prediction_ids(db, pred_ids):
+        """Which of ``pred_ids`` sit on a photo no longer in this workspace.
+
+        The fourth precondition alongside decided / superseded / ambiguous, and
+        the same shape: ``_parse_prediction_ids`` verified workspace ownership
+        before the lock, but a folder detach is itself a write. In WAL mode
+        another connection can acquire the writer lock, delete the row from
+        ``workspace_folders``, and commit — all in the window between
+        ``_parse_prediction_ids`` finishing and ``BEGIN IMMEDIATE`` on this
+        request succeeding. Skipping the row here catches that race so a batch
+        cannot tag a now-foreign photo or write workspace-scoped
+        ``prediction_review`` state for it. Reported as
+        ``skipped_out_of_workspace`` so a caller can tell "detached mid-flight"
+        from any of the other skip reasons — the user's next step is a panel
+        refresh, and folding it into a different count would misname the
+        problem the way ``CORE_PHILOSOPHY.md`` rules out.
+
+        Chunked for the same reason every other id query here is (see
+        ``_SQL_PARAM_CHUNK``).
+        """
+        if not pred_ids:
+            return set()
+        ws = db._ws_id()
+        # Rows whose ``workspace_folders`` join misses are out of scope. The
+        # LEFT JOIN keeps a row for every prediction id regardless of folder
+        # membership; the WHERE clause selects the misses.
+        found = set()
+        for chunk in _chunked(pred_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            found.update(
+                row["id"] for row in db.conn.execute(
+                    f"""SELECT pr.id FROM predictions pr
+                        JOIN detections d ON d.id = pr.detection_id
+                        JOIN photos ph ON ph.id = d.photo_id
+                        LEFT JOIN workspace_folders wf
+                          ON wf.folder_id = ph.folder_id
+                         AND wf.workspace_id = ?
+                        WHERE pr.id IN ({placeholders})
+                          AND wf.workspace_id IS NULL""",
+                    (ws, *chunk),
+                )
+            )
+        return found
+
+    def _species_drifted_prediction_ids(db, rows, expected_species):
+        """Which of ``rows`` no longer resolve to the species Browse rendered.
+
+        Both accept panels group by species and label the button with the
+        species they will apply — "Accept on 38 Bald Eagle". If the row's
+        grouping changes between render and click, ``accept_prediction``
+        will now apply a different species than the button named. Two known
+        shapes:
+
+        * ``/api/predictions/group/apply`` in another tab ungroups a burst
+          member, so the row's ``individual`` votes are cleared and
+          ``_prediction_consensus_species`` falls back to the raw per-frame
+          label — a Robin-consensus row for a frame whose own species column
+          reads Sparrow now accepts as Sparrow, not the Robin the button
+          named.
+        * Re-running consensus after a per-vote edit shifts the winner (Robin
+          4 → Robin 2, Sparrow 4).
+
+        Both let the endpoint tag the photo with a species the caller was
+        never shown as the target of this click, and the shared "all resolve
+        to one species" precondition below doesn't catch it when *every* row
+        drifts to the same new species.
+
+        No-ops when ``expected_species`` is falsy — a caller with no species
+        in hand (Review's single-photo routes, older tests) is out of scope
+        for this check. Match key uses ``keyword_match_key`` so canonical
+        casing / typography does not falsely register as a drift.
+
+        Returns the drifted-row subset of ``rows`` ids.
+        """
+        rows = list(rows)
+        if not rows or not expected_species:
+            return set()
+        expected_key = keyword_match_key(expected_species)
+        drifted = set()
+        for row in rows:
+            current = _prediction_consensus_species(row)
+            if not current or keyword_match_key(current) != expected_key:
+                drifted.add(row["id"])
+        return drifted
+
     def _begin_prediction_decision(db):
         """Hold SQLite's write lock across a decision's checks *and* its writes.
 
@@ -17603,6 +17739,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         superseded_ids = _superseded_prediction_ids(db, pred_ids)
         pred_ids = [pid for pid in pred_ids if pid not in superseded_ids]
 
+        # Same shape as batch-accept: the workspace half of
+        # ``_parse_prediction_ids`` runs outside the lock and a folder detach
+        # can slip through in the parse→lock window. A reject writes no
+        # keyword, but a workspace-scoped ``prediction_review`` row for a
+        # now-foreign photo is the same class of leak the accept side
+        # closes, and both endpoints filter identically for the same reason
+        # they share ``_decided_prediction_ids``: a rule with two
+        # implementations drifts.
+        out_of_workspace_ids = _out_of_workspace_prediction_ids(db, pred_ids)
+        pred_ids = [pid for pid in pred_ids if pid not in out_of_workspace_ids]
+
         ws = db._ws_id()
         items = []
         species = None
@@ -17665,6 +17812,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # Same name and meaning as on the accept side: rows a later
             # classification run replaced.
             "skipped_superseded": len(superseded_ids),
+            # Same name and meaning as on the accept side: rows whose photo
+            # left the workspace between parse and lock. Reported so a
+            # panel-refresh caller can distinguish "detached mid-flight"
+            # from "already rejected" or "superseded".
+            "skipped_out_of_workspace": len(out_of_workspace_ids),
         })
 
     @app.route("/api/predictions/<int:pred_id>/accept", methods=["POST"])

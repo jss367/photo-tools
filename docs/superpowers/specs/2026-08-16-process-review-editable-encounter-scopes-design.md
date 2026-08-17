@@ -1733,10 +1733,18 @@ view:
   decision can move an encounter across the cursor boundary or out of the
   result set, so cursor reuse could repeat or miss encounters. A decision
   mutation that changes a sort or filter key of the active view therefore
-  marks the cursor stale, and the next page fetch obtains a fresh cursor
-  anchored at the stable ID of the last loaded encounter. Already-loaded rows
-  stay in place and update through the delta, and the client's ID-keyed maps
-  drop any encounter a re-anchored page would repeat.
+  marks the cursor stale, and the next page fetch requests a replacement
+  cursor built from the stale cursor's recorded keyset tuple — the boundary
+  sort-key values captured when the page was served, plus the stable ID —
+  never from the anchor row's current values. Deriving the boundary from the
+  moved row would lose ground: resolving the anchor under `unresolved first`
+  would re-anchor inside the resolved partition and skip unseen unresolved
+  encounters, and resolving it under a needs-review filter would remove the
+  anchor from the result entirely. Because the recorded tuple is the
+  boundary, the server resumes strictly after it in the current ordering
+  even when no row matches the tuple anymore. Already-loaded rows stay in
+  place and update through the delta, and the client's ID-keyed maps drop
+  any already-seen encounter that a refreshed page returns again.
 
 The server observes both a target encounter count and a soft target photo
 count:
@@ -1778,7 +1786,8 @@ its active cursor: a bumped value means the next page fetch must use a fresh
 cursor. When the value is unchanged, pagination remains valid unless the
 active view depends on decision state and `view_may_have_changed` reports
 that a sort or filter key changed, in which case the next page fetch
-re-anchors as described in the Pagination section. The client applies the
+refreshes the cursor from its recorded keyset boundary as described in the
+Pagination section. The client applies the
 delta to normalized maps keyed by stable IDs. It does not replace or
 deep-clone the complete review result.
 

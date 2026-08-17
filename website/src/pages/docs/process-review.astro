@@ -158,7 +158,7 @@ const sections = [
             <div class="page-map__list">
               <div class="map-encounter"><strong>Encounter card</strong><span>species · progress · summary</span><i></i><i></i><i></i><i></i></div>
               <div class="map-encounter map-encounter--faded"><strong>Next encounter</strong><i></i><i></i><i></i></div>
-              <div class="map-pagination"><span>Previous</span><strong>Page 2 of 14</strong><span>Next</span></div>
+              <div class="map-pagination"><span>34 encounters loaded</span><strong>Loading more as you scroll…</strong></div>
             </div>
             <div class="page-map__panel"><strong>Evidence</strong><span>Subjects</span><span>Models</span><span>Alternatives</span><span>History</span></div>
           </div>
@@ -174,7 +174,7 @@ const sections = [
           <div><strong>Page header</strong><p>States which Process result is being reviewed, how much of the workspace it covers, and whether changes still need sidecar synchronization.</p></div>
           <div><strong>Summary strip</strong><p>Shows photos, encounters, bursts, triage totals, and species-confirmation progress for the current view.</p></div>
           <div><strong>Review toolbar</strong><p>Searches and narrows the encounter list without modifying the saved Process result.</p></div>
-          <div><strong>Encounter list</strong><p>Displays a bounded page of complete encounters. Moving between pages never changes grouping.</p></div>
+          <div><strong>Encounter list</strong><p>Loads complete encounters progressively in bounded pages as you approach the end of the list. Loading more never changes grouping.</p></div>
           <div><strong>Advanced controls</strong><p>Adjust grouping and scoring, inspect why an encounter was formed, and control optional overlays.</p></div>
           <div><strong>Evidence panel</strong><p>Explains species suggestions by subject, model, and label list while leaving the encounter visible.</p></div>
         </div>
@@ -477,7 +477,7 @@ const sections = [
           </details>
           <details>
             <summary><span>05</span><strong>Make a large review faster</strong></summary>
-            <ol><li>Use a collection, triage, or species-review condition to reduce the qualifying encounters.</li><li>Keep Any photo selected when context matters most; use Every photo for strict containment.</li><li>Sort disagreements and unresolved review units first.</li><li>Keep the evidence panel closed until a decision needs explanation.</li><li>Move through bounded encounter pages rather than loading the complete workspace at once.</li></ol>
+            <ol><li>Use a collection, triage, or species-review condition to reduce the qualifying encounters.</li><li>Keep Any photo selected when context matters most; use Every photo for strict containment.</li><li>Sort disagreements and unresolved review units first.</li><li>Keep the evidence panel closed until a decision needs explanation.</li><li>Let the encounter list load progressively in bounded pages rather than loading the complete workspace at once.</li></ol>
           </details>
         </div>
       </section>

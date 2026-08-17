@@ -86,142 +86,161 @@
     code span.vs { color: #4070a0; } /* VerbatimString */
     code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
   </style>
-    <style type="text/css">:root {
-  color-scheme: light;
-  --page: #fafcf9;
-  --surface: #ffffff;
-  --ink: #26362e;
-  --muted: #687970;
-  --line: #e1e9e3;
-  --accent: #3a7d62;
-  --accent-soft: #edf7f1;
-  --code: #f4f7f5;
-  --quote: #f7fbf8;
-  --blue-soft: #eaf3ff;
-  --amber-soft: #fff4d8;
-  --violet-soft: #f2edfb;
+  <style type="text/css">:root {
+    color-scheme: light;
+    --page: #fafcf9;
+    --surface: #ffffff;
+    --ink: #26362e;
+    --muted: #687970;
+    --line: #e1e9e3;
+    --accent: #3a7d62;
+    --accent-soft: #edf7f1;
+    --code: #f4f7f5;
+    --quote: #f7fbf8;
+    --blue-soft: #eaf3ff;
+    --amber-soft: #fff4d8;
+    --violet-soft: #f2edfb;
   }
+
   * { box-sizing: border-box; }
+
   html {
-  background: var(--page);
-  color: var(--ink);
+    background: var(--page);
+    color: var(--ink);
   }
+
   body {
-  display: grid;
-  grid-template-columns: 260px minmax(0, 780px);
-  column-gap: 64px;
-  align-items: start;
-  max-width: 1168px;
-  margin: 0 auto;
-  padding: 52px 32px 96px;
-  color: var(--ink);
-  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont,
-  "Segoe UI", sans-serif;
-  font-size: 17px;
-  line-height: 1.68;
-  overflow-wrap: break-word;
-  text-rendering: optimizeLegibility;
+    display: grid;
+    grid-template-columns: 260px minmax(0, 780px);
+    column-gap: 64px;
+    align-items: start;
+    max-width: 1168px;
+    margin: 0 auto;
+    padding: 52px 32px 96px;
+    color: var(--ink);
+    font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont,
+      "Segoe UI", sans-serif;
+    font-size: 17px;
+    line-height: 1.68;
+    overflow-wrap: break-word;
+    text-rendering: optimizeLegibility;
   }
+
   body > * {
-  grid-column: 2;
-  min-width: 0;
+    grid-column: 2;
+    min-width: 0;
   }
+
   header {
-  margin: 0 0 32px;
-  text-align: left;
+    margin: 0 0 32px;
+    text-align: left;
   }
+
   header::before {
-  content: "Vireo product design";
-  display: block;
-  margin-bottom: 10px;
-  color: var(--accent);
-  font-size: 0.75rem;
-  font-weight: 750;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+    content: "Vireo product design";
+    display: block;
+    margin-bottom: 10px;
+    color: var(--accent);
+    font-size: 0.75rem;
+    font-weight: 750;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
   }
+
   header .title {
-  max-width: 760px;
-  margin: 0;
-  font-size: clamp(2.25rem, 5vw, 3.6rem);
-  line-height: 1.04;
-  letter-spacing: -0.045em;
+    max-width: 760px;
+    margin: 0;
+    font-size: clamp(2.25rem, 5vw, 3.6rem);
+    line-height: 1.04;
+    letter-spacing: -0.045em;
   }
+
   body > h1 { display: none; }
+
   body > h1 + p {
-  margin: 0 0 52px;
-  padding: 20px 22px;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: var(--surface);
-  color: var(--muted);
-  box-shadow: 0 10px 30px rgba(47, 82, 64, 0.04);
+    margin: 0 0 52px;
+    padding: 20px 22px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--surface);
+    color: var(--muted);
+    box-shadow: 0 10px 30px rgba(47, 82, 64, 0.04);
   }
+
   body > h1 + p strong { color: var(--ink); }
+
   #TOC {
-  grid-column: 1;
-  position: fixed;
-  left: max(24px, calc(50vw - 552px));
-  top: 24px;
-  width: 260px;
-  max-height: calc(100vh - 48px);
-  overflow: auto;
-  padding: 18px 16px 20px;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.94);
-  box-shadow: 0 12px 30px rgba(47, 82, 64, 0.05);
-  backdrop-filter: blur(14px);
-  font-size: 0.79rem;
-  line-height: 1.35;
-  scrollbar-width: thin;
+    grid-column: 1;
+    position: fixed;
+    left: max(24px, calc(50vw - 552px));
+    top: 24px;
+    width: 260px;
+    max-height: calc(100vh - 48px);
+    overflow: auto;
+    padding: 18px 16px 20px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.94);
+    box-shadow: 0 12px 30px rgba(47, 82, 64, 0.05);
+    backdrop-filter: blur(14px);
+    font-size: 0.79rem;
+    line-height: 1.35;
+    scrollbar-width: thin;
   }
+
   #TOC::before {
-  content: "Contents";
-  display: block;
-  margin: 0 8px 10px;
-  color: var(--muted);
-  font-size: 0.7rem;
-  font-weight: 750;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+    content: "Contents";
+    display: block;
+    margin: 0 8px 10px;
+    color: var(--muted);
+    font-size: 0.7rem;
+    font-weight: 750;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
   }
+
   #TOC > ul > li > a { display: none; }
   #TOC ul, #TOC > ul, #TOC > ul > li > ul { margin: 0; padding: 0; }
   #TOC ul ul ul { display: none; }
   #TOC li { margin: 1px 0; list-style: none; }
+
   #TOC a {
-  display: block;
-  padding: 6px 8px;
-  border-radius: 7px;
-  color: var(--muted);
-  text-decoration: none;
+    display: block;
+    padding: 6px 8px;
+    border-radius: 7px;
+    color: var(--muted);
+    text-decoration: none;
   }
+
   #TOC a:hover, #TOC a:focus-visible {
-  background: var(--accent-soft);
-  color: var(--accent);
-  outline: none;
+    background: var(--accent-soft);
+    color: var(--accent);
+    outline: none;
   }
+
   h2 {
-  margin: 68px 0 18px;
-  padding-top: 20px;
-  border-top: 1px solid var(--line);
-  font-size: 1.75rem;
-  line-height: 1.2;
-  letter-spacing: -0.025em;
+    margin: 68px 0 18px;
+    padding-top: 20px;
+    border-top: 1px solid var(--line);
+    font-size: 1.75rem;
+    line-height: 1.2;
+    letter-spacing: -0.025em;
   }
+
   h3 {
-  margin: 42px 0 12px;
-  color: #315043;
-  font-size: 1.22rem;
-  line-height: 1.3;
-  letter-spacing: -0.01em;
+    margin: 42px 0 12px;
+    color: #315043;
+    font-size: 1.22rem;
+    line-height: 1.3;
+    letter-spacing: -0.01em;
   }
+
   h4 {
-  margin: 30px 0 10px;
-  color: var(--accent);
-  font-size: 1.02rem;
+    margin: 30px 0 10px;
+    color: var(--accent);
+    font-size: 1.02rem;
   }
+
   h2 + p, h3 + p, h4 + p { margin-top: 0; }
   p { margin: 0.9em 0; }
   a { color: var(--accent); text-underline-offset: 0.16em; }
@@ -229,98 +248,112 @@
   strong { font-weight: 720; }
   ol, ul { padding-left: 1.55em; }
   li { margin: 0.38em 0; padding-left: 0.2em; }
+
   blockquote {
-  margin: 22px 0;
-  padding: 14px 18px;
-  border: 1px solid #d7e8dd;
-  border-left: 5px solid var(--accent);
-  border-radius: 0 10px 10px 0;
-  background: var(--quote);
-  color: #496157;
+    margin: 22px 0;
+    padding: 14px 18px;
+    border: 1px solid #d7e8dd;
+    border-left: 5px solid var(--accent);
+    border-radius: 0 10px 10px 0;
+    background: var(--quote);
+    color: #496157;
   }
+
   blockquote p { margin: 0.2em 0; }
+
   code {
-  padding: 0.1em 0.32em;
-  border-radius: 5px;
-  background: #eef4f0;
-  color: #264f3d;
-  font-family: Menlo, Monaco, Consolas, monospace;
-  font-size: 0.84em;
+    padding: 0.1em 0.32em;
+    border-radius: 5px;
+    background: #eef4f0;
+    color: #264f3d;
+    font-family: Menlo, Monaco, Consolas, monospace;
+    font-size: 0.84em;
   }
+
   div.sourceCode, pre {
-  margin: 22px 0;
-  overflow: auto;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--code);
-  box-shadow: 0 8px 24px rgba(47, 82, 64, 0.05);
+    margin: 22px 0;
+    overflow: auto;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--code);
+    box-shadow: 0 8px 24px rgba(47, 82, 64, 0.05);
   }
+
   pre { padding: 18px 20px; }
   div.sourceCode pre { margin: 0; padding: 18px 20px; border: 0; box-shadow: none; }
   pre code, div.sourceCode code {
-  padding: 0;
-  background: transparent;
-  color: #294338;
-  font-size: 0.82rem;
-  line-height: 1.55;
-  white-space: pre;
+    padding: 0;
+    background: transparent;
+    color: #294338;
+    font-size: 0.82rem;
+    line-height: 1.55;
+    white-space: pre;
   }
+
   table {
-  display: table;
-  width: 100%;
-  margin: 24px 0;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-collapse: separate;
-  border-spacing: 0;
-  border-radius: 10px;
-  background: var(--surface);
-  font-size: 0.92rem;
-  font-variant-numeric: tabular-nums;
+    display: table;
+    width: 100%;
+    margin: 24px 0;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-collapse: separate;
+    border-spacing: 0;
+    border-radius: 10px;
+    background: var(--surface);
+    font-size: 0.92rem;
+    font-variant-numeric: tabular-nums;
   }
+
   th {
-  border: 0;
-  border-bottom: 1px solid var(--line);
-  padding: 11px 14px;
-  background: var(--accent-soft);
-  color: #264f3d;
-  text-align: left;
-  vertical-align: top;
+    border: 0;
+    border-bottom: 1px solid var(--line);
+    padding: 11px 14px;
+    background: var(--accent-soft);
+    color: #264f3d;
+    text-align: left;
+    vertical-align: top;
   }
+
   td {
-  border: 0;
-  border-bottom: 1px solid #edf0ed;
-  padding: 11px 14px;
-  vertical-align: top;
+    border: 0;
+    border-bottom: 1px solid #edf0ed;
+    padding: 11px 14px;
+    vertical-align: top;
   }
+
   tr:last-child td { border-bottom: 0; }
   ::selection { background: #c9e8d7; }
+
   .design-diagram {
-  margin: 30px 0 38px;
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  overflow: hidden;
-  background: var(--surface);
-  box-shadow: 0 14px 36px rgba(47, 82, 64, 0.06);
+    margin: 30px 0 38px;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    overflow: hidden;
+    background: var(--surface);
+    box-shadow: 0 14px 36px rgba(47, 82, 64, 0.06);
   }
+
   .diagram-scroll {
-  overflow-x: auto;
-  padding: 20px;
-  background: linear-gradient(180deg, #ffffff 0%, #f8fbf8 100%);
+    overflow-x: auto;
+    padding: 20px;
+    background: linear-gradient(180deg, #ffffff 0%, #f8fbf8 100%);
   }
+
   .design-diagram svg {
-  display: block;
-  width: 100%;
-  min-width: 720px;
-  height: auto;
+    display: block;
+    width: 100%;
+    min-width: 720px;
+    height: auto;
   }
+
   .design-diagram figcaption {
-  padding: 14px 18px 16px;
-  border-top: 1px solid var(--line);
-  color: var(--muted);
-  font-size: 0.88rem;
-  line-height: 1.5;
+    padding: 14px 18px 16px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 0.88rem;
+    line-height: 1.5;
   }
+
   .design-diagram figcaption strong { color: var(--ink); }
   .diagram-surface { fill: #ffffff; stroke: #dbe6df; stroke-width: 2; }
   .diagram-panel { fill: #f4f8f5; stroke: #cfddd4; stroke-width: 2; }
@@ -340,36 +373,39 @@
   .diagram-title { fill: #26362e; font: 750 19px Inter, ui-sans-serif, sans-serif; }
   .diagram-number { fill: #ffffff; font: 750 13px Inter, ui-sans-serif, sans-serif; text-anchor: middle; dominant-baseline: middle; }
   .diagram-number-circle { fill: #3a7d62; }
+
   @media (max-width: 980px) {
-  body {
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  max-width: 820px;
-  padding: 32px 24px 80px;
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      max-width: 820px;
+      padding: 32px 24px 80px;
+    }
+    header { order: -3; }
+    body > h1 { order: -2; }
+    body > h1 + p { order: -1; }
+    #TOC { position: static; width: auto; max-height: none; margin: 0 0 36px; }
   }
-  header { order: -3; }
-  body > h1 { order: -2; }
-  body > h1 + p { order: -1; }
-  #TOC { position: static; width: auto; max-height: none; margin: 0 0 36px; }
-  }
+
   @media (max-width: 600px) {
-  html, body { max-width: 100%; overflow-x: hidden; }
-  body { padding: 24px 16px 64px; font-size: 16px; }
-  header .title { font-size: clamp(2rem, 10vw, 2.3rem); overflow-wrap: anywhere; }
-  body > h1 + p { margin-bottom: 38px; padding: 16px; }
-  h2 { margin-top: 52px; font-size: 1.5rem; }
-  table { display: block; overflow-x: auto; }
+    html, body { max-width: 100%; overflow-x: hidden; }
+    body { padding: 24px 16px 64px; font-size: 16px; }
+    header .title { font-size: clamp(2rem, 10vw, 2.3rem); overflow-wrap: anywhere; }
+    body > h1 + p { margin-bottom: 38px; padding: 16px; }
+    h2 { margin-top: 52px; font-size: 1.5rem; }
+    table { display: block; overflow-x: auto; }
   }
+
   @media print {
-  body { display: block; max-width: none; padding: 0; font-size: 12pt; }
-  #TOC { position: static; max-height: none; margin-bottom: 32px; box-shadow: none; }
-  #TOC ul ul ul { display: block; }
-  body > h1 + p, div.sourceCode, pre { box-shadow: none; }
-  .design-diagram { break-inside: avoid; page-break-inside: avoid; box-shadow: none; }
-  .diagram-scroll { overflow: visible; padding: 10px; }
-  .design-diagram svg { width: 100%; min-width: 0; }
-  h2, h3, h4 { break-after: avoid; }
+    body { display: block; max-width: none; padding: 0; font-size: 12pt; }
+    #TOC { position: static; max-height: none; margin-bottom: 32px; box-shadow: none; }
+    #TOC ul ul ul { display: block; }
+    body > h1 + p, div.sourceCode, pre { box-shadow: none; }
+    .design-diagram { break-inside: avoid; page-break-inside: avoid; box-shadow: none; }
+    .diagram-scroll { overflow: visible; padding: 10px; }
+    .design-diagram svg { width: 100%; min-width: 0; }
+    h2, h3, h4 { break-after: avoid; }
   }
   </style>
 </head>
@@ -2459,10 +2495,18 @@ or species-review filters), a decision can move an encounter across the
 cursor boundary or out of the result set, so cursor reuse could repeat
 or miss encounters. A decision mutation that changes a sort or filter
 key of the active view therefore marks the cursor stale, and the next
-page fetch obtains a fresh cursor anchored at the stable ID of the last
-loaded encounter. Already-loaded rows stay in place and update through
-the delta, and the client’s ID-keyed maps drop any encounter a
-re-anchored page would repeat.</li>
+page fetch requests a replacement cursor built from the stale cursor’s
+recorded keyset tuple — the boundary sort-key values captured when the
+page was served, plus the stable ID — never from the anchor row’s
+current values. Deriving the boundary from the moved row would lose
+ground: resolving the anchor under <code>unresolved first</code> would
+re-anchor inside the resolved partition and skip unseen unresolved
+encounters, and resolving it under a needs-review filter would remove
+the anchor from the result entirely. Because the recorded tuple is the
+boundary, the server resumes strictly after it in the current ordering
+even when no row matches the tuple anymore. Already-loaded rows stay in
+place and update through the delta, and the client’s ID-keyed maps drop
+any already-seen encounter that a refreshed page returns again.</li>
 </ul>
 <p>The server observes both a target encounter count and a soft target
 photo count:</p>
@@ -2500,10 +2544,10 @@ with the one bound to its active cursor: a bumped value means the next
 page fetch must use a fresh cursor. When the value is unchanged,
 pagination remains valid unless the active view depends on decision
 state and <code>view_may_have_changed</code> reports that a sort or
-filter key changed, in which case the next page fetch re-anchors as
-described in the Pagination section. The client applies the delta to
-normalized maps keyed by stable IDs. It does not replace or deep-clone
-the complete review result.</p>
+filter key changed, in which case the next page fetch refreshes the
+cursor from its recorded keyset boundary as described in the Pagination
+section. The client applies the delta to normalized maps keyed by stable
+IDs. It does not replace or deep-clone the complete review result.</p>
 <h3 id="persistence-model">Persistence model</h3>
 <p>Computed pipeline output and mutable review state must not require a
 complete JSON rewrite for every click.</p>

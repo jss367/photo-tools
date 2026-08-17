@@ -257,7 +257,11 @@ card's key for any reason other than a taxonomy-cache transition — which
 that section already handles, and which the frozen membership already
 bounds.
 
-**No schema change to `predictions`.** The key is computed at read time
+**No schema change to `predictions` for the taxon key.** (§2's Phase 0
+does add one additive nullable column, `run_token`, for edge
+suppression — guarded by a `db_meta` marker exactly as this bullet's
+escape-hatch note prescribes, and with no backfill. Nothing about the
+taxon key or node identity depends on it.) The key is computed at read time
 from the in-memory taxonomy dict (O(1) per row) plus the cached iNat lookup
 table. The background resolver's negative cache is stored in the existing
 `taxonomy_api_cache` mechanism (or a peer table with the same lifecycle) —
@@ -315,7 +319,13 @@ the truncated 6-char suffix embedded inside `group_id` survives to
 disk, so no merge-time key over stored rows can recover the full job
 identity without a schema change and a companion backfill — which
 would violate the "works retroactively on existing prediction rows
-with no destructive migration" goal.
+with no destructive migration" goal. Phase 0's `run_token` column is
+not that backfill and does not contradict this: it is additive,
+nullable and written only *going forward*, so existing rows keep
+exactly today's behaviour through the `legacy:` run-key namespace (§2,
+"Run key") rather than being rewritten with a guessed job identity.
+What is unrecoverable stays unrecovered; what is knowable from here on
+is recorded.
 
 Without *some* split, two independently-minted bursts that collide on
 `(classifier_model, labels_fingerprint, group_id)` share one graph
@@ -491,17 +501,23 @@ semantics" specifies; they cannot move a node's identity. The server
 stamps the encoded `node_id` on each returned row, so the client never
 recomputes node identity itself.
 
-**Phase 0 (new, prerequisite of §2)** widens
-`_store_grouped_predictions` to mint group IDs with enough entropy to
-be unique on their own:
+**Phase 0 (new, prerequisite of §2)** mints **one run token per classify
+pass** — one `_store_grouped_predictions` call, which is one job over
+one `(classifier_model, labels_fingerprint)` (`classify_job.py:2493`,
+`3536`; a job never loops over models) — and builds group IDs out of it:
 
 ```python
-gid = f"g{secrets.token_hex(16)}-{group_count:04d}"
+run_token = secrets.token_hex(16)        # once, at entry
+gid = f"g{run_token}-{group_count:04d}"
 ```
 
-128 bits per group; collision probability across the entire history of
-classify runs is effectively zero. The ID stays an opaque
-backwards-compatible string, so read-side consumers are unchanged. Two
+128 bits per pass plus a counter that is unique within the pass;
+collision probability across the entire history of classify runs is
+effectively zero. The ID stays an opaque backwards-compatible string, so
+read-side consumers are unchanged. Minting per *pass* rather than per
+*group* is what makes the token double as a run identity (next
+paragraph) at no extra cost; per-group tokens would have been equally
+unique and told us nothing about which rows were written together. Two
 weaker options are explicitly rejected:
 
 - `f"g{job_id}-{group_count:04d}"` (the full job ID). `job_id` is
@@ -522,15 +538,42 @@ weaker options are explicitly rejected:
   counter value reach ~50% birthday-collision probability after
   roughly 77k draws. Not safe at catalog scale.
 
+**The token is persisted per row, because `group_id` alone cannot carry
+it.** Phase 0 adds one nullable column, `predictions.run_token TEXT`,
+written with the pass's token by every row the pass stores
+(`_store_pending_detection_prediction`, `_store_match_prediction` —
+`classify_job.py:2046`, `1883`) and refreshed on the `_existing` reuse
+branch (`classify_job.py:2061-2099`) in the same place that already
+updates or clears the row's group metadata, so a row's token always
+names **the pass whose grouping decision that row currently reflects**.
+Migration: `ALTER TABLE predictions ADD COLUMN run_token TEXT`, guarded
+by a `db_meta` marker rather than `user_version` (the live DB's
+`user_version` has drifted ahead of the schema constant, so a
+version-gated migration silently skips). No backfill: the pass that
+wrote a pre-Phase-0 row left no durable trace to recover — the row
+carries neither a job column nor a usable time signal (above).
+
+The column exists because the group ID cannot cover **singleton** rows:
+a singleton node keys on `"p" + prediction_id` and has no `group_id` at
+all, and singleton-versus-grouped on the same photo is precisely one of
+the within-pass splits the edge rule below has to respect. Every other
+choice was worse: `classifier_runs` is keyed
+`(detection_id, classifier_model, labels_fingerprint)` and is deleted
+and rewritten by reclassify paths (`db.py:16090-16134`), so it cannot
+be read as history; `prediction_review` would fit the workspace scope
+but pending rows are deliberately absent from it ("absence == pending",
+`db.py:15908-15917`), and materializing a row per pending prediction to
+hold a token inverts that invariant for every consumer.
+
 The node key stays `(classifier_model, labels_fingerprint, group_id,
-species_key)`. Phase 0 makes the fourth element redundant for new rows
-(a self-unique `group_id` already means one bucket is one burst) and
-leaves it doing useful work only on pre-Phase-0 rows. No schema change
-to `predictions` or `prediction_review`, no new column, and no
-backfill — node identity is read entirely off columns that already
-exist. Phase 0 lands before the merge-graph work in Phase 3, so every
-row the merge graph reads with the new semantics has a self-unique
-`group_id`.
+species_key)` — `run_token` is **not** part of any key, and node
+identity is still read entirely off columns that already exist, so a
+node minted before Phase 0 and one minted after decode the same way.
+Phase 0 makes the fourth element redundant for new rows (a self-unique
+`group_id` already means one bucket is one burst) and leaves it doing
+useful work only on pre-Phase-0 rows. Phase 0 lands before the
+merge-graph work in Phase 3, so every row the merge graph reads with
+the new semantics has a self-unique `group_id` and a run token.
 
 Singleton nodes key on `(classifier_model, labels_fingerprint, "p" +
 prediction_id)`; `prediction_id` is a unique primary key
@@ -552,7 +595,7 @@ stay separate cards; two models' views of the same burst merge.
 **Within-run subject partition is authoritative on the edge.** Same-taxon
 overlap is a *cross-run* signal only: the edge is added between nodes A and B
 iff they share a taxon key, their photo memberships overlap, **and** their
-`(classifier_model, labels_fingerprint)` differ — never within a single
+**run keys are disjoint** — never within a single
 classify run. When one run produces two same-taxon nodes on the same photos
 — a real Blue Tit box and a false-positive Blue Tit box on the same frame,
 placed by similarity grouping in different `group_id`s (or one grouped and
@@ -565,9 +608,10 @@ same-taxon subjects on one photo" flags. The within-run half of the
 `(taxon_key, overlapping photos)` rule therefore only *appears* to apply;
 it is a no-op because within-run same-node identity already means one node,
 and within-run different-node identity means the run separated the subjects
-and the graph does not re-join them. Across runs (either classifier or
-labels-fingerprint differs) the run partitions are not comparable — one
-model's `group_id`s carry no information about the other's — so the
+and the graph does not re-join them. Across runs (disjoint run keys — which
+covers a different classifier or label set, and equally two passes that
+shared both) the run partitions are not comparable — one
+pass's `group_id`s carry no information about the other's — so the
 overlap-and-same-taxon edge is the strongest cross-run signal we have and
 is used as designed. The residual **cross-run ambiguity** on a shared photo
 where both runs produce ≥2 same-taxon subjects — which of the two BioCLIP
@@ -579,6 +623,50 @@ unambiguous frame in the same burst or fails to merge and the two remain
 separate cards. See §Edge cases, *Distinct same-taxon subjects on one
 photo*, for the concrete shape.
 
+**Run key — what "the same run" means, and why it is not
+`(classifier_model, labels_fingerprint)`.** A row's run key is, in order:
+the token embedded in its `group_id` when it has one (Phase 0 mints
+`g{run_token}-{counter}`, so the prefix *is* the pass that grouped it);
+otherwise its `predictions.run_token`; otherwise — only for rows written
+before Phase 0 — the synthetic `legacy:{classifier_model}:{labels_fingerprint}`.
+A node's run-key set is the set over its member rows, and **the edge is
+suppressed iff the two nodes' run-key sets intersect.**
+
+`(classifier_model, labels_fingerprint)` is a *configuration*, not a run.
+Classifying a newly imported folder with the same model and the same label
+set as last week's folder is the ordinary case, not an exotic one, and a
+reclassify pass over a subset is another; every one of those passes shares
+the pair. Treating the pair as a run identity therefore suppresses edges
+between nodes from genuinely different passes — two same-taxon groups that
+overlap on a photo stay two cards forever, the exact duplicate this design
+exists to collapse — and does so *undetectably*, because nothing recorded
+which pass wrote what. That is why the token has to be minted per pass in
+Phase 0 rather than per group: the fix is unavailable later if the rows
+never carried it. The pair survives only as the **legacy namespace**, where
+it reproduces today's behaviour on rows that predate the token and nothing
+better exists; because the two namespaces are disjoint strings, a legacy row
+and a stamped row are never "the same run", which is correct — a stamped row
+was written after the legacy row's pass ended.
+
+Intersection rather than equality, because a node's rows can carry two
+tokens: a pass that re-saw some of a burst's detections and inserted others
+leaves the reused rows re-stamped by the refresh above and the new rows
+stamped on insert, and a node that spans a legacy row and a stamped one is
+reachable the same way. Suppression is the conservative branch — it
+preserves a split the classifier made — so any pass shared by both nodes is
+enough to conclude that some pass separated them deliberately.
+
+One residual, stated rather than hidden: `group_id` is workspace-scoped
+while `predictions.run_token` is global, so a second workspace
+re-classifying the same detections re-stamps the global token on rows whose
+*other* workspace's partition predates it. Grouped nodes are unaffected —
+they read the token out of their own workspace's `group_id`, which the same
+pass wrote — so this reaches only singleton nodes, and its failure direction
+is an allowed edge where suppression would have blocked one: a singleton
+merges into a same-taxon overlapping card, the same granularity loss §Edge
+cases, *Distinct same-taxon subjects on one photo* already documents for the
+cross-run-ambiguity case, rather than a wrong card identity.
+
 **Payload changes.** Each prediction row gains `taxon_key`, `card_id`,
 `node_id` (the encoded node identity from "Node identity" above — the
 handle the client echoes back: as the mutation target when a filter is
@@ -586,6 +674,11 @@ active, and as the card's frozen membership otherwise, §3 step 1), and
 `display_name` (§4). Rows are *not* collapsed server-side — the client keeps
 all rows (it already receives every group member) and dedups by `card_id`
 instead of `group_id`, so per-model detail remains available for rendering.
+`run_token` is added to the endpoint's column list because the merge graph
+needs it (one more column on the same row select — no join, and the row
+`SELECT` stays named-column, never `p.*`), but it is **not** serialized to
+the client: run identity decides edges server-side and the client has no use
+for it.
 
 **Scope invariant — one rule, four sites.** Merging gives four
 different surfaces the chance to cover more than the user was looking
@@ -672,6 +765,11 @@ with no defined rendering.
   not incidental: a toolbar that iterates rows accepts part of a merged
   card and leaves the rest, which is the badge-vs-rows contradiction
   this section exists to prevent, reached without ever clicking a card.
+  Re-reading them as cards is necessary but not sufficient — `pending`
+  rows and *actionable cards* are different sets once `mixed` exists, in
+  both directions — so all three bind to the single
+  `getActionableCards()` predicate §3 defines rather than to
+  `getVisibleItems()` or to a `status === 'pending'` filter.
   §3 "Every mutation entry point, enumerated" lists each one and its
   disposition; Phase 5 converts them all in one go.
 - **Card status and actions are aggregated across every member row**, not
@@ -1968,8 +2066,8 @@ union**, not just the clicked group's photos:
   untouched. The sibling scan follows the same edge rule §2
   ("Within-run subject partition is authoritative on the edge") uses to
   build the component in the first place — it only broadens **across
-  runs**, i.e. rows whose `(classifier_model, labels_fingerprint)` differs
-  from the clicked row's — never within the run. Within the clicked row's
+  runs**, i.e. rows whose run key (§2, "Run key") is disjoint from the
+  clicked row's — never within the run. Within the clicked row's
   own run, the group-siblings loop `accept_prediction` already runs
   (`pr.classifier_model = ?` on the clicked row's own `group_id`)
   remains the only same-run reach — **bounded to the resolved node, per
@@ -2879,14 +2977,56 @@ issues one mutation each rather than iterating members, and why the
 keyboard handler targets a card rather than a row; the batching is a
 correctness requirement, not a round-trip optimization.
 
+A third clause fixes *which* cards a bulk or targeted action touches.
+**The actionable set is derived from status, never from what happens to
+be rendered.** §2's aggregate is a total function on member statuses, so
+"actionable" needs no separate notion — it is one predicate over that
+table, stated once here and referenced by every caller below:
+
+> `getActionableCards()` = the cards `getVisibleItems()` returns whose
+> aggregate status is `pending` or `mixed`. Cards whose aggregate is
+> unanimously `accepted` or unanimously `rejected` are terminal and are
+> **not** members.
+
+Iterating the visible list instead is a live bug, not a hypothetical:
+the default `all` tab applies no status predicate
+(`review.html:1298-1300`), so `getVisibleItems()` returns accepted and
+rejected cards alongside pending and mixed ones. A toolbar loop over
+that list — visible whenever *any* card is actionable — would POST an
+accept for every terminal card too, silently reversing every prior
+rejection in the view; a keyboard shortcut that grabs `[0]` would fire
+at whatever card the current sort happened to put first, terminal or
+not. The three callers therefore bind to the set, not to the list:
+**Accept All** iterates it, `renderButtons` **counts** it, and `A` / `S`
+target its **first element** (first in the grid's own filtered+sorted
+order, which is what the toolbar hint promises). A card's own "Accept
+all" / "Reject all" buttons are already per-card and per-status, and if
+a toolbar **Reject All** is ever added it binds to this same set — the
+one definition is the extension point.
+
+The old handler's `status === 'pending'` filter is not a workable
+substitute for two independent reasons, and both matter: it is a *row*
+predicate where the target is a card, and even read as a card predicate
+it omits `mixed`, which §2 makes actionable and gives both reconciling
+actions. A shortcut that skips mixed cards is the worse half — those are
+exactly the cards holding two contradictory decisions, and the keyboard
+is how the user gets through a review queue.
+
+Because Accept All can act on `mixed` cards, it can override prior
+rejections. That is the reconciliation §2 specifies, not a surprise, but
+it is destructive, so the run's summary names it rather than reporting a
+flat count: "Accepted 13 cards — 2 were mixed; 3 prior rejections were
+overridden". The number in the button and the number in the summary are
+both counts of cards the click acted on.
+
 *Routed through card mutations (Phase 5):*
 
 | entry point | code today | what changes |
 | --- | --- | --- |
 | Per-card Accept / Reject | `acceptPrediction` / `rejectPrediction` (`review.html:1576`, `1591`) | POST the card mutation with the displayed `card_id` (or `node_id` under a filter), the frozen `observed` map (member ids → the statuses this render displayed), and the scope tuple. This is the happy path §2/§3 specify. |
-| Toolbar **Accept All** | `acceptAllPending` (`review.html:1618-1633`) — filters `predictions` to raw `status === 'pending'` rows and POSTs `/api/predictions/<id>/accept` per row | Iterates the **displayed cards** from `getVisibleItems()`, not raw rows, and issues one card mutation per card with that card's own frozen membership and the same scope tuple. Without this, "Accept All" on a `{pending, rejected}` card accepts the pending member and leaves the rejected one rejected — i.e. it *creates* a `mixed` card out of the click that was supposed to resolve it, and it does so bypassing the reconciling-reject retraction rule above. A card whose mutation comes back **409 `card_changed`** (§2) is skipped, not retried and not fatal to the run: the loop continues, that card keeps its own inline notice, and the run's summary reports the worse outcome — "Accepted 12 of 13 cards — 1 card changed and was skipped; nothing was changed on it" — rather than a plain completion. |
-| Toolbar button label and visibility | `renderButtons` (`review.html:1258-1273`) — counts raw pending rows for "Accept All (N)" and hides the button when that count is 0 | Counts **actionable cards** (status `pending` or `mixed`, per §2's table) and labels accordingly. Counting rows would promise "Accept All (7)" over 4 cards, and — worse — would *hide* the button on a view whose only cards are `{accepted, rejected}` mixed, which are exactly the cards that need reconciling. Same rule as the badge: the number the user reads must be the number of things the click acts on. |
-| Keyboard `A` / `S` | keydown handler (`review.html:1638-1655`), currently `acceptPrediction(pending[0].id)` over `getVisibleItems()` rows | Targets the first visible **card** and issues that card's mutation. The handler already reads `getVisibleItems()` "because the toolbar hint promises *first visible card*" — after §2 that function returns cards, so this is a one-line follow-through, but it is listed because leaving it on row ids would silently half-accept the first card. |
+| Toolbar **Accept All** | `acceptAllPending` (`review.html:1618-1633`) — filters `predictions` to raw `status === 'pending'` rows and POSTs `/api/predictions/<id>/accept` per row | Iterates `getActionableCards()` — cards, not raw rows, and actionable cards, not every displayed one — and issues one card mutation per card with that card's own frozen membership and the same scope tuple. Iterating `getVisibleItems()` directly would submit mutations for terminal cards on the `all` tab (see the actionable-set clause above). Without this, "Accept All" on a `{pending, rejected}` card accepts the pending member and leaves the rejected one rejected — i.e. it *creates* a `mixed` card out of the click that was supposed to resolve it, and it does so bypassing the reconciling-reject retraction rule above. A card whose mutation comes back **409 `card_changed`** (§2) is skipped, not retried and not fatal to the run: the loop continues, that card keeps its own inline notice, and the run's summary reports the worse outcome — "Accepted 12 of 13 cards — 1 card changed and was skipped; nothing was changed on it" — rather than a plain completion. |
+| Toolbar button label and visibility | `renderButtons` (`review.html:1258-1273`) — counts raw pending rows for "Accept All (N)" and hides the button when that count is 0 | Counts `getActionableCards()` — the same set Accept All iterates, so the number on the button is by construction the number of cards the click acts on. Counting rows would promise "Accept All (7)" over 4 cards, and — worse — would *hide* the button on a view whose only cards are `{accepted, rejected}` mixed, which are exactly the cards that need reconciling. Same rule as the badge: the number the user reads must be the number of things the click acts on. |
+| Keyboard `A` / `S` | keydown handler (`review.html:1638-1655`), currently `acceptPrediction(pending[0].id)` over `getVisibleItems()` rows filtered to `status === 'pending'` | Targets `getActionableCards()[0]` and issues that card's mutation. Two changes, not one: the target becomes a card rather than a row id (leaving it on row ids would silently half-accept the first card), **and** the `pending`-only filter is replaced by the shared actionable predicate, so `A` / `S` reach `mixed` cards instead of skipping them. Swapping only the id would leave the keys inert on a queue whose first — or only — actionable card is mixed; dropping the filter entirely would let them mutate a terminal card. |
 
 *Deliberately excluded, with the reason:*
 
@@ -3212,13 +3352,18 @@ caeruleus*") on the Keywords page with a one-click merge.
 - **Transitive card components:** the accept path always operates on the
   card's pre-computed union of photos, so a chain (A: 1-2, B: 2-3, C: 3-4)
   resolves in one click. See §3, "Enumerate photos from the component".
-- **Two same-taxon groups from one model** (e.g. re-runs under different
-  fingerprints): they merge into one card if their photos overlap — which is
-  the correct de-duplication, and the fingerprint filter still separates
-  them when the user asks. (This is a cross-*run* merge — the
-  `labels_fingerprint` differs — so §2's "Within-run subject partition
-  is authoritative on the edge" rule permits it, unlike the same-run
-  case below.)
+- **Two same-taxon groups from one model** (re-runs under different
+  fingerprints, *or* two passes under the same model and the same
+  fingerprint — classifying this week's import the same way as last
+  week's is the ordinary case): they merge into one card if their photos
+  overlap — which is the correct de-duplication, and the fingerprint
+  filter still separates them when the user asks. (This is a cross-*run*
+  merge — the run keys are disjoint — so §2's "Within-run subject
+  partition is authoritative on the edge" rule permits it, unlike the
+  same-run case below. The same-configuration half of this case only
+  works because run identity is a persisted per-pass token; under a
+  `(classifier_model, labels_fingerprint)` proxy those two passes would
+  read as one run and never merge.)
 - **Distinct same-taxon subjects on one photo.** One classify run
   can — and routinely does — produce two nodes on the same photo that
   both predict the same taxon: a real Blue Tit box in one `group_id`
@@ -3228,8 +3373,9 @@ caeruleus*") on the Keywords page with a one-click merge.
   split, based on image evidence the Review layer no longer has. §2's
   edge rule ("Within-run subject partition is authoritative on the
   edge") preserves the choice: no `(taxon_key, overlapping photos)`
-  edge is drawn between two nodes that share
-  `(classifier_model, labels_fingerprint)`, so the two subjects
+  edge is drawn between two nodes whose run keys intersect — the
+  grouped/singleton pair included, which is why the run token is
+  persisted per row and not only inside `group_id` — so the two subjects
   render as two separate cards and one accept-or-reject decision does
   not silently resolve the other. The **cross-run** case — a second
   classifier also produces its own real-vs-false split for the same
@@ -3300,25 +3446,42 @@ caeruleus*") on the Keywords page with a one-click merge.
 
 Each phase lands as its own PR and is independently useful.
 
-0. **Collision-resistant `group_id` in `_store_grouped_predictions`**
-   (prerequisite of Phase 3; see §2 "Node identity"). Change the ID
-   template from `f"g{job_id[-6:]}-{group_count:04d}"` to
-   `f"g{secrets.token_hex(16)}-{group_count:04d}"`. Neither the
+0. **Per-pass run token: collision-resistant `group_id` + a persisted
+   run identity** (prerequisite of Phase 3; see §2 "Node identity" and
+   "Run key"). Mint `run_token = secrets.token_hex(16)` once per
+   `_store_grouped_predictions` call and change the ID template from
+   `f"g{job_id[-6:]}-{group_count:04d}"` to
+   `f"g{run_token}-{group_count:04d}"`. Neither the
    truncated nor the *full* `job_id` is acceptable: `JobRunner` resets
    `_enqueue_counter` to `0` on every process start (`jobs.py:112,
    687-689`), so `job_id` is unique only within a process and a
-   restart plus a backward clock adjustment can re-mint one. Tests:
-   the same job's group IDs remain distinct; two independently minted
+   restart plus a backward clock adjustment can re-mint one. Add
+   `predictions.run_token TEXT` (`ALTER TABLE`, nullable, `db_meta`
+   marker — not `user_version`), stamp it on every row the pass stores,
+   and refresh it on the `_existing` reuse branch alongside the existing
+   group-metadata update/clear so token and partition always come from
+   the same pass. Tests:
+   the same pass's group IDs remain distinct; two independently minted
    jobs' group IDs are always distinct across every combination of
    `classifier_model` × `labels_fingerprint`; a **restart-collision
    fixture** — two jobs of the same `job_type` given the *same*
    `job_id` (simulating a `_enqueue_counter` reset with a repeated
    wall-clock millisecond) still mint disjoint `group_id`s, which the
-   full-`job_id` template would have failed; existing consumers of
+   full-`job_id` template would have failed; a **run-token pairing
+   fixture** — every row a single pass stores shares one token, that
+   token is the prefix of every `group_id` the pass minted, and two
+   passes with the *same* `(classifier_model, labels_fingerprint)` get
+   different tokens; a **regroup fixture** — a row grouped by pass 1 and
+   re-seen (regrouped, or ungrouped via `clear_prediction_group_info`)
+   by pass 2 ends up carrying pass 2's token, not pass 1's; a
+   **legacy-namespace fixture** — a pre-migration row's run key is
+   `legacy:{model}:{fp}` and never equals any stamped token; existing
+   consumers of
    `group_id` (`add_prediction`, `prediction_review.group_id`,
    `_folded_species_key`, the review-endpoint dedup path) accept the
-   longer string unchanged (opaque). No schema change; no read-side
-   change; safe to land ahead of the merge feature.
+   longer string unchanged (opaque). One additive nullable column, no
+   backfill, no read-side change; safe to land ahead of the merge
+   feature.
 
    Same phase, same file, same "stop generating the mess" character:
    **backfill a `NULL` `scientific_name` on the reuse path.** The
@@ -3398,10 +3561,21 @@ Each phase lands as its own PR and is independently useful.
    `labels_fingerprint`, run back-to-back so their timestamps land in
    the same second and their per-job group counters both start at 1)
    mint distinct `group_id`s under the Phase 0 write path — 128 bits
-   of entropy per group makes them different by construction — so
+   of entropy per pass makes them different by construction — so
    their `(classifier_model, labels_fingerprint, group_id,
    species_key)` nodes are distinct and their disjoint bursts stay as
-   two separate cards; **legacy-collision
+   two separate cards; a **cross-pass same-configuration fixture** —
+   two passes sharing a `classifier_model` and `labels_fingerprint`
+   whose same-taxon groups *overlap* on photos: assert they merge into
+   **one** card, which the `(classifier_model, labels_fingerprint)`
+   proxy would have suppressed as if the two passes were one run; its
+   mirror, a **within-pass split fixture** — one pass producing two
+   same-taxon nodes on the same photos, one grouped and one singleton
+   (so the split is not visible in `group_id` alone), stays **two**
+   cards because both rows carry that pass's `run_token`; a
+   **legacy-suppression fixture** — two pre-Phase-0 rows with the same
+   `(classifier_model, labels_fingerprint)` and no `run_token` keep
+   today's suppression through the `legacy:` namespace; **legacy-collision
    split fixture** — the same fixture built with legacy pre-Phase-0
    rows (same short suffix + counter, colliding `group_id`) where the
    two bursts are of *different* species resolves as two cards,
@@ -4113,9 +4287,22 @@ Each phase lands as its own PR and is independently useful.
    *shows* the button rather than hiding it on a zero pending-row count;
    under an active filter the same click issues one `node_id` mutation
    per displayed node with the scope tuple, and rows the filter hid stay
-   pending; a **keyboard-shortcut fixture** — `A` on the first visible
-   merged card accepts every member of that card and only that card,
-   matching what a click on its "Accept all" button does; an
+   pending; an **actionable-set fixture** — the `all` tab holding four
+   cards, one each `{pending}`, `{accepted}`, `{rejected}` and
+   `{pending, rejected}`: "Accept All" issues **exactly two** mutations
+   (the pending and the mixed card), the button reads "Accept All (2)",
+   the terminal accepted and rejected cards are byte-identical
+   afterwards — in particular the rejected card is still rejected, which
+   a loop over `getVisibleItems()` reverses — and the summary names the
+   overridden rejection inside the mixed card; a **keyboard-shortcut
+   fixture** — `A` on the first visible merged card accepts every member
+   of that card and only that card, matching what a click on its "Accept
+   all" button does, and its two counterparts on the same actionable
+   set: with a `mixed` card sorted first, `A` targets *it* (a
+   `status === 'pending'` filter would skip to a later card or no-op
+   entirely), and on a view whose visible cards are all terminal both
+   `A` and `S` are no-ops rather than mutating `getVisibleItems()[0]`;
+   an
    **excluded-path fixture** — `acceptAlternative` on a member of a
    merged card still POSTs the legacy per-prediction endpoint, touches
    only that detection's rows, and leaves the card rendering `mixed`

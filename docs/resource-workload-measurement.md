@@ -74,10 +74,14 @@ window ends. Repeat the same sequence when comparing builds or resource policy.
 
 The `summary.targets` object reports the initial responsiveness gates:
 
-- Jobs API 95th-percentile (`p95`) latency below 500 milliseconds.
+- Jobs API 95th-percentile (`p95`) latency below 500 milliseconds. The gate
+  additionally requires zero failed samples during the run.
 - System idle CPU 5th-percentile (`p05`) of at least 10 percent.
 - No equal-key embedding single-flight violations.
-- The Vireo executable remained present for the complete run.
+- The Vireo executable remained present for the complete run. Reported as
+  `null` when the executable path could not be read (for example on hosts
+  that deny `psutil` inspection) — the gate has to be verified manually
+  in that case rather than reported as passed.
 
 The summary also includes CPU and resident-memory distributions, resource-wait
 deltas, maximum queued jobs and waiters, cache hits, producer starts and joins,

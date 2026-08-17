@@ -16,7 +16,6 @@ import json
 import math
 import os
 import platform
-import re
 import socket
 import sys
 import time
@@ -72,55 +71,22 @@ def _number_summary(values):
     }
 
 
-# URLs — cover before path patterns so "http://…" isn't split by the path REs.
-_URL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s]+")
-# Absolute unix paths ("/foo/bar") anchored to a start-of-string or whitespace so
-# fractions such as "1/3" in job phase strings are not misread as paths.  The
-# body accepts any non-delimiter character so unicode segments (``/家族/写真``)
-# and library names with spaces (``/My Photos``) redact instead of leaking.
-_UNIX_PATH_RE = re.compile(r"(?:(?<=\s)|^)/[^:\r\n\"']+")
-# Windows drive-letter paths ("C:\Users\..." or "C:/Users/..."), also accepting
-# any non-delimiter character in the body so unicode and spaced segments match.
-_WIN_PATH_RE = re.compile(r"\b[A-Za-z]:[\\/][^:\r\n\"']+")
-# Filenames with a common-shaped extension (`name.ext`, extension starts with a
-# letter and is 2-8 chars long) so numeric fragments like "1.2" are ignored.
-# `\w` is unicode-aware in Python 3, so `写真.raw` is redacted the same way as
-# `capture.nef`.
-_FILENAME_RE = re.compile(r"\b[\w\-]+\.[A-Za-z][A-Za-z0-9]{1,7}\b")
-
-
-def _sanitize_phase(phase):
-    """Strip filesystem paths and filenames from a job phase string.
-
-    `vireo/app.py` builds phase text such as ``"Scanning root 1 of 2:
-    /private/photos"`` and ``"Downloading 1/3: capture.nef..."``.  Reports
-    promise to exclude filenames and full paths, so before including a phase
-    in the sanitized report we redact any URL, path, or filename tokens it
-    contains — including unicode segments and paths that carry spaces.
-    Returns ``None`` when the sanitized value would be empty.
-    """
-    if not isinstance(phase, str):
-        return None
-    sanitized = _URL_RE.sub("[url]", phase)
-    sanitized = _WIN_PATH_RE.sub("[path]", sanitized)
-    sanitized = _UNIX_PATH_RE.sub("[path]", sanitized)
-    sanitized = _FILENAME_RE.sub("[file]", sanitized)
-    sanitized = sanitized.strip()
-    return sanitized or None
-
-
 def _compact_progress(progress):
     if not isinstance(progress, dict):
         return {}
-    compact = {
+    # `phase` is intentionally omitted.  Vireo builds phase text from a mix
+    # of generic labels ("Importing photos"), user-derived folder names
+    # ("Copying <folder> locally"), absolute paths ("Scanning root 1 of
+    # 2: /photos"), and filenames ("Downloading 1/3: capture.nef..."), and
+    # no path/URL/filename regex can reliably tell the safe ones apart from
+    # phrases that leak library contents.  The numeric progress
+    # (current/total/rate) and the generated `stage_id` are enough to
+    # correlate steps across polls without exposing free-form text.
+    return {
         key: progress[key]
         for key in ("current", "total", "stage_id", "rate")
         if progress.get(key) is not None
     }
-    phase = _sanitize_phase(progress.get("phase"))
-    if phase is not None:
-        compact["phase"] = phase
-    return compact
 
 
 def _compact_job(job, source):
@@ -500,10 +466,19 @@ def build_summary(baseline, samples):
         baseline.get("workload_metrics", {}).get("embedding_cache")
         and final_api.get("workload_metrics", {}).get("embedding_cache")
     )
-    executable_present = all(
-        sample["process"].get("executable_exists") is not False
-        for sample in samples
-    )
+    # `executable_exists` is tri-state: True (verified present), False
+    # (verified missing at some point), or None (unknown — e.g. psutil
+    # `AccessDenied` on `Process.exe()`).  Treating unknown as True would
+    # let the trustworthiness gate falsely pass in restricted environments,
+    # so require an explicit True to pass, an explicit False to fail, and
+    # otherwise surface the gate as None.
+    executable_states = [sample["process"].get("executable_exists") for sample in samples]
+    if not executable_states or any(state is False for state in executable_states):
+        executable_present = False
+    elif all(state is True for state in executable_states):
+        executable_present = True
+    else:
+        executable_present = None
     return {
         "sample_count": len(samples),
         "api_failure_count": api_failure_count,
@@ -584,7 +559,19 @@ def collect_workload(
             })
             if monotonic() >= deadline:
                 break
-            next_sample = min(next_sample + interval, deadline)
+            next_sample += interval
+            # If a poll (or another sampler) ran longer than `interval`,
+            # `next_sample` is now in the past.  Firing back-to-back
+            # catch-up polls would both add load to an already unresponsive
+            # server and record CPU samples over abnormally short windows,
+            # contaminating the resource and latency distributions this
+            # tool is meant to compare — skip the missed slots so the
+            # sampling schedule stays aligned to the original cadence.
+            now = monotonic()
+            if next_sample < now:
+                slots_missed = math.ceil((now - next_sample) / interval)
+                next_sample += slots_missed * interval
+            next_sample = min(next_sample, deadline)
     except KeyboardInterrupt:
         interrupted = True
     if not samples:

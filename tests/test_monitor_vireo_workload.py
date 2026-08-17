@@ -166,6 +166,138 @@ def test_collect_workload_builds_deltas_targets_and_job_summary():
     assert summary["jobs"][0]["observed_resource_wait_seconds"] == 2.5
 
 
+def test_slow_poll_skips_missed_slots_instead_of_firing_back_to_back():
+    """A single poll that takes longer than `--interval` (a transient
+    slow request, for example) previously left `next_sample` in the past
+    and caused back-to-back catch-up polls that contaminate CPU/latency
+    distributions.  Missed slots must be skipped instead so the sampling
+    cadence stays honest.
+    """
+    clock = _FakeClock()
+
+    class _SlowApi:
+        def __init__(self):
+            self.calls = 0
+
+        def authenticate(self):
+            pass
+
+        def sample(self):
+            self.calls += 1
+            # Loop iteration #1 (call #2 overall) takes 5s — more than
+            # the 2s interval.
+            if self.calls == 2:
+                clock.sleep(5.0)
+            return _api_sample(
+                latency=0.001, wait_count=0, wait_seconds=0.0,
+                producer_starts=0, waiter_joins=0,
+            )
+
+    api = _SlowApi()
+    n = 8
+    process = _SequenceSampler(
+        [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True}
+         for _ in range(n)],
+        {"pid": 123, "executable_exists": True},
+    )
+    system = _SequenceSampler(
+        [{"cpu_idle_percent": 50.0} for _ in range(n)],
+        {"logical_cpu_count": 16},
+    )
+
+    report = collect_workload(
+        duration=10.0,
+        interval=2.0,
+        api_client=api,
+        process_sampler=process,
+        system_sampler=system,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    elapsed = [sample["elapsed_seconds"] for sample in report["samples"]]
+    # No two adjacent samples may collapse into a back-to-back burst.
+    for prev, cur in zip(elapsed, elapsed[1:], strict=False):
+        assert cur - prev >= 2.0, f"back-to-back polls at {prev}s → {cur}s"
+    # We expected samples at approximately t=2 (fast), then t=8 and t=10
+    # after skipping the missed slots at 4 and 6 — never at t=7 (immediate
+    # after the slow poll ended).
+    assert elapsed == [2.0, 8.0, 10.0]
+
+
+def test_executable_target_is_none_when_presence_is_unknown():
+    """When psutil can't read `Process.exe()` (e.g. `AccessDenied`),
+    every sample reports `executable_exists=None`.  The old predicate
+    treated None as success and made the trustworthiness gate falsely
+    pass; the gate should now surface as None ("unknown") in that case.
+    """
+    clock = _FakeClock()
+    api = _SequenceApi([
+        _api_sample(
+            latency=0.001, wait_count=0, wait_seconds=0.0,
+            producer_starts=0, waiter_joins=0,
+        ),
+        _api_sample(
+            latency=0.001, wait_count=0, wait_seconds=0.0,
+            producer_starts=0, waiter_joins=0,
+        ),
+    ])
+    process = _SequenceSampler(
+        [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": None}],
+        {"pid": 123, "executable_exists": None},
+    )
+    system = _SequenceSampler(
+        [{"cpu_idle_percent": 50.0}],
+        {"logical_cpu_count": 16},
+    )
+
+    report = collect_workload(
+        duration=1.0,
+        interval=1.0,
+        api_client=api,
+        process_sampler=process,
+        system_sampler=system,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert report["summary"]["targets"]["vireo_executable_present_throughout"] is None
+
+
+def test_executable_target_is_false_when_presence_verified_missing():
+    clock = _FakeClock()
+    api = _SequenceApi([
+        _api_sample(
+            latency=0.001, wait_count=0, wait_seconds=0.0,
+            producer_starts=0, waiter_joins=0,
+        ),
+        _api_sample(
+            latency=0.001, wait_count=0, wait_seconds=0.0,
+            producer_starts=0, waiter_joins=0,
+        ),
+    ])
+    process = _SequenceSampler(
+        [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": False}],
+        {"pid": 123, "executable_exists": False},
+    )
+    system = _SequenceSampler(
+        [{"cpu_idle_percent": 50.0}],
+        {"logical_cpu_count": 16},
+    )
+
+    report = collect_workload(
+        duration=1.0,
+        interval=1.0,
+        api_client=api,
+        process_sampler=process,
+        system_sampler=system,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert report["summary"]["targets"]["vireo_executable_present_throughout"] is False
+
+
 def test_job_summary_tracks_history_only_jobs_and_ignores_baseline_history():
     """A short job (e.g. a cached embedding request) may start and finish
     between two polling intervals, appearing only in `history`.  Such jobs
@@ -318,10 +450,10 @@ def test_compact_jobs_payload_removes_paths_configs_results_and_filenames():
     assert "/private" not in encoded
     assert "private-name" not in encoded
     assert "Private workspace" not in encoded
+    # `phase` is deliberately dropped even when its content looks safe.
     assert compact["jobs"][0]["progress"] == {
         "current": 2,
         "total": 10,
-        "phase": "Detecting",
     }
 
 
@@ -355,107 +487,53 @@ def test_compact_jobs_payload_omits_user_derived_step_labels():
     assert "My Vacation 2024" not in json.dumps(compact)
 
 
-def test_compact_jobs_payload_sanitizes_unicode_spaced_and_windows_paths_from_phase():
-    """Real-world job phase strings may embed unicode segments (``/家族/写真``),
-    library paths with spaces (``/My Photos``), and Windows drive paths — none
-    of which can be allowed to leak into the sanitized report.
+def test_compact_progress_drops_free_form_phase_entirely():
+    """Phase text is a mix of generic labels ("Importing photos"), paths
+    ("Scanning root 1 of 2: /private/photos"), filenames ("Downloading 1/3:
+    capture.nef..."), and user folder names ("Copying My Vacation locally").
+    No regex can reliably split the safe from the unsafe, so `_compact_progress`
+    omits the phase field entirely and reports only numeric progress plus
+    `stage_id`.
     """
+    unsafe_phases = [
+        "Scanning root 1 of 2: /private/photos",
+        "Scanning root 1 of 2: /家族/写真",
+        "Scanning C:\\Program Files\\Vireo\\lib",
+        "Downloading 1/3: capture.nef...",
+        "Retrying secret.raw in 3s ...",
+        "Copying My Vacation 2024 locally",
+        "Syncing Птицы to remote",
+        "Importing photos",  # generic — still dropped
+    ]
     compact = compact_jobs_payload({
         "active": [
             {
-                "id": "unicode-scan",
+                "id": f"job-{i}",
                 "type": "scan",
                 "status": "running",
-                "progress": {"phase": "Scanning root 1 of 2: /家族/写真"},
-            },
-            {
-                "id": "spaces-scan",
-                "type": "scan",
-                "status": "running",
-                "progress": {"phase": "Scanning root 1 of 2: /My Photos/Family"},
-            },
-            {
-                "id": "win-scan",
-                "type": "scan",
-                "status": "running",
-                "progress": {"phase": "Scanning C:\\Program Files\\Vireo\\lib"},
-            },
-            {
-                "id": "unicode-file",
-                "type": "scan",
-                "status": "running",
-                "progress": {"phase": "Downloading 写真.raw..."},
-            },
+                "progress": {
+                    "current": i,
+                    "total": 10,
+                    "phase": phase,
+                    "stage_id": "walk",
+                },
+            }
+            for i, phase in enumerate(unsafe_phases)
         ],
         "history": [],
         "resource_budget": {"waiters": 0},
     })
 
     encoded = json.dumps(compact, ensure_ascii=False)
-    assert "家族" not in encoded
-    assert "My Photos" not in encoded
-    assert "Family" not in encoded
-    assert "Program Files" not in encoded
-    assert "写真.raw" not in encoded
-
-    assert compact["jobs"][0]["progress"]["phase"] == "Scanning root 1 of 2: [path]"
-    assert compact["jobs"][1]["progress"]["phase"] == "Scanning root 1 of 2: [path]"
-    assert compact["jobs"][2]["progress"]["phase"] == "Scanning [path]"
-    assert compact["jobs"][3]["progress"]["phase"] == "Downloading [file]..."
-
-
-def test_compact_jobs_payload_sanitizes_paths_and_filenames_from_phase():
-    """`progress.phase` carries strings like ``Scanning root 1 of 2:
-    /private/photos``; the sanitized report must not leak that path.
-    """
-    compact = compact_jobs_payload({
-        "active": [
-            {
-                "id": "scan-1",
-                "type": "scan",
-                "status": "running",
-                "progress": {
-                    "current": 5,
-                    "total": 10,
-                    "phase": "Scanning root 1 of 2: /private/photos",
-                },
-                "steps": [{
-                    "id": "walk",
-                    "label": "Walk",
-                    "status": "running",
-                    "progress": {
-                        "current": 3,
-                        "total": 5,
-                        "phase": "Downloading 1/3: capture.nef...",
-                    },
-                }],
-            },
-            {
-                "id": "scan-2",
-                "type": "scan",
-                "status": "running",
-                "progress": {
-                    "current": 1,
-                    "total": 4,
-                    "phase": "Retrying secret.raw in 3s ...",
-                },
-            },
-        ],
-        "history": [],
-        "resource_budget": {"waiters": 0},
-    })
-
-    encoded = json.dumps(compact)
-    assert "/private" not in encoded
-    assert "capture.nef" not in encoded
-    assert "secret.raw" not in encoded
-
-    scan1_phase = compact["jobs"][0]["progress"]["phase"]
-    assert scan1_phase == "Scanning root 1 of 2: [path]"
-    step_phase = compact["jobs"][0]["running_steps"][0]["progress"]["phase"]
-    # "1/3" is a fraction, not a path, and must survive the sanitizer.
-    assert step_phase == "Downloading 1/3: [file]..."
-    assert compact["jobs"][1]["progress"]["phase"] == "Retrying [file] in 3s ..."
+    for fragment in (
+        "/private", "家族", "写真", "Program Files", "capture.nef",
+        "secret.raw", "My Vacation", "Птицы", "Importing photos",
+    ):
+        assert fragment not in encoded, f"phase text {fragment!r} leaked into report"
+    for job in compact["jobs"]:
+        assert "phase" not in job["progress"]
+        assert job["progress"]["stage_id"] == "walk"
+        assert "current" in job["progress"] and "total" in job["progress"]
 
 
 def test_api_client_establishes_browser_cookie_before_reading_jobs():

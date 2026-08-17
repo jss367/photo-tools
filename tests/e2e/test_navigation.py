@@ -41,6 +41,29 @@ def test_workspace_dropdown_shows_current(live_server, page):
     expect(dropdown).to_contain_text("Default")
 
 
+def test_workspace_dropdown_does_not_wait_for_active_workspace(live_server, page):
+    """Workspace names render while the heavier active lookup is pending."""
+    url = live_server["url"]
+    held_active_requests = []
+
+    def hold_active_request(route):
+        held_active_requests.append(route)
+
+    page.route("**/api/workspaces/active", hold_active_request)
+    page.goto(f"{url}/browse")
+    page.click("[data-testid='workspace-dropdown']")
+
+    # The active-workspace response is still paused, but the lightweight
+    # workspace list should already be usable.
+    expect(page.locator(".ws-menu-item", has_text="Field Work")).to_be_visible(
+        timeout=1500
+    )
+    assert held_active_requests
+
+    for route in held_active_requests:
+        route.abort()
+
+
 def test_workspace_switch(live_server, page):
     """Switching workspace updates the dropdown to show the new workspace."""
     url = live_server["url"]

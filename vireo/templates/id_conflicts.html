@@ -570,7 +570,12 @@ async function jsonFetch(url, options) {
     // failure after that commit is indistinguishable from one before it at
     // this end. Callers must not report the second as "not applied".
     err.status = resp.status;
-    err.answered = resp.status >= 400 && resp.status < 500;
+    // An `error` body is itself the answer: the server got far enough to
+    // explain the refusal in its own words, whatever status it chose to send
+    // it under. Classifying on the status alone reported those as unconfirmed,
+    // which understates what we know — so both shapes count as answered, and
+    // only a status-only failure (5xx, or a fetch that threw) stays unknown.
+    err.answered = Boolean(data.error) || (resp.status >= 400 && resp.status < 500);
     throw err;
   }
   return data;

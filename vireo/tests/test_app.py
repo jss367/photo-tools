@@ -19787,12 +19787,18 @@ def test_browse_prediction_panels_refresh_on_keyword_edits(app_and_db):
     assert first_return == -1 or refresh_at < first_return
 
 
-def test_browse_prediction_panels_refresh_on_undo_and_redo(app_and_db):
+def test_browse_sidebar_panels_refresh_on_undo_and_redo(app_and_db):
     """Undo/redo lives in the navbar and writes straight to the database.
 
-    Undoing a ``prediction_accept`` returns the row to pending and strips
-    the keyword, so Browse's panel — which offered the Undo toast in the
-    first place — must not keep rendering the accepted state.
+    Undoing a ``prediction_accept`` reverts *both* halves of the accept: the
+    row returns to pending and the species keyword it wrote is stripped. Each
+    half has its own panel in Browse's right sidebar, so refreshing only the
+    prediction panels leaves the Keywords section listing a keyword the
+    database no longer holds — the same falsehood in the other direction.
+
+    So the handler goes through one sidebar-wide chokepoint rather than
+    naming the panel that happens to be wrong today, and a panel added to
+    that sidebar later is refreshed by default.
     """
     app, _ = app_and_db
     client = app.test_client()
@@ -19802,10 +19808,24 @@ def test_browse_prediction_panels_refresh_on_undo_and_redo(app_and_db):
     )
     assert listener_at != -1, "Browse must listen for undo/redo"
     handler = html[listener_at: listener_at + 700]
-    assert (
-        "refreshPredictionPanels" in handler
-        or "_refreshBrowseKeywordState" in handler
+    assert "refreshBrowseSidebarPanels(" in handler, (
+        "undo/redo must repaint the whole sidebar, not one panel"
     )
+    body = _browse_js_function_body(
+        html, "function refreshBrowseSidebarPanels(",
+    )
+    # The prediction half.
+    assert "refreshPredictionPanels(" in body
+    # The keyword half: the single-photo Keywords section repaints via
+    # loadDetail, the multi-selection one via the batch suggestions loader —
+    # whose cache key must be cleared first, since the selection has not
+    # changed here, only the state its rows are computed from.
+    assert "loadDetail(" in body
+    assert "loadSelectionKeywordSuggestions(" in body
+    key_at = body.find("selectionKeywordKey = ''")
+    assert key_at != -1 and key_at < body.find(
+        "loadSelectionKeywordSuggestions("
+    ), "stale selection key would make the keyword refresh a no-op"
 
 
 def test_browse_review_deep_link_clears_persisted_filters(app_and_db):

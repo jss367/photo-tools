@@ -7124,7 +7124,9 @@ function openPredictionInReview(photoId) {
 // mutation already passes through:
 //   * `_refreshBrowseKeywordState` — every keyword write in Browse calls it,
 //     because card badges have to be refetched anyway;
-//   * the `vireo:edit-history-changed` document event — undo and redo;
+//   * `refreshBrowseSidebarPanels`, off the `vireo:edit-history-changed`
+//     document event — undo and redo, which revert keywords and prediction
+//     rows together and so repaint the whole sidebar;
 //   * `_afterPredictionMutation` / `rejectDetailPredictions` — status writes.
 // A future keyword mutation path therefore gets panel freshness for free.
 //
@@ -7149,17 +7151,44 @@ function refreshPredictionPanels(opts) {
 }
 
 // Undo/redo lives in the shared navbar and writes straight to the database:
-// undoing a `prediction_accept` returns the row to pending and strips the
-// keyword it added. Without this listener Browse keeps rendering the accepted
-// state — a status tag, no Accept button — until the photo is reselected,
-// even though the toast that offered the undo was Browse's own. Review has
-// listened for this event since it shipped.
+// undoing a `prediction_accept` returns the row to pending AND strips the
+// keyword it added. Both halves of that revert have a panel in Browse's right
+// sidebar, so an undo that repainted only the prediction panels left the
+// Keywords section listing a keyword the database no longer holds — the same
+// falsehood in the other direction.
+//
+// Undo/redo is the one mutation source Browse cannot route through its own
+// call sites: the navbar writes and then announces. So this repaints the
+// sidebar wholesale rather than naming the panel that happens to be wrong
+// today, and a panel added to that sidebar later is refreshed by default
+// instead of silently going stale until someone notices.
+function refreshBrowseSidebarPanels() {
+  var selection = getActiveSelection();
+  // Single photo: `loadDetail` re-fetches the photo AND its predictions in one
+  // request, so it refreshes both halves. Tell the prediction half to skip its
+  // own fetch — the `skipDetail` de-duplication `_afterPredictionMutation`
+  // already relies on.
+  var reloadingDetail = selection.length <= 1 && window._detailPhotoId != null;
+  refreshPredictionPanels({skipDetail: reloadingDetail});
+  // Multi-selection: the batch inspector's keyword suggestions are computed
+  // from the selection's current keywords, and its loader early-returns on an
+  // unchanged selection key — which is exactly this case, since the selection
+  // did not move, only the state behind it.
+  if (selection.length > 1) {
+    selectionKeywordKey = '';
+    loadSelectionKeywordSuggestions(selection);
+  } else if (reloadingDetail) {
+    loadDetail(window._detailPhotoId);
+  }
+}
+
 document.addEventListener('vireo:edit-history-changed', function() {
-  // Card badges move with the same edits, so refresh the loaded grid rows
-  // too; that call fans out to refreshPredictionPanels itself.
+  // Card badges move with the same edits, so refresh the loaded grid rows too.
+  // `skipPanels` because the sidebar refresh below is the broader one: without
+  // it the prediction panels would be fetched twice per undo.
   var loadedIds = photos.map(function(photo) { return photo.id; });
-  if (loadedIds.length) _refreshBrowseKeywordState(loadedIds);
-  else refreshPredictionPanels();
+  if (loadedIds.length) _refreshBrowseKeywordState(loadedIds, {skipPanels: true});
+  refreshBrowseSidebarPanels();
 });
 
 // Accepting writes a keyword, so every surface that counts keywords has to be
@@ -7807,12 +7836,15 @@ function _keywordNameFromCache(keywordId) {
 // Refresh the loaded rows from the authoritative batch endpoint after every
 // keyword mutation so taxonomy badges and representative state cannot drift.
 async function _refreshBrowseKeywordState(photoIds, opts) {
+  opts = opts || {};
   // Species keywords are exactly the input the prediction panels' ambiguity
   // and "N missing" counts are computed from, so repaint them here rather
   // than at each keyword call site — see refreshPredictionPanels. Done first,
   // and before the early returns below, so it still runs when the mutated
-  // photos are outside the loaded grid page.
-  refreshPredictionPanels(opts);
+  // photos are outside the loaded grid page. `skipPanels` is for the one
+  // caller that repaints the whole sidebar itself (undo/redo), which would
+  // otherwise fetch the prediction panels twice.
+  if (!opts.skipPanels) refreshPredictionPanels(opts);
   if (!Array.isArray(photoIds) || !photoIds.length) return;
   var loadedIds = new Set(photos.map(function(photo) { return photo.id; }));
   var ids = Array.from(new Set(photoIds)).filter(function(id) {

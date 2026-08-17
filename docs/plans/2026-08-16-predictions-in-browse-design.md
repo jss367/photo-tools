@@ -428,13 +428,29 @@ already passes through:
 | Chokepoint | Covers |
 | --- | --- |
 | `_refreshBrowseKeywordState(ids, opts)` | every keyword write in Browse — `addKeyword`, `removeKeyword`, `applySelectionKeyword`, `removeSelectionKeyword`, the batch keyword modal, `setKeywordType` — because each must refetch card badges anyway |
-| `document` event `vireo:edit-history-changed` | undo and redo, which the navbar performs |
+| `refreshBrowseSidebarPanels()`, off the `document` event `vireo:edit-history-changed` | undo and redo, which the navbar performs |
 | `_afterPredictionMutation` / `rejectDetailPredictions` | prediction status writes |
 
 A future keyword mutation path therefore gets panel freshness for free.
 `opts.skipDetail` is for callers about to run a full `loadDetail` (which
 re-fetches the photo *and* its predictions), so one accept does not issue two
 identical prediction requests.
+
+Undo/redo is the one row in that table that needs a *wider* refresh than the
+prediction panels. Undoing a `prediction_accept` reverts both halves of the
+accept — the row returns to pending *and* the species keyword it wrote is
+stripped — and each half has its own panel in the sidebar, so repainting only
+the prediction panels leaves the Keywords section listing a keyword the
+database no longer holds. It is the same rule pointing the other way. Hence
+`refreshBrowseSidebarPanels()`: it repaints the sidebar wholesale rather than
+naming the panel that happens to be wrong today, so a panel added there later
+is refreshed by default. It branches once on the selection — `loadDetail` for
+a single photo (one request covering the photo *and* its predictions, so the
+prediction half is told to `skipDetail`), `loadSelectionPredictions` plus
+`loadSelectionKeywordSuggestions` for a multi-selection, with both cache keys
+dropped first because the selection has not changed, only the state behind it.
+The grid-card refresh in the same handler passes `opts.skipPanels` so one undo
+does not fetch the prediction panels twice.
 
 **The Review deep link.** "Open in Review" navigates to
 `/review?photo_id=N&filters=<empty expression>`. The explicit empty handoff is
@@ -789,7 +805,12 @@ Conflicts surfaces the new 409s, and "not applied" is a claim about the
 database that only holds when the server answered: these routes commit inside
 `BEGIN IMMEDIATE`, so a dropped connection or a 5xx leaves an outcome this end
 genuinely cannot distinguish. `jsonFetch` therefore carries the response status
-on the error (`err.status`, `err.answered`), the single-row handler reports a
+on the error (`err.status`, `err.answered`). `answered` is true for a 4xx *and*
+for any response carrying an `error` body whatever its status — a body the
+server wrote to explain its refusal is itself the answer, and classifying on
+the status alone reported those as unconfirmed, which understates what this end
+knows. Only a status-only failure (a 5xx, or a fetch that threw) stays unknown.
+The single-row handler reports a
 refusal as a refusal and anything else as "could not confirm the decision", and
 `batchAction` counts the two classes separately in its toast. Both paths reload
 afterwards, which is what actually resolves the ambiguity.
@@ -878,6 +899,10 @@ it has no ambiguity check because there is no winner to pick.
 - The panels' invalidation lives in `_refreshBrowseKeywordState` (before its
   early returns) and in a `vireo:edit-history-changed` listener, so the
   coverage is structural rather than per-call-site.
+- `test_browse_sidebar_panels_refresh_on_undo_and_redo` — the undo/redo
+  handler goes through `refreshBrowseSidebarPanels`, and that function
+  reaches the prediction *and* keyword halves (including clearing the
+  selection keyword cache key before reloading, or the refresh is a no-op).
 - "Open in Review" sends an explicit empty `filters` handoff.
 - `test_browse_detail_prediction_buttons_survive_apostrophe_species` — the
   panel's real renderer is executed under `node` (its own functions, lifted

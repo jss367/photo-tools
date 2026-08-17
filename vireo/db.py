@@ -140,6 +140,7 @@ KEYWORD_SOURCE_CONFLICT_SQL = (
 
 _SQLITE_PARAM_CHUNK_SIZE = 800
 _MISSING_PHOTOS_PROGRESS_INTERVAL = 200
+_WILDLIFE_RETIREMENT_WRITE_CHUNK_SIZE = 100
 
 
 class IncompatibleDatabaseError(RuntimeError):
@@ -3718,112 +3719,131 @@ class Database:
             )
             self.conn.commit()
 
-        # From this point through the final commit, serialize with interactive
-        # keyword writes. The sidecar scan above can take minutes on a large
-        # catalog; a person may explicitly re-add Wildlife while it runs.
-        # Re-read durable provenance only after taking the writer lock so an
-        # association promoted to ``manual`` is neither queued for removal
-        # nor deleted. A later user add waits for this transaction, then the
-        # route's normal add path cancels the migration's flat removal.
-        self.conn.execute("BEGIN IMMEDIATE")
-        still_retirable = {}
-        for photo_id, entry in photo_workspaces.items():
-            candidate_ids = {
-                keyword_id
-                for keyword_id in entry["candidate_keyword_ids"]
-                if self.conn.execute(
-                    """SELECT 1
-                       FROM photo_keywords candidate_pk
-                       JOIN keywords candidate_k
-                         ON candidate_k.id = candidate_pk.keyword_id
-                       WHERE candidate_pk.photo_id = ?
-                         AND candidate_pk.keyword_id = ?
-                         AND (candidate_pk.source IS NULL
-                              OR candidate_pk.source <> 'manual')
-                         AND candidate_k.name = 'Wildlife' COLLATE NOCASE
-                         AND candidate_k.type = 'genre'
-                         AND candidate_k.parent_id IS NULL""",
-                    (photo_id, keyword_id),
-                ).fetchone() is not None
-            }
-            if candidate_ids:
-                candidate_placeholders = ",".join("?" for _ in candidate_ids)
-                has_current_same_name_survivor = self.conn.execute(
-                    f"""SELECT 1
-                        FROM photo_keywords survivor_pk
-                        JOIN keywords survivor_k
-                          ON survivor_k.id = survivor_pk.keyword_id
-                        WHERE survivor_pk.photo_id = ?
-                          AND survivor_k.name = 'Wildlife' COLLATE NOCASE
-                          AND survivor_pk.keyword_id
-                              NOT IN ({candidate_placeholders})
-                        LIMIT 1""",
-                    [photo_id, *candidate_ids],
-                ).fetchone() is not None
-                still_retirable[photo_id] = (
+        # Finalize in bounded writer transactions. The sidecar scan above can
+        # take minutes on a large catalog, during which a person may re-add,
+        # retype, or create another Wildlife keyword. Each chunk takes the
+        # writer lock, revalidates those facts, queues cleanup, and deletes the
+        # exact associations atomically. An edit before the lock is observed;
+        # an edit after the commit follows the normal route and cancels any
+        # now-stale flat removal. Bounding the chunk prevents this background
+        # migration from monopolizing SQLite's single writer for the entire
+        # catalog and turning otherwise-live edit requests into lock errors.
+        retired_photo_ids = set()
+        for photo_chunk in _chunks(
+            photo_workspaces.items(),
+            _WILDLIFE_RETIREMENT_WRITE_CHUNK_SIZE,
+        ):
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                still_retirable = {}
+                for photo_id, entry in photo_chunk:
+                    candidate_ids = {
+                        keyword_id
+                        for keyword_id in entry["candidate_keyword_ids"]
+                        if self.conn.execute(
+                            """SELECT 1
+                               FROM photo_keywords candidate_pk
+                               JOIN keywords candidate_k
+                                 ON candidate_k.id = candidate_pk.keyword_id
+                               WHERE candidate_pk.photo_id = ?
+                                 AND candidate_pk.keyword_id = ?
+                                 AND (candidate_pk.source IS NULL
+                                      OR candidate_pk.source <> 'manual')
+                                 AND candidate_k.name
+                                     = 'Wildlife' COLLATE NOCASE
+                                 AND candidate_k.type = 'genre'
+                                 AND candidate_k.parent_id IS NULL""",
+                            (photo_id, keyword_id),
+                        ).fetchone() is not None
+                    }
+                    if candidate_ids:
+                        candidate_placeholders = ",".join(
+                            "?" for _ in candidate_ids
+                        )
+                        has_current_same_name_survivor = self.conn.execute(
+                            f"""SELECT 1
+                                FROM photo_keywords survivor_pk
+                                JOIN keywords survivor_k
+                                  ON survivor_k.id = survivor_pk.keyword_id
+                                WHERE survivor_pk.photo_id = ?
+                                  AND survivor_k.name
+                                      = 'Wildlife' COLLATE NOCASE
+                                  AND survivor_pk.keyword_id
+                                      NOT IN ({candidate_placeholders})
+                                LIMIT 1""",
+                            [photo_id, *candidate_ids],
+                        ).fetchone() is not None
+                        still_retirable[photo_id] = (
+                            entry,
+                            candidate_ids,
+                            has_current_same_name_survivor,
+                        )
+
+                for photo_id, (
                     entry,
-                    candidate_ids,
+                    _candidate_ids,
                     has_current_same_name_survivor,
-                )
-
-        for photo_id, (
-            entry,
-            _candidate_ids,
-            has_current_same_name_survivor,
-        ) in still_retirable.items():
-            if has_current_same_name_survivor:
-                # Another top-level 'Wildlife' keyword (e.g. type='individual')
-                # still owns the flat XMP subject. Removing it would strip the
-                # surviving user-authored tag from the sidecar, and a later
-                # XMP reconciliation could detach it from the DB. Leave the
-                # sidecar alone and only detach the generated genre row below.
-                continue
-            ws_ids = entry["ws_ids"]
-            target_ws_ids = (
-                ws_ids
-                if ws_ids
-                else ({fallback_workspace} if fallback_workspace is not None else set())
-            )
-            for ws_id in target_ws_ids:
-                existing_remove = self.conn.execute(
-                    """SELECT 1 FROM pending_changes
-                       WHERE photo_id = ? AND workspace_id = ?
-                         AND change_type IN ('keyword_remove', 'keyword_remove_flat')
-                         AND value = 'Wildlife' COLLATE NOCASE
-                       LIMIT 1""",
-                    (photo_id, ws_id),
-                ).fetchone()
-                if existing_remove is None:
-                    self.queue_change(
-                        photo_id,
-                        "keyword_remove_flat",
-                        "Wildlife",
-                        workspace_id=ws_id,
-                        _commit=False,
+                ) in still_retirable.items():
+                    if has_current_same_name_survivor:
+                        # Another top-level 'Wildlife' keyword (for example,
+                        # type='individual') still owns the flat XMP subject.
+                        # Keep its sidecar term while detaching the generated
+                        # genre association below.
+                        continue
+                    ws_ids = entry["ws_ids"]
+                    target_ws_ids = (
+                        ws_ids
+                        if ws_ids
+                        else (
+                            {fallback_workspace}
+                            if fallback_workspace is not None
+                            else set()
+                        )
                     )
+                    for ws_id in target_ws_ids:
+                        existing_remove = self.conn.execute(
+                            """SELECT 1 FROM pending_changes
+                               WHERE photo_id = ? AND workspace_id = ?
+                                 AND change_type IN (
+                                     'keyword_remove', 'keyword_remove_flat'
+                                 )
+                                 AND value = 'Wildlife' COLLATE NOCASE
+                               LIMIT 1""",
+                            (photo_id, ws_id),
+                        ).fetchone()
+                        if existing_remove is None:
+                            self.queue_change(
+                                photo_id,
+                                "keyword_remove_flat",
+                                "Wildlife",
+                                workspace_id=ws_id,
+                                _commit=False,
+                            )
 
-        retired_photo_ids = list(still_retirable.keys())
-        retired_associations = [
-            (photo_id, keyword_id)
-            for photo_id, (
-                _entry,
-                candidate_ids,
-                _has_current_same_name_survivor,
-            ) in still_retirable.items()
-            for keyword_id in candidate_ids
-        ]
-        if retired_associations:
-            # Delete the exact candidate associations. A catalog can contain
-            # case-variant duplicate genre rows (``Wildlife``/``wildlife``),
-            # and provenance is evaluated per keyword ID; deleting every
-            # matching genre from a candidate photo would erase a duplicate
-            # association that the manual-history predicates preserved.
-            self.conn.executemany(
-                """DELETE FROM photo_keywords
-                   WHERE photo_id = ? AND keyword_id = ?
-                     AND (source IS NULL OR source <> 'manual')""",
-                retired_associations,
-            )
+                retired_associations = [
+                    (photo_id, keyword_id)
+                    for photo_id, (
+                        _entry,
+                        candidate_ids,
+                        _has_current_same_name_survivor,
+                    ) in still_retirable.items()
+                    for keyword_id in candidate_ids
+                ]
+                if retired_associations:
+                    # Delete only the exact candidates revalidated under this
+                    # chunk's writer lock. The source predicate is repeated as
+                    # a final fail-safe against future code movement.
+                    self.conn.executemany(
+                        """DELETE FROM photo_keywords
+                           WHERE photo_id = ? AND keyword_id = ?
+                             AND (source IS NULL OR source <> 'manual')""",
+                        retired_associations,
+                    )
+                self.conn.commit()
+                retired_photo_ids.update(still_retirable)
+            except Exception:
+                self.conn.rollback()
+                raise
         # Only stamp the completion marker if every candidate photo was
         # actually inspected. When a previously-imported sidecar is offline
         # we cannot tell whether its Wildlife association is generated or

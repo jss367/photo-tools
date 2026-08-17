@@ -15611,7 +15611,11 @@ def test_retire_builtin_wildlife_handles_photo_counts_over_bind_limit(tmp_path):
     ``SQLITE_MAX_VARIABLE_NUMBER`` (999 on legacy builds). This asserts the
     background upgrade pass succeeds when its photo set spans multiple chunks.
     """
-    from db import _SQLITE_PARAM_CHUNK_SIZE, Database
+    from db import (
+        _SQLITE_PARAM_CHUNK_SIZE,
+        _WILDLIFE_RETIREMENT_WRITE_CHUNK_SIZE,
+        Database,
+    )
     db = Database(str(tmp_path / "test.db"))
     ws = db.create_workspace("ws")
     db.set_active_workspace(ws)
@@ -15641,7 +15645,18 @@ def test_retire_builtin_wildlife_handles_photo_counts_over_bind_limit(tmp_path):
     db.conn.commit()
     db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
 
+    traced_statements = []
+    db.conn.set_trace_callback(traced_statements.append)
     assert db.retire_builtin_wildlife_genre() == total
+    db.conn.set_trace_callback(None)
+
+    writer_chunks = [
+        statement for statement in traced_statements
+        if statement == "BEGIN IMMEDIATE"
+    ]
+    assert len(writer_chunks) == (
+        total + _WILDLIFE_RETIREMENT_WRITE_CHUNK_SIZE - 1
+    ) // _WILDLIFE_RETIREMENT_WRITE_CHUNK_SIZE
 
     remaining = db.conn.execute(
         "SELECT COUNT(*) AS c FROM photo_keywords WHERE keyword_id = ?",

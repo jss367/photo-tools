@@ -3732,9 +3732,17 @@ class Database:
                 keyword_id
                 for keyword_id in entry["candidate_keyword_ids"]
                 if self.conn.execute(
-                    """SELECT 1 FROM photo_keywords
-                       WHERE photo_id = ? AND keyword_id = ?
-                         AND (source IS NULL OR source <> 'manual')""",
+                    """SELECT 1
+                       FROM photo_keywords candidate_pk
+                       JOIN keywords candidate_k
+                         ON candidate_k.id = candidate_pk.keyword_id
+                       WHERE candidate_pk.photo_id = ?
+                         AND candidate_pk.keyword_id = ?
+                         AND (candidate_pk.source IS NULL
+                              OR candidate_pk.source <> 'manual')
+                         AND candidate_k.name = 'Wildlife' COLLATE NOCASE
+                         AND candidate_k.type = 'genre'
+                         AND candidate_k.parent_id IS NULL""",
                     (photo_id, keyword_id),
                 ).fetchone() is not None
             }

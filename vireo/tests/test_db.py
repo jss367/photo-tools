@@ -14422,7 +14422,11 @@ def test_retire_builtin_wildlife_detaches_associations_and_queues_flat_removal(t
 
 @pytest.mark.parametrize(
     ("concurrent_change", "expected_retired"),
-    [("promote_candidate", 0), ("add_same_name_survivor", 1)],
+    [
+        ("promote_candidate", 0),
+        ("retype_candidate", 0),
+        ("add_same_name_survivor", 1),
+    ],
 )
 def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
     tmp_path, monkeypatch, concurrent_change, expected_retired,
@@ -14474,6 +14478,10 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
                 concurrent_db.tag_photo(
                     photo_id, wildlife_id, source="manual",
                 )
+            elif concurrent_change == "retype_candidate":
+                concurrent_db.update_keyword(
+                    wildlife_id, type="individual",
+                )
             else:
                 survivor_id = concurrent_db.conn.execute(
                     "INSERT INTO keywords (name, type) "
@@ -14495,6 +14503,12 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
     if concurrent_change == "promote_candidate":
         assert genre_association is not None
         assert genre_association["source"] == "manual"
+    elif concurrent_change == "retype_candidate":
+        assert genre_association is not None
+        assert db.conn.execute(
+            "SELECT type FROM keywords WHERE id = ?",
+            (wildlife_id,),
+        ).fetchone()["type"] == "individual"
     else:
         assert genre_association is None
         assert db.conn.execute(

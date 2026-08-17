@@ -2989,12 +2989,20 @@ async function loadPhoto(photoId, opts) {
 }
 
 function initEditorKeyboard() {
+  function isActivationControl(t, tag) {
+    var role = t && t.getAttribute ? t.getAttribute('role') : null;
+    return tag === 'button' || tag === 'a' || tag === 'summary' || tag === 'label' ||
+      role === 'button' || role === 'link' || role === 'menuitem' || role === 'tab';
+  }
   document.addEventListener('keydown', function(e) {
     var t = e.target;
     var tag = t && t.tagName ? t.tagName.toLowerCase() : '';
     var isTextEntry = tag === 'input' || tag === 'textarea' || tag === 'select' ||
       (t && t.isContentEditable);
-    if ((e.key === ' ' || e.code === 'Space') && !e.metaKey && !e.ctrlKey && !e.altKey && !isTextEntry) {
+    if ((e.key === ' ' || e.code === 'Space') && !e.metaKey && !e.ctrlKey && !e.altKey &&
+        !isTextEntry && !isActivationControl(t, tag)) {
+      // Skip when focus is on a button/link/summary/role="button" so Space
+      // still triggers the control's native activation instead of pan mode.
       window.setEditorSpacePan(true);
       e.preventDefault();
       return;
@@ -3009,9 +3017,7 @@ function initEditorKeyboard() {
       // summary, role="button") so tabbing to Reset All / Back / a transform
       // button and pressing Enter still triggers that control. No-op when
       // there's nothing to save so it doesn't fire on an unchanged photo.
-      var role = t && t.getAttribute ? t.getAttribute('role') : null;
-      if (tag === 'button' || tag === 'a' || tag === 'summary' || tag === 'label' ||
-          role === 'button' || role === 'link' || role === 'menuitem' || role === 'tab') return;
+      if (isActivationControl(t, tag)) return;
       var saveBtn = document.getElementById('saveBtn');
       if (saveBtn && !saveBtn.disabled) { e.preventDefault(); saveRecipe(); }
     }

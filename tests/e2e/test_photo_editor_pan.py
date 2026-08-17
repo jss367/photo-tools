@@ -148,3 +148,18 @@ def test_photo_editor_space_drag_overrides_crop_move(live_server, page):
 
     assert page.evaluate("() => JSON.stringify(editorState.recipe.crop)") == before_crop
     assert page.evaluate("() => editorState.spacePan") is False
+
+
+def test_photo_editor_space_on_focused_button_activates_button(live_server, page):
+    """Space on a focused editor button activates the button, not pan mode."""
+    _open_large_editor_preview(live_server, page)
+    page.locator("#actualBtn").focus()
+    page.keyboard.press("Space")
+    page.wait_for_function(
+        """() => document.getElementById('editorCanvasWrap')
+              .classList.contains('zoom-actual')"""
+    )
+    assert page.evaluate("() => editorState.spacePan") is False
+    assert "space-pan" not in (
+        page.locator("#editorCanvasWrap").get_attribute("class") or ""
+    ).split()

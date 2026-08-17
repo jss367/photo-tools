@@ -18097,7 +18097,12 @@ class Database:
                 earlier (tagging that photo with the species it was denied)
                 and re-flips long-accepted siblings, whose "previous" status
                 in the resulting history item is then a fiction: undo would
-                knock them back to pending.
+                knock them back to pending. ``reviewed`` is treated the same
+                as ``accepted`` / ``rejected`` here: the user marked the row
+                reviewed to say "I looked and chose not to act", and
+                expanding a group into it would silently flip that decision
+                to ``accepted`` without any audit trail describing the
+                overwrite.
 
                 Rows the caller *named* are exempt, because then the caller,
                 not the expansion, chose them: the entry row itself, and any
@@ -18113,7 +18118,7 @@ class Database:
                     and this_pred_id in limited_pred_ids
                 ):
                     return True
-                return status not in ("accepted", "rejected")
+                return status not in ("accepted", "rejected", "reviewed")
 
             # If grouped, accept every prediction in the group (in this
             # workspace) that survives the caller's scope.
@@ -18517,7 +18522,7 @@ class Database:
                 self.conn.rollback()
             raise
 
-    def accept_subject_species(self, prediction_id):
+    def accept_subject_species(self, prediction_id, _commit=True):
         """Accept agreeing model predictions for one detected subject.
 
         Compare uses this for an additional-species suggestion: the species
@@ -18526,6 +18531,12 @@ class Database:
         species on the same detection is resolved together. Grouped
         predictions are explicitly limited to this photo so accepting a
         subject in Compare cannot silently tag the rest of a burst.
+
+        ``_commit=False`` leaves the surrounding transaction open so the
+        caller can bundle the accept with its own writes (edit history,
+        precondition checks) inside one ``BEGIN IMMEDIATE`` — used by
+        ``api_accept_subject_species`` to serialize with the rest of the
+        prediction-decision routes.
         """
         ws = self._ws_id()
         target = self.conn.execute(
@@ -18578,9 +18589,11 @@ class Database:
                     result = accepted
                     accepted_ids.append(row["id"])
                     affected.extend(accepted["affected"])
-            self.conn.commit()
+            if _commit:
+                self.conn.commit()
         except Exception:
-            self.conn.rollback()
+            if _commit:
+                self.conn.rollback()
             raise
 
         if result is None:

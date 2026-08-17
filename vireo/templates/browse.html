@@ -6888,7 +6888,15 @@ function renderDetailPredictions(data, photoId) {
   var groups = [];
   var groupByKey = {};
   visible.forEach(function(p) {
-    var decided = p.status === 'accepted' || p.status === 'rejected';
+    // ``reviewed`` is a decision too — the user explicitly said "looked and
+    // chose not to act" in Review. Grouping it as pending here would render
+    // Accept/Reject buttons whose click would overwrite that decision and
+    // record a history entry whose "previous" status of ``pending`` is a
+    // fiction. Server guards refuse the flip (see _DECIDED_PREDICTION_STATUSES
+    // in app.py), but the panel must not offer the action in the first place.
+    var decided = p.status === 'accepted' ||
+                  p.status === 'rejected' ||
+                  p.status === 'reviewed';
     var displaySpecies = p.consensus_species || p.species || 'Unknown';
     var key = asciiCaseFoldKey(displaySpecies) + '|' + (decided ? p.status : 'pending');
     var g = groupByKey[key];

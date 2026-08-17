@@ -16763,68 +16763,126 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     @app.route("/api/predictions/<int:pred_id>/reviewed", methods=["POST"])
     def api_mark_prediction_reviewed(pred_id):
+        """Mark a pending prediction as reviewed, atomically.
+
+        Under the same lock as the accept/reject routes. The existing
+        pending-only precondition was correct but was read outside a
+        transaction, so a batch-accept that landed between the read and the
+        write could accept the row and then the reviewed write would overwrite
+        the batch's ``accepted`` status with ``reviewed`` — losing the
+        accept and the keyword together. Holding the writer lock across the
+        read and the write is what makes the precondition actually mean what
+        it says.
+        """
         db = _get_db()
-        pred = db.conn.execute(
-            """SELECT pr.id, pr.species, d.photo_id,
-                      COALESCE(pr_rev.status, 'pending') AS status
-               FROM predictions pr
-               JOIN detections d ON d.id = pr.detection_id
-               LEFT JOIN prediction_review pr_rev
-                 ON pr_rev.prediction_id = pr.id
-                AND pr_rev.workspace_id = ?
-               WHERE pr.id = ?""",
-            (db._ws_id(), pred_id),
-        ).fetchone()
-        if pred is None:
-            return json_error("prediction not found", 404)
-        # Only pending predictions may transition to reviewed. Without this
-        # guard a stale/double request or a direct API call against an
-        # already accepted/rejected prediction would silently overwrite the
-        # prior decision, corrupting review state and audit history.
-        if pred["status"] != "pending":
-            return json_error(
-                f'prediction already {pred["status"]}; cannot mark reviewed',
-                409,
+        lock_err = _begin_prediction_decision(db)
+        if lock_err is not None:
+            return lock_err
+        try:
+            pred = db.conn.execute(
+                """SELECT pr.id, pr.species, d.photo_id,
+                          COALESCE(pr_rev.status, 'pending') AS status
+                   FROM predictions pr
+                   JOIN detections d ON d.id = pr.detection_id
+                   LEFT JOIN prediction_review pr_rev
+                     ON pr_rev.prediction_id = pr.id
+                    AND pr_rev.workspace_id = ?
+                   WHERE pr.id = ?""",
+                (db._ws_id(), pred_id),
+            ).fetchone()
+            if pred is None:
+                db.conn.rollback()
+                return json_error("prediction not found", 404)
+            # Only pending predictions may transition to reviewed. Without
+            # this guard a stale/double request or a direct API call against
+            # an already accepted/rejected prediction would silently
+            # overwrite the prior decision, corrupting review state and
+            # audit history.
+            if pred["status"] != "pending":
+                db.conn.rollback()
+                return json_error(
+                    f'prediction already {pred["status"]}; cannot mark reviewed',
+                    409,
+                )
+            db.update_prediction_status(pred_id, "reviewed", _commit=False)
+            db.record_edit(
+                "prediction_reviewed",
+                f'Marked prediction "{pred["species"]}" reviewed',
+                "reviewed",
+                [{
+                    "photo_id": pred["photo_id"],
+                    "old_value": "pending",
+                    "new_value": "reviewed",
+                }],
+                _commit=False,
             )
-        db.update_prediction_status(pred_id, "reviewed")
-        db.record_edit(
-            "prediction_reviewed",
-            f'Marked prediction "{pred["species"]}" reviewed',
-            "reviewed",
-            [{"photo_id": pred["photo_id"], "old_value": "pending", "new_value": "reviewed"}],
-        )
-        return jsonify({"ok": True})
+            db.conn.commit()
+            return jsonify({"ok": True})
+        except Exception:
+            db.conn.rollback()
+            raise
 
     @app.route("/api/predictions/<int:pred_id>/replace-keywords", methods=["POST"])
     def api_replace_species_keywords_with_prediction(pred_id):
+        """Accept a prediction and replace existing species keywords atomically.
+
+        Same lock as every other prediction-decision route. Without it, a
+        replace-keywords request racing a batch-reject on the same row would
+        strip conflicting species keywords under an accept while the reject
+        commits the row as ``rejected`` — leaving the replaced photo tagged
+        with a species now marked rejected, and the old species permanently
+        lost even though undo cannot restore it.
+        """
         db = _get_db()
-        # accept_prediction(replace_species=True) strips existing
-        # species/taxonomy keywords from *every* photo it tags (the whole
-        # group, not just this photo) inside one transaction, so grouped
-        # photos are replaced consistently.
-        result = db.accept_prediction(pred_id, replace_species=True)
-        if result is None:
-            return json_error("prediction not found", 404)
-        items = [
-            {
-                "photo_id": a["photo_id"],
-                "old_value": ", ".join(a.get("old_species", [])),
-                "new_value": result["species"],
-            }
-            for a in result["affected"]
-        ]
-        is_batch = len(items) > 1
-        desc = f'Replaced species keyword with "{result["species"]}"'
-        if is_batch:
-            desc += f" across {len(items)} photos"
-        db.record_edit(
-            "prediction_replace_species",
-            desc,
-            result["species"],
-            items,
-            is_batch=is_batch,
-        )
-        return jsonify({"ok": True})
+        lock_err = _begin_prediction_decision(db)
+        if lock_err is not None:
+            return lock_err
+        try:
+            current_status = _prediction_status(db, pred_id)
+            if current_status is None:
+                db.conn.rollback()
+                return json_error("prediction not found", 404)
+            if current_status in _DECIDED_PREDICTION_STATUSES:
+                db.conn.rollback()
+                return json_error(
+                    f"prediction already {current_status}; cannot accept",
+                    409,
+                )
+            # accept_prediction(replace_species=True) strips existing
+            # species/taxonomy keywords from *every* photo it tags (the whole
+            # group, not just this photo) inside one transaction, so grouped
+            # photos are replaced consistently.
+            result = db.accept_prediction(
+                pred_id, replace_species=True, _commit=False,
+            )
+            if result is None:
+                db.conn.rollback()
+                return json_error("prediction not found", 404)
+            items = [
+                {
+                    "photo_id": a["photo_id"],
+                    "old_value": ", ".join(a.get("old_species", [])),
+                    "new_value": result["species"],
+                }
+                for a in result["affected"]
+            ]
+            is_batch = len(items) > 1
+            desc = f'Replaced species keyword with "{result["species"]}"'
+            if is_batch:
+                desc += f" across {len(items)} photos"
+            db.record_edit(
+                "prediction_replace_species",
+                desc,
+                result["species"],
+                items,
+                is_batch=is_batch,
+                _commit=False,
+            )
+            db.conn.commit()
+            return jsonify({"ok": True})
+        except Exception:
+            db.conn.rollback()
+            raise
 
     @app.route("/api/predictions/batch-accept", methods=["POST"])
     def api_batch_accept_predictions():
@@ -17121,17 +17179,26 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             ).fetchall())
         return rows
 
-    # The one definition of "already decided" for both batch prediction
-    # endpoints. ``pending`` rows are the normal case; ``alternative`` is not a
-    # decision, so this list deliberately omits it — but that only means the
-    # rows survive *this* filter. ``batch-reject`` then acts on them (a reject
-    # sweeps the runners-up down with the winner); ``batch-accept`` still
-    # refuses every row on a ``(detection, model)`` that carries one, via
-    # ``_ambiguous_prediction_ids`` below, because promoting a runner-up picks
-    # a winner the user was never shown. Skipped there is reported as
-    # ``skipped_ambiguous``, never ``already_decided``: the two counts name
-    # different problems with different next steps.
-    _DECIDED_PREDICTION_STATUSES = ("accepted", "rejected")
+    # The one definition of "already decided" for every prediction-decision
+    # endpoint (batch and single-row alike). ``pending`` rows are the normal
+    # case; ``alternative`` is not a decision, so this list deliberately omits
+    # it — but that only means the rows survive *this* filter. ``batch-reject``
+    # then acts on them (a reject sweeps the runners-up down with the winner);
+    # ``batch-accept`` still refuses every row on a ``(detection, model)`` that
+    # carries one, via ``_ambiguous_prediction_ids`` below, because promoting a
+    # runner-up picks a winner the user was never shown. Skipped there is
+    # reported as ``skipped_ambiguous``, never ``already_decided``: the two
+    # counts name different problems with different next steps.
+    #
+    # ``reviewed`` is included because it *is* a decision: the user pressed
+    # "Reviewed" in Review to say "I looked at this and chose not to act". A
+    # later accept or reject flip would overwrite that decision the same way a
+    # stale accept overwrites a rejected row's sibling scope, and the history
+    # entry the flip records reports a "previous" status of ``pending`` — a
+    # fiction. Batch endpoints skip the row and report it as
+    # ``already_decided``; single-row endpoints refuse with 409, mirroring
+    # ``api_mark_prediction_reviewed``'s own precondition.
+    _DECIDED_PREDICTION_STATUSES = ("accepted", "rejected", "reviewed")
 
     def _decided_prediction_ids(db, pred_ids):
         """Which of ``pred_ids`` already have a decision recorded.
@@ -17168,6 +17235,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
             )
         return found
+
+    def _prediction_status(db, pred_id):
+        """Current review status of one prediction in the active workspace.
+
+        Single-row decision endpoints (accept, reject, mark-reviewed,
+        replace-keywords, accept-subject) use this inside
+        ``_begin_prediction_decision`` to enforce the same "still actionable"
+        precondition the batch endpoints already enforce via
+        ``_decided_prediction_ids``. Same reason the batch helper exists: the
+        rule for which statuses are terminal lives in one place, so the
+        single-row and batch flavors cannot drift on what "already decided"
+        means, and neither flavor can be tightened on one side and forgotten
+        on the other.
+
+        Returns ``"pending"`` when no ``prediction_review`` row exists yet,
+        the stored status string when one does, and ``None`` when the
+        prediction id is unknown. Callers combine that with
+        ``_DECIDED_PREDICTION_STATUSES`` to decide whether to 409.
+        """
+        row = db.conn.execute(
+            """SELECT COALESCE(pr_rev.status, 'pending') AS status
+               FROM predictions pr
+               LEFT JOIN prediction_review pr_rev
+                 ON pr_rev.prediction_id = pr.id
+                AND pr_rev.workspace_id = ?
+               WHERE pr.id = ?""",
+            (db._ws_id(), pred_id),
+        ).fetchone()
+        return row["status"] if row else None
 
     def _superseded_prediction_ids(db, pred_ids):
         """Which of ``pred_ids`` belong to a label set the catalog moved past.
@@ -17451,134 +17547,235 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     @app.route("/api/predictions/<int:pred_id>/accept", methods=["POST"])
     def api_accept_prediction(pred_id):
+        """Accept a single prediction as one atomic decision.
+
+        Serialized with every other prediction-decision route through
+        ``_begin_prediction_decision`` — batch-accept, batch-reject, single
+        reject, replace-keywords, accept-subject, mark-reviewed. Without the
+        lock, a double-clicked Accept, or an Accept fired while a batch-reject
+        for the same row is in flight, can both pass their status precondition
+        against the same pre-write state and both commit. The reject wins the
+        write; the accept's keyword stays on the photo; keyword state and
+        review state then contradict each other and undo restores a state that
+        never existed. Holding SQLite's writer lock across the read *and* the
+        write makes the check-then-write indivisible, exactly as the batch
+        endpoints already do.
+        """
         db = _get_db()
-        result = db.accept_prediction(pred_id)
-        if result and result["affected"]:
-            # ``changed_tag=False`` means the photo already carried an
-            # equivalent species (hierarchical or root) so the accept only
-            # flipped ``prediction_review.status``. Encode that as a JSON
-            # ``no_tag`` payload so undo/redo can reverse the status change
-            # without untagging (or re-tagging) a keyword the user
-            # deliberately kept. Regular accepts still use the compact
-            # ``str(prediction_id)`` form so existing edit-history rows
-            # keep parsing unchanged.
-            def _make_item(a):
-                if a.get('changed_tag', True):
-                    old_value = str(a['prediction_id'])
-                else:
-                    old_value = json.dumps({
-                        'prediction_id': a['prediction_id'],
-                        'no_tag': True,
-                    })
-                return {
-                    'photo_id': a['photo_id'],
-                    'old_value': old_value,
-                    'new_value': str(result['keyword_id']),
-                }
-            items = [_make_item(a) for a in result['affected']]
-            is_batch = len(result['affected']) > 1
-            desc = f'Accepted prediction: added "{result["species"]}"'
-            if is_batch:
-                desc += f' to {len(result["affected"])} photos'
-            db.record_edit('prediction_accept', desc, str(result['keyword_id']),
-                           items, is_batch=is_batch)
-        return jsonify({"ok": True})
+        lock_err = _begin_prediction_decision(db)
+        if lock_err is not None:
+            return lock_err
+        try:
+            current_status = _prediction_status(db, pred_id)
+            # Missing row falls through to ``accept_prediction`` returning None
+            # — the endpoint's historical contract for unknown ids is a 200
+            # no-op, not a 404.
+            if current_status in _DECIDED_PREDICTION_STATUSES:
+                db.conn.rollback()
+                return json_error(
+                    f"prediction already {current_status}; cannot accept",
+                    409,
+                )
+            result = db.accept_prediction(pred_id, _commit=False)
+            if result and result["affected"]:
+                # ``changed_tag=False`` means the photo already carried an
+                # equivalent species (hierarchical or root) so the accept only
+                # flipped ``prediction_review.status``. Encode that as a JSON
+                # ``no_tag`` payload so undo/redo can reverse the status change
+                # without untagging (or re-tagging) a keyword the user
+                # deliberately kept. Regular accepts still use the compact
+                # ``str(prediction_id)`` form so existing edit-history rows
+                # keep parsing unchanged.
+                def _make_item(a):
+                    if a.get('changed_tag', True):
+                        old_value = str(a['prediction_id'])
+                    else:
+                        old_value = json.dumps({
+                            'prediction_id': a['prediction_id'],
+                            'no_tag': True,
+                        })
+                    return {
+                        'photo_id': a['photo_id'],
+                        'old_value': old_value,
+                        'new_value': str(result['keyword_id']),
+                    }
+                items = [_make_item(a) for a in result['affected']]
+                is_batch = len(result['affected']) > 1
+                desc = f'Accepted prediction: added "{result["species"]}"'
+                if is_batch:
+                    desc += f' to {len(result["affected"])} photos'
+                db.record_edit(
+                    'prediction_accept', desc, str(result['keyword_id']),
+                    items, is_batch=is_batch, _commit=False,
+                )
+            db.conn.commit()
+            return jsonify({"ok": True})
+        except Exception:
+            db.conn.rollback()
+            raise
 
     @app.route("/api/predictions/<int:pred_id>/accept-subject", methods=["POST"])
     def api_accept_subject_species(pred_id):
+        """Accept an additional-subject species from Compare, atomically.
+
+        Under the same lock as every other prediction-decision route (see
+        ``api_accept_prediction``). The precondition check is on the entry
+        row's status: if the user marked it reviewed, or a race with a batch
+        endpoint already accepted/rejected it, this endpoint must refuse
+        rather than overwrite that decision.
+        """
         db = _get_db()
-        result = db.accept_subject_species(pred_id)
-        if result is None:
-            return json_error("prediction not found", 404)
-        if result["affected"]:
-            # Accept-subject can accept agreeing predictions from
-            # multiple classifier models on one detection. Undo/redo
-            # must reset every sibling scope, so always encode the full
-            # ``prediction_ids`` list as JSON — the compact
-            # comma-separated fallback cannot be parsed by
-            # ``_edit_prediction_ids`` and would drop every sibling
-            # status flip. ``no_tag`` is set only when every underlying
-            # accept was a no-op (photo already carried the target via
-            # an equivalent hierarchical or root row); in mixed batches
-            # one accept actually tagged the species, so undo must
-            # untag exactly once.
-            _all_no_tag = all(
-                not a.get("changed_tag", True) for a in result["affected"]
-            )
-            payload = {
-                "prediction_ids": [
-                    int(pred_id) for pred_id in result["prediction_ids"]
-                ],
-            }
-            if _all_no_tag:
-                payload["no_tag"] = True
-            old_value = json.dumps(payload)
-            db.record_edit(
-                "prediction_accept",
-                f'Accepted additional subject species: added "{result["species"]}"',
-                str(result["keyword_id"]),
-                [{
-                    "photo_id": result["photo_id"],
-                    "old_value": old_value,
-                    "new_value": str(result["keyword_id"]),
-                }],
-            )
-        return jsonify({
-            "ok": True,
-            "species": result["species"],
-            "prediction_ids": result["prediction_ids"],
-        })
+        lock_err = _begin_prediction_decision(db)
+        if lock_err is not None:
+            return lock_err
+        try:
+            current_status = _prediction_status(db, pred_id)
+            if current_status is None:
+                db.conn.rollback()
+                return json_error("prediction not found", 404)
+            if current_status in _DECIDED_PREDICTION_STATUSES:
+                db.conn.rollback()
+                return json_error(
+                    f"prediction already {current_status}; cannot accept",
+                    409,
+                )
+            result = db.accept_subject_species(pred_id, _commit=False)
+            if result is None:
+                db.conn.rollback()
+                return json_error("prediction not found", 404)
+            if result["affected"]:
+                # Accept-subject can accept agreeing predictions from
+                # multiple classifier models on one detection. Undo/redo
+                # must reset every sibling scope, so always encode the full
+                # ``prediction_ids`` list as JSON — the compact
+                # comma-separated fallback cannot be parsed by
+                # ``_edit_prediction_ids`` and would drop every sibling
+                # status flip. ``no_tag`` is set only when every underlying
+                # accept was a no-op (photo already carried the target via
+                # an equivalent hierarchical or root row); in mixed batches
+                # one accept actually tagged the species, so undo must
+                # untag exactly once.
+                _all_no_tag = all(
+                    not a.get("changed_tag", True) for a in result["affected"]
+                )
+                payload = {
+                    "prediction_ids": [
+                        int(pid) for pid in result["prediction_ids"]
+                    ],
+                }
+                if _all_no_tag:
+                    payload["no_tag"] = True
+                old_value = json.dumps(payload)
+                db.record_edit(
+                    "prediction_accept",
+                    f'Accepted additional subject species: added "{result["species"]}"',
+                    str(result["keyword_id"]),
+                    [{
+                        "photo_id": result["photo_id"],
+                        "old_value": old_value,
+                        "new_value": str(result["keyword_id"]),
+                    }],
+                    _commit=False,
+                )
+            db.conn.commit()
+            return jsonify({
+                "ok": True,
+                "species": result["species"],
+                "prediction_ids": result["prediction_ids"],
+            })
+        except Exception:
+            db.conn.rollback()
+            raise
 
     @app.route("/api/predictions/<int:pred_id>/reject", methods=["POST"])
     def api_reject_prediction(pred_id):
+        """Reject a single prediction as one atomic decision.
+
+        Serialized with every other prediction-decision route through
+        ``_begin_prediction_decision`` — see ``api_accept_prediction`` for the
+        full argument. Codex's fresh evidence beyond the batch-atomicity fix:
+        a Browse batch accept overlapping a Review-side single reject on the
+        same row would let the reject read while the batch held the writer
+        lock and then overwrite the newly accepted status *after* the batch
+        committed, leaving the species keyword attached to a row now marked
+        rejected. Same failure mode as the inverse (single accept vs batch
+        reject). The single-row routes now take the same lock and honour the
+        same terminal-status precondition as their batch siblings.
+        """
         db = _get_db()
-        # Review state lives in prediction_review now; predictions.model is
-        # renamed to classifier_model.  Sibling-alternative rejection goes
-        # through the workspace-scoped review table.
-        ws = db._ws_id()
-        pred = db.conn.execute(
-            """SELECT pr.id, pr.species, pr.detection_id,
-                      pr.classifier_model AS model,
-                      pr.labels_fingerprint, d.photo_id
-               FROM predictions pr
-               JOIN detections d ON d.id = pr.detection_id
-               WHERE pr.id = ?""",
-            (pred_id,),
-        ).fetchone()
-        # prediction_review has an FK on prediction_id; writing review state
-        # for a missing pred would raise an IntegrityError and return 500
-        # where the legacy endpoint returned a harmless no-op. Gate the
-        # write on existence so stale IDs stay a clean 404.
-        if pred is None:
-            return json_error("prediction not found", 404)
-        db.update_prediction_status(pred_id, "rejected", _commit=False)
-        # Also reject sibling alternative predictions for the same
-        # (detection, classifier_model, labels_fingerprint) in this
-        # workspace. Fingerprint scoping matters: without it, rejecting a
-        # prediction from a new label set would rewrite review state for
-        # prior fingerprints' alternatives on the same detection.
-        sibling_ids = [row["id"] for row in db.conn.execute(
-            """SELECT pr.id
-               FROM predictions pr
-               JOIN prediction_review pr_rev
-                 ON pr_rev.prediction_id = pr.id
-                AND pr_rev.workspace_id = ?
-               WHERE pr.detection_id = ?
-                 AND pr.classifier_model = ?
-                 AND pr.labels_fingerprint = ?
-                 AND pr.id != ?
-                 AND pr_rev.status = 'alternative'""",
-            (ws, pred["detection_id"], pred["model"],
-             pred["labels_fingerprint"], pred_id),
-        ).fetchall()]
-        for sid in sibling_ids:
-            db.update_prediction_status(sid, "rejected", _commit=False)
-        db.conn.commit()
-        db.record_edit('prediction_reject',
-                       f'Rejected prediction "{pred["species"]}"',
-                       'rejected',
-                       [{'photo_id': pred['photo_id'], 'old_value': 'pending', 'new_value': 'rejected'}])
-        return jsonify({"ok": True})
+        lock_err = _begin_prediction_decision(db)
+        if lock_err is not None:
+            return lock_err
+        try:
+            # Review state lives in prediction_review now; predictions.model
+            # is renamed to classifier_model. Sibling-alternative rejection
+            # goes through the workspace-scoped review table.
+            ws = db._ws_id()
+            pred = db.conn.execute(
+                """SELECT pr.id, pr.species, pr.detection_id,
+                          pr.classifier_model AS model,
+                          pr.labels_fingerprint, d.photo_id,
+                          COALESCE(pr_rev.status, 'pending') AS status
+                   FROM predictions pr
+                   JOIN detections d ON d.id = pr.detection_id
+                   LEFT JOIN prediction_review pr_rev
+                     ON pr_rev.prediction_id = pr.id
+                    AND pr_rev.workspace_id = ?
+                   WHERE pr.id = ?""",
+                (ws, pred_id),
+            ).fetchone()
+            # prediction_review has an FK on prediction_id; writing review
+            # state for a missing pred would raise an IntegrityError and
+            # return 500 where the legacy endpoint returned a harmless
+            # no-op. Gate the write on existence so stale IDs stay a clean
+            # 404.
+            if pred is None:
+                db.conn.rollback()
+                return json_error("prediction not found", 404)
+            if pred["status"] in _DECIDED_PREDICTION_STATUSES:
+                db.conn.rollback()
+                return json_error(
+                    f'prediction already {pred["status"]}; cannot reject',
+                    409,
+                )
+            db.update_prediction_status(pred_id, "rejected", _commit=False)
+            # Also reject sibling alternative predictions for the same
+            # (detection, classifier_model, labels_fingerprint) in this
+            # workspace. Fingerprint scoping matters: without it, rejecting a
+            # prediction from a new label set would rewrite review state for
+            # prior fingerprints' alternatives on the same detection.
+            sibling_ids = [row["id"] for row in db.conn.execute(
+                """SELECT pr.id
+                   FROM predictions pr
+                   JOIN prediction_review pr_rev
+                     ON pr_rev.prediction_id = pr.id
+                    AND pr_rev.workspace_id = ?
+                   WHERE pr.detection_id = ?
+                     AND pr.classifier_model = ?
+                     AND pr.labels_fingerprint = ?
+                     AND pr.id != ?
+                     AND pr_rev.status = 'alternative'""",
+                (ws, pred["detection_id"], pred["model"],
+                 pred["labels_fingerprint"], pred_id),
+            ).fetchall()]
+            for sid in sibling_ids:
+                db.update_prediction_status(sid, "rejected", _commit=False)
+            db.record_edit(
+                'prediction_reject',
+                f'Rejected prediction "{pred["species"]}"',
+                'rejected',
+                [{
+                    'photo_id': pred['photo_id'],
+                    'old_value': 'pending',
+                    'new_value': 'rejected',
+                }],
+                _commit=False,
+            )
+            db.conn.commit()
+            return jsonify({"ok": True})
+        except Exception:
+            db.conn.rollback()
+            raise
 
     @app.route("/api/predictions/group/<group_id>")
     def api_prediction_group(group_id):

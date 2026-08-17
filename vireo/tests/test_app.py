@@ -19396,3 +19396,303 @@ def test_browse_review_deep_link_clears_persisted_filters(app_and_db):
         )
     )
     assert review_resp.status_code == 200
+
+
+def _seed_pending_prediction(db, filename, species):
+    """One pending prediction on a fresh photo — the starting state every
+    reviewed-status test then transitions from through
+    ``api_mark_prediction_reviewed`` (rather than a direct status write) so
+    the fixture matches what a real "Reviewed" click leaves in the database.
+    """
+    photo_id, _ = _seed_prediction_photo(db, filename, species, 0.9)
+    pred_id = _prediction_id(db, photo_id, species)
+    return photo_id, pred_id
+
+
+def test_mark_reviewed_transition_and_reject_refuses_reviewed(app_and_db):
+    """``reviewed`` is a decision; single-row reject must not overwrite it.
+
+    Codex P2 (browse.html:6891): "Include ``reviewed`` in the terminal-status
+    checks across the panel and server paths." A pending row the user marked
+    reviewed to say "I looked and chose not to act" cannot be silently flipped
+    to ``rejected`` by a stale Browse Reject button; the recorded history
+    entry would encode a "previous" status of ``pending`` — a fiction — and
+    undo would then knock the row back to ``pending`` even though it had
+    never been pending since the reviewed decision.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    _, pred_id = _seed_pending_prediction(db, "reviewed-then-reject.jpg", "Osprey")
+
+    resp = client.post(f"/api/predictions/{pred_id}/reviewed")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    ws_id = db._ws_id()
+    status = db.conn.execute(
+        """SELECT pr_rev.status FROM prediction_review pr_rev
+           WHERE pr_rev.prediction_id = ? AND pr_rev.workspace_id = ?""",
+        (pred_id, ws_id),
+    ).fetchone()["status"]
+    assert status == "reviewed"
+    edits_after_mark = len(db.get_edit_history(limit=50))
+
+    reject = client.post(f"/api/predictions/{pred_id}/reject")
+    assert reject.status_code == 409, reject.get_data(as_text=True)
+    assert "reviewed" in reject.get_json().get("error", "")
+
+    # The reviewed decision survives untouched — status did not flip and no
+    # ghost history entry was appended.
+    status = db.conn.execute(
+        """SELECT pr_rev.status FROM prediction_review pr_rev
+           WHERE pr_rev.prediction_id = ? AND pr_rev.workspace_id = ?""",
+        (pred_id, ws_id),
+    ).fetchone()["status"]
+    assert status == "reviewed"
+    assert len(db.get_edit_history(limit=50)) == edits_after_mark
+
+
+def test_single_accept_refuses_reviewed_prediction(app_and_db):
+    """The accept mirror of the reject-refuses-reviewed case.
+
+    ``api_accept_prediction`` on a reviewed row would tag the photo with the
+    species the user just explicitly chose not to act on, and would record a
+    ``prediction_accept`` history entry whose recorded previous prediction
+    state is a lie.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, pred_id = _seed_pending_prediction(db, "reviewed-then-accept.jpg", "Merlin")
+
+    reviewed = client.post(f"/api/predictions/{pred_id}/reviewed")
+    assert reviewed.status_code == 200
+    edits_after_mark = len(db.get_edit_history(limit=50))
+    keywords_before = {k["name"] for k in db.get_photo_keywords(photo_id)}
+
+    accept = client.post(f"/api/predictions/{pred_id}/accept")
+    assert accept.status_code == 409, accept.get_data(as_text=True)
+    assert "reviewed" in accept.get_json().get("error", "")
+
+    assert {k["name"] for k in db.get_photo_keywords(photo_id)} == keywords_before, (
+        "an accept that should have been refused still tagged the photo"
+    )
+    assert len(db.get_edit_history(limit=50)) == edits_after_mark
+
+
+def test_batch_endpoints_skip_reviewed_predictions(app_and_db):
+    """Reviewed rows are counted back under ``already_decided``, not accepted.
+
+    Bulk endpoints share ``_DECIDED_PREDICTION_STATUSES`` with the single-row
+    routes so the meaning of "already decided" cannot drift between them. A
+    reviewed row surviving into a Browse batch payload — from a stale panel
+    or a hand-rolled request — hits the same wall the single-row endpoints do.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, pred_id = _seed_pending_prediction(
+        db, "batch-vs-reviewed.jpg", "Peregrine Falcon",
+    )
+    assert client.post(f"/api/predictions/{pred_id}/reviewed").status_code == 200
+    keywords_before = {k["name"] for k in db.get_photo_keywords(photo_id)}
+
+    accept = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+    )
+    assert accept.status_code == 200, accept.get_data(as_text=True)
+    body = accept.get_json()
+    assert body["accepted"] == 0
+    assert body["already_decided"] == 1
+
+    reject = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": [pred_id]},
+    )
+    assert reject.status_code == 200, reject.get_data(as_text=True)
+    body = reject.get_json()
+    assert body["rejected"] == 0
+    assert body["already_decided"] == 1
+
+    ws_id = db._ws_id()
+    status = db.conn.execute(
+        """SELECT pr_rev.status FROM prediction_review pr_rev
+           WHERE pr_rev.prediction_id = ? AND pr_rev.workspace_id = ?""",
+        (pred_id, ws_id),
+    ).fetchone()["status"]
+    assert status == "reviewed"
+    assert {k["name"] for k in db.get_photo_keywords(photo_id)} == keywords_before
+
+
+def test_grouped_accept_expansion_skips_reviewed_group_member(app_and_db):
+    """Group expansion cannot reach a reviewed sibling.
+
+    ``_expansion_allowed`` (db.py) treats a reviewed row exactly like an
+    accepted or rejected one. Without this, accepting one burst member would
+    silently flip a reviewed sibling to ``accepted`` — tagging its photo with
+    a species the user had chosen not to act on and writing a history entry
+    whose previous status is a fiction.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+    group_id = "grp-reviewed"
+    photo_ids = []
+    pred_ids = []
+    for name in ("burst-a.jpg", "burst-b.jpg"):
+        pid = db.add_photo(
+            folder_id=folder_id, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det = db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(
+            det, "Common Loon", 0.9, "bioclip",
+            status="pending", labels_fingerprint="fp1",
+            group_id=group_id, individual='{"Common Loon": 2}',
+        )
+        photo_ids.append(pid)
+        pred_ids.append(_prediction_id(db, pid, "Common Loon"))
+
+    # Mark one member reviewed — the group expansion must leave it alone
+    # when the other member is accepted.
+    resp = client.post(f"/api/predictions/{pred_ids[0]}/reviewed")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    accept = client.post(f"/api/predictions/{pred_ids[1]}/accept")
+    assert accept.status_code == 200, accept.get_data(as_text=True)
+
+    ws_id = db._ws_id()
+    rows = {
+        row["prediction_id"]: row["status"]
+        for row in db.conn.execute(
+            """SELECT prediction_id, status FROM prediction_review
+               WHERE workspace_id = ? AND prediction_id IN (?, ?)""",
+            (ws_id, pred_ids[0], pred_ids[1]),
+        )
+    }
+    assert rows[pred_ids[0]] == "reviewed", (
+        "group expansion swept a reviewed sibling into accepted"
+    )
+    assert rows[pred_ids[1]] == "accepted"
+    # Only the accepted member's photo is tagged; the reviewed one stays clear.
+    assert {k["name"] for k in db.get_photo_keywords(photo_ids[0])} == set()
+    assert "Common Loon" in {k["name"] for k in db.get_photo_keywords(photo_ids[1])}
+
+
+def test_single_reject_serializes_with_concurrent_batch_accept(
+    app_and_db, monkeypatch,
+):
+    """Codex P1: single-row reject cannot slip past a batch-accept in flight.
+
+    The failure mode Codex identified: a Browse batch-accept overlapping a
+    Review-side single reject on the same row lets the reject read while the
+    batch holds the writer lock, then overwrite the newly accepted status
+    *after* the batch commits — leaving the species keyword attached to a
+    row now marked ``rejected``. The fix wraps ``api_reject_prediction`` in
+    ``_begin_prediction_decision`` so its check-and-write is one indivisible
+    step against the batch's.
+
+    Same in-process, deterministic exercise as
+    ``test_batch_accept_checks_and_writes_are_one_transaction`` — a competing
+    connection fires at the exact instant between the endpoint's check and
+    its first write, hooked through the DB layer.
+    """
+    import sqlite3
+    import threading
+
+    import db as db_module
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(
+        db, "single-reject-vs-batch.jpg", "TestZanclusgamma", 0.9,
+    )
+    pred_id = _prediction_id(db, photo_id, "TestZanclusgamma")
+    ws_id = db._ws_id()
+    db_file = _db_file(db)
+
+    competing = {}
+
+    def _competing_accept():
+        # 0.5s timeout — long enough to take an unlocked opening, short
+        # enough that a properly locked one gives up well inside the test.
+        conn = sqlite3.connect(db_file, timeout=0.5)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """INSERT INTO prediction_review
+                     (prediction_id, workspace_id, status, reviewed_at)
+                   VALUES (?, ?, 'accepted', datetime('now'))
+                   ON CONFLICT(prediction_id, workspace_id)
+                   DO UPDATE SET status = 'accepted'""",
+                (pred_id, ws_id),
+            )
+            conn.commit()
+            competing["committed"] = True
+        except sqlite3.OperationalError as exc:
+            competing["refused"] = str(exc)
+        finally:
+            conn.close()
+
+    original_update = db_module.Database.update_prediction_status
+    fired = []
+
+    def _update_with_interleave(self, this_pred_id, status, *args, **kwargs):
+        # Only fire on the first write, which is the reject we are guarding.
+        if not fired and status == "rejected" and this_pred_id == pred_id:
+            fired.append(True)
+            thread = threading.Thread(target=_competing_accept)
+            thread.start()
+            thread.join(timeout=30)
+            assert not thread.is_alive()
+        return original_update(self, this_pred_id, status, *args, **kwargs)
+
+    monkeypatch.setattr(
+        db_module.Database,
+        "update_prediction_status",
+        _update_with_interleave,
+    )
+
+    resp = client.post(f"/api/predictions/{pred_id}/reject")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert fired, "the interleave hook never ran, so nothing was exercised"
+    assert not competing.get("committed"), (
+        "another connection recorded a decision between single-row reject's "
+        "precondition check and its write — the check is not atomic with "
+        "the write it guards"
+    )
+    assert "locked" in competing.get("refused", ""), competing
+
+    status = db.conn.execute(
+        """SELECT COALESCE(pr_rev.status, 'pending') AS status
+           FROM predictions pr
+           LEFT JOIN prediction_review pr_rev
+             ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+           WHERE pr.id = ?""",
+        (ws_id, pred_id),
+    ).fetchone()["status"]
+    assert status == "rejected"
+
+
+def test_browse_panel_treats_reviewed_status_as_decided(app_and_db):
+    """The single-photo predictions panel must not offer Accept on ``reviewed``.
+
+    Server guards refuse the flip regardless, but ``CORE_PHILOSOPHY.md``'s
+    "no black boxes" rule forbids rendering an action the panel knows will
+    409. The bug shape without the fix: the panel groups every non-decided
+    row into a ``pending`` bucket and renders Accept/Reject; a click then
+    posts a payload the server refuses, leaving the user staring at a button
+    that appears to do nothing.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    marker = "var decided ="
+    at = html.find(marker)
+    assert at != -1, "the panel's decided-status check is missing"
+    snippet = html[at: at + 200]
+    for status in ("'accepted'", "'rejected'", "'reviewed'"):
+        assert status in snippet, (
+            f"the panel's decided-status check must include {status}; "
+            f"currently: {snippet!r}"
+        )

@@ -204,6 +204,36 @@ function isBareShortcut(keyStr) {
   return !sc.ctrl && !sc.meta && !sc.shift && !sc.alt;
 }
 
+function isBarePageShortcut(keyStr) {
+  if (!isBareShortcut(keyStr)) return false;
+  var key = parseShortcut(keyStr).key;
+
+  // Keep default and fixed page-local keys available in their owning views.
+  var reservedDefaults = [
+    '?', 'j', 'k', 'enter', 'escape', 'arrowleft', 'arrowright',
+    'arrowup', 'arrowdown', 'home', 'end', 'delete', 'backspace', ' ',
+    '+', '=', '-', '_', 'f', 'g',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    'a', 'b', 'c', 'h', 'p', 's', 'u', 'x', 'z'
+  ];
+  if (reservedDefaults.indexOf(key) !== -1) {
+    return true;
+  }
+
+  // A bare navigation key is safe when no configurable page action uses it.
+  // This lets users choose otherwise-unused letters (for example "d") while
+  // preserving page actions such as Browse's "b", "p", and "x" bindings.
+  for (var ctx in currentShortcuts) {
+    if (ctx === 'navigation') continue;
+    var shortcuts = currentShortcuts[ctx] || {};
+    for (var action in shortcuts) {
+      var shortcut = shortcuts[action];
+      if (isBareShortcut(shortcut) && parseShortcut(shortcut).key === key) return true;
+    }
+  }
+  return false;
+}
+
 function startCapture(btn, ctx, action) {
   if (capturingBtn) capturingBtn.classList.remove('capturing');
   capturingBtn = btn;
@@ -232,7 +262,7 @@ function startCapture(btn, ctx, action) {
     if (e.altKey) parts.push('alt');
     parts.push(e.key.toLowerCase());
     var keyStr = parts.join('+');
-    if (ctx === 'navigation' && isBareShortcut(keyStr)) keyStr = '';
+    if (ctx === 'navigation' && isBarePageShortcut(keyStr)) keyStr = '';
 
     var conflict = findConflict(ctx, action, keyStr);
     if (conflict) {
@@ -300,7 +330,7 @@ safeFetch('/api/config', {}, { toast: false }).then(function(cfg) {
     if (!currentShortcuts[ctx]) currentShortcuts[ctx] = {};
     for (var action in SHORTCUT_DEFAULTS[ctx]) {
       if (!(action in currentShortcuts[ctx])) currentShortcuts[ctx][action] = SHORTCUT_DEFAULTS[ctx][action];
-      if (ctx === 'navigation' && isBareShortcut(currentShortcuts[ctx][action])) {
+      if (ctx === 'navigation' && isBarePageShortcut(currentShortcuts[ctx][action])) {
         currentShortcuts[ctx][action] = '';
       }
     }

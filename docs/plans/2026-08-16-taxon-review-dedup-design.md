@@ -2084,6 +2084,21 @@ these two are halves of one mutation, at runtime.)
   synonyms could exist, so no per-photo enumeration extra is needed
   beyond the fold-equal match.
 
+  The two clauses together define one relation, and the rest of this
+  section is stated over it rather than over taxa: **a card's key
+  *claims* a `photo_keywords` row** when that row is what the card's
+  own half of §4 would have written or reused — taxon-resolved rows
+  for a `('taxon', T)` card, fold-equal rows for a `('name', L)` one.
+  Stating retraction at the level of *card identity* rather than of
+  taxon ids is not a stylistic preference: it is the same level §2's
+  frozen-membership precondition and §3's scope tuple are already
+  stated at, and it is the only level at which the `name:` fallback
+  and the taxon path are one rule instead of two that have to be kept
+  in step by hand. The non-overlap noted above is a statement about
+  which clause a *single card* uses; it is emphatically not a
+  statement that a given `photo_keywords` row is claimed by only one
+  card, which the liveness rule below turns on.
+
   *Persisting the exact accepted `keyword_id` on the
   `prediction_review` row was the alternative, and is rejected.* It
   invents a new column to record something recoverable from the same
@@ -2134,7 +2149,11 @@ rejected, so they no longer count as live. One rule, no list.
 runs, so it is worth pinning down: a row in
 `predictions`/`prediction_review` on that photo, in **any workspace
 that contains the photo — not just the active one** (see the
-cross-workspace note below), whose §1 taxon key equals the card's and
+cross-workspace note below), whose §1 key **claims the association
+being retracted** (the relation defined by the two enumeration clauses
+above — for an assertion sharing the card's key this reads simply as
+"its key equals the card's"; the cross-key case is two paragraphs
+down) and
 whose **post-Phase-A** status is `pending` or `accepted`. Both
 `rejected` and `alternative` are excluded, and for the same reason:
 only top-level, still-in-play assertions can keep an accept-owned tag
@@ -2165,6 +2184,28 @@ not `get_photos_with_equivalent_species` (`db.py:13874`), which
 answers the different question "does this photo already carry an
 equivalent species keyword" and is the accept path's idempotence
 check.
+
+*Liveness is asked per claimed association, not per card key.* Keying
+it on "same §1 key as the card" is right whenever both sides are
+`taxon:` keys, and wrong at the seam the `name:` clause just opened,
+because the two kinds of key can claim the **same** `photo_keywords`
+row: a `('name', 'blue tit')` accept writes the raw label "Blue Tit",
+and a `('taxon', 13094)` card whose §4 precedence-1 lookup reuses that
+very keyword row claims it too — the row's `keywords.taxon_id` and its
+folded name are both satisfied, by different cards. Under card-key
+equality each of those two cards treats the other's live assertion as
+invisible, and whichever is rejected first strips a tag the other
+still asserts: the same badge-disagrees-with-metadata failure, this
+time along the key axis rather than the mutation-order axis or the
+workspace axis. So the unit of the question is the association, not
+the card: a claimed row is retracted only when **no** live assertion
+anywhere claims it, where each assertion claims rows under its *own*
+§1 key by the relation above. This is the second reason the rule is
+stated over card identity — a taxon-keyed formulation cannot even
+express half of the set it is obliged to check — and it is the reason
+the two enumeration clauses had to be folded into one relation rather
+than left as a taxon path with a `name:` special case bolted beside
+it.
 
 *Cross-workspace, and load-bearing.* `photo_keywords` is a
 catalog-global table — `(photo_id, keyword_id)` with no
@@ -2354,6 +2395,52 @@ is retracting from:
   entry-point table below is the closure clause for status writes: a
   path that restores a `(photo, keyword)` association without the loop
   is a bug, not a gap.
+- **And a queued `keyword_remove` is re-validated against the catalog
+  when it is applied, rather than trusted because it was queued.** The
+  restore-side loop above enumerates three paths and asserts the
+  enumeration is closed; that is the right rule, and it is still a
+  closure clause maintained by hand over a queue whose copies have
+  independent lifetimes. The tension underneath is structural and is
+  not going away: `sync.py` is *delta*-driven (`sync.py:155-243` writes
+  the queued values rather than re-deriving the photo's keyword set),
+  `pending_changes` is workspace-scoped (`db.py:810-818`), and
+  `photo_keywords` is global — so *any* multi-workspace queueing
+  produces copies that can outlive the condition that justified them,
+  and a copy the loop never reached is still a live instruction to
+  strip a term the catalog says the photo has. The loop misses at
+  least two cases by construction: a removal queued while the photo
+  was visible in a workspace that has since lost the folder (the same
+  stale-visibility argument the queue-side bullet uses to key on
+  `(photo_id, value)`), and any future restore path added without the
+  loop — precisely the failure the enumeration can only *forbid*, not
+  prevent. So the invariant is also stated at the point of the write:
+  where `sync.py` collects a photo's `keyword_remove` deltas, it drops
+  any whose value still matches a live `photo_keywords` association on
+  that photo — compared on `keyword_match_key`, the normalization the
+  sidecar writer already uses — and deletes the pending row instead of
+  writing it. The catalog is authoritative for *whether the photo has
+  the keyword*; the queue only records *when to tell the disk*, and a
+  delta that contradicts the catalog at apply time is stale by
+  definition, whatever workspace holds it and whatever restored it.
+  The symmetric hazard on the add side is the same check inverted —
+  apply a `keyword_add` only while the association exists — which is
+  what every add producer already means: `audit.py:580` re-queues adds
+  *because* the catalog holds an association the sidecar lacks.
+  **Two exemptions, both already visible in `sync.py`'s structure.**
+  `paired_removes` — a remove whose match key is re-added in the same
+  batch — is a spelling normalization whose purpose is to rewrite a
+  variant on disk *while* the association survives, so re-validation
+  must not drop it and it keeps its flat-only path unchanged;
+  `keyword_remove_flat` is exempt for the identical reason
+  (`repair_duplicate_photo_species` queues it exactly when the
+  hierarchical association is meant to stay). The two rules are not
+  redundant and neither subsumes the other: the restore-side loop is
+  what keeps every workspace's *pending list* truthful in the window
+  before its next sync — a workspace advertising "remove 'Blue Tit'"
+  for a photo whose catalog row says otherwise is the cheap-proxy
+  substitution the transparency rule forbids, one surface over — and
+  the apply-time check is what keeps the *sidecar* correct for the
+  copies no cancellation reached.
 
 **This cancellation is not a second retraction rule — it is downstream
 of the first, and inherits #1488's lattice by construction.** It runs
@@ -3364,7 +3451,14 @@ Each phase lands as its own PR and is independently useful.
    carries the mutation-scoped half of §4 — the card's keyword resolved
    **once** over the union of member photos, and the two-part
    `tags as "…" — N photos keep "…"` disclosure — because this is the
-   phase in which a mutation first spans more than one photo. DB
+   phase in which a mutation first spans more than one photo. The
+   `sync.py` half of the retraction rule lands here rather than as a
+   follow-up, because this is the phase that first queues a keyword
+   delta in a workspace other than the acting one: the apply-time
+   re-validation of `keyword_remove` (and its mirror on `keyword_add`)
+   against the live `photo_keywords` set, alongside the restore-side
+   cancellation loop (§3, "The pending queue is workspace-scoped and
+   the association is not"). DB
    tests: accepting the merged card (unfiltered — POST carries
    `card_id`) flips both models' rows; undo restores both; reject
    mirrors; Compare's `accept_subject_species` matches across name
@@ -3514,7 +3608,19 @@ Each phase lands as its own PR and is independently useful.
    name". Negative variant: the same card whose row is
    `source = 'manual'` (the user typed the same label) takes the
    disclosure path with the workspace-aware wording, and a `taxon_id`
-   build silently strips it; a
+   build silently strips it. **Cross-key liveness variant, the
+   load-bearing one:** photo P carries a single `photo_keywords` row
+   that *both* a `('name', 'blue tit')` prediction and a
+   `('taxon', 13094)` card claim — the taxon card's §4 precedence-1
+   lookup resolves to that same keyword row. Rejecting the taxon card
+   while the `name:` row is still pending keeps the association and
+   discloses why; rejecting the `name:` card while a `taxon:` row is
+   pending likewise keeps it; only once both are rejected is it
+   retracted. A build that tests liveness by card-key equality — the
+   natural reading of "same §1 key as the card" — strips the tag on
+   the first of the two rejects and fails, which is the regression
+   guard for §3, "Liveness is asked per claimed association, not per
+   card key"; a
    **case-2 multi-synonym retraction fixture** — a card whose earlier
    accepts (under §4 case 2) left `source = 'accept'` "Blue Tit" on
    photo P1 and `source = 'accept'` "Eurasian Blue Tit" on photo P2:
@@ -3596,7 +3702,23 @@ Each phase lands as its own PR and is independently useful.
    `count_pending_changes` in a *third* workspace C that also contains
    P shows zero pending `keyword_remove` for the term throughout, so
    the fix is not "make the queue row workspace-null" (which would
-   surface in C's summary); a
+   surface in C's summary); an
+   **apply-time re-validation fixture**, covering the copies the
+   restore loop cannot reach — B's `keyword_remove` is queued, then
+   P's folder is removed from B (so no
+   `(photo_id, value)`-keyed restore loop enumerating *current*
+   workspaces would find B), and the user restores the keyword in A;
+   driving B's sync leaves "Blue Tit" in the sidecar and deletes B's
+   pending row rather than applying it. A build that trusts the queue
+   strips a restored, user-authored tag and fails on sidecar contents.
+   Two negative variants keep the check from degenerating into "never
+   remove": a genuine removal, where the catalog association really is
+   gone, still applies in every workspace holding a copy; and a
+   **paired remove+add normalization rename** (remove and add sharing
+   one `keyword_match_key` in the same batch) still performs its
+   flat-only removal instead of being discarded as stale, as does a
+   `keyword_remove_flat` queued by `repair_duplicate_photo_species`
+   while the hierarchical association survives; a
    **two-phase-ordering fixture** — "Reject all" on an
    `{accepted, pending}` card whose two members assert the **same taxon
    on the same photo**, the accepted one having tagged it

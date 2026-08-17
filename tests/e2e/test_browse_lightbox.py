@@ -119,10 +119,10 @@ def test_lightbox_track_eye_keeps_eye_at_same_screen_position(
             pending1To1: false,
         })"""
     )
+    page.locator("#lightboxViewBtn").click()
     page.locator("#lightboxTrackEye").click()
-    expect(page.locator("#lightboxTrackEye")).to_have_attribute(
-        "aria-pressed", "true"
-    )
+    expect(page.locator("#lightboxTrackEye")).to_be_checked()
+    page.locator("#lightboxViewBtn").click()
     assert page.evaluate("localStorage.getItem('vireo.lb.trackEye')") == "1"
 
     eye_screen_js = """() => {
@@ -543,6 +543,7 @@ def test_browse_lightbox_reserves_space_for_bottom_controls(live_server, page):
     assert visible["wrapBottom"] < visible["barTop"]
     assert visible["imageBottom"] <= visible["wrapBottom"] + 1
 
+    page.locator("#lightboxViewBtn").click()
     page.locator("#lightboxToggleChrome").click()
     expect(page.locator("#lightboxOverlay")).to_have_class(
         "lightbox-overlay active lb-hide-chrome"

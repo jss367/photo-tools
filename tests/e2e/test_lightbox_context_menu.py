@@ -177,6 +177,8 @@ def test_lightbox_overlay_toggles_persist_and_context_restores(live_server, page
         timeout=3000,
     )
 
+    # Visibility toggles live in the View menu popover.
+    page.locator("#lightboxViewBtn").click()
     page.locator("#lightboxToggleBoxes").click()
     page.locator("#lightboxToggleMasks").click()
     page.locator("#lightboxToggleEye").click()
@@ -234,9 +236,10 @@ def test_lightbox_overlay_toggles_persist_and_context_restores(live_server, page
         "document.getElementById('lightboxOverlay').classList.contains('lb-hide-info')",
         timeout=2000,
     )
-    assert page.locator("#lightboxToggleBoxes").inner_text() == "Hide Boxes"
-    assert page.locator("#lightboxToggleMasks").inner_text() == "Hide Masks"
-    assert page.locator("#lightboxToggleEye").inner_text() == "Hide Eye"
+    page.locator("#lightboxViewBtn").click()
+    expect(page.locator("#lightboxToggleBoxes")).to_be_checked()
+    expect(page.locator("#lightboxToggleMasks")).to_be_checked()
+    expect(page.locator("#lightboxToggleEye")).to_be_checked()
 
 
 def test_lightbox_right_click_does_not_toggle_zoom(live_server, page):
@@ -409,9 +412,10 @@ def test_mask_toggle_off_detaches_loaded_overlay_image(live_server, page):
         timeout=3000,
     )
 
+    page.locator("#lightboxViewBtn").click()
     page.locator("#lightboxToggleMasks").click()
     assert page.evaluate("localStorage.getItem('vireo.lb.masksVisible')") == "0"
-    assert page.locator("#lightboxToggleMasks").inner_text() == "Show Masks"
+    expect(page.locator("#lightboxToggleMasks")).not_to_be_checked()
     assert not page.locator("#lightboxMaskOverlay").evaluate(
         "el => el.classList.contains('show')"
     ), "hide must remove the visible overlay class"

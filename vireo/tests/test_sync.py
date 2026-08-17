@@ -391,6 +391,33 @@ def test_sync_from_xmp_updates_db(tmp_path):
     assert 'Sparrow' not in kw_names
 
 
+def test_sync_from_xmp_locks_before_reading_sidecar(tmp_path, monkeypatch):
+    """Reconciliation must hold the writer lock through its XMP read."""
+    import sync
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    pid, _xmp_path = _setup_photo_with_xmp(
+        tmp_path, db, keywords={"Wildlife"},
+    )
+
+    original_read_keywords = sync.read_keywords
+    observed_transactions = []
+
+    def read_keywords_under_lock(path):
+        observed_transactions.append(db.conn.in_transaction)
+        return original_read_keywords(path)
+
+    monkeypatch.setattr(sync, "read_keywords", read_keywords_under_lock)
+
+    sync.sync_from_xmp(db, [pid])
+
+    assert observed_transactions == [True]
+    assert db.conn.in_transaction is False
+
+
 def test_sync_from_xmp_does_not_restore_keyword_with_pending_removal(tmp_path):
     """A stale sidecar cannot resurrect metadata awaiting a sync removal."""
     from db import Database

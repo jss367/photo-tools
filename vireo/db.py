@@ -3866,15 +3866,42 @@ class Database:
             except Exception:
                 self.conn.rollback()
                 raise
-        # Only stamp the completion marker if every candidate photo was
-        # inspected against its current sidecar state. When a sidecar is
-        # unavailable/corrupt or an XMP reconciliation changes its version
-        # during the scan, leave the marker unset so the next startup retries.
-        if not deferred_sidecar:
-            self.set_meta(
-                self._RETIRED_WILDLIFE_GENRE_KEY, "1", _commit=False,
-            )
-        self.conn.commit()
+        # Only stamp the completion marker after a final locked population
+        # check. A photo can become eligible while the sidecar scan is in
+        # progress (for example, when a species is added), and XMP-to-DB
+        # reconciliation uses this same writer lock from sidecar read through
+        # its mtime stamp. The marker and this query therefore describe one
+        # stable catalog state; any remaining or newly eligible candidate
+        # leaves the marker unset for the next startup.
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            remaining_candidate = self.conn.execute(
+                """SELECT 1
+                   FROM photo_keywords pk
+                   JOIN keywords k ON k.id = pk.keyword_id
+                   WHERE k.name = 'Wildlife' COLLATE NOCASE
+                     AND k.type = 'genre'
+                     AND k.parent_id IS NULL
+                     AND (pk.source IS NULL OR pk.source <> 'manual')
+                     AND EXISTS (
+                         SELECT 1
+                         FROM photo_keywords species_pk
+                         JOIN keywords species_k
+                           ON species_k.id = species_pk.keyword_id
+                         WHERE species_pk.photo_id = pk.photo_id
+                           AND (species_k.type = 'taxonomy'
+                                OR species_k.is_species = 1)
+                     )
+                   LIMIT 1""",
+            ).fetchone()
+            if not deferred_sidecar and remaining_candidate is None:
+                self.set_meta(
+                    self._RETIRED_WILDLIFE_GENRE_KEY, "1", _commit=False,
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
         return len(retired_photo_ids)
 
     _SPECIES_HIGHLIGHTS_BACKFILL_KEY = "species_highlights_from_preferences_backfill"

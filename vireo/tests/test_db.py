@@ -14605,6 +14605,82 @@ def test_retire_builtin_wildlife_preserves_manual_change_during_sidecar_scan(
     db.close()
 
 
+def test_retire_builtin_wildlife_retries_photo_that_becomes_eligible_during_scan(
+    tmp_path, monkeypatch,
+):
+    """A species added after the initial query must keep the marker unset."""
+    import xml.etree.ElementTree as ET
+
+    from db import Database
+
+    db_path = str(tmp_path / "test.db")
+    photos_dir = tmp_path / "photos"
+    photos_dir.mkdir()
+    (photos_dir / "eligible.xmp").write_text(
+        "<x:xmpmeta xmlns:x='adobe:ns:meta/'/>", encoding="utf-8",
+    )
+
+    db = Database(db_path)
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photos_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    eligible_id = db.add_photo(
+        folder_id=fid, filename="eligible.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    newly_eligible_id = db.add_photo(
+        folder_id=fid, filename="later.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    first_species_id = db.add_keyword("House Sparrow", is_species=True)
+    later_species_id = db.add_keyword("Song Sparrow", is_species=True)
+    db.tag_photo(eligible_id, first_species_id)
+    db.conn.executemany(
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) "
+        "VALUES (?, ?, 'generated')",
+        [
+            (eligible_id, wildlife_id),
+            (newly_eligible_id, wildlife_id),
+        ],
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    original_parse = ET.parse
+    added_species = False
+
+    def add_species_during_parse(path, *args, **kwargs):
+        nonlocal added_species
+        if not added_species:
+            added_species = True
+            concurrent_db = Database(db_path, initialize_schema=False)
+            concurrent_db.tag_photo(
+                newly_eligible_id, later_species_id, source="manual",
+            )
+            concurrent_db.close()
+        return original_parse(path, *args, **kwargs)
+
+    monkeypatch.setattr(ET, "parse", add_species_during_parse)
+
+    assert db.retire_builtin_wildlife_genre() == 1
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "0"
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (newly_eligible_id, wildlife_id),
+    ).fetchone() is not None
+
+    assert db.retire_builtin_wildlife_genre() == 1
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (newly_eligible_id, wildlife_id),
+    ).fetchone() is None
+
+
 def test_retire_builtin_wildlife_preserves_manual_tag_during_mixed_cleanup(tmp_path):
     """A standalone Wildlife genre may be user-authored metadata."""
     from db import Database
@@ -15736,7 +15812,7 @@ def test_retire_builtin_wildlife_handles_photo_counts_over_bind_limit(tmp_path):
         statement for statement in traced_statements
         if statement == "BEGIN IMMEDIATE"
     ]
-    assert len(writer_chunks) == (
+    assert len(writer_chunks) == 1 + (
         total + _WILDLIFE_RETIREMENT_WRITE_CHUNK_SIZE - 1
     ) // _WILDLIFE_RETIREMENT_WRITE_CHUNK_SIZE
 

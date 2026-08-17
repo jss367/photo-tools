@@ -266,10 +266,20 @@ def _derive_miss_updates(rows, pipeline_config, target_ids=None,
 
 
 def _attach_primary_detections(db, photos, detector_confidence):
+    """Attach the primary box for each preview row, mirroring list_misses.
+
+    A preview card must show what the same photo would show once the
+    thresholds are applied, so the box is drawn only when a detection
+    clears ``detector_confidence`` — exactly the filter ``db.list_misses``
+    applies to persisted rows.  ``raw_detection_conf`` still carries the
+    best below-threshold candidate so the card can explain why nothing
+    qualified.
+    """
     if not photos:
         return
     photo_ids = [p["id"] for p in photos]
     primary = {}
+    raw_primary = {}
     CHUNK = 500
     for i in range(0, len(photo_ids), CHUNK):
         chunk = photo_ids[i:i + CHUNK]
@@ -279,14 +289,21 @@ def _attach_primary_detections(db, photos, detector_confidence):
             f"       detector_confidence "
             f"FROM detections "
             f"WHERE photo_id IN ({placeholders}) "
+            f"  AND (detector_model IS NULL OR detector_model != 'full-image') "
+            f"  AND COALESCE(category, 'animal') = 'animal' "
             f"ORDER BY photo_id, detector_confidence DESC",
             chunk,
         ).fetchall()
         for d in det_rows:
-            primary.setdefault(d["photo_id"], d)
+            raw_primary.setdefault(d["photo_id"], d)
+            if d["detector_confidence"] >= detector_confidence:
+                primary.setdefault(d["photo_id"], d)
     for p in photos:
-        p["detector_confidence_threshold"] = detector_confidence
         d = primary.get(p["id"])
+        raw = raw_primary.get(p["id"])
+        p["raw_detection_conf"] = (
+            raw["detector_confidence"] if raw is not None else None
+        )
         if d is None:
             p["detection_box"] = None
             p["detection_conf"] = None
@@ -333,6 +350,12 @@ def preview_misses_for_workspace(db, pipeline_config, detector_confidence=None,
         photo["miss_no_subject"] = int(flags["no_subject"])
         photo["miss_clipped"] = int(flags["clipped"])
         photo["miss_oof"] = int(flags["oof"])
+        # Stamp the floor actually used to derive this card so the "No
+        # detection above N%" message on the Misses page reflects the
+        # live-preview slider rather than the previously saved
+        # missConfig fallback.  Mirrors ``db.list_misses`` for persisted
+        # rows.
+        photo["detector_confidence_threshold"] = detector_confidence
         if flags["no_subject"]:
             grouped["no_subject"].append(dict(photo))
         if flags["clipped"]:

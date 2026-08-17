@@ -41,7 +41,12 @@ RAW_CONF_FLOOR = 0.01
 # ``RAW_CONF_FLOOR`` (not the trigger threshold) so that a workspace lowering
 # its user-visible confidence threshold can still surface small-subject boxes
 # that the crop grid found — matching the full-frame pass and preserving the
-# read-time-filter contract of the global detection cache.
+# read-time-filter contract of the global detection cache.  Every seam-safe
+# window is always run: ``_map_tile_detection`` rejects proposals clipped by
+# internal crop boundaries, so pixel coverage alone is not enough — a subject
+# whose bounding box crosses two corner crops' shared internal seam is only
+# recovered by the edge-center crop that contains it as an interior box.  An
+# early stop after the corner subset would silently blind those seams.
 TILED_FALLBACK_TRIGGER_CONFIDENCE = 0.20
 TILED_CROP_FRACTION = 0.60
 TILED_SOURCE_MAX_SIZE = 2560

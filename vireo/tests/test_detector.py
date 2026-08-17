@@ -238,7 +238,7 @@ def test_tiled_windows_cover_center_and_edges_without_duplicates():
     assert windows[0] == (200, 0, 800, 300)
     assert (0, 0, 600, 300) in windows
     assert (400, 200, 1000, 500) in windows
-    assert set(windows[2:detector.TILED_COVERAGE_CROP_COUNT]) == {
+    assert set(windows[2:6]) == {
         (0, 0, 600, 300),
         (400, 0, 1000, 300),
         (0, 200, 600, 500),
@@ -338,8 +338,9 @@ def test_detect_animals_runs_tiled_fallback_after_weak_full_pass(
 
     detections = detector.detect_animals(str(img_path))
 
-    # One full-frame pass plus enough tiles to cover every part of the photo.
-    assert fake_session.run.call_count == 7
+    # Seam rejection means every overlapping crop must run even after a strong
+    # result; another subject may only be interior in a later edge-center crop.
+    assert fake_session.run.call_count == 10
     assert detections[0]["confidence"] == pytest.approx(0.9)
     assert detections[0]["category"] == "animal"
     assert detections[0]["box"]["w"] < 0.2

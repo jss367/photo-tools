@@ -265,7 +265,7 @@ def _derive_miss_updates(rows, pipeline_config, target_ids=None,
     return updates, flags_by_id
 
 
-def _attach_primary_detections(db, photos):
+def _attach_primary_detections(db, photos, detector_confidence):
     if not photos:
         return
     photo_ids = [p["id"] for p in photos]
@@ -285,6 +285,7 @@ def _attach_primary_detections(db, photos):
         for d in det_rows:
             primary.setdefault(d["photo_id"], d)
     for p in photos:
+        p["detector_confidence_threshold"] = detector_confidence
         d = primary.get(p["id"])
         if d is None:
             p["detection_box"] = None
@@ -348,7 +349,7 @@ def preview_misses_for_workspace(db, pipeline_config, detector_confidence=None,
             ),
             reverse=True,
         )
-        _attach_primary_detections(db, photos)
+        _attach_primary_detections(db, photos, detector_confidence)
     return grouped
 
 

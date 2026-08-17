@@ -375,6 +375,21 @@ def test_api_misses_config_returns_thresholds(client, db_with_misses):
 
 
 @pytest.mark.parametrize("path", ["/api/misses/preview", "/api/misses/recompute"])
+def test_api_misses_threshold_response_includes_active_detector_floor(
+    client, path,
+):
+    r = client.post(
+        path,
+        data=json.dumps({"detector_confidence": 0.15}),
+        content_type="application/json",
+    )
+
+    assert r.status_code == 200
+    no_subject = r.get_json()["no_subject"][0]
+    assert no_subject["detector_confidence_threshold"] == pytest.approx(0.15)
+
+
+@pytest.mark.parametrize("path", ["/api/misses/preview", "/api/misses/recompute"])
 def test_api_misses_threshold_endpoints_reject_non_object_json(client, path):
     r = client.post(path, data=json.dumps(["not", "an", "object"]),
                     content_type="application/json")

@@ -327,6 +327,50 @@ def test_predictionless_pipeline_encounter_can_add_species(live_server, page):
     assert {r["id"] for r in rows} == set(photo_ids)
 
 
+def test_pipeline_review_encounter_time_range_includes_capture_date(
+    live_server, page
+):
+    photo_ids = live_server["data"]["photos"][1:3]
+    _write_predictionless_pipeline_cache(live_server, photo_ids)
+
+    db = live_server["db"]
+    path = os.path.join(
+        os.path.dirname(db._db_path),
+        f"pipeline_results_ws{db._active_workspace_id}.json",
+    )
+    with open(path) as f:
+        cache = json.load(f)
+    cache["encounters"][0]["time_range"] = [
+        "2026-08-15T10:12:03",
+        "2026-08-15T10:15:47",
+    ]
+    with open(path, "w") as f:
+        json.dump(cache, f)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+
+    same_day = page.locator(
+        ".encounter-meta > span",
+        has_text="Aug 15, 2026 · 10:12:03–10:15:47",
+    )
+    expect(same_day).to_have_count(2)  # Top header and repeated bottom bar.
+
+    page.evaluate(
+        """() => {
+            pipelineResults.encounters[0].time_range = [
+                '2026-08-15T23:59:52',
+                '2026-08-16T00:01:14'
+            ];
+            renderResults();
+        }"""
+    )
+    across_days = page.locator(
+        ".encounter-meta > span",
+        has_text="Aug 15, 2026 23:59:52 – Aug 16, 2026 00:01:14",
+    )
+    expect(across_days).to_have_count(2)
+
+
 def test_pipeline_review_search_matches_filename_without_species_predictions(
     live_server, page
 ):

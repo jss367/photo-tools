@@ -14408,6 +14408,58 @@ def test_api_import_folder_preview_summary_only_omits_file_rows(app_and_db, tmp_
     assert data["total_count"] == 2
     assert data["type_breakdown"][".jpg"] == 2
     assert data["files"] == []
+    assert data["source_counts"] == {str(source): 2}
+
+
+def test_api_import_source_scan_policy(app_and_db, monkeypatch):
+    """Import scan policy exposes only the bounded per-volume decision."""
+    import source_scan_policy
+
+    app, _ = app_and_db
+    monkeypatch.setattr(
+        source_scan_policy,
+        "classify_sources",
+        lambda paths: [
+            {
+                "path": path,
+                "volume_key": "volume-a",
+                "storage": "network",
+                "max_parallel": 1,
+            }
+            for path in paths
+        ],
+    )
+
+    resp = app.test_client().post(
+        "/api/import/source-scan-policy",
+        json={"folders": ["/photos/a", "/photos/b"]},
+    )
+    assert resp.status_code == 200
+    assert resp.get_json()["sources"] == [
+        {
+            "path": "/photos/a",
+            "volume_key": "volume-a",
+            "storage": "network",
+            "max_parallel": 1,
+        },
+        {
+            "path": "/photos/b",
+            "volume_key": "volume-a",
+            "storage": "network",
+            "max_parallel": 1,
+        },
+    ]
+
+
+def test_api_import_source_scan_policy_validates_folders(app_and_db):
+    app, _ = app_and_db
+    client = app.test_client()
+    assert client.post(
+        "/api/import/source-scan-policy", json={"folders": []},
+    ).status_code == 400
+    assert client.post(
+        "/api/import/source-scan-policy", json={"folders": [7]},
+    ).status_code == 400
 
 
 def test_api_import_folder_preview_no_folders(app_and_db):

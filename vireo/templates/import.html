@@ -29,6 +29,10 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .source-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-primary); background: var(--bg-tertiary); border-radius: 4px; padding: 4px 8px; }
 .source-item button { background: none; border: none; color: var(--danger); cursor: pointer; font-size: 14px; }
 .source-meta { color: var(--text-secondary); white-space: nowrap; }
+.source-count-progress {
+  display: none; margin-top: 7px; font-size: 11px; color: var(--text-secondary);
+}
+.source-count-progress.visible { display: block; }
 .hint { font-size: 11px; color: var(--text-secondary); }
 .section-divider { border-top: 1px solid var(--border-primary); margin-top: 12px; padding-top: 12px; }
 .option-stack { display: flex; flex-direction: column; gap: 8px; margin: 6px 0 8px; }
@@ -243,6 +247,7 @@ body { display: flex; flex-direction: column; height: 100vh; }
         <button class="btn" id="btnAddSource" onclick="addSource()">Add</button>
       </div>
       <div class="source-list" id="sourceList"></div>
+      <div class="source-count-progress" id="sourceCountProgress"></div>
       <div class="row" id="sourceRecursiveRow" style="margin-top:8px;">
         <label><input type="checkbox" id="chkRecursive" checked onchange="refreshSourceCounts()"> Include subfolders</label>
       </div>
@@ -478,6 +483,13 @@ let cardCleanupImportSources = [];
 let stagingResultsByPath = {};
 let sourceCounts = {};
 let sourceCountRequestSeq = 0;
+let sourceCountInflight = new Map();
+let sourceCountPending = [];
+let sourceCountPolicies = {};
+let sourceCountRunOptions = null;
+let sourceCountPolicyAbort = null;
+let sourceCountScheduleTimer = null;
+let sourceCountTickTimer = null;
 let activeImportMode = 'in_place';
 let importRemoteTargets = [];
 let importRsyncAvailable = false;
@@ -1155,15 +1167,14 @@ function renderSources() {
     span.style.flex = '1';
     const meta = document.createElement('span');
     meta.className = 'source-meta';
-    meta.textContent = sourceCounts[s] && sourceCounts[s].text
-      ? sourceCounts[s].text
-      : 'Counting photos...';
+    meta.textContent = sourceCountRowText(sourceCounts[s]);
     const btn = document.createElement('button');
     btn.textContent = '×';
     btn.title = 'Remove';
     btn.onclick = () => {
       sources.splice(i, 1);
       delete sourceCounts[s];
+      refreshSourceCounts();
       hideDestStructure();
       if (!sources.length) {
         clearImportPreviewGrid();
@@ -1185,7 +1196,73 @@ function renderSources() {
     div.appendChild(btn);
     list.appendChild(div);
   });
+  renderSourceCountProgress();
   updateStartGate();
+}
+
+function sourceCountRowText(state) {
+  if (!state) return 'Waiting to scan';
+  if (state.status === 'queued') {
+    return 'Waiting · ' + state.position + ' of ' + state.total;
+  }
+  if (state.status === 'loading') {
+    const elapsed = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000));
+    return 'Scanning…' + (elapsed ? ' ' + elapsed + 's' : '');
+  }
+  return state.text || 'Count unavailable';
+}
+
+function renderSourceCountProgress() {
+  const el = document.getElementById('sourceCountProgress');
+  if (!el) return;
+  const states = sources.map(path => sourceCounts[path]).filter(Boolean);
+  const active = states.filter(state => state.status === 'loading');
+  const queued = states.filter(state => state.status === 'queued').length;
+  const loaded = states.filter(state => state.status === 'loaded');
+  const errors = states.filter(state => state.status === 'error').length;
+  const photos = loaded.reduce((sum, state) => sum + Number(state.count || 0), 0);
+
+  if (active.length) {
+    const oldestStart = Math.min(...active.map(state => state.startedAt));
+    const elapsed = Math.max(0, Math.floor((Date.now() - oldestStart) / 1000));
+    const counted = loaded.length + errors;
+    const countedText = counted
+      ? counted.toLocaleString() + ' folder' + (counted === 1 ? '' : 's') +
+        ' counted (' + formatPhotoCount(photos) + ')'
+      : 'no folders finished yet';
+    const positions = active.map(state => state.position).join(' and ');
+    const storageKinds = new Set(active.map(state => state.storage).filter(Boolean));
+    const storageLabels = {
+      local: ' on local storage',
+      network: ' on network storage',
+      removable: ' on removable storage',
+    };
+    const storageLabel = storageKinds.size === 1
+      ? (storageLabels[[...storageKinds][0]] || '')
+      : '';
+    el.textContent = 'Scanning folder' + (active.length === 1 ? ' ' : 's ') +
+      positions + ' of ' + active[0].total + storageLabel +
+      ' · ' + countedText + (queued ? ' · ' + queued + ' waiting' : '') +
+      (elapsed ? ' · ' + elapsed + 's elapsed' : '');
+    el.classList.add('visible');
+    return;
+  }
+  if (queued) {
+    el.textContent = 'Preparing to scan ' + queued + ' folder' +
+      (queued === 1 ? '' : 's') + '…';
+    el.classList.add('visible');
+    return;
+  }
+  if (states.length && loaded.length + errors === states.length) {
+    el.textContent = loaded.length.toLocaleString() + ' folder' +
+      (loaded.length === 1 ? '' : 's') + ' counted · ' +
+      formatPhotoCount(photos) + ' found' +
+      (errors ? ' · ' + errors + ' unavailable' : '');
+    el.classList.add('visible');
+    return;
+  }
+  el.textContent = '';
+  el.classList.remove('visible');
 }
 
 function selectedSourceCountOptions() {
@@ -1209,25 +1286,204 @@ function formatPhotoCount(n) {
   return count.toLocaleString() + ' photo' + (count === 1 ? '' : 's');
 }
 
-async function refreshSourceCount(path) {
-  if (!path) return;
+function refreshSourceCounts() {
   if (newImagesSnapshotId !== null) return;
+  // A multi-select picker adds its paths synchronously. Coalesce those calls
+  // into one queue instead of starting (and immediately replacing) a scan
+  // for each intermediate source list.
+  if (sourceCountScheduleTimer) clearTimeout(sourceCountScheduleTimer);
+  sourceCountScheduleTimer = setTimeout(() => {
+    sourceCountScheduleTimer = null;
+    runSourceCountQueue();
+  }, 0);
+}
+
+function cancelSourceCountWork() {
+  sourceCountInflight.forEach(flight => flight.abort.abort());
+  sourceCountInflight.clear();
+  sourceCountPending = [];
+  if (sourceCountPolicyAbort) {
+    sourceCountPolicyAbort.abort();
+    sourceCountPolicyAbort = null;
+  }
+  stopSourceCountClock();
+}
+
+function ensureSourceCountClock() {
+  if (!sourceCountTickTimer) {
+    sourceCountTickTimer = setInterval(updateSourceCountClock, 1000);
+  }
+}
+
+function stopSourceCountClock() {
+  if (sourceCountTickTimer) {
+    clearInterval(sourceCountTickTimer);
+    sourceCountTickTimer = null;
+  }
+}
+
+function updateSourceCountClock() {
+  const metas = document.querySelectorAll('#sourceList .source-meta');
+  sources.forEach((sourcePath, index) => {
+    if (metas[index]) metas[index].textContent =
+      sourceCountRowText(sourceCounts[sourcePath]);
+  });
+  renderSourceCountProgress();
+}
+
+function fallbackSourceScanPolicies(paths) {
+  return Object.fromEntries(paths.map(path => [path, {
+    volume_key: 'unknown-volume',
+    storage: 'unknown',
+    max_parallel: 1,
+  }]));
+}
+
+async function loadSourceScanPolicies(paths, requestSeq) {
+  const abort = new AbortController();
+  sourceCountPolicyAbort = abort;
+  try {
+    const resp = await fetch('/api/import/source-scan-policy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: abort.signal,
+      body: JSON.stringify({ folders: paths }),
+    });
+    if (!resp.ok) return fallbackSourceScanPolicies(paths);
+    const data = await resp.json();
+    if (requestSeq !== sourceCountRequestSeq) return null;
+    const policies = fallbackSourceScanPolicies(paths);
+    (data.sources || []).forEach(policy => {
+      if (!paths.includes(policy.path)) return;
+      policies[policy.path] = {
+        volume_key: String(policy.volume_key || 'unknown-volume'),
+        storage: ['local', 'network', 'removable'].includes(policy.storage)
+          ? policy.storage
+          : 'unknown',
+        max_parallel: Math.max(1, Math.min(2, Number(policy.max_parallel || 1))),
+      };
+    });
+    return policies;
+  } catch (e) {
+    if (e && e.name === 'AbortError') return null;
+    return fallbackSourceScanPolicies(paths);
+  } finally {
+    if (sourceCountPolicyAbort === abort) sourceCountPolicyAbort = null;
+  }
+}
+
+async function runSourceCountQueue() {
+  const requestSeq = ++sourceCountRequestSeq;
+  const paths = sources.slice();
   const options = selectedSourceCountOptions();
-  const key = sourceCountKey(path, options);
-  const existing = sourceCounts[path];
-  if (existing && existing.key === key && existing.status === 'loaded') return;
-  const requestId = ++sourceCountRequestSeq;
-  sourceCounts[path] = {
-    key: key,
-    requestId: requestId,
-    status: 'loading',
-    text: 'Counting photos...',
-  };
+
+  // Retire only work that no longer matches the source list or options.
+  // In-flight scans for unchanged folders keep running: aborting the fetch
+  // does not stop the server-side walk, so restarting one would stack a
+  // second walk of the same folder on top of the abandoned one.
+  sourceCountPending = [];
+  if (sourceCountPolicyAbort) {
+    sourceCountPolicyAbort.abort();
+    sourceCountPolicyAbort = null;
+  }
+  sourceCountInflight.forEach((flight, path) => {
+    if (!paths.includes(path) || flight.key !== sourceCountKey(path, options)) {
+      flight.abort.abort();
+      sourceCountInflight.delete(path);
+    }
+  });
+
+  if (!paths.length) {
+    stopSourceCountClock();
+    renderSources();
+    return;
+  }
+
+  const toSchedule = [];
+  paths.forEach((path, index) => {
+    const key = sourceCountKey(path, options);
+    const existing = sourceCounts[path];
+    if (sourceCountInflight.has(path)) {
+      if (existing) {
+        existing.position = index + 1;
+        existing.total = paths.length;
+      }
+      return;
+    }
+    if (existing && existing.key === key && existing.status === 'loaded') return;
+    sourceCounts[path] = {
+      key: key,
+      status: 'queued',
+      position: index + 1,
+      total: paths.length,
+    };
+    toSchedule.push(path);
+  });
   renderSources();
+  if (!toSchedule.length && !sourceCountInflight.size) {
+    stopSourceCountClock();
+    return;
+  }
+  ensureSourceCountClock();
+  if (!toSchedule.length) return;
+
+  const policies = await loadSourceScanPolicies(paths, requestSeq);
+  if (!policies || requestSeq !== sourceCountRequestSeq) return;
+  toSchedule.forEach(path => {
+    if (sourceCounts[path]) sourceCounts[path].storage = policies[path].storage;
+  });
+  sourceCountPolicies = policies;
+  sourceCountRunOptions = options;
+  sourceCountPending = toSchedule;
+  pumpSourceCountQueue();
+}
+
+function pumpSourceCountQueue() {
+  const globalLimit = 4;
+  while (sourceCountInflight.size < globalLimit && sourceCountPending.length) {
+    const nextIndex = sourceCountPending.findIndex(path => {
+      const policy = sourceCountPolicies[path] ||
+        fallbackSourceScanPolicies([path])[path];
+      let activeOnVolume = 0;
+      sourceCountInflight.forEach(flight => {
+        if (flight.volumeKey === policy.volume_key) activeOnVolume += 1;
+      });
+      return activeOnVolume < policy.max_parallel;
+    });
+    if (nextIndex < 0) break;
+    const path = sourceCountPending.splice(nextIndex, 1)[0];
+    if (!sources.includes(path)) continue;
+    countOneSource(path);
+  }
+  if (!sourceCountInflight.size && !sourceCountPending.length) {
+    stopSourceCountClock();
+  }
+}
+
+async function countOneSource(path) {
+  const state = sourceCounts[path];
+  if (!state || state.status !== 'queued') return;
+  const key = state.key;
+  const options = sourceCountRunOptions || selectedSourceCountOptions();
+  const policy = sourceCountPolicies[path] ||
+    fallbackSourceScanPolicies([path])[path];
+  state.status = 'loading';
+  state.startedAt = Date.now();
+  const abort = new AbortController();
+  // Registered synchronously so pumpSourceCountQueue's lane accounting sees
+  // this scan before the next findIndex.
+  sourceCountInflight.set(path, {
+    key: key,
+    volumeKey: policy.volume_key,
+    abort: abort,
+  });
+  renderSources();
+  let result = null;
   try {
     const resp = await fetch('/api/import/folder-preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: abort.signal,
       body: JSON.stringify({
         folders: [path],
         file_types: options.file_types,
@@ -1236,30 +1492,56 @@ async function refreshSourceCount(path) {
       }),
     });
     const data = await resp.json().catch(() => ({}));
-    const current = sourceCounts[path];
-    if (!sources.includes(path) || !current || current.requestId !== requestId) return;
-    sourceCounts[path] = {
-      key: key,
-      requestId: requestId,
+    result = {
       status: resp.ok ? 'loaded' : 'error',
+      count: resp.ok ? Number(data.total_count || 0) : 0,
       text: resp.ok ? formatPhotoCount(data.total_count) : 'Count unavailable',
     };
   } catch (e) {
-    const current = sourceCounts[path];
-    if (!sources.includes(path) || !current || current.requestId !== requestId) return;
+    if (!e || e.name !== 'AbortError') {
+      result = { status: 'error', count: 0, text: 'Count unavailable' };
+    }
+  } finally {
+    const flight = sourceCountInflight.get(path);
+    if (flight && flight.abort === abort) sourceCountInflight.delete(path);
+  }
+  const current = sourceCounts[path];
+  if (result && sources.includes(path) && current && current.key === key &&
+      current.status === 'loading') {
     sourceCounts[path] = {
       key: key,
-      requestId: requestId,
-      status: 'error',
-      text: 'Count unavailable',
+      status: result.status,
+      count: result.count,
+      text: result.text,
     };
   }
   renderSources();
+  pumpSourceCountQueue();
 }
 
-function refreshSourceCounts() {
-  if (newImagesSnapshotId !== null) return;
-  sources.forEach(refreshSourceCount);
+function applyPreviewSourceCounts(counts, options) {
+  if (!counts || typeof counts !== 'object' || Array.isArray(counts)) return;
+  const complete = sources.every(path =>
+    Object.prototype.hasOwnProperty.call(counts, path) &&
+    Number.isFinite(Number(counts[path])));
+  if (!complete) return;
+
+  // The full preview just completed the same discovery walk and has a count
+  // for every source. Retire any redundant row-count requests still queued or
+  // in flight instead of walking those folders a second time after the user
+  // can already see the preview.
+  sourceCountRequestSeq += 1;
+  cancelSourceCountWork();
+  sources.forEach(path => {
+    const count = Number(counts[path]);
+    sourceCounts[path] = {
+      key: sourceCountKey(path, options),
+      status: 'loaded',
+      count: count,
+      text: formatPhotoCount(count),
+    };
+  });
+  renderSources();
 }
 
 function addSourcePath(path) {
@@ -1269,7 +1551,7 @@ function addSourcePath(path) {
     sources.push(v);
     hideDestStructure();
     renderSources();
-    refreshSourceCount(v);
+    refreshSourceCounts();
     scheduleImportPreview();
     return true;
   }
@@ -1957,7 +2239,7 @@ function useStagingAsImportSource(result) {
   sources = [result.source_root];
   hideDestStructure();
   renderSources();
-  refreshSourceCount(result.source_root);
+  refreshSourceCounts();
   // Staging recovery must copy the temporary staging tree into the archive.
   // In-place would catalog paths that disappear once staging is cleaned,
   // leaving missing-folder rows, so force Copy to archive here.
@@ -3019,6 +3301,12 @@ async function previewImport(opts) {
     if (requestSeq !== importPreviewSeq) return;
     if (importPreviewSignatureChanged(requestSignature)) {
       return;
+    }
+    if (!snapshotMode) {
+      applyPreviewSourceCounts(data.source_counts, {
+        file_types: fileTypes,
+        recursive: document.getElementById('chkRecursive').checked,
+      });
     }
     const files = data.files || [];
     // SUCCESS. This is the only place the selection is replaced: a completed

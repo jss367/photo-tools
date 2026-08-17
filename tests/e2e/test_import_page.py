@@ -46,6 +46,17 @@ def test_import_source_browse_button_shows_quick_photo_count(live_server, page):
           const originalFetch = window.fetch.bind(window);
           window.fetch = (input, init) => {
             const target = typeof input === 'string' ? input : input.url;
+            if (target && target.indexOf('/api/import/source-scan-policy') === 0) {
+              const paths = JSON.parse(init.body).folders;
+              return Promise.resolve(new Response(JSON.stringify({
+                sources: paths.map((path) => ({
+                  path: path,
+                  volume_key: 'nas-a',
+                  storage: 'network',
+                  max_parallel: 1,
+                })),
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
             if (target && target.indexOf('/api/import/folder-preview') === 0) {
               return Promise.resolve(new Response(JSON.stringify({
                 total_count: 42,
@@ -67,6 +78,289 @@ def test_import_source_browse_button_shows_quick_photo_count(live_server, page):
     source_list = page.locator("#sourceList")
     expect(source_list).to_contain_text("/tmp/card-a")
     expect(source_list.locator(".source-meta")).to_have_text("42 photos")
+
+
+def test_import_source_counts_explain_queue_progress(live_server, page):
+    """Multiple folders show which scan is active and which are waiting."""
+    url = live_server["url"]
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+    page.evaluate(
+        """
+        () => {
+          window.__countResolvers = [];
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const target = typeof input === 'string' ? input : input.url;
+            if (target && target.indexOf('/api/import/source-scan-policy') === 0) {
+              const paths = JSON.parse(init.body).folders;
+              return Promise.resolve(new Response(JSON.stringify({
+                sources: paths.map((path) => ({
+                  path: path,
+                  volume_key: 'nas-a',
+                  storage: 'network',
+                  max_parallel: 1,
+                })),
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            if (target && target.indexOf('/api/import/folder-preview') === 0) {
+              return new Promise((resolve) => {
+                window.__countResolvers.push((count) => resolve(new Response(
+                  JSON.stringify({
+                    total_count: count,
+                    total_size: 0,
+                    type_breakdown: {'.jpg': count},
+                    duplicate_count: 0,
+                    files: [],
+                  }), {status: 200, headers: {'Content-Type': 'application/json'}}
+                )));
+              });
+            }
+            return originalFetch(input, init);
+          };
+          window.pickDirectory = async () => ['/tmp/card-a', '/tmp/card-b'];
+        }
+        """
+    )
+
+    page.locator("[data-testid='import-source-browse-btn']").click()
+
+    metas = page.locator("#sourceList .source-meta")
+    expect(metas.nth(0)).to_contain_text("Scanning")
+    expect(metas.nth(1)).to_have_text("Waiting · 2 of 2")
+    expect(page.locator("#sourceCountProgress")).to_contain_text(
+        "Scanning folder 1 of 2")
+    expect(page.locator("#sourceCountProgress")).to_contain_text(
+        "network storage")
+    assert page.evaluate("() => window.__countResolvers.length") == 1
+
+    page.evaluate("() => window.__countResolvers[0](3)")
+    expect(metas.nth(0)).to_have_text("3 photos")
+    expect(metas.nth(1)).to_contain_text("Scanning")
+    expect(page.locator("#sourceCountProgress")).to_contain_text(
+        "1 folder counted (3 photos)")
+    assert page.evaluate("() => window.__countResolvers.length") == 2
+
+    page.evaluate("() => window.__countResolvers[1](4)")
+    expect(metas.nth(1)).to_have_text("4 photos")
+    expect(page.locator("#sourceCountProgress")).to_have_text(
+        "2 folders counted · 7 photos found")
+
+
+def test_import_source_counts_overlap_on_known_local_storage(live_server, page):
+    """A fast local volume gets bounded parallelism instead of serialization."""
+    url = live_server["url"]
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+    page.evaluate(
+        """
+        () => {
+          window.__countResolvers = [];
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const target = typeof input === 'string' ? input : input.url;
+            if (target && target.indexOf('/api/import/source-scan-policy') === 0) {
+              const paths = JSON.parse(init.body).folders;
+              return Promise.resolve(new Response(JSON.stringify({
+                sources: paths.map((path) => ({
+                  path: path,
+                  volume_key: 'local-a',
+                  storage: 'local',
+                  max_parallel: 2,
+                })),
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            if (target && target.indexOf('/api/import/folder-preview') === 0) {
+              return new Promise((resolve) => {
+                window.__countResolvers.push((count) => resolve(new Response(
+                  JSON.stringify({total_count: count, files: []}),
+                  {status: 200, headers: {'Content-Type': 'application/json'}}
+                )));
+              });
+            }
+            return originalFetch(input, init);
+          };
+          window.pickDirectory = async () => ['/tmp/card-a', '/tmp/card-b'];
+        }
+        """
+    )
+
+    page.locator("[data-testid='import-source-browse-btn']").click()
+
+    metas = page.locator("#sourceList .source-meta")
+    expect(metas.nth(0)).to_contain_text("Scanning")
+    expect(metas.nth(1)).to_contain_text("Scanning")
+    expect(page.locator("#sourceCountProgress")).to_contain_text(
+        "Scanning folders 1 and 2 of 2")
+    expect(page.locator("#sourceCountProgress")).to_contain_text(
+        "local storage")
+    assert page.evaluate("() => window.__countResolvers.length") == 2
+
+    page.evaluate("() => { window.__countResolvers[0](3); window.__countResolvers[1](4); }")
+    expect(page.locator("#sourceCountProgress")).to_have_text(
+        "2 folders counted · 7 photos found")
+
+
+def test_completed_preview_retires_redundant_source_count_scans(
+        live_server, page):
+    """The full preview's per-source totals stop slower duplicate walks."""
+    url = live_server["url"]
+    page.goto(f"{url}/import")
+    page.evaluate(
+        """
+        () => {
+          window.__countAborts = 0;
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const target = typeof input === 'string' ? input : input.url;
+            if (target && target.indexOf('/api/import/source-scan-policy') === 0) {
+              const paths = JSON.parse(init.body).folders;
+              return Promise.resolve(new Response(JSON.stringify({
+                sources: paths.map((path) => ({
+                  path: path, volume_key: 'local-a', storage: 'local',
+                  max_parallel: 2,
+                })),
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            if (target && target.indexOf('/api/import/folder-preview') === 0) {
+              const body = JSON.parse(init.body || '{}');
+              if (body.summary_only) {
+                return new Promise((_resolve, reject) => {
+                  init.signal.addEventListener('abort', () => {
+                    window.__countAborts += 1;
+                    reject(new DOMException('Aborted', 'AbortError'));
+                  }, {once: true});
+                });
+              }
+              const files = body.folders.map((folder, index) => ({
+                path: folder + '/bird-' + index + '.jpg',
+                filename: 'bird-' + index + '.jpg',
+                subfolder: folder,
+                size: 1,
+                extension: '.jpg',
+                thumb_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
+              }));
+              return Promise.resolve(new Response(JSON.stringify({
+                total_count: 2,
+                total_size: 2,
+                type_breakdown: {'.jpg': 2},
+                duplicate_count: 0,
+                files: files,
+                source_counts: {'/tmp/card-a': 1, '/tmp/card-b': 1},
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            return originalFetch(input, init);
+          };
+          window.pickDirectory = async () => ['/tmp/card-a', '/tmp/card-b'];
+        }
+        """
+    )
+
+    page.locator("[data-testid='import-source-browse-btn']").click()
+
+    expect(page.locator("#sourceList .source-meta")).to_have_text([
+        "1 photo", "1 photo",
+    ])
+    expect(page.locator("#sourceCountProgress")).to_have_text(
+        "2 folders counted · 2 photos found")
+    page.wait_for_function("() => window.__countAborts === 2")
+    assert page.evaluate("() => window.__countAborts") == 2
+
+
+SOURCE_COUNT_TRACKING_STUB = """
+    () => {
+      window.__countRequests = [];
+      window.__countResolvers = [];
+      window.__countAborts = 0;
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const target = typeof input === 'string' ? input : input.url;
+        if (target && target.indexOf('/api/import/source-scan-policy') === 0) {
+          const paths = JSON.parse(init.body).folders;
+          return Promise.resolve(new Response(JSON.stringify({
+            sources: paths.map((path) => ({
+              path: path,
+              volume_key: 'local-a',
+              storage: 'local',
+              max_parallel: 2,
+            })),
+          }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+        }
+        if (target && target.indexOf('/api/import/folder-preview') === 0) {
+          window.__countRequests.push(JSON.parse(init.body).folders[0]);
+          return new Promise((resolve, reject) => {
+            init.signal.addEventListener('abort', () => {
+              window.__countAborts += 1;
+              reject(new DOMException('Aborted', 'AbortError'));
+            }, {once: true});
+            window.__countResolvers.push((count) => resolve(new Response(
+              JSON.stringify({total_count: count, files: []}),
+              {status: 200, headers: {'Content-Type': 'application/json'}}
+            )));
+          });
+        }
+        return originalFetch(input, init);
+      };
+    }
+"""
+
+
+def test_adding_a_folder_keeps_in_flight_scan_running(live_server, page):
+    """Growing the source list must not restart scans already in flight.
+
+    Aborting the count fetch does not stop the server-side folder walk, so a
+    restart stacks a second walk of the same folder on top of the abandoned
+    one -- the exact disk contention the scan queue exists to prevent.
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+    page.evaluate(SOURCE_COUNT_TRACKING_STUB)
+
+    page.evaluate("() => addSourcePath('/tmp/card-a')")
+    metas = page.locator("#sourceList .source-meta")
+    expect(metas.nth(0)).to_contain_text("Scanning")
+    assert page.evaluate("() => window.__countRequests") == ["/tmp/card-a"]
+
+    page.evaluate("() => addSourcePath('/tmp/card-b')")
+    expect(metas.nth(1)).to_contain_text("Scanning")
+    assert page.evaluate("() => window.__countAborts") == 0
+    assert page.evaluate("() => window.__countRequests") == [
+        "/tmp/card-a", "/tmp/card-b",
+    ]
+
+    page.evaluate("() => window.__countResolvers[0](3)")
+    expect(metas.nth(0)).to_have_text("3 photos")
+    page.evaluate("() => window.__countResolvers[1](4)")
+    expect(page.locator("#sourceCountProgress")).to_have_text(
+        "2 folders counted · 7 photos found")
+    assert page.evaluate("() => window.__countRequests") == [
+        "/tmp/card-a", "/tmp/card-b",
+    ]
+
+
+def test_removing_a_folder_aborts_only_its_own_scan(live_server, page):
+    """Removing one folder cancels its scan without restarting the others."""
+    url = live_server["url"]
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+    page.evaluate(SOURCE_COUNT_TRACKING_STUB)
+    page.evaluate(
+        "() => { addSourcePath('/tmp/card-a'); addSourcePath('/tmp/card-b'); }")
+
+    metas = page.locator("#sourceList .source-meta")
+    expect(metas.nth(0)).to_contain_text("Scanning")
+    expect(metas.nth(1)).to_contain_text("Scanning")
+
+    page.locator("#sourceList .source-item button").nth(1).click()
+    page.wait_for_function("() => window.__countAborts === 1")
+    expect(metas.nth(0)).to_contain_text("Scanning")
+
+    page.evaluate("() => window.__countResolvers[0](3)")
+    expect(metas.nth(0)).to_have_text("3 photos")
+    assert page.evaluate("() => window.__countRequests") == [
+        "/tmp/card-a", "/tmp/card-b",
+    ]
 
 
 # Stubs a two-file copy-mode preview where IMG_0002.jpg comes back flagged as

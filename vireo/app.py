@@ -39,6 +39,7 @@ import card_cleanup
 import path_guard
 import places
 import remote_setup
+import source_scan_policy
 from db import (
     _LIFE_LIST_ANCESTOR_SUPPRESSION_CLAUSE,
     KEYWORD_TYPES,
@@ -21652,6 +21653,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         from ingest import discover_source_files
 
         all_files = []
+        source_counts = {}
         type_breakdown = {}
         total_size = 0
         multi_source = len(folders) > 1
@@ -21676,6 +21678,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         for folder in folders:
             root_name = root_names.get(folder, os.path.basename(folder.rstrip("/")))
             discovered = discover_source_files(folder, file_types=file_types if file_types else "both", recursive=body.get("recursive", True))
+            source_counts[folder] = len(discovered)
             for f in discovered:
                 stat = f.stat()
                 ext = f.suffix.lower()
@@ -21710,7 +21713,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "type_breakdown": type_breakdown,
             "duplicate_count": 0,
             "files": all_files,
+            "source_counts": source_counts,
         })
+
+    @app.route("/api/import/source-scan-policy", methods=["POST"])
+    def api_import_source_scan_policy():
+        """Return bounded folder-count concurrency grouped by storage volume."""
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return json_error("JSON body must be an object", 400)
+        folders = body.get("folders")
+        if (
+            not isinstance(folders, list)
+            or not folders
+            or any(not isinstance(path, str) or not path for path in folders)
+        ):
+            return json_error("folders must be a non-empty list of paths", 400)
+        return jsonify({"sources": source_scan_policy.classify_sources(folders)})
 
     @app.route("/api/import/new-images-preview", methods=["POST"])
     def api_import_new_images_preview():

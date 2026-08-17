@@ -258,6 +258,7 @@ POST         /api/import/folder-preview
 POST         /api/import/new-images-preview
 POST         /api/import/orphaned-staging/verify
 POST         /api/import/preview
+POST         /api/import/source-scan-policy
 POST         /api/inat/submit
 POST         /api/inat/submit-batch
 POST         /api/inat/validate-token

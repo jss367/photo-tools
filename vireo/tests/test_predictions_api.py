@@ -922,3 +922,100 @@ def test_group_apply_records_decisions_under_the_lock(app_and_db):
     # The lock was released, so a following decision goes through.
     fresh, _ = _one_prediction(db, species='Plush-crested Jay')
     assert client.post(f'/api/predictions/{fresh}/reject').status_code == 200
+
+
+def test_group_apply_preserves_already_decided_predictions(app_and_db):
+    """A stale group apply must not overwrite a decision the lock committed.
+
+    The decision lock orders group apply against every other decision
+    route, but ordering alone is not enough: ``_apply_group_decisions``
+    used to unconditionally rewrite every ``prediction_review`` row for a
+    picked/rejected photo, so a stale group-apply payload — the Review
+    modal still has the photo in ``rejects`` while Browse's Accept for
+    the same row commits first — would flip the earlier ``accepted`` to
+    ``rejected`` under the lock. The species keyword the accept added
+    stayed on the photo, so keyword state and review state contradicted
+    each other with no UI cue pointing at the mismatch. The DB-layer
+    guard on ``update_predictions_status_by_photo`` skips the overwrite
+    when the existing row is in ``DECIDED_PREDICTION_STATUSES``.
+
+    Both directions are guarded: an earlier ``rejected`` (from Browse's
+    single-row Reject) must survive a stale group-apply pick just as an
+    earlier ``accepted`` must survive a stale group-apply reject. Same
+    guard, same reason — the second writer never claims the first
+    writer's row.
+    """
+    app, db = app_and_db
+    photos = db.get_photos()
+    accepted_photo = photos[0]['id']
+    rejected_photo = photos[1]['id']
+    det_a = _make_detection(db, accepted_photo)
+    det_b = _make_detection(db, rejected_photo)
+    db.add_prediction(detection_id=det_a, species='Azure Jay', confidence=0.9,
+                      model='test-model', category='new', group_id=None)
+    db.add_prediction(detection_id=det_b, species='Azure Jay', confidence=0.8,
+                      model='test-model', category='new', group_id=None)
+    pred_a = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?", (det_a,)
+    ).fetchone()['id']
+    pred_b = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?", (det_b,)
+    ).fetchone()['id']
+    ws = db._active_workspace_id
+
+    client = app.test_client()
+
+    # First writers: single-row Accept on one photo, single-row Reject on
+    # the other. Both commit through the decision lock and record their
+    # keyword state on the photo.
+    assert client.post(
+        f'/api/predictions/{pred_a}/accept').status_code == 200
+    assert client.post(
+        f'/api/predictions/{pred_b}/reject').status_code == 200
+    assert db.get_review_status(pred_a, ws) == 'accepted'
+    assert db.get_review_status(pred_b, ws) == 'rejected'
+    accepted_keywords_before = {
+        k['name'] for k in db.get_photo_keywords(accepted_photo)}
+    assert 'Azure Jay' in accepted_keywords_before
+
+    # Stale group apply arrives with the mirror decisions: it asks to
+    # reject the already-accepted photo and pick (accept) the already-
+    # rejected photo. Without the guard both statuses flip.
+    resp = client.post('/api/predictions/group/apply', json={
+        'picks': [rejected_photo],
+        'rejects': [accepted_photo],
+        'removed': [],
+        'species': '',
+    })
+    assert resp.status_code == 200
+
+    # The lock-committed decisions survive.
+    assert db.get_review_status(pred_a, ws) == 'accepted'
+    assert db.get_review_status(pred_b, ws) == 'rejected'
+
+    # The keyword the accept added is still attached — same-side
+    # confirmation that status and keyword did not drift apart.
+    accepted_keywords_after = {
+        k['name'] for k in db.get_photo_keywords(accepted_photo)}
+    assert 'Azure Jay' in accepted_keywords_after
+
+    # Rows that were still pending are still writable: a fresh prediction
+    # on a third photo takes the group-apply status normally, so the
+    # guard preserves committed decisions without freezing the row set.
+    third_photo = photos[2]['id']
+    det_c = _make_detection(db, third_photo)
+    db.add_prediction(detection_id=det_c, species='Azure Jay',
+                      confidence=0.7, model='test-model',
+                      category='new', group_id=None)
+    pred_c = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?", (det_c,)
+    ).fetchone()['id']
+    assert db.get_review_status(pred_c, ws) == 'pending'
+    resp = client.post('/api/predictions/group/apply', json={
+        'picks': [third_photo],
+        'rejects': [],
+        'removed': [],
+        'species': '',
+    })
+    assert resp.status_code == 200
+    assert db.get_review_status(pred_c, ws) == 'accepted'

@@ -17552,6 +17552,17 @@ class Database:
         ``_commit=False`` lets a caller that already holds the prediction
         decision lock (``app.py``'s ``_under_prediction_decision_lock``) fold
         these writes into that transaction.
+
+        Rows already in a decided status (``DECIDED_PREDICTION_STATUSES``)
+        are preserved: burst group apply — the only caller — runs at photo
+        granularity, so a stale ``rejects`` list would otherwise overwrite
+        an ``accepted`` that a single-row Accept, batch-accept, or an
+        earlier group apply committed under the same decision lock. The
+        keyword the accept added stays on the photo either way, so the
+        overwrite left status and keywords contradicting each other with no
+        UI cue pointing at the mismatch. The lock orders the two writers;
+        this ON CONFLICT guard is what keeps the second one from silently
+        flipping the first's decision.
         """
         ws = self._ws_id()
         rows = self.conn.execute(
@@ -17560,15 +17571,18 @@ class Database:
                WHERE d.photo_id = ?""",
             (photo_id,),
         ).fetchall()
+        decided_ph = ",".join("?" for _ in self.DECIDED_PREDICTION_STATUSES)
         for r in rows:
             self.conn.execute(
-                """INSERT INTO prediction_review
-                     (prediction_id, workspace_id, status, reviewed_at)
-                   VALUES (?, ?, ?, datetime('now'))
-                   ON CONFLICT(prediction_id, workspace_id)
-                   DO UPDATE SET status = excluded.status,
-                                 reviewed_at = excluded.reviewed_at""",
-                (r["id"], ws, status),
+                f"""INSERT INTO prediction_review
+                      (prediction_id, workspace_id, status, reviewed_at)
+                    VALUES (?, ?, ?, datetime('now'))
+                    ON CONFLICT(prediction_id, workspace_id)
+                    DO UPDATE SET status = excluded.status,
+                                  reviewed_at = excluded.reviewed_at
+                      WHERE prediction_review.status
+                            NOT IN ({decided_ph})""",
+                (r["id"], ws, status, *self.DECIDED_PREDICTION_STATUSES),
             )
         if _commit:
             self.conn.commit()

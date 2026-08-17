@@ -4501,6 +4501,29 @@ def test_snapshot_mode_hides_selection_and_says_what_it_will_import(
     expect(page.locator("#modeInPlace")).to_be_disabled()
 
 
+def test_snapshot_mode_suppresses_folder_scan_totals(live_server, page):
+    """Snapshot mode never runs folder-count scans, so the source-count
+    summary must stay silent instead of announcing "0 photos found"
+    underneath the snapshot's own file-count message. activateNewImagesImport
+    marks each source `loaded` with no `count`; a summary that would sum
+    those into 0 is a lie about work that never happened.
+    """
+    page.goto(f"{live_server['url']}/import")  # warm the app before routing
+    _stub_snapshot_import(page, _files(3))
+    page.goto(f"{live_server['url']}/import?new_images=42")
+    expect(page.locator("#importPreviewGrid")).to_be_visible()
+
+    expect(page.locator("#newImagesImportSource")).to_contain_text(
+        "3 newly detected images",
+    )
+    # The summary strip is either empty or hidden; either way it must not
+    # claim "0 photos found" or announce a scan count.
+    progress = page.locator("#sourceCountProgress")
+    expect(progress).not_to_contain_text("0 photos")
+    expect(progress).not_to_contain_text("folders counted")
+    expect(progress).not_to_contain_text("photos found")
+
+
 def test_snapshot_mode_loads_while_import_readiness_is_slow(
         live_server, page):
     """A metadata-repair count must not hold a captured import hostage.

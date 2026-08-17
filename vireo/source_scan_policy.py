@@ -11,7 +11,6 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import ntpath
-import os
 import posixpath
 import subprocess
 import sys
@@ -54,20 +53,16 @@ def _unescape_mount_path(value):
 
 
 def _path_candidates(path, *, windows=False):
+    # Purely lexical: normpath / abspath / expanduser do not stat path
+    # components, so a stale NAS mount can't block this call. Resolving
+    # symlinks with os.path.realpath would defeat that guarantee.
     path_module = ntpath if windows else posixpath
     try:
-        normalized = path_module.normpath(path_module.abspath(path))
+        expanded = path_module.expanduser(path) if not windows else path
+        normalized = path_module.normpath(path_module.abspath(expanded))
     except (OSError, TypeError, ValueError):
         return []
-    candidates = [normalized]
-    if not windows:
-        try:
-            resolved = os.path.realpath(os.path.expanduser(path))
-        except (OSError, TypeError, ValueError):
-            resolved = None
-        if resolved and resolved not in candidates:
-            candidates.append(posixpath.normpath(resolved))
-    return candidates
+    return [normalized]
 
 
 def _path_under_mount(path, mount_point, *, case_insensitive=False):

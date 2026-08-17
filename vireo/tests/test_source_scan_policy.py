@@ -1,3 +1,4 @@
+import os
 import subprocess
 from types import SimpleNamespace
 
@@ -74,3 +75,25 @@ def test_windows_distinguishes_fixed_remote_and_removable_drives():
         "local", "network", "removable",
     ]
     assert [policy["max_parallel"] for policy in policies] == [2, 1, 1]
+
+
+def test_classify_sources_does_not_stat_the_selected_paths(monkeypatch):
+    """Path classification must stay purely lexical: a stale NAS mount
+    (`os.path.realpath` blocks on stat) would otherwise be the exact
+    failure mode this API exists to keep the UI out of."""
+    mount_output = "//user@nas/Photography on /Volumes/Photography (smbfs, nodev)"
+
+    def run(*_args, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout=mount_output)
+
+    def _refuse(*_args, **_kwargs):
+        raise AssertionError("classify_sources must not stat the selected paths")
+
+    monkeypatch.setattr(os.path, "realpath", _refuse)
+    monkeypatch.setattr(os, "stat", _refuse)
+    monkeypatch.setattr(os, "lstat", _refuse)
+
+    policies = source_scan_policy.classify_sources(
+        ["/Volumes/Photography/2026/one"], platform="darwin", run=run,
+    )
+    assert policies[0]["storage"] == "network"

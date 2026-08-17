@@ -1215,6 +1215,15 @@ function sourceCountRowText(state) {
 function renderSourceCountProgress() {
   const el = document.getElementById('sourceCountProgress');
   if (!el) return;
+  // Snapshot mode never runs folder-count scans — the per-source rows show
+  // "Captured source folder" text with no `count`, so summing them would
+  // render a bogus "N folders counted · 0 photos found" underneath the
+  // snapshot's own photo-count message.
+  if (newImagesSnapshotId !== null) {
+    el.textContent = '';
+    el.classList.remove('visible');
+    return;
+  }
   const states = sources.map(path => sourceCounts[path]).filter(Boolean);
   const active = states.filter(state => state.status === 'loading');
   const queued = states.filter(state => state.status === 'queued').length;

@@ -2058,6 +2058,44 @@ these two are halves of one mutation, at runtime.)
   names each string rather than picking a representative:
   `untagged "Blue Tit" and "Eurasian Blue Tit" from 3 photos`.
 
+  *`name:`-keyed cards enumerate by folded keyword name, not
+  `taxon_id`.* An unresolved custom label has no `taxa` binding, so the
+  `taxon_id` join above finds no row — and the accept side already
+  knows this: §4 precedence 2 states that "`name:`-keyed rows
+  (unresolved) keep writing their raw label, as today". Under #1488
+  that raw-label row is stamped `source = 'accept'` all the same, so a
+  retraction driven *only* by `taxon_id` would flip every member to
+  `rejected` without finding either the keyword or its pending
+  `keyword_add`, and the card would badge "Rejected" over a photo still
+  carrying the accept-owned tag — the same badge-disagrees-with-metadata
+  failure the retraction rule exists to prevent, this time arriving
+  through the fallback path §1 deliberately leaves in. So the
+  enumeration takes a **second clause for cards whose key is
+  `('name', L)`**: for each affected photo, additionally enumerate
+  every `photo_keywords` row whose `keywords.name` folds equal to the
+  card's canonical folded label (the same `_fold` §1 uses to build the
+  key), and retract each one whose folded `source = 'accept'` that
+  survives the liveness predicate below. The two clauses do not overlap
+  by construction — the key is a card-level property built once in §1
+  and every accepted member of the card wrote its keyword under the
+  same clause of §4 — so each retraction clause finds exactly the
+  associations its half of §4 could have written. Case 2's residual is
+  taxon-only: a `name:`-keyed card has no taxonomy over which two
+  synonyms could exist, so no per-photo enumeration extra is needed
+  beyond the fold-equal match.
+
+  *Persisting the exact accepted `keyword_id` on the
+  `prediction_review` row was the alternative, and is rejected.* It
+  invents a new column to record something recoverable from the same
+  fold `('name', L)` was keyed on, and it under-covers the two
+  cases the read-time enumeration was already built to catch: rows
+  written before the column exists (backfill on legacy data would have
+  to fall back to the fold anyway), and case 2's residual synonym rows
+  on `('taxon', T)` cards, where an earlier accept wrote a
+  taxon-matched keyword whose `keyword_id` this reject would not have
+  picked. The read-time key mirrors the accept side and is strictly
+  smaller.
+
 Without the split, a row-at-a-time loop evaluates each keyword decision
 against a state the same click is about to invalidate. The concrete
 failure: "Reject all" on an `{accepted, pending}` card whose two members
@@ -2275,6 +2313,47 @@ is retracting from:
   global rule cancels unconditionally and queues unconditionally; the
   cost of the extra no-op is a write, and the cost of the shortcut is a
   wrong sidecar.
+- **Every restore of `(photo_id, keyword name)` cancels matching
+  pending `keyword_remove` in every workspace, too — not just the
+  active one.** The queue-side rule above puts a `keyword_remove` into
+  every workspace containing the photo, and each of those queues has
+  its own sync lifetime; leaving the restore side workspace-local
+  undoes exactly the symmetry the queue side just established.
+  Concretely: A syncs first and its remove reaches the sidecar, then
+  the user either undoes the reject or hand-retags the same term in A
+  through `tag_photo`. B's queued `keyword_remove` still sits,
+  unchanged, and the next time B syncs it strips the restored tag back
+  off the sidecar — the same badge-disagrees-with-metadata failure the
+  queue-side rule fixes, arriving through the restore path a minute
+  later and in a workspace the user was not looking at. So every entry
+  point that restores `(photo, keyword name)` loops
+  `remove_pending_changes(photo_id, 'keyword_remove', name,
+  workspace_id=…)` across every workspace, keyed on the row's own
+  `(photo_id, value)` for the same folder-visibility reason the
+  queue-side cancel bullet gave. The paths in scope:
+  `_apply_undo`'s `keyword_remove` branch (`db.py:18956-18970`, which
+  today calls `remove_pending_changes` unqualified and so picks up the
+  active workspace only); `_queue_keyword_add`'s
+  cancel-instead-of-queue shortcut (`app.py:8225-8232`); and any
+  subsequent card accept whose Phase-B keyword resolution writes the
+  same term into a photo whose global `photo_keywords` row was
+  previously stripped — under §4 precedence 1 that write is what makes
+  the row exist again, so every other workspace's stale
+  `keyword_remove` must be cancelled at the moment of the write, for
+  the reasons above. *A rejected alternative — a single global
+  `pending_changes` row with `workspace_id = NULL` for the removal* —
+  would need a null-workspace value on a column every accessor scopes
+  on (`get_pending_changes`, `count_pending_changes`, and both
+  writers), and per-workspace pending views exist so the sync summary
+  answers questions about *this* workspace's outstanding writes. A
+  global-scoped row would leak into all of them, or force each
+  accessor to grow a second clause; cancelling across workspaces on
+  the restore side keeps the existing scoping contract intact and
+  costs one extra small `DELETE` per restore. The three paths above
+  are the closure clause for restores, in the same shape as the
+  entry-point table below is the closure clause for status writes: a
+  path that restores a `(photo, keyword)` association without the loop
+  is a bug, not a gap.
 
 **This cancellation is not a second retraction rule — it is downstream
 of the first, and inherits #1488's lattice by construction.** It runs
@@ -3422,6 +3501,20 @@ Each phase lands as its own PR and is independently useful.
    `prediction_accept` entry, which is the regression guard for not
    sourcing provenance from the bounded edit log), and another live
    non-rejected prediction still asserting the taxon; a
+   **`name:`-keyed retraction fixture** — a card whose §1 key is
+   `('name', 'blue tit')` (an unresolved custom label, no `taxa` row
+   for it): an earlier accept stamped `source = 'accept'` on the
+   raw-label `photo_keywords` row per §4 precedence 2. A subsequent
+   "Reject all" retracts that keyword via an undoable `keyword_remove`
+   and cancels its pending `keyword_add` across every workspace,
+   exactly as the `('taxon', T)` case does. A build whose retraction
+   enumeration keys only on `keywords.taxon_id` finds no row, leaves
+   the keyword on the photo, and fails — this is the regression guard
+   for §3 Phase B, "`name:`-keyed cards enumerate by folded keyword
+   name". Negative variant: the same card whose row is
+   `source = 'manual'` (the user typed the same label) takes the
+   disclosure path with the workspace-aware wording, and a `taxon_id`
+   build silently strips it; a
    **case-2 multi-synonym retraction fixture** — a card whose earlier
    accepts (under §4 case 2) left `source = 'accept'` "Blue Tit" on
    photo P1 and `source = 'accept'` "Eurasian Blue Tit" on photo P2:
@@ -3485,6 +3578,25 @@ Each phase lands as its own PR and is independently useful.
    asked for. A build that cancels pending adds for the rejected taxon
    independently of the retraction decision drops the user's own keyword
    from the sidecar and fails; a
+   **cross-workspace stale-remove fixture** — a photo P shared by
+   workspaces A and B, an accept then reject of "Blue Tit" from A
+   queues a `keyword_remove` in both A and B (the queue-side rule
+   above). A syncs, stripping the term from P's sidecar; the user then
+   restores the keyword in A — first via `_apply_undo` on the reject,
+   then, in a second variant, via `tag_photo` (`app.py:8221`), and in
+   a third, via a subsequent accept whose Phase-B keyword resolution
+   re-writes the term. In all three, assert **B's queued
+   `keyword_remove` is gone** at the moment of the restore, so that
+   driving B's sync afterwards is a no-op on the sidecar. A build that
+   cancels only A's pending remove leaves B's copy alive; B's next
+   sync strips the restored user-authored tag back off the file, and
+   the fixture fails on **sidecar contents** rather than on B's queue
+   state. Negative variant pinning the loop to `remove_pending_changes`
+   rather than to a proposed global-scope row: assert that
+   `count_pending_changes` in a *third* workspace C that also contains
+   P shows zero pending `keyword_remove` for the term throughout, so
+   the fix is not "make the queue row workspace-null" (which would
+   surface in C's summary); a
    **two-phase-ordering fixture** — "Reject all" on an
    `{accepted, pending}` card whose two members assert the **same taxon
    on the same photo**, the accepted one having tagged it

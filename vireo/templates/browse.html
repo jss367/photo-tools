@@ -10728,22 +10728,32 @@ async function removeWorkspaceRootFromBrowse(fid) {
     });
 
     // The DELETE succeeded, so strip any ``?folder_id=<id>`` from the
-    // current URL when it points at the removed root or anything beneath
-    // it. Otherwise a subsequent ``window.location.reload()`` (either
-    // recovery branch below) or a manual reload would restore
-    // ``activeFolderId`` from the query and load an empty scope because
-    // the refreshed tree no longer contains that folder (Codex reviews
-    // r3799300182 and r3799361364).
+    // current URL when it points at a folder that will not survive the
+    // removal. That includes the removed root, its visible descendants,
+    // and any descendant already flagged ``missing`` before the DELETE —
+    // ``browseFolderRows`` excludes missing rows, so a health refresh
+    // that removed the descendant before the click would leave it out of
+    // ``removedSubtreeIds`` and the URL would still restore an empty
+    // scope on any subsequent reload (Codex reviews r3799300182,
+    // r3799361364, and r3799431533). Treating "not currently visible in
+    // ``browseFolderRows``" as also-strip covers the missing-descendant
+    // case without pulling in catalog ancestry.
     try {
       var urlParams = new URLSearchParams(window.location.search);
       var urlFolderId = parseInt(urlParams.get('folder_id'), 10);
-      if (!isNaN(urlFolderId) && removedSubtreeIds[Number(urlFolderId)]) {
-        urlParams.delete('folder_id');
-        var newSearch = urlParams.toString();
-        var newUrl = window.location.pathname +
-          (newSearch ? '?' + newSearch : '') +
-          window.location.hash;
-        window.history.replaceState({}, '', newUrl);
+      if (!isNaN(urlFolderId)) {
+        var stillVisible = !removedSubtreeIds[Number(urlFolderId)] &&
+          browseFolderRows.some(function(row) {
+            return Number(row.id) === Number(urlFolderId);
+          });
+        if (!stillVisible) {
+          urlParams.delete('folder_id');
+          var newSearch = urlParams.toString();
+          var newUrl = window.location.pathname +
+            (newSearch ? '?' + newSearch : '') +
+            window.location.hash;
+          window.history.replaceState({}, '', newUrl);
+        }
       }
     } catch (urlErr) {
       console.warn('Could not strip folder_id from URL after removal', urlErr);

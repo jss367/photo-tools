@@ -169,6 +169,68 @@ def test_folder_tree_remove_strips_descendant_folder_id_from_url(
     )
 
 
+def test_folder_tree_remove_strips_missing_descendant_folder_id_from_url(
+    live_server, page
+):
+    """Also clears ``?folder_id=<missing-descendant>`` from the URL.
+
+    When a descendant folder is flagged ``missing`` before the user
+    removes its workspace root, ``/api/folders`` no longer returns it,
+    so ``browseFolderRows`` (which excludes missing rows) doesn't hold
+    it either. The old cleanup traversed the visible subtree only, so
+    it never added the missing descendant to ``removedSubtreeIds`` and
+    left ``?folder_id=<missing-descendant>`` in the URL — a later
+    reload then restored an empty Browse scope (Codex review
+    r3799431533).
+    """
+    db = live_server["db"]
+    root_id = live_server["data"]["folders"][0]
+    child_id = db.add_folder(
+        "/photos/park/nested",
+        name="nested",
+        parent_id=root_id,
+        workspace_root=False,
+    )
+    workspace_id = db._active_workspace_id
+    # Flip the descendant to ``missing`` so ``/api/folders`` drops it —
+    # the exact precondition described in the review comment.
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?", (child_id,)
+    )
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/browse?folder_id={child_id}")
+    root = page.locator(f'.tree-item[data-folder-id="{root_id}"]')
+    root.wait_for(state="visible")
+    expect(root).to_have_attribute("data-workspace-root", "1")
+    # Confirm the descendant is genuinely absent from the rendered tree
+    # so this test really exercises the missing-descendant path.
+    expect(
+        page.locator(f'.tree-item[data-folder-id="{child_id}"]')
+    ).to_have_count(0)
+    root.click(button="right")
+
+    page.once("dialog", lambda dialog: dialog.accept())
+    with page.expect_response(
+        lambda response: response.request.method == "DELETE"
+        and response.url.endswith(
+            f"/api/workspaces/{workspace_id}/folders/{root_id}"
+        )
+        and response.status == 200
+    ):
+        page.locator(
+            ".vireo-ctx-menu .vireo-ctx-item",
+            has_text="Remove from This Workspace…",
+        ).click()
+
+    expect(root).to_have_count(0)
+    page.wait_for_function(
+        "() => !(new URLSearchParams(window.location.search)"
+        ".has('folder_id'))",
+        timeout=5000,
+    )
+
+
 def test_folder_tree_does_not_offer_remove_for_inherited_descendant(
     live_server, page
 ):

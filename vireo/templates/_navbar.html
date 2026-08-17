@@ -13320,6 +13320,10 @@ async function _deleteMissingPhotoIds(ids, deleteSidecars) {
 }
 </script>
 <script src="/static/vireo-utils.js"></script>
+<!-- Shared by every page that decides predictions (Review, ID Conflicts):
+     the one implementation of "which rows did my earlier request already
+     decide". See vireo-predictions.js. -->
+<script src="/static/vireo-predictions.js"></script>
 <script src="/static/tauri-bridge.js"></script>
 <script>
   /* Updater disabled — startupUpdateCheck skipped until updater is configured */

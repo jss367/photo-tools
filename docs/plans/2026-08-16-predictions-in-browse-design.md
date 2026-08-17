@@ -849,6 +849,36 @@ carried on the write has none of that: a row settled by anyone else still 409s
 and is still reported as a refusal, which is what the second half of the
 regression test pins.
 
+**One contract, one implementation, and the full list of consumers.** The fix
+above shipped in `batchAction` alone, and Review's Accept All — a second loop
+over the same three routes — was left on the old assumption. There it is worse
+than a miscount: Review's `catch` *breaks* the loop, so one burst anywhere in
+the queue silently abandons every unrelated prediction queued behind it. Two
+private copies of "which rows did my earlier request already decide" is exactly
+how the two pages came to disagree, so the rule now lives in one shared file,
+`vireo/static/vireo-predictions.js`, loaded from `_navbar.html`:
+`groupedDecisionTracker()` for a loop over a stale snapshot, and
+`decidedPredictionIds(response)` for a single call that still has to credit the
+siblings it expanded through. Both pages call it; the regression tests drive
+that file, not a copy of it, and both harnesses run against one stub server so
+they cannot agree while the pages diverge.
+
+Every client caller of the three grouped routes, and what each needs:
+
+| Caller | Loops? | Treatment |
+| --- | --- | --- |
+| `id_conflicts.html` `batchAction` | yes, one request per selected photo | consumes the tracker |
+| `review.html` `acceptAllPending` | yes, one request per pending row | consumes the tracker |
+| `review.html` `acceptPrediction` | no | credits `decidedPredictionIds` so expanded siblings stop rendering as pending |
+| `review.html` `acceptAlternative` | no | none — it `await loadPredictions()` immediately, so the expansion arrives from the server |
+| `id_conflicts.html` `predictionAction` | no | none — it `await loadComparison()` on every path, success or failure |
+| `browse.html` panel accept/reject | no | none — `batch-accept`/`batch-reject` take the whole selection in one request and expand server-side, reporting `accepted` / `already_decided` / `skipped_*` counts |
+
+`/reject` is deliberately not in that set. It expands only to `alternative`
+siblings of the *same detection*, so it cannot reach another photo, and no
+caller loops it across photos that could collide. It returns no
+`prediction_ids` and needs none.
+
 This is where the alternative-row contract stated above lands: because the
 check keys on `(detection, classifier_model)`, neither a row with an
 `alternative` sibling nor an `alternative` row itself can be accepted through
@@ -924,6 +954,17 @@ it has no ambiguity check because there is no winner to pick.
   one request and no failure toast; the control case, where the second row was
   settled by somebody else, still sends both and still reports "1 of 2 not
   applied". Verified to fail against the pre-fix template.
+- `test_review_accept_all_consumes_grouped_accept_expansion` and
+  `test_review_single_accept_marks_expanded_group_members` (`test_app.py`) —
+  the same treatment for Review, the second consumer, against the same stub
+  server and the same shared module. A burst plus one unrelated prediction:
+  Accept All sends two requests, not three, and the unrelated row is accepted
+  rather than stranded behind a 409 that broke the loop. The control, where the
+  middle row was settled by somebody else, still 409s and still stops the run,
+  and never marks that row accepted. The single-card test puts the expanded
+  sibling outside the collection filter, so it is only reachable through
+  `allPredictions` — walking the filtered view alone would leave the unfiltered
+  copy lying. Both verified to fail against the pre-fix template.
 - `test_grouped_accept_names_every_row_it_decided` and
   `test_grouped_replace_names_every_row_it_decided`
   (`test_predictions_api.py`) — the server half: both routes return the full

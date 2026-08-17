@@ -20159,17 +20159,25 @@ def test_browse_reject_toast_names_workspace_detach_skips(app_and_db):
     assert clean == []
 
 
-# ID Conflicts' batch accept is inline JS with no server of its own, so the
-# only honest way to check what its rollup claims is to run it against a
-# miniature of the real one: a decision on any row of a burst settles every
-# member of that burst, and a settled row answers 409. Everything under
-# assertion is lifted verbatim from the shipped template.
-_ID_CONFLICTS_BATCH_STUB = """
+# ID Conflicts' batch accept and Review's Accept All are inline JS with no
+# server of their own, so the only honest way to check what they claim is to
+# run them against a miniature of the real one: a decision on any row of a
+# burst settles every member of that burst and names them all in
+# ``prediction_ids``, and a row already settled answers 409. Everything under
+# assertion is lifted verbatim from the shipped templates.
+#
+# One stub, both pages. They loop the same three routes over the same contract,
+# and giving each harness its own idea of what the server does is how the two
+# pages came to disagree about it in the first place — the harnesses would have
+# happily agreed while the pages diverged.
+def _grouped_decision_server_stub(fetch_name):
+    """The burst-expanding decision server, wired to a page's fetch helper."""
+    return """
 var __input = JSON.parse(process.argv[2]);
 var __status = __input.status;   // {predId: 'pending' | terminal status}
 var __groups = __input.groups;   // {predId: [every row one decision settles]}
 var __requests = [];
-async function jsonFetch(url) {
+async function %s(url) {
   var predId = Number(url.split('/')[3]);
   __requests.push(predId);
   if (__status[predId] !== 'pending') {
@@ -20185,6 +20193,20 @@ async function jsonFetch(url) {
 }
 var __toasts = [];
 function showToast(message, kind) { __toasts.push({message: message, kind: kind}); }
+""" % fetch_name
+
+
+def _grouped_decision_module():
+    """The shared client contract, from the very file both pages load."""
+    from pathlib import Path
+
+    src = Path(__file__).parent.parent / "static" / "vireo-predictions.js"
+    text = src.read_text(encoding="utf-8")
+    assert "groupedDecisionTracker" in text, "vireo-predictions.js moved"
+    return text
+
+
+_ID_CONFLICTS_BATCH_STUB = """
 var compareData = {photos: __input.photos};
 var selectedRows = new Set(__input.photos.map(function(p) { return p.photo_id; }));
 function bestPrediction(photo) { return photo.prediction; }
@@ -20213,6 +20235,7 @@ def _run_id_conflicts_batch(html, payload):
     import json as _json
 
     source = "\n".join([
+        _grouped_decision_server_stub("jsonFetch"), _grouped_decision_module(),
         _ID_CONFLICTS_BATCH_STUB, html[start:end], _ID_CONFLICTS_BATCH_DRIVER,
     ])
     return _run_node(source, [_json.dumps(payload)])
@@ -20267,6 +20290,146 @@ def test_id_conflicts_batch_accept_reports_group_expanded_rows_as_applied(
     assert [t["message"] for t in stale["toasts"]] == [
         "1 of 2 not applied — prediction already rejected; cannot accept",
     ]
+
+
+# Review's accept handlers, driven against the same burst-expanding server.
+# ``predictions`` is the filtered view and ``allPredictions`` the unfiltered
+# copy over the same objects, exactly as ``loadPredictions`` builds them; the
+# ``filtered_out`` key lets a test put a group sibling outside the current
+# filter, where only the unfiltered copy can see it.
+_REVIEW_ACCEPT_STUB = """
+var allPredictions = __input.predictions;
+var __filteredOut = __input.filtered_out || [];
+var predictions = allPredictions.filter(function(p) {
+  return __filteredOut.indexOf(p.id) < 0;
+});
+var _predictionsReloading = false;
+var _loadPredictionsEpoch = 0;
+function _predictionEpochStale(epoch) { return epoch !== _loadPredictionsEpoch; }
+var __renders = 0;
+function renderAll() { __renders++; }
+async function loadPredictions() {}
+function __report() {
+  var local = {};
+  allPredictions.forEach(function(p) { local[p.id] = p.status; });
+  process.stdout.write(JSON.stringify({
+    requests: __requests, serverStatus: __status, localStatus: local,
+    toasts: __toasts, renders: __renders,
+  }));
+}
+"""
+
+
+def _run_review_accept(html, payload, call):
+    """Run Review's real accept handlers against the stub server."""
+    start = html.find("/* ---------- Actions ---------- */")
+    end = html.find("/* ---------- Keyboard Shortcuts ---------- */")
+    assert start != -1 and end > start, (
+        "review.html's accept actions could not be located"
+    )
+    import json as _json
+
+    source = "\n".join([
+        _grouped_decision_server_stub("safeFetch"), _grouped_decision_module(),
+        _REVIEW_ACCEPT_STUB, html[start:end], call + ".then(__report);",
+    ])
+    return _run_node(source, [_json.dumps(payload)])
+
+
+def test_review_accept_all_consumes_grouped_accept_expansion(app_and_db):
+    """A burst in Review's queue must not abandon the rest of Accept All.
+
+    Codex P2 (app.py:17964). ``acceptAllPending`` loops ``/accept`` over a
+    snapshot of the pending rows, and ``accept_prediction`` fans one accept
+    across every pending member of the burst group. The second member is then
+    already decided, meets the terminal-status 409 this PR added, and Review's
+    catch block *breaks the loop* — so one burst anywhere in the queue leaves
+    every unrelated prediction after it unaccepted, with the button reporting
+    nothing at all. Worse than the ID Conflicts case round 18 fixed: there the
+    loop continued and merely miscounted.
+
+    The fix is the same one, from the same shared module: consume the
+    ``prediction_ids`` the accept says it wrote. The control below keeps the
+    distinction that fix exists to preserve — a row settled by somebody *else*
+    is not in that list, still 409s, and still stops the run rather than being
+    quietly credited to this one.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/review").get_data(as_text=True)
+    assert "/static/vireo-predictions.js" in html, (
+        "Review must load the shared grouped-decision module"
+    )
+    # 11 and 12 are one burst; 13 is unrelated and queued behind them.
+    predictions = [
+        {"id": 11, "status": "pending"},
+        {"id": 12, "status": "pending"},
+        {"id": 13, "status": "pending"},
+    ]
+
+    burst = _run_review_accept(html, {
+        "predictions": predictions,
+        "status": {"11": "pending", "12": "pending", "13": "pending"},
+        "groups": {"11": [11, 12], "12": [11, 12]},
+    }, "acceptAllPending()")
+    assert burst["requests"] == [11, 13], (
+        "12 was already decided by the request for 11; re-sending it 409s and "
+        "kills the run before 13 is ever accepted"
+    )
+    assert burst["serverStatus"] == {
+        "11": "accepted", "12": "accepted", "13": "accepted",
+    }
+    # And the cards agree with the database: no row is left offering an Accept
+    # the server has already recorded.
+    assert burst["localStatus"] == {
+        "11": "accepted", "12": "accepted", "13": "accepted",
+    }
+
+    # Control: no group, and 12 was decided by someone else. That 409 is a real
+    # conflict, not this run's own work, and must still stop the run.
+    stale = _run_review_accept(html, {
+        "predictions": predictions,
+        "status": {"11": "pending", "12": "rejected", "13": "pending"},
+        "groups": {},
+    }, "acceptAllPending()")
+    assert stale["requests"] == [11, 12]
+    assert stale["localStatus"]["12"] != "accepted", (
+        "a row somebody else rejected must never be marked accepted here"
+    )
+    assert stale["localStatus"]["13"] == "pending"
+
+
+def test_review_single_accept_marks_expanded_group_members(app_and_db):
+    """One Accept click on a burst member settles the whole burst on screen.
+
+    The other half of the same Codex P2: ``acceptPrediction`` credited only the
+    row in the URL, so the siblings ``accept_prediction`` decided in the same
+    transaction kept rendering as pending — offering an Accept the database had
+    already recorded, and a Reject that would now 409.
+
+    The sibling here sits outside the collection filter, so it exists only in
+    ``allPredictions``. Walking just the filtered view would miss it and leave
+    the unfiltered copy lying the moment the filter is cleared.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/review").get_data(as_text=True)
+
+    result = _run_review_accept(html, {
+        "predictions": [
+            {"id": 11, "status": "pending"},
+            {"id": 12, "status": "pending"},
+            {"id": 13, "status": "pending"},
+        ],
+        "filtered_out": [12],
+        "status": {"11": "pending", "12": "pending", "13": "pending"},
+        "groups": {"11": [11, 12], "12": [11, 12]},
+    }, "acceptPrediction(11)")
+    assert result["requests"] == [11]
+    assert result["localStatus"] == {
+        "11": "accepted", "12": "accepted", "13": "pending",
+    }
+    assert result["renders"] == 1
 
 
 def _seed_pending_prediction(db, filename, species):

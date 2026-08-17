@@ -1621,31 +1621,21 @@ async function batchAction(action) {
   // and accept-subject expand through the burst group, so one request can
   // settle several of the selected photos; the next iteration would then hit
   // the terminal-status 409 and be counted as "not applied" for work that
-  // demonstrably landed. The ids come back from the request that wrote them,
-  // so this skips only rows this batch itself decided — a row settled by
-  // someone else still 409s and is still reported as a refusal, which is the
-  // distinction that matters. Deducing it instead from an "already accepted"
-  // status in the 409 would call a *different* decision this batch's own
-  // success: a replace answering "already accepted" may be sitting on a plain
-  // accept that never stripped the old species keywords, and reporting that
-  // as done is the same false claim about the database, just pointing the
-  // other way.
-  var decidedByThisBatch = new Set();
+  // demonstrably landed. Shared with Review's Accept All, which loops the same
+  // routes over the same contract — see vireo-predictions.js for why the ids
+  // ride on the write rather than being read out of the 409's wording.
+  var decidedByThisBatch = Vireo.predictions.groupedDecisionTracker();
   for (var i = 0; i < photos.length; i++) {
     var pred = bestPrediction(photos[i]);
     if (!pred) continue;
     attempted++;
     // Applied, not skipped: it counts in the denominator and against no
     // failure bucket, because the server told us it wrote this row.
-    if (decidedByThisBatch.has(pred.id)) continue;
+    if (decidedByThisBatch.alreadyDecided(pred.id)) continue;
     try {
-      var applied = await jsonFetch('/api/predictions/' + pred.id + '/' + endpointForAction(action), { method: 'POST' });
-      var expanded = applied && applied.prediction_ids;
-      if (Array.isArray(expanded)) {
-        for (var j = 0; j < expanded.length; j++) {
-          decidedByThisBatch.add(expanded[j]);
-        }
-      }
+      decidedByThisBatch.record(await jsonFetch(
+        '/api/predictions/' + pred.id + '/' + endpointForAction(action),
+        { method: 'POST' }));
     } catch (e) {
       // One already-settled row must not abandon the rest of the batch, but
       // the count has to be named — a batch that quietly did less than the

@@ -2220,6 +2220,47 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
+function formatEncounterTimeRange(timeRange) {
+  if (!timeRange || !timeRange[0]) return '';
+
+  var monthNames = [
+    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
+  ];
+  function timestampParts(value) {
+    var match = String(value || '').match(
+      /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}:\d{2}(?::\d{2})?)/
+    );
+    if (!match) return null;
+    var monthIndex = parseInt(match[2], 10) - 1;
+    if (monthIndex < 0 || monthIndex >= monthNames.length) return null;
+    return {
+      dayKey: match[1] + '-' + match[2] + '-' + match[3],
+      date: monthNames[monthIndex] + ' ' + parseInt(match[3], 10) + ', ' + match[1],
+      time: match[4],
+    };
+  }
+
+  var start = timestampParts(timeRange[0]);
+  var end = timestampParts(timeRange[1]);
+  // Keep the old time-only fallback for unexpected legacy timestamp shapes.
+  if (!start) {
+    var fallbackStart = String(timeRange[0]).split('T')[1] || String(timeRange[0]);
+    var fallbackEnd = timeRange[1]
+      ? (String(timeRange[1]).split('T')[1] || String(timeRange[1]))
+      : '';
+    return fallbackStart.substring(0, 8)
+      + (fallbackEnd ? ' – ' + fallbackEnd.substring(0, 8) : '');
+  }
+  if (!end || (start.dayKey === end.dayKey && start.time === end.time)) {
+    return start.date + ' · ' + start.time;
+  }
+  if (start.dayKey === end.dayKey) {
+    return start.date + ' · ' + start.time + '–' + end.time;
+  }
+  return start.date + ' ' + start.time + ' – ' + end.date + ' ' + end.time;
+}
+
 function speciesNameArg(name) {
   if (name == null) return "''";
   return "'" + escapeHtml(String(name).replace(/\\/g, '\\\\').replace(/'/g, "\\'")) + "'";
@@ -3153,12 +3194,7 @@ function renderResults() {
   pipelineReviewVisibleTargets = {};
   encounterSortOrder().forEach(function(ei) {
     var enc = pipelineResults.encounters[ei];
-    var timeRange = '';
-    if (enc.time_range && enc.time_range[0]) {
-      var t0 = enc.time_range[0].split('T')[1] || '';
-      var t1 = enc.time_range[1] ? enc.time_range[1].split('T')[1] || '' : '';
-      timeRange = t0.substring(0,8) + (t1 ? ' - ' + t1.substring(0,8) : '');
-    }
+    var timeRange = formatEncounterTimeRange(enc.time_range);
 
     // Check if the encounter passes the species/filename search.
     if (!encounterMatchesSearch(enc, photoMap)) return;
@@ -3192,7 +3228,7 @@ function renderResults() {
     html += '<span class="encounter-meta" onclick="toggleEncounter(' + ei + ')" style="cursor:pointer;flex:1;">';
     html += '<span>' + enc.photo_count + ' photos</span>';
     if (enc.burst_count) html += '<span>' + enc.burst_count + ' bursts</span>';
-    if (timeRange) html += '<span>' + timeRange + '</span>';
+    if (timeRange) html += '<span>' + escapeHtml(timeRange) + '</span>';
     html += missingTimestampBadge(enc);
     html += renderEncounterSpeciesConflict(enc, speciesConflictEvidence, confirmedHiddenIds);
     html += '</span>';
@@ -3254,7 +3290,7 @@ function renderResults() {
     html += '<span class="encounter-meta" style="flex:1;">';
     html += '<span>' + enc.photo_count + ' photos</span>';
     if (enc.burst_count) html += '<span>' + enc.burst_count + ' bursts</span>';
-    if (timeRange) html += '<span>' + timeRange + '</span>';
+    if (timeRange) html += '<span>' + escapeHtml(timeRange) + '</span>';
     html += missingTimestampBadge(enc);
     html += renderEncounterSpeciesConflict(enc, speciesConflictEvidence, confirmedHiddenIds);
     html += '</span></div>';

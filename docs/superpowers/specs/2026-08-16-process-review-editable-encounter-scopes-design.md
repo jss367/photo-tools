@@ -241,7 +241,9 @@ previews the before/after structure, names inherited state, and supports undo.
 ### Process result
 
 The latest completed Process run creates a canonical result with a stable
-`review_run_id` and monotonically increasing `revision`. It defines:
+`review_run_id` and two monotonically increasing counters: `revision`, which
+advances on any review mutation, and `structural_revision`, which advances
+only when encounter or burst membership changes. It defines:
 
 - the photos included in that run;
 - encounter and burst boundaries;
@@ -1199,8 +1201,9 @@ message, and audit record.
 Species confirmation uses the assertion model above. The request names the
 target subjects or photos, taxon, operation (add, replace, Not identifiable, or
 False detection), canonical run, and expected revision. The server returns the
-changed photos and encounters, updated completion and summary counts, and the
-new revision. It does not return the complete encounter list.
+changed photos and encounters, updated completion and summary counts, the new
+`revision`, and the unchanged `structural_revision` so an active pagination
+cursor remains valid. It does not return the complete encounter list.
 
 Confirmation never changes structure merely because another species is
 present: multi-species photos and encounters are valid. When credible species
@@ -1576,9 +1579,18 @@ Every canonical review result has:
 ```json
 {
   "review_run_id": "pipeline-1786837933532-107",
-  "revision": 42
+  "revision": 42,
+  "structural_revision": 7
 }
 ```
+
+`revision` advances on every review mutation, including species confirmation,
+triage, and flag changes. `structural_revision` advances only when encounter
+or burst membership changes: a new Process run, applied regrouping, or an
+explicit structural command such as Split, Extract, Merge, or Separate.
+Decision-only mutations increment `revision` but preserve
+`structural_revision` so pagination cursors, focus, and scroll position
+remain valid.
 
 Every encounter and burst has an opaque stable ID. IDs survive labels, flags,
 sorting, filtering, and pagination. A structural regroup may replace IDs;
@@ -1587,9 +1599,10 @@ groups.
 
 Mutation requests include `review_run_id`, the expected `revision`, and the
 target IDs. If a new Process run or another structural mutation has made the
-page stale, the server returns `409 Conflict` with the current run and revision.
-The page refreshes its view and explains that the review changed; it never
-applies a command to whichever group now occupies an old array index.
+page stale, the server returns `409 Conflict` with the current run,
+`revision`, and `structural_revision`. The page refreshes its view and
+explains that the review changed; it never applies a command to whichever
+group now occupies an old array index.
 
 ### Species evidence contract
 
@@ -1685,7 +1698,7 @@ request is:
 The server resolves collection membership and intersects it with the canonical
 process result. It returns:
 
-- canonical run and revision;
+- canonical run, `revision`, and `structural_revision`;
 - process-coverage counts;
 - match, encounter, context-photo, and confirmation counts;
 - a page of complete encounters;
@@ -1699,14 +1712,17 @@ large collection ID list and intersect it with a second large result payload.
 ### Pagination
 
 Pagination is encounter-based and uses an opaque cursor tied to the run,
-revision, sort, and filter fingerprint. The server observes both a target
-encounter count and a soft target photo count:
+`structural_revision`, sort, and filter fingerprint. Decision-only mutations
+such as species confirmation, triage, and flags do not invalidate the
+cursor, so a large review can be edited while continuing to scroll from the
+loaded position. The server observes both a target encounter count and a
+soft target photo count:
 
 - never split an encounter;
 - return at least one encounter even when it exceeds the photo target;
 - otherwise stop before adding an encounter that would exceed the soft photo
   target; and
-- invalidate the cursor when the structural revision or query changes.
+- invalidate the cursor when `structural_revision` or the query changes.
 
 The client loads the next page as the user approaches the end of the current
 window. Already loaded pages may be virtualized or discarded outside a bounded
@@ -1723,6 +1739,7 @@ All review mutations use a common delta envelope:
   "ok": true,
   "review_run_id": "pipeline-1786837933532-107",
   "revision": 43,
+  "structural_revision": 7,
   "updated_encounters": [],
   "removed_encounter_ids": [],
   "updated_photos": [],
@@ -1731,8 +1748,11 @@ All review mutations use a common delta envelope:
 }
 ```
 
-The client applies the delta to normalized maps keyed by stable IDs. It does
-not replace or deep-clone the complete review result.
+The client compares the returned `structural_revision` with the one bound to
+its active cursor: an unchanged value means pagination remains valid and no
+requery is required, while a bumped value means the next page fetch must use
+a fresh cursor. The client applies the delta to normalized maps keyed by
+stable IDs. It does not replace or deep-clone the complete review result.
 
 ### Persistence model
 
@@ -1995,7 +2015,8 @@ invariant in both modes.
   criteria.
 - Collection intersection with partial canonical process coverage.
 - Complete encounter and burst membership in every returned page.
-- Cursor stability and invalidation after structural revisions.
+- Cursor stability across decision-only mutations and invalidation after
+  structural revisions.
 - Stable-ID targeting for every mutation type.
 - Stale run and stale revision conflict responses.
 - Delta correctness for single-species and multi-species confirmation.

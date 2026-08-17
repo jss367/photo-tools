@@ -186,8 +186,8 @@ const sections = [
         <p>A review view is a lens over one saved Process result. Changing the view decides which complete encounters appear; it does not rerun grouping and does not create a second, read-only result.</p>
 
         <div class="steps">
-          <article><span>1</span><div><h3>Choose a source</h3><p>Begin with the complete latest Process result, the active workspace, or a collection.</p></div></article>
-          <article><span>2</span><div><h3>Add conditions</h3><p>Filter by folder, date, species, triage status, confirmation state, camera, rating, or other supported metadata.</p></div></article>
+          <article><span>1</span><div><h3>Start from the latest Process result</h3><p>Every view is a lens over the same canonical result. Begin with <strong>All processed photos</strong>, and optionally narrow to one collection.</p></div></article>
+          <article><span>2</span><div><h3>Add conditions</h3><p>Narrow by triage, species-review state, encounter match rule, or a search across species, scientific name, filename, model name, label-list name, or photo ID.</p></div></article>
           <article><span>3</span><div><h3>Choose how encounters qualify</h3><p>Use <strong>Any photo</strong> for inclusive discovery or <strong>Every photo</strong> for strict containment.</p></div></article>
           <article><span>4</span><div><h3>Review complete encounters</h3><p>Once an encounter qualifies, all of its photos remain together and every edit uses the same stable identities.</p></div></article>
         </div>
@@ -477,7 +477,7 @@ const sections = [
           </details>
           <details>
             <summary><span>05</span><strong>Make a large review faster</strong></summary>
-            <ol><li>Use a folder, date, collection, or status condition to reduce the qualifying encounters.</li><li>Keep Any photo selected when context matters most; use Every photo for strict containment.</li><li>Sort disagreements and unresolved review units first.</li><li>Keep the evidence panel closed until a decision needs explanation.</li><li>Move through bounded encounter pages rather than loading the complete workspace at once.</li></ol>
+            <ol><li>Use a collection, triage, or species-review condition to reduce the qualifying encounters.</li><li>Keep Any photo selected when context matters most; use Every photo for strict containment.</li><li>Sort disagreements and unresolved review units first.</li><li>Keep the evidence panel closed until a decision needs explanation.</li><li>Move through bounded encounter pages rather than loading the complete workspace at once.</li></ol>
           </details>
         </div>
       </section>

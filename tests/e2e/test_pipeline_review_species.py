@@ -371,6 +371,56 @@ def test_pipeline_review_encounter_time_range_includes_capture_date(
     expect(across_days).to_have_count(2)
 
 
+def test_pipeline_review_can_hide_encounters_without_species_suggestions(
+    live_server, page
+):
+    photo_ids = live_server["data"]["photos"][:3]
+    _write_confirmation_pipeline_cache(live_server, photo_ids)
+
+    # Keep one confirmed suggestion and one unconfirmed suggestion, then turn
+    # the final encounter into the exact state rendered as "Add species".
+    db = live_server["db"]
+    path = os.path.join(
+        os.path.dirname(db._db_path),
+        f"pipeline_results_ws{db._active_workspace_id}.json",
+    )
+    with open(path) as f:
+        cache = json.load(f)
+    missing = cache["encounters"][-1]
+    missing["species"] = []
+    missing["species_predictions"] = []
+    missing["bursts"][0]["species_predictions"] = []
+    with open(path, "w") as f:
+        json.dump(cache, f)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+
+    expect(page.locator(".encounter-card")).to_have_count(3)
+    expect(page.locator(".species-widget .species-name.missing")).to_have_count(2)
+
+    hide_missing = page.locator("#hideWithoutSuggestionsBtn")
+    hide_missing.click()
+    expect(hide_missing).to_have_class(re.compile(r"\bactive\b"))
+    expect(page.locator(".encounter-card")).to_have_count(2)
+    expect(page.locator(".species-widget .species-name.missing")).to_have_count(0)
+    expect(page.locator("#countAll")).to_have_text(" (2)")
+
+    # The new toggle composes with Hide confirmed to leave only suggested,
+    # unconfirmed encounters, and both settings survive a reload.
+    page.locator("#hideConfirmedBtn").click()
+    expect(page.locator(".encounter-card")).to_have_count(1)
+    expect(page.locator("#countAll")).to_have_text(" (1)")
+
+    page.reload()
+    expect(hide_missing).to_have_class(re.compile(r"\bactive\b"))
+    expect(page.locator("#hideConfirmedBtn")).to_have_class(re.compile(r"\bactive\b"))
+    expect(page.locator(".encounter-card")).to_have_count(1)
+
+    hide_missing.click()
+    expect(page.locator(".encounter-card")).to_have_count(2)
+    expect(page.locator(".species-widget .species-name.missing")).to_have_count(2)
+
+
 def test_pipeline_review_search_matches_filename_without_species_predictions(
     live_server, page
 ):

@@ -562,7 +562,21 @@ async function jsonFetch(url, options) {
   var resp = await fetch(url, options || {});
   var data = await resp.json().catch(function() { return {}; });
   if (!resp.ok || data.error) {
-    throw new Error(data.error || ('Request failed: ' + resp.status));
+    var err = new Error(data.error || ('Request failed: ' + resp.status));
+    // Keep the outcome class on the error, not just its text. A 4xx (or any
+    // response carrying an `error` body) is the server *answering* — it
+    // refused, and wrote nothing. A 5xx or a thrown fetch is an unknown
+    // outcome: the decision routes commit inside BEGIN IMMEDIATE, so a
+    // failure after that commit is indistinguishable from one before it at
+    // this end. Callers must not report the second as "not applied".
+    err.status = resp.status;
+    // An `error` body is itself the answer: the server got far enough to
+    // explain the refusal in its own words, whatever status it chose to send
+    // it under. Classifying on the status alone reported those as unconfirmed,
+    // which understates what we know — so both shapes count as answered, and
+    // only a status-only failure (5xx, or a fetch that threw) stays unknown.
+    err.answered = Boolean(data.error) || (resp.status >= 400 && resp.status < 500);
+    throw err;
   }
   return data;
 }
@@ -1563,7 +1577,27 @@ function bestPrediction(photo) {
 
 async function predictionAction(predId, action) {
   var url = '/api/predictions/' + predId + '/' + endpointForAction(action);
-  await jsonFetch(url, { method: 'POST' });
+  try {
+    await jsonFetch(url, { method: 'POST' });
+  } catch (e) {
+    // The decision endpoints now answer 409 when the row was already settled
+    // — from a second tab, or from a Browse batch decision landing while this
+    // page sat open. The buttons here are disabled for non-pending rows, so
+    // reaching this means the page is stale: say so and reload, rather than
+    // swallowing the click, which would look like the action succeeded.
+    //
+    // Only a server that answered lets us say the decision was not applied.
+    // For a dropped connection or a 5xx the request may well have committed,
+    // so the honest report is that we cannot confirm it — the reload below
+    // shows which it was either way.
+    if (e && e.answered) {
+      showToast(e.message || 'Could not apply that decision', 'error');
+    } else {
+      showToast('Could not confirm the decision (' +
+        (e && e.message ? e.message : 'the request failed') +
+        ') — reloading to show the current state.', 'error');
+    }
+  }
   await loadComparison();
 }
 
@@ -1580,10 +1614,56 @@ async function batchAction(action) {
   var photos = (compareData.photos || []).filter(function(photo) {
     return ids.indexOf(photo.photo_id) >= 0;
   });
+  var attempted = 0;
+  var refused = [];
+  var unconfirmed = 0;
+  // Rows an earlier request in *this* loop already decided. Accept, replace
+  // and accept-subject expand through the burst group, so one request can
+  // settle several of the selected photos; the next iteration would then hit
+  // the terminal-status 409 and be counted as "not applied" for work that
+  // demonstrably landed. Shared with Review's Accept All, which loops the same
+  // routes over the same contract — see vireo-predictions.js for why the ids
+  // ride on the write rather than being read out of the 409's wording.
+  var decidedByThisBatch = Vireo.predictions.groupedDecisionTracker();
   for (var i = 0; i < photos.length; i++) {
     var pred = bestPrediction(photos[i]);
     if (!pred) continue;
-    await jsonFetch('/api/predictions/' + pred.id + '/' + endpointForAction(action), { method: 'POST' });
+    attempted++;
+    // Applied, not skipped: it counts in the denominator and against no
+    // failure bucket, because the server told us it wrote this row.
+    if (decidedByThisBatch.alreadyDecided(pred.id)) continue;
+    try {
+      decidedByThisBatch.record(await jsonFetch(
+        '/api/predictions/' + pred.id + '/' + endpointForAction(action),
+        { method: 'POST' }));
+    } catch (e) {
+      // One already-settled row must not abandon the rest of the batch, but
+      // the count has to be named — a batch that quietly did less than the
+      // selection implies is the gap this whole flow exists to close. The
+      // denominator is what was actually attempted, not the selection: rows
+      // with no usable prediction were never sent.
+      //
+      // Split by outcome class rather than lumping every failure under "not
+      // applied": that phrasing is a claim about the database, and it is only
+      // true when the server answered. A lost response leaves the decision
+      // possibly committed, and saying otherwise is the same kind of
+      // convenient fiction the rest of this flow exists to remove.
+      if (e && e.answered) refused.push(e.message || 'refused');
+      else unconfirmed++;
+    }
+  }
+  var reportParts = [];
+  if (refused.length) {
+    reportParts.push(refused.length + ' of ' + attempted + ' not applied — ' +
+      refused[0]);
+  }
+  if (unconfirmed) {
+    reportParts.push(unconfirmed + ' of ' + attempted +
+      ' could not be confirmed (the request failed with no answer from the ' +
+      'server) — the reload below shows whether they landed');
+  }
+  if (reportParts.length) {
+    showToast(reportParts.join('; '), 'error');
   }
   selectedRows.clear();
   await loadComparison();

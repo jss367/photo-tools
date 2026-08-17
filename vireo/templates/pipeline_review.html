@@ -1810,6 +1810,7 @@ input[type="range"]::-moz-range-thumb {
       <button class="filter-btn" data-filter="REJECT" onclick="setFilter('REJECT')">Reject<span class="count" id="countReject"></span></button>
       <button class="filter-btn species-conflicts" data-filter="SPECIES_CONFLICT" onclick="setFilter('SPECIES_CONFLICT')" title="Show photos whose classification conflicts with the species suggested for their encounter or burst">Species conflicts<span class="count" id="countSpeciesConflict"></span></button>
       <button class="filter-btn" id="hideConfirmedBtn" onclick="toggleHideConfirmed()" title="Hide encounters/bursts whose species has been confirmed">Hide confirmed</button>
+      <button class="filter-btn" id="hideWithoutSuggestionsBtn" onclick="toggleHideWithoutSuggestions()" title="Hide encounters whose header shows Add species">Hide without suggestions</button>
       <div class="species-filter-wrap">
         <div class="search-control">
           <input type="text" id="speciesFilterInput" placeholder="Search species or filename..." aria-label="Search process review by species or filename" oninput="setSpeciesFilter(this.value)">
@@ -2010,6 +2011,7 @@ var speciesFilterText = '';
 var speciesFilterSearchOptions = {matchCase: false, wholeWord: false};
 var speciesDropdownSearchOptions = {matchCase: false, wholeWord: false};
 var hideConfirmed = false;
+var hideWithoutSuggestions = false;
 // Captured from /api/pipeline/page-init so computeReviewNow() can apply
 // the same workspace-override logic the happy path uses on page load.
 var workspaceOverrides = null;
@@ -2078,6 +2080,7 @@ function persistPipelineReviewViewState() {
       speciesFilter: speciesInput ? speciesInput.value : speciesFilterText,
       speciesFilterSearchOptions: speciesFilterSearchOptions,
       hideConfirmed: !!hideConfirmed,
+      hideWithoutSuggestions: !!hideWithoutSuggestions,
       encounterSort: encounterSort,
       showPhotoLabels: !!showPhotoLabels,
       thumbSize: document.getElementById('thumbSizeSlider')
@@ -2094,6 +2097,11 @@ function applyPipelineReviewToolbarState() {
 
   var hideBtn = document.getElementById('hideConfirmedBtn');
   if (hideBtn) hideBtn.classList.toggle('active', hideConfirmed);
+
+  var hideWithoutSuggestionsBtn = document.getElementById('hideWithoutSuggestionsBtn');
+  if (hideWithoutSuggestionsBtn) {
+    hideWithoutSuggestionsBtn.classList.toggle('active', hideWithoutSuggestions);
+  }
 
   var input = document.getElementById('speciesFilterInput');
   if (input) input.value = speciesFilterText || '';
@@ -2130,6 +2138,7 @@ function restorePipelineReviewViewState() {
     };
   }
   hideConfirmed = !!state.hideConfirmed;
+  hideWithoutSuggestions = !!state.hideWithoutSuggestions;
   showPhotoLabels = !!state.showPhotoLabels;
 
   if (PIPELINE_ENCOUNTER_SORTS.indexOf(state.encounterSort) !== -1) {
@@ -3103,6 +3112,10 @@ function photoMatchesPipelineFilter(photo, issue) {
   return photo.label === activeFilter;
 }
 
+function encounterHasSpeciesSuggestion(enc) {
+  return !!(enc && (enc.confirmed_species || (enc.species && enc.species[0])));
+}
+
 function renderResults() {
   if (!pipelineResults) return;
   var container = document.getElementById('encountersContainer');
@@ -3141,11 +3154,24 @@ function renderResults() {
     });
   }
 
-  // Update filter counts (respecting species filter and hide-confirmed)
+  // This toggle mirrors the encounter-level species widget: if the header
+  // would render "Add species", hide the entire encounter and exclude its
+  // photos from the toolbar counts.
+  var withoutSuggestionHiddenIds = null;
+  if (hideWithoutSuggestions) {
+    withoutSuggestionHiddenIds = new Set();
+    pipelineResults.encounters.forEach(function(enc) {
+      if (encounterHasSpeciesSuggestion(enc)) return;
+      (enc.photo_ids || []).forEach(function(pid) { withoutSuggestionHiddenIds.add(pid); });
+    });
+  }
+
+  // Update filter counts (respecting search and both hide toggles)
   var counts = {all: 0, KEEP: 0, REVIEW: 0, REJECT: 0, SPECIES_CONFLICT: 0};
   pipelineResults.photos.forEach(function(p) {
     if (speciesVisibleIds && !speciesVisibleIds.has(p.id)) return;
     if (confirmedHiddenIds && confirmedHiddenIds.has(p.id)) return;
+    if (withoutSuggestionHiddenIds && withoutSuggestionHiddenIds.has(p.id)) return;
     counts.all++;
     if (p.label) counts[p.label] = (counts[p.label] || 0) + 1;
     if (speciesConflictEvidence[p.id] && speciesConflictEvidence[p.id].severity) {
@@ -3172,6 +3198,7 @@ function renderResults() {
 
     // Check if the encounter passes the species/filename search.
     if (!encounterMatchesSearch(enc, photoMap)) return;
+    if (hideWithoutSuggestions && !encounterHasSpeciesSuggestion(enc)) return;
 
     // Build the set of photos this encounter will actually draw: skip
     // hide-confirmed photos and photos filtered out by the active label /
@@ -3408,6 +3435,13 @@ function visibleEncounterPhotoIds(enc) {
 
 function toggleHideConfirmed() {
   hideConfirmed = !hideConfirmed;
+  applyPipelineReviewToolbarState();
+  persistPipelineReviewViewState();
+  renderResults();
+}
+
+function toggleHideWithoutSuggestions() {
+  hideWithoutSuggestions = !hideWithoutSuggestions;
   applyPipelineReviewToolbarState();
   persistPipelineReviewViewState();
   renderResults();

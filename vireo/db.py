@@ -10,7 +10,11 @@ import unicodedata
 import uuid
 from datetime import datetime
 
-from keyword_normalization import keyword_match_key, normalize_keyword_display
+from keyword_normalization import (
+    keyword_match_key,
+    normalize_keyword_display,
+    species_match_key,
+)
 from new_images import get_shared_cache
 
 log = logging.getLogger(__name__)
@@ -9129,15 +9133,20 @@ class Database:
             photo_ids, rating, verify_workspace=verify_workspace
         )
 
-    def update_photo_flag(self, photo_id, flag, verify_workspace=True):
+    def update_photo_flag(self, photo_id, flag, verify_workspace=True, _commit=True):
         """Set photo flag ('none', 'flagged', 'rejected').
 
         Args:
             verify_workspace: when True (the default), raises ValueError if
                 the photo is not in the active workspace's folders.
+            _commit: If False, skip the internal commit (caller is responsible
+                     for committing the transaction). Callers that hold
+                     ``BEGIN IMMEDIATE`` — the prediction decision lock, for
+                     example — must pass False so the writer lock is not
+                     released mid-decision.
         """
         self._photo_review_repository().set_flag(
-            photo_id, flag, verify_workspace=verify_workspace
+            photo_id, flag, verify_workspace=verify_workspace, _commit=_commit
         )
 
     def update_photo_wildlife_excluded(self, photo_id, excluded, verify_workspace=True):
@@ -16913,6 +16922,71 @@ class Database:
             )
         self.conn.commit()
 
+    def get_prediction_states(self, photo_ids):
+        """Explain, per photo, why it may have no predictions to show.
+
+        An empty prediction list has four completely different meanings and a
+        blank panel implies only the first, so Browse needs them separated:
+        nothing has run yet, the detector ran and found no animals, detections
+        exist but were never classified, or classification ran and produced
+        nothing the user's confidence floor admits.
+
+        ``threshold`` travels with the state so the panel can split the rows
+        it already has into visible and below-the-floor, and say the hidden
+        count out loud rather than dropping those rows silently.
+
+        ``detection_count`` counts only what the rest of this file calls a
+        real detection: ``detector_model = 'full-image'`` rows are the
+        synthetic whole-frame anchor written *because* the detector found
+        nothing, and rows under the workspace's ``detector_confidence`` floor
+        are the noise the classifier never acts on. Counting either would
+        report "detections exist but were never classified" for a photo whose
+        detector plainly found no animal — the exact conflation this method
+        exists to prevent. Same rule as ``count_real_detections_in_scope``.
+        """
+        if not photo_ids:
+            return {}
+        import config as cfg
+        effective = self.get_effective_config(cfg.load())
+        threshold = effective.get("classifier_confidence", 0.0) or 0.0
+        detector_floor = effective.get("detector_confidence", 0.2)
+        ids = list(dict.fromkeys(int(pid) for pid in photo_ids))
+        states = {
+            pid: {
+                "detector_ran": False,
+                "detection_count": 0,
+                "classifier_ran": False,
+                "threshold": threshold,
+            }
+            for pid in ids
+        }
+        for chunk in _chunks(ids):
+            placeholders = ",".join("?" for _ in chunk)
+            for row in self.conn.execute(
+                f"""SELECT photo_id, COUNT(*) AS n FROM detector_runs
+                    WHERE photo_id IN ({placeholders}) GROUP BY photo_id""",
+                chunk,
+            ):
+                states[row["photo_id"]]["detector_ran"] = row["n"] > 0
+            for row in self.conn.execute(
+                f"""SELECT photo_id, COUNT(*) AS n FROM detections
+                    WHERE photo_id IN ({placeholders})
+                      AND detector_model != 'full-image'
+                      AND detector_confidence >= ?
+                    GROUP BY photo_id""",
+                [*chunk, detector_floor],
+            ):
+                states[row["photo_id"]]["detection_count"] = row["n"]
+            for row in self.conn.execute(
+                f"""SELECT d.photo_id AS photo_id, COUNT(*) AS n
+                    FROM classifier_runs cr
+                    JOIN detections d ON d.id = cr.detection_id
+                    WHERE d.photo_id IN ({placeholders}) GROUP BY d.photo_id""",
+                chunk,
+            ):
+                states[row["photo_id"]]["classifier_ran"] = row["n"] > 0
+        return states
+
     def get_predictions(self, photo_ids=None, model=None, status=None,
                         rules=None):
         """Get predictions with photo, detection and review info.
@@ -17365,6 +17439,14 @@ class Database:
 
         return [r for r in rows if _eval(root, r)]
 
+    # The one definition of "this prediction's review is already settled".
+    # ``app.py`` binds ``_DECIDED_PREDICTION_STATUSES`` to it, the grouped
+    # accept expansion below uses it, and Browse's panel mirrors it in JS, so
+    # no surface can drift on which rows are still actionable. See
+    # ``app.py``'s ``_decided_prediction_ids`` for why ``alternative`` is
+    # absent and what each endpoint then does with those rows.
+    DECIDED_PREDICTION_STATUSES = ("accepted", "rejected", "reviewed")
+
     def update_prediction_status(self, prediction_id, status, _commit=True):
         """Update per-workspace review status for a prediction.
 
@@ -17468,12 +17550,31 @@ class Database:
             )
         return rows
 
-    def update_predictions_status_by_photo(self, photo_id, status):
+    def update_predictions_status_by_photo(self, photo_id, status,
+                                           _commit=True):
         """Upsert review status for every prediction of a photo in the active workspace.
 
         Review state is workspace-scoped (``prediction_review``); detections
         and predictions are global.  We enumerate the prediction ids via the
         detections join and upsert each review row.
+
+        ``_commit=False`` lets a caller that already holds the prediction
+        decision lock (``app.py``'s ``_under_prediction_decision_lock``) fold
+        these writes into that transaction.
+
+        Deliberately unconditional. The stale-overwrite this method used to
+        enable — a group apply flipping an ``accepted`` row to ``rejected``
+        while the keyword the accept added stays on the photo — is guarded
+        one level up, in ``api_prediction_group_apply``, against the statuses
+        the burst modal displayed (``_stale_group_apply_photos``). A
+        ``WHERE status NOT IN DECIDED_PREDICTION_STATUSES`` clause on the
+        ``ON CONFLICT`` below was tried first and removed: it cannot tell a
+        stale payload from the user re-opening an applied burst and changing
+        the split, which is a reachable flow (Review's default tab is "All",
+        and every grouped card there renders "Review Burst Group"), so it
+        silently froze the statuses while the flag and keyword writes above
+        it — which run before this call and outside the lock — went ahead
+        anyway. Guarding here is both too strict and too late.
         """
         ws = self._ws_id()
         rows = self.conn.execute(
@@ -17492,9 +17593,145 @@ class Database:
                                  reviewed_at = excluded.reviewed_at""",
                 (r["id"], ws, status),
             )
-        self.conn.commit()
+        if _commit:
+            self.conn.commit()
 
-    def ungroup_prediction(self, prediction_id):
+    _MIXED_SPECIES_GROUP_REPAIR_KEY = "prediction_review_mixed_species_groups_v1"
+
+    def repair_mixed_species_prediction_groups(self):
+        """Ungroup legacy bursts whose stored votes span more than one species.
+
+        ``classify_job._store_grouped_predictions`` only stamps ``group_id``
+        and ``individual`` when every frame in the burst folds to a single
+        ``species_match_key`` — ``group_reviewable``. That gate arrived in
+        #1165; bursts stored before it got a ``group_id`` and an
+        unconditional multi-species vote dict regardless of whether the
+        frames agreed.
+
+        Those rows are actively wrong, not merely stale. ``accept_prediction``
+        derives the species it applies from the vote dict, so a legacy row
+        displays its own ``predictions.species`` and tags the vote winner:
+        accepting a frame labelled ``Purple Finch`` writes ``Cassin's
+        Finch``. That is the black box ``CORE_PHILOSOPHY.md`` forbids, and no
+        amount of careful rendering fixes it — the button would still have to
+        name one species and apply another.
+
+        So repair the data rather than the symptom: for every review row
+        whose ``individual`` holds more than one distinct species key, clear
+        ``group_id``, ``individual``, ``vote_count`` and ``total_votes``.
+        The row then reads exactly as the current classifier would have
+        written it — an ungrouped prediction that accepts as its own species.
+        ``status`` is untouched (a decision the user already made stays
+        made), and nothing in ``predictions`` is read or written: no
+        prediction is deleted, retitled or rescored, only the burst-grouping
+        metadata that was never valid.
+
+        Rows whose ``individual`` has several JSON keys that fold to *one*
+        species are left grouped. ``species_match_key`` collapses okina,
+        typographic-apostrophe and case variants, so ``{"Hawai'i 'Amakihi":
+        4, "Hawai’i ’Amakihi": 2}`` is a unanimous burst spelled two
+        ways and its grouping is legitimate. This is why the fold runs in
+        Python: SQLite's ``lower()`` does not apply that normalization and
+        would ungroup those rows.
+
+        Not workspace-scoped. ``prediction_review`` is keyed by
+        ``(prediction_id, workspace_id)`` and the same legacy classify run
+        wrote rows in whichever workspaces were active at the time, so this
+        deliberately runs across every workspace rather than through
+        ``_ws_id()``.
+
+        Idempotent and gated by a ``db_meta`` marker rather than
+        ``PRAGMA user_version``: this repo has known ``user_version`` drift
+        between branches, and a version-gated migration silently skips on a
+        database whose number already ran ahead. After the first run the cost
+        is one indexed ``db_meta`` lookup.
+
+        Returns the number of review rows cleared.
+        """
+        if self.get_meta(self._MIXED_SPECIES_GROUP_REPAIR_KEY) == "1":
+            return 0
+        # A single-species vote dict is ``{"Robin": 4}`` — one JSON member,
+        # no comma. Any row that could hold two species therefore contains a
+        # comma, so this probe both short-circuits on the first candidate
+        # (immediate on a catalog that has any) and lets a database with no
+        # legacy groups stamp its marker after one scan instead of decoding
+        # every ``individual`` blob in the table. A species name containing a
+        # comma would pass the probe and then be left alone by the fold
+        # below; the probe only has to avoid false negatives.
+        try:
+            candidate = self.conn.execute(
+                """SELECT 1 FROM prediction_review
+                   WHERE individual LIKE '%,%' LIMIT 1"""
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # Schema older than prediction_review (or a connection opened
+            # with initialize_schema=False before it exists). Leave the
+            # marker unset so a later boot retries.
+            return 0
+        if candidate is None:
+            self.set_meta(self._MIXED_SPECIES_GROUP_REPAIR_KEY, "1")
+            log.info(
+                "Skipped mixed-species prediction-group repair: "
+                "no multi-vote burst rows"
+            )
+            return 0
+
+        rows = self.conn.execute(
+            """SELECT pr.prediction_id, pr.workspace_id, pr.individual,
+                      d.photo_id
+               FROM prediction_review pr
+               JOIN predictions p ON p.id = pr.prediction_id
+               JOIN detections d ON d.id = p.detection_id
+               WHERE pr.individual LIKE '%,%'"""
+        ).fetchall()
+        targets = []
+        photo_ids = set()
+        for row in rows:
+            try:
+                votes = json.loads(row["individual"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(votes, dict) or len(votes) < 2:
+                continue
+            if len({species_match_key(name) for name in votes}) < 2:
+                continue
+            targets.append((row["prediction_id"], row["workspace_id"]))
+            photo_ids.add(row["photo_id"])
+
+        # One transaction for the whole repair, marker included. Partway
+        # through is the one state that must not be reachable: a stamped
+        # marker over a half-cleared table would strand the rest forever,
+        # and cleared rows without the marker would re-scan on every boot.
+        # The writes are chunked only to keep executemany's parameter list
+        # bounded — ~42k two-column updates on the live catalog is well
+        # inside what SQLite holds in a single transaction.
+        for chunk in _chunks(targets):
+            self.conn.executemany(
+                """UPDATE prediction_review
+                      SET group_id = NULL,
+                          individual = NULL,
+                          vote_count = NULL,
+                          total_votes = NULL
+                    WHERE prediction_id = ? AND workspace_id = ?""",
+                chunk,
+            )
+        self.set_meta(self._MIXED_SPECIES_GROUP_REPAIR_KEY, "1", _commit=False)
+        commit_with_retry(self.conn)
+        if targets:
+            log.info(
+                "Ungrouped %d legacy prediction review row(s) across %d "
+                "photo(s) whose burst votes spanned more than one species; "
+                "these now accept as their own species",
+                len(targets), len(photo_ids),
+            )
+        else:
+            log.info(
+                "Mixed-species prediction-group repair found nothing to "
+                "clear: every multi-vote burst folds to one species"
+            )
+        return len(targets)
+
+    def ungroup_prediction(self, prediction_id, _commit=True):
         """Remove a prediction from its group in the active workspace.
 
         ``group_id`` lives in ``prediction_review``; this only clears the
@@ -17505,7 +17742,8 @@ class Database:
                WHERE prediction_id = ? AND workspace_id = ?""",
             (prediction_id, self._ws_id()),
         )
-        self.conn.commit()
+        if _commit:
+            self.conn.commit()
 
     def get_existing_prediction_photo_ids(self, model, labels_fingerprint=None):
         """Return photo_ids with predictions for a (model, fingerprint), scoped to active workspace.
@@ -17841,6 +18079,7 @@ class Database:
         prediction_id,
         replace_species=False,
         photo_ids=None,
+        prediction_ids=None,
         _commit=True,
     ):
         """Accept a prediction: mark as accepted and add species keyword.
@@ -17859,6 +18098,36 @@ class Database:
         group members are tagged and marked accepted. This lets callers apply a
         grouped accept to a filtered subset without changing hidden photos.
 
+        ``prediction_ids`` is the stricter form of the same limit, for callers
+        that already know the exact prediction rows they are acting on: the
+        grouped accept touches only those rows. Prefer it over ``photo_ids``
+        whenever the caller has a submitted id list. A photo is not a unique
+        key for a prediction — one photo can carry several rows in the same
+        burst group (one per classifier model, or per detection) — so a
+        photo-id limit lets a grouped accept reach a row on an allowed photo
+        that the caller never submitted. ``photo_ids`` remains for callers
+        whose intent really is "these photos" (highlight confirm, accept
+        subject), where the row set is chosen by this method.
+
+        Independently of either limit, group expansion only ever *discovers*
+        undecided rows: a group member already ``accepted`` or ``rejected`` is
+        left alone unless the caller named it (as the entry row, or in
+        ``prediction_ids``). Accepting one burst member must not resurrect a
+        sibling the user rejected in Review, nor re-flip a long-accepted one
+        into a history item whose "previous" status never happened.
+
+        Both limits are settled before the first write, so a call whose scope
+        excludes every candidate row is a true no-op: no keyword row is
+        created, no sibling alternative is rejected, no status is flipped. It
+        returns ``accepted_prediction_ids: []`` with ``keyword_id`` set to the
+        existing keyword for the resolved species (``None`` when no such
+        keyword exists yet).
+
+        The returned ``accepted_prediction_ids`` lists every prediction row
+        this call marked accepted, so a caller looping over a submitted batch
+        can skip rows a previous grouped accept already covered instead of
+        re-accepting them into duplicate history items.
+
         All database changes are performed atomically in a single transaction
         unless ``_commit`` is False and the caller owns the transaction.
         """
@@ -17866,6 +18135,9 @@ class Database:
         limited_photo_ids = None
         if photo_ids is not None:
             limited_photo_ids = {int(pid) for pid in photo_ids}
+        limited_pred_ids = None
+        if prediction_ids is not None:
+            limited_pred_ids = {int(pid) for pid in prediction_ids}
         # Load taxonomy once for the whole call so replace_species can protect
         # keywords whose relationship to a neighbouring subject's prediction is
         # broader/same/narrower — not just exact-text matches. Loaded here
@@ -17899,16 +18171,34 @@ class Database:
         if not pred:
             return None
 
-        try:
-            # Reject sibling predictions for the same
-            # (detection, classifier_model, labels_fingerprint) in this
-            # workspace (covers both accepting an alternative and accepting
-            # the top-1). Scoping by fingerprint is critical — without it,
-            # accepting a prediction from a new label set would mark old
-            # label-set rows as rejected, silently rewriting review state
-            # for unrelated fingerprints. Review state is workspace-scoped,
-            # so we upsert each row rather than UPDATE the base predictions
-            # table.
+        def _reject_siblings_of(this_pred_id):
+            """Resolve the losing rows on one accepted row's detection.
+
+            Rejects siblings for the same
+            (detection, classifier_model, labels_fingerprint) in this
+            workspace (covers both accepting an alternative and accepting the
+            top-1). Scoping by fingerprint is critical — without it, accepting
+            a prediction from a new label set would mark old label-set rows as
+            rejected, silently rewriting review state for unrelated
+            fingerprints. Review state is workspace-scoped, so we upsert each
+            row rather than UPDATE the base predictions table.
+
+            Run per accepted row, and only for rows this call accepts: a
+            grouped accept decides every member's detection, so leaving the
+            other members' alternatives at 'alternative' would keep photos in
+            Review's queue that this call already settled — and would make it
+            unsafe for a batch caller to skip a submitted row that a grouped
+            accept covered. Equally, a row the caller's scope excludes must
+            not have its alternatives resolved, so this never runs for the
+            entry row before scope is settled.
+            """
+            row = self.conn.execute(
+                """SELECT detection_id, classifier_model, labels_fingerprint
+                   FROM predictions WHERE id = ?""",
+                (this_pred_id,),
+            ).fetchone()
+            if row is None:
+                return
             sibs = self.conn.execute(
                 """SELECT pr.id FROM predictions pr
                    LEFT JOIN prediction_review pr_rev
@@ -17918,8 +18208,8 @@ class Database:
                      AND pr.labels_fingerprint = ?
                      AND pr.id != ?
                      AND COALESCE(pr_rev.status, 'pending') IN ('pending', 'alternative')""",
-                (ws, pred["detection_id"], pred["model"],
-                 pred["labels_fingerprint"], prediction_id),
+                (ws, row["detection_id"], row["classifier_model"],
+                 row["labels_fingerprint"], this_pred_id),
             ).fetchall()
             for s in sibs:
                 self.conn.execute(
@@ -17932,6 +18222,7 @@ class Database:
                     (s["id"], ws),
                 )
 
+        try:
             # For grouped predictions, derive consensus from individual votes
             species = pred["species"]
             if pred["group_id"] and pred["individual"]:
@@ -17943,6 +18234,112 @@ class Database:
                     species = best
                 except Exception:
                     pass
+
+            # Settle scope before the first write.
+            #
+            # ``limited_photo_ids`` / ``limited_pred_ids`` exist to make this
+            # call a no-op outside the caller's submitted scope, so *every*
+            # mutation — sibling rejection, keyword creation, status flips —
+            # has to sit behind that decision rather than beside it. This
+            # method used to reject the entry row's alternatives up front,
+            # which silently resolved rows the caller never submitted while
+            # the return value truthfully reported no accepts. The row set is
+            # therefore computed from reads only; nothing below writes until
+            # it is non-empty.
+            def _in_scope(photo_id, this_pred_id):
+                photo_allowed = (
+                    limited_photo_ids is None
+                    or photo_id in limited_photo_ids
+                )
+                # The row-level limit, checked independently: a group
+                # member's photo being in scope does not make every row
+                # that member carries in scope.
+                row_allowed = (
+                    limited_pred_ids is None
+                    or this_pred_id in limited_pred_ids
+                )
+                return photo_allowed and row_allowed
+
+            def _expansion_allowed(this_pred_id, status):
+                """May group expansion *discover* this row?
+
+                Group expansion reaches rows the caller never named — that is
+                its whole point — so it must not reach rows whose decision is
+                already made. Without this, accepting one burst member from
+                Review re-accepts a sibling the user explicitly rejected
+                earlier (tagging that photo with the species it was denied)
+                and re-flips long-accepted siblings, whose "previous" status
+                in the resulting history item is then a fiction: undo would
+                knock them back to pending. ``reviewed`` is treated the same
+                as ``accepted`` / ``rejected`` here: the user marked the row
+                reviewed to say "I looked and chose not to act", and
+                expanding a group into it would silently flip that decision
+                to ``accepted`` without any audit trail describing the
+                overwrite.
+
+                Rows the caller *named* are exempt, because then the caller,
+                not the expansion, chose them: the entry row itself, and any
+                row listed in ``limited_pred_ids``. ``batch-accept`` never
+                lists a decided row (``_decided_prediction_ids`` filters them
+                out first), so in practice this only ever exempts a row a
+                route was pointed at directly.
+                """
+                if this_pred_id == prediction_id:
+                    return True
+                if (
+                    limited_pred_ids is not None
+                    and this_pred_id in limited_pred_ids
+                ):
+                    return True
+                return status not in self.DECIDED_PREDICTION_STATUSES
+
+            # If grouped, accept every prediction in the group (in this
+            # workspace) that survives the caller's scope.
+            if pred["group_id"]:
+                group_preds = self.conn.execute(
+                    """SELECT pr.id, d.photo_id, pr_rev.status AS status
+                       FROM predictions pr
+                       JOIN prediction_review pr_rev
+                         ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+                       JOIN detections d ON d.id = pr.detection_id
+                       JOIN photos ph ON ph.id = d.photo_id
+                       JOIN workspace_folders wf
+                         ON wf.folder_id = ph.folder_id AND wf.workspace_id = ?
+                       WHERE pr_rev.group_id = ? AND pr.classifier_model = ?""",
+                    (ws, ws, pred["group_id"], pred["model"]),
+                ).fetchall()
+                targets = [
+                    (gp["photo_id"], gp["id"])
+                    for gp in group_preds
+                    if _in_scope(gp["photo_id"], gp["id"])
+                    and _expansion_allowed(gp["id"], gp["status"])
+                ]
+            elif _in_scope(pred["photo_id"], prediction_id):
+                targets = [(pred["photo_id"], prediction_id)]
+            else:
+                targets = []
+
+            if not targets:
+                # Nothing this caller submitted is acceptable here, so leave
+                # the database exactly as it was and report no changes.
+                # ``add_keyword`` is a write too (it creates the species row),
+                # so it also waits behind the scope decision; the read-only
+                # lookup keeps ``keyword_id``/``species`` meaningful for
+                # callers reconciling one batch's species without inventing a
+                # keyword for an accept that never happened.
+                display = normalize_keyword_display(species)
+                existing = self.conn.execute(
+                    """SELECT id, name FROM keywords
+                       WHERE name = ? COLLATE NOCASE
+                       ORDER BY id LIMIT 1""",
+                    (display,),
+                ).fetchone()
+                return {
+                    "species": existing["name"] if existing else display,
+                    "keyword_id": existing["id"] if existing else None,
+                    "affected": [],
+                    "accepted_prediction_ids": [],
+                }
 
             kid = self.add_keyword(species, is_species=True, _commit=False)
             # Re-read the stored keyword name so the queued sidecar changes,
@@ -17959,8 +18356,18 @@ class Database:
                 species = stored["name"]
             # list of {"photo_id", "prediction_id", "old_species"}
             affected = []
+            # Every row this call flips to accepted, including ones that
+            # produced no ``affected`` entry (a status-only accept under
+            # replace_species). Callers batching over a submitted id list use
+            # it to avoid re-entering rows a grouped accept already covered.
+            accepted_pred_ids = []
 
             def _accept_for_photo(photo_id, this_pred_id):
+                accepted_pred_ids.append(this_pred_id)
+                # Every accepted row resolves its own detection's losers,
+                # including the entry row. Doing it here rather than up front
+                # is what keeps an out-of-scope entry row untouched.
+                _reject_siblings_of(this_pred_id)
                 self.update_prediction_status(this_pred_id, "accepted", _commit=False)
                 old_species = []
                 already_has_species = photo_id in self.get_photos_with_equivalent_species(
@@ -18272,46 +18679,23 @@ class Database:
                         "changed_tag": False,
                     })
 
-            # If grouped, accept all predictions in the group (in this workspace).
-            if pred["group_id"]:
-                group_preds = self.conn.execute(
-                    """SELECT pr.id, d.photo_id
-                       FROM predictions pr
-                       JOIN prediction_review pr_rev
-                         ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
-                       JOIN detections d ON d.id = pr.detection_id
-                       JOIN photos ph ON ph.id = d.photo_id
-                       JOIN workspace_folders wf
-                         ON wf.folder_id = ph.folder_id AND wf.workspace_id = ?
-                       WHERE pr_rev.group_id = ? AND pr.classifier_model = ?""",
-                    (ws, ws, pred["group_id"], pred["model"]),
-                ).fetchall()
-                for gp in group_preds:
-                    if (
-                        limited_photo_ids is not None
-                        and gp["photo_id"] not in limited_photo_ids
-                    ):
-                        continue
-                    _accept_for_photo(gp["photo_id"], gp["id"])
-            else:
-                if (
-                    limited_photo_ids is not None
-                    and pred["photo_id"] not in limited_photo_ids
-                ):
-                    if _commit:
-                        self.conn.commit()
-                    return {"species": species, "keyword_id": kid, "affected": []}
-                _accept_for_photo(pred["photo_id"], prediction_id)
+            for target_photo_id, target_pred_id in targets:
+                _accept_for_photo(target_photo_id, target_pred_id)
 
             if _commit:
                 self.conn.commit()
-            return {"species": species, "keyword_id": kid, "affected": affected}
+            return {
+                "species": species,
+                "keyword_id": kid,
+                "affected": affected,
+                "accepted_prediction_ids": accepted_pred_ids,
+            }
         except Exception:
             if _commit:
                 self.conn.rollback()
             raise
 
-    def accept_subject_species(self, prediction_id):
+    def accept_subject_species(self, prediction_id, _commit=True):
         """Accept agreeing model predictions for one detected subject.
 
         Compare uses this for an additional-species suggestion: the species
@@ -18320,6 +18704,12 @@ class Database:
         species on the same detection is resolved together. Grouped
         predictions are explicitly limited to this photo so accepting a
         subject in Compare cannot silently tag the rest of a burst.
+
+        ``_commit=False`` leaves the surrounding transaction open so the
+        caller can bundle the accept with its own writes (edit history,
+        precondition checks) inside one ``BEGIN IMMEDIATE`` — used by
+        ``api_accept_subject_species`` to serialize with the rest of the
+        prediction-decision routes.
         """
         ws = self._ws_id()
         target = self.conn.execute(
@@ -18364,13 +18754,19 @@ class Database:
                     photo_ids=[target["photo_id"]],
                     _commit=False,
                 )
-                if accepted is not None:
+                # A row whose grouped scope excluded this photo accepts
+                # nothing, so it must not be reported as an accepted id (nor
+                # supply the returned keyword, which is None when the species
+                # keyword does not exist yet).
+                if accepted and accepted["accepted_prediction_ids"]:
                     result = accepted
                     accepted_ids.append(row["id"])
                     affected.extend(accepted["affected"])
-            self.conn.commit()
+            if _commit:
+                self.conn.commit()
         except Exception:
-            self.conn.rollback()
+            if _commit:
+                self.conn.rollback()
             raise
 
         if result is None:

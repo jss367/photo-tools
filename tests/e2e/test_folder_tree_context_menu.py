@@ -79,6 +79,48 @@ def test_folder_tree_removes_workspace_root_without_deleting_folder(
     }
 
 
+def test_folder_tree_remove_strips_folder_id_from_url(live_server, page):
+    """After a successful removal, ``?folder_id=<removed>`` is cleared.
+
+    Otherwise any subsequent reload (either the two recovery ``reload()``
+    branches inside ``removeWorkspaceRootFromBrowse`` or a manual browser
+    refresh) would restore ``activeFolderId`` from the query and load an
+    empty scope because the refreshed tree no longer contains that folder
+    (Codex review r3799300182).
+    """
+    db = live_server["db"]
+    folder_id = live_server["data"]["folders"][0]
+    workspace_id = db._active_workspace_id
+
+    page.goto(f"{live_server['url']}/browse?folder_id={folder_id}")
+    item = page.locator(f'.tree-item[data-folder-id="{folder_id}"]')
+    item.wait_for(state="visible")
+    expect(item).to_have_attribute("data-workspace-root", "1")
+    item.click(button="right")
+
+    page.once("dialog", lambda dialog: dialog.accept())
+    with page.expect_response(
+        lambda response: response.request.method == "DELETE"
+        and response.url.endswith(
+            f"/api/workspaces/{workspace_id}/folders/{folder_id}"
+        )
+        and response.status == 200
+    ):
+        page.locator(
+            ".vireo-ctx-menu .vireo-ctx-item",
+            has_text="Remove from This Workspace…",
+        ).click()
+
+    expect(item).to_have_count(0)
+    page.wait_for_function(
+        f"() => !(new URLSearchParams(window.location.search)"
+        f".has('folder_id')) || "
+        f"new URLSearchParams(window.location.search).get('folder_id') "
+        f"!== '{folder_id}'",
+        timeout=5000,
+    )
+
+
 def test_folder_tree_does_not_offer_remove_for_inherited_descendant(
     live_server, page
 ):

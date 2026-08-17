@@ -10697,6 +10697,27 @@ async function removeWorkspaceRootFromBrowse(fid) {
       method: 'DELETE',
     });
 
+    // The DELETE succeeded, so strip any ``?folder_id=<fid>`` from the
+    // current URL. Otherwise a subsequent ``window.location.reload()``
+    // (either recovery branch below) or a manual reload would restore
+    // ``activeFolderId`` from the query and load an empty scope because
+    // the refreshed tree no longer contains that folder (Codex review
+    // r3799300182).
+    try {
+      var urlParams = new URLSearchParams(window.location.search);
+      var urlFolderId = parseInt(urlParams.get('folder_id'), 10);
+      if (!isNaN(urlFolderId) && Number(urlFolderId) === Number(fid)) {
+        urlParams.delete('folder_id');
+        var newSearch = urlParams.toString();
+        var newUrl = window.location.pathname +
+          (newSearch ? '?' + newSearch : '') +
+          window.location.hash;
+        window.history.replaceState({}, '', newUrl);
+      }
+    } catch (urlErr) {
+      console.warn('Could not strip folder_id from URL after removal', urlErr);
+    }
+
     // Refresh the authoritative local-folder payload before rebuilding
     // the tree. Without this, ``window.vireoLocalFolderData`` still
     // carries the removed root when ``renderFolderTree`` runs, so

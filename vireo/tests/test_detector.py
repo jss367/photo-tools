@@ -358,8 +358,11 @@ def test_tiled_fallback_retains_detections_between_raw_floor_and_trigger(
 
     import detector
 
-    assert 0.15 > detector.RAW_CONF_FLOOR
-    assert 0.15 < detector.TILED_FALLBACK_TRIGGER_CONFIDENCE
+    assert (
+        detector.RAW_CONF_FLOOR
+        < 0.15
+        < detector.TILED_FALLBACK_TRIGGER_CONFIDENCE
+    )
 
     fake_session = MagicMock()
     fake_session.get_inputs.return_value = [MagicMock(name="images")]

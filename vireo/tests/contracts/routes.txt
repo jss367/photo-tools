@@ -33,6 +33,7 @@ GET          /api/classify/readiness
 GET          /api/collections
 GET          /api/collections/<int:collection_id>/photo-ids
 GET          /api/collections/<int:collection_id>/photos
+GET          /api/color-label-descriptions
 GET          /api/computation-cache
 GET          /api/computation-cache/export
 GET          /api/config
@@ -53,6 +54,7 @@ GET          /api/filters/fields
 GET          /api/filters/values
 GET          /api/folders
 GET          /api/folders/<int:folder_id>
+GET          /api/folders/<int:folder_id>/workspaces
 GET          /api/folders/missing
 GET          /api/health
 GET          /api/highlights
@@ -222,6 +224,7 @@ POST         /api/batch/location
 POST         /api/batch/location/from-exif
 POST         /api/batch/location/text
 POST         /api/batch/rating
+POST         /api/batch/wildlife-excluded
 POST         /api/browse/mkdir
 POST         /api/browse/photo-counts
 POST         /api/capture-time/preview
@@ -348,6 +351,8 @@ POST         /api/predictions/<int:pred_id>/accept-subject
 POST         /api/predictions/<int:pred_id>/reject
 POST         /api/predictions/<int:pred_id>/replace-keywords
 POST         /api/predictions/<int:pred_id>/reviewed
+POST         /api/predictions/batch-accept
+POST         /api/predictions/batch-reject
 POST         /api/predictions/group/apply
 POST         /api/preview-cache/clear
 POST         /api/processes
@@ -361,6 +366,8 @@ POST         /api/remote-setup/ssh-check
 POST         /api/remote-targets/test
 POST         /api/report-issue
 POST         /api/selection/keyword-suggestions
+POST         /api/selection/prediction-suggestions
+POST         /api/selection/wildlife-state
 POST         /api/settings/import
 POST         /api/setup/complete
 POST         /api/shutdown
@@ -398,6 +405,7 @@ POST         /api/workspaces/active/local-workspace/sync
 POST         /api/workspaces/active/new-images/snapshot
 POST,PUT     /api/photos/<int:photo_id>/edit-recipe
 PUT          /api/collections/<int:collection_id>
+PUT          /api/color-label-descriptions/<color>
 PUT          /api/keywords/<int:keyword_id>
 PUT          /api/move-rules/<int:rule_id>
 PUT          /api/processes/<int:process_id>

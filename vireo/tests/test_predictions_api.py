@@ -107,6 +107,72 @@ def test_accept_prediction(app_and_db):
     assert 'Blue Jay' in kw_names
 
 
+def _burst_pair(db, group_id, species, photo_indexes=(0, 1)):
+    """Two photos of one burst carrying the same species from one model."""
+    photos = db.get_photos()
+    pred_ids = []
+    for offset, index in enumerate(photo_indexes):
+        det = _make_detection(db, photos[index]['id'])
+        db.add_prediction(detection_id=det, species=species,
+                          confidence=0.95 - 0.05 * offset, model='test-model',
+                          category='new', group_id=group_id)
+        pred_ids.append(db.conn.execute(
+            "SELECT id FROM predictions WHERE detection_id = ?", (det,)
+        ).fetchone()['id'])
+    return [photos[i]['id'] for i in photo_indexes], pred_ids
+
+
+def test_grouped_accept_names_every_row_it_decided(app_and_db):
+    """The accept response lists the burst rows it settled, not just the URL's.
+
+    ID Conflicts' batch accept loops this single-row route once per selected
+    photo. Two selected photos of one burst are a single grouped decision on
+    the server: the first request accepts both rows, and the second meets the
+    terminal-status 409 for work that demonstrably landed. Without an explicit
+    list of what the write covered, the client has no truthful way to tell
+    that 409 apart from a row somebody else decided, so it reports an applied
+    decision as "not applied" — a claim about the database that is false.
+
+    The list has to come from the transaction that wrote it. Inferring it
+    instead from an "already accepted" status echoed back in the 409 would
+    call *any* prior accept this batch's own success, including one made in
+    another tab under different scope.
+    """
+    app, db = app_and_db
+    _, (pred_a, pred_b) = _burst_pair(db, 'gburst', 'Steller Jay')
+    ws = db._active_workspace_id
+    client = app.test_client()
+
+    resp = client.post(f'/api/predictions/{pred_a}/accept')
+    assert resp.status_code == 200
+    assert sorted(resp.get_json()['prediction_ids']) == sorted([pred_a, pred_b])
+    assert db.get_review_status(pred_b, ws) == 'accepted'
+
+    # The request the loop would otherwise send next. It is a genuine refusal
+    # — the row is settled — which is exactly why the client must skip it
+    # rather than classify it after the fact.
+    assert client.post(f'/api/predictions/{pred_b}/accept').status_code == 409
+
+
+def test_grouped_replace_names_every_row_it_decided(app_and_db):
+    """Replace expands through the burst too, so it reports the same list.
+
+    Replace is the case that rules out reading idempotence off the 409's
+    status: a replace answering "already accepted" may be sitting on a plain
+    accept that never stripped the old species keywords, so treating it as
+    success would report a replacement that never happened.
+    """
+    app, db = app_and_db
+    _, (pred_a, pred_b) = _burst_pair(db, 'greplace', 'Scrub Jay')
+    ws = db._active_workspace_id
+    client = app.test_client()
+
+    resp = client.post(f'/api/predictions/{pred_a}/replace-keywords')
+    assert resp.status_code == 200
+    assert sorted(resp.get_json()['prediction_ids']) == sorted([pred_a, pred_b])
+    assert db.get_review_status(pred_b, ws) == 'accepted'
+
+
 def test_reject_prediction(app_and_db):
     """POST reject marks prediction as rejected."""
     app, db = app_and_db
@@ -800,4 +866,518 @@ def test_get_predictions_classifier_model_is_not_keeps_other_model_siblings(app_
     assert 'PickA' not in returned, (
         'row-level pass failed to drop the model-a sibling from the '
         'is-not result set'
+    )
+
+
+def _one_prediction(db, species='Blue Jay', photo_index=2, model='test-model'):
+    """Seed one ungrouped prediction and return (prediction_id, photo_id).
+
+    Each call makes its own detection, so several predictions can share a
+    photo without colliding — the fixture catalog is small.
+    """
+    photos = db.get_photos()
+    photo_id = photos[photo_index % len(photos)]['id']
+    det = _make_detection(db, photo_id)
+    db.add_prediction(detection_id=det, species=species, confidence=0.90,
+                      model=model, category='new', group_id=None)
+    row = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ? AND species = ?",
+        (det, species),
+    ).fetchone()
+    return row['id'], photo_id
+
+
+def test_decision_routes_leave_no_transaction_open(app_and_db):
+    """Every path out of the lock releases it, including the refusals.
+
+    ``BEGIN IMMEDIATE`` holds SQLite's single writer lock, so a 404 or a 409
+    that returned without committing would stall every later decision served
+    on the same connection. The successful accept after the refusals is the
+    assertion that matters — without the release it would block until the
+    30 s ``busy_timeout`` and come back 503.
+    """
+    app, db = app_and_db
+    _seed_predictions(db)
+    client = app.test_client()
+
+    assert client.post('/api/predictions/999999/reject').status_code == 404
+    # /accept answers 200 for a missing id (``accept_prediction`` returns None
+    # and the route reports a no-op) — unchanged behaviour, exercised here
+    # because it is another path that leaves the lock without writing.
+    assert client.post('/api/predictions/999999/accept').status_code == 200
+
+    settled, _ = _one_prediction(db, species='Woodhouse Scrub Jay')
+    db.update_prediction_status(settled, 'reviewed')
+    assert client.post(f'/api/predictions/{settled}/accept').status_code == 409
+
+    fresh, photo_id = _one_prediction(db, species='Florida Scrub Jay',
+                                      photo_index=3)
+    resp = client.post(f'/api/predictions/{fresh}/accept')
+    assert resp.status_code == 200
+    kw_names = {k['name'] for k in db.get_photo_keywords(photo_id)}
+    assert 'Florida Scrub Jay' in kw_names
+
+
+def test_undo_of_an_accept_still_works_under_the_decision_lock(app_and_db):
+    """Undo restores prediction status from inside the shared writer lock.
+
+    ``/api/undo`` replays ``prediction_review`` statuses out of edit history,
+    which makes it a decision route: it was the last of the unlocked ones, and
+    wrapping it must not change what it does. Nothing to undo also has to
+    release the lock, so the accept afterwards is part of the assertion.
+    """
+    app, db = app_and_db
+    _seed_predictions(db)
+    client = app.test_client()
+    ws = db._active_workspace_id
+
+    pred_id, photo_id = _one_prediction(db, species='Unicolored Jay')
+    assert client.post(f'/api/predictions/{pred_id}/accept').status_code == 200
+    assert db.get_review_status(pred_id, ws) == 'accepted'
+    kw_names = {k['name'] for k in db.get_photo_keywords(photo_id)}
+    assert 'Unicolored Jay' in kw_names
+
+    assert client.post('/api/undo').status_code == 200
+    assert db.get_review_status(pred_id, ws) == 'pending'
+    kw_names = {k['name'] for k in db.get_photo_keywords(photo_id)}
+    assert 'Unicolored Jay' not in kw_names
+
+    assert client.post('/api/redo').status_code == 200
+    assert db.get_review_status(pred_id, ws) == 'accepted'
+
+    # "Nothing to redo" returns without writing; the lock must still be gone.
+    assert client.post('/api/redo').status_code == 400
+    second, _ = _one_prediction(db, species='White-throated Magpie-Jay',
+                                photo_index=1)
+    assert client.post(f'/api/predictions/{second}/accept').status_code == 200
+    assert db.get_review_status(second, ws) == 'accepted'
+
+
+def test_group_apply_records_decisions_under_the_lock(app_and_db):
+    """Burst group apply writes review statuses, so it holds the lock too.
+
+    Its status writes have no precondition of their own — that is precisely
+    why it was easy to miss — but they still have to be serialized against the
+    batch endpoints' check-then-write window rather than landing inside it.
+    """
+    app, db = app_and_db
+    photos = db.get_photos()
+    pick, reject = photos[0]['id'], photos[1]['id']
+    det_a = _make_detection(db, pick)
+    det_b = _make_detection(db, reject)
+    db.add_prediction(detection_id=det_a, species='Azure Jay', confidence=0.9,
+                      model='test-model', category='new', group_id='gapply')
+    db.add_prediction(detection_id=det_b, species='Azure Jay', confidence=0.8,
+                      model='test-model', category='new', group_id='gapply')
+    pred_a = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?", (det_a,)
+    ).fetchone()['id']
+    pred_b = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?", (det_b,)
+    ).fetchone()['id']
+    ws = db._active_workspace_id
+
+    client = app.test_client()
+    resp = client.post('/api/predictions/group/apply', json={
+        'picks': [pick], 'rejects': [reject], 'removed': [], 'species': '',
+    })
+    assert resp.status_code == 200
+    assert db.get_review_status(pred_a, ws) == 'accepted'
+    assert db.get_review_status(pred_b, ws) == 'rejected'
+
+    # The lock was released, so a following decision goes through.
+    fresh, _ = _one_prediction(db, species='Plush-crested Jay')
+    assert client.post(f'/api/predictions/{fresh}/reject').status_code == 200
+
+
+def test_group_apply_preserves_already_decided_predictions(app_and_db):
+    """A stale group apply must not overwrite a decision the lock committed.
+
+    The decision lock orders group apply against every other decision
+    route, but ordering alone is not enough: ``_apply_group_decisions``
+    used to unconditionally rewrite every ``prediction_review`` row for a
+    picked/rejected photo, so a stale group-apply payload — the Review
+    modal still has the photo in ``rejects`` while Browse's Accept for
+    the same row commits first — would flip the earlier ``accepted`` to
+    ``rejected`` under the lock. The species keyword the accept added
+    stayed on the photo, so keyword state and review state contradicted
+    each other with no UI cue pointing at the mismatch.
+
+    Both directions are guarded: an earlier ``rejected`` (from Browse's
+    single-row Reject) must survive a stale group-apply pick just as an
+    earlier ``accepted`` must survive a stale group-apply reject. Same
+    guard, same reason — the second writer never claims the first
+    writer's row.
+
+    What makes this payload *stale* rather than a deliberate re-decision
+    is the baseline it carries: it says it was rendered while both rows
+    were pending, and they are not pending any more. Nothing else in the
+    request distinguishes the two cases — see
+    ``test_group_apply_allows_a_deliberate_re_decision`` for the payload
+    with the same shape that must go through.
+    """
+    app, db = app_and_db
+    photos = db.get_photos()
+    accepted_photo = photos[0]['id']
+    rejected_photo = photos[1]['id']
+    det_a = _make_detection(db, accepted_photo)
+    det_b = _make_detection(db, rejected_photo)
+    db.add_prediction(detection_id=det_a, species='Azure Jay', confidence=0.9,
+                      model='test-model', category='new', group_id=None)
+    db.add_prediction(detection_id=det_b, species='Azure Jay', confidence=0.8,
+                      model='test-model', category='new', group_id=None)
+    pred_a = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?", (det_a,)
+    ).fetchone()['id']
+    pred_b = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?", (det_b,)
+    ).fetchone()['id']
+    ws = db._active_workspace_id
+
+    client = app.test_client()
+
+    # First writers: single-row Accept on one photo, single-row Reject on
+    # the other. Both commit through the decision lock and record their
+    # keyword state on the photo.
+    assert client.post(
+        f'/api/predictions/{pred_a}/accept').status_code == 200
+    assert client.post(
+        f'/api/predictions/{pred_b}/reject').status_code == 200
+    assert db.get_review_status(pred_a, ws) == 'accepted'
+    assert db.get_review_status(pred_b, ws) == 'rejected'
+    accepted_keywords_before = {
+        k['name'] for k in db.get_photo_keywords(accepted_photo)}
+    assert 'Azure Jay' in accepted_keywords_before
+
+    # Stale group apply arrives with the mirror decisions: it asks to
+    # reject the already-accepted photo and pick (accept) the already-
+    # rejected photo. Without the guard both statuses flip.
+    resp = client.post('/api/predictions/group/apply', json={
+        'picks': [rejected_photo],
+        'rejects': [accepted_photo],
+        'removed': [],
+        'species': 'Azure Jay',
+        'observed': {str(pred_a): 'pending', str(pred_b): 'pending'},
+    })
+    assert resp.status_code == 200
+    # Named, not just skipped: a group apply that quietly does less than
+    # the modal promised is the same black box this PR exists to remove.
+    assert resp.get_json()['already_decided'] == 2
+
+    # The lock-committed decisions survive.
+    assert db.get_review_status(pred_a, ws) == 'accepted'
+    assert db.get_review_status(pred_b, ws) == 'rejected'
+
+    # The keyword the accept added is still attached — same-side
+    # confirmation that status and keyword did not drift apart.
+    accepted_keywords_after = {
+        k['name'] for k in db.get_photo_keywords(accepted_photo)}
+    assert 'Azure Jay' in accepted_keywords_after
+
+    # And the mirror: the stale *pick* on the already-rejected photo must
+    # not tag it either. A guard that only defends the status write runs
+    # after the keyword write, so it leaves the species attached to a row
+    # that stays ``rejected`` — the same contradiction, entered from the
+    # other side. Skipping the photo before any write is what closes it.
+    rejected_keywords = {
+        k['name'] for k in db.get_photo_keywords(rejected_photo)}
+    assert 'Azure Jay' not in rejected_keywords
+    assert (db.get_photo(rejected_photo)['flag'] or 'none') == 'none'
+
+    # Rows that were still pending are still writable: a fresh prediction
+    # on a third photo takes the group-apply status normally, so the
+    # guard preserves committed decisions without freezing the row set.
+    third_photo = photos[2]['id']
+    det_c = _make_detection(db, third_photo)
+    db.add_prediction(detection_id=det_c, species='Azure Jay',
+                      confidence=0.7, model='test-model',
+                      category='new', group_id=None)
+    pred_c = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?", (det_c,)
+    ).fetchone()['id']
+    assert db.get_review_status(pred_c, ws) == 'pending'
+    resp = client.post('/api/predictions/group/apply', json={
+        'picks': [third_photo],
+        'rejects': [],
+        'removed': [],
+        'species': '',
+        'observed': {str(pred_c): 'pending'},
+    })
+    assert resp.status_code == 200
+    assert resp.get_json()['already_decided'] == 0
+    assert db.get_review_status(pred_c, ws) == 'accepted'
+
+
+def _seed_burst_group(db, group_id='gbaseline'):
+    """Two grouped predictions on two photos; returns (pred, photo) pairs."""
+    photos = db.get_photos()
+    out = []
+    for photo in photos[:2]:
+        det = _make_detection(db, photo['id'])
+        db.add_prediction(detection_id=det, species='Azure Jay',
+                          confidence=0.9, model='test-model',
+                          category='new', group_id=group_id)
+        pred_id = db.conn.execute(
+            "SELECT id FROM predictions WHERE detection_id = ?", (det,)
+        ).fetchone()['id']
+        out.append((pred_id, photo['id']))
+    return out
+
+
+def test_group_apply_skips_photos_decided_since_the_modal_rendered(app_and_db):
+    """A stale burst apply must not overwrite a decision made after it loaded.
+
+    The shape: a prediction is rejected elsewhere while the burst modal still
+    holds that photo in its picks. Serializing the two requests (which the
+    decision lock already does) only orders them — an unconditional update
+    still lands last, flipping the rejected row to ``accepted`` and tagging
+    the photo with a species the user just dismissed. The modal sends the
+    statuses it displayed, so the server can tell that this photo's meaning
+    changed underneath it and leave the whole photo alone: no status write,
+    no flag, no keyword.
+    """
+    app, db = app_and_db
+    (pred_a, photo_a), (pred_b, photo_b) = _seed_burst_group(db)
+    ws = db._active_workspace_id
+    client = app.test_client()
+
+    # A decision lands on photo A after the modal rendered. Reject rather
+    # than accept because accepting a grouped row expands to the whole burst
+    # — every member would then be stale, which is correct but tests nothing
+    # about applying the untouched remainder.
+    assert client.post(f'/api/predictions/{pred_a}/reject').status_code == 200
+    assert db.get_review_status(pred_a, ws) == 'rejected'
+    flag_before = db.get_photo(photo_a)['flag'] or 'none'
+
+    resp = client.post('/api/predictions/group/apply', json={
+        'picks': [photo_a],
+        'rejects': [photo_b],
+        'removed': [],
+        'species': 'Azure Jay',
+        # What the modal showed when it opened: both pending.
+        'observed': {str(pred_a): 'pending', str(pred_b): 'pending'},
+    })
+    assert resp.status_code == 200
+    assert resp.get_json()['already_decided'] == 1
+
+    # A's completed decision survives, and nothing was written for it —
+    # including the keyword, which is the half an under-the-lock status guard
+    # alone would still have written.
+    assert db.get_review_status(pred_a, ws) == 'rejected'
+    assert (db.get_photo(photo_a)['flag'] or 'none') == flag_before
+    assert 'Azure Jay' not in {k['name'] for k in db.get_photo_keywords(photo_a)}
+
+    # The rest of the burst still applied.
+    assert db.get_review_status(pred_b, ws) == 'rejected'
+    assert db.get_photo(photo_b)['flag'] == 'rejected'
+
+
+def test_group_apply_allows_a_deliberate_re_decision(app_and_db):
+    """Re-opening an applied burst and changing the split still works.
+
+    The reason group apply compares against a baseline instead of refusing
+    every decided row the way the single-row endpoints do: the burst modal is
+    reachable from any card carrying a ``group_id``, including one this same
+    user just applied, and it re-derives picks/rejects from quality scores
+    rather than from the stored statuses. "Skip anything decided" would make
+    a second apply silently freeze the statuses while still moving the flags,
+    and would describe the user's own decision as somebody else's.
+    """
+    app, db = app_and_db
+    (pred_a, photo_a), (pred_b, photo_b) = _seed_burst_group(db, 'gredecide')
+    ws = db._active_workspace_id
+    client = app.test_client()
+
+    first = client.post('/api/predictions/group/apply', json={
+        'picks': [photo_a], 'rejects': [photo_b], 'removed': [],
+        'species': 'Azure Jay',
+        'observed': {str(pred_a): 'pending', str(pred_b): 'pending'},
+    })
+    assert first.status_code == 200
+    assert first.get_json()['already_decided'] == 0
+    assert db.get_review_status(pred_a, ws) == 'accepted'
+    assert db.get_review_status(pred_b, ws) == 'rejected'
+
+    # The modal is re-opened: it now displays the statuses just written, and
+    # the user swaps the split.
+    second = client.post('/api/predictions/group/apply', json={
+        'picks': [photo_b], 'rejects': [photo_a], 'removed': [],
+        'species': 'Azure Jay',
+        'observed': {str(pred_a): 'accepted', str(pred_b): 'rejected'},
+    })
+    assert second.status_code == 200
+    assert second.get_json()['already_decided'] == 0
+    assert db.get_review_status(pred_a, ws) == 'rejected'
+    assert db.get_review_status(pred_b, ws) == 'accepted'
+
+
+def test_group_apply_writes_every_side_effect_in_one_transaction(
+    app_and_db, monkeypatch,
+):
+    """A burst apply is one decision, so it is one transaction.
+
+    This is the structural property that makes a single staleness check
+    sufficient. The route used to check the baseline twice — once before the
+    flag/keyword writes and once at the status write — with those writes
+    committing on their own in between. A decision landing in that gap made
+    the second check skip the status update for a photo whose flag, keyword,
+    pending change and history rows had already committed: flagged and tagged
+    with a species whose prediction reads rejected.
+
+    The test drives the same boundary from the side that can be forced
+    deterministically. A photo leaves the workspace part-way through the
+    apply, which is the one mid-flight failure the route can hit for real
+    (its pre-lock membership check runs before ``BEGIN IMMEDIATE``). Every
+    write made for the *earlier* photo has to be gone. Under the old shape
+    they were already committed and stayed — which is why "the flag and
+    keyword writes are not review state" was never a safe reason to leave
+    them outside.
+    """
+    from repositories.photo_review import PhotoReviewRepository
+
+    app, db = app_and_db
+    (pred_a, photo_a), (pred_b, photo_b) = _seed_burst_group(db, 'gatomic')
+    ws = db._active_workspace_id
+    client = app.test_client()
+
+    # Photo B detaches from the workspace after the route's pre-lock check
+    # passed — detected at the first write that touches it.
+    original_verify = PhotoReviewRepository._verify_photo
+
+    def detached_for_b(self, photo_id):
+        if photo_id == photo_b:
+            raise ValueError(
+                f"Photo {photo_id} does not belong to the active workspace"
+            )
+        return original_verify(self, photo_id)
+
+    monkeypatch.setattr(
+        PhotoReviewRepository, "_verify_photo", detached_for_b,
+    )
+
+    history_before = len(db.get_edit_history(limit=100))
+    resp = client.post('/api/predictions/group/apply', json={
+        'picks': [photo_a, photo_b],
+        'rejects': [],
+        'removed': [],
+        'species': 'Azure Jay',
+        'observed': {str(pred_a): 'pending', str(pred_b): 'pending'},
+    })
+    assert resp.status_code == 403
+
+    # Nothing was written for photo A, which the loop reached first.
+    assert (db.get_photo(photo_a)['flag'] or 'none') == 'none'
+    assert 'Azure Jay' not in {k['name'] for k in db.get_photo_keywords(photo_a)}
+    assert db.get_review_status(pred_a, ws) == 'pending'
+    assert not [
+        c for c in db.get_pending_changes() if c['photo_id'] == photo_a
+    ]
+    assert len(db.get_edit_history(limit=100)) == history_before
+    # Not even the keyword row: ``add_keyword`` runs inside the same
+    # transaction, so a refused burst leaves no orphan species behind.
+    assert db.conn.execute(
+        "SELECT 1 FROM keywords WHERE name = 'Azure Jay'"
+    ).fetchone() is None
+
+
+def test_group_apply_treats_regenerated_predictions_as_stale(app_and_db):
+    """Classification rerunning while the burst modal is open makes the photo stale.
+
+    The bug: ``_stale_group_apply_photos`` checked only the observed row's
+    status. If a classifier rerun inserted a new prediction row for the same
+    ``(detection, classifier_model)`` while the modal was open, the observed
+    row's status was still pending, so the check passed — and
+    ``update_predictions_status_by_photo`` blindly wrote the modal's decision
+    to *every* prediction on the photo, including the newly generated row the
+    user never saw, tagging the photo with the modal's stale species.
+
+    The fix: an observed row that is no longer the latest ``labels_fingerprint``
+    for its ``(detection, classifier_model)`` invalidates its photo. The photo
+    is dropped from the apply the same way status drift drops one.
+    """
+    app, db = app_and_db
+    (pred_a, photo_a), (pred_b, photo_b) = _seed_burst_group(db, 'gregen')
+    ws = db._active_workspace_id
+    client = app.test_client()
+
+    # Classifier reruns on photo A between render and click: a new prediction
+    # row is inserted for the same detection with a newer labels_fingerprint.
+    # The old row stays pending, so status-only staleness would clear.
+    det_a = db.conn.execute(
+        "SELECT detection_id FROM predictions WHERE id = ?", (pred_a,)
+    ).fetchone()['detection_id']
+    db.add_prediction(
+        detection_id=det_a, species='Verdin', confidence=0.7,
+        model='test-model', category='new',
+        labels_fingerprint='rerun-v2',
+    )
+    new_pred_a = db.conn.execute(
+        """SELECT id FROM predictions
+             WHERE detection_id = ? AND classifier_model = ? AND species = ?""",
+        (det_a, 'test-model', 'Verdin'),
+    ).fetchone()['id']
+    assert new_pred_a != pred_a
+    flag_before = db.get_photo(photo_a)['flag'] or 'none'
+
+    resp = client.post('/api/predictions/group/apply', json={
+        'picks': [photo_a],
+        'rejects': [photo_b],
+        'removed': [],
+        'species': 'Azure Jay',
+        # What the modal showed when it opened: both pending, only the *old*
+        # predictions listed. The new row is not observed.
+        'observed': {str(pred_a): 'pending', str(pred_b): 'pending'},
+    })
+    assert resp.status_code == 200
+    assert resp.get_json()['already_decided'] == 1
+
+    # Nothing was written for photo A — including the new row that the write
+    # would have blindly touched — and the modal's species did not attach.
+    assert db.get_review_status(pred_a, ws) == 'pending'
+    assert db.get_review_status(new_pred_a, ws) == 'pending'
+    assert (db.get_photo(photo_a)['flag'] or 'none') == flag_before
+    assert 'Azure Jay' not in {k['name'] for k in db.get_photo_keywords(photo_a)}
+
+    # Photo B, whose detections were untouched, still applies.
+    assert db.get_review_status(pred_b, ws) == 'rejected'
+    assert db.get_photo(photo_b)['flag'] == 'rejected'
+
+
+def test_group_apply_rejects_a_malformed_baseline(app_and_db):
+    """``observed`` is validated rather than silently ignored.
+
+    A baseline the server cannot read is not the same as no baseline: quietly
+    dropping it would turn every write back into the unconditional overwrite
+    this precondition exists to prevent, with nothing on screen to say so.
+    """
+    app, db = app_and_db
+    (pred_a, photo_a), _ = _seed_burst_group(db, 'gbadbaseline')
+    client = app.test_client()
+
+    for bad in (['pending'], {'not-an-id': 'pending'}, {'1': 7}):
+        resp = client.post('/api/predictions/group/apply', json={
+            'picks': [photo_a], 'rejects': [], 'removed': [], 'species': '',
+            'observed': bad,
+        })
+        assert resp.status_code == 400, bad
+
+
+def test_group_apply_client_sends_the_observed_baseline(app_and_db):
+    """Review's burst modal must send what it displayed.
+
+    The server can only refuse a write the client claims to have seen a
+    status for, so an omitted ``observed`` map turns the check off for the
+    one caller that has one. Asserted against the rendered page for the same
+    reason ``test_browse_panel_treats_reviewed_status_as_decided`` is: the
+    guarantee is a property of the pair, and a server-side test alone would
+    stay green while the modal quietly stopped participating.
+    """
+    app, _ = app_and_db
+    html = app.test_client().get('/review').get_data(as_text=True)
+    assert "observed[it.id] = it.status || 'pending';" in html, (
+        "the burst modal must build its baseline from the statuses it "
+        "displayed"
+    )
+    assert 'observed: observed,' in html, (
+        "the burst modal must send its baseline to /api/predictions/group/apply"
     )

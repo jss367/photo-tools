@@ -68,7 +68,7 @@
     align-items: center;
     flex-wrap: wrap;
   }
-  .setting-group { display: flex; align-items: center; gap: 8px; }
+  .setting-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .setting-group label { font-size: 13px; color: var(--text-muted); white-space: nowrap; }
   .setting-group input[type=range] {
     width: 180px;
@@ -81,6 +81,14 @@
     color: var(--text-primary, #E0F0F0);
     font-variant-numeric: tabular-nums;
   }
+  .review-photo-size-control {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 12px;
+  }
+  .setting-group .review-photo-size-control input[type=range] { width: 110px; }
+  .setting-group .review-photo-size-control .value { min-width: 42px; }
 
   /* ---------- Category Tabs ---------- */
   .tabs {
@@ -772,7 +780,8 @@
     <select class="model-selector" id="modelFilter" onchange="switchModel(this.value)" style="display:none;">
       <option value="all">All models</option>
     </select>
-    <select class="model-selector" id="sortSelect" onchange="changeSort(this.value)">
+    <select class="model-selector" id="sortSelect" onchange="changeSort(this.value)"
+            data-view-preference="vireo.review.sort">
       <option value="confidence_desc">Confidence (highest)</option>
       <option value="confidence_asc">Confidence (lowest)</option>
       <option value="species">Species (A-Z)</option>
@@ -785,6 +794,13 @@
             onclick="toggleReviewDetectionBoxes()"
             title="Toggle bounding-box overlays on review cards"
             style="margin-left:12px;cursor:pointer;">Show Boxes</button>
+    <label class="review-photo-size-control" for="thumbSizeSlider">
+      Photo size:
+      <input type="range" id="thumbSizeSlider" min="200" max="600" step="20" value="400"
+             data-view-preference="vireo.review.thumbSize"
+             oninput="updateThumbSize(this.value)">
+      <span class="value" id="thumbSizeVal">400px</span>
+    </label>
     <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted,#888);margin-left:12px;">
       Min confidence:
       <input type="range" id="confFilter" min="0" max="90" step="5" value="0"
@@ -821,6 +837,7 @@ var currentCollection = 'all';
 var currentSort = 'filename';
 var minConfidence = 0;
 var currentLabelsFingerprint = null;  // set from ?labels_fingerprint= URL param
+var currentPhotoIdFilter = null;  // set from ?photo_id= (deep link from Browse)
 var availableModels = [];
 var collectionPhotoIds = null;  // null = no filter
 var thumbSize = 400;
@@ -1021,6 +1038,9 @@ function _predictionEpochStale(epoch) {
 }
 
 /* ---------- Bootstrap ---------- */
+VireoViewPreferences.restoreAll(document.getElementById('reviewBar'));
+currentSort = document.getElementById('sortSelect').value;
+updateThumbSize(document.getElementById('thumbSizeSlider').value);
 applyReviewQueryParams();
 loadPredictions();
 loadCollectionFilter();
@@ -1057,13 +1077,29 @@ function applyReviewQueryParams() {
   var qsFp = qs.get('labels_fingerprint');
   if (qsModel) currentModel = qsModel;
   if (qsFp) currentLabelsFingerprint = qsFp;
+  // Browse's prediction panel sends ambiguous predictions here rather than
+  // offering a bare Accept it can't honour. Landing on the full workspace
+  // queue would make the user hunt for the photo they just clicked, so the
+  // deep link narrows Review to it.
+  var qsPhoto = parseInt(qs.get('photo_id'), 10);
+  if (!isNaN(qsPhoto)) currentPhotoIdFilter = qsPhoto;
+}
+
+// Filter pills sit right after the toolbar. When there is no toolbar the
+// fallback must be an *append into* the body, not `bar.parentNode.insertBefore`
+// — with `bar = document.body` the parent is `<html>`, so the pill lands as a
+// sibling of `<body>` and never renders. A silent no-op is exactly the failure
+// mode these pills exist to prevent.
+function insertFilterPill(pill, bar) {
+  if (bar && bar.parentNode) bar.parentNode.insertBefore(pill, bar.nextSibling);
+  else document.body.appendChild(pill);
 }
 
 function renderFingerprintFilterPill() {
   var existing = document.getElementById('fpFilterPill');
   if (existing) existing.remove();
   if (!currentLabelsFingerprint) return;
-  var bar = document.querySelector('.toolbar') || document.body;
+  var bar = document.querySelector('.toolbar');
   var pill = document.createElement('div');
   pill.id = 'fpFilterPill';
   pill.style.cssText = 'display:inline-flex;align-items:center;gap:6px;padding:3px 10px;' +
@@ -1072,7 +1108,7 @@ function renderFingerprintFilterPill() {
   pill.innerHTML = 'Filtered to fingerprint <code>' +
     currentLabelsFingerprint.substring(0, 12) +
     '</code> <a href="#" id="fpFilterClear" style="color:inherit;text-decoration:none;">×</a>';
-  bar.parentNode.insertBefore(pill, bar.nextSibling);
+  insertFilterPill(pill, bar);
   document.getElementById('fpFilterClear').addEventListener('click', function(e) {
     e.preventDefault();
     currentLabelsFingerprint = null;
@@ -1081,6 +1117,33 @@ function renderFingerprintFilterPill() {
     window.history.replaceState({}, '', url.toString());
     pill.remove();
     renderAll();
+  });
+}
+
+function renderPhotoFilterPill() {
+  var existing = document.getElementById('photoFilterPill');
+  if (existing) existing.remove();
+  if (currentPhotoIdFilter == null) return;
+  // Without this pill a one-photo queue reads as "Review is empty" — the
+  // narrowing came from a deep link the user may not have noticed making.
+  var bar = document.querySelector('.toolbar');
+  var pill = document.createElement('div');
+  pill.id = 'photoFilterPill';
+  pill.style.cssText = 'display:inline-flex;align-items:center;gap:6px;padding:3px 10px;' +
+    'border-radius:12px;background:color-mix(in srgb,var(--accent) 15%,transparent);' +
+    'color:var(--accent);font-size:12px;margin:6px 0;';
+  pill.innerHTML = 'Showing one photo from Browse ' +
+    '<a href="#" id="photoFilterClear" style="color:inherit;text-decoration:none;">' +
+    'show all ×</a>';
+  insertFilterPill(pill, bar);
+  document.getElementById('photoFilterClear').addEventListener('click', function(e) {
+    e.preventDefault();
+    currentPhotoIdFilter = null;
+    var url = new URL(window.location.href);
+    url.searchParams.delete('photo_id');
+    window.history.replaceState({}, '', url.toString());
+    pill.remove();
+    loadPredictions();
   });
 }
 
@@ -1120,6 +1183,7 @@ async function loadPredictions() {
       var collId = parseInt(currentCollection, 10);
       if (!isNaN(collId)) params.set('collection_id', String(collId));
     }
+    if (currentPhotoIdFilter != null) params.set('photo_ids', String(currentPhotoIdFilter));
     var qs = params.toString();
     var predData = await safeFetch('/api/predictions' + (qs ? '?' + qs : ''), {}, { toast: false });
     if (myEpoch !== _loadPredictionsEpoch) return;  // superseded — drop
@@ -1203,6 +1267,7 @@ document.addEventListener('vireo:edit-history-changed', function() {
 function renderAll() {
   renderModelFilter();
   renderFingerprintFilterPill();
+  renderPhotoFilterPill();
   renderStats();
   renderTabs();
   renderButtons();
@@ -1363,7 +1428,7 @@ function renderGrid() {
     return;
   }
   empty.style.display = 'none';
-  grid.style.setProperty('--card-width', thumbSize + 20 + 'px');
+  grid.style.setProperty('--card-width', thumbSize + 'px');
 
   grid.innerHTML = items.map(function(p) { return renderPredictionCard(p); }).join('');
 }
@@ -1598,18 +1663,42 @@ function groupMembersHtml(pred) {
 }
 
 /* ---------- Actions ---------- */
+
+// Mark every row the accept says it decided, not only the one in the URL.
+// ``accept_prediction`` fans a decision across the still-pending members of
+// the same burst group, so the response names siblings too; leaving those at
+// ``pending`` locally keeps cards on screen offering an Accept the database
+// has already recorded. See vireo-predictions.js for the contract.
+//
+// ``predictions`` is a filtered view holding the *same objects* as
+// ``allPredictions``, but a sibling outside the current collection filter is
+// only in the unfiltered copy — walk both so neither is left claiming a row is
+// pending after the server accepted it.
+function _markPredictionsAccepted(predIds) {
+  if (!predIds || !predIds.length) return;
+  var wanted = new Set(predIds);
+  [allPredictions, predictions].forEach(function(list) {
+    (list || []).forEach(function(p) {
+      if (p && wanted.has(p.id)) p.status = 'accepted';
+    });
+  });
+}
+
 async function acceptPrediction(predId) {
   if (_predictionsReloading) return;
   var epoch = _loadPredictionsEpoch;
+  var applied;
   try {
-    await safeFetch('/api/predictions/' + predId + '/accept', { method: 'POST' });
+    applied = await safeFetch('/api/predictions/' + predId + '/accept', { method: 'POST' });
   } catch(e) { return; }
   // A reload between click and response would have swapped ``predictions``;
   // touching the new array with a stale id would either miss (harmless) or
   // mis-label a row that isn't the one the user clicked.
   if (_predictionEpochStale(epoch)) return;
-  var pred = predictions.find(function(p) { return p.id === predId; });
-  if (pred) pred.status = 'accepted';
+  // The clicked row is credited whatever the body carried — a 200 means the
+  // accept ran — and the group expansion is credited on top of it.
+  _markPredictionsAccepted(
+    [predId].concat(Vireo.predictions.decidedPredictionIds(applied)));
   renderAll();
 }
 
@@ -1648,11 +1737,22 @@ async function acceptAllPending() {
   // visible chips already show a narrower filter. See r3618935660.
   var epoch = _loadPredictionsEpoch;
   var pending = predictions.filter(function(p) { return p.status === 'pending'; });
+  // ``pending`` is a snapshot, and one accept can settle several of its rows:
+  // ``accept_prediction`` expands across the burst group and the response
+  // names every row it decided. Without consuming that, the next member of the
+  // same burst is re-sent, meets the terminal-status 409, and the catch below
+  // abandons the run — so a single burst in the queue would leave every
+  // unrelated prediction after it unaccepted, silently. Shared with ID
+  // Conflicts' batch accept; see vireo-predictions.js.
+  var decided = Vireo.predictions.groupedDecisionTracker();
   for (var i = 0; i < pending.length; i++) {
     if (_predictionEpochStale(epoch)) break;
+    // Accepted, not skipped: an earlier request in this very run wrote it.
+    if (decided.alreadyDecided(pending[i].id)) continue;
     try {
-      await safeFetch('/api/predictions/' + pending[i].id + '/accept', { method: 'POST' });
-      pending[i].status = 'accepted';
+      var applied = await safeFetch('/api/predictions/' + pending[i].id + '/accept', { method: 'POST' });
+      _markPredictionsAccepted(
+        [pending[i].id].concat(decided.record(applied)));
     } catch(e) { break; }
   }
   if (_predictionEpochStale(epoch)) return;
@@ -1977,9 +2077,17 @@ document.addEventListener('contextmenu', function(e) {
 
 /* ---------- Settings ---------- */
 function updateThumbSize(val) {
-  thumbSize = parseInt(val, 10);
-  document.getElementById('thumbSizeVal').textContent = val + 'px';
-  renderGrid();
+  var parsed = parseInt(val, 10);
+  if (isNaN(parsed)) parsed = 400;
+  thumbSize = Math.max(200, Math.min(600, parsed));
+
+  var slider = document.getElementById('thumbSizeSlider');
+  if (slider) slider.value = String(thumbSize);
+  var value = document.getElementById('thumbSizeVal');
+  if (value) value.textContent = thumbSize + 'px';
+  var grid = document.getElementById('grid');
+  if (grid) grid.style.setProperty('--card-width', thumbSize + 'px');
+
 }
 
 /* ==================== Group Review Modal ==================== */
@@ -3231,7 +3339,19 @@ function grmUpdateApplyLabel() {
 async function grmApply() {
   var species = document.getElementById('grmSpecies').value.trim();
   try {
-    await safeFetch('/api/predictions/group/apply', {
+    // The statuses this modal displayed when it loaded. The server applies a
+    // photo's decision only while its member still holds the status shown
+    // here, so a decision that landed from Browse or a second tab after the
+    // burst was opened is left alone instead of being overwritten. Sending
+    // the baseline (rather than letting the server refuse every decided row)
+    // is what keeps a deliberate re-decision working: re-open a burst that
+    // was already applied, change the split, apply — the observed status
+    // still matches, so the change goes through.
+    var observed = {};
+    (grmState.items || []).forEach(function(it) {
+      observed[it.id] = it.status || 'pending';
+    });
+    var applyResp = await safeFetch('/api/predictions/group/apply', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
@@ -3239,8 +3359,23 @@ async function grmApply() {
         rejects: Array.from(grmState.rejects),
         removed: Array.from(grmState.removed),
         species: species,
+        observed: observed,
       }),
     });
+
+    if (applyResp && applyResp.already_decided) {
+      // Say what was left undone and reload rather than patching statuses
+      // locally: the local patch below assumes every pick/reject landed, and
+      // the page's own copy of these rows is now the stale one.
+      var n = applyResp.already_decided;
+      showToast(n + (n === 1 ? ' photo was' : ' photos were') +
+        ' decided elsewhere after this burst was opened — ' +
+        (n === 1 ? 'its prediction was' : 'their predictions were') +
+        ' left as they are.', 'error');
+      closeGroupReview();
+      await loadPredictions();
+      return;
+    }
 
     // Update local prediction status immediately so cards reflect the
     // change — mirroring what the backend just did: picks become accepted,

@@ -4,6 +4,7 @@ import logging
 import os
 from collections import defaultdict
 
+from db import KEYWORD_SOURCE_UNKNOWN
 from keyword_normalization import keyword_match_key
 from xmp import (
     read_keywords,
@@ -295,7 +296,9 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
 
     # Clear successfully synced changes
     if synced_ids:
-        db.clear_pending(synced_ids)
+        db.clear_pending(
+            synced_ids, clear_equivalent_flat_removals=True,
+        )
 
     log.info("Sync complete: %d synced, %d failed", synced, failed)
     return {"synced": synced, "failed": failed, "failures": failures}
@@ -322,48 +325,80 @@ def sync_from_xmp(db, photo_ids):
         if not os.path.exists(xmp_path):
             continue
 
-        # Read current XMP keywords. Compare with a normalized match key on
-        # both sides so an XMP variant like `‘apapane` matches a DB row
-        # stored as `apapane` (add_keyword normalizes on insert). A plain
-        # `.lower()` comparison would treat them as different names, making
-        # the add-side an INSERT-OR-IGNORE no-op and then prune the DB tag
-        # because the raw DB name is not in the raw XMP set -- leaving the
-        # photo untagged.
-        #
-        # Skip XMP entries whose normalized match key is empty (e.g. a
-        # lone ASCII or smart quote). add_keyword() now raises ValueError
-        # for names that normalize to empty, so keeping such entries would
-        # abort the whole sidecar reconcile on a malformed edge-quote
-        # keyword instead of ignoring it and processing the rest.
-        xmp_keywords = read_keywords(xmp_path)
-        xmp_keywords_by_key = {}
-        for kw in xmp_keywords:
-            key = keyword_match_key(kw)
-            if not key:
-                continue
-            xmp_keywords_by_key.setdefault(key, kw)
+        # Serialize the sidecar read, DB reconciliation, and mtime stamp as
+        # one writer transaction. Background migrations use the same SQLite
+        # writer lock, so they cannot act on a pre-reconciliation association
+        # snapshot between this read and the final xmp_mtime update.
+        db.conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Read current XMP keywords. Compare with a normalized match key on
+            # both sides so an XMP variant like `‘apapane` matches a DB row
+            # stored as `apapane` (add_keyword normalizes on insert). A plain
+            # `.lower()` comparison would treat them as different names, making
+            # the add-side an INSERT-OR-IGNORE no-op and then prune the DB tag
+            # because the raw DB name is not in the raw XMP set -- leaving the
+            # photo untagged.
+            #
+            # Skip XMP entries whose normalized match key is empty (e.g. a
+            # lone ASCII or smart quote). add_keyword() now raises ValueError
+            # for names that normalize to empty, so keeping such entries would
+            # abort the whole sidecar reconcile on a malformed edge-quote
+            # keyword instead of ignoring it and processing the rest.
+            xmp_keywords = read_keywords(xmp_path)
+            pending_removals = db.get_pending_keyword_removal_keys(photo_id)
+            pending_hierarchical_removals = db.get_pending_keyword_removal_keys(
+                photo_id, hierarchical=True,
+            )
+            pending_flat_only_removals = (
+                pending_removals - pending_hierarchical_removals
+            )
+            xmp_keywords_by_key = {}
+            for kw in xmp_keywords:
+                key = keyword_match_key(kw)
+                if not key or key in pending_removals:
+                    continue
+                xmp_keywords_by_key.setdefault(key, kw)
 
-        # Get current DB keywords
-        db_keywords = db.get_photo_keywords(photo_id)
-        db_keywords_by_key = {keyword_match_key(k["name"]): k for k in db_keywords}
+            # Get current DB keywords
+            db_keywords = db.get_photo_keywords(photo_id)
+            db_keywords_by_key = {
+                keyword_match_key(k["name"]): k for k in db_keywords
+            }
 
-        # Reconcile DB keyword associations to match the current XMP file.
-        for kw_key, kw_name in xmp_keywords_by_key.items():
-            if kw_key in db_keywords_by_key:
-                continue
-            kid = db.add_keyword(kw_name)
-            db.tag_photo(photo_id, kid)
+            # Reconcile DB keyword associations to match the current XMP file.
+            for kw_key, kw_name in xmp_keywords_by_key.items():
+                if kw_key in db_keywords_by_key:
+                    continue
+                kid = db.add_keyword(kw_name, _commit=False)
+                # Reconciling *from* a sidecar cannot tell a hand-typed Lightroom
+                # keyword from one Vireo wrote out, so this writer stays
+                # provenance-neutral instead of claiming manual authorship.
+                db.tag_photo(
+                    photo_id,
+                    kid,
+                    source=KEYWORD_SOURCE_UNKNOWN,
+                    _commit=False,
+                )
 
-        for kw in db_keywords:
-            if keyword_match_key(kw["name"]) not in xmp_keywords_by_key:
-                db.untag_photo(photo_id, kw["id"])
+            for kw in db_keywords:
+                kw_key = keyword_match_key(kw["name"])
+                preserve_hierarchy = (
+                    kw["parent_id"] is not None
+                    and kw_key in pending_flat_only_removals
+                )
+                if kw_key not in xmp_keywords_by_key and not preserve_hierarchy:
+                    db.untag_photo(photo_id, kw["id"], _commit=False)
 
-        # Update xmp_mtime
-        xmp_mtime = os.path.getmtime(xmp_path)
-        db.conn.execute(
-            "UPDATE photos SET xmp_mtime = ? WHERE id = ?", (xmp_mtime, photo_id)
-        )
-        db.conn.commit()
+            # Update xmp_mtime in the same transaction as reconciliation.
+            xmp_mtime = os.path.getmtime(xmp_path)
+            db.conn.execute(
+                "UPDATE photos SET xmp_mtime = ? WHERE id = ?",
+                (xmp_mtime, photo_id),
+            )
+            db.conn.commit()
+        except Exception:
+            db.conn.rollback()
+            raise
 
         log.info(
             "Synced XMP -> DB for photo %d: %d keywords", photo_id, len(xmp_keywords)

@@ -63,6 +63,53 @@ def test_review_page_title_shows_pending_count(live_server, page):
     expect(title).to_contain_text("pending")
 
 
+def test_review_photo_size_slider_resizes_and_persists(live_server, page):
+    """Review cards follow the photo-size control and retain its value."""
+    url = live_server["url"]
+    page.goto(f"{url}/review", timeout=5000)
+    page.locator("[data-pred-id]").first.wait_for(state="visible", timeout=5000)
+
+    slider = page.locator("#thumbSizeSlider")
+    expect(slider).to_be_visible()
+    expect(slider).to_have_value("400")
+    expect(page.locator("#thumbSizeVal")).to_have_text("400px")
+    initial_width = page.locator("[data-pred-id]").first.bounding_box()["width"]
+
+    slider.evaluate(
+        """el => {
+            el.value = '240';
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+        }"""
+    )
+
+    expect(page.locator("#thumbSizeVal")).to_have_text("240px")
+    assert page.locator("#grid").evaluate(
+        "el => el.style.getPropertyValue('--card-width')"
+    ) == "240px"
+    assert page.locator("[data-pred-id]").first.bounding_box()["width"] < initial_width
+
+    page.reload()
+    page.locator("[data-pred-id]").first.wait_for(state="visible", timeout=5000)
+    expect(slider).to_have_value("240")
+    expect(page.locator("#thumbSizeVal")).to_have_text("240px")
+    assert page.locator("#grid").evaluate(
+        "el => el.style.getPropertyValue('--card-width')"
+    ) == "240px"
+
+
+def test_review_sort_persists_across_navigation(live_server, page):
+    url = live_server["url"]
+    page.goto(f"{url}/review", timeout=5000)
+    page.locator("[data-pred-id]").first.wait_for(state="visible", timeout=5000)
+
+    page.locator("#sortSelect").select_option("confidence_asc")
+    page.goto(f"{url}/")
+    page.goto(f"{url}/review", timeout=5000)
+    page.locator("[data-pred-id]").first.wait_for(state="visible", timeout=5000)
+
+    expect(page.locator("#sortSelect")).to_have_value("confidence_asc")
+
+
 def test_history_undo_refreshes_review_prediction_state(live_server, page):
     """Undo from the shared History panel must refresh Review's local state."""
     url = live_server["url"]

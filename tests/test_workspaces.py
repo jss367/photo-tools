@@ -640,16 +640,13 @@ def test_job_history_filtered_by_workspace(db_with_workspace):
 def client(tmp_path, monkeypatch):
     """Flask test client with a fresh DB.
 
-    Isolates $HOME and config paths to tmp_path so create_app's
-    ``_mark_species_and_maybe_backfill`` doesn't read the developer's real
+    Isolates $HOME and config paths to tmp_path so create_app's background
+    species-marking pass doesn't read the developer's real
     ``~/.vireo/taxonomy.json``. Without this, the lazy
     ``from taxonomy import ...`` inside that helper freezes
     ``taxonomy.TAXONOMY_JSON_PATH`` to the real path on first import; later
-    tests in ``vireo/tests/`` then load the real 554MB taxonomy via the
-    cached module, retype "Cardinal" as a species, and trigger the
-    auto-Wildlife backfill — breaking ``test_remove_keyword_from_photo`` and
-    ``test_undo_keyword_remove_clears_pending_change`` with a phantom
-    Wildlife tag.
+    tests in ``vireo/tests/`` then load the real taxonomy via the cached
+    module and unexpectedly retype "Cardinal" as a species.
     """
     import os
     import sys
@@ -1394,10 +1391,7 @@ def test_merge_duplicate_keywords_retargets_species_curation_when_source_merges_
     assert [(row["id"], row["name"]) for row in kw_rows] == [
         (survivor_id, "apapane"),
     ]
-    # The legacy photo's species tag moved onto the surviving id. The photo
-    # also carries an auto-added Wildlife genre from tag_photo's
-    # auto-Wildlife trigger (only-species-on-photo path); check membership
-    # rather than equality so that unrelated tag isn't hard-coded.
+    # The legacy photo's species tag moved onto the surviving id.
     tag_ids = {
         row["keyword_id"]
         for row in db.conn.execute(
@@ -1866,8 +1860,7 @@ def test_merge_duplicate_keywords_handles_stale_group_after_parent_merge(db):
     # Keep every child in the same species-bearing slot; this test exercises
     # stale recursive groups, not the distinct species/plain homonym boundary.
     # Location metadata carried only by the duplicate must still fold into
-    # the survivor instead of being deleted with it. (Set after tagging so
-    # the auto-Wildlife rule doesn't muddy the tag assertions.)
+    # the survivor instead of being deleted with it.
     db.conn.execute(
         "UPDATE keywords SET is_species = 1 WHERE LOWER(name) = 'heron'"
     )
@@ -2055,6 +2048,37 @@ def test_move_folders_moves_pending_changes(db_with_workspace):
     assert len(db.get_pending_changes()) == 1
     db.set_active_workspace(ws1)
     assert len(db.get_pending_changes()) == 0
+
+
+def test_move_folders_bumps_source_pending_changes_version(db_with_workspace):
+    """Moving a pending_changes row between workspaces must bump BOTH
+    workspace counters, not just the destination's.
+
+    ``/api/sync/preview`` keys its snapshot cache on
+    ``pending_changes_version:<ws>``. Without a source-side bump, a
+    cached progressive preview for the source workspace keeps its
+    fingerprint and continues serving rows that have already moved
+    away instead of returning 409 (Codex review, PR #1483).
+    """
+    db, ws1, folder_id, photo_id = db_with_workspace
+    db.queue_change(photo_id, "rating", "5")
+    ws2 = db.create_workspace("Target")
+
+    def version(ws):
+        row = db.conn.execute(
+            "SELECT value FROM db_meta WHERE key = ?",
+            (f"pending_changes_version:{ws}",),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    before_src = version(ws1)
+    before_dst = version(ws2)
+
+    result = db.move_folders_to_workspace(ws1, ws2, [folder_id])
+    assert result["pending_changes_moved"] == 1
+
+    assert version(ws1) > before_src
+    assert version(ws2) > before_dst
 
 
 def test_move_folders_moves_photo_preferences(db_with_workspace):

@@ -113,6 +113,20 @@ def test_empty_detection_result_is_valid_completed_computation():
     assert validate_artifact(artifact)["subjects"] == []
 
 
+def test_megadetector_runtime_identity_includes_tiled_fallback(tmp_path, monkeypatch):
+    import computation_cache
+    import detector
+
+    weights = tmp_path / "model.onnx"
+    weights.write_bytes(b"model")
+    baseline = computation_cache.megadetector_runtime_fingerprint(str(weights))
+
+    monkeypatch.setattr(detector, "TILED_CROP_FRACTION", 0.55)
+    changed = computation_cache.megadetector_runtime_fingerprint(str(weights))
+
+    assert changed != baseline
+
+
 def test_input_fingerprint_and_numeric_bounds_are_verified():
     artifact = detection_artifact()
     artifact["input_fingerprint"] = "9" * 64

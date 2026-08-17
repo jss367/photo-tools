@@ -14,6 +14,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from pipeline_job import (
     STAGE_WEIGHTS,
     PipelineParams,
+    _cached_classify_detections,
+    _classification_eta_progress,
+    _record_unattempted_cache_hit,
+    _remove_attempted_cache_hits,
     _stage_fraction,
     _weighted_progress,
     run_pipeline_job,
@@ -62,6 +66,334 @@ class FakeRunner:
 
     def is_cancelled(self, job_id):
         return job_id in self.cancelled_ids
+
+
+def test_contextual_weak_cached_candidates_ignore_foreign_detectors():
+    detections = [
+        {
+            "id": 1,
+            "detector_model": "other-detector",
+            "category": "animal",
+            "confidence": 0.9,
+        },
+        {
+            "id": 2,
+            "detector_model": "megadetector-v6",
+            "category": "animal",
+            "confidence": 0.3,
+        },
+    ]
+
+    ordinary = _cached_classify_detections(detections, 0.2)
+    contextual = _cached_classify_detections(
+        detections, 0.2, contextual_weak=True,
+    )
+
+    assert [d["id"] for d in ordinary] == [1, 2]
+    assert [d["id"] for d in contextual] == [2]
+
+
+def test_attempted_photo_is_not_still_reported_as_cached():
+    cache_hits = {10, 20}
+
+    removed = _remove_attempted_cache_hits(
+        attempted_photo_ids={10, 30},
+        cache_hit_ids=cache_hits,
+    )
+
+    assert removed == 1
+    assert cache_hits == {20}
+
+
+def test_later_cache_hit_does_not_restore_attempted_photo():
+    cache_hits = set()
+
+    recorded = _record_unattempted_cache_hit(
+        photo_id=10,
+        inferred_photo_ids=set(),
+        attempted_photo_ids={10},
+        cache_hit_ids=cache_hits,
+    )
+
+    assert recorded is False
+    assert cache_hits == set()
+
+
+def test_classification_eta_excludes_fast_cache_hits_from_rate():
+    """A cache-heavy prefix must not masquerade as model throughput."""
+    fields = _classification_eta_progress(
+        total=15_418,
+        seen=6_112,
+        cached_estimate=4_062,
+        cache_hits=4_157,
+        inference_attempts=913,
+        classified=913,
+        elapsed=1_480,
+    )
+
+    assert fields["eta_state"] == "ready"
+    assert fields["eta_rate_per_min"] == pytest.approx(37.0, abs=0.1)
+    assert fields["remaining_uncached"] == 9_306
+    assert fields["eta_seconds"] == pytest.approx(15_085, abs=1)
+    # The broken UI used seen / elapsed: roughly 248/min and a 37-minute ETA.
+    assert fields["eta_seconds"] > 4 * 60 * 60
+
+
+def test_classification_eta_waits_for_a_representative_uncached_batch():
+    fields = _classification_eta_progress(
+        total=1_000,
+        seen=700,
+        cached_estimate=650,
+        cache_hits=650,
+        inference_attempts=15,
+        classified=15,
+        elapsed=60,
+    )
+
+    assert fields["eta_state"] == "estimating"
+    assert fields["eta_seconds"] is None
+    assert fields["eta_rate_per_min"] is None
+
+
+def test_classification_eta_subtracts_expected_future_cache_hits():
+    fields = _classification_eta_progress(
+        total=100,
+        seen=36,
+        cached_estimate=60,
+        cache_hits=20,
+        inference_attempts=16,
+        classified=16,
+        elapsed=120,
+    )
+
+    assert fields["remaining_uncached"] == 24
+    assert fields["eta_rate_per_min"] == 8.0
+    assert fields["eta_seconds"] == 180
+
+
+def test_classification_eta_reconciles_overcounted_cache_estimate():
+    """The preflight counts a photo as cached whenever every qualifying
+    detection has a classifier_runs row, but the runtime cache-hit
+    predicate additionally requires cached predictions to exist. On a
+    collection dominated by run-key-without-predictions rows, the
+    preflight overcounts; without reconciliation ``remaining_uncached``
+    collapses to zero after the first inference batch and the UI would
+    report "finishing…" while most photos still need inference.
+    """
+    # 100 photos: preflight said all 100 are cached, but every single one
+    # falls through at runtime (run key present, predictions missing).
+    # After 20 photos we have 20 observed overcounts and 20 inferred; the
+    # remaining 80 photos are ALL uncached work.
+    fields = _classification_eta_progress(
+        total=100,
+        seen=20,
+        cached_estimate=100,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=120,
+        cache_overcount=20,
+    )
+
+    assert fields["remaining_uncached"] == 80
+    assert fields["eta_state"] == "ready"
+    assert fields["eta_rate_per_min"] == 10.0
+    assert fields["eta_seconds"] == 480
+
+
+def test_classification_eta_overcount_floors_at_observed_cache_hits():
+    """``cache_overcount`` must never push corrected cached_estimate
+    below the cache hits we've already observed — otherwise a burst of
+    overcounts on later photos could retroactively erase legitimate
+    cache hits from the projection.
+    """
+    fields = _classification_eta_progress(
+        total=100,
+        seen=40,
+        cached_estimate=50,
+        cache_hits=30,
+        inference_attempts=10,
+        classified=10,
+        elapsed=60,
+        # Absurdly large overcount that would drive corrected estimate
+        # negative if not floored.
+        cache_overcount=1000,
+    )
+
+    # remaining_photos = 60; corrected_cached_estimate floors at
+    # cache_hits (30) so future expected hits = 0.
+    assert fields["remaining_uncached"] == 60
+
+
+def test_classification_eta_subtracts_future_unclassifiable_photos():
+    """Photos the runtime deterministically skips at the ``raw_real_dets``
+    continue branch (real detections but none above the classify floor,
+    not contextual-weak) must not inflate ``remaining_uncached`` — the
+    runtime never enters an inference batch for them, so the ETA
+    otherwise reports a large numeric estimate for a tail that will be
+    traversed almost immediately (Codex #1468 P2).
+    """
+    # 100 photos total; preflight identified 60 as unclassifiable. After
+    # 20 seen (0 skipped so far — the prefix happens to be all
+    # classifiable), we have 20 real inference attempts. The remaining
+    # 80 photos include 60 unclassifiable — only 20 are real work.
+    fields = _classification_eta_progress(
+        total=100,
+        seen=20,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=120,
+        unclassifiable_estimate=60,
+        unclassifiable_seen=0,
+    )
+
+    assert fields["remaining_uncached"] == 20
+    assert fields["eta_state"] == "ready"
+    assert fields["eta_rate_per_min"] == 10.0
+    assert fields["eta_seconds"] == 120
+
+
+def test_classification_eta_elapsed_is_inference_active_seconds_only():
+    """``elapsed`` is the accumulated inference-active seconds (time
+    spent inside ``_flush_batch``), not walltime since the spec started.
+    Passing walltime would bleed the cache-traversal prefix into the
+    rate: on a spec that walked a cached prefix for 500s before hitting
+    inference, walltime-based ``elapsed`` would derate the inferred
+    rate by that entire prefix, inflating the ETA for the uncached
+    tail (Codex #1468 P2).
+
+    Same 20 inference attempts, same 100-photo total. With walltime-
+    based elapsed (600s including a 500s cache prefix), the rate reads
+    2/min and the 60-photo tail projects to ~30 minutes. With
+    inference-active elapsed (100s of pure model work), the rate reads
+    12/min and the tail projects to 5 minutes.
+    """
+    walltime_fields = _classification_eta_progress(
+        total=100,
+        seen=40,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=600,  # walltime — includes cache-traversal prefix
+    )
+    inference_only_fields = _classification_eta_progress(
+        total=100,
+        seen=40,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=100,  # inference-active seconds only
+    )
+
+    # The fix is at the caller (pass inference_seconds, not walltime).
+    # This test pins the contract by demonstrating that the ETA
+    # function relies on the caller to hand it the right denominator —
+    # so a future regression that reverts to walltime here would be
+    # caught immediately by the walltime ETA being ~6x too large.
+    assert walltime_fields["eta_rate_per_min"] == 2.0
+    assert walltime_fields["eta_seconds"] == 1800
+    assert inference_only_fields["eta_rate_per_min"] == 12.0
+    assert inference_only_fields["eta_seconds"] == 300
+
+
+def test_classification_eta_finishing_when_preflight_leaves_no_uncached_work():
+    """When preflight determines the entire remaining collection is either
+    cached or unclassifiable, ``expected_uncached`` collapses to zero and
+    the runtime will never enter an inference batch. In that state the
+    "Estimating after the first uncached batch…" placeholder can never
+    resolve, so the Jobs page would linger on it throughout the traversal.
+    ``_classification_eta_progress`` must instead return ``eta_state ==
+    "finishing"`` so the UI shows the correct signal from tick zero
+    (Codex #1468 P2).
+    """
+    # Fully cached: 100 photos, preflight said all 100 are cached, no
+    # inference has run yet.
+    fully_cached = _classification_eta_progress(
+        total=100,
+        seen=0,
+        cached_estimate=100,
+        cache_hits=0,
+        inference_attempts=0,
+        classified=0,
+        elapsed=0.0,
+    )
+    assert fully_cached["eta_state"] == "finishing"
+    assert fully_cached["eta_seconds"] == 0
+
+    # Fully unclassifiable: 100 photos, preflight said all 100 will be
+    # skipped at the raw_real_dets branch, no inference will run.
+    fully_unclassifiable = _classification_eta_progress(
+        total=100,
+        seen=0,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=0,
+        classified=0,
+        elapsed=0.0,
+        unclassifiable_estimate=100,
+        unclassifiable_seen=0,
+    )
+    assert fully_unclassifiable["eta_state"] == "finishing"
+    assert fully_unclassifiable["eta_seconds"] == 0
+
+    # Mix that leaves no uncached work: 40 cached + 60 unclassifiable.
+    fully_covered = _classification_eta_progress(
+        total=100,
+        seen=10,
+        cached_estimate=40,
+        cache_hits=10,
+        inference_attempts=0,
+        classified=0,
+        elapsed=0.0,
+        unclassifiable_estimate=60,
+        unclassifiable_seen=0,
+    )
+    assert fully_covered["eta_state"] == "finishing"
+    assert fully_covered["eta_seconds"] == 0
+
+    # A genuinely uncached tail still waits for the first representative
+    # batch — the finishing early-return must not swallow the estimating
+    # state when there is real inference work ahead.
+    uncached_tail = _classification_eta_progress(
+        total=100,
+        seen=0,
+        cached_estimate=50,
+        cache_hits=0,
+        inference_attempts=0,
+        classified=0,
+        elapsed=0.0,
+        unclassifiable_estimate=10,
+        unclassifiable_seen=0,
+    )
+    assert uncached_tail["eta_state"] == "estimating"
+    assert uncached_tail["eta_seconds"] is None
+
+
+def test_classification_eta_unclassifiable_seen_capped_at_estimate():
+    """The seen count for unclassifiable photos should not exceed the
+    preflight estimate — an unexpected extra skip cannot make future
+    unclassifiable count go negative and cancel out real work.
+    """
+    fields = _classification_eta_progress(
+        total=100,
+        seen=40,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=60,
+        unclassifiable_estimate=10,
+        unclassifiable_seen=15,  # runtime skipped more than preflight said
+    )
+
+    # remaining_photos = 60; expected_future_unclassifiable clamps at 0
+    # (all 10 preflight-predicted skips accounted for by seen), so all
+    # 60 remaining photos count as work.
+    assert fields["remaining_uncached"] == 60
 
 
 def test_pipeline_params_has_skip_classify():
@@ -2950,6 +3282,382 @@ def test_pipeline_classifies_full_image_when_detector_finds_nothing(
     assert pred_after_reclassify[0]["species"] == "Full-image Robin"
 
 
+def test_pipeline_classifies_full_image_when_only_raw_noise_boxes_exist(
+    tmp_path, monkeypatch,
+):
+    """A raw detector box below every eligibility floor must not suppress
+    full-image classification.
+
+    MegaDetector persists output down to its raw confidence floor so future
+    threshold changes can reuse it. Previously, the mere presence of one of
+    those rows made classify skip the photo: it was too weak to crop, but also
+    blocked the full-image fallback. That stranded clear subjects whenever the
+    detector emitted only noise-level boxes.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+    from PIL import Image
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    photo_id = db.add_photo(
+        folder_id, "bird-in-branches.jpg", ".jpg", 100, 1_000_000.0,
+    )
+    _drop_jpeg(folder_path, "bird-in-branches.jpg")
+    collection_id = db.add_collection(
+        "Raw noise box",
+        json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+
+    model_id = _setup_fake_downloaded_model(tmp_path, monkeypatch)
+    raw_detection = {
+        "box": {"x": 0.42, "y": 0.48, "w": 0.15, "h": 0.16},
+        "confidence": 0.02,
+        "category": "animal",
+    }
+    raw_detection_id = db.write_detection_batch(
+        photo_id, "megadetector-v6", [raw_detection],
+    )[0]
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det = {
+            "id": raw_detection_id,
+            "box_x": raw_detection["box"]["x"],
+            "box_y": raw_detection["box"]["y"],
+            "box_w": raw_detection["box"]["w"],
+            "box_h": raw_detection["box"]["h"],
+            "confidence": raw_detection["confidence"],
+            "category": "animal",
+            "detector_model": "megadetector-v6",
+        }
+        return {photo_id: [det]}, 1, {photo_id}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    prepared_detections = []
+
+    def fake_prepare_image(photo, folders, detection, vireo_dir=None):
+        prepared_detections.append(detection)
+        return Image.new("RGB", (32, 32), "white"), folder_path, str(
+            os.path.join(folder_path, photo["filename"])
+        )
+
+    monkeypatch.setattr(classify_job, "_prepare_image", fake_prepare_image)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def classify_batch_with_embedding(self, images, threshold=0):
+            import numpy as np
+
+            return [(
+                [{"species": "Downy Woodpecker", "score": 0.94}],
+                np.zeros(512, dtype=np.float32),
+            ) for _ in images]
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    result = run_pipeline_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        PipelineParams(
+            collection_id=collection_id,
+            model_id=model_id,
+            skip_extract_masks=True,
+            skip_regroup=True,
+        ),
+    )
+
+    assert result["stages"]["classify"]["full_image_fallbacks"] == 1
+    assert prepared_detections == [None]
+
+    check = Database(db_path)
+    check.set_active_workspace(ws_id)
+    rows = check.conn.execute(
+        """SELECT d.detector_model, pr.species
+             FROM detections d
+             LEFT JOIN predictions pr ON pr.detection_id = d.id
+            WHERE d.photo_id = ?
+            ORDER BY d.detector_model""",
+        (photo_id,),
+    ).fetchall()
+    assert [dict(row) for row in rows] == [
+        {"detector_model": "full-image", "species": "Downy Woodpecker"},
+        {"detector_model": "megadetector-v6", "species": None},
+    ]
+
+
+def test_pipeline_skips_full_image_when_only_confident_non_animal_box(
+    tmp_path, monkeypatch,
+):
+    """A confident person/vehicle box must still suppress the full-image
+    fallback.
+
+    The animal-filter above ``detections_to_classify`` strips non-animal
+    rows before the emptiness check, so a photo whose only MegaDetector
+    output is a high-confidence person or vehicle box would otherwise slip
+    into the fallback and get a spurious wildlife prediction. The guard
+    only whitelists photos whose non-animal rows are all sub-threshold
+    (i.e. actual noise).
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+    from PIL import Image
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    photo_id = db.add_photo(
+        folder_id, "hiker.jpg", ".jpg", 100, 1_000_000.0,
+    )
+    _drop_jpeg(folder_path, "hiker.jpg")
+    collection_id = db.add_collection(
+        "Confident person",
+        json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+
+    model_id = _setup_fake_downloaded_model(tmp_path, monkeypatch)
+    person_det = {
+        "box": {"x": 0.30, "y": 0.20, "w": 0.20, "h": 0.60},
+        "confidence": 0.95,
+        "category": "person",
+    }
+    person_det_id = db.write_detection_batch(
+        photo_id, "megadetector-v6", [person_det],
+    )[0]
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det = {
+            "id": person_det_id,
+            "box_x": person_det["box"]["x"],
+            "box_y": person_det["box"]["y"],
+            "box_w": person_det["box"]["w"],
+            "box_h": person_det["box"]["h"],
+            "confidence": person_det["confidence"],
+            "category": "person",
+            "detector_model": "megadetector-v6",
+        }
+        return {photo_id: [det]}, 1, {photo_id}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    prepared_detections = []
+
+    def fake_prepare_image(photo, folders, detection, vireo_dir=None):
+        prepared_detections.append(detection)
+        return Image.new("RGB", (32, 32), "white"), folder_path, str(
+            os.path.join(folder_path, photo["filename"])
+        )
+
+    monkeypatch.setattr(classify_job, "_prepare_image", fake_prepare_image)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def classify_batch_with_embedding(self, images, threshold=0):
+            import numpy as np
+
+            return [(
+                [{"species": "Bald Eagle", "score": 0.99}],
+                np.zeros(512, dtype=np.float32),
+            ) for _ in images]
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    result = run_pipeline_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        PipelineParams(
+            collection_id=collection_id,
+            model_id=model_id,
+            skip_extract_masks=True,
+            skip_regroup=True,
+        ),
+    )
+
+    assert result["stages"]["classify"]["full_image_fallbacks"] == 0
+    assert prepared_detections == []
+
+    check = Database(db_path)
+    check.set_active_workspace(ws_id)
+    rows = check.conn.execute(
+        """SELECT d.detector_model, d.category, pr.species
+             FROM detections d
+             LEFT JOIN predictions pr ON pr.detection_id = d.id
+            WHERE d.photo_id = ?
+            ORDER BY d.detector_model""",
+        (photo_id,),
+    ).fetchall()
+    assert [dict(row) for row in rows] == [
+        {
+            "detector_model": "megadetector-v6",
+            "category": "person",
+            "species": None,
+        },
+    ]
+
+
+def test_pipeline_precreates_full_image_anchor_for_noise_only_photo(
+    tmp_path, monkeypatch,
+):
+    """The detect stage must pre-create a full-image anchor for a photo whose
+    only detections are sub-threshold noise.
+
+    Without this pre-creation, the post-detect ``materialize_local_store``
+    reapply has nothing for a cached full-image classifier artifact to
+    attach to (the anchor is only created lazily during ``classify_stage``
+    later). The classify stage then re-runs the classifier for an answer
+    that is already in the local store. The runtime fallback fires under
+    the same predicate the pre-materialization anchor selection now
+    mirrors — no usable animal box at the strict threshold and no
+    confident non-animal box — so the pre-created anchor is what the
+    fallback would use.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import computation_cache as cc
+    import config as cfg
+    from db import Database
+    from PIL import Image
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    photo_id = db.add_photo(
+        folder_id, "faint-warbler.jpg", ".jpg", 100, 1_000_000.0,
+    )
+    _drop_jpeg(folder_path, "faint-warbler.jpg")
+    collection_id = db.add_collection(
+        "Noise only",
+        json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+
+    model_id = _setup_fake_downloaded_model(tmp_path, monkeypatch)
+    raw_detection = {
+        "box": {"x": 0.10, "y": 0.10, "w": 0.05, "h": 0.05},
+        "confidence": 0.03,
+        "category": "animal",
+    }
+    raw_detection_id = db.write_detection_batch(
+        photo_id, "megadetector-v6", [raw_detection],
+    )[0]
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det = {
+            "id": raw_detection_id,
+            "box_x": raw_detection["box"]["x"],
+            "box_y": raw_detection["box"]["y"],
+            "box_w": raw_detection["box"]["w"],
+            "box_h": raw_detection["box"]["h"],
+            "confidence": raw_detection["confidence"],
+            "category": "animal",
+            "detector_model": "megadetector-v6",
+        }
+        return {photo_id: [det]}, 1, {photo_id}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    # Capture the DB state at the moment the post-detect reapply runs.
+    # A pre-created full-image detection row here proves the anchor is
+    # available for cached classifier artifacts to attach to during
+    # materialize — i.e., before classify_stage would otherwise have to
+    # rerun the classifier.
+    anchors_at_reapply = []
+    original_materialize = cc.materialize_local_store
+
+    def spy_materialize(db_obj, *args, **kwargs):
+        rows = db_obj.conn.execute(
+            "SELECT detector_model, runtime_fingerprint FROM detections "
+            "WHERE photo_id = ? ORDER BY detector_model",
+            (photo_id,),
+        ).fetchall()
+        anchors_at_reapply.append([dict(r) for r in rows])
+        return original_materialize(db_obj, *args, **kwargs)
+
+    monkeypatch.setattr(cc, "materialize_local_store", spy_materialize)
+
+    def fake_prepare_image(photo, folders, detection, vireo_dir=None):
+        return Image.new("RGB", (32, 32), "white"), folder_path, str(
+            os.path.join(folder_path, photo["filename"])
+        )
+
+    monkeypatch.setattr(classify_job, "_prepare_image", fake_prepare_image)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def classify_batch_with_embedding(self, images, threshold=0):
+            import numpy as np
+
+            return [(
+                [{"species": "Yellow Warbler", "score": 0.87}],
+                np.zeros(512, dtype=np.float32),
+            ) for _ in images]
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    result = run_pipeline_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        PipelineParams(
+            collection_id=collection_id,
+            model_id=model_id,
+            skip_extract_masks=True,
+            skip_regroup=True,
+        ),
+    )
+
+    # The pipeline runs materialize twice: once before detect (no anchor
+    # expected yet) and once after detect (anchor must exist so cached
+    # full-image classifier runs can attach). The post-detect call is the
+    # second one — assert it saw the full-image anchor for this noise-only
+    # photo.
+    assert len(anchors_at_reapply) >= 2, (
+        f"expected pre- and post-detect materialize calls, "
+        f"saw {len(anchors_at_reapply)}"
+    )
+    post_detect_state = anchors_at_reapply[-1]
+    detector_models = {row["detector_model"] for row in post_detect_state}
+    assert "full-image" in detector_models, (
+        "detect-stage reapply must see a pre-created full-image anchor "
+        "for a noise-only photo so cached full-image classifiers can "
+        f"attach; saw {post_detect_state}"
+    )
+
+    # And the run still classifies via full-image fallback — the guard
+    # cannot regress the noise-only rescue path itself.
+    assert result["stages"]["classify"]["full_image_fallbacks"] == 1
+
+
 def test_pipeline_redownloads_taxonomy_when_existing_file_is_corrupt(
     tmp_path, monkeypatch
 ):
@@ -3478,6 +4186,9 @@ def test_pipeline_classifies_bracketed_weak_detection_without_lowering_threshold
 
     assert ("bird1.jpg", 0.18) in captured
     assert [name for name, _ in captured].count("bird1.jpg") == 1
+    assert db.get_detections(
+        photo_ids[1], detector_model="full-image", min_conf=0,
+    ) == []
 
 
 def test_pipeline_reclassify_purges_stale_detection_rows(tmp_path, monkeypatch):
@@ -13378,9 +14089,10 @@ def test_collection_rerun_redoes_only_missing_work(tmp_path, monkeypatch):
         )
         runner = FakeRunner()
         job = _make_job()
-        return run_pipeline_job(job, runner, db_path, ws_id, params)
+        result = run_pipeline_job(job, runner, db_path, ws_id, params)
+        return result, runner
 
-    first = run_once()
+    first, _first_runner = run_once()
     n = len(photo_ids)
     assert first["stages"]["thumbnails"]["generated"] == n, first["stages"]
     assert first["stages"]["previews"]["generated"] == n, first["stages"]
@@ -13390,7 +14102,7 @@ def test_collection_rerun_redoes_only_missing_work(tmp_path, monkeypatch):
     assert inference_calls, "first run never invoked the classifier"
 
     inference_calls.clear()
-    second = run_once()
+    second, second_runner = run_once()
     assert second["stages"]["thumbnails"] == {
         "generated": 0, "skipped": n, "failed": 0,
     }, second["stages"]
@@ -13408,6 +14120,17 @@ def test_collection_rerun_redoes_only_missing_work(tmp_path, monkeypatch):
     assert inference_calls == [], (
         f"rerun invoked the classifier: {inference_calls}"
     )
+    eta_updates = [
+        kw["progress"]
+        for _, step_id, kw in second_runner.step_updates
+        if step_id.startswith("classify:")
+        and isinstance(kw.get("progress"), dict)
+        and kw["progress"].get("eta_kind") == "classification"
+    ]
+    assert eta_updates, "classify step never published cache-aware ETA fields"
+    assert eta_updates[-1]["cache_hits"] == n
+    assert eta_updates[-1]["classified"] == 0
+    assert eta_updates[-1]["eta_state"] == "finishing"
 
 
 # ---------------------------------------------------------------------------

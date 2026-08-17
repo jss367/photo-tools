@@ -230,13 +230,16 @@ body {
 .location-review-coordinate-toggle input { margin: 0; accent-color: var(--accent); }
 .location-review-suggestion-mode {
   display: flex;
-  width: max-content;
+  width: 100%;
   margin: -1px 0 9px;
   padding: 2px;
   border-radius: 7px;
   background: var(--bg-primary);
+  box-sizing: border-box;
+  overflow-x: auto;
 }
 .location-review-suggestion-mode button {
+  flex: 1 0 auto;
   padding: 5px 8px;
   border: 0;
   border-radius: 5px;
@@ -245,6 +248,7 @@ body {
   font: inherit;
   font-size: 10px;
   cursor: pointer;
+  white-space: nowrap;
 }
 .location-review-suggestion-mode button:hover { color: var(--text-primary); }
 .location-review-suggestion-mode button.active {
@@ -252,6 +256,19 @@ body {
   color: var(--accent);
 }
 .location-review-candidates { display: flex; flex-direction: column; gap: 7px; }
+.location-review-candidate-group {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.location-review-candidate-group + .location-review-candidate-group { margin-top: 5px; }
+.location-review-candidate-group-title {
+  color: var(--text-ghost);
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
 .location-review-setup-prompt {
   display: flex;
   flex-direction: column;
@@ -380,7 +397,37 @@ body {
   border-top: 1px solid var(--border-primary);
   background: var(--bg-secondary);
 }
+.location-review-assign-column {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.location-review-assignment-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.location-review-assignment-status {
+  color: var(--text-dim);
+  font-size: 10px;
+  line-height: 1.2;
+}
+.location-review-assignment-track {
+  height: 5px;
+  border-radius: 999px;
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+.location-review-assignment-fill {
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width .2s;
+}
 .location-review-assign {
+  width: 100%;
   border: 0;
   border-radius: 5px;
   background: var(--accent);
@@ -494,16 +541,19 @@ body {
           <div class="location-review-section-title">
             <span>Suggested locations</span>
             <div class="location-review-section-controls">
-              <label class="location-review-coordinate-toggle" for="locationReviewIncludeCoordinates">
+              <label class="location-review-coordinate-toggle" for="locationReviewIncludeCoordinates"
+                     title="Display only. This does not change location assignments or metadata written to XMP.">
                 <input id="locationReviewIncludeCoordinates" type="checkbox">
-                Include coordinates
+                Show coordinates
               </label>
               <small id="locationReviewSuggestionStatus">Looking nearby…</small>
             </div>
           </div>
-          <div class="location-review-suggestion-mode location-review-hidden" id="locationReviewSuggestionMode" role="group" aria-label="Suggested location categories">
-            <button class="active" type="button" data-suggestion-mode="nature" aria-pressed="true">Parks &amp; nature</button>
-            <button type="button" data-suggestion-mode="all" aria-pressed="false">All nearby</button>
+          <div class="location-review-suggestion-mode" id="locationReviewSuggestionMode" role="group" aria-label="Suggested location categories">
+            <button class="active" type="button" data-suggestion-mode="recommended" aria-pressed="true">Recommended</button>
+            <button type="button" data-suggestion-mode="areas" aria-pressed="false">Areas</button>
+            <button type="button" data-suggestion-mode="nature" aria-pressed="false">Nature</button>
+            <button type="button" data-suggestion-mode="places" aria-pressed="false">Places</button>
           </div>
           <div class="location-review-candidates" id="locationReviewCandidates">
             <div class="location-review-loading">Finding saved and nearby locations…</div>
@@ -527,7 +577,15 @@ body {
 
       <div class="location-review-actions">
         <button class="location-review-button" id="locationReviewSkip" type="button">Skip for now</button>
-        <button class="location-review-assign" id="locationReviewAssign" type="button" disabled>Select a location</button>
+        <div class="location-review-assign-column">
+          <div class="location-review-assignment-progress location-review-hidden" id="locationReviewAssignmentProgress">
+            <div class="location-review-assignment-status" id="locationReviewAssignmentStatus" aria-live="polite"></div>
+            <div class="location-review-assignment-track" id="locationReviewAssignmentTrack" role="progressbar" aria-labelledby="locationReviewAssignmentStatus" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
+              <div class="location-review-assignment-fill" id="locationReviewAssignmentFill"></div>
+            </div>
+          </div>
+          <button class="location-review-assign" id="locationReviewAssign" type="button" disabled>Select a location</button>
+        </div>
       </div>
     </aside>
   </div>
@@ -556,11 +614,10 @@ body {
     includeCoordinates: false,
     savedCandidates: [],
     googleCandidates: [],
-    googleCandidatesByMode: {nature: null, all: null},
+    googleCandidatesLoaded: false,
     regionCandidates: [],
-    regionCandidatesLoaded: false,
     searchedCandidate: null,
-    suggestionMode: 'nature',
+    suggestionMode: 'recommended',
     config: null,
     mapMode: null,
     map: null,
@@ -570,6 +627,8 @@ body {
     autocomplete: null,
     googleMapsUnavailableReason: null,
     renderToken: 0,
+    assignment: null,
+    isAssigning: false,
   };
 
   var NATURAL_TYPES = {
@@ -577,7 +636,29 @@ body {
     wildlife_refuge: 'Wildlife refuge', nature_preserve: 'Nature preserve',
     natural_feature: 'Natural feature', hiking_area: 'Hiking area', campground: 'Campground',
     rv_park: 'RV park',
-    scenic_spot: 'Scenic spot', tourist_attraction: 'Place of interest',
+    scenic_spot: 'Scenic spot',
+  };
+
+  var AREA_TYPES = {
+    neighborhood: {label: 'Neighborhood', scope: 'local'},
+    colloquial_area: {label: 'Local area', scope: 'local'},
+    sublocality_level_5: {label: 'Local area', scope: 'local'},
+    sublocality_level_4: {label: 'Local area', scope: 'local'},
+    sublocality_level_3: {label: 'Local area', scope: 'local'},
+    sublocality_level_2: {label: 'Local area', scope: 'local'},
+    sublocality_level_1: {label: 'Local area', scope: 'local'},
+    sublocality: {label: 'Local area', scope: 'local'},
+    postal_town: {label: 'Town', scope: 'local'},
+    locality: {label: 'City or town', scope: 'local'},
+    administrative_area_level_3: {label: 'District or municipality', scope: 'local'},
+    administrative_area_level_2: {label: 'County or region', scope: 'broad'},
+    administrative_area_level_1: {label: 'State or province', scope: 'broad'},
+    country: {label: 'Country', scope: 'broad'},
+  };
+
+  var PLACE_TYPES = {
+    tourist_attraction: 'Landmark', museum: 'Museum', place_of_worship: 'Place of worship',
+    lodging: 'Lodging', restaurant: 'Restaurant', store: 'Business', establishment: 'Place',
   };
 
   function returnToBrowse() { window.location.href = state.returnUrl || '/browse'; }
@@ -692,6 +773,76 @@ body {
     document.getElementById('locationReviewProgressFill').style.width = pct + '%';
   }
 
+  function resetAssignmentProgress() {
+    var progress = document.getElementById('locationReviewAssignmentProgress');
+    var status = document.getElementById('locationReviewAssignmentStatus');
+    var track = document.getElementById('locationReviewAssignmentTrack');
+    progress.classList.add('location-review-hidden');
+    status.textContent = '';
+    document.getElementById('locationReviewAssignmentFill').style.width = '0%';
+    track.setAttribute('aria-valuemax', '0');
+    track.setAttribute('aria-valuenow', '0');
+    track.removeAttribute('aria-valuetext');
+  }
+
+  function updateAssignmentProgress(completed, total, interrupted) {
+    var progress = document.getElementById('locationReviewAssignmentProgress');
+    var status = document.getElementById('locationReviewAssignmentStatus');
+    var track = document.getElementById('locationReviewAssignmentTrack');
+    var pct = total ? Math.round((completed / total) * 100) : 100;
+    var remaining = Math.max(0, total - completed);
+    var statusText = interrupted
+      ? formatNumber(completed) + ' of ' + formatNumber(total) + ' assigned · ' + formatNumber(remaining) + ' remaining'
+      : 'Assigning ' + formatNumber(completed) + ' of ' + formatNumber(total) + ' photos · ' + pct + '%';
+    progress.classList.remove('location-review-hidden');
+    status.textContent = statusText;
+    document.getElementById('locationReviewAssignmentFill').style.width = pct + '%';
+    track.setAttribute('aria-valuemax', String(total));
+    track.setAttribute('aria-valuenow', String(completed));
+    track.setAttribute('aria-valuetext', statusText);
+  }
+
+  function setAssignmentNavigationDisabled(disabled) {
+    document.getElementById('locationReviewSkip').disabled = disabled;
+    document.getElementById('locationReviewPrevious').disabled = disabled || state.groups.length < 2;
+    document.getElementById('locationReviewNext').disabled = disabled || state.groups.length < 2;
+    document.querySelectorAll('[data-suggestion-mode]').forEach(function(button) {
+      button.disabled = disabled;
+    });
+  }
+
+  function hasPartialAssignmentProgress() {
+    return !!(state.assignment && state.assignment.completed > 0
+      && state.assignment.completed < state.assignment.total);
+  }
+
+  function countProcessedInPhotoIds(assignment) {
+    if (!assignment || !assignment.processedIds) return 0;
+    var count = 0;
+    for (var i = 0; i < assignment.photoIds.length; i++) {
+      if (assignment.processedIds.has(assignment.photoIds[i])) count++;
+    }
+    return count;
+  }
+
+  function reconcileAssignmentForDeletion(photoId) {
+    // A deletion arriving mid-partial (or mid-batch via a pre-existing modal
+    // that bypassed openPhotoPreview's guard) must not leave a stale ID in the
+    // retry snapshot: the batch endpoints validate every ID up front and 404
+    // on any that no longer exist, permanently jamming the retry loop. Drop
+    // the deleted ID from photoIds and resync the counters against
+    // processedIds so both the display and the next chunk see reality.
+    if (!state.assignment) return;
+    var idx = state.assignment.photoIds.indexOf(photoId);
+    if (idx === -1) return;
+    state.assignment.photoIds.splice(idx, 1);
+    state.assignment.total = state.assignment.photoIds.length;
+    state.assignment.completed = countProcessedInPhotoIds(state.assignment);
+    if (state.assignment.completed > state.assignment.total) {
+      state.assignment.completed = state.assignment.total;
+    }
+  }
+
   function clearMapObjects() {
     if (state.mapMode === 'google') {
       state.photoMarkers.forEach(function(marker) { marker.setMap(null); });
@@ -707,6 +858,23 @@ body {
   function openPhotoPreview(photo) {
     var group = currentGroup();
     if (!photo || !group || typeof openLightbox !== 'function') return;
+    // While an assignment is in flight or a partial batch is waiting for
+    // retry, opening the lightbox lets the user delete a photo; the
+    // 'lightbox:photodeleted' handler then runs renderCurrentGroup() which
+    // nulls state.assignment and unlocks navigation, silently orphaning the
+    // committed chunks. Keep the preview closed until the pending
+    // assignment resolves.
+    if (hasPartialAssignmentProgress()) {
+      showToast('Finish or retry the pending assignment before opening a photo — ' +
+        formatNumber(state.assignment.completed) + ' of ' +
+        formatNumber(state.assignment.total) + ' photos already got “' +
+        state.selectedChoice.name + '”. Reload to abandon.', 'error');
+      return;
+    }
+    if (state.isAssigning) {
+      showToast('Assignment in progress — finish or wait before opening a photo.', 'error');
+      return;
+    }
     openLightbox(photo.id, photo.filename || '', group.photos.slice());
   }
 
@@ -767,6 +935,47 @@ body {
     group.photos = group.photos.filter(function(photo) { return photo.id !== photoId; });
     group.photo_ids = group.photo_ids.filter(function(id) { return id !== photoId; });
     group.count = group.photos.length;
+    // If an assignment is in flight, or a partial batch is waiting for retry,
+    // rebuilding the UI here would null state.assignment and re-enable Skip /
+    // Prev / Next — orphaning the already-committed chunks. Update the group
+    // quietly instead; the pending assignment will refresh the group when it
+    // finishes or is explicitly abandoned. Reconciling the assignment's
+    // snapshot at the same time keeps future retries from submitting the
+    // deleted ID and 404-ing the whole batch.
+    if (state.isAssigning || hasPartialAssignmentProgress()) {
+      reconcileAssignmentForDeletion(photoId);
+      if (group.count) refreshGroupMetadata(group);
+      if (!state.isAssigning && state.assignment) {
+        var pendingRemaining = state.assignment.total - state.assignment.completed;
+        if (pendingRemaining <= 0) {
+          // Every still-pending photo was deleted, so the assignment is
+          // effectively finished. Advance past this group as the catch
+          // path does — even when reconciliation left already-committed
+          // photos behind, those photos are already saved to the chosen
+          // location, so re-rendering the group here would present them
+          // as unreviewed and let the user double-assign them under a
+          // different name.
+          state.assignment = null;
+          resetAssignmentProgress();
+          state.groups.splice(state.currentIndex, 1);
+          state.assignedGroups += 1;
+          if (state.currentIndex >= state.groups.length) {
+            state.currentIndex = Math.max(0, state.groups.length - 1);
+          }
+          renderCurrentGroup();
+          return;
+        }
+        updateAssignmentProgress(
+          state.assignment.completed, state.assignment.total, true
+        );
+        var pendingAssign = document.getElementById('locationReviewAssign');
+        if (pendingAssign) {
+          pendingAssign.textContent =
+            'Retry ' + formatNumber(pendingRemaining) + ' remaining';
+        }
+      }
+      return;
+    }
     if (!group.count) {
       state.groups.splice(state.currentIndex, 1);
       if (state.currentIndex >= state.groups.length) state.currentIndex = Math.max(0, state.groups.length - 1);
@@ -825,29 +1034,72 @@ body {
 
   function candidateKey(choice) {
     if (!choice) return '';
+    if (choice.place_id) return 'place:' + choice.place_id;
     if (choice.kind === 'keyword') return 'keyword:' + choice.keyword_id;
-    if (choice.kind === 'google') return 'google:' + choice.place_id;
     return 'custom:' + choice.name;
+  }
+
+  function typeDetails(types) {
+    types = Array.isArray(types) ? types : [];
+    for (var index = 0; index < types.length; index += 1) {
+      if (AREA_TYPES[types[index]]) {
+        return {
+          category: 'areas',
+          type: types[index],
+          label: AREA_TYPES[types[index]].label,
+          areaScope: AREA_TYPES[types[index]].scope,
+        };
+      }
+    }
+    for (var naturalIndex = 0; naturalIndex < types.length; naturalIndex += 1) {
+      if (NATURAL_TYPES[types[naturalIndex]]) {
+        return {category: 'nature', type: types[naturalIndex], label: NATURAL_TYPES[types[naturalIndex]]};
+      }
+    }
+    for (var placeIndex = 0; placeIndex < types.length; placeIndex += 1) {
+      if (PLACE_TYPES[types[placeIndex]]) {
+        return {category: 'places', type: types[placeIndex], label: PLACE_TYPES[types[placeIndex]]};
+      }
+    }
+    return {category: 'places', type: types[0] || 'place', label: 'Place'};
+  }
+
+  function normalizeCandidate(choice) {
+    if (!choice) return choice;
+    if (choice.kind === 'custom') {
+      choice.category = 'places';
+      choice.type_label = choice.type_label || 'Custom friendly name';
+      return choice;
+    }
+    if (choice.kind === 'keyword') {
+      // Older saved keywords do not retain their original Google place types.
+      // Treat them as named places while keeping source as a separate badge.
+      choice.category = choice.category || 'places';
+      choice.type_label = choice.type_label || 'Saved location';
+      choice.previously_used = true;
+      choice.category_is_fallback = true;
+      return choice;
+    }
+    var details = typeDetails(choice.types);
+    choice.category = choice.category || details.category;
+    choice.place_type = choice.place_type || details.type;
+    choice.type_label = choice.type_label || details.label;
+    choice.area_scope = choice.area_scope || details.areaScope;
+    return choice;
   }
 
   function candidateType(choice) {
     if (choice.kind === 'custom') {
       return {label: 'Custom friendly name', category: 'custom'};
     }
-    if (choice.kind !== 'google') return null;
-    var naturalLabel = '';
-    (choice.types || []).some(function(type) {
-      if (NATURAL_TYPES[type]) { naturalLabel = NATURAL_TYPES[type]; return true; }
-      return false;
-    });
-    if (naturalLabel) return {label: naturalLabel, category: 'nature'};
-    var category = {
-      'City or town': 'locality',
-      'County or region': 'region',
-      'State or province': 'region',
-      'Country': 'country',
-    }[choice.type_label] || 'place';
-    return {label: choice.type_label || 'Google place', category: category};
+    if (choice.kind !== 'google' && choice.category_is_fallback) return null;
+    var category = 'place';
+    if (choice.category === 'nature') category = 'nature';
+    else if (choice.category === 'areas') {
+      if (choice.place_type === 'country') category = 'country';
+      else category = choice.area_scope === 'broad' ? 'region' : 'locality';
+    }
+    return {label: choice.type_label || 'Place', category: category};
   }
 
   function candidateMeta(choice) {
@@ -855,7 +1107,8 @@ body {
     if (choice.kind === 'keyword') {
       parts.push(formatNumber(choice.photo_count) + (choice.photo_count === 1 ? ' photo' : ' photos'));
     }
-    if (choice.distance_m != null) parts.push(formatDistance(choice.distance_m) + ' from photo center');
+    if (choice.relationship === 'at_photos') parts.push('At photo coordinates');
+    else if (choice.distance_m != null) parts.push(formatDistance(choice.distance_m) + ' from photo center');
     if (choice.context) parts.push(choice.context);
     return parts.join(' · ');
   }
@@ -869,7 +1122,7 @@ body {
   }
 
   function allCandidates() {
-    var seen = {};
+    var indexes = {};
     var values = [];
     var nearby = state.savedCandidates.concat(state.googleCandidates);
     nearby.sort(function(a, b) {
@@ -887,11 +1140,68 @@ body {
       state.regionCandidates
     ).forEach(function(choice) {
       var key = candidateKey(choice);
-      if (!key || seen[key]) return;
-      seen[key] = true;
+      if (!key) return;
+      if (indexes[key] != null) {
+        var existing = values[indexes[key]];
+        if (choice.previously_used) {
+          existing.previously_used = true;
+          existing.photo_count = choice.photo_count;
+          existing.keyword_id = choice.keyword_id;
+        }
+        if (existing.category_is_fallback && !choice.category_is_fallback) {
+          existing.category = choice.category;
+          existing.place_type = choice.place_type;
+          existing.type_label = choice.type_label;
+          existing.area_scope = choice.area_scope;
+          existing.category_is_fallback = false;
+        }
+        if (choice.relationship === 'at_photos') {
+          existing.relationship = choice.relationship;
+          existing.area_scope = choice.area_scope;
+          existing.category = choice.category;
+          existing.place_type = choice.place_type;
+          existing.type_label = choice.type_label;
+        }
+        if ((!existing.address_components || !existing.address_components.length) && choice.address_components) {
+          existing.address_components = choice.address_components;
+        }
+        return;
+      }
+      indexes[key] = values.length;
       values.push(choice);
     });
     return values;
+  }
+
+  function visibleCandidates() {
+    var candidates = allCandidates();
+    if (state.suggestionMode === 'recommended') return candidates;
+    var selectedKey = candidateKey(state.selectedChoice);
+    return candidates.filter(function(choice) {
+      return choice.category === state.suggestionMode || (selectedKey && candidateKey(choice) === selectedKey);
+    });
+  }
+
+  function candidateGroup(choice) {
+    var selectedKey = candidateKey(state.selectedChoice);
+    if (
+      state.suggestionMode !== 'recommended'
+      && selectedKey
+      && candidateKey(choice) === selectedKey
+      && choice.category !== state.suggestionMode
+    ) return 'selected';
+    if (choice.relationship === 'at_photos' && choice.area_scope === 'local') return 'at';
+    if (choice.category === 'areas' && choice.area_scope === 'broad') return 'broader';
+    return 'nearby';
+  }
+
+  function candidateGroupLabel(group) {
+    return {
+      selected: 'Selected location',
+      at: 'At the photos',
+      nearby: state.suggestionMode === 'recommended' ? 'Nearby places' : '',
+      broader: 'Broader areas',
+    }[group] || '';
   }
 
   function renderCandidateMarkers() {
@@ -902,7 +1212,7 @@ body {
       state.candidateMarkers.forEach(function(marker) { state.map.removeLayer(marker); });
     }
     state.candidateMarkers = [];
-    allCandidates().forEach(function(choice) {
+    visibleCandidates().forEach(function(choice) {
       if (choice.latitude == null || choice.longitude == null) return;
       var selected = candidateKey(choice) === candidateKey(state.selectedChoice);
       if (state.mapMode === 'google') {
@@ -926,17 +1236,34 @@ body {
   }
 
   function selectChoice(choice) {
+    if (state.isAssigning) return;
+    var choiceKey = candidateKey(choice);
+    if (hasPartialAssignmentProgress() && state.assignment.choiceKey !== choiceKey) {
+      showToast('Finish or retry the pending assignment — ' +
+        formatNumber(state.assignment.completed) + ' of ' +
+        formatNumber(state.assignment.total) + ' photos already got “' +
+        state.selectedChoice.name + '”. Reload to abandon.', 'error');
+      return;
+    }
+    if (state.assignment && state.assignment.choiceKey !== choiceKey) {
+      state.assignment = null;
+      resetAssignmentProgress();
+    }
     state.selectedChoice = choice;
     renderCandidates();
     renderCandidateMarkers();
     var assign = document.getElementById('locationReviewAssign');
     assign.disabled = false;
-    assign.textContent = 'Assign “' + choice.name + '”';
+    if (state.assignment && state.assignment.choiceKey === choiceKey && state.assignment.completed) {
+      assign.textContent = 'Retry ' + formatNumber(state.assignment.total - state.assignment.completed) + ' remaining';
+    } else {
+      assign.textContent = 'Assign “' + choice.name + '”';
+    }
   }
 
   function renderCandidates() {
     var container = document.getElementById('locationReviewCandidates');
-    var candidates = allCandidates();
+    var candidates = visibleCandidates();
     var setupPrompt = '';
     if (state.googleMapsUnavailableReason === 'missing_key') {
       setupPrompt = '<div class="location-review-setup-prompt">' +
@@ -953,24 +1280,39 @@ body {
       container.innerHTML = setupPrompt || '<div class="location-review-loading">No nearby named places found. Search the map or enter a custom friendly name.</div>';
       return;
     }
-    container.innerHTML = setupPrompt + candidates.map(function(choice, index) {
-      var selected = candidateKey(choice) === candidateKey(state.selectedChoice) ? ' selected' : '';
-      var badge = choice.kind === 'keyword'
-        ? '<span class="location-review-candidate-badge">Previously used</span>' : '';
-      var type = candidateType(choice);
-      var typeBadge = type
-        ? '<span class="location-review-candidate-type location-review-candidate-type--' + type.category + '">' +
-          escapeHtml(type.label) + '</span>' : '';
-      var meta = candidateMeta(choice);
-      var coordinates = state.includeCoordinates ? candidateCoordinates(choice) : '';
-      return '<button class="location-review-candidate' + selected + '" type="button" data-candidate-index="' + index + '">' +
-        '<span class="location-review-radio"></span><span>' +
-        '<span class="location-review-candidate-heading">' +
-        '<span class="location-review-candidate-name">' + escapeHtml(choice.name) + '</span>' + badge + '</span>' +
-        '<span class="location-review-candidate-meta">' + typeBadge +
-        (meta ? '<span class="location-review-candidate-detail">' + escapeHtml(meta) + '</span>' : '') + '</span>' +
-        (coordinates ? '<span class="location-review-candidate-coordinates">' + escapeHtml(coordinates) + '</span>' : '') +
-        '</span></button>';
+    var groupedByName = {selected: [], at: [], nearby: [], broader: []};
+    candidates.forEach(function(choice, index) {
+      var group = candidateGroup(choice);
+      groupedByName[group].push({choice: choice, index: index});
+    });
+    var grouped = ['selected', 'at', 'nearby', 'broader'].map(function(name) {
+      return {name: name, choices: groupedByName[name]};
+    }).filter(function(group) { return group.choices.length; });
+    container.innerHTML = setupPrompt + grouped.map(function(group) {
+      var label = candidateGroupLabel(group.name);
+      return '<div class="location-review-candidate-group" data-candidate-group="' + group.name + '">' +
+        (label ? '<div class="location-review-candidate-group-title">' + escapeHtml(label) + '</div>' : '') +
+        group.choices.map(function(item) {
+          var choice = item.choice;
+          var index = item.index;
+          var selected = candidateKey(choice) === candidateKey(state.selectedChoice) ? ' selected' : '';
+          var badge = choice.previously_used
+            ? '<span class="location-review-candidate-badge">Previously used</span>' : '';
+          var type = candidateType(choice);
+          var typeBadge = type
+            ? '<span class="location-review-candidate-type location-review-candidate-type--' + type.category + '">' +
+              escapeHtml(type.label) + '</span>' : '';
+          var meta = candidateMeta(choice);
+          var coordinates = state.includeCoordinates ? candidateCoordinates(choice) : '';
+          return '<button class="location-review-candidate' + selected + '" type="button" data-candidate-index="' + index + '">' +
+            '<span class="location-review-radio"></span><span>' +
+            '<span class="location-review-candidate-heading">' +
+            '<span class="location-review-candidate-name">' + escapeHtml(choice.name) + '</span>' + badge + '</span>' +
+            '<span class="location-review-candidate-meta">' + typeBadge +
+            (meta ? '<span class="location-review-candidate-detail">' + escapeHtml(meta) + '</span>' : '') + '</span>' +
+            (coordinates ? '<span class="location-review-candidate-coordinates">' + escapeHtml(coordinates) + '</span>' : '') +
+            '</span></button>';
+        }).join('') + '</div>';
     }).join('');
     container.querySelectorAll('[data-candidate-index]').forEach(function(button) {
       button.addEventListener('click', function() {
@@ -1013,6 +1355,10 @@ body {
   }
 
   function renderCurrentGroup() {
+    state.assignment = null;
+    state.isAssigning = false;
+    resetAssignmentProgress();
+    setAssignmentNavigationDisabled(false);
     var group = currentGroup();
     if (!group) {
       if (state.skippedGroups.length) {
@@ -1035,9 +1381,8 @@ body {
     state.selectedChoice = null;
     state.savedCandidates = [];
     state.googleCandidates = [];
-    state.googleCandidatesByMode = {nature: null, all: null};
+    state.googleCandidatesLoaded = false;
     state.regionCandidates = [];
-    state.regionCandidatesLoaded = false;
     state.searchedCandidate = null;
     document.getElementById('locationReviewSearch').value = '';
     var assign = document.getElementById('locationReviewAssign');
@@ -1062,7 +1407,7 @@ body {
       var data = await safeFetch('/api/location-review/saved-suggestions?' + params.toString(), {}, {toast: false});
       if (token !== state.renderToken) return;
       state.savedCandidates = (data.suggestions || []).map(function(item) {
-        return Object.assign({kind: 'keyword'}, item);
+        return normalizeCandidate(Object.assign({kind: 'keyword'}, item));
       });
     } catch (e) {}
   }
@@ -1076,12 +1421,12 @@ body {
     var lng = location && (typeof location.lng === 'function' ? location.lng() : location.lng);
     var types = Array.isArray(result.types) ? result.types : [];
     if (!placeId || !name || types.indexOf('plus_code') !== -1 || /^[A-Z0-9]{4,}\+[A-Z0-9]+\b/i.test(name)) return null;
-    return {
+    return normalizeCandidate({
       kind: 'google', place_id: placeId, name: name, types: types,
       type_label: typeLabel || '', latitude: Number(lat), longitude: Number(lng),
       context: result.vicinity || result.formatted_address || result.formattedAddress || '',
       _googleResult: result,
-    };
+    });
   }
 
   function nearbySearch(request) {
@@ -1094,30 +1439,93 @@ body {
     });
   }
 
-  async function loadGoogleSuggestions(group, token, mode) {
+  function geocodeLocation(location) {
+    return new Promise(function(resolve) {
+      var geocoder = new google.maps.Geocoder();
+      geocoder.geocode({location: location}, function(results, status) {
+        resolve(status === 'OK' ? (results || []) : []);
+      });
+    });
+  }
+
+  function representativeGroupLocations(group) {
+    var center = {lat: Number(group.center.lat), lng: Number(group.center.lng)};
+    var positions = (group.photos || []).map(function(photo) {
+      return {lat: Number(photo.latitude), lng: Number(photo.longitude)};
+    }).filter(function(position) {
+      return Number.isFinite(position.lat) && Number.isFinite(position.lng);
+    });
+    var unique = [];
+    var seen = {};
+    positions.forEach(function(position) {
+      var key = position.lat.toFixed(5) + ',' + position.lng.toFixed(5);
+      if (seen[key]) return;
+      seen[key] = true;
+      unique.push(position);
+    });
+    if (!unique.length) return [center];
+    var farthestFromCenter = unique.slice().sort(function(a, b) {
+      return distanceBetween(center.lat, center.lng, b.lat, b.lng)
+        - distanceBetween(center.lat, center.lng, a.lat, a.lng);
+    })[0];
+    var farthestFromEdge = unique.slice().sort(function(a, b) {
+      return distanceBetween(farthestFromCenter.lat, farthestFromCenter.lng, b.lat, b.lng)
+        - distanceBetween(farthestFromCenter.lat, farthestFromCenter.lng, a.lat, a.lng);
+    })[0];
+    var samples = [center, farthestFromCenter, farthestFromEdge];
+    var sampleSeen = {};
+    return samples.filter(function(position) {
+      var key = position.lat.toFixed(5) + ',' + position.lng.toFixed(5);
+      if (sampleSeen[key]) return false;
+      sampleSeen[key] = true;
+      return true;
+    });
+  }
+
+  function regionChoiceFromResult(result, center) {
+    var matchedType = Object.keys(AREA_TYPES).find(function(type) {
+      return (result.types || []).indexOf(type) !== -1;
+    });
+    if (!matchedType) return null;
+    var component = (result.address_components || []).find(function(item) {
+      return (item.types || []).indexOf(matchedType) !== -1;
+    });
+    if (!component) return null;
+    var details = AREA_TYPES[matchedType];
+    var namedResult = Object.assign({}, result, {name: component.long_name});
+    var choice = googleResultToChoice(namedResult, details.label);
+    if (!choice) return null;
+    choice.category = 'areas';
+    choice.place_type = matchedType;
+    choice.area_scope = details.scope;
+    choice.relationship = 'at_photos';
+    choice.address_components = result.address_components || [];
+    choice.distance_m = distanceBetween(center.lat, center.lng, choice.latitude, choice.longitude);
+    return choice;
+  }
+
+  async function loadGoogleSuggestions(group, token) {
     if (state.mapMode !== 'google' || !state.placesService) return;
-    mode = mode || state.suggestionMode;
-    var cached = state.googleCandidatesByMode[mode];
-    if (cached) {
-      if (token === state.renderToken && mode === state.suggestionMode) {
-        state.googleCandidates = cached;
-      }
-      return;
-    }
+    if (state.googleCandidatesLoaded) return;
     var location = new google.maps.LatLng(group.center.lat, group.center.lng);
     var radius = Math.min(50000, Math.max(10000, Number(group.spread_m || 0) + 12000));
-    var requests = mode === 'all'
-      ? [{location: location, radius: radius}]
-      : [
-          {location: location, radius: radius, type: 'park'},
-          {location: location, radius: radius, type: 'campground'},
-          {location: location, radius: radius, keyword: 'state park wildlife refuge nature preserve hiking area'},
-        ];
-    var resultSets = await Promise.all(requests.map(nearbySearch));
+    var requests = [
+      {location: location, radius: radius, type: 'park'},
+      {location: location, radius: radius, type: 'campground'},
+      {location: location, radius: radius, keyword: 'state park wildlife refuge nature preserve hiking area'},
+      {location: location, radius: radius},
+    ];
+    var geocodeLocations = representativeGroupLocations(group).map(function(position) {
+      return new google.maps.LatLng(position.lat, position.lng);
+    });
+    var payloads = await Promise.all([
+      Promise.all(requests.map(nearbySearch)),
+      Promise.all(geocodeLocations.map(geocodeLocation)),
+    ]);
     if (token !== state.renderToken) return;
     var center = group.center;
     var choices = [];
-    resultSets.forEach(function(results) {
+    payloads[0].forEach(function(results) {
       results.forEach(function(result) {
         var choice = googleResultToChoice(result);
         if (!choice) return;
@@ -1131,44 +1539,40 @@ body {
       if (seenPlaceIds[choice.place_id]) return false;
       seenPlaceIds[choice.place_id] = true;
       return true;
-    }).slice(0, 8);
-    state.googleCandidatesByMode[mode] = choices;
-    if (mode === state.suggestionMode) state.googleCandidates = choices;
+    });
+    var categoryCounts = {nature: 0, places: 0, areas: 0};
+    state.googleCandidates = choices.filter(function(choice) {
+      var category = choice.category || 'places';
+      if (categoryCounts[category] == null || categoryCounts[category] >= 8) return false;
+      categoryCounts[category] += 1;
+      return true;
+    });
 
-    if (!state.regionCandidatesLoaded) {
-      state.regionCandidatesLoaded = true;
-      var geocoder = new google.maps.Geocoder();
-      geocoder.geocode({location: location}, function(results, status) {
-        if (token !== state.renderToken || status !== 'OK') return;
-        var allowed = ['locality', 'administrative_area_level_2', 'administrative_area_level_1', 'country'];
-        var regionChoices = [];
-        (results || []).forEach(function(result) {
-          var matchedType = allowed.find(function(type) { return (result.types || []).indexOf(type) !== -1; });
-          if (!matchedType) return;
-          var component = (result.address_components || []).find(function(item) {
-            return (item.types || []).indexOf(matchedType) !== -1;
-          });
-          if (!component) return;
-          var namedResult = Object.assign({}, result, {name: component.long_name});
-          var choice = googleResultToChoice(namedResult, {
-            locality: 'City or town', administrative_area_level_2: 'County or region',
-            administrative_area_level_1: 'State or province', country: 'Country'
-          }[matchedType]);
-          if (!choice) return;
-          choice.address_components = result.address_components;
-          regionChoices.push(choice);
-        });
-        state.regionCandidates = regionChoices.slice(0, 4);
-        finishSuggestionRender(token);
+    var regionSeen = {};
+    var regionChoices = [];
+    payloads[1].forEach(function(results) {
+      results.forEach(function(result) {
+        var choice = regionChoiceFromResult(result, center);
+        if (!choice) return;
+        var key = candidateKey(choice);
+        if (regionSeen[key]) return;
+        regionSeen[key] = true;
+        regionChoices.push(choice);
       });
-    }
+    });
+    regionChoices.sort(function(a, b) {
+      if (a.area_scope !== b.area_scope) return a.area_scope === 'local' ? -1 : 1;
+      return a.distance_m - b.distance_m;
+    });
+    state.regionCandidates = regionChoices.slice(0, 8);
+    state.googleCandidatesLoaded = true;
   }
 
   function finishSuggestionRender(token) {
     if (token !== state.renderToken) return;
     renderCandidates();
     renderCandidateMarkers();
-    var count = allCandidates().length;
+    var count = visibleCandidates().length;
     var status = count ? count + (count === 1 ? ' option' : ' options') : 'No matches';
     if (state.googleMapsUnavailableReason === 'missing_key') {
       status = count ? count + (count === 1 ? ' saved option' : ' saved options') : 'Setup needed';
@@ -1181,7 +1585,7 @@ body {
   async function loadSuggestions(group, token) {
     await Promise.all([
       loadSavedSuggestions(group, token),
-      loadGoogleSuggestions(group, token, state.suggestionMode),
+      loadGoogleSuggestions(group, token),
     ]);
     finishSuggestionRender(token);
   }
@@ -1194,26 +1598,19 @@ body {
     });
   }
 
-  async function setSuggestionMode(mode) {
-    if ((mode !== 'nature' && mode !== 'all') || mode === state.suggestionMode) return;
+  function setSuggestionMode(mode) {
+    // Guard against programmatic calls that can bypass the disabled
+    // attribute and detach a pending batch assignment from its choice.
+    if (state.isAssigning || hasPartialAssignmentProgress()) return;
+    if (
+      ['recommended', 'areas', 'nature', 'places'].indexOf(mode) === -1
+      || mode === state.suggestionMode
+    ) return;
     var group = currentGroup();
     if (!group) return;
     state.suggestionMode = mode;
-    state.selectedChoice = null;
-    state.googleCandidates = state.googleCandidatesByMode[mode] || [];
     updateSuggestionModeControls();
-    var assign = document.getElementById('locationReviewAssign');
-    assign.disabled = true;
-    assign.textContent = 'Select a location';
-    renderCandidates();
-    renderCandidateMarkers();
-    if (state.googleCandidatesByMode[mode]) {
-      finishSuggestionRender(state.renderToken);
-      return;
-    }
-    document.getElementById('locationReviewSuggestionStatus').textContent = 'Looking nearby…';
-    await loadGoogleSuggestions(group, state.renderToken, mode);
-    if (mode === state.suggestionMode) finishSuggestionRender(state.renderToken);
+    finishSuggestionRender(state.renderToken);
   }
 
   function distanceBetween(lat1, lng1, lat2, lng2) {
@@ -1277,7 +1674,6 @@ body {
           streetViewControl: false, fullscreenControl: true, clickableIcons: true,
         });
         state.placesService = new google.maps.places.PlacesService(state.map);
-        document.getElementById('locationReviewSuggestionMode').classList.remove('location-review-hidden');
         bindGoogleSearch();
         state.map.addListener('click', function(event) {
           if (!event.placeId) return;
@@ -1379,17 +1775,64 @@ body {
     });
   }
 
+  function lightboxIsOpen() {
+    var overlay = document.getElementById('lightboxOverlay');
+    return !!(overlay && overlay.classList.contains('active'));
+  }
+
   async function assignCurrentGroup() {
     var group = currentGroup();
     var choice = state.selectedChoice;
     if (!group || !choice) return;
+    // A lightbox opened before the assignment starts (e.g. keyboard-tabbed to
+    // the Assign button while a preview was still on screen) sits outside
+    // openPhotoPreview()'s new guard. Close it so a mid-assignment delete
+    // cannot fire lightbox:photodeleted and reset state.assignment while
+    // committed chunks are still in flight.
+    if (lightboxIsOpen() && typeof closeLightbox === 'function') {
+      try { closeLightbox(); } catch (_) {}
+    }
     var button = document.getElementById('locationReviewAssign');
+    var choiceKey = candidateKey(choice);
+    if (!state.assignment || state.assignment.group !== group || state.assignment.choiceKey !== choiceKey) {
+      // Snapshot photo_ids so a mid-partial lightbox:photodeleted that
+      // splices group.photo_ids cannot shift the retry offset — if a photo
+      // in the already-committed prefix were removed, the surviving IDs
+      // slide left and offset=completed would slice past what should be
+      // the next unassigned photo, silently marking the group done.
+      // processedIds tracks which snapshot IDs have been sent to the server
+      // so the retry loop can rebuild "remaining" from set membership rather
+      // than an index that could drift out from under a reconciled snapshot.
+      var snapshotIds = group.photo_ids.slice();
+      state.assignment = {
+        group: group,
+        choiceKey: choiceKey,
+        completed: 0,
+        total: snapshotIds.length,
+        photoIds: snapshotIds,
+        processedIds: new Set(),
+      };
+    } else if (!state.assignment.processedIds) {
+      state.assignment.processedIds = new Set();
+    }
+    var assignment = state.assignment;
+    state.isAssigning = true;
+    setAssignmentNavigationDisabled(true);
     button.disabled = true;
     button.textContent = 'Assigning…';
+    updateAssignmentProgress(assignment.completed, assignment.total);
     try {
       if (choice.kind === 'google') choice = await hydrateGoogleChoice(choice);
-      for (var offset = 0; offset < group.photo_ids.length; offset += 1000) {
-        var chunk = group.photo_ids.slice(offset, offset + 1000);
+      while (true) {
+        // Rebuild the pending set from photoIds \ processedIds each iteration
+        // so a concurrent reconciliation (from lightbox:photodeleted) drops
+        // deleted IDs out of the next chunk instead of forcing the batch to
+        // 404 on a now-missing photo.
+        var pending = assignment.photoIds.filter(function(id) {
+          return !assignment.processedIds.has(id);
+        });
+        if (!pending.length) break;
+        var chunk = pending.slice(0, 1000);
         var endpoint = '/api/batch/location';
         var body = {photo_ids: chunk};
         if (choice.kind === 'keyword') body.keyword_id = choice.keyword_id;
@@ -1405,20 +1848,59 @@ body {
         await safeFetch(endpoint, {
           method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
         });
+        chunk.forEach(function(id) { assignment.processedIds.add(id); });
+        assignment.total = assignment.photoIds.length;
+        assignment.completed = countProcessedInPhotoIds(assignment);
+        updateAssignmentProgress(assignment.completed, assignment.total);
       }
-      showToast('Assigned “' + choice.name + '” to ' + formatNumber(group.count) + (group.count === 1 ? ' photo' : ' photos'), 'success');
+      var assignedCount = assignment.total;
+      if (assignedCount > 0) {
+        showToast('Assigned “' + choice.name + '” to ' + formatNumber(assignedCount) + (assignedCount === 1 ? ' photo' : ' photos'), 'success');
+      }
+      state.assignment = null;
+      state.isAssigning = false;
       state.groups.splice(state.currentIndex, 1);
       state.assignedGroups += 1;
       if (state.currentIndex >= state.groups.length) state.currentIndex = Math.max(0, state.groups.length - 1);
       renderCurrentGroup();
     } catch (e) {
+      state.isAssigning = false;
       button.disabled = false;
-      button.textContent = 'Assign “' + choice.name + '”';
+      // Resync counters in case a reconciliation landed between the last
+      // update and the failure — otherwise "Retry N remaining" could quote a
+      // stale count that includes IDs no longer in the snapshot.
+      assignment.total = assignment.photoIds.length;
+      assignment.completed = countProcessedInPhotoIds(assignment);
+      var remaining = assignment.total - assignment.completed;
+      if (remaining <= 0) {
+        // Deletions during the failed batch drained everything the retry
+        // still had to do. Treat the group as finished and move on.
+        state.assignment = null;
+        setAssignmentNavigationDisabled(false);
+        resetAssignmentProgress();
+        state.groups.splice(state.currentIndex, 1);
+        state.assignedGroups += 1;
+        if (state.currentIndex >= state.groups.length) state.currentIndex = Math.max(0, state.groups.length - 1);
+        renderCurrentGroup();
+      } else if (assignment.completed) {
+        updateAssignmentProgress(assignment.completed, assignment.total, true);
+        button.textContent = 'Retry ' + formatNumber(remaining) + ' remaining';
+        // Keep group navigation and suggestion-mode locked while a partial
+        // assignment is pending. Skip/Prev/Next would otherwise drop
+        // state.assignment silently: Skip splices the group as "skipped
+        // without changes" even though committed chunks already changed
+        // photos, and Prev/Next runs renderCurrentGroup() which nulls the
+        // offset so a later Retry reprocesses the committed chunks.
+      } else {
+        setAssignmentNavigationDisabled(false);
+        resetAssignmentProgress();
+        button.textContent = 'Retry “' + choice.name + '”';
+      }
     }
   }
 
   function moveGroup(direction) {
-    if (state.groups.length < 2) return;
+    if (state.isAssigning || hasPartialAssignmentProgress() || state.groups.length < 2) return;
     state.currentIndex = (state.currentIndex + direction + state.groups.length) % state.groups.length;
     renderCurrentGroup();
   }
@@ -1430,6 +1912,7 @@ body {
     renderCandidates();
   });
   document.getElementById('locationReviewSkip').addEventListener('click', function() {
+    if (state.isAssigning || hasPartialAssignmentProgress()) return;
     var group = currentGroup();
     if (!group) return;
     state.skippedGroups.push(group);
@@ -1446,7 +1929,7 @@ body {
   document.getElementById('locationReviewCustom').addEventListener('click', function() {
     var name = document.getElementById('locationReviewSearch').value.trim();
     if (!name) { showToast('Enter a friendly location name first.', 'error'); return; }
-    state.searchedCandidate = {kind: 'custom', name: name};
+    state.searchedCandidate = normalizeCandidate({kind: 'custom', name: name});
     selectChoice(state.searchedCandidate);
   });
   document.getElementById('locationReviewSearch').addEventListener('keydown', function(event) {

@@ -127,6 +127,23 @@
   font-size: 12px; color: var(--text-muted); display: flex; gap: 16px;
   flex-wrap: wrap; padding: 8px 24px; border-bottom: 1px solid var(--border-subtle);
 }
+.job-move-route {
+  display: grid; grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px 12px; padding: 12px 24px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--bg-secondary) 55%, transparent);
+}
+.job-move-route-label {
+  color: var(--text-muted); font-size: 12px; font-weight: 600;
+}
+.job-move-route-path {
+  color: var(--text-primary); font-size: 12px;
+  font-family: var(--font-mono, monospace);
+  overflow-wrap: anywhere;
+}
+.job-move-route-note {
+  grid-column: 2; color: var(--text-muted); font-size: 11px;
+}
 .job-pause-banner {
   font-size: 13px; padding: 8px 12px; margin: 8px 0;
   background: color-mix(in srgb, var(--warning, #d99a24) 12%, transparent);
@@ -398,6 +415,32 @@
     return job && job.config && typeof job.config === 'object' ? job.config : {};
   }
 
+  function renderMoveRoute(job) {
+    if (!job || job.type !== 'move-folder') return '';
+    var cfg = jobConfig(job);
+    var source = cfg.source_path;
+    var destination = cfg.resolved_destination;
+    // Older history entries predate the route snapshot. Avoid presenting
+    // their destination parent as though it were the exact landing folder.
+    if (!source || !destination) return '';
+
+    var html = '<div class="job-move-route" aria-label="Move locations">';
+    html += '<span class="job-move-route-label">From</span>';
+    html += '<span class="job-move-route-path" title="' +
+      escapeAttr(source) + '">' + esc(source) + '</span>';
+    html += '<span class="job-move-route-label">To</span>';
+    html += '<span class="job-move-route-path" title="' +
+      escapeAttr(destination) + '">' + esc(destination) + '</span>';
+    if (cfg.folder_template) {
+      html += '<span class="job-move-route-note">Organizing photos into capture-date folders using <code>' +
+        esc(cfg.folder_template) + '</code></span>';
+    } else if (cfg.merge) {
+      html += '<span class="job-move-route-note">Merging with the existing destination folder</span>';
+    }
+    html += '</div>';
+    return html;
+  }
+
   // A retry job carries its parent's id in ``config.parent_import_job_id``
   // and the original failed import's id in ``config.root_import_job_id``
   // (see api_job_import_photos). Suppresses the Retry button on the
@@ -566,6 +609,8 @@
       html += '<span>' + esc(visibleProgress.label) + ': ' + progressPct(visibleProgress) + '%</span>';
     }
     html += '</div>';
+
+    html += renderMoveRoute(job);
 
     var failedImportCount = job.result && Number(job.result.failed || 0);
     if (!isLive && failedImportCount > 0 && importRetryBody(job)) {
@@ -745,6 +790,44 @@
             importStatusLine = 'Estimating after the first transfer batch…';
           }
           html += '<div class="tree-step-throughput">' + importStatusLine + '</div>';
+        } else if (step.progress.eta_kind === 'classification') {
+          // Classification can walk cached photos far faster than it can
+          // decode and infer uncached ones. Use the backend's model-work ETA;
+          // current / elapsed would turn a cache-heavy prefix into a wildly
+          // optimistic prediction for the uncached tail.
+          var classifyParts = [];
+          var cacheHits = Number(step.progress.cache_hits) || 0;
+          var classified = Number(step.progress.classified) || 0;
+          if (cacheHits > 0) {
+            classifyParts.push(cacheHits.toLocaleString() + ' cached');
+          }
+          if (classified > 0) {
+            classifyParts.push(
+              classified.toLocaleString() + ' newly classified'
+            );
+          }
+          var classifyEtaState = step.progress.eta_state;
+          var classifyEtaSeconds = Number(step.progress.eta_seconds);
+          var classifyRate = Number(step.progress.eta_rate_per_min);
+          if (
+            classifyEtaState === 'ready'
+            && isFinite(classifyEtaSeconds)
+            && isFinite(classifyRate)
+            && classifyRate > 0
+          ) {
+            classifyParts.push('~' + Math.round(classifyRate) + '/min uncached');
+            if (classifyEtaSeconds > 0) {
+              classifyParts.push('ETA ' + formatElapsed(classifyEtaSeconds));
+            } else {
+              classifyParts.push('finishing…');
+            }
+          } else if (classifyEtaState === 'finishing') {
+            classifyParts.push('finishing…');
+          } else {
+            classifyParts.push('Estimating after the first uncached batch…');
+          }
+          html += '<div class="tree-step-throughput">' +
+            classifyParts.join(' &middot; ') + '</div>';
         } else {
           var stepSecs = (Date.now() - new Date(step.started_at).getTime()) / 1000;
           if (stepSecs > 0) {

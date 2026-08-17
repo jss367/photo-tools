@@ -141,3 +141,49 @@ def keyword_match_key(name: str) -> str:
     lockstep with the SQL side.
     """
     return normalize_keyword_display(name).translate(_ASCII_LOWER_TABLE)
+
+
+def folded_species_key(species):
+    """Return the string ``Database.add_prediction`` keys ``species`` by.
+
+    Mirrors the normalization branch in ``add_prediction``: fold when the
+    result is non-empty, otherwise keep the original. Callers use this to
+    dedupe alternatives against a primary before writing prediction_review
+    rows, so the key must match exactly what ends up in the UNIQUE column.
+
+    ``None`` passes through so callers can distinguish "no species" from a
+    species that normalizes to the empty string.
+    """
+    if species is None:
+        return None
+    folded = normalize_keyword_display(species)
+    return folded if folded else species
+
+
+def species_match_key(species):
+    """Return the equivalence key used to decide whether two species agree.
+
+    This is the rule that decides whether a burst is unanimous. It differs
+    from ``keyword_match_key`` only for names that normalize away entirely
+    (``folded_species_key`` keeps the original in that case), and it is the
+    fold that ``classify_job._store_grouped_predictions`` applies when it
+    computes ``group_reviewable``.
+
+    Lives here rather than in ``classify_job`` because ``db`` needs the same
+    rule to recognise a burst whose stored votes span more than one species
+    (see ``Database.repair_mixed_species_prediction_groups``) and
+    ``classify_job`` imports ``db``, so the dependency can only run this way.
+    Two copies would be worse than one import: the repair's whole job is to
+    reproduce the classifier's grouping decision, and a fold that drifted
+    from the classifier's would either strip legitimate groups or leave
+    divergent ones behind.
+
+    ``str.lower()``/``str.casefold()`` and SQLite's ``lower()`` are all
+    wrong substitutes: the first two fold non-ASCII pairs SQLite treats as
+    distinct, and the last does not apply the apostrophe/edge-quote folding
+    in ``normalize_keyword_display``, so ``Hawai'i 'Amakihi`` and
+    ``Hawai’i ’Amakihi`` would read as two species.
+    """
+    return (folded_species_key(species) or "").strip().translate(
+        _ASCII_LOWER_TABLE,
+    )

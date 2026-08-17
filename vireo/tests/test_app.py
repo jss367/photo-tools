@@ -138,6 +138,43 @@ def test_api_add_keyword_accepts_existing_keyword_id(app_and_db):
     assert "Cardinal" in names
 
 
+def test_api_add_keyword_clears_shared_flat_removals(app_and_db):
+    """A manual re-add supersedes migration cleanup in every workspace."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.conn.execute(
+        "SELECT id, folder_id FROM photos WHERE filename = 'bird3.jpg'"
+    ).fetchone()
+    wildlife_id = db.add_keyword("Wildlife", kw_type="genre")
+    ws1 = db._ws_id()
+    ws2 = db.create_workspace("keyword-readd-sibling")
+    db.add_workspace_folder(ws2, photo["folder_id"])
+    for ws_id in (ws1, ws2):
+        db.queue_change(
+            photo["id"], "keyword_remove_flat", "Wildlife",
+            workspace_id=ws_id,
+        )
+
+    resp = client.post(
+        f"/api/photos/{photo['id']}/keywords",
+        json={"keyword_id": wildlife_id},
+    )
+
+    assert resp.status_code == 200
+    assert db.conn.execute(
+        """SELECT 1 FROM pending_changes
+           WHERE photo_id = ? AND change_type = 'keyword_remove_flat'""",
+        (photo["id"],),
+    ).fetchone() is None
+    pending_add = db.conn.execute(
+        """SELECT workspace_id FROM pending_changes
+           WHERE photo_id = ? AND change_type = 'keyword_add'
+             AND value = 'Wildlife'""",
+        (photo["id"],),
+    ).fetchall()
+    assert [row["workspace_id"] for row in pending_add] == [ws1]
+
+
 def test_help_static_assets_served(app_and_db):
     """The help modal's JS, JSON, and vendored Fuse library must be served.
 
@@ -552,6 +589,102 @@ def test_api_folder_get_rejects_other_workspace(app_and_db):
     assert resp.status_code == 404
 
 
+def test_api_folder_workspaces_lists_inherited_and_direct_memberships(app_and_db):
+    """GET /api/folders/<id>/workspaces includes every workspace where the
+    folder is visible, including visibility inherited from an ancestor root.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    active_ws = db.get_workspace(db._active_workspace_id)
+    root = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024'"
+    ).fetchone()
+    child = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024/January'"
+    ).fetchone()
+    inherited_ws = db.create_workspace("Inherited Photos")
+    db.add_workspace_folder(inherited_ws, root["id"])
+    direct_ws = db.create_workspace("Direct Photos")
+    db.add_workspace_folder(direct_ws, child["id"])
+
+    resp = client.get(f'/api/folders/{child["id"]}/workspaces')
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["folder"]["path"] == "/photos/2024/January"
+    by_name = {workspace["name"]: workspace for workspace in body["workspaces"]}
+    assert {active_ws["name"], "Inherited Photos", "Direct Photos"} <= set(by_name)
+    assert by_name[active_ws["name"]]["is_active"] is True
+    assert by_name["Inherited Photos"]["is_root"] is False
+    assert by_name["Direct Photos"]["is_root"] is True
+
+
+def test_api_folder_workspaces_rejects_folder_hidden_from_active_workspace(
+    app_and_db,
+):
+    """Workspace names cannot be enumerated through a hidden folder ID."""
+    app, db = app_and_db
+    active_ws = db._active_workspace_id
+    other_ws = db.create_workspace("Private Workspace")
+    db.set_active_workspace(other_ws)
+    hidden_id = db.add_folder('/private/folder', name='folder')
+    db.set_active_workspace(active_ws)
+
+    resp = app.test_client().get(f'/api/folders/{hidden_id}/workspaces')
+    assert resp.status_code == 404
+
+
+def test_api_folder_workspaces_does_not_expand_restricted_exact_links(app_and_db):
+    """Reading memberships must not turn an exact link into a recursive one."""
+    app, db = app_and_db
+    root = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024'"
+    ).fetchone()
+    child = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024/January'"
+    ).fetchone()
+    restricted_ws = db.create_workspace("Restricted Import")
+    db.add_workspace_folder_exact(restricted_ws, root["id"], is_root=False)
+
+    resp = app.test_client().get(f'/api/folders/{root["id"]}/workspaces')
+    assert resp.status_code == 200
+    assert "Restricted Import" in {
+        workspace["name"] for workspace in resp.get_json()["workspaces"]
+    }
+    assert db.conn.execute(
+        "SELECT 1 FROM workspace_folders WHERE workspace_id = ? AND folder_id = ?",
+        (restricted_ws, child["id"]),
+    ).fetchone() is None
+
+
+def test_api_folder_workspaces_infers_late_recursive_child_without_mutation(
+    app_and_db,
+):
+    """A child discovered after root linking is visible without inserting a link."""
+    app, db = app_and_db
+    root = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024'"
+    ).fetchone()
+    recursive_ws = db.create_workspace("Recursive Library")
+    db.add_workspace_folder(recursive_ws, root["id"])
+    late_child_id = db.add_folder(
+        "/photos/2024/Late Discovery", name="Late Discovery"
+    )
+    assert db.conn.execute(
+        "SELECT 1 FROM workspace_folders WHERE workspace_id = ? AND folder_id = ?",
+        (recursive_ws, late_child_id),
+    ).fetchone() is None
+
+    resp = app.test_client().get(f'/api/folders/{late_child_id}/workspaces')
+    assert resp.status_code == 200
+    assert "Recursive Library" in {
+        workspace["name"] for workspace in resp.get_json()["workspaces"]
+    }
+    assert db.conn.execute(
+        "SELECT 1 FROM workspace_folders WHERE workspace_id = ? AND folder_id = ?",
+        (recursive_ws, late_child_id),
+    ).fetchone() is None
+
+
 def test_api_keywords(app_and_db):
     """GET /api/keywords returns keyword tree."""
     app, _ = app_and_db
@@ -582,6 +715,17 @@ def test_logs_page(app_and_db):
 
     resp = client.get('/logs')
     assert resp.status_code == 200
+
+
+def test_jobs_page_uses_cache_aware_classification_eta(app_and_db):
+    """Classification must not estimate throughput from cache-hit progress."""
+    app, _ = app_and_db
+    resp = app.test_client().get('/jobs')
+
+    assert resp.status_code == 200
+    assert b"step.progress.eta_kind === 'classification'" in resp.data
+    assert b"newly classified" in resp.data
+    assert b"first uncached batch" in resp.data
 
 
 def test_storage_page_has_preview_cache_field(app_and_db):
@@ -8296,6 +8440,40 @@ def test_wildlife_excluded_route_does_not_add_landscape_keyword(app_and_db):
     assert all(k["name"] != "Landscape" for k in keywords)
 
 
+def test_batch_wildlife_excluded_updates_only_changed_photos_and_undoes(app_and_db):
+    app, db = app_and_db
+    photo_ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY id LIMIT 2"
+        ).fetchall()
+    ]
+    db.update_photo_wildlife_excluded(photo_ids[0], True)
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/batch/wildlife-excluded",
+        json={"photo_ids": photo_ids, "excluded": True},
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["photo_ids"] == [photo_ids[1]]
+    states = db.conn.execute(
+        "SELECT id, wildlife_excluded FROM photos WHERE id IN (?, ?) ORDER BY id",
+        photo_ids,
+    ).fetchall()
+    assert [row["wildlife_excluded"] for row in states] == [1, 1]
+
+    undo = client.post("/api/undo")
+    assert undo.status_code == 200
+    states = db.conn.execute(
+        "SELECT id, wildlife_excluded FROM photos WHERE id IN (?, ?) ORDER BY id",
+        photo_ids,
+    ).fetchall()
+    assert [row["wildlife_excluded"] for row in states] == [1, 0]
+
+
 def test_batch_keyword_route_handles_non_string_type(app_and_db):
     """Same regression for the batch endpoint."""
     app, db = app_and_db
@@ -8544,6 +8722,215 @@ def test_selection_keyword_suggestions_chunks_large_selection(app_and_db):
     assert by_name["Large Suggestion"]["count"] == 1
     assert by_name["Large Suggestion"]["missing_count"] == 999
     assert len(by_name["Large Suggestion"]["missing_photo_ids"]) == 999
+
+
+def test_selection_wildlife_state_counts_full_selection_including_off_page(app_and_db):
+    """Aggregation must reflect every submitted id, not just the loaded grid.
+
+    "Select all matching" hands the client a full id list that can exceed
+    the loaded page. The panel relies on this endpoint for its counts and
+    button visibility, so an id that is not currently rendered must still
+    contribute.
+    """
+    app, db = app_and_db
+    ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY filename"
+        ).fetchall()
+    ]
+    assert len(ids) >= 2
+    db.update_photo_wildlife_excluded(ids[0], True)
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/selection/wildlife-state",
+        json={"photo_ids": ids},
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["selected_count"] == len(ids)
+    assert data["excluded_count"] == 1
+    assert data["included_count"] == len(ids) - 1
+
+
+def test_selection_wildlife_state_ignores_photos_outside_active_workspace(app_and_db):
+    """Ids outside the active workspace must not appear in the aggregate."""
+    app, db = app_and_db
+    ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY filename"
+        ).fetchall()
+    ]
+    other_ws = db.create_workspace("other")
+    original_ws = db._active_workspace_id
+    db.set_active_workspace(other_ws)
+    stray_folder = db.add_folder("/other-only", name="other-only")
+    stray = db.add_photo(
+        folder_id=stray_folder, filename="stray.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.set_active_workspace(original_ws)
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/selection/wildlife-state",
+        json={"photo_ids": ids + [stray]},
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["selected_count"] == len(ids)
+    assert data["included_count"] == len(ids)
+    assert data["excluded_count"] == 0
+    # The out-of-workspace id must be reported as missing so the panel can
+    # surface an incomplete selection instead of implying the counts cover
+    # every submitted id.
+    assert data["missing_count"] == 1
+    assert data["requested_count"] == len(ids) + 1
+
+
+def test_selection_wildlife_state_reports_missing_photo_ids(app_and_db):
+    """Unknown ids appear in ``missing_count`` so the panel stays honest
+    about how much of the selection its counts describe.
+    """
+    app, db = app_and_db
+    ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY filename"
+        ).fetchall()
+    ]
+    unknown = max(ids) + 12345
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/selection/wildlife-state",
+        json={"photo_ids": ids + [unknown]},
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["selected_count"] == len(ids)
+    assert data["missing_count"] == 1
+    assert data["requested_count"] == len(ids) + 1
+
+
+def test_batch_wildlife_excluded_skips_missing_and_out_of_workspace(app_and_db):
+    """The batch endpoint applies to accessible photos and reports the
+    rest as ``skipped_count`` instead of rejecting the whole selection.
+
+    The panel derives its counts from the same subset via
+    ``/api/selection/wildlife-state``; rejecting a partial selection here
+    made those counts and actions disagree — the user would see an
+    Exclude button then get a 404/403 on submit.
+    """
+    app, db = app_and_db
+    ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY filename"
+        ).fetchall()
+    ]
+    other_ws = db.create_workspace("other-batch")
+    original_ws = db._active_workspace_id
+    db.set_active_workspace(other_ws)
+    stray_folder = db.add_folder("/batch-stray", name="batch-stray")
+    stray = db.add_photo(
+        folder_id=stray_folder, filename="batch-stray.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.set_active_workspace(original_ws)
+    unknown = max(ids + [stray]) + 999
+
+    client = app.test_client()
+    resp = client.post(
+        "/api/batch/wildlife-excluded",
+        json={
+            "photo_ids": ids + [stray, unknown],
+            "excluded": True,
+        },
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["ok"] is True
+    assert data["updated"] == len(ids)
+    assert sorted(data["photo_ids"]) == sorted(ids)
+    assert data["skipped_count"] == 2
+
+    # The stray photo in the other workspace and the unknown id must not
+    # have been mutated.
+    stray_state = db.conn.execute(
+        "SELECT wildlife_excluded FROM photos WHERE id = ?", (stray,)
+    ).fetchone()
+    assert stray_state["wildlife_excluded"] == 0
+    for photo_id in ids:
+        row = db.conn.execute(
+            "SELECT wildlife_excluded FROM photos WHERE id = ?", (photo_id,)
+        ).fetchone()
+        assert row["wildlife_excluded"] == 1
+
+
+def test_batch_wildlife_excluded_uses_chunked_workspace_lookup(app_and_db):
+    """"Select all matching" can submit a very large ID list. The endpoint
+    must resolve workspace membership through chunked set-based SELECTs
+    rather than one query per photo, or a library-wide toggle triggers
+    tens of thousands of redundant SQLite queries and blocks the request.
+    """
+    app, db = app_and_db
+    folder_id = db.add_folder("/bulk", name="bulk")
+    db.add_workspace_folder(db._active_workspace_id, folder_id)
+    photo_ids = [
+        db.add_photo(
+            folder_id=folder_id,
+            filename=f"bulk-{i:04d}.jpg",
+            extension=".jpg",
+            file_size=100,
+            file_mtime=1.0,
+        )
+        for i in range(1500)
+    ]
+
+    executed = []
+    real_conn = db.conn
+
+    class TrackingConn:
+        def execute(self, sql, params=()):
+            executed.append(sql)
+            return real_conn.execute(sql, params)
+
+        def executemany(self, sql, seq):
+            return real_conn.executemany(sql, seq)
+
+        def __getattr__(self, name):
+            return getattr(real_conn, name)
+
+    db.conn = TrackingConn()
+    try:
+        client = app.test_client()
+        resp = client.post(
+            "/api/batch/wildlife-excluded",
+            json={"photo_ids": photo_ids, "excluded": True},
+            content_type="application/json",
+        )
+    finally:
+        db.conn = real_conn
+
+    assert resp.status_code == 200
+    assert resp.get_json()["updated"] == len(photo_ids)
+
+    workspace_lookups = [sql for sql in executed if "workspace_folders" in sql]
+    assert len(workspace_lookups) <= 4, (
+        f"expected O(N/chunk) workspace lookups for {len(photo_ids)} photos, "
+        f"got {len(workspace_lookups)}"
+    )
 
 
 def test_batch_keyword_route_accepts_existing_keyword_id(app_and_db):
@@ -8797,14 +9184,8 @@ def test_batch_keyword_route_chunks_large_existing_keyword_lookup(app_and_db):
     assert resp.get_json()["updated"] == len(ids)
 
 
-def test_create_app_runs_wildlife_backfill_synchronously_on_first_boot(tmp_path, monkeypatch):
-    """Regression: on first boot after upgrade (wildlife_backfill_done
-    marker unset), create_app must complete the species-marking +
-    Wildlife-backfill pipeline synchronously before returning, so user
-    edits via the served HTTP API can't race with the one-shot backfill
-    overwriting their Wildlife removals."""
-    from unittest.mock import MagicMock, patch
-
+def test_create_app_defers_builtin_wildlife_retirement(tmp_path, monkeypatch):
+    """A catalog-wide sidecar scan must not block HTTP app construction."""
     from db import Database
 
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -8820,39 +9201,54 @@ def test_create_app_runs_wildlife_backfill_synchronously_on_first_boot(tmp_path,
     thumb_dir = str(tmp_path / "thumbs")
     os.makedirs(thumb_dir)
 
-    # Pre-create the DB with the marker UNSET (simulates first boot
-    # post-upgrade).
     db = Database(db_path)
     ws_id = db.ensure_default_workspace()
     db.set_active_workspace(ws_id)
-    assert db.get_meta(Database._WILDLIFE_BACKFILL_DONE_KEY) != "1", (
-        "Pre-condition: marker should be unset before create_app"
+    folder_id = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws_id, folder_id)
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
     )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(photo_id, species_id)
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id, source) VALUES (?, ?, ?)",
+        (photo_id, wildlife_id, "generated"),
+    )
+    db.conn.execute(
+        "DELETE FROM db_meta WHERE key = ?",
+        (Database._RETIRED_WILDLIFE_GENRE_KEY,),
+    )
+    db.conn.commit()
     db.close()
 
-    # Stub taxonomy loading to return a non-None object so the sync path
-    # runs mark_species + backfill. mark_species_keywords gets a real DB
-    # call but the stub taxonomy returns None for every lookup, so no
-    # rows are actually changed — we just need it to complete without
-    # raising so the marker gets set.
-    fake_tax = MagicMock()
-    fake_tax.lookup.return_value = None
-
-    with patch("taxonomy.load_local_taxonomy", return_value=fake_tax):
-        app = create_app(
-            db_path=db_path, thumb_cache_dir=thumb_dir, api_token="test",
-        )
-        assert app is not None
-
-    # After create_app returns, the marker MUST be set — the synchronous
-    # path ran. (If it had been async, we'd be racing the background
-    # thread here and the marker might or might not be set yet.)
-    db2 = Database(db_path)
-    assert db2.get_meta(Database._WILDLIFE_BACKFILL_DONE_KEY) == "1", (
-        "Wildlife backfill marker must be set synchronously by create_app "
-        "on first boot — otherwise user edits race the backfill."
+    app = create_app(
+        db_path=db_path, thumb_cache_dir=thumb_dir, api_token="test",
     )
+    assert app is not None
+
+    db2 = Database(db_path, initialize_schema=False)
+    assert db2.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) is None
+    assert db2.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (photo_id, wildlife_id),
+    ).fetchone() is not None
     db2.close()
+
+    assert app._retire_wildlife_genre() == 1
+
+    db2 = Database(db_path, initialize_schema=False)
+    assert db2.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+    assert db2.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (photo_id, wildlife_id),
+    ).fetchone() is None
+    db2.close()
+    app._cleanup_app_resources()
 
 
 def test_create_app_repairs_duplicate_species_after_taxonomy_marking(
@@ -8947,7 +9343,6 @@ def test_create_app_skips_taxonomy_when_duplicate_repair_is_impossible(
     db = Database(db_path)
     ws_id = db.ensure_default_workspace()
     db.set_active_workspace(ws_id)
-    db.set_meta(Database._WILDLIFE_BACKFILL_DONE_KEY, "1")
     db.conn.execute(
         "DELETE FROM db_meta WHERE key = ?",
         (Database._DUPLICATE_PHOTO_SPECIES_REPAIR_KEY,),
@@ -15539,6 +15934,111 @@ def test_sync_discard_reports_true_count(app_and_db):
     assert db.get_pending_changes() == []
 
 
+def test_sync_discard_records_exact_same_name_keyword(app_and_db):
+    """Discard history identifies a manual association among homonyms."""
+    app, db = app_and_db
+    client = app.test_client()
+    pid = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()["id"]
+    generated_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    manual_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'individual')"
+    ).lastrowid
+    # Only the individual is user-authored; the genre is the generated row.
+    db.tag_photo(pid, generated_id, source=None)
+    db.tag_photo(pid, manual_id, source="manual")
+    db.queue_change(pid, "keyword_add", "Wildlife")
+    change_id = db.get_pending_changes()[0]["id"]
+
+    resp = client.post(
+        "/api/sync/discard", json={"change_ids": [change_id]},
+    )
+
+    assert resp.status_code == 200
+    item = db.conn.execute(
+        """SELECT item.old_value, item.new_value
+           FROM edit_history_items item
+           JOIN edit_history edit ON edit.id = item.edit_id
+           WHERE edit.action_type = 'discard'
+           ORDER BY item.id DESC LIMIT 1"""
+    ).fetchone()
+    assert item["old_value"] == "keyword_add:Wildlife"
+    assert item["new_value"] == str(manual_id)
+
+
+def test_sync_discard_chunks_large_change_sets(app_and_db):
+    """Selective discard keeps its history lookup below SQLite's bind limit."""
+    from db import _SQLITE_PARAM_CHUNK_SIZE
+
+    app, db = app_and_db
+    client = app.test_client()
+    pid = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()["id"]
+    total = _SQLITE_PARAM_CHUNK_SIZE + 5
+    db.conn.executemany(
+        """INSERT INTO pending_changes
+           (photo_id, change_type, value, change_token, workspace_id)
+           VALUES (?, 'rating', '4', ?, ?)""",
+        [
+            (pid, f"discard-large-{idx}", db._ws_id())
+            for idx in range(total)
+        ],
+    )
+    db.conn.commit()
+    change_ids = [row["id"] for row in db.get_pending_changes()]
+
+    resp = client.post(
+        "/api/sync/discard", json={"change_ids": change_ids},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["discarded"] == total
+    assert db.get_pending_changes() == []
+
+
+def test_sync_discard_clears_sibling_workspace_flat_removals(app_and_db):
+    """Selective and discard-all choices coordinate a shared sidecar."""
+    app, db = app_and_db
+    client = app.test_client()
+    ws1 = db._active_workspace_id
+    ws2 = db.create_workspace("discard-sibling")
+    pid = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()["id"]
+
+    def queue_in_both():
+        db.queue_change(
+            pid, "keyword_remove_flat", "Wildlife", workspace_id=ws1,
+        )
+        db.queue_change(
+            pid, "keyword_remove_flat", "Wildlife", workspace_id=ws2,
+        )
+        return db.conn.execute(
+            """SELECT id FROM pending_changes
+               WHERE photo_id = ? AND workspace_id = ?
+                 AND change_type = 'keyword_remove_flat'""",
+            (pid, ws1),
+        ).fetchone()["id"]
+
+    active_id = queue_in_both()
+    resp = client.post(
+        "/api/sync/discard", json={"change_ids": [active_id]},
+    )
+    assert resp.status_code == 200
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (pid,),
+    ).fetchone() is None
+
+    queue_in_both()
+    preview = client.get("/api/sync/preview").get_json()
+    resp = client.post(
+        "/api/sync/discard",
+        json={"discard_all": True, "revision": preview["revision"]},
+    )
+    assert resp.status_code == 200
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (pid,),
+    ).fetchone() is None
+
+
 def test_audit_resolve_validates_direction_and_photo_id(app_and_db):
     """POST /api/audit/resolve must 400 on unknown directions (resolve_drift
     silently no-ops on them) and non-integer photo_id."""
@@ -16287,3 +16787,4300 @@ def test_build_explorer_payload_always_includes_default_aves_class(db):
         "Default Aves class must remain in the selector after switching to a "
         "non-Aves class, otherwise the user has no in-page way back to Birds"
     )
+
+
+# ---------------------------------------------------------------------------
+# Predictions in Browse — see docs/plans/2026-08-16-predictions-in-browse-design.md
+# ---------------------------------------------------------------------------
+
+
+def _seed_prediction_photo(db, filename, species, confidence,
+                           model="bioclip", status="pending",
+                           labels_fingerprint="fp1", folder_id=None):
+    """Add a photo with one detection carrying one prediction."""
+    if folder_id is None:
+        folder_id = db.get_folder_tree()[0]["id"]
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename=filename, extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detection_id = db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    db.add_prediction(
+        detection_id, species, confidence, model,
+        status=status, labels_fingerprint=labels_fingerprint,
+    )
+    return photo_id, detection_id
+
+
+def _prediction_id(db, photo_id, species):
+    return next(
+        row["id"] for row in db.get_predictions(photo_ids=[photo_id])
+        if row["species"] == species
+    )
+
+
+def test_predictions_api_accepts_photo_ids_filter(app_and_db):
+    """GET /api/predictions?photo_ids=N returns only that photo's rows.
+
+    Browse's single-photo panel needs the same enriched rows Review gets
+    (alternatives nested, latest labels_fingerprint only) without pulling
+    the whole workspace queue.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, _ = _seed_prediction_photo(db, "eagle-a.jpg", "Bald Eagle", 0.9)
+    photo_b, _ = _seed_prediction_photo(db, "heron-b.jpg", "Great Blue Heron", 0.8)
+
+    resp = client.get(f"/api/predictions?photo_ids={photo_a}")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    preds = resp.get_json()["predictions"]
+    assert [p["species"] for p in preds] == ["Bald Eagle"]
+    assert all(p["photo_id"] == photo_a for p in preds)
+
+    # Sanity: without the filter both photos' predictions come back.
+    all_species = {
+        p["species"] for p in client.get("/api/predictions").get_json()["predictions"]
+    }
+    assert {"Bald Eagle", "Great Blue Heron"} <= all_species
+    assert photo_b is not None
+
+
+def test_predictions_api_photo_ids_rejects_foreign_photo(app_and_db):
+    """A photo outside the active workspace must not leak predictions."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "eagle-scoped.jpg", "Bald Eagle", 0.9)
+    other_ws = db.create_workspace("Other")
+    assert client.post(f"/api/workspaces/{other_ws}/activate").status_code == 200
+
+    resp = client.get(f"/api/predictions?photo_ids={photo_id}")
+    assert resp.status_code == 403
+
+
+def test_selection_prediction_suggestions_aggregates_by_species(app_and_db):
+    """Predictions aggregate per species across the selection.
+
+    Two photos predict Bald Eagle; one already carries the keyword. Its
+    pending prediction still needs to leave Review, so it lands in
+    ``acceptable_prediction_ids`` for a status-only accept — the panel
+    reports how many of the targets are already keyworded so the user
+    knows some of them will only flip status.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, _ = _seed_prediction_photo(db, "sel-a.jpg", "Bald Eagle", 0.91)
+    photo_b, _ = _seed_prediction_photo(db, "sel-b.jpg", "Bald Eagle", 0.83)
+    photo_c, _ = _seed_prediction_photo(db, "sel-c.jpg", "Osprey", 0.72)
+
+    kid = db.add_keyword("Bald Eagle", is_species=True)
+    db.tag_photo(photo_a, kid)
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_a, photo_b, photo_c]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    data = resp.get_json()
+    assert data["selected_count"] == 3
+
+    by_species = {p["species"]: p for p in data["predictions"]}
+    eagle = by_species["Bald Eagle"]
+    pred_a = _prediction_id(db, photo_a, "Bald Eagle")
+    pred_b = _prediction_id(db, photo_b, "Bald Eagle")
+    assert eagle["predicted_count"] == 2
+    assert eagle["keyworded_count"] == 1
+    assert eagle["missing_photo_ids"] == [photo_b]
+    # Both photos' pending prediction rows must be actionable: the
+    # already-keyworded photo goes through as a status-only accept, and
+    # the missing photo gets both the keyword and the accepted status.
+    assert set(eagle["prediction_ids"]) == {pred_a, pred_b}
+    assert set(eagle["acceptable_prediction_ids"]) == {pred_a, pred_b}
+    assert eagle["acceptable_photo_count"] == 2
+    assert set(eagle["acceptable_photo_ids"]) == {photo_a, photo_b}
+    assert eagle["acceptable_keyworded_count"] == 1
+    assert eagle["ambiguous_prediction_ids"] == []
+    assert eagle["min_confidence"] == 0.83
+    assert eagle["max_confidence"] == 0.91
+
+    osprey = by_species["Osprey"]
+    assert osprey["predicted_count"] == 1
+    assert osprey["keyworded_count"] == 0
+    assert osprey["missing_photo_ids"] == [photo_c]
+    assert osprey["acceptable_keyworded_count"] == 0
+
+
+def test_selection_prediction_suggestions_marks_ambiguous(app_and_db):
+    """A prediction with an alternative sibling is reported as ambiguous.
+
+    The panel must not offer a bare Accept for it — CORE_PHILOSOPHY forbids
+    a button that silently acts on fewer photos than it names.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, det_a = _seed_prediction_photo(db, "amb-a.jpg", "Bald Eagle", 0.55)
+    db.add_prediction(
+        det_a, "Golden Eagle", 0.45, "bioclip",
+        status="alternative", labels_fingerprint="fp1",
+    )
+    photo_b, _ = _seed_prediction_photo(db, "amb-b.jpg", "Bald Eagle", 0.95)
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_a, photo_b]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    eagle = next(
+        p for p in resp.get_json()["predictions"] if p["species"] == "Bald Eagle"
+    )
+    assert eagle["predicted_count"] == 2
+    ambiguous_id = _prediction_id(db, photo_a, "Bald Eagle")
+    assert eagle["ambiguous_prediction_ids"] == [ambiguous_id]
+    # The clean subset is what an Accept button may act on.
+    assert eagle["acceptable_prediction_ids"] == [
+        _prediction_id(db, photo_b, "Bald Eagle")
+    ]
+
+
+def test_selection_prediction_suggestions_rejects_foreign_photo(app_and_db):
+    """Matches the workspace guard on /api/selection/keyword-suggestions."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "ws-a.jpg", "Bald Eagle", 0.9)
+    other_ws = db.create_workspace("Other")
+    assert client.post(f"/api/workspaces/{other_ws}/activate").status_code == 200
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions", json={"photo_ids": [photo_id]},
+    )
+    assert resp.status_code == 403
+
+
+def test_selection_prediction_suggestions_caps_selection(app_and_db):
+    """Same 1,000-photo cap the keyword panel uses."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": list(range(1, 1002))},
+    )
+    assert resp.status_code == 400
+    assert "too many" in resp.get_json()["error"].lower()
+
+
+def test_batch_accept_flips_status_and_tags(app_and_db):
+    """Batch accept must tag AND clear the Review queue.
+
+    Tagging alone would keyword the photos in Browse and leave them
+    pending in Review — the same work twice.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, _ = _seed_prediction_photo(db, "acc-a.jpg", "Bald Eagle", 0.91)
+    photo_b, _ = _seed_prediction_photo(db, "acc-b.jpg", "Bald Eagle", 0.83)
+    pred_ids = [
+        _prediction_id(db, photo_a, "Bald Eagle"),
+        _prediction_id(db, photo_b, "Bald Eagle"),
+    ]
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert resp.get_json()["accepted"] == 2
+
+    statuses = {
+        row["photo_id"]: row["status"]
+        for row in db.get_predictions(photo_ids=[photo_a, photo_b])
+        if row["species"] == "Bald Eagle"
+    }
+    assert statuses == {photo_a: "accepted", photo_b: "accepted"}
+
+    for pid in (photo_a, photo_b):
+        names = {k["name"] for k in db.get_photo_keywords(pid)}
+        assert "Bald Eagle" in names
+
+
+def test_batch_accept_records_single_undo_entry(app_and_db):
+    """One Cmd-Z reverses the whole batch, not one photo at a time."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, _ = _seed_prediction_photo(db, "undo-a.jpg", "Bald Eagle", 0.91)
+    photo_b, _ = _seed_prediction_photo(db, "undo-b.jpg", "Bald Eagle", 0.83)
+    pred_ids = [
+        _prediction_id(db, photo_a, "Bald Eagle"),
+        _prediction_id(db, photo_b, "Bald Eagle"),
+    ]
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    accept_rows = [
+        row for row in db.get_edit_history()
+        if row["action_type"] == "prediction_accept"
+    ]
+    assert len(accept_rows) == 1
+
+    db.undo_last_edit()
+    statuses = {
+        row["photo_id"]: row["status"]
+        for row in db.get_predictions(photo_ids=[photo_a, photo_b])
+        if row["species"] == "Bald Eagle"
+    }
+    assert statuses == {photo_a: "pending", photo_b: "pending"}
+    for pid in (photo_a, photo_b):
+        names = {k["name"] for k in db.get_photo_keywords(pid)}
+        assert "Bald Eagle" not in names
+
+
+def test_batch_accept_chunks_oversized_id_payloads(app_and_db):
+    """The raised cap must not hand SQLite a 25,000-variable IN clause.
+
+    ``_parse_prediction_ids`` accepts far more ids than the 999-variable limit
+    older SQLite builds enforce, so both its photo lookup and the
+    already-accepted probe have to go through ``_SQL_PARAM_CHUNK`` like every
+    other wide IN query in this module. A payload wider than one chunk is the
+    regression guard.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_count = 340
+    pred_ids = []
+    for i in range(photo_count):
+        photo_id, det_id = _seed_prediction_photo(
+            db, f"chunk-{i}.jpg", "Bald Eagle", 0.9, model="bioclip",
+        )
+        for extra_model in ("speciesnet", "merlin"):
+            db.add_prediction(
+                det_id, "Bald Eagle", 0.9, extra_model,
+                labels_fingerprint="fp1",
+            )
+        pred_ids.extend(
+            row["id"] for row in db.get_predictions(photo_ids=[photo_id])
+        )
+    assert len(pred_ids) > 1000, "fixture must exceed one param chunk"
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert resp.get_json()["accepted"] == photo_count
+
+    # And the idempotency probe re-reads the same oversized list.
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert resp.get_json()["already_decided"] == len(pred_ids)
+
+
+def test_batch_accept_rejects_foreign_prediction(app_and_db):
+    """Predictions outside the active workspace must not be acceptable."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "acc-ws.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+    other_ws = db.create_workspace("Other")
+    assert client.post(f"/api/workspaces/{other_ws}/activate").status_code == 200
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 403
+
+
+def test_batch_accept_rejects_replace_species_flag(app_and_db):
+    """``replace_species=True`` would strip conflicting keywords from every
+    tagged photo, but the batch endpoint records one ``prediction_accept``
+    edit whose ``old_value`` only names the prediction id — no room for the
+    removed keyword names. Undo would then restore prediction status but
+    leave the replaced species permanently gone. The single-photo
+    ``/replace-keywords`` route sidesteps this by recording
+    ``prediction_replace_species`` (explicitly non-undoable). The batch
+    endpoint must refuse the flag rather than silently accept a lossy
+    operation.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "rep-flag.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_id], "replace_species": True},
+    )
+    assert resp.status_code == 400
+    assert "replace_species" in resp.get_json()["error"]
+
+    # The rejection must not partially mutate: the prediction stays pending.
+    row = db.conn.execute(
+        "SELECT status FROM prediction_review WHERE prediction_id = ?",
+        (pred_id,),
+    ).fetchone()
+    assert row is None or row["status"] == "pending"
+
+    # A falsy value should NOT trip the guard — accept still works normally.
+    resp2 = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_id], "replace_species": False},
+    )
+    assert resp2.status_code == 200
+
+
+def test_browse_page_has_prediction_panels(app_and_db):
+    """Browse ships both prediction surfaces: single-photo and selection."""
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    assert 'id="detailPredictions"' in html
+    assert 'id="selectionPredictions"' in html
+    # The empty states must stay distinguishable — an empty panel would
+    # otherwise imply "not classified" for a photo that was classified.
+    assert "Not yet classified" in html
+    assert "No species above threshold" in html
+
+
+def test_browse_names_the_status_only_share_of_an_accept(app_and_db):
+    """"Accept on 38" covers photos that already carry the keyword, and for
+    those it writes no tag — it only clears the pending prediction out of
+    Review. One count standing for two different outcomes is exactly what
+    CORE_PHILOSOPHY.md's transparency rule forbids, so the panel has to say
+    which is which. ``acceptable_keyworded_count`` exists for this; without a
+    consumer it is a field the backend computes and nobody reads.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    assert "acceptable_keyworded_count" in html, (
+        "the backend reports how many of the Accept targets are status-only "
+        "but the panel never shows it"
+    )
+    assert "accepting only clears" in html
+
+
+def test_browse_reject_predictions_refreshes_collections(app_and_db):
+    """A rejection can change membership in prediction-status collections
+    (e.g. a "pending predictions" saved collection), so the grid and
+    collection counts must be re-evaluated the same way the accept path
+    does. Without this the rejected photo sticks around in the visible
+    grid and the sidebar counts stay stale until a manual refresh.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    reject_fn_idx = html.find("async function rejectDetailPredictions")
+    assert reject_fn_idx != -1, "rejectDetailPredictions must exist"
+    # Bound the search to the body of the function.
+    next_fn_idx = html.find("\nasync function ", reject_fn_idx + 1)
+    body = html[reject_fn_idx: next_fn_idx if next_fn_idx != -1 else len(html)]
+    assert "scheduleCollectionCountsRefresh()" in body
+    assert "refreshActiveCollectionAfterMembershipChange()" in body
+
+
+def test_selection_prediction_suggestions_applies_confidence_threshold(app_and_db):
+    """Low-confidence noise must not arrive wearing an Accept button.
+
+    On a real catalog the unfiltered list is dominated by 2-10% guesses. The
+    floor is the user's own setting, so hidden rows are counted, not dropped.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, _ = _seed_prediction_photo(db, "thr-a.jpg", "Bald Eagle", 0.91)
+    photo_b, _ = _seed_prediction_photo(db, "thr-b.jpg", "Black Saddlebags", 0.02)
+
+    ws_id = db.get_workspaces()[0]["id"]
+    db.update_workspace(ws_id, config_overrides={"classifier_confidence": 0.5})
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_a, photo_b]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    data = resp.get_json()
+    assert [p["species"] for p in data["predictions"]] == ["Bald Eagle"]
+    assert data["below_threshold_count"] == 1
+    assert data["threshold"] == 0.5
+
+
+def test_batch_reject_flips_status_and_records_single_undo(app_and_db):
+    """Dismissing a species group is one action, not one per detection."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, _ = _seed_prediction_photo(db, "rej-a.jpg", "Bald Eagle", 0.91)
+    photo_b, _ = _seed_prediction_photo(db, "rej-b.jpg", "Bald Eagle", 0.83)
+    pred_ids = [
+        _prediction_id(db, photo_a, "Bald Eagle"),
+        _prediction_id(db, photo_b, "Bald Eagle"),
+    ]
+
+    resp = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert resp.get_json()["rejected"] == 2
+
+    statuses = {
+        row["photo_id"]: row["status"]
+        for row in db.get_predictions(photo_ids=[photo_a, photo_b])
+    }
+    assert statuses == {photo_a: "rejected", photo_b: "rejected"}
+
+    reject_rows = [
+        row for row in db.get_edit_history()
+        if row["action_type"] == "prediction_reject"
+    ]
+    assert len(reject_rows) == 1
+    # Rejecting must not tag anything.
+    for pid in (photo_a, photo_b):
+        assert not db.get_photo_keywords(pid)
+
+
+def test_batch_reject_rejects_foreign_prediction(app_and_db):
+    """Same workspace guard as batch accept."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "rej-ws.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+    other_ws = db.create_workspace("Other")
+    assert client.post(f"/api/workspaces/{other_ws}/activate").status_code == 200
+
+    resp = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 403
+
+
+def test_batch_accept_grouped_stays_scoped_to_submitted_photos(app_and_db):
+    """A grouped accept must not tag photos the caller didn't submit.
+
+    ``accept_prediction`` expands a grouped accept to every photo in the
+    burst group unless ``photo_ids`` is supplied. The batch endpoint has
+    to pass the submitted selection, or accepting a species for one
+    Browse-selected group member tags the hidden burst members too.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_grouped(filename):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=filename, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(
+            det_id, "Bald Eagle", 0.9, "bioclip",
+            group_id="burst-1",
+        )
+        return photo_id
+
+    photo_selected_a = _seed_grouped("grp-a.jpg")
+    photo_selected_b = _seed_grouped("grp-b.jpg")
+    photo_unselected = _seed_grouped("grp-c.jpg")
+
+    pred_a = _prediction_id(db, photo_selected_a, "Bald Eagle")
+    pred_b = _prediction_id(db, photo_selected_b, "Bald Eagle")
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_a, pred_b]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    # Selected photos get the species keyword and their prediction flips.
+    for pid in (photo_selected_a, photo_selected_b):
+        names = {k["name"] for k in db.get_photo_keywords(pid)}
+        assert "Bald Eagle" in names
+
+    # The unselected group member must be untouched — no tag, still pending.
+    unselected_kws = {k["name"] for k in db.get_photo_keywords(photo_unselected)}
+    assert "Bald Eagle" not in unselected_kws
+    unselected_status = next(
+        row["status"] for row in db.get_predictions(photo_ids=[photo_unselected])
+        if row["species"] == "Bald Eagle"
+    )
+    assert unselected_status == "pending"
+
+
+def test_batch_reject_does_not_hide_earlier_undoable_edit(app_and_db):
+    """A reject must not shift ``/api/undo/status`` onto an unrelated edit.
+
+    ``prediction_reject`` is in ``Database._NON_UNDOABLE`` (there is no
+    ``_apply_undo`` handler for it), so the undo endpoint keeps advertising
+    whatever undoable edit came before. The frontend accordingly avoids
+    showing an "undo the reject" toast that would silently reverse the
+    unrelated earlier edit instead.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, _ = _seed_prediction_photo(db, "rej-undo-a.jpg", "Bald Eagle", 0.91)
+    photo_b, _ = _seed_prediction_photo(db, "rej-undo-b.jpg", "Great Blue Heron", 0.9)
+
+    accept_pred = _prediction_id(db, photo_a, "Bald Eagle")
+    reject_pred = _prediction_id(db, photo_b, "Great Blue Heron")
+
+    # An undoable edit first, then a reject after it.
+    assert client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [accept_pred]},
+    ).status_code == 200
+    assert client.post(
+        "/api/predictions/batch-reject",
+        json={"prediction_ids": [reject_pred]},
+    ).status_code == 200
+
+    status = client.get("/api/undo/status").get_json()
+    # The undo cursor still points at the earlier accept, not the reject.
+    # Advertising the reject as undoable would let Ctrl+Z silently undo the
+    # accept instead.
+    assert status["available"] is True
+    assert "Bald Eagle" in status["description"]
+    assert "Great Blue Heron" not in status["description"]
+
+
+def test_prediction_states_distinguish_empty_reasons(app_and_db):
+    """Four different reasons a photo shows no predictions, kept apart."""
+    app, db = app_and_db
+    folder_id = db.get_folder_tree()[0]["id"]
+    untouched = db.add_photo(
+        folder_id=folder_id, filename="state-none.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detected_only = db.add_photo(
+        folder_id=folder_id, filename="state-detected.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.record_detector_run(detected_only, "MDV6", box_count=1)
+    db.save_detections(
+        detected_only,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )
+
+    states = db.get_prediction_states([untouched, detected_only])
+    assert states[untouched]["detector_ran"] is False
+    assert states[untouched]["detection_count"] == 0
+    # Detector ran and found a box, but nothing has classified it yet - that
+    # is NOT the same fact as "no prediction".
+    assert states[detected_only]["detector_ran"] is True
+    assert states[detected_only]["detection_count"] == 1
+    assert states[detected_only]["classifier_ran"] is False
+
+
+def test_prediction_states_ignore_fallback_and_noise_detections(app_and_db):
+    """"Detections exist" must mean detections the classifier could act on.
+
+    The whole-frame ``full-image`` row is written *because* the detector found
+    nothing, and rows under the workspace ``detector_confidence`` floor are
+    noise. Counting either would render "detections found, but no classifier
+    has run yet" for a photo whose detector plainly found no animal.
+    """
+    app, db = app_and_db
+    assert app is not None
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    fallback_only = db.add_photo(
+        folder_id=folder_id, filename="state-fallback.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.record_detector_run(fallback_only, "MDV6", box_count=0)
+    db.save_detections(
+        fallback_only,
+        [{"box": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+          "confidence": 1.0, "category": "animal"}],
+        detector_model="full-image",
+    )
+
+    noise_only = db.add_photo(
+        folder_id=folder_id, filename="state-noise.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.record_detector_run(noise_only, "MDV6", box_count=1)
+    db.save_detections(
+        noise_only,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
+          "confidence": 0.01, "category": "animal"}],
+        detector_model="MDV6",
+    )
+
+    states = db.get_prediction_states([fallback_only, noise_only])
+    assert states[fallback_only]["detector_ran"] is True
+    assert states[fallback_only]["detection_count"] == 0
+    assert states[noise_only]["detector_ran"] is True
+    assert states[noise_only]["detection_count"] == 0
+
+
+def test_batch_accept_skips_already_accepted_predictions(app_and_db):
+    """A double-clicked Accept must not record a second accept.
+
+    The keyword already exists by then, so the second pass would log a
+    status-only edit claiming the prediction was previously pending. Undoing
+    it would knock a long-accepted prediction back to pending.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "dupe-accept.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+
+    first = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+    )
+    assert first.status_code == 200, first.get_data(as_text=True)
+    assert first.get_json()["accepted"] == 1
+    edits_after_first = len(db.get_edit_history(limit=50))
+
+    second = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+    )
+    assert second.status_code == 200, second.get_data(as_text=True)
+    body = second.get_json()
+    assert body["accepted"] == 0
+    assert body["already_decided"] == 1
+    # No second edit row: the resubmission changed nothing, so it must not
+    # sit at the top of the undo stack pretending to be reversible work.
+    assert len(db.get_edit_history(limit=50)) == edits_after_first
+    assert app is not None
+
+
+def test_batch_accept_skips_rejected_predictions(app_and_db):
+    """A row rejected elsewhere must not be accepted by a stale Browse payload.
+
+    The race: Browse renders a panel listing the top-1 row as pending. In
+    Review (or a second tab) the user then accepts that row's *alternative*,
+    which promotes the runner-up and rejects the top-1. Clicking Accept in
+    the still-open Browse panel submits the now-rejected loser. Accepting it
+    would tag the photo with the species the user just rejected — and because
+    the batch's undo entry knows only "this prediction was accepted", undoing
+    it would reset the whole sibling scope to pending/alternative rather than
+    restoring the winner's accepted state.
+
+    ``batch-reject`` has skipped decided rows since e4855edd; both endpoints
+    now read the same ``_decided_prediction_ids`` set, so the pair cannot
+    disagree about which statuses are still actionable.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, det_id = _seed_prediction_photo(
+        db, "alt-race.jpg", "Bald Eagle", 0.7,
+    )
+    db.add_prediction(
+        det_id, "Golden Eagle", 0.3, "bioclip",
+        status="alternative", labels_fingerprint="fp1",
+    )
+    stale_pred = _prediction_id(db, photo_id, "Bald Eagle")
+    winner_pred = _prediction_id(db, photo_id, "Golden Eagle")
+
+    def _status_by_species():
+        return {
+            row["species"]: row["status"] for row in db.conn.execute(
+                """SELECT pr.species,
+                          COALESCE(pr_rev.status, 'pending') AS status
+                   FROM predictions pr
+                   LEFT JOIN prediction_review pr_rev
+                     ON pr_rev.prediction_id = pr.id
+                    AND pr_rev.workspace_id = ?
+                   WHERE pr.detection_id = ?""",
+                (db._ws_id(), det_id),
+            ).fetchall()
+        }
+
+    # Elsewhere: the alternative wins, so the row Browse still shows as
+    # pending becomes the rejected loser.
+    promoted = client.post(f"/api/predictions/{winner_pred}/accept")
+    assert promoted.status_code == 200, promoted.get_data(as_text=True)
+    assert _status_by_species() == {
+        "Bald Eagle": "rejected", "Golden Eagle": "accepted",
+    }
+    keywords_after_promotion = db.get_photo_keywords(photo_id)
+    edits_after_promotion = len(db.get_edit_history(limit=50))
+
+    # The stale panel submits the loser.
+    stale = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [stale_pred]},
+    )
+    assert stale.status_code == 200, stale.get_data(as_text=True)
+    body = stale.get_json()
+    assert body["accepted"] == 0
+    assert body["already_decided"] == 1
+
+    assert _status_by_species() == {
+        "Bald Eagle": "rejected", "Golden Eagle": "accepted",
+    }, "a stale accept re-decided a row the user had already rejected"
+    assert db.get_photo_keywords(photo_id) == keywords_after_promotion, (
+        "the rejected loser's species was tagged onto the photo"
+    )
+    # And nothing was recorded: a no-op must not sit on the undo stack, where
+    # reversing it would reset the winner's accepted state too.
+    assert len(db.get_edit_history(limit=50)) == edits_after_promotion
+    assert app is not None
+
+
+def test_predictions_api_rejects_oversized_photo_ids(app_and_db):
+    """The GET filter runs one workspace check per id, so it is capped like
+    the selection endpoints rather than accepting an unbounded list."""
+    app, _ = app_and_db
+    client = app.test_client()
+    ids = ",".join(str(i) for i in range(1, 1002))
+    resp = client.get(f"/api/predictions?photo_ids={ids}")
+    assert resp.status_code == 400
+    assert "too many photo_ids" in resp.get_data(as_text=True)
+    assert app is not None
+
+
+def test_review_supports_photo_id_deep_link(app_and_db):
+    """Browse routes ambiguous predictions to Review filtered to one photo."""
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/review").get_data(as_text=True)
+    assert "currentPhotoIdFilter" in html
+    # The narrowing must be visible, or a one-photo queue reads as "empty".
+    assert "photoFilterPill" in html
+
+
+def test_selection_prediction_suggestions_keeps_all_matching_ids_per_photo(app_and_db):
+    """Every unambiguous prediction row for the species on a selected photo
+    must be submittable in one batch.
+
+    When a photo has the same species predicted from multiple detections
+    (or multiple classifier models), aggregating down to the highest
+    confidence row and submitting only that id would flip only that
+    prediction to ``accepted``. The other sibling rows stay pending in
+    Review, and once the accept keywords the photo the Browse panel
+    filters it out as "already keyworded" — the user is stranded.
+
+    The button label still counts photos, not prediction rows, so
+    ``acceptable_photo_count`` stays honest even when a photo contributes
+    several ids.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    # Photo A: same species predicted on two separate detections.
+    photo_multi = db.add_photo(
+        folder_id=folder_id, filename="multi-det.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_ids = db.save_detections(
+        photo_multi,
+        [
+            {"box": {"x": 0.1, "y": 0.1, "w": 0.4, "h": 0.4},
+             "confidence": 0.9, "category": "animal"},
+            {"box": {"x": 0.5, "y": 0.5, "w": 0.4, "h": 0.4},
+             "confidence": 0.9, "category": "animal"},
+        ],
+        detector_model="MDV6",
+    )
+    db.add_prediction(det_ids[0], "Cape Cormorant", 0.95, "bioclip")
+    db.add_prediction(det_ids[1], "Cape Cormorant", 0.65, "bioclip")
+
+    # Photo B: same species predicted by two classifier models on one detection.
+    photo_multi_model = db.add_photo(
+        folder_id=folder_id, filename="multi-model.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_b = db.save_detections(
+        photo_multi_model,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    db.add_prediction(det_b, "Cape Cormorant", 0.9, "bioclip")
+    db.add_prediction(det_b, "Cape Cormorant", 0.7, "inat21")
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_multi, photo_multi_model]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    entry = next(
+        p for p in resp.get_json()["predictions"]
+        if p["species"] == "Cape Cormorant"
+    )
+    # Counted by photos.
+    assert entry["predicted_count"] == 2
+    assert entry["acceptable_photo_count"] == 2
+
+    # Every matching prediction row is submittable — not just the top one.
+    all_pred_ids = {
+        row["id"]
+        for row in db.get_predictions(photo_ids=[photo_multi, photo_multi_model])
+        if row["species"] == "Cape Cormorant"
+    }
+    assert set(entry["acceptable_prediction_ids"]) == all_pred_ids
+    assert entry["ambiguous_prediction_ids"] == []
+
+    # Submitting the batch flips every one of them to accepted — Review
+    # is left with nothing pending on this species.
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": entry["acceptable_prediction_ids"]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    remaining = [
+        row for row in db.get_predictions(
+            photo_ids=[photo_multi, photo_multi_model], status="pending",
+        )
+        if row["species"] == "Cape Cormorant"
+    ]
+    assert remaining == []
+
+
+def test_selection_prediction_suggestions_marks_photo_ambiguous_across_siblings(app_and_db):
+    """One ambiguous sibling flags the whole photo, and every id on that
+    photo is routed to ``ambiguous_prediction_ids``.
+
+    A partial accept — flipping only the "clean" sibling while leaving the
+    ambiguous one pending — would leave Review with the same conflict to
+    resolve later. The panel routes the whole photo to Review instead.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="mixed.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_ids = db.save_detections(
+        photo_id,
+        [
+            {"box": {"x": 0.1, "y": 0.1, "w": 0.4, "h": 0.4},
+             "confidence": 0.9, "category": "animal"},
+            {"box": {"x": 0.5, "y": 0.5, "w": 0.4, "h": 0.4},
+             "confidence": 0.9, "category": "animal"},
+        ],
+        detector_model="MDV6",
+    )
+    # Clean sibling.
+    db.add_prediction(det_ids[0], "Verdin", 0.9, "bioclip")
+    # Ambiguous sibling: has an alternative row for the same (detection, model).
+    db.add_prediction(
+        det_ids[1], "Verdin", 0.55, "bioclip", labels_fingerprint="fp1",
+    )
+    db.add_prediction(
+        det_ids[1], "Bushtit", 0.45, "bioclip",
+        status="alternative", labels_fingerprint="fp1",
+    )
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    entry = next(
+        p for p in resp.get_json()["predictions"] if p["species"] == "Verdin"
+    )
+    verdin_ids = {
+        row["id"]
+        for row in db.get_predictions(photo_ids=[photo_id])
+        if row["species"] == "Verdin"
+    }
+    # Whole photo is ambiguous; no clean id leaks into acceptable.
+    assert entry["acceptable_prediction_ids"] == []
+    assert entry["acceptable_photo_count"] == 0
+    assert set(entry["ambiguous_prediction_ids"]) == verdin_ids
+    assert entry["ambiguous_photo_ids"] == [photo_id]
+
+
+def test_selection_prediction_suggestions_uses_burst_consensus_species(app_and_db):
+    """A minority-frame burst prediction aggregates under the winning species.
+
+    ``accept_prediction`` derives a grouped prediction's species from the
+    individual-vote consensus stored in ``prediction_review.individual`` — a
+    Robin/Robin/Sparrow burst accepts as Robin from every frame, including
+    the minority Sparrow one. If the selection aggregator keyed by the raw
+    per-frame ``species`` instead, the Sparrow frame would surface its own
+    bucket advertising an Accept button that silently tags Robin.
+    """
+    import json as _json
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_burst_photo(name, species):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        # ``individual`` carries the vote counts across the burst; the
+        # consensus is Robin (2 votes) even in the Sparrow-labelled frame.
+        db.add_prediction(
+            det_id, species, 0.9, "bioclip",
+            group_id="burst-consensus-1",
+            individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
+        )
+        return photo_id
+
+    robin_a = _seed_burst_photo("burst-robin-a.jpg", "Robin")
+    robin_b = _seed_burst_photo("burst-robin-b.jpg", "Robin")
+    sparrow_frame = _seed_burst_photo("burst-sparrow.jpg", "Sparrow")
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [robin_a, robin_b, sparrow_frame]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    predictions = resp.get_json()["predictions"]
+    # The Sparrow-labelled minority frame must NOT surface as its own
+    # bucket — every burst member aggregates under the accept-time
+    # consensus so the Accept button and the resulting tag agree.
+    assert {p["species"] for p in predictions} == {"Robin"}
+    robin = predictions[0]
+    assert robin["predicted_count"] == 3
+    assert robin["acceptable_photo_count"] == 3
+    assert set(robin["acceptable_photo_ids"]) == {robin_a, robin_b, sparrow_frame}
+
+    # And a real accept over the aggregated ids tags every photo with the
+    # consensus species — including the Sparrow-labelled frame.
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": robin["acceptable_prediction_ids"]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    for pid in (robin_a, robin_b, sparrow_frame):
+        names = {k["name"] for k in db.get_photo_keywords(pid)}
+        assert "Robin" in names
+        assert "Sparrow" not in names
+
+
+def test_selection_prediction_suggestions_ignores_minority_frame_confidence(
+    app_and_db,
+):
+    """Confidence in the panel must come from the consensus species itself.
+
+    A burst frame's ``confidence`` is the classifier's score for that
+    frame's own per-label vote — a Sparrow-labelled frame at 95% inside a
+    Robin-majority burst is 95% *for Sparrow*, not for Robin. Pooling it
+    into the Robin bucket would rank Robin above genuine higher-confidence
+    Robin results (and, when combined with the earlier threshold filter,
+    keep Robin actionable on the strength of a vote for a different
+    species). The aggregate must credit only rows whose raw label agrees
+    with the consensus.
+    """
+    import json as _json
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_burst_photo(name, species, confidence):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        # Same burst, same vote count blob — Robin wins the consensus (2)
+        # over Sparrow (1) even on the Sparrow-labelled frame.
+        db.add_prediction(
+            det_id, species, confidence, "bioclip",
+            group_id="burst-mixed-conf",
+            individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
+        )
+        return photo_id
+
+    robin_a = _seed_burst_photo("burst-robin-a.jpg", "Robin", 0.40)
+    robin_b = _seed_burst_photo("burst-robin-b.jpg", "Robin", 0.45)
+    sparrow_frame = _seed_burst_photo("burst-sparrow.jpg", "Sparrow", 0.95)
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [robin_a, robin_b, sparrow_frame]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    predictions = resp.get_json()["predictions"]
+    assert {p["species"] for p in predictions} == {"Robin"}
+    robin = predictions[0]
+    # All three photos still aggregate under the consensus, and all three
+    # remain acceptable — the fix touches confidence attribution, not row
+    # membership.
+    assert robin["predicted_count"] == 3
+    assert robin["acceptable_photo_count"] == 3
+    # Confidence is derived from the two Robin-labelled frames only; the
+    # Sparrow frame's 0.95 must not surface as Robin's aggregate max.
+    assert robin["min_confidence"] == 0.40
+    assert robin["max_confidence"] == 0.45
+
+
+def test_selection_prediction_suggestions_confidence_unknown_without_consensus_rows(
+    app_and_db,
+):
+    """When only minority-frame rows survive, confidence is reported as unknown.
+
+    The selection may hold just the Sparrow-labelled frame of a Robin-
+    majority burst. The row still routes to Robin (that is what the
+    Accept would apply), but there is no evidence for Robin in the
+    selection itself — no Robin-labelled row contributes a confidence.
+    Rather than inventing a 0% or letting Sparrow's score stand in as
+    Robin's, the endpoint returns ``null`` and the panel renders it as
+    "confidence unknown". A silent 0.95 in Robin's bucket is exactly the
+    misattribution ``CORE_PHILOSOPHY.md`` forbids.
+    """
+    import json as _json
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="burst-sparrow-only.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    db.add_prediction(
+        det_id, "Sparrow", 0.95, "bioclip",
+        group_id="burst-consensus-only-minority",
+        individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
+    )
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    predictions = resp.get_json()["predictions"]
+    assert {p["species"] for p in predictions} == {"Robin"}
+    robin = predictions[0]
+    assert robin["predicted_count"] == 1
+    # No Robin-labelled row contributed a confidence, so the aggregate is
+    # explicitly unknown — not 0.0 (which would falsely imply "we measured
+    # zero"), and not 0.95 (which would misattribute Sparrow's evidence).
+    assert robin["min_confidence"] is None
+    assert robin["max_confidence"] is None
+
+
+def test_selection_prediction_suggestions_offers_repaired_legacy_burst_as_own_species(
+    app_and_db,
+):
+    """A repaired legacy row becomes an ordinary, honest bucket.
+
+    This is the shape the endpoint used to suppress. A lone Sparrow-
+    labelled frame at 0.95, stamped by the pre-#1165 classifier with a
+    ``group_id`` and a Robin-winning vote dict, cleared an 0.80 floor on
+    its own raw score and then aggregated under Robin — an "Accept on 1"
+    for a species with no evidence above the floor. The endpoint answered
+    that by dropping the bucket and reporting the drop.
+
+    ``repair_mixed_species_prediction_groups`` removes the cause instead.
+    The row is ungrouped, so it means what it says: a 95% Sparrow
+    prediction. It surfaces as Sparrow at 0.95, actionable, and accepting
+    it tags Sparrow — nothing is hidden and nothing needs explaining.
+    """
+    import json as _json
+
+    app, db = app_and_db
+    # 0.80 floor: high enough that the pre-repair Robin bucket would have
+    # rested entirely on Sparrow's borrowed 0.95.
+    ws_id = db.get_workspaces()[0]["id"]
+    db.update_workspace(ws_id, config_overrides={"classifier_confidence": 0.80})
+
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="borrowed-only-above-threshold.jpg",
+        extension=".jpg", file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    db.add_prediction(
+        det_id, "Sparrow", 0.95, "bioclip",
+        group_id="burst-borrowed-above-threshold",
+        individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
+    )
+
+    # The fixture's create_app already ran the repair against an empty
+    # catalog and stamped its one-shot marker. Clear the marker so the row
+    # above is met the way an upgrade meets it: written before the boot that
+    # repairs it.
+    db.conn.execute(
+        "DELETE FROM db_meta WHERE key = ?",
+        (type(db)._MIXED_SPECIES_GROUP_REPAIR_KEY,),
+    )
+    db.conn.commit()
+    assert db.repair_mixed_species_prediction_groups() == 1
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    data = resp.get_json()
+    predictions = data["predictions"]
+    assert [p["species"] for p in predictions] == ["Sparrow"]
+    sparrow = predictions[0]
+    # The score is the row's own, credited to the row's own species — the
+    # attribution problem is gone because the misattribution is gone.
+    assert sparrow["max_confidence"] == 0.95
+    assert sparrow["acceptable_photo_count"] == 1
+    assert data["below_threshold_count"] == 0
+    assert data["threshold"] == 0.80
+    # No second empty-state vocabulary: nothing is suppressed, so the
+    # endpoint has no suppression to report.
+    assert "suppressed_borrowed_count" not in data
+
+
+def test_selection_prediction_suggestions_keeps_bucket_when_matching_row_above_threshold(
+    app_and_db,
+):
+    """A genuinely unanimous burst keeps every frame in one actionable bucket.
+
+    The credit gate is an attribution rule, not a filter: a row whose raw
+    label differs from the consensus still belongs to the bucket and still
+    rides along in the batch accept, because ``accept_prediction`` applies
+    the burst consensus to every frame. Only its *confidence* is withheld
+    from the aggregate. Pinned so a future tightening of the gate does not
+    turn it into row-membership filtering.
+    """
+    import json as _json
+
+    app, db = app_and_db
+    ws_id = db.get_workspaces()[0]["id"]
+    db.update_workspace(ws_id, config_overrides={"classifier_confidence": 0.80})
+
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_burst_photo(name, species, confidence):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(
+            det_id, species, confidence, "bioclip",
+            group_id="burst-mixed-above-threshold",
+            individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
+        )
+        return photo_id
+
+    robin_frame = _seed_burst_photo("burst-robin-above.jpg", "Robin", 0.90)
+    sparrow_frame = _seed_burst_photo("burst-sparrow-above.jpg", "Sparrow", 0.95)
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [robin_frame, sparrow_frame]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    data = resp.get_json()
+    predictions = data["predictions"]
+    assert {p["species"] for p in predictions} == {"Robin"}
+    robin = predictions[0]
+    # Both photos aggregate under Robin — the Sparrow row's borrowed
+    # confidence does not count for Robin's max, but the row still
+    # participates in the acceptable set because acceptance flips to the
+    # burst consensus.
+    assert robin["predicted_count"] == 2
+    assert robin["acceptable_photo_count"] == 2
+    assert robin["max_confidence"] == 0.90
+
+
+def test_predictions_api_exposes_consensus_species_for_burst(app_and_db):
+    """/api/predictions surfaces the accept-time species as consensus_species.
+
+    Browse's single-photo panel groups rows by species and offers an
+    Accept per bucket. Without the accept-time consensus in the payload
+    the panel groups by the raw per-frame label — a minority Sparrow
+    frame in a majority-Robin burst then renders a Sparrow row whose
+    Accept button tags Robin.
+    """
+    import json as _json
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="consensus.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    db.add_prediction(
+        det_id, "Sparrow", 0.9, "bioclip",
+        group_id="burst-consensus-2",
+        individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
+    )
+
+    resp = client.get(f"/api/predictions?photo_ids={photo_id}")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    preds = resp.get_json()["predictions"]
+    assert len(preds) == 1
+    pred = preds[0]
+    # Raw per-frame label is preserved for provenance…
+    assert pred["species"] == "Sparrow"
+    # …but the accept-time species is what the panel groups and labels by.
+    assert pred["consensus_species"] == "Robin"
+
+
+def test_predictions_api_consensus_species_falls_back_to_raw(app_and_db):
+    """Non-grouped predictions expose the raw species as consensus.
+
+    Groups only exist for burst photos; ordinary single-photo predictions
+    have no ``individual`` blob. Their consensus is simply their own
+    species — the panel must not receive a null and skip grouping.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(
+        db, "consensus-plain.jpg", "Bald Eagle", 0.9,
+    )
+    resp = client.get(f"/api/predictions?photo_ids={photo_id}")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    preds = resp.get_json()["predictions"]
+    assert [p["consensus_species"] for p in preds] == ["Bald Eagle"]
+
+
+def test_browse_detail_panel_groups_by_consensus_species(app_and_db):
+    """The single-photo panel keys its species groups off consensus_species.
+
+    A regression to the raw ``p.species`` would let a minority-frame
+    burst row render its own Accept button that tags the majority
+    species. The template must consult ``consensus_species`` first.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    # The rendered grouping key uses the consensus species when present.
+    assert "p.consensus_species || p.species" in html
+
+
+def test_browse_prediction_panels_carry_no_borrowed_suppression(app_and_db):
+    """The borrowed-evidence suppression is gone from both Browse panels.
+
+    Two mirrored suppressions used to live here: ``renderDetailPredictions``
+    dropped pending buckets left with ``confidence == null`` under an active
+    threshold, and ``renderSelectionPredictions`` rendered the server's
+    ``suppressed_borrowed_count`` as a second empty state ("No actionable
+    predictions..."), with ``predictionEmptyMessage`` carrying a third
+    branch to name the suppression as the reason a panel was empty. All of
+    it existed only to handle legacy mixed-consensus burst rows, which
+    ``repair_mixed_species_prediction_groups`` now clears from the catalog
+    at startup — so ``predictionEmptyMessage``'s two surviving branches are
+    exhaustive again.
+
+    Pinned as an absence because the cost of keeping them was the user-
+    facing one: two vocabularies for an empty panel, one of which could no
+    longer occur. The credit gate that computes the confidence honestly is
+    a separate thing and stays — asserted here so retiring the suppression
+    cannot quietly take it along.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    assert "suppressedBorrowedRows" not in html
+    assert "meta.suppressed_borrowed_count" not in html
+    assert "consensus-attributable score above your confidence threshold" not in html
+    assert "No actionable predictions on the selected photos." not in html
+    assert "suppressedCount" not in html
+    assert "Pending predictions exist but were suppressed" not in html
+    # The credit gate itself is untouched: a row only contributes its
+    # confidence to the bucket whose species it actually names.
+    assert "asciiCaseFoldKey(p.species || '') === asciiCaseFoldKey(g.species)" in html
+
+
+def test_selection_prediction_suggestions_flips_status_on_already_keyworded_photo(
+    app_and_db,
+):
+    """A pending prediction on an already-keyworded photo is still acceptable.
+
+    ``accept_prediction`` supports a status-only accept: ``add_keyword``
+    is idempotent and the ``already_has_species`` branch skips the re-tag.
+    Dropping the row entirely — the previous behaviour — left the
+    prediction pending in Review while the panel reported "already
+    keyworded", stranding the user.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_keyworded, _ = _seed_prediction_photo(
+        db, "keyworded-pending.jpg", "Bald Eagle", 0.9,
+    )
+    photo_missing, _ = _seed_prediction_photo(
+        db, "missing-pending.jpg", "Bald Eagle", 0.85,
+    )
+    # Manually keyword one photo before running the aggregator.
+    kid = db.add_keyword("Bald Eagle", is_species=True)
+    db.tag_photo(photo_keyworded, kid)
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_keyworded, photo_missing]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    entry = next(
+        p for p in resp.get_json()["predictions"] if p["species"] == "Bald Eagle"
+    )
+    pred_keyworded = _prediction_id(db, photo_keyworded, "Bald Eagle")
+    pred_missing = _prediction_id(db, photo_missing, "Bald Eagle")
+    assert set(entry["acceptable_prediction_ids"]) == {pred_keyworded, pred_missing}
+    assert entry["acceptable_photo_count"] == 2
+    assert entry["acceptable_keyworded_count"] == 1
+    assert entry["keyworded_count"] == 1
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": entry["acceptable_prediction_ids"]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    # Both prediction rows flip to accepted; neither photo gains a
+    # duplicate tag, and the pre-existing keyword survives.
+    statuses = {
+        row["photo_id"]: row["status"]
+        for row in db.get_predictions(
+            photo_ids=[photo_keyworded, photo_missing],
+        )
+        if row["species"] == "Bald Eagle"
+    }
+    assert statuses == {
+        photo_keyworded: "accepted",
+        photo_missing: "accepted",
+    }
+    for pid in (photo_keyworded, photo_missing):
+        names = [k["name"] for k in db.get_photo_keywords(pid)]
+        assert names.count("Bald Eagle") == 1
+
+
+def test_batch_accept_admits_payload_larger_than_1000(app_and_db):
+    """Payloads emitted by a 1,000-photo selection must not 400.
+
+    The selection endpoint caps at 1,000 photos, but a single photo can
+    emit several prediction rows (multiple detections, or the same
+    detection classified by more than one model). Codex flagged that
+    capping batch-accept at 1,000 prediction ids rejected any selection
+    where the multiplier crossed one, so the panel's own Accept button
+    could 400 on a legal selection.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    # 600 photos × 2 classifier models on one detection = 1,200 ids, above
+    # the old 1,000 cap. Kept modest so the test is quick but still crosses
+    # the previous boundary.
+    photos = []
+    for i in range(600):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=f"bulk-{i}.jpg", extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(det_id, "Bald Eagle", 0.9, "bioclip")
+        db.add_prediction(det_id, "Bald Eagle", 0.7, "inat21")
+        photos.append(photo_id)
+
+    all_ids = [
+        row["id"] for row in db.get_predictions(photo_ids=photos)
+        if row["species"] == "Bald Eagle"
+    ]
+    assert len(all_ids) == 1200
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": all_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    # A single undo entry — even a 1,200-row payload lands as one action.
+    accept_rows = [
+        row for row in db.get_edit_history()
+        if row["action_type"] == "prediction_accept"
+    ]
+    assert len(accept_rows) == 1
+
+
+def test_batch_accept_grouped_scopes_photos_per_model_bucket(app_and_db):
+    """A grouped accept must only touch photos that submitted that model.
+
+    Codex flagged a batch-wide photo union: when one species bucket
+    contains predictions from multiple classifier models, passing every
+    submitted photo id to every ``accept_prediction`` call leaks the
+    grouped accept onto rows the user never selected. If photo A submits
+    only model X and photo B submits only model Y, accepting A's model-X
+    prediction with ``photo_ids=[A, B]`` would tag B's model-X row too
+    (even though the panel hid it), and its status-only edit would let
+    Undo reset a previously accepted prediction to pending.
+
+    The fix keys the allowed photo set on the ``(group_id, model)`` bucket
+    each prediction belongs to.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_grouped_two_models(filename):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=filename, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        # Same species from two different classifier models, both in the
+        # same burst group — the batch endpoint sees them as one species
+        # bucket, so any per-model scoping bug shows up here.
+        db.add_prediction(
+            det_id, "Bald Eagle", 0.9, "bioclip",
+            group_id="burst-mm",
+        )
+        db.add_prediction(
+            det_id, "Bald Eagle", 0.8, "inat21",
+            group_id="burst-mm",
+        )
+        return photo_id
+
+    photo_a = _seed_grouped_two_models("mm-a.jpg")
+    photo_b = _seed_grouped_two_models("mm-b.jpg")
+
+    # Submit A's bioclip row and B's inat21 row only — mimicking a panel
+    # that has legitimately hidden the other model on each photo.
+    pred_a_bioclip = next(
+        row["id"] for row in db.get_predictions(photo_ids=[photo_a])
+        if row["species"] == "Bald Eagle" and row["model"] == "bioclip"
+    )
+    pred_b_inat = next(
+        row["id"] for row in db.get_predictions(photo_ids=[photo_b])
+        if row["species"] == "Bald Eagle" and row["model"] == "inat21"
+    )
+    pred_b_bioclip = next(
+        row["id"] for row in db.get_predictions(photo_ids=[photo_b])
+        if row["species"] == "Bald Eagle" and row["model"] == "bioclip"
+    )
+    pred_a_inat = next(
+        row["id"] for row in db.get_predictions(photo_ids=[photo_a])
+        if row["species"] == "Bald Eagle" and row["model"] == "inat21"
+    )
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_a_bioclip, pred_b_inat]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    statuses = {
+        (row["photo_id"], row["model"]): row["status"]
+        for row in db.get_predictions(photo_ids=[photo_a, photo_b])
+    }
+    # Submitted rows flip to accepted.
+    assert statuses[(photo_a, "bioclip")] == "accepted"
+    assert statuses[(photo_b, "inat21")] == "accepted"
+    # Unsubmitted "other-model" rows must stay pending — the bug was that
+    # the batch-wide photo union let each accept leak onto the other
+    # photo's same-model row.
+    assert statuses[(photo_b, "bioclip")] == "pending", (
+        "Photo B's bioclip prediction was never submitted and must not be "
+        "swept up by A's bioclip accept."
+    )
+    assert statuses[(photo_a, "inat21")] == "pending", (
+        "Photo A's inat21 prediction was never submitted and must not be "
+        "swept up by B's inat21 accept."
+    )
+    # And unused ids are still resolvable (regression guard: the seeding
+    # helper actually stored both models).
+    assert pred_a_inat != pred_b_inat
+    assert pred_a_bioclip != pred_b_bioclip
+
+
+def test_batch_accept_rejects_selection_beyond_photo_cap(app_and_db):
+    """Enforce the same 1,000-photo cap the selection endpoint uses.
+
+    The two Browse panels that feed this route resolve to at most 1,000
+    photos apiece (``_parse_selection_photo_ids``). The batch route now
+    validates the resolved photo count so the semantic constraint holds
+    at both ends of the request path.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    pred_ids = []
+    for i in range(1001):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=f"cap-{i}.jpg", extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(det_id, "Bald Eagle", 0.9, "bioclip")
+        pred_ids.append(
+            _prediction_id(db, photo_id, "Bald Eagle")
+        )
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 400, resp.get_data(as_text=True)
+    assert "photos" in resp.get_json().get("error", "").lower()
+
+
+def test_selection_prediction_suggestions_recomputes_ambiguity_after_keyword_edit(
+    app_and_db,
+):
+    """A keyword added AFTER classification must route Browse to Review.
+
+    ``predictions.category`` is a classify-time snapshot — later keyword
+    edits never touch it. Without recomputing per-request, a photo with a
+    pending Zanclus prediction (category='new' when classified) that later
+    gains a conflicting keyword would surface a bare "Accept on 1" button
+    in Browse and silently add a second, disagreeing species. Species
+    names below are deliberately made up so no local taxonomy on the
+    test host can quietly reclassify the relationship.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    stale_photo, _ = _seed_prediction_photo(
+        db, "stale-cat-a.jpg", "TestZanclusalpha", 0.9,
+    )
+    clean_photo, _ = _seed_prediction_photo(
+        db, "stale-cat-b.jpg", "TestZanclusalpha", 0.85,
+    )
+    # A conflicting species is added AFTER the prediction is recorded —
+    # the stored category stays "new" but the photo now carries a
+    # different species.
+    conflict_kid = db.add_keyword("TestZanclusbeta", is_species=True)
+    db.tag_photo(stale_photo, conflict_kid)
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [stale_photo, clean_photo]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    entry = next(
+        p for p in resp.get_json()["predictions"]
+        if p["species"] == "TestZanclusalpha"
+    )
+    stale_pred = _prediction_id(db, stale_photo, "TestZanclusalpha")
+    clean_pred = _prediction_id(db, clean_photo, "TestZanclusalpha")
+    # The photo whose keyword now conflicts must route to Review, not to
+    # a bare Accept — that's the whole point of the fresh comparison.
+    assert stale_pred in entry["ambiguous_prediction_ids"]
+    assert stale_pred not in entry["acceptable_prediction_ids"]
+    assert stale_photo in entry["ambiguous_photo_ids"]
+    # The unrelated photo without a conflicting keyword still accepts
+    # cleanly — the fresh check must not over-fire onto every row.
+    assert clean_pred in entry["acceptable_prediction_ids"]
+
+
+def test_batch_accept_revalidates_ambiguity_after_keywords_move(app_and_db):
+    """A row that turned ambiguous after render is skipped, not accepted.
+
+    The decided-status precondition cannot catch this one: when a species
+    keyword is added from Review, a second Browse tab, or an XMP sync, the
+    submitted prediction stays ``pending`` — only its *relationship* to the
+    photo's keywords changes. A status-only filter would let it through and
+    ``accept_prediction`` would tag the now-conflicting species, exactly the
+    decision the panel routes to Review instead.
+
+    The endpoint therefore re-derives ambiguity through
+    ``_ambiguous_prediction_ids``, the same helper that produced the panel's
+    ``acceptable_prediction_ids`` — one rule, two callers, so the button's
+    promise and the write's precondition cannot describe different sets.
+
+    Made-up species names again, so no local taxonomy on the test host can
+    quietly reclassify the relationship into a refinement.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    stale_photo, _ = _seed_prediction_photo(
+        db, "revalidate-a.jpg", "TestZanclusalpha", 0.9,
+    )
+    clean_photo, _ = _seed_prediction_photo(
+        db, "revalidate-b.jpg", "TestZanclusalpha", 0.85,
+    )
+    stale_pred = _prediction_id(db, stale_photo, "TestZanclusalpha")
+    clean_pred = _prediction_id(db, clean_photo, "TestZanclusalpha")
+
+    # What Browse renders: both photos are clean, so both are acceptable.
+    rendered = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [stale_photo, clean_photo]},
+    )
+    assert rendered.status_code == 200, rendered.get_data(as_text=True)
+    entry = next(
+        p for p in rendered.get_json()["predictions"]
+        if p["species"] == "TestZanclusalpha"
+    )
+    payload = entry["acceptable_prediction_ids"]
+    assert set(payload) == {stale_pred, clean_pred}
+    assert entry["ambiguous_prediction_ids"] == []
+
+    # Elsewhere, between render and click: a conflicting species lands on one
+    # of the two photos. Nothing touches prediction status.
+    conflict_kid = db.add_keyword("TestZanclusbeta", is_species=True)
+    db.tag_photo(stale_photo, conflict_kid)
+    assert db.get_predictions(photo_ids=[stale_photo], status="pending")
+
+    # The stale button posts the payload it rendered with.
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": payload},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    # The honest half still lands — one moved row must not strand the rest.
+    assert body["accepted"] == 1
+    assert body["skipped_ambiguous"] == 1
+    assert body["already_decided"] == 0
+
+    def _species_names(photo_id):
+        return {k["name"] for k in db.get_photo_keywords(photo_id)}
+
+    assert "TestZanclusalpha" in _species_names(clean_photo)
+    assert "TestZanclusalpha" not in _species_names(stale_photo), (
+        "a stale accept tagged a species that now conflicts with the photo's "
+        "keywords, instead of leaving it for Review"
+    )
+    statuses = {
+        row["photo_id"]: row["status"]
+        for row in db.get_predictions(photo_ids=[stale_photo, clean_photo])
+    }
+    assert statuses[stale_photo] == "pending"
+    assert statuses[clean_photo] == "accepted"
+
+    # And the panel now agrees with what the endpoint just did: the skipped
+    # row reads as ambiguous on reload, so the user is shown the Review
+    # hand-off rather than an Accept button that would be declined again.
+    reloaded = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [stale_photo, clean_photo]},
+    )
+    reloaded_entry = next(
+        p for p in reloaded.get_json()["predictions"]
+        if p["species"] == "TestZanclusalpha"
+    )
+    assert reloaded_entry["ambiguous_prediction_ids"] == [stale_pred]
+    assert reloaded_entry["acceptable_prediction_ids"] == []
+
+
+def _db_file(db):
+    """The on-disk path behind a Database, for opening a second connection."""
+    return next(
+        row["file"] for row in db.conn.execute("PRAGMA database_list")
+        if row["name"] == "main"
+    )
+
+
+def _reclassify(db, detection_id, species, confidence,
+                model="bioclip", labels_fingerprint="fp2"):
+    """Add a newer label set's prediction on an existing detection.
+
+    ``get_predictions`` keeps only the newest ``labels_fingerprint`` per
+    ``(detection, classifier_model)``, so this is what "classification re-ran"
+    looks like to every read path: the old row still exists and is still
+    pending, but no surface shows it any more.
+    """
+    db.add_prediction(
+        detection_id, species, confidence, model,
+        status="pending", labels_fingerprint=labels_fingerprint,
+    )
+
+
+def test_batch_accept_skips_superseded_label_set_rows(app_and_db):
+    """A payload rendered before a re-classification cannot accept the old row.
+
+    Same shape as the decided-status and ambiguity preconditions: the panel
+    told the truth when it rendered, and stopped telling the truth before the
+    click. Accepting here would tag the photo from a label set nothing
+    displays and mark accepted a row the user can no longer see, while the
+    current prediction stayed pending in the panel in front of them.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, det_id = _seed_prediction_photo(
+        db, "superseded.jpg", "TestZanclusdelta", 0.9,
+    )
+    stale_pred = _prediction_id(db, photo_id, "TestZanclusdelta")
+
+    # What Browse rendered.
+    rendered = client.post(
+        "/api/selection/prediction-suggestions", json={"photo_ids": [photo_id]},
+    )
+    entry = next(
+        p for p in rendered.get_json()["predictions"]
+        if p["species"] == "TestZanclusdelta"
+    )
+    assert entry["acceptable_prediction_ids"] == [stale_pred]
+
+    # Classification re-runs against a new label set between render and click.
+    _reclassify(db, det_id, "TestZanclusepsilon", 0.95)
+    current_pred = _prediction_id(db, photo_id, "TestZanclusepsilon")
+    assert current_pred != stale_pred
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [stale_pred]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["accepted"] == 0
+    assert body["skipped_superseded"] == 1
+    # Counted as superseded, not folded into a conflict the user would go
+    # looking for in Review and never find.
+    assert body["skipped_ambiguous"] == 0
+    assert body["already_decided"] == 0
+
+    names = {k["name"] for k in db.get_photo_keywords(photo_id)}
+    assert "TestZanclusdelta" not in names, (
+        "accepted a species from a label set the catalog has moved past"
+    )
+    stale_status = db.conn.execute(
+        """SELECT COALESCE(pr_rev.status, 'pending') AS status
+           FROM predictions pr
+           LEFT JOIN prediction_review pr_rev
+             ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+           WHERE pr.id = ?""",
+        (db._ws_id(), stale_pred),
+    ).fetchone()["status"]
+    assert stale_status == "pending"
+    # The current row is untouched and still offered.
+    reloaded = client.post(
+        "/api/selection/prediction-suggestions", json={"photo_ids": [photo_id]},
+    )
+    current_entry = next(
+        p for p in reloaded.get_json()["predictions"]
+        if p["species"] == "TestZanclusepsilon"
+    )
+    assert current_entry["acceptable_prediction_ids"] == [current_pred]
+
+
+def test_batch_reject_skips_superseded_label_set_rows(app_and_db):
+    """The reject side applies the same rule through the same helper.
+
+    A stale reject writes no keyword, but it misreports just as loudly: the
+    user dismisses a species, the row marked ``rejected`` is one no panel
+    shows, and the current prediction stays pending in front of them.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, det_id = _seed_prediction_photo(
+        db, "superseded-reject.jpg", "TestZancluszeta", 0.9,
+    )
+    stale_pred = _prediction_id(db, photo_id, "TestZancluszeta")
+    _reclassify(db, det_id, "TestZancluseta", 0.95)
+
+    resp = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": [stale_pred]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["rejected"] == 0
+    assert body["skipped_superseded"] == 1
+    assert body["already_decided"] == 0
+    stale_status = db.conn.execute(
+        """SELECT COALESCE(pr_rev.status, 'pending') AS status
+           FROM predictions pr
+           LEFT JOIN prediction_review pr_rev
+             ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+           WHERE pr.id = ?""",
+        (db._ws_id(), stale_pred),
+    ).fetchone()["status"]
+    assert stale_status == "pending"
+    assert db.get_edit_history() == []
+
+
+def test_batch_accept_checks_and_writes_are_one_transaction(
+    app_and_db, monkeypatch,
+):
+    """No other writer can decide these rows between the check and the write.
+
+    The preconditions (decided, superseded, ambiguous) are only worth what
+    their atomicity with the write is worth. Read them outside a transaction
+    and two overlapping requests — a double-clicked Accept, or an Accept and a
+    Reject fired before the panel reloads — both pass the same checks against
+    the same pre-write state and then both write.
+
+    The interleave is exercised in-process, deterministically: a competing
+    connection tries to record a decision on the very row being accepted, at
+    the exact instant between the endpoint's checks and its first write
+    (hooked through ``Database.accept_prediction``, the call that separates
+    them). It runs with a short ``busy_timeout``, so it either commits — which
+    is the bug — or is refused because the endpoint already holds SQLite's
+    writer lock, which is the guarantee. Nothing here depends on thread
+    scheduling luck: the hook blocks the request until the competing writer
+    has had its answer.
+    """
+    import sqlite3
+    import threading
+
+    import db as db_module
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(
+        db, "atomic.jpg", "TestZanclustheta", 0.9,
+    )
+    pred_id = _prediction_id(db, photo_id, "TestZanclustheta")
+    ws_id = db._ws_id()
+    db_file = _db_file(db)
+
+    competing = {}
+
+    def _competing_reject():
+        # 0.5s busy timeout: long enough that an *unlocked* window is taken
+        # without a race, short enough that a properly locked one gives up
+        # well inside the test.
+        conn = sqlite3.connect(db_file, timeout=0.5)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """INSERT INTO prediction_review
+                     (prediction_id, workspace_id, status, reviewed_at)
+                   VALUES (?, ?, 'rejected', datetime('now'))
+                   ON CONFLICT(prediction_id, workspace_id)
+                   DO UPDATE SET status = 'rejected'""",
+                (pred_id, ws_id),
+            )
+            conn.commit()
+            competing["committed"] = True
+        except sqlite3.OperationalError as exc:
+            competing["refused"] = str(exc)
+        finally:
+            conn.close()
+
+    original_accept = db_module.Database.accept_prediction
+    fired = []
+
+    def _accept_with_interleave(self, *args, **kwargs):
+        if not fired:
+            fired.append(True)
+            thread = threading.Thread(target=_competing_reject)
+            thread.start()
+            thread.join(timeout=30)
+            assert not thread.is_alive()
+        return original_accept(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        db_module.Database, "accept_prediction", _accept_with_interleave,
+    )
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert fired, "the interleave hook never ran, so nothing was exercised"
+    assert not competing.get("committed"), (
+        "another connection recorded a decision between batch-accept's "
+        "precondition check and its write — the check is not atomic with "
+        "the write it guards"
+    )
+    assert "locked" in competing.get("refused", ""), competing
+
+    # And the accept the endpoint was allowed to make is the whole truth:
+    # status and keyword agree, with no rejected-then-accepted overwrite.
+    assert resp.get_json()["accepted"] == 1
+    status = db.conn.execute(
+        """SELECT COALESCE(pr_rev.status, 'pending') AS status
+           FROM predictions pr
+           LEFT JOIN prediction_review pr_rev
+             ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+           WHERE pr.id = ?""",
+        (ws_id, pred_id),
+    ).fetchone()["status"]
+    assert status == "accepted"
+    assert "TestZanclustheta" in {
+        k["name"] for k in db.get_photo_keywords(photo_id)
+    }
+
+
+def test_batch_accept_skips_ambiguous_rows_with_alternatives(app_and_db):
+    """The alternative-sibling half of the rule is enforced server-side too.
+
+    The panel withholds Accept from a row whose ``(detection, model)`` has an
+    ``alternative`` sibling, because accepting picks a winner the user was
+    never asked about. A caller that submits one anyway — a hand-rolled
+    request, or a payload rendered before the alternative was recorded — must
+    hit the same wall, since both go through ``_ambiguous_prediction_ids``.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, det_id = _seed_prediction_photo(
+        db, "revalidate-alt.jpg", "TestZanclusgamma", 0.7,
+    )
+    db.add_prediction(
+        det_id, "TestZanclusdelta", 0.3, "bioclip",
+        status="alternative", labels_fingerprint="fp1",
+    )
+    pred_id = _prediction_id(db, photo_id, "TestZanclusgamma")
+    alt_id = _prediction_id(db, photo_id, "TestZanclusdelta")
+    edits_before = len(db.get_edit_history(limit=50))
+
+    # Both halves of the contract in one call: the pending row that *has* an
+    # alternative, and the alternative row itself. ``_ambiguous_prediction_ids``
+    # keys on ``(detection, model)``, which the two share, so neither is
+    # acceptable here — promoting a runner-up stays a Review decision.
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_id, alt_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["accepted"] == 0
+    assert body["skipped_ambiguous"] == 2
+    assert body["already_decided"] == 0, (
+        "an alternative row is undecided, not decided — it is skipped for "
+        "ambiguity, and the count the user is shown has to say which"
+    )
+    assert {"TestZanclusgamma", "TestZanclusdelta"}.isdisjoint(
+        {k["name"] for k in db.get_photo_keywords(photo_id)}
+    )
+    # A no-op must leave nothing on the undo stack: Browse gates its undo
+    # toast on ``accepted``, and an entry here would let Ctrl+Z reverse some
+    # older, unrelated edit.
+    assert len(db.get_edit_history(limit=50)) == edits_before
+    assert app is not None
+
+
+def test_batch_reject_resolves_alternative_rows(app_and_db):
+    """The other half of the alternative contract: reject still acts on them.
+
+    ``batch-accept`` skips anything with an ``alternative`` in play because a
+    bare accept would pick a winner the user was never shown. Rejection has no
+    such problem — dismissing the species dismisses its runners-up too, which
+    is exactly what the single-photo reject already does — so the alternative
+    row is actionable here whether it is submitted directly or swept up as a
+    sibling of the row that was.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    swept_photo, swept_det = _seed_prediction_photo(
+        db, "reject-alt-sweep.jpg", "TestZanclusgamma", 0.7,
+    )
+    db.add_prediction(
+        swept_det, "TestZanclusdelta", 0.3, "bioclip",
+        status="alternative", labels_fingerprint="fp1",
+    )
+    direct_photo, direct_det = _seed_prediction_photo(
+        db, "reject-alt-direct.jpg", "TestZanclusgamma", 0.7,
+    )
+    db.add_prediction(
+        direct_det, "TestZanclusdelta", 0.3, "bioclip",
+        status="alternative", labels_fingerprint="fp1",
+    )
+
+    def _status(photo_id, species):
+        return db.conn.execute(
+            """SELECT pr_rev.status FROM predictions pr
+               JOIN detections d ON d.id = pr.detection_id
+               LEFT JOIN prediction_review pr_rev
+                 ON pr_rev.prediction_id = pr.id
+                AND pr_rev.workspace_id = ?
+               WHERE d.photo_id = ? AND pr.species = ?""",
+            (db._ws_id(), photo_id, species),
+        ).fetchone()["status"]
+
+    resp = client.post(
+        "/api/predictions/batch-reject",
+        json={"prediction_ids": [
+            _prediction_id(db, swept_photo, "TestZanclusgamma"),
+            _prediction_id(db, direct_photo, "TestZanclusdelta"),
+        ]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["rejected"] == 2
+    assert body["already_decided"] == 0
+    # Submitted top-1: its alternative goes down with it.
+    assert _status(swept_photo, "TestZanclusgamma") == "rejected"
+    assert _status(swept_photo, "TestZanclusdelta") == "rejected"
+    # Submitted alternative: rejected on its own, and the row it lost to is
+    # untouched — dismissing a runner-up says nothing about the winner.
+    assert _status(direct_photo, "TestZanclusdelta") == "rejected"
+    # No review row at all: the winner is still undecided, exactly as it was.
+    assert _status(direct_photo, "TestZanclusgamma") is None
+    assert app is not None
+
+
+def _patch_begin_prediction_decision(app, view_name, replacement):
+    """Swap the endpoint's captured ``_begin_prediction_decision`` closure.
+
+    The helpers in ``create_app`` are captured as free variables of every
+    view function that uses them, so a module-level patch never reaches the
+    live handler. This walks the view's closure cells and rebinds the one
+    holding ``_begin_prediction_decision`` to ``replacement`` — matching how
+    the endpoint would call it. Returns True when the swap landed, so tests
+    can assert on rewire rather than on the hook silently missing.
+    """
+    view = app.view_functions[view_name]
+    for cell in view.__closure__ or ():
+        try:
+            candidate = cell.cell_contents
+        except ValueError:
+            continue
+        if (
+            callable(candidate)
+            and getattr(candidate, "__name__", "") == "_begin_prediction_decision"
+        ):
+            cell.cell_contents = replacement
+            return True
+    return False
+
+
+def test_batch_accept_skips_rows_whose_photo_left_the_workspace(app_and_db):
+    """A folder detach in the parse→lock window must not tag a foreign photo.
+
+    ``_parse_prediction_ids`` verifies workspace ownership before
+    ``BEGIN IMMEDIATE``, but a folder detach is itself a write — in WAL
+    another connection can acquire the writer lock, delete the row from
+    ``workspace_folders``, and commit in exactly that window. Without the
+    in-lock re-check the batch would tag the now-foreign photo and record a
+    workspace-scoped ``prediction_review`` row for a photo the workspace no
+    longer owns.
+
+    Exercised deterministically by rebinding
+    ``_begin_prediction_decision`` in the endpoint's closure: right before
+    the endpoint takes the lock, the hook detaches the photo's folder on a
+    competing connection so the in-lock check must catch it.
+    """
+    import sqlite3
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(
+        db, "detached.jpg", "TestDetachAlpha", 0.9,
+    )
+    pred_id = _prediction_id(db, photo_id, "TestDetachAlpha")
+    ws_id = db._ws_id()
+    folder_id = db.conn.execute(
+        "SELECT folder_id FROM photos WHERE id = ?", (photo_id,),
+    ).fetchone()["folder_id"]
+    db_file = _db_file(db)
+
+    fired = []
+
+    def _detach_before_lock(target_db):
+        # Runs after ``_parse_prediction_ids`` has already validated ownership
+        # but before the endpoint's ``BEGIN IMMEDIATE`` — the exact window
+        # the race lives in. Committed via a separate connection so this
+        # detach is a real WAL write, not a scoped test fixture.
+        if not fired:
+            fired.append(True)
+            side = sqlite3.connect(db_file, timeout=5.0)
+            try:
+                side.execute(
+                    "DELETE FROM workspace_folders "
+                    "WHERE workspace_id = ? AND folder_id = ?",
+                    (ws_id, folder_id),
+                )
+                side.commit()
+            finally:
+                side.close()
+        return None
+
+    assert _patch_begin_prediction_decision(
+        app, "api_batch_accept_predictions", _detach_before_lock,
+    )
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert fired, "the pre-lock hook never ran, so nothing was exercised"
+    assert body["accepted"] == 0
+    assert body["skipped_out_of_workspace"] == 1
+    assert body["already_decided"] == 0
+    assert body["skipped_ambiguous"] == 0
+    assert body["skipped_superseded"] == 0
+    # Nothing on the photo: no keyword, no workspace-scoped review row for a
+    # folder that no longer belongs to this workspace.
+    names = {k["name"] for k in db.get_photo_keywords(photo_id)}
+    assert "TestDetachAlpha" not in names
+    status = db.conn.execute(
+        """SELECT COALESCE(pr_rev.status, 'pending') AS status
+           FROM predictions pr
+           LEFT JOIN prediction_review pr_rev
+             ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+           WHERE pr.id = ?""",
+        (ws_id, pred_id),
+    ).fetchone()["status"]
+    assert status == "pending"
+    # Batch reported no accepts, so no undo entry landed either.
+    assert db.get_edit_history(limit=5) == []
+
+
+def test_batch_reject_skips_rows_whose_photo_left_the_workspace(app_and_db):
+    """Reject shares the workspace re-check with accept — same helper.
+
+    A stale reject writes no keyword, but a workspace-scoped
+    ``prediction_review`` row for a now-foreign photo is the same class of
+    leak the accept side closes. Both endpoints filter through
+    ``_out_of_workspace_prediction_ids`` for the reason they share
+    ``_decided_prediction_ids``: a rule with two implementations drifts.
+    """
+    import sqlite3
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(
+        db, "detached-reject.jpg", "TestDetachBeta", 0.9,
+    )
+    pred_id = _prediction_id(db, photo_id, "TestDetachBeta")
+    ws_id = db._ws_id()
+    folder_id = db.conn.execute(
+        "SELECT folder_id FROM photos WHERE id = ?", (photo_id,),
+    ).fetchone()["folder_id"]
+    db_file = _db_file(db)
+
+    fired = []
+
+    def _detach_before_lock(target_db):
+        if not fired:
+            fired.append(True)
+            side = sqlite3.connect(db_file, timeout=5.0)
+            try:
+                side.execute(
+                    "DELETE FROM workspace_folders "
+                    "WHERE workspace_id = ? AND folder_id = ?",
+                    (ws_id, folder_id),
+                )
+                side.commit()
+            finally:
+                side.close()
+        return None
+
+    assert _patch_begin_prediction_decision(
+        app, "api_batch_reject_predictions", _detach_before_lock,
+    )
+
+    resp = client.post(
+        "/api/predictions/batch-reject",
+        json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert fired, "the pre-lock hook never ran, so nothing was exercised"
+    assert body["rejected"] == 0
+    assert body["skipped_out_of_workspace"] == 1
+    status = db.conn.execute(
+        """SELECT COALESCE(pr_rev.status, 'pending') AS status
+           FROM predictions pr
+           LEFT JOIN prediction_review pr_rev
+             ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+           WHERE pr.id = ?""",
+        (ws_id, pred_id),
+    ).fetchone()["status"]
+    assert status == "pending"
+    assert db.get_edit_history(limit=5) == []
+
+
+def test_batch_accept_skips_row_whose_consensus_drifted(app_and_db):
+    """A grouping change after render must not tag with the wrong species.
+
+    The panel groups by species and labels the button "Accept on N
+    <species>". If another tab dissolves the burst grouping between render
+    and click — ``/api/predictions/group/apply`` ungrouping a member so
+    ``individual`` votes are cleared — ``accept_prediction`` will apply the
+    raw per-frame label instead of the consensus the button named. Browse
+    now sends ``expected_species`` and the endpoint skips rows whose current
+    consensus does not match.
+
+    The mid-flight change is delivered by hooking
+    ``_begin_prediction_decision``: right before the lock, the hook clears
+    the row's ``individual`` votes so ``_prediction_consensus_species``
+    falls back to the raw label "Sparrow" — different from the "Robin"
+    label the caller passed as ``expected_species``.
+    """
+    import json as _json
+    import sqlite3
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="drift.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    # Raw species column is "Sparrow" (the minority per-frame label), but the
+    # burst consensus is "Robin" (2 votes). At render time the panel offered
+    # an "Accept on 1 Robin" button; the click submits with expected="Robin".
+    db.add_prediction(
+        det_id, "Sparrow", 0.9, "bioclip",
+        group_id="drift-burst-1",
+        individual=_json.dumps({"Robin": 2, "Sparrow": 1}),
+    )
+    pred_id = _prediction_id(db, photo_id, "Sparrow")
+    ws_id = db._ws_id()
+    db_file = _db_file(db)
+
+    fired = []
+
+    def _clear_group_before_lock(target_db):
+        # Another tab's group-apply lands right before this request takes
+        # the writer lock. Committed on a separate connection so the write
+        # is a real WAL write, not a scoped test fixture. ``individual`` and
+        # ``group_id`` live on ``prediction_review`` (workspace-scoped
+        # state), not on the base ``predictions`` row.
+        if not fired:
+            fired.append(True)
+            side = sqlite3.connect(db_file, timeout=5.0)
+            try:
+                side.execute(
+                    """UPDATE prediction_review
+                       SET individual = NULL, group_id = NULL
+                       WHERE prediction_id = ? AND workspace_id = ?""",
+                    (pred_id, ws_id),
+                )
+                side.commit()
+            finally:
+                side.close()
+        return None
+
+    assert _patch_begin_prediction_decision(
+        app, "api_batch_accept_predictions", _clear_group_before_lock,
+    )
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={
+            "prediction_ids": [pred_id],
+            "expected_species": "Robin",
+        },
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert fired
+    assert body["accepted"] == 0
+    assert body["skipped_species_drifted"] == 1
+    assert body["skipped_ambiguous"] == 0
+    assert body["already_decided"] == 0
+    # The photo carries neither the raw label the row would have tagged with
+    # nor the consensus the button named — a drift is a caller-side refresh,
+    # not a "close enough, tag anyway" decision.
+    names = {k["name"] for k in db.get_photo_keywords(photo_id)}
+    assert "Robin" not in names
+    assert "Sparrow" not in names
+    status = db.conn.execute(
+        """SELECT COALESCE(pr_rev.status, 'pending') AS status
+           FROM predictions pr
+           LEFT JOIN prediction_review pr_rev
+             ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+           WHERE pr.id = ?""",
+        (ws_id, pred_id),
+    ).fetchone()["status"]
+    assert status == "pending"
+
+
+def test_batch_accept_without_expected_species_still_accepts(app_and_db):
+    """Older callers that pass no ``expected_species`` keep working.
+
+    The drift check is optional so single-species callers, tests, and any
+    caller that already restricts each submission to one bucket keep the
+    endpoint's pre-existing contract. With no expected label to compare
+    against, ``skipped_species_drifted`` is always zero — the "all resolve
+    to one species" precondition in the loop below carries the single-
+    species invariant instead. This test covers only the happy path of that
+    older contract; the drift path itself is exercised by the tests that
+    pass ``expected_species``.
+    """
+    import json as _json
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="no-expected.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    db.add_prediction(
+        det_id, "Warbler", 0.9, "bioclip",
+        group_id="no-expected-burst",
+        individual=_json.dumps({"Warbler": 3}),
+    )
+    pred_id = _prediction_id(db, photo_id, "Warbler")
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["accepted"] == 1
+    assert body["skipped_species_drifted"] == 0
+    names = {k["name"] for k in db.get_photo_keywords(photo_id)}
+    assert "Warbler" in names
+
+
+def test_predictions_api_effective_category_reflects_current_keywords(
+    app_and_db,
+):
+    """/api/predictions returns a fresh effective_category per pending row.
+
+    Browse's single-photo panel uses ``effective_category`` alongside the
+    stored ``category`` in ``predictionIsAmbiguous`` — the stored field is
+    a classify-time snapshot, so a keyword added after classification must
+    still cause the panel to route to Review instead of offering a bare
+    Accept. When there is no keyword conflict, ``effective_category`` is
+    ``new`` and the panel offers Accept as before.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    conflicted_photo, _ = _seed_prediction_photo(
+        db, "eff-cat-conflict.jpg", "TestZanclusalpha", 0.9,
+    )
+    clean_photo, _ = _seed_prediction_photo(
+        db, "eff-cat-clean.jpg", "TestZanclusalpha", 0.9,
+    )
+    conflict_kid = db.add_keyword("TestZanclusbeta", is_species=True)
+    db.tag_photo(conflicted_photo, conflict_kid)
+
+    conflicted_resp = client.get(
+        f"/api/predictions?photo_ids={conflicted_photo}"
+    )
+    assert conflicted_resp.status_code == 200
+    conflicted_pred = next(
+        p for p in conflicted_resp.get_json()["predictions"]
+        if p["species"] == "TestZanclusalpha"
+    )
+    # Category downgraded from stored ``new`` to fresh ``conflict``
+    # because a conflicting keyword landed on the photo after
+    # classification.
+    assert conflicted_pred["effective_category"] == "conflict"
+    # ``existing_species`` is enriched whenever the effective_category
+    # flags a conflict — the panel needs the keyword name to explain WHY
+    # it's routing this prediction to Review rather than accepting inline.
+    assert "TestZanclusbeta" in conflicted_pred["existing_species"]
+
+    clean_resp = client.get(f"/api/predictions?photo_ids={clean_photo}")
+    assert clean_resp.status_code == 200
+    clean_pred = next(
+        p for p in clean_resp.get_json()["predictions"]
+        if p["species"] == "TestZanclusalpha"
+    )
+    # No conflicting keyword, so the effective category is "new" and the
+    # panel offers Accept normally.
+    assert clean_pred["effective_category"] == "new"
+
+
+def test_batch_accept_dedupes_grouped_prediction_expansion(app_and_db):
+    """Submitting every member of a burst group must not re-expand N times.
+
+    ``accept_prediction`` on a grouped prediction expands to every group
+    member whose photo is in the submitted selection. Before dedup, the
+    batch endpoint called it once per submitted member — each pass re-ran
+    the same status/tag work over every photo in the group and appended a
+    fresh round of no-op ``affected`` entries. A 5-member burst therefore
+    produced 5 + 4·5 = 25 items in the edit-history batch; a large burst
+    could time out and undo would grind through duplicate rows.
+
+    The batch must land as ONE edit with exactly one item per photo — no
+    duplicates — and every submitted prediction row must still end up
+    accepted.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_burst_member(name):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(
+            det_id, "Bald Eagle", 0.9, "bioclip",
+            group_id="dedup-burst-1", labels_fingerprint="fp1",
+        )
+        return photo_id
+
+    photos = [_seed_burst_member(f"dedup-{i}.jpg") for i in range(5)]
+    pred_ids = [_prediction_id(db, pid, "Bald Eagle") for pid in photos]
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    accept_rows = [
+        row for row in db.get_edit_history()
+        if row["action_type"] == "prediction_accept"
+    ]
+    assert len(accept_rows) == 1
+    # One item per submitted photo — not N × N. Duplicates would inflate
+    # this count to 25 for a 5-member burst.
+    assert accept_rows[0]["item_count"] == 5
+    items = db.conn.execute(
+        "SELECT photo_id FROM edit_history_items WHERE edit_id = ?",
+        (accept_rows[0]["id"],),
+    ).fetchall()
+    photo_ids_in_edit = [row["photo_id"] for row in items]
+    assert sorted(photo_ids_in_edit) == sorted(photos)
+
+    # Every submitted prediction row must still end up accepted — dedup
+    # only skips re-expanding the same group, it does not silently drop
+    # any prediction from being marked accepted.
+    for pid in photos:
+        names = {k["name"] for k in db.get_photo_keywords(pid)}
+        assert "Bald Eagle" in names
+    remaining = [
+        row for row in db.get_predictions(photo_ids=photos, status="pending")
+        if row["species"] == "Bald Eagle"
+    ]
+    assert remaining == []
+
+
+def test_batch_accept_dedup_still_rejects_skipped_detection_alternatives(
+    app_and_db,
+):
+    """Deduping the accept loop must not leave a skipped detection's
+    alternatives pending.
+
+    Each grouped burst member has its own detection, and each detection
+    can carry its own alternative predictions. ``accept_prediction`` only
+    rejects sibling alternatives scoped to the representative's detection,
+    so a naive dedup would leave the skipped members' alternatives
+    ``pending``/``alternative`` in Review even though the parent
+    predictions were accepted via the representative's group expansion.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_grouped_with_alternative(name):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(
+            det_id, "Bald Eagle", 0.7, "bioclip",
+            group_id="dedup-alt-burst", labels_fingerprint="fp1",
+        )
+        db.add_prediction(
+            det_id, "Golden Eagle", 0.3, "bioclip",
+            status="alternative", labels_fingerprint="fp1",
+        )
+        return photo_id, det_id
+
+    a_photo, a_det = _seed_grouped_with_alternative("alt-a.jpg")
+    b_photo, b_det = _seed_grouped_with_alternative("alt-b.jpg")
+    pred_ids = [
+        _prediction_id(db, a_photo, "Bald Eagle"),
+        _prediction_id(db, b_photo, "Bald Eagle"),
+    ]
+
+    # A row with an alternative sibling is ambiguous, so ``batch-accept``
+    # now declines the whole payload rather than picking a winner the panel
+    # never offered — the panel puts these in ``ambiguous_prediction_ids``.
+    # That is the endpoint's contract; the group-expansion behaviour this
+    # test exists for therefore has to be exercised one layer down, on
+    # ``accept_prediction`` itself, which Review's single-photo route still
+    # reaches with alternatives present.
+    declined = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": pred_ids},
+    )
+    assert declined.status_code == 200, declined.get_data(as_text=True)
+    assert declined.get_json() == {
+        "ok": True, "accepted": 0, "already_decided": 0,
+        "skipped_ambiguous": 2, "skipped_superseded": 0,
+        "skipped_out_of_workspace": 0, "skipped_species_drifted": 0,
+        "species": None,
+    }
+
+    db.accept_prediction(pred_ids[0], prediction_ids=set(pred_ids))
+
+    # Every submitted detection's alternative row must end up rejected —
+    # the representative's accept path only rejects siblings scoped to its
+    # own detection, so a skipped detection's alternative would otherwise
+    # linger. Read the workspace-scoped status directly to bypass status
+    # filters in the higher-level helpers.
+    def _alternative_status(det_id):
+        row = db.conn.execute(
+            """SELECT COALESCE(pr_rev.status, 'pending') AS status
+               FROM predictions pr
+               LEFT JOIN prediction_review pr_rev
+                 ON pr_rev.prediction_id = pr.id
+                AND pr_rev.workspace_id = ?
+               WHERE pr.detection_id = ? AND pr.species = ?""",
+            (db._ws_id(), det_id, "Golden Eagle"),
+        ).fetchone()
+        return row["status"] if row else None
+
+    assert _alternative_status(a_det) == "rejected"
+    assert _alternative_status(b_det) == "rejected"
+
+
+def test_batch_accept_takes_any_payload_the_suggestions_endpoint_emits(app_and_db):
+    """The producer's output is the consumer's contract.
+
+    ``/api/selection/prediction-suggestions`` bounds only the *photo*
+    selection; it then emits every matching prediction row for those photos,
+    and a photo legitimately carries several (one per detection, one per
+    classifier model). Two review rounds tried to bound batch-accept by id
+    count instead — 1,000, then 25,000 — and both walls sat below what the
+    producer could emit, so the panel's own Accept button 400ed on a legal
+    selection. The only bound that cannot drift is the producer's own: the
+    photo selection.
+
+    This drives the real path — selection in, emitted ids straight back out
+    to the Accept endpoint — so a future cap that the producer can exceed
+    fails here rather than in Browse.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    # 400 photos × 3 classifier models = 1,200 ids: more ids than photos
+    # (the shape any id-count cap gets wrong) and wider than one
+    # ``_SQL_PARAM_CHUNK``.
+    photos = []
+    for i in range(400):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=f"bulk-{i}.jpg", extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        for model, conf in (("bioclip", 0.9), ("inat21", 0.8), ("merlin", 0.7)):
+            db.add_prediction(det_id, "Bald Eagle", conf, model)
+        photos.append(photo_id)
+
+    suggestions = client.post(
+        "/api/selection/prediction-suggestions", json={"photo_ids": photos},
+    )
+    assert suggestions.status_code == 200, suggestions.get_data(as_text=True)
+    entry = suggestions.get_json()["predictions"][0]
+    emitted = entry["acceptable_prediction_ids"]
+    assert len(emitted) == 1200
+    assert len(emitted) > len(photos), (
+        "fixture must emit more ids than photos, or it cannot catch an "
+        "id-count cap"
+    )
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": emitted},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert resp.get_json()["accepted"] == len(photos)
+    # A single undo entry — even a 1,200-row payload lands as one action.
+    accept_rows = [
+        row for row in db.get_edit_history()
+        if row["action_type"] == "prediction_accept"
+    ]
+    assert len(accept_rows) == 1
+
+
+def test_batch_accept_has_no_prediction_id_count_cap(app_and_db):
+    """Nothing about the payload's *length* may reject it.
+
+    The rows-per-photo multiplier has no ceiling, so any number picked here
+    is a guess — 1,000, then 25,000, then 200,000 were all picked and all
+    retired. A payload past every one of them must fail (if at all) on what
+    the ids are, not on how many there are.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "nocap.jpg", "Bald Eagle", 0.9)
+    real_id = _prediction_id(db, photo_id, "Bald Eagle")
+    payload = [real_id] + list(range(real_id + 1, real_id + 200002))
+    assert len(payload) > 200000
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": payload},
+    )
+    error = resp.get_json()["error"].lower()
+    assert resp.status_code == 404, resp.get_data(as_text=True)
+    assert "not found" in error
+    assert "too many" not in error
+
+
+def test_batch_prediction_payload_shares_the_selection_photo_cap(app_and_db):
+    """Both batch endpoints stop exactly where the producer stops.
+
+    The bound is one number (``_MAX_SELECTION_PHOTOS``) in one unit
+    (photos), so "what a selection may ask for" and "what a batch may act
+    on" cannot drift apart again.
+    """
+    import app as app_module
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    photos, pred_ids = [], []
+    for i in range(app_module._MAX_SELECTION_PHOTOS + 1):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=f"cap-{i}.jpg", extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(det_id, "Bald Eagle", 0.9, "bioclip")
+        pred_ids.append(db.conn.execute(
+            "SELECT id FROM predictions WHERE detection_id = ?", (det_id,),
+        ).fetchone()["id"])
+        photos.append(photo_id)
+
+    # The producer refuses the selection...
+    resp = client.post(
+        "/api/selection/prediction-suggestions", json={"photo_ids": photos},
+    )
+    assert resp.status_code == 400
+    assert "too many" in resp.get_json()["error"].lower()
+
+    # ...and the consumers refuse a payload spanning the same photos, for
+    # the same reason, at the same number.
+    for route in ("batch-accept", "batch-reject"):
+        resp = client.post(
+            f"/api/predictions/{route}", json={"prediction_ids": pred_ids},
+        )
+        assert resp.status_code == 400, resp.get_data(as_text=True)
+        assert "too many photos" in resp.get_json()["error"].lower()
+
+    # One photo fewer is a legal selection, and stays legal on the way back.
+    resp = client.post(
+        "/api/selection/prediction-suggestions", json={"photo_ids": photos[:-1]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    resp = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": pred_ids[:-1]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+
+def test_batch_accept_scopes_grouped_accept_to_the_submitted_rows(app_and_db):
+    """A grouped accept must not reach a row the caller left out.
+
+    One burst photo carries one prediction row per classifier model, so a
+    photo id does not identify a prediction. When photo A submits model X's
+    row and photo B submits model Y's row, scoping the batch by the *union
+    of submitted photos* lets A's grouped accept walk the burst under model
+    X and accept B's model-X row too — a row the panel deliberately omitted
+    (below threshold, already accepted, or ambiguous). The batch is scoped
+    by submitted prediction id instead, which no such projection can widen.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_burst_member(filename):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=filename, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        for model, conf in (("bioclip", 0.9), ("inat21", 0.4)):
+            db.add_prediction(
+                det_id, "Bald Eagle", conf, model,
+                group_id="burst-1", labels_fingerprint="fp1",
+            )
+        rows = {
+            row["classifier_model"]: row["id"] for row in db.conn.execute(
+                "SELECT id, classifier_model FROM predictions "
+                "WHERE detection_id = ?", (det_id,),
+            ).fetchall()
+        }
+        return photo_id, rows
+
+    photo_a, rows_a = _seed_burst_member("burst-a.jpg")
+    photo_b, rows_b = _seed_burst_member("burst-b.jpg")
+
+    def _status(pred_id):
+        row = db.conn.execute(
+            """SELECT status FROM prediction_review
+               WHERE prediction_id = ? AND workspace_id = ?""",
+            (pred_id, db._ws_id()),
+        ).fetchone()
+        return row["status"] if row else "pending"
+
+    # Photo A submits its bioclip row, photo B its inat21 row. B's bioclip
+    # row is NOT submitted — the panel's confidence floor hid it.
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [rows_a["bioclip"], rows_b["inat21"]]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    assert _status(rows_a["bioclip"]) == "accepted"
+    assert _status(rows_b["inat21"]) == "accepted"
+    # The rows nobody submitted stay pending in Review.
+    assert _status(rows_b["bioclip"]) == "pending", (
+        "A's grouped accept expanded into B's unsubmitted model-X row"
+    )
+    assert _status(rows_a["inat21"]) == "pending"
+
+    # Both submitted photos still get the keyword, exactly once each.
+    for pid in (photo_a, photo_b):
+        names = [k["name"] for k in db.get_photo_keywords(pid)]
+        assert names.count("Bald Eagle") == 1
+
+
+def test_batch_accept_does_not_re_enter_rows_a_grouped_accept_covered(app_and_db):
+    """Siblings resolved by one grouped accept are not accepted twice.
+
+    Submitting a whole burst means the first call already flips every
+    submitted member. Looping into the rest would append a second,
+    status-only history item per photo whose recorded "previous" status is
+    a fiction — undo would then knock the accept back to pending while
+    leaving the keyword on.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    pred_ids, photos = [], []
+    for name in ("cover-a.jpg", "cover-b.jpg", "cover-c.jpg"):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(
+            det_id, "Bald Eagle", 0.9, "bioclip",
+            group_id="burst-2", labels_fingerprint="fp1",
+        )
+        pred_ids.append(db.conn.execute(
+            "SELECT id FROM predictions WHERE detection_id = ?", (det_id,),
+        ).fetchone()["id"])
+        photos.append(photo_id)
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    accept_rows = [
+        row for row in db.get_edit_history()
+        if row["action_type"] == "prediction_accept"
+    ]
+    assert len(accept_rows) == 1
+    # One item per photo, not one per loop iteration.
+    assert accept_rows[0]["item_count"] == len(photos)
+    item_photos = {
+        row["photo_id"] for row in db.conn.execute(
+            "SELECT photo_id FROM edit_history_items WHERE edit_id = ?",
+            (accept_rows[0]["id"],),
+        ).fetchall()
+    }
+    assert item_photos == set(photos)
+
+    db.undo_last_edit()
+    for pid in photos:
+        names = {k["name"] for k in db.get_photo_keywords(pid)}
+        assert "Bald Eagle" not in names
+
+
+def test_browse_predictions_stay_acceptable_when_keywords_agree(app_and_db):
+    """The recompare must not route settled photos to Review.
+
+    A photo already carrying the predicted species is the "already
+    keyworded, accept only clears Review" case the panel names explicitly.
+    Recomparing has to keep calling that a match.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "agree-cat.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+    kid = db.add_keyword("Bald Eagle", is_species=True)
+    db.tag_photo(photo_id, kid)
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions", json={"photo_ids": [photo_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    entry = resp.get_json()["predictions"][0]
+    assert pred_id in entry["acceptable_prediction_ids"]
+    assert entry["acceptable_keyworded_count"] == 1
+
+
+def test_browse_clears_stale_ambiguity_when_keywords_no_longer_conflict(app_and_db):
+    """Ambiguity must not be a one-way ratchet.
+
+    The stored ``category`` is a classify-time snapshot in both directions:
+    a prediction stamped ``disagreement`` because the photo carried a
+    conflicting species keyword keeps saying so after that keyword is
+    removed. ORing the stored value into the fresh comparison — the obvious
+    way to be "safe" — would route such a photo to Review forever, naming a
+    conflict that no longer exists and offering no way to resolve it from
+    Browse. The fresh comparison wins outright; the snapshot is only the
+    fallback for when no fresh comparison could be made.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, det_id = _seed_prediction_photo(
+        db, "ratchet.jpg", "Bald Eagle", 0.9,
+    )
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+    # Classification-time snapshot: this prediction conflicted with a species
+    # the photo carried back then.
+    db.conn.execute(
+        "UPDATE predictions SET category = 'disagreement' WHERE id = ?",
+        (pred_id,),
+    )
+    db.conn.commit()
+    # ...and the photo now carries the predicted species instead.
+    kid = db.add_keyword("Bald Eagle", is_species=True)
+    db.tag_photo(photo_id, kid)
+
+    resp = client.get(f"/api/predictions?photo_ids={photo_id}")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    row = next(p for p in resp.get_json()["predictions"] if p["id"] == pred_id)
+    assert row["effective_category"] == "match"
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions", json={"photo_ids": [photo_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    entry = resp.get_json()["predictions"][0]
+    assert pred_id in entry["acceptable_prediction_ids"], (
+        "a stale disagreement snapshot kept routing a settled photo to Review"
+    )
+    assert pred_id not in entry["ambiguous_prediction_ids"]
+
+    # The single-photo panel decides this in JS, so it needs the same
+    # precedence: fresh when present, stored only as fallback.
+    html = client.get("/browse").get_data(as_text=True)
+    idx = html.find("function predictionIsAmbiguous")
+    assert idx != -1
+    body = html[idx:html.find("\n}", idx)]
+    assert "if (eff)" in body, (
+        "predictionIsAmbiguous must prefer the fresh comparison over the "
+        "stored snapshot, not OR them together"
+    )
+    assert det_id is not None
+
+
+def test_batch_accept_leaves_earlier_accept_untouched_when_resubmitted(app_and_db):
+    """Filtering already-accepted ids must not leak their photos into a
+    sibling's grouped scope.
+
+    Codex flagged: photos A and B share one ``(group_id, model)`` bucket.
+    B was already accepted (a second panel, a raced click), so ``pred_ids``
+    drops it. If the grouped scope still names B's photo, A's accept re-
+    touches B and appends a phantom ``no_tag`` item — undo then walks that
+    item and resets B's earlier accept back to pending. The current fix
+    tracks scope by row identity built after the already-accepted filter,
+    which closes it. This test locks that in via the undo path: the second
+    batch's edit-history entry must only cover A's photo, and undoing it
+    must not touch B.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_grouped_photo(filename):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=filename, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(
+            det_id, "Bald Eagle", 0.9, "bioclip",
+            group_id="burst-skip-scope",
+        )
+        return photo_id
+
+    photo_a = _seed_grouped_photo("skip-a.jpg")
+    photo_b = _seed_grouped_photo("skip-b.jpg")
+    pred_a = _prediction_id(db, photo_a, "Bald Eagle")
+    pred_b = _prediction_id(db, photo_b, "Bald Eagle")
+
+    # Simulate the "B already accepted" starting state — one earlier batch
+    # decided B alone, so the (burst-skip-scope, bioclip) bucket already
+    # holds an accept on B.
+    first = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_b]},
+    )
+    assert first.status_code == 200, first.get_data(as_text=True)
+    edits_after_first = db.get_edit_history(limit=50)
+    b_first_status = {
+        row["photo_id"]: row["status"]
+        for row in db.get_predictions(photo_ids=[photo_a, photo_b])
+    }
+    assert b_first_status[photo_b] == "accepted"
+    assert b_first_status[photo_a] == "pending"
+
+    # Second batch: the panel refreshes and now submits BOTH ids — the
+    # already-accepted skip must not leave B in A's grouped scope.
+    second = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_a, pred_b]},
+    )
+    assert second.status_code == 200, second.get_data(as_text=True)
+    body = second.get_json()
+    assert body["accepted"] == 1
+    assert body["already_decided"] == 1
+
+    # One new edit entry — a phantom re-accept would leave a second
+    # ``no_tag`` item on this entry that undo would happily walk.
+    edits_after_second = db.get_edit_history(limit=50)
+    assert len(edits_after_second) == len(edits_after_first) + 1
+    new_entry_id = edits_after_second[0]["id"]
+    items = db.conn.execute(
+        "SELECT photo_id FROM edit_history_items WHERE edit_id = ?",
+        (new_entry_id,),
+    ).fetchall()
+    photo_ids_in_entry = {row["photo_id"] for row in items}
+    assert photo_ids_in_entry == {photo_a}, (
+        "Photo B was already accepted and skipped from pred_ids — its "
+        "photo must not sit in A's grouped scope, or undo would reset "
+        "the earlier accept on B."
+    )
+
+    # And the load-bearing assertion: undoing the second batch must not
+    # touch B's earlier accept. A phantom no_tag item's undo would flip B
+    # back to pending/alternative even though its accept wasn't in this
+    # batch.
+    undo_resp = client.post("/api/undo")
+    assert undo_resp.status_code == 200, undo_resp.get_data(as_text=True)
+    post_undo = {
+        row["photo_id"]: row["status"]
+        for row in db.get_predictions(photo_ids=[photo_a, photo_b])
+    }
+    assert post_undo[photo_b] == "accepted", (
+        "Undoing the second batch reset B's earlier (unrelated) accept — "
+        "the phantom no_tag item leaked B into the second batch's edit "
+        "record."
+    )
+
+
+def test_browse_uses_ascii_case_fold_for_prediction_group_key(app_and_db):
+    """Grouping predictions by JS ``toLowerCase()`` merges rows the DB
+    intentionally keeps distinct.
+
+    ``keyword_match_key`` (and the ``keywords`` table's ASCII NOCASE
+    constraints) treat ``Éclair`` and ``éclair`` as separate species, so
+    accepting either lands on a different keyword id. JS's Unicode-aware
+    ``toLowerCase()`` folds the two together, so the group's Accept
+    button ends up submitting ids that resolve to two different keywords
+    — and ``/api/predictions/batch-accept`` rejects the batch with
+    ``prediction_ids must all resolve to one species``, leaving the row
+    unactionable from Browse. The single-photo prediction panel must
+    group with an ASCII-only fold to mirror the backend.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    # Helper is present.
+    assert "function asciiCaseFoldKey" in html
+    # And is what the prediction group key actually uses — no lingering
+    # ``displaySpecies.toLowerCase()`` at the grouping site.
+    assert "asciiCaseFoldKey(displaySpecies)" in html
+    assert "displaySpecies.toLowerCase()" not in html
+
+
+def test_batch_reject_skips_already_accepted_predictions(app_and_db):
+    """Accept-then-Reject must not overwrite the accept.
+
+    A double click, a second tab, or a Browse panel that loaded before the
+    accept landed can all submit an ``accepted`` row to ``batch-reject``.
+    Overwriting the status leaves the species keyword the accept added
+    attached to a photo whose prediction now reads ``rejected`` — keyword
+    state and review state contradicting each other with nothing in the UI
+    admitting it. The mirror case — a stale accept of a row rejected
+    elsewhere — is covered by
+    ``test_batch_accept_skips_rejected_predictions``; both endpoints read the
+    same ``_decided_prediction_ids`` set.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "acc-then-rej.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+
+    accepted = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+    )
+    assert accepted.status_code == 200, accepted.get_data(as_text=True)
+    keywords_after_accept = db.get_photo_keywords(photo_id)
+    assert keywords_after_accept, "accept should have tagged the photo"
+    edits_after_accept = len(db.get_edit_history(limit=50))
+
+    resp = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["rejected"] == 0
+    assert body["already_decided"] == 1
+
+    statuses = [row["status"] for row in db.get_predictions(photo_ids=[photo_id])]
+    assert statuses == ["accepted"], (
+        "the stale reject overwrote a completed accept, orphaning its keyword"
+    )
+    assert db.get_photo_keywords(photo_id) == keywords_after_accept
+    # And nothing was recorded: a no-op must not sit on the undo stack.
+    assert len(db.get_edit_history(limit=50)) == edits_after_accept
+
+
+def test_batch_reject_skips_already_rejected_predictions(app_and_db):
+    """A resubmitted reject is a no-op, not a second history entry.
+
+    The recorded ``old_value`` is a hard-coded ``"pending"``; replaying it
+    for a row that was already ``rejected`` writes a previous status that
+    never existed.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "rej-twice.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+
+    first = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": [pred_id]},
+    )
+    assert first.status_code == 200
+    assert first.get_json()["rejected"] == 1
+    edits_after_first = len(db.get_edit_history(limit=50))
+
+    second = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": [pred_id]},
+    )
+    assert second.status_code == 200
+    body = second.get_json()
+    assert body["rejected"] == 0
+    assert body["already_decided"] == 1
+    assert len(db.get_edit_history(limit=50)) == edits_after_first
+
+
+def _browse_js_function_body(html, signature):
+    """The source text of one inline Browse function, for structure asserts."""
+    start = html.find(signature)
+    assert start != -1, f"{signature} must exist in browse.html"
+    nxt = html.find("\nfunction ", start + 1)
+    nxt_async = html.find("\nasync function ", start + 1)
+    ends = [i for i in (nxt, nxt_async) if i != -1]
+    return html[start: min(ends) if ends else len(html)]
+
+
+def test_browse_prediction_panels_refresh_on_keyword_edits(app_and_db):
+    """Prediction rows are computed from the photos' CURRENT species
+    keywords, so a keyword edit invalidates the panel just as an accept
+    does. ``keyworded_count`` / ``missing_photo_ids`` move underneath the
+    "Accept on N" button, and CORE_PHILOSOPHY.md forbids a button that
+    states a count it will not act on.
+
+    The invalidation hangs off ``_refreshBrowseKeywordState`` — the one
+    function every Browse keyword mutation already calls — rather than
+    being re-added at each call site, so a future keyword path cannot ship
+    with a stale panel.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    assert "function refreshPredictionPanels(" in html
+    body = _browse_js_function_body(
+        html, "async function _refreshBrowseKeywordState(",
+    )
+    assert "refreshPredictionPanels(" in body, (
+        "keyword mutations must invalidate the prediction panels"
+    )
+    # It has to run before the early returns, or a mutation on photos
+    # outside the loaded grid page would silently skip the refresh.
+    refresh_at = body.find("refreshPredictionPanels(")
+    first_return = body.find("return;")
+    assert first_return == -1 or refresh_at < first_return
+
+
+def test_browse_sidebar_panels_refresh_on_undo_and_redo(app_and_db):
+    """Undo/redo lives in the navbar and writes straight to the database.
+
+    Undoing a ``prediction_accept`` reverts *both* halves of the accept: the
+    row returns to pending and the species keyword it wrote is stripped. Each
+    half has its own panel in Browse's right sidebar, so refreshing only the
+    prediction panels leaves the Keywords section listing a keyword the
+    database no longer holds — the same falsehood in the other direction.
+
+    So the handler goes through one sidebar-wide chokepoint rather than
+    naming the panel that happens to be wrong today, and a panel added to
+    that sidebar later is refreshed by default.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    listener_at = html.find(
+        "document.addEventListener('vireo:edit-history-changed'"
+    )
+    assert listener_at != -1, "Browse must listen for undo/redo"
+    handler = html[listener_at: listener_at + 700]
+    assert "refreshBrowseSidebarPanels(" in handler, (
+        "undo/redo must repaint the whole sidebar, not one panel"
+    )
+    body = _browse_js_function_body(
+        html, "function refreshBrowseSidebarPanels(",
+    )
+    # The prediction half.
+    assert "refreshPredictionPanels(" in body
+    # The keyword half: the single-photo Keywords section repaints via
+    # loadDetail, the multi-selection one via the batch suggestions loader —
+    # whose cache key must be cleared first, since the selection has not
+    # changed here, only the state its rows are computed from.
+    assert "loadDetail(" in body
+    assert "loadSelectionKeywordSuggestions(" in body
+    key_at = body.find("selectionKeywordKey = ''")
+    assert key_at != -1 and key_at < body.find(
+        "loadSelectionKeywordSuggestions("
+    ), "stale selection key would make the keyword refresh a no-op"
+
+
+def test_browse_review_deep_link_clears_persisted_filters(app_and_db):
+    """``/review?photo_id=N`` alone is not the scope the pill advertises.
+
+    ``VireoFilter.init()`` restores the last persisted Review expression
+    whenever the URL carries no ``filters`` param, so a filter left active
+    on Review can exclude the very photo Browse just handed over — an empty
+    queue under a pill reading "Showing one photo from Browse".
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    body = _browse_js_function_body(html, "function openPredictionInReview(")
+    assert "filters=" in body, (
+        "the Review deep link must send an explicit empty filter handoff"
+    )
+    # A well-formed empty payload: VireoFilter.init throws on a
+    # present-but-unparseable ``filters`` param.
+    assert "rules: []" in body
+    import urllib.parse
+
+    review_resp = client.get(
+        "/review?photo_id=1&filters="
+        + urllib.parse.quote(
+            json.dumps({"root": {"mode": "all", "rules": []}, "visual": None})
+        )
+    )
+    assert review_resp.status_code == 200
+
+
+# Browse's prediction panels are inline JS, so the only honest way to check
+# what they emit for a given species name is to run them. Everything these
+# helpers execute is lifted verbatim from the shipped template and
+# vireo-utils.js; the harness supplies only the DOM surface those functions
+# touch and stubs for the calls under assertion.
+_PANEL_DOM_STUB = """
+var __list = {
+  innerHTML: '',
+  _handlers: {},
+  addEventListener: function(type, fn) { __list._handlers[type] = fn; },
+};
+var document = {
+  getElementById: function(id) {
+    return id === 'detailPredictions' ? __list : null;
+  },
+  createElement: function() {
+    return {
+      _text: '',
+      appendChild: function(node) { this._text += node.text; },
+      get innerHTML() {
+        return this._text
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      },
+    };
+  },
+  createTextNode: function(text) { return { text: String(text) }; },
+};
+// Declared in browse.html above the panel code, outside the slice below.
+var PREDICTION_COLLAPSE_AT = 5;
+var detailPredictionsExpanded = false;
+var _detailPredictionData = null;
+var detailPredictionGroups = [];
+var detailPredictionGroupsPhotoId = null;
+// The calls the panel is supposed to make, captured instead of made.
+var __calls = [];
+function acceptDetailPredictions(ids, photoId, species) {
+  __calls.push(
+    {fn: 'accept', ids: ids, photoId: photoId, species: species},
+  );
+}
+function rejectDetailPredictions(ids, photoId) {
+  __calls.push({fn: 'reject', ids: ids, photoId: photoId});
+}
+function openPredictionInReview(photoId) {
+  __calls.push({fn: 'review', photoId: photoId});
+}
+"""
+
+_PANEL_DRIVER = """
+var __input = JSON.parse(process.argv[3] || '{}');
+renderDetailPredictions(__input.data, __input.photoId);
+if (process.argv[2] === 'render') {
+  process.stdout.write(JSON.stringify({html: __list.innerHTML}));
+} else {
+  var __attrs = __input.attrs || {};
+  var __el = {
+    getAttribute: function(name) {
+      return Object.prototype.hasOwnProperty.call(__attrs, name)
+        ? __attrs[name] : null;
+    },
+  };
+  __el.closest = function() {
+    return __attrs['data-prediction-action'] ? __el : null;
+  };
+  var __handler = __list._handlers.click;
+  if (!__handler) {
+    process.stdout.write(JSON.stringify({error: 'no delegated click listener'}));
+  } else {
+    __handler({target: __el});
+    process.stdout.write(JSON.stringify({calls: __calls}));
+  }
+}
+"""
+
+
+def _run_node(source, args):
+    """Execute a JS snippet under node and return its parsed JSON stdout."""
+    import json as _json
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    import pytest
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to execute Browse's inline panel JS")
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "panel.js"
+        script.write_text(source, encoding="utf-8")
+        # Windows CI's cold Node start (antivirus scanning node.exe and the
+        # freshly written script) can spike well past 30s on a busy runner,
+        # timing out a script that would otherwise finish in milliseconds.
+        # The pytest-level --timeout=120 still bounds a genuinely hung run.
+        proc = subprocess.run(
+            [node, str(script), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=120,
+        )
+    assert proc.returncode == 0, proc.stderr
+    return _json.loads(proc.stdout)
+
+
+def _browse_escape_helpers():
+    """The real ``escapeHtml`` / ``escapeAttr`` from the shared static file."""
+    from pathlib import Path
+
+    src = Path(__file__).parent.parent / "static" / "vireo-utils.js"
+    text = src.read_text(encoding="utf-8")
+    start = text.find("function escapeHtml(")
+    end = text.find("var VireoTextInputs")
+    assert start != -1 and end > start, "vireo-utils.js escape helpers moved"
+    return text[start:end]
+
+
+def _run_detail_prediction_panel(html, mode, payload):
+    """Run Browse's single-photo prediction renderer for real."""
+    start = html.find("function predictionIsAmbiguous(")
+    end = html.find("function openPredictionInReview(")
+    assert start != -1 and end > start, (
+        "browse.html's detail prediction panel could not be located"
+    )
+    source = "\n".join([
+        _PANEL_DOM_STUB, _browse_escape_helpers(), html[start:end],
+        _PANEL_DRIVER,
+    ])
+    import json as _json
+
+    return _run_node(source, [mode, _json.dumps(payload)])
+
+
+_APOSTROPHE_SPECIES = "Say's Phoebe"
+
+
+def _apostrophe_panel_payload():
+    """One pending, unambiguous prediction whose species has an apostrophe."""
+    return {
+        "photoId": 44,
+        "data": {
+            "predictions": [{
+                "id": 12, "photo_id": 44,
+                "species": _APOSTROPHE_SPECIES,
+                "consensus_species": _APOSTROPHE_SPECIES,
+                "status": "pending", "confidence": 0.91,
+                "model": "test-classifier", "effective_category": "new",
+                "alternatives": [],
+            }],
+            "photo_states": {"44": {
+                "threshold": 0, "detector_ran": True, "classifier_ran": True,
+            }},
+        },
+    }
+
+
+def _parse_elements(markup):
+    """Every (tag, attrs) the browser would see, via the stdlib parser.
+
+    Attribute-level assertions are the point: a species name that escaped
+    into markup shows up here as extra attributes on the button, which is
+    exactly what a browser would do with it.
+    """
+    from html.parser import HTMLParser
+
+    found = []
+
+    class _Collector(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            found.append((tag, dict(attrs)))
+
+    parser = _Collector(convert_charrefs=True)
+    parser.feed(markup)
+    parser.close()
+    return found
+
+
+def test_browse_detail_prediction_buttons_survive_apostrophe_species(
+    app_and_db,
+):
+    """Say's Phoebe must get a working Accept button.
+
+    Codex P2 (browse.html:6996). The panel used to build its buttons as
+    ``onclick='acceptDetailPredictions([12],44,"Say's Phoebe")'`` — a
+    single-quoted attribute holding a JSON string. The apostrophe closed the
+    attribute, so the browser kept a truncated handler and parsed the rest of
+    the species as stray attributes: Accept and Reject were broken outright
+    for Say's Phoebe, Cooper's Hawk, Steller's Jay, Bewick's Wren, Swainson's
+    Hawk and every other possessive common name, which is a large share of
+    the North American birds this app exists to organise.
+
+    The fix keeps row data out of markup entirely — the buttons carry an
+    index and a delegated listener reads ids and species back out of
+    ``detailPredictionGroups`` — so this test asserts on the parsed markup
+    (no species anywhere in any attribute) and then on the round trip (the
+    handler still receives the exact species, apostrophe intact).
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    payload = _apostrophe_panel_payload()
+
+    rendered = _run_detail_prediction_panel(html, "render", payload)["html"]
+    elements = _parse_elements(rendered)
+    accepts = [
+        attrs for tag, attrs in elements
+        if tag == "button" and attrs.get("class") == "prediction-accept"
+    ]
+    rejects = [
+        attrs for tag, attrs in elements
+        if tag == "button" and attrs.get("class") == "prediction-reject"
+    ]
+    assert len(accepts) == 1, f"expected one Accept button, got {elements}"
+    assert len(rejects) == 1
+    # The exact attribute set, not just "the ones we want are present":
+    # the old bug manifested as *extra* attributes split out of the species.
+    assert set(accepts[0]) == {
+        "class", "data-prediction-action", "data-prediction-group", "title",
+    }
+    assert accepts[0]["data-prediction-action"] == "accept"
+    assert accepts[0]["data-prediction-group"] == "0"
+    assert set(rejects[0]) == {
+        "class", "data-prediction-action", "data-prediction-group", "title",
+    }
+    # No fragment of the species reaches any attribute of any element — the
+    # name belongs in text, where escapeHtml already handles it.
+    for tag, attrs in elements:
+        for name, value in attrs.items():
+            assert "Phoebe" not in name, (tag, name)
+            assert "Phoebe" not in (value or ""), (tag, name, value)
+    # It is still displayed, and displayed correctly.
+    assert "Say&#x27;s Phoebe" in rendered or "Say's Phoebe" in rendered
+
+    # The round trip: clicking the rendered button calls the accept path
+    # with the species the row named, apostrophe and all.
+    clicked = _run_detail_prediction_panel(
+        html, "click", {**payload, "attrs": accepts[0]},
+    )
+    assert clicked.get("error") is None, clicked
+    assert clicked["calls"] == [{
+        "fn": "accept", "ids": [12], "photoId": 44,
+        "species": _APOSTROPHE_SPECIES,
+    }]
+
+    rejected = _run_detail_prediction_panel(
+        html, "click", {**payload, "attrs": rejects[0]},
+    )
+    assert rejected.get("error") is None, rejected
+    assert rejected["calls"] == [
+        {"fn": "reject", "ids": [12], "photoId": 44},
+    ]
+
+
+def test_browse_detail_panel_scores_consensus_species_from_matching_row(
+    app_and_db,
+):
+    """Codex P2 (browse.html:7038): borrowed confidence for the consensus.
+
+    ``renderDetailPredictions`` groups burst rows under their
+    ``consensus_species`` — a Robin/Robin/Sparrow burst aggregates under
+    Robin from every frame, including the Sparrow-labelled minority — but
+    the pre-fix rendering then ranked the group by whichever row's raw
+    ``p.confidence`` was highest. Sparrow at 95% in a Robin-majority
+    burst was rendered as ``Robin · 95%`` even though nothing scored
+    Robin at 95%, and the sort could float that bucket above genuine
+    Robin evidence at a real 60%.
+
+    Reachability is legacy: the classifier since #1165 stores
+    ``group_id = NULL`` when the frames disagree, but rows written before
+    that are still pending in the catalog and carry a mixed-consensus
+    ``group_id``. The single-photo panel used to display and rank them
+    on a borrowed score.
+
+    Mirrors the server-side fix in
+    ``api_selection_prediction_suggestions``: credit ``p.confidence``
+    only when the raw label agrees with the consensus, and a bucket with
+    no contributing row reports confidence unknown and sinks below any
+    bucket carrying real evidence.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+
+    def _pred(pid, raw, consensus, confidence):
+        return {
+            "id": pid, "photo_id": 44,
+            "species": raw, "consensus_species": consensus,
+            "status": "pending", "confidence": confidence,
+            "model": "burst-classifier", "effective_category": "new",
+            "alternatives": [],
+        }
+
+    def _render(preds):
+        return _run_detail_prediction_panel(html, "render", {
+            "photoId": 44,
+            "data": {
+                "predictions": preds,
+                "photo_states": {"44": {
+                    "threshold": 0,
+                    "detector_ran": True,
+                    "classifier_ran": True,
+                }},
+            },
+        })["html"]
+
+    # Two rows, both aggregated under Robin (their ``consensus_species``).
+    # The minority Sparrow frame scores 0.95 — evidence for Sparrow, not
+    # Robin. The Robin-labelled frame scores 0.60 — the only real Robin
+    # evidence in the bucket. The rendered meta line must credit Robin
+    # at 60% (its own evidence), never at Sparrow's 95%.
+    mixed = _render([
+        _pred(1, "Sparrow", "Robin", 0.95),
+        _pred(2, "Robin", "Robin", 0.60),
+    ])
+    assert "60%" in mixed, mixed
+    assert "95%" not in mixed, (
+        "the Sparrow frame's 0.95 was for Sparrow — the Robin bucket must "
+        "not rank or display on a borrowed score"
+    )
+
+    # Only-minority bucket: every row in the Robin bucket is a Sparrow
+    # frame, so no row carries Robin evidence and the confidence is
+    # unknown, not a fabricated 95%.
+    only_minority = _render([_pred(1, "Sparrow", "Robin", 0.95)])
+    assert "confidence unknown" in only_minority, only_minority
+    assert "95%" not in only_minority
+
+    # Sort: a bucket with real 60% Cormorant evidence still ranks above
+    # one whose only rows borrow from another species (null confidence).
+    # Document order is DOM order, which is what the user reads.
+    ranked = _render([
+        _pred(1, "Sparrow", "Robin", 0.95),
+        _pred(2, "Cormorant", "Cormorant", 0.60),
+    ])
+    cormorant_at = ranked.find("Cormorant")
+    robin_at = ranked.find("Robin")
+    assert cormorant_at != -1 and robin_at != -1
+    assert cormorant_at < robin_at, (
+        "a bucket with genuine 60% evidence must rank above one whose "
+        "only rows borrow from another species"
+    )
+
+
+def test_browse_reject_toast_names_workspace_detach_skips(app_and_db):
+    """A reject that skipped a detached photo has to say so.
+
+    Codex P2 (browse.html:7212). ``batch-reject`` filters photos whose folder
+    left the workspace between the payload check and the decision lock and
+    returns ``skipped_out_of_workspace``, exactly as ``batch-accept`` does.
+    The reject reporter ignored the counter, so the response
+    ``{rejected: 0, skipped_out_of_workspace: 1}`` produced no toast at all:
+    a click that did nothing and said nothing, which is the silence this
+    PR's skip reporting exists to remove.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    body = _browse_js_function_body(html, "function _reportSkippedRejects(")
+    import json as _json
+
+    source = (
+        "var __toasts = [];\n"
+        "function showToast(message) { __toasts.push(message); }\n"
+        + body
+        + "\n_reportSkippedRejects(JSON.parse(process.argv[2]));\n"
+        "process.stdout.write(JSON.stringify({toasts: __toasts}));\n"
+    )
+    detached_only = _run_node(source, [_json.dumps({
+        "ok": True, "rejected": 0, "already_decided": 0,
+        "skipped_superseded": 0, "skipped_out_of_workspace": 1,
+    })])["toasts"]
+    assert len(detached_only) == 1, (
+        "a reject that skipped a detached photo must not be silent"
+    )
+    assert "no longer in this workspace" in detached_only[0]
+    assert detached_only[0].startswith("Nothing rejected")
+
+    # And it is named alongside the other reasons, not instead of them.
+    mixed = _run_node(source, [_json.dumps({
+        "ok": True, "rejected": 2, "already_decided": 1,
+        "skipped_superseded": 0, "skipped_out_of_workspace": 3,
+    })])["toasts"]
+    assert len(mixed) == 1
+    assert "Rejected 2" in mixed[0]
+    assert "1 already decided elsewhere" in mixed[0]
+    assert "3 no longer in this workspace" in mixed[0]
+
+    # Nothing skipped stays quiet: a toast on every clean reject would be
+    # noise, and the accept side behaves the same way.
+    clean = _run_node(source, [_json.dumps({
+        "ok": True, "rejected": 2, "already_decided": 0,
+        "skipped_superseded": 0, "skipped_out_of_workspace": 0,
+    })])["toasts"]
+    assert clean == []
+
+
+# ID Conflicts' batch accept and Review's Accept All are inline JS with no
+# server of their own, so the only honest way to check what they claim is to
+# run them against a miniature of the real one: a decision on any row of a
+# burst settles every member of that burst and names them all in
+# ``prediction_ids``, and a row already settled answers 409. Everything under
+# assertion is lifted verbatim from the shipped templates.
+#
+# One stub, both pages. They loop the same three routes over the same contract,
+# and giving each harness its own idea of what the server does is how the two
+# pages came to disagree about it in the first place — the harnesses would have
+# happily agreed while the pages diverged.
+def _grouped_decision_server_stub(fetch_name):
+    """The burst-expanding decision server, wired to a page's fetch helper."""
+    return """
+var __input = JSON.parse(process.argv[2]);
+var __status = __input.status;   // {predId: 'pending' | terminal status}
+var __groups = __input.groups;   // {predId: [every row one decision settles]}
+var __requests = [];
+async function %s(url) {
+  var predId = Number(url.split('/')[3]);
+  __requests.push(predId);
+  if (__status[predId] !== 'pending') {
+    var err = new Error(
+      'prediction already ' + __status[predId] + '; cannot accept');
+    err.status = 409;
+    err.answered = true;
+    throw err;
+  }
+  var members = __groups[predId] || [predId];
+  members.forEach(function(m) { __status[m] = 'accepted'; });
+  return {ok: true, prediction_ids: members};
+}
+var __toasts = [];
+function showToast(message, kind) { __toasts.push({message: message, kind: kind}); }
+""" % fetch_name
+
+
+def _grouped_decision_module():
+    """The shared client contract, from the very file both pages load."""
+    from pathlib import Path
+
+    src = Path(__file__).parent.parent / "static" / "vireo-predictions.js"
+    text = src.read_text(encoding="utf-8")
+    assert "groupedDecisionTracker" in text, "vireo-predictions.js moved"
+    return text
+
+
+_ID_CONFLICTS_BATCH_STUB = """
+var compareData = {photos: __input.photos};
+var selectedRows = new Set(__input.photos.map(function(p) { return p.photo_id; }));
+function bestPrediction(photo) { return photo.prediction; }
+async function loadComparison() {}
+"""
+
+_ID_CONFLICTS_BATCH_DRIVER = """
+batchAction('accept').then(function() {
+  process.stdout.write(JSON.stringify({
+    toasts: __toasts, requests: __requests, status: __status,
+  }));
+});
+"""
+
+
+def _run_id_conflicts_batch(html, payload):
+    """Run ID Conflicts' real ``batchAction`` against the stub server."""
+    start = html.find("function endpointForAction(")
+    # ``rfind``: the threshold control is also *called* earlier in the page,
+    # and only the last occurrence is the bootstrap line that follows
+    # ``batchAction``.
+    end = html.rfind("updateConflictThresholdControl();")
+    assert start != -1 and end > start, (
+        "id_conflicts.html's batch action code could not be located"
+    )
+    import json as _json
+
+    source = "\n".join([
+        _grouped_decision_server_stub("jsonFetch"), _grouped_decision_module(),
+        _ID_CONFLICTS_BATCH_STUB, html[start:end], _ID_CONFLICTS_BATCH_DRIVER,
+    ])
+    return _run_node(source, [_json.dumps(payload)])
+
+
+def test_id_conflicts_batch_accept_reports_group_expanded_rows_as_applied(
+    app_and_db,
+):
+    """A burst the server settles in one write must not be reported as failed.
+
+    Codex P2 (id_conflicts.html:1645). Select two photos of one burst and the
+    loop's first accept expands through ``accept_prediction`` and decides both
+    rows; the second request then meets the terminal-status 409 this PR added.
+    Counting that as "not applied" is a false claim about the database, and
+    about work this very batch performed — the exact failure the rest of this
+    flow exists to remove.
+
+    The fix reads the ids the accept says it wrote and skips them, so the
+    second request is never sent. That keeps the distinction that matters
+    intact, which the second half asserts: a row settled by somebody *else*
+    is not in that list, still 409s, and is still reported as a refusal.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/id-conflicts").get_data(as_text=True)
+    photos = [
+        {"photo_id": 1, "prediction": {"id": 11}},
+        {"photo_id": 2, "prediction": {"id": 12}},
+    ]
+
+    burst = _run_id_conflicts_batch(html, {
+        "photos": photos,
+        "status": {"11": "pending", "12": "pending"},
+        "groups": {"11": [11, 12], "12": [11, 12]},
+    })
+    assert burst["requests"] == [11], (
+        "the second photo's row was already decided by the first request"
+    )
+    assert burst["status"] == {"11": "accepted", "12": "accepted"}
+    assert burst["toasts"] == [], (
+        "both rows were accepted, so nothing may be reported as not applied"
+    )
+
+    # Control: same two photos, no group, and the second row was decided
+    # elsewhere. That 409 is a real conflict and has to stay one.
+    stale = _run_id_conflicts_batch(html, {
+        "photos": photos,
+        "status": {"11": "pending", "12": "rejected"},
+        "groups": {},
+    })
+    assert stale["requests"] == [11, 12]
+    assert [t["message"] for t in stale["toasts"]] == [
+        "1 of 2 not applied — prediction already rejected; cannot accept",
+    ]
+
+
+# Review's accept handlers, driven against the same burst-expanding server.
+# ``predictions`` is the filtered view and ``allPredictions`` the unfiltered
+# copy over the same objects, exactly as ``loadPredictions`` builds them; the
+# ``filtered_out`` key lets a test put a group sibling outside the current
+# filter, where only the unfiltered copy can see it.
+_REVIEW_ACCEPT_STUB = """
+var allPredictions = __input.predictions;
+var __filteredOut = __input.filtered_out || [];
+var predictions = allPredictions.filter(function(p) {
+  return __filteredOut.indexOf(p.id) < 0;
+});
+var _predictionsReloading = false;
+var _loadPredictionsEpoch = 0;
+function _predictionEpochStale(epoch) { return epoch !== _loadPredictionsEpoch; }
+var __renders = 0;
+function renderAll() { __renders++; }
+async function loadPredictions() {}
+function __report() {
+  var local = {};
+  allPredictions.forEach(function(p) { local[p.id] = p.status; });
+  process.stdout.write(JSON.stringify({
+    requests: __requests, serverStatus: __status, localStatus: local,
+    toasts: __toasts, renders: __renders,
+  }));
+}
+"""
+
+
+def _run_review_accept(html, payload, call):
+    """Run Review's real accept handlers against the stub server."""
+    start = html.find("/* ---------- Actions ---------- */")
+    end = html.find("/* ---------- Keyboard Shortcuts ---------- */")
+    assert start != -1 and end > start, (
+        "review.html's accept actions could not be located"
+    )
+    import json as _json
+
+    source = "\n".join([
+        _grouped_decision_server_stub("safeFetch"), _grouped_decision_module(),
+        _REVIEW_ACCEPT_STUB, html[start:end], call + ".then(__report);",
+    ])
+    return _run_node(source, [_json.dumps(payload)])
+
+
+def test_review_accept_all_consumes_grouped_accept_expansion(app_and_db):
+    """A burst in Review's queue must not abandon the rest of Accept All.
+
+    Codex P2 (app.py:17964). ``acceptAllPending`` loops ``/accept`` over a
+    snapshot of the pending rows, and ``accept_prediction`` fans one accept
+    across every pending member of the burst group. The second member is then
+    already decided, meets the terminal-status 409 this PR added, and Review's
+    catch block *breaks the loop* — so one burst anywhere in the queue leaves
+    every unrelated prediction after it unaccepted, with the button reporting
+    nothing at all. Worse than the ID Conflicts case round 18 fixed: there the
+    loop continued and merely miscounted.
+
+    The fix is the same one, from the same shared module: consume the
+    ``prediction_ids`` the accept says it wrote. The control below keeps the
+    distinction that fix exists to preserve — a row settled by somebody *else*
+    is not in that list, still 409s, and still stops the run rather than being
+    quietly credited to this one.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/review").get_data(as_text=True)
+    assert "/static/vireo-predictions.js" in html, (
+        "Review must load the shared grouped-decision module"
+    )
+    # 11 and 12 are one burst; 13 is unrelated and queued behind them.
+    predictions = [
+        {"id": 11, "status": "pending"},
+        {"id": 12, "status": "pending"},
+        {"id": 13, "status": "pending"},
+    ]
+
+    burst = _run_review_accept(html, {
+        "predictions": predictions,
+        "status": {"11": "pending", "12": "pending", "13": "pending"},
+        "groups": {"11": [11, 12], "12": [11, 12]},
+    }, "acceptAllPending()")
+    assert burst["requests"] == [11, 13], (
+        "12 was already decided by the request for 11; re-sending it 409s and "
+        "kills the run before 13 is ever accepted"
+    )
+    assert burst["serverStatus"] == {
+        "11": "accepted", "12": "accepted", "13": "accepted",
+    }
+    # And the cards agree with the database: no row is left offering an Accept
+    # the server has already recorded.
+    assert burst["localStatus"] == {
+        "11": "accepted", "12": "accepted", "13": "accepted",
+    }
+
+    # Control: no group, and 12 was decided by someone else. That 409 is a real
+    # conflict, not this run's own work, and must still stop the run.
+    stale = _run_review_accept(html, {
+        "predictions": predictions,
+        "status": {"11": "pending", "12": "rejected", "13": "pending"},
+        "groups": {},
+    }, "acceptAllPending()")
+    assert stale["requests"] == [11, 12]
+    assert stale["localStatus"]["12"] != "accepted", (
+        "a row somebody else rejected must never be marked accepted here"
+    )
+    assert stale["localStatus"]["13"] == "pending"
+
+
+def test_review_single_accept_marks_expanded_group_members(app_and_db):
+    """One Accept click on a burst member settles the whole burst on screen.
+
+    The other half of the same Codex P2: ``acceptPrediction`` credited only the
+    row in the URL, so the siblings ``accept_prediction`` decided in the same
+    transaction kept rendering as pending — offering an Accept the database had
+    already recorded, and a Reject that would now 409.
+
+    The sibling here sits outside the collection filter, so it exists only in
+    ``allPredictions``. Walking just the filtered view would miss it and leave
+    the unfiltered copy lying the moment the filter is cleared.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/review").get_data(as_text=True)
+
+    result = _run_review_accept(html, {
+        "predictions": [
+            {"id": 11, "status": "pending"},
+            {"id": 12, "status": "pending"},
+            {"id": 13, "status": "pending"},
+        ],
+        "filtered_out": [12],
+        "status": {"11": "pending", "12": "pending", "13": "pending"},
+        "groups": {"11": [11, 12], "12": [11, 12]},
+    }, "acceptPrediction(11)")
+    assert result["requests"] == [11]
+    assert result["localStatus"] == {
+        "11": "accepted", "12": "accepted", "13": "pending",
+    }
+    assert result["renders"] == 1
+
+
+def _seed_pending_prediction(db, filename, species):
+    """One pending prediction on a fresh photo — the starting state every
+    reviewed-status test then transitions from through
+    ``api_mark_prediction_reviewed`` (rather than a direct status write) so
+    the fixture matches what a real "Reviewed" click leaves in the database.
+    """
+    photo_id, _ = _seed_prediction_photo(db, filename, species, 0.9)
+    pred_id = _prediction_id(db, photo_id, species)
+    return photo_id, pred_id
+
+
+def test_mark_reviewed_transition_and_reject_refuses_reviewed(app_and_db):
+    """``reviewed`` is a decision; single-row reject must not overwrite it.
+
+    Codex P2 (browse.html:6891): "Include ``reviewed`` in the terminal-status
+    checks across the panel and server paths." A pending row the user marked
+    reviewed to say "I looked and chose not to act" cannot be silently flipped
+    to ``rejected`` by a stale Browse Reject button; the recorded history
+    entry would encode a "previous" status of ``pending`` — a fiction — and
+    undo would then knock the row back to ``pending`` even though it had
+    never been pending since the reviewed decision.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    _, pred_id = _seed_pending_prediction(db, "reviewed-then-reject.jpg", "Osprey")
+
+    resp = client.post(f"/api/predictions/{pred_id}/reviewed")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    ws_id = db._ws_id()
+    status = db.conn.execute(
+        """SELECT pr_rev.status FROM prediction_review pr_rev
+           WHERE pr_rev.prediction_id = ? AND pr_rev.workspace_id = ?""",
+        (pred_id, ws_id),
+    ).fetchone()["status"]
+    assert status == "reviewed"
+    edits_after_mark = len(db.get_edit_history(limit=50))
+
+    reject = client.post(f"/api/predictions/{pred_id}/reject")
+    assert reject.status_code == 409, reject.get_data(as_text=True)
+    assert "reviewed" in reject.get_json().get("error", "")
+
+    # The reviewed decision survives untouched — status did not flip and no
+    # ghost history entry was appended.
+    status = db.conn.execute(
+        """SELECT pr_rev.status FROM prediction_review pr_rev
+           WHERE pr_rev.prediction_id = ? AND pr_rev.workspace_id = ?""",
+        (pred_id, ws_id),
+    ).fetchone()["status"]
+    assert status == "reviewed"
+    assert len(db.get_edit_history(limit=50)) == edits_after_mark
+
+
+def test_single_accept_refuses_reviewed_prediction(app_and_db):
+    """The accept mirror of the reject-refuses-reviewed case.
+
+    ``api_accept_prediction`` on a reviewed row would tag the photo with the
+    species the user just explicitly chose not to act on, and would record a
+    ``prediction_accept`` history entry whose recorded previous prediction
+    state is a lie.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, pred_id = _seed_pending_prediction(db, "reviewed-then-accept.jpg", "Merlin")
+
+    reviewed = client.post(f"/api/predictions/{pred_id}/reviewed")
+    assert reviewed.status_code == 200
+    edits_after_mark = len(db.get_edit_history(limit=50))
+    keywords_before = {k["name"] for k in db.get_photo_keywords(photo_id)}
+
+    accept = client.post(f"/api/predictions/{pred_id}/accept")
+    assert accept.status_code == 409, accept.get_data(as_text=True)
+    assert "reviewed" in accept.get_json().get("error", "")
+
+    assert {k["name"] for k in db.get_photo_keywords(photo_id)} == keywords_before, (
+        "an accept that should have been refused still tagged the photo"
+    )
+    assert len(db.get_edit_history(limit=50)) == edits_after_mark
+
+
+def test_batch_endpoints_skip_reviewed_predictions(app_and_db):
+    """Reviewed rows are counted back under ``already_decided``, not accepted.
+
+    Bulk endpoints share ``_DECIDED_PREDICTION_STATUSES`` with the single-row
+    routes so the meaning of "already decided" cannot drift between them. A
+    reviewed row surviving into a Browse batch payload — from a stale panel
+    or a hand-rolled request — hits the same wall the single-row endpoints do.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, pred_id = _seed_pending_prediction(
+        db, "batch-vs-reviewed.jpg", "Peregrine Falcon",
+    )
+    assert client.post(f"/api/predictions/{pred_id}/reviewed").status_code == 200
+    keywords_before = {k["name"] for k in db.get_photo_keywords(photo_id)}
+
+    accept = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+    )
+    assert accept.status_code == 200, accept.get_data(as_text=True)
+    body = accept.get_json()
+    assert body["accepted"] == 0
+    assert body["already_decided"] == 1
+
+    reject = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": [pred_id]},
+    )
+    assert reject.status_code == 200, reject.get_data(as_text=True)
+    body = reject.get_json()
+    assert body["rejected"] == 0
+    assert body["already_decided"] == 1
+
+    ws_id = db._ws_id()
+    status = db.conn.execute(
+        """SELECT pr_rev.status FROM prediction_review pr_rev
+           WHERE pr_rev.prediction_id = ? AND pr_rev.workspace_id = ?""",
+        (pred_id, ws_id),
+    ).fetchone()["status"]
+    assert status == "reviewed"
+    assert {k["name"] for k in db.get_photo_keywords(photo_id)} == keywords_before
+
+
+def test_grouped_accept_expansion_skips_reviewed_group_member(app_and_db):
+    """Group expansion cannot reach a reviewed sibling.
+
+    ``_expansion_allowed`` (db.py) treats a reviewed row exactly like an
+    accepted or rejected one. Without this, accepting one burst member would
+    silently flip a reviewed sibling to ``accepted`` — tagging its photo with
+    a species the user had chosen not to act on and writing a history entry
+    whose previous status is a fiction.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+    group_id = "grp-reviewed"
+    photo_ids = []
+    pred_ids = []
+    for name in ("burst-a.jpg", "burst-b.jpg"):
+        pid = db.add_photo(
+            folder_id=folder_id, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det = db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(
+            det, "Common Loon", 0.9, "bioclip",
+            status="pending", labels_fingerprint="fp1",
+            group_id=group_id, individual='{"Common Loon": 2}',
+        )
+        photo_ids.append(pid)
+        pred_ids.append(_prediction_id(db, pid, "Common Loon"))
+
+    # Mark one member reviewed — the group expansion must leave it alone
+    # when the other member is accepted.
+    resp = client.post(f"/api/predictions/{pred_ids[0]}/reviewed")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    accept = client.post(f"/api/predictions/{pred_ids[1]}/accept")
+    assert accept.status_code == 200, accept.get_data(as_text=True)
+
+    ws_id = db._ws_id()
+    rows = {
+        row["prediction_id"]: row["status"]
+        for row in db.conn.execute(
+            """SELECT prediction_id, status FROM prediction_review
+               WHERE workspace_id = ? AND prediction_id IN (?, ?)""",
+            (ws_id, pred_ids[0], pred_ids[1]),
+        )
+    }
+    assert rows[pred_ids[0]] == "reviewed", (
+        "group expansion swept a reviewed sibling into accepted"
+    )
+    assert rows[pred_ids[1]] == "accepted"
+    # Only the accepted member's photo is tagged; the reviewed one stays clear.
+    assert {k["name"] for k in db.get_photo_keywords(photo_ids[0])} == set()
+    assert "Common Loon" in {k["name"] for k in db.get_photo_keywords(photo_ids[1])}
+
+
+def test_single_reject_serializes_with_concurrent_batch_accept(
+    app_and_db, monkeypatch,
+):
+    """Codex P1: single-row reject cannot slip past a batch-accept in flight.
+
+    The failure mode Codex identified: a Browse batch-accept overlapping a
+    Review-side single reject on the same row lets the reject read while the
+    batch holds the writer lock, then overwrite the newly accepted status
+    *after* the batch commits — leaving the species keyword attached to a
+    row now marked ``rejected``. The fix wraps ``api_reject_prediction`` in
+    ``_begin_prediction_decision`` so its check-and-write is one indivisible
+    step against the batch's.
+
+    Same in-process, deterministic exercise as
+    ``test_batch_accept_checks_and_writes_are_one_transaction`` — a competing
+    connection fires at the exact instant between the endpoint's check and
+    its first write, hooked through the DB layer.
+    """
+    import sqlite3
+    import threading
+
+    import db as db_module
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(
+        db, "single-reject-vs-batch.jpg", "TestZanclusgamma", 0.9,
+    )
+    pred_id = _prediction_id(db, photo_id, "TestZanclusgamma")
+    ws_id = db._ws_id()
+    db_file = _db_file(db)
+
+    competing = {}
+
+    def _competing_accept():
+        # 0.5s timeout — long enough to take an unlocked opening, short
+        # enough that a properly locked one gives up well inside the test.
+        conn = sqlite3.connect(db_file, timeout=0.5)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """INSERT INTO prediction_review
+                     (prediction_id, workspace_id, status, reviewed_at)
+                   VALUES (?, ?, 'accepted', datetime('now'))
+                   ON CONFLICT(prediction_id, workspace_id)
+                   DO UPDATE SET status = 'accepted'""",
+                (pred_id, ws_id),
+            )
+            conn.commit()
+            competing["committed"] = True
+        except sqlite3.OperationalError as exc:
+            competing["refused"] = str(exc)
+        finally:
+            conn.close()
+
+    original_update = db_module.Database.update_prediction_status
+    fired = []
+
+    def _update_with_interleave(self, this_pred_id, status, *args, **kwargs):
+        # Only fire on the first write, which is the reject we are guarding.
+        if not fired and status == "rejected" and this_pred_id == pred_id:
+            fired.append(True)
+            thread = threading.Thread(target=_competing_accept)
+            thread.start()
+            thread.join(timeout=30)
+            assert not thread.is_alive()
+        return original_update(self, this_pred_id, status, *args, **kwargs)
+
+    monkeypatch.setattr(
+        db_module.Database,
+        "update_prediction_status",
+        _update_with_interleave,
+    )
+
+    resp = client.post(f"/api/predictions/{pred_id}/reject")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert fired, "the interleave hook never ran, so nothing was exercised"
+    assert not competing.get("committed"), (
+        "another connection recorded a decision between single-row reject's "
+        "precondition check and its write — the check is not atomic with "
+        "the write it guards"
+    )
+    assert "locked" in competing.get("refused", ""), competing
+
+    status = db.conn.execute(
+        """SELECT COALESCE(pr_rev.status, 'pending') AS status
+           FROM predictions pr
+           LEFT JOIN prediction_review pr_rev
+             ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+           WHERE pr.id = ?""",
+        (ws_id, pred_id),
+    ).fetchone()["status"]
+    assert status == "rejected"
+
+
+def test_browse_panel_treats_reviewed_status_as_decided(app_and_db):
+    """The single-photo predictions panel must not offer Accept on ``reviewed``.
+
+    Server guards refuse the flip regardless, but ``CORE_PHILOSOPHY.md``'s
+    "no black boxes" rule forbids rendering an action the panel knows will
+    409. The bug shape without the fix: the panel groups every non-decided
+    row into a ``pending`` bucket and renders Accept/Reject; a click then
+    posts a payload the server refuses, leaving the user staring at a button
+    that appears to do nothing.
+    """
+    import re
+
+    from db import Database
+
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+
+    # The panel routes its check through one named constant rather than an
+    # inline comparison, so assert the constant equals the backend's list
+    # instead of grepping near the comparison. That catches drift in either
+    # direction — a status added to the server and forgotten in the panel, or
+    # the reverse — which a proximity check on literals cannot.
+    match = re.search(
+        r"var PREDICTION_DECIDED_STATUSES = \[([^\]]*)\]", html,
+    )
+    assert match, "the panel's decided-status constant is missing"
+    panel_statuses = [
+        part.strip().strip("'\"")
+        for part in match.group(1).split(",")
+        if part.strip()
+    ]
+    assert panel_statuses == list(Database.DECIDED_PREDICTION_STATUSES), (
+        "the panel's decided-status list must match "
+        "Database.DECIDED_PREDICTION_STATUSES; "
+        f"panel has {panel_statuses}"
+    )
+    assert "var decided = predictionIsDecided(p);" in html, (
+        "the panel's row grouping must use the shared decided-status check"
+    )
+
+
+def test_browse_detail_panel_keeps_row_data_out_of_markup(app_and_db):
+    """No prediction row's data may be interpolated into an attribute.
+
+    The escaping bug this replaces was possible because the panel built
+    inline handlers by string concatenation. Escaping fixed the one line;
+    this asserts the idiom itself is gone from the renderer, so the next
+    button added here cannot reintroduce it — the buttons carry an index
+    into ``detailPredictionGroups`` and a delegated listener reads the ids
+    and species back out.
+
+    ``test_browse_detail_prediction_buttons_survive_apostrophe_species``
+    proves the resulting markup and click round trip actually work; this
+    one guards the shape that keeps them working.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    body = _browse_js_function_body(html, "function renderDetailPredictions(")
+    assert body, "renderDetailPredictions must exist in browse.html"
+    assert "onclick" not in body, (
+        "the detail prediction panel must wire its buttons through the "
+        "delegated listener, not inline handlers built by concatenation"
+    )
+    assert "JSON.stringify(g.species)" not in body
+    assert 'data-prediction-action="accept"' in body
+    assert "detailPredictionGroups = shown;" in body
+    handler = _browse_js_function_body(
+        html, "function handleDetailPredictionClick(",
+    )
+    assert "detailPredictionGroups[" in handler, (
+        "the handler must resolve the row's data from the side table"
+    )
+
+
+def test_browse_reject_reporter_names_workspace_detach_skips(app_and_db):
+    """Codex P2 (browse.html:7206): silent Reject when the photo was detached.
+
+    ``batch-reject`` returns ``skipped_out_of_workspace`` for the same
+    parse-vs-lock race the accept path handles, but ``_reportSkippedRejects``
+    was only reading ``already_decided`` and ``skipped_superseded`` — a Reject
+    that skipped every row for a detach would return success with no toast at
+    all, leaving the user hunting for a broken button.
+
+    Structural: the field's client-side rendering is what was missing, and
+    the server-side count already has coverage in
+    ``test_batch_reject_skips_out_of_workspace``.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    body = _browse_js_function_body(html, "function _reportSkippedRejects(")
+    assert body, "_reportSkippedRejects must exist in browse.html"
+    assert "skipped_out_of_workspace" in body, (
+        "the reject reporter must surface skipped_out_of_workspace the same "
+        "way _reportSkippedAccepts does — silence would be a black box"
+    )
+    # And the accept reporter still names the same field, so the two panels
+    # cannot drift back apart on this one signal.
+    accept_body = _browse_js_function_body(html, "function _reportSkippedAccepts(")
+    assert "skipped_out_of_workspace" in accept_body

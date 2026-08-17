@@ -1380,12 +1380,15 @@ async function togglePendingDetail() {
   panel.innerHTML = '<span style="color:var(--text-ghost);font-size:13px;">Loading...</span>';
   pendingOpen = true;
   try {
-    var data = await safeFetch('/api/sync/preview', {}, { toast: false });
+    // Keep the Dashboard summary quick even when a workspace has thousands
+    // of sidecars on network storage. The full review modal loads every page
+    // progressively and exposes exact progress.
+    var data = await safeFetch('/api/sync/preview?limit=50&offset=0', {}, { toast: false });
     if (data.total_changes === 0) {
       panel.innerHTML = '<span style="color:var(--text-ghost);font-size:13px;">No pending changes.</span>';
       return;
     }
-    var html = '<div style="font-size:12px;color:var(--text-dim);margin-bottom:12px;">' + data.total_changes + ' change(s) across ' + data.photos.length + ' photo(s)</div>';
+    var html = '<div style="font-size:12px;color:var(--text-dim);margin-bottom:12px;">' + data.total_changes + ' change(s) across ' + data.total_photos + ' photo(s)</div>';
     data.photos.forEach(function(p) {
       html += '<div style="margin-bottom:10px;padding:8px 10px;background:var(--bg-tertiary);border-radius:4px;">' +
         '<div style="font-size:12px;color:var(--text-primary);font-weight:500;margin-bottom:4px;">' + escapeHtml(p.filename) + '</div>' +
@@ -1407,6 +1410,9 @@ async function togglePendingDetail() {
       });
       html += '</div>';
     });
+    if (data.has_more) {
+      html += '<div style="font-size:12px;color:var(--text-ghost);padding:8px 2px;">Showing the first ' + data.photos.length + ' photos. Open Review Changes for the full progressive review.</div>';
+    }
     panel.innerHTML = html;
   } catch(e) {
     panel.innerHTML = '<span style="color:var(--danger);font-size:12px;">Failed to load pending changes.</span>';

@@ -14,15 +14,26 @@
       <h2 style="font-size:16px;color:var(--accent);margin:0;">Review Pending Changes</h2>
       <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);margin-left:auto;">
         <input type="range" id="syncThumbSize" min="60" max="600" value="120" step="20"
+               data-view-preference="vireo.syncPreview.thumbSize"
                style="width:80px;accent-color:var(--accent);"
                oninput="updateSyncThumbSize(this.value)">
         <span id="syncThumbSizeVal" style="min-width:32px;">120px</span>
       </label>
     </div>
+    <div id="syncPreviewProgress" class="sync-preview-progress" role="status" aria-live="polite">
+      <div style="display:flex;align-items:center;gap:12px;">
+        <strong id="syncPreviewProgressText" style="color:var(--text-primary);font-size:13px;">Preparing review...</strong>
+        <span id="syncPreviewProgressPercent" style="margin-left:auto;color:var(--text-dim);font-size:12px;"></span>
+      </div>
+      <div id="syncPreviewProgressTrack" class="sync-preview-progress-track" role="progressbar" aria-label="Preparing pending-change review" aria-valuemin="0">
+        <div id="syncPreviewProgressBar" class="sync-preview-progress-bar"></div>
+      </div>
+      <div id="syncPreviewProgressDetail" style="color:var(--text-ghost);font-size:11px;"></div>
+    </div>
     <div id="syncPreviewContent">Loading...</div>
     <div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end;">
-      <button onclick="discardAllChanges()" style="background:none;color:var(--danger);border:1px solid var(--danger);border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;">Discard All</button>
-      <button onclick="runVisibleSync()" style="background:var(--accent);color:var(--accent-text);border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;font-weight:500;">Sync to XMP</button>
+      <button id="syncPreviewDiscardAllButton" onclick="discardAllChanges()" style="background:none;color:var(--danger);border:1px solid var(--danger);border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;">Discard All</button>
+      <button id="syncPreviewSyncButton" onclick="runVisibleSync()" style="background:var(--accent);color:var(--accent-text);border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;font-weight:500;">Sync to XMP</button>
     </div>
   </div>
 </div>
@@ -84,6 +95,52 @@
     line-height: 1;
   }
   .sync-preview-discard:hover { color: var(--danger); }
+  .sync-preview-progress {
+    margin-bottom: 14px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-secondary);
+    border-radius: 6px;
+    background: var(--bg-tertiary);
+  }
+  .sync-preview-progress-track {
+    height: 5px;
+    margin: 8px 0 6px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--border-primary);
+  }
+  .sync-preview-progress-bar {
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--accent);
+    transition: width 180ms ease-out;
+  }
+  .sync-preview-progress-bar.is-preparing {
+    width: 32%;
+    animation: sync-preview-preparing 1.2s ease-in-out infinite alternate;
+  }
+  @keyframes sync-preview-preparing {
+    from { transform: translateX(-85%); }
+    to { transform: translateX(300%); }
+  }
+  #syncPreviewOverlay button:disabled {
+    cursor: not-allowed !important;
+    opacity: 0.45;
+  }
+  .sync-lightbox-action:disabled {
+    cursor: not-allowed !important;
+    opacity: 0.45;
+  }
+  .sync-preview-more {
+    margin-top: 12px;
+    padding: 10px;
+    border: 1px dashed var(--border-secondary);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-size: 12px;
+    text-align: center;
+  }
 </style>
 
 <script>
@@ -95,6 +152,16 @@ var _syncActiveFilters = null;
 var _syncModalOpen = false;
 var _syncEscToken = null;
 var _syncLightboxPanelEl = null;
+var _syncPreviewLoading = false;
+// Distinct "the load finished cleanly" flag. `_syncPreviewLoading` also
+// goes false on partial-load failure, so re-renders (filter toggle, Show
+// More) would otherwise re-enable Sync / Discard on a truncated queue.
+var _syncPreviewComplete = false;
+var _syncPreviewLoadToken = 0;
+var _syncPreviewAbortController = null;
+var _syncPreviewStartedAt = 0;
+var _syncPreviewElapsedTimer = null;
+var _syncPreviewDisplayLimit = 300;
 
 async function checkPendingSync() {
   try {
@@ -168,7 +235,189 @@ function updateSyncThumbSize(val) {
   });
 }
 
+function _syncElapsedText() {
+  if (!_syncPreviewStartedAt) return '';
+  var seconds = Math.max(0, Math.round((Date.now() - _syncPreviewStartedAt) / 1000));
+  if (seconds < 60) return seconds + 's elapsed';
+  return Math.floor(seconds / 60) + 'm ' + (seconds % 60) + 's elapsed';
+}
+
+function _syncSetPreviewActionsEnabled(enabled) {
+  var bottomDiscard = document.getElementById('syncPreviewDiscardAllButton');
+  var bottomSync = document.getElementById('syncPreviewSyncButton');
+  if (bottomDiscard) bottomDiscard.disabled = !enabled;
+  if (bottomSync) bottomSync.disabled = !enabled;
+  document.querySelectorAll('#syncPreviewContent .sync-preview-action').forEach(function(button) {
+    button.disabled = !enabled;
+  });
+}
+
+function _syncUpdatePreviewProgress(state, errorMessage) {
+  var box = document.getElementById('syncPreviewProgress');
+  var text = document.getElementById('syncPreviewProgressText');
+  var percent = document.getElementById('syncPreviewProgressPercent');
+  var track = document.getElementById('syncPreviewProgressTrack');
+  var bar = document.getElementById('syncPreviewProgressBar');
+  var detail = document.getElementById('syncPreviewProgressDetail');
+  if (!box || !text || !percent || !track || !bar || !detail) return;
+  box.style.display = 'block';
+
+  var loaded = _syncPreviewData && _syncPreviewData.photos
+    ? _syncPreviewData.photos.length : 0;
+  var total = _syncPreviewData ? (_syncPreviewData.total_photos || 0) : 0;
+  var pct = total > 0 ? Math.min(100, Math.round(loaded * 100 / total)) : 0;
+  bar.classList.remove('is-preparing');
+  if (total > 0) {
+    track.setAttribute('aria-valuemax', String(total));
+    track.setAttribute('aria-valuenow', String(loaded));
+  } else {
+    track.removeAttribute('aria-valuemax');
+    track.removeAttribute('aria-valuenow');
+  }
+
+  if (state === 'error') {
+    text.textContent = 'Could not finish preparing the review';
+    text.style.color = 'var(--danger)';
+    percent.textContent = '';
+    bar.style.width = pct + '%';
+    detail.textContent = errorMessage || 'Try closing and reopening the review.';
+    return;
+  }
+  text.style.color = 'var(--text-primary)';
+  if (state === 'complete') {
+    text.textContent = total === 0
+      ? 'No pending changes'
+      : 'Review ready — ' + total.toLocaleString() + ' photos checked';
+    percent.textContent = total > 0 ? '100%' : '';
+    bar.style.width = total > 0 ? '100%' : '0';
+    detail.textContent = total > 0
+      ? 'All results are loaded. Sync and discard actions are now available. · ' + _syncElapsedText()
+      : '';
+    return;
+  }
+  if (total > 0) {
+    text.textContent = 'Reviewing XMP metadata — ' + loaded.toLocaleString() + ' of ' + total.toLocaleString() + ' photos';
+    percent.textContent = pct + '%';
+    bar.style.width = pct + '%';
+    detail.textContent = 'Completed results are available below while Vireo reads the next batch. · ' + _syncElapsedText();
+  } else {
+    text.textContent = 'Preparing pending-change summary...';
+    percent.textContent = '';
+    bar.style.width = '32%';
+    bar.classList.add('is-preparing');
+    detail.textContent = 'The first results will appear as soon as they are ready. · ' + _syncElapsedText();
+  }
+}
+
+function _syncStopPreviewLoad() {
+  _syncPreviewLoadToken++;
+  if (_syncPreviewAbortController) {
+    _syncPreviewAbortController.abort();
+    _syncPreviewAbortController = null;
+  }
+  if (_syncPreviewElapsedTimer !== null) {
+    clearInterval(_syncPreviewElapsedTimer);
+    _syncPreviewElapsedTimer = null;
+  }
+  _syncPreviewLoading = false;
+  _syncPreviewComplete = false;
+}
+
+async function _syncStartPreviewLoad(restartCount) {
+  restartCount = restartCount || 0;
+  _syncStopPreviewLoad();
+  var loadToken = _syncPreviewLoadToken;
+  _syncPreviewAbortController = new AbortController();
+  _syncPreviewStartedAt = Date.now();
+  _syncPreviewDisplayLimit = 300;
+  _syncPreviewLoading = true;
+  _syncPreviewData = null;
+  _syncSetPreviewActionsEnabled(false);
+  document.getElementById('syncPreviewContent').innerHTML =
+    '<p style="color:var(--text-dim);padding:20px;">Waiting for the first results...</p>';
+  _syncUpdatePreviewProgress('loading');
+  _syncPreviewElapsedTimer = setInterval(function() {
+    if (_syncPreviewLoading && loadToken === _syncPreviewLoadToken) {
+      _syncUpdatePreviewProgress('loading');
+    }
+  }, 1000);
+
+  var offset = 0;
+  var revision = null;
+  var firstPage = true;
+  try {
+    var summary = await safeFetch('/api/sync/status', {
+      signal: _syncPreviewAbortController.signal,
+    }, { toast: false });
+    if (loadToken !== _syncPreviewLoadToken || !_syncModalOpen) return;
+    _syncPreviewData = {
+      photos: [],
+      total_changes: summary.pending_count || 0,
+      total_photos: summary.pending_photo_count || 0,
+      change_type_counts: summary.change_type_counts || {},
+    };
+    _syncActiveFilters = new Set(Object.keys(_syncPreviewData.change_type_counts));
+    renderSyncPreview();
+    _syncUpdatePreviewProgress('loading');
+
+    while (_syncModalOpen) {
+      var pageSize = firstPage ? 25 : 100;
+      var url = '/api/sync/preview?limit=' + pageSize + '&offset=' + offset;
+      if (revision) url += '&revision=' + encodeURIComponent(revision);
+      var page = await safeFetch(url, {
+        signal: _syncPreviewAbortController.signal,
+      }, { toast: false });
+      if (loadToken !== _syncPreviewLoadToken || !_syncModalOpen) return;
+
+      if (firstPage) {
+        revision = page.revision;
+        _syncPreviewData = {
+          photos: [],
+          total_changes: page.total_changes,
+          total_photos: page.total_photos,
+          change_type_counts: page.change_type_counts || {},
+          location_sync_enabled: page.location_sync_enabled,
+          revision: page.revision,
+        };
+        _syncActiveFilters = new Set(Object.keys(_syncPreviewData.change_type_counts));
+      }
+      Array.prototype.push.apply(_syncPreviewData.photos, page.photos || []);
+      offset = page.next_offset;
+      firstPage = false;
+      if (!page.has_more) {
+        _syncPreviewLoading = false;
+        _syncPreviewComplete = true;
+      }
+      renderSyncPreview();
+      _syncUpdatePreviewProgress(page.has_more ? 'loading' : 'complete');
+
+      if (!page.has_more) {
+        _syncSetPreviewActionsEnabled(_syncPreviewData.total_changes > 0);
+        if (_syncPreviewElapsedTimer !== null) {
+          clearInterval(_syncPreviewElapsedTimer);
+          _syncPreviewElapsedTimer = null;
+        }
+        return;
+      }
+      // Let WebKit paint the completed batch before requesting the next one.
+      await new Promise(function(resolve) { setTimeout(resolve, 0); });
+    }
+  } catch(e) {
+    if (loadToken !== _syncPreviewLoadToken || (e && e.name === 'AbortError')) return;
+    if (e && e.code === 'sync_preview_changed' && restartCount < 1) {
+      document.getElementById('syncPreviewProgressDetail').textContent =
+        'Pending changes were updated; restarting with a fresh snapshot...';
+      return _syncStartPreviewLoad(restartCount + 1);
+    }
+    _syncPreviewLoading = false;
+    _syncSetPreviewActionsEnabled(false);
+    _syncUpdatePreviewProgress('error', e && e.message);
+  }
+}
+
 async function openSyncPreview() {
+  VireoViewPreferences.restore(document.getElementById('syncThumbSize'));
+  updateSyncThumbSize(document.getElementById('syncThumbSize').value);
   var alreadyOpen = _syncModalOpen;
   if (_syncEscToken !== null) Keymap.popEsc(_syncEscToken);
   _syncEscToken = Keymap.pushEsc(function() { closeSyncPreview(); });
@@ -176,16 +425,8 @@ async function openSyncPreview() {
   _syncActiveFilters = null;
   _syncModalOpen = true;
   var overlay = document.getElementById('syncPreviewOverlay');
-  var content = document.getElementById('syncPreviewContent');
   overlay.style.display = 'block';
-  content.innerHTML = '<p style="color:var(--text-dim);padding:20px;">Loading changes...</p>';
-
-  try {
-    _syncPreviewData = await safeFetch('/api/sync/preview', {}, { toast: false });
-    renderSyncPreview();
-  } catch(e) {
-    content.innerHTML = '<p style="color:var(--danger);padding:20px;">Failed to load: ' + escapeHtml(e.message) + '</p>';
-  }
+  await _syncStartPreviewLoad(0);
 }
 
 function _syncTypeLabel(type) {
@@ -263,7 +504,7 @@ function _syncGroupedChanges(data, activeFilters) {
   return groups;
 }
 
-function _syncGroupTitle(group) {
+function _syncGroupTitle(group, partial) {
   var count = group.entries.length;
   var photoWord = count === 1 ? 'photo' : 'photos';
   var presentation = group.presentation;
@@ -275,21 +516,32 @@ function _syncGroupTitle(group) {
     checked: 'checked on',
     unchanged: 'unchanged on'
   }[presentation.action] || presentation.action + ' on';
-  return presentation.field + ' ' + connector + ' ' + count + ' ' + photoWord;
+  return presentation.field + ' ' + connector + ' ' + count + ' ' + photoWord +
+    (partial ? ' reviewed so far' : '');
 }
 
 function renderSyncPreview() {
   var data = _syncPreviewData;
   var content = document.getElementById('syncPreviewContent');
-  if (!data || data.photos.length === 0) {
+  if (!data) return;
+  if (data.photos.length === 0 && _syncPreviewLoading) {
+    content.innerHTML = '<p style="color:var(--text-dim);padding:20px;">Waiting for the first results...</p>';
+    return;
+  }
+  if (data.photos.length === 0) {
     content.innerHTML = '<p style="color:var(--text-dim);padding:20px;">No pending changes.</p>';
     return;
   }
 
   var allTypes = {};
-  data.photos.forEach(function(photo) {
-    photo.changes.forEach(function(change) { allTypes[change.type] = true; });
+  Object.keys(data.change_type_counts || {}).forEach(function(type) {
+    allTypes[type] = true;
   });
+  if (Object.keys(allTypes).length === 0) {
+    data.photos.forEach(function(photo) {
+      photo.changes.forEach(function(change) { allTypes[change.type] = true; });
+    });
+  }
   var typeList = Object.keys(allTypes).sort();
   if (_syncActiveFilters === null) _syncActiveFilters = new Set(typeList);
 
@@ -316,10 +568,12 @@ function renderSyncPreview() {
 
   var changeWord = visibleCount === 1 ? 'change' : 'changes';
   var photoWord = visiblePhotos === 1 ? 'photo' : 'photos';
+  var reviewedSuffix = _syncPreviewLoading ? ' reviewed so far' : '';
+  var actionsDisabled = _syncPreviewComplete ? '' : ' disabled';
   html += '<div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;">' +
-    '<span style="font-size:12px;color:var(--text-dim);flex:1;">' + visibleCount + ' ' + changeWord + ' across ' + visiblePhotos + ' ' + photoWord + '</span>' +
-    '<button onclick="discardAllChanges()" style="background:none;color:var(--danger);border:1px solid var(--danger);border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;">Discard All</button>' +
-    '<button onclick="runVisibleSync()" style="background:var(--accent);color:var(--accent-text);border:none;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;font-weight:500;">Sync to XMP</button>' +
+    '<span style="font-size:12px;color:var(--text-dim);flex:1;">' + visibleCount.toLocaleString() + ' ' + changeWord + ' across ' + visiblePhotos.toLocaleString() + ' ' + photoWord + reviewedSuffix + '</span>' +
+    '<button class="sync-preview-action" onclick="discardAllChanges()"' + actionsDisabled + ' style="background:none;color:var(--danger);border:1px solid var(--danger);border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;">Discard All</button>' +
+    '<button class="sync-preview-action" onclick="runVisibleSync()"' + actionsDisabled + ' style="background:var(--accent);color:var(--accent-text);border:none;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;font-weight:500;">Sync to XMP</button>' +
   '</div>';
 
   if (_syncActiveFilters.has('location') && allTypes.location) {
@@ -332,7 +586,13 @@ function renderSyncPreview() {
 
   var groups = _syncGroupedChanges(data, _syncActiveFilters);
   html += '<div class="sync-review-groups">';
+  var displayRemaining = _syncPreviewDisplayLimit;
+  var hiddenEntries = 0;
   groups.forEach(function(group) {
+    var displayedEntries = group.entries.slice(0, Math.max(0, displayRemaining));
+    displayRemaining -= displayedEntries.length;
+    hiddenEntries += group.entries.length - displayedEntries.length;
+    if (displayedEntries.length === 0) return;
     var presentation = group.presentation;
     var style = _syncChangeStyle({ type: group.type });
     var ids = group.entries.map(function(entry) { return entry.change.id; });
@@ -340,7 +600,7 @@ function renderSyncPreview() {
     html += '<div class="sync-review-group-header">';
     html += '<span style="color:' + style.color + ';font-weight:700;font-size:17px;width:16px;text-align:center;">' + style.icon + '</span>';
     html += '<div style="flex:1;min-width:0;">';
-    html += '<div class="sync-review-group-title">' + escapeHtml(_syncGroupTitle(group)) + '</div>';
+    html += '<div class="sync-review-group-title">' + escapeHtml(_syncGroupTitle(group, _syncPreviewLoading)) + '</div>';
     html += '<div class="sync-review-delta"><span class="sync-review-before">' + escapeHtml(presentation.before) + '</span><span class="sync-review-arrow">\u2192</span><span class="sync-review-after">' + escapeHtml(presentation.after) + '</span></div>';
     if (presentation.before_detail) {
       html += '<div class="sync-review-detail">Before: ' + escapeHtml(presentation.before_detail) + '</div>';
@@ -349,26 +609,43 @@ function renderSyncPreview() {
       html += '<div class="sync-review-detail">' + escapeHtml(presentation.after_detail) + '</div>';
     }
     html += '</div>';
-    html += '<button onclick="discardSyncChanges([' + ids.join(',') + '])" style="background:none;border:none;color:var(--text-ghost);font-size:11px;cursor:pointer;white-space:nowrap;" title="Discard this group">Discard group</button>';
+    html += '<button class="sync-preview-action" onclick="discardSyncChanges([' + ids.join(',') + '])"' + actionsDisabled + ' style="background:none;border:none;color:var(--text-ghost);font-size:11px;cursor:pointer;white-space:nowrap;" title="Discard this group">Discard group</button>';
     html += '</div>';
     html += '<div class="sync-review-photos">';
-    group.entries.forEach(function(entry) {
+    displayedEntries.forEach(function(entry) {
       var photo = entry.photo;
       var change = entry.change;
       var thumbUrl = window.vireoThumbnailUrl
         ? window.vireoThumbnailUrl(photo)
         : '/thumbnails/' + photo.photo_id + '.jpg';
       html += '<div class="sync-preview-photo" style="width:' + _syncThumbSize + 'px;">';
-      html += '<img class="sync-preview-thumb" src="' + escapeAttr(thumbUrl) + '" style="width:' + _syncThumbSize + 'px;height:' + Math.round(_syncThumbSize * 2 / 3) + 'px;object-fit:cover;border-radius:4px;cursor:pointer;display:block;" data-photo-id="' + photo.photo_id + '" data-filename="' + escapeAttr(photo.filename) + '">';
+      html += '<img class="sync-preview-thumb" src="' + escapeAttr(thumbUrl) + '" loading="lazy" decoding="async" style="width:' + _syncThumbSize + 'px;height:' + Math.round(_syncThumbSize * 2 / 3) + 'px;object-fit:cover;border-radius:4px;cursor:pointer;display:block;" data-photo-id="' + photo.photo_id + '" data-filename="' + escapeAttr(photo.filename) + '">';
       html += '<div class="sync-preview-filename" title="' + escapeAttr(photo.filename) + '">' + escapeHtml(photo.filename) + '</div>';
-      html += '<button class="sync-preview-discard" onclick="event.stopPropagation();discardChange(' + change.id + ')" title="Discard this change" aria-label="Discard change for ' + escapeAttr(photo.filename) + '">&times;</button>';
+      html += '<button class="sync-preview-discard sync-preview-action" onclick="event.stopPropagation();discardChange(' + change.id + ')"' + actionsDisabled + ' title="Discard this change" aria-label="Discard change for ' + escapeAttr(photo.filename) + '">&times;</button>';
       html += '</div>';
     });
     html += '</div></section>';
   });
   html += '</div>';
+  if (hiddenEntries > 0) {
+    html += '<div class="sync-preview-more">Showing the first ' +
+      (_syncPreviewDisplayLimit - displayRemaining).toLocaleString() + ' matching results to keep this review responsive. ' +
+      '<button onclick="showMoreSyncPreview()" style="margin-left:8px;padding:4px 10px;border:1px solid var(--border-secondary);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary);cursor:pointer;">Show ' +
+      Math.min(300, hiddenEntries).toLocaleString() + ' more</button></div>';
+  }
 
   content.innerHTML = html;
+  _syncSetPreviewActionsEnabled(
+    _syncPreviewComplete && (_syncPreviewData.total_changes || 0) > 0
+  );
+  if (_syncLightboxPanelEl && typeof _lightboxCurrentId !== 'undefined') {
+    _syncRenderLightboxPanel(_lightboxCurrentId);
+  }
+}
+
+function showMoreSyncPreview() {
+  _syncPreviewDisplayLimit += 300;
+  renderSyncPreview();
 }
 
 /* Delegate sync preview thumb clicks for lightbox (XSS-safe) */
@@ -390,6 +667,7 @@ document.getElementById('syncPreviewContent').addEventListener('click', function
 
 function closeSyncPreview() {
   var wasOpen = _syncModalOpen;
+  _syncStopPreviewLoad();
   if (_syncEscToken !== null) {
     Keymap.popEsc(_syncEscToken);
     _syncEscToken = null;
@@ -413,6 +691,7 @@ function getVisibleSyncChangeIds() {
 }
 
 function runVisibleSync() {
+  if (!_syncPreviewComplete) return;
   var changeIds = getVisibleSyncChangeIds();
   if (changeIds.length === 0) {
     var status = document.getElementById('syncStatus');
@@ -485,6 +764,7 @@ function _syncRenderLightboxPanel(photoId) {
   }
   var panel = _syncEnsureLightboxPanel();
   if (!panel) return;
+  var actionsDisabled = _syncPreviewComplete ? '' : ' disabled';
   var html = '<div style="font-weight:600;margin-bottom:6px;color:var(--accent);">Pending changes</div>';
   visible.forEach(function(c) {
     var style = _syncChangeStyle(c);
@@ -496,18 +776,18 @@ function _syncRenderLightboxPanel(photoId) {
         '<div style="margin-top:2px;color:var(--text-dim);">' + escapeHtml(presentation.before) + ' \u2192 <span style="color:var(--text-primary);">' + escapeHtml(presentation.after) + '</span></div>' +
         (presentation.after_detail ? '<div style="margin-top:2px;color:var(--text-ghost);font-size:10px;">' + escapeHtml(presentation.after_detail) + '</div>' : '') +
       '</div>' +
-      '<button data-sync-discard-change="' + c.id + '" style="background:none;border:none;color:var(--text-ghost);cursor:pointer;padding:0 4px;font-size:16px;line-height:1;" title="Discard this change">&times;</button>' +
+      '<button class="sync-lightbox-action" data-sync-discard-change="' + c.id + '"' + actionsDisabled + ' style="background:none;border:none;color:var(--text-ghost);cursor:pointer;padding:0 4px;font-size:16px;line-height:1;" title="Discard this change">&times;</button>' +
       '</div>';
   });
   html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:8px;">' +
     '<span style="font-size:11px;color:var(--text-dim);">Use ← → to navigate</span>' +
-    '<button data-sync-discard-photo="' + photoId + '" style="background:none;border:1px solid var(--danger);color:var(--danger);border-radius:4px;font-size:11px;cursor:pointer;padding:3px 8px;">Discard all</button>' +
+    '<button class="sync-lightbox-action" data-sync-discard-photo="' + photoId + '"' + actionsDisabled + ' style="background:none;border:1px solid var(--danger);color:var(--danger);border-radius:4px;font-size:11px;cursor:pointer;padding:3px 8px;">Discard all</button>' +
     '</div>';
   panel.innerHTML = html;
 }
 
 async function _syncDiscardFromLightbox(changeIds, photoId) {
-  if (!changeIds || changeIds.length === 0) return;
+  if (!_syncPreviewComplete || !changeIds || changeIds.length === 0) return;
   try {
     await safeFetch('/api/sync/discard', {
       method: 'POST',
@@ -558,43 +838,28 @@ document.addEventListener('lightbox:closed', function() {
   _syncDestroyLightboxPanel();
 });
 
-function _syncForgetChanges(changeIds) {
-  if (!_syncPreviewData || !_syncPreviewData.photos || !changeIds || changeIds.length === 0) return;
-  var drop = {};
-  changeIds.forEach(function(id) { drop[id] = true; });
-  _syncPreviewData.photos.forEach(function(p) {
-    p.changes = p.changes.filter(function(c) { return !drop[c.id]; });
-  });
-  _syncPreviewData.photos = _syncPreviewData.photos.filter(function(p) { return p.changes.length > 0; });
-}
-
-// Refetch the preview after a discard so derived flags (creates_xmp_sidecar,
+// Reload the progressive preview after a discard so derived flags (creates_xmp_sidecar,
 // paired_keyword_rename) and per-change presentations reflect the new state.
 // Discarding one half of a same-key keyword_add/keyword_remove pair
 // invalidates the surviving remove's rename-pairing flags, and rating
 // previews rely on those flags to decide whether a sidecar will be
 // created; without the refetch, a rating queued alongside such a pair
 // can look like it will be written and then be silently dropped by
-// sync_to_xmp. If the refetch fails, fall back to a local removal so the
-// UI still reflects the discard.
-async function _syncRefreshPreviewAfterDiscard(changeIds) {
-  try {
-    _syncPreviewData = await safeFetch('/api/sync/preview', {}, { toast: false });
-  } catch(e) {
-    _syncForgetChanges(changeIds);
-  }
+// sync_to_xmp.
+async function _syncRefreshPreviewAfterDiscard() {
+  if (!_syncModalOpen) return;
+  await _syncStartPreviewLoad(0);
 }
 
 async function discardSyncChanges(changeIds) {
-  if (!changeIds || changeIds.length === 0) return;
+  if (!_syncPreviewComplete || !changeIds || changeIds.length === 0) return;
   try {
     await safeFetch('/api/sync/discard', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({change_ids: changeIds}),
     });
-    await _syncRefreshPreviewAfterDiscard(changeIds);
-    renderSyncPreview();
+    await _syncRefreshPreviewAfterDiscard();
   } catch(e) {}
 }
 
@@ -607,20 +872,23 @@ function discardPhotoChanges(changeIds) {
 }
 
 async function discardAllChanges() {
+  if (!_syncPreviewComplete || !_syncPreviewData) return;
   if (!confirm('Discard ALL pending changes? Nothing will be written to XMP.')) return;
   try {
-    var data = await safeFetch('/api/sync/preview', {}, { toast: false });
-    var allIds = [];
-    data.photos.forEach(function(p) {
-      p.changes.forEach(function(c) { allIds.push(c.id); });
-    });
     await safeFetch('/api/sync/discard', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({change_ids: allIds}),
+      body: JSON.stringify({
+        discard_all: true,
+        revision: _syncPreviewData.revision,
+      }),
     });
     closeSyncPreview();
-  } catch(e) {}
+  } catch(e) {
+    if (e && e.code === 'sync_preview_changed' && _syncModalOpen) {
+      await _syncStartPreviewLoad(0);
+    }
+  }
 }
 
 function toggleSyncFilter(type) {
@@ -629,6 +897,7 @@ function toggleSyncFilter(type) {
   } else {
     _syncActiveFilters.add(type);
   }
+  _syncPreviewDisplayLimit = 300;
   renderSyncPreview();
 }
 </script>

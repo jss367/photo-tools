@@ -5,6 +5,10 @@ All notable changes to Vireo are documented in this file.
 ## Unreleased
 
 ### Added
+- **Described color labels.** Right-click any photo color label to give that
+  color a short, workspace-specific meaning such as “Reptiles.” The meaning
+  appears in color-label tooltips wherever that color is shown, including the
+  lightbox context menu.
 - **Automatic catalog backup before upgrades.** When a new Vireo version
   needs to migrate the database, a snapshot is saved next to it (e.g.
   `vireo.db.pre-v8.bak`) before any migration runs. Only the most recent
@@ -24,6 +28,18 @@ All notable changes to Vireo are documented in this file.
   updater, and uninstall-preservation gates before publication.
 
 ### Fixed
+- Large existing photo catalogs no longer fail Vireo's startup check while a
+  one-time Wildlife metadata migration scans tens of thousands of sidecar
+  files. The app opens first and completes that migration in the background.
+- Wildlife detection now retries weak full-frame MegaDetector results on
+  overlapping higher-resolution crops. Small or unusually posed birds that
+  were previously labeled "No subject" can clear the normal confidence floor
+  without lowering it globally; cached detector results are versioned so the
+  improved pass is not skipped. Every crop in the grid is scanned, so a
+  second animal lying along the boundary between two crops is no longer
+  missed. Miss cards now state the applicable threshold and show the best
+  below-threshold candidate confidence, and threshold previews report the
+  floor they were actually computed with rather than the last saved one.
 - Freeing card space now verifies only archive copies that match the selected
   card instead of re-hashing the entire workspace, refreshes the preview
   automatically, and reads each card file only once at deletion.
@@ -50,6 +66,14 @@ All notable changes to Vireo are documented in this file.
   any user-customized thresholds are left untouched.
 
 ### Changed
+- **Wildlife classification is now explicit workflow state.** Adding a species
+  no longer creates a redundant `Wildlife` keyword. Existing generated terms
+  are retired without disturbing real keyword hierarchies, and Browse now
+  groups selected-photo metadata by meaning with dedicated bulk controls for
+  including or excluding photos from wildlife processing. Keywords you add by
+  hand now record that you added them, so a tag is never mistaken for a
+  generated one once its edit history ages out — and that record follows the
+  keyword through duplicate merges, keyword renames, and RAW/JPEG pairing.
 - **Work Locally follows folders across workspaces.** Local copies are now
   managed per top-level folder. A folder shared by several workspaces uses one
   local copy in all of them, while workspace controls can stage or finish

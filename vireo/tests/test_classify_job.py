@@ -2013,7 +2013,7 @@ def test_multi_species_xmp_does_not_auto_accept_detection_match(tmp_path):
     )[0]
     write_sidecar(
         tmp_path / "a.xmp",
-        {"Robin", "Sparrow", "Wildlife"},
+        {"Robin", "Sparrow"},
         set(),
     )
 
@@ -2546,6 +2546,186 @@ def test_mixed_group_match_then_unmatch_reenters_pending_for_dissenters(
         assert r["category"] == "disagreement"
         assert not r["group_id"]
     assert not db.get_predictions(photo_ids=photo_ids, status="accepted")
+
+
+def test_mixed_burst_never_groups_so_displayed_species_is_accepted_species(
+    tmp_path, monkeypatch
+):
+    """A prediction row's own species is always the species an accept tags.
+
+    ``accept_prediction`` swaps in the burst consensus derived from
+    ``prediction_review.individual`` whenever the row carries a ``group_id``.
+    Any UI that labels a row with ``pr.species`` — Browse's prediction panel
+    and the selection aggregation — would then be able to advertise Sparrow
+    and tag Robin, which is the exact failure CORE_PHILOSOPHY.md's
+    no-black-boxes rule forbids.
+
+    The guard is ``group_reviewable`` in ``_store_grouped_predictions``: a
+    burst is only stamped with a ``group_id``/``individual`` when every frame
+    folds to ONE species key, so the consensus can never name a different
+    species than the row. This locks that invariant end to end — the burst
+    disagrees, so no member gets grouped, and accepting the minority frame
+    tags the minority frame's own species.
+    """
+    from datetime import datetime
+
+    import classify_job
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    folder_id = db.add_folder(str(tmp_path))
+    ws = db.create_workspace("A")
+    db._active_workspace_id = ws
+    db.add_workspace_folder(ws, folder_id)
+    photo_ids = [
+        db.add_photo(
+            folder_id, f"{i}.jpg", extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        for i in range(3)
+    ]
+    det_ids = [
+        db.save_detections(
+            pid,
+            [{
+                "box": {"x": 0, "y": 0, "w": 1, "h": 1},
+                "confidence": 0.9,
+                "category": "animal",
+            }],
+            detector_model="MDV6",
+        )[0]
+        for pid in photo_ids
+    ]
+
+    class Tax:
+        def get_hierarchy(self, _species):
+            return {}
+
+    monkeypatch.setattr("compare.categorize", lambda *_a, **_k: "new")
+
+    # Two Robin frames outvote one Sparrow frame inside a single burst.
+    species_by_frame = ["Robin", "Robin", "Sparrow"]
+    raw = [
+        {
+            "photo": {
+                "id": pid, "filename": f"{i}.jpg", "folder_id": folder_id,
+                "timestamp": None, "burst_id": None,
+            },
+            "folder_path": str(tmp_path),
+            "detection_id": did,
+            "prediction": species_by_frame[i],
+            "confidence": 0.9,
+            "alternatives": [],
+            "taxonomy": {},
+            "timestamp": datetime(2024, 1, 1, 12, 0, i),
+        }
+        for i, (pid, did) in enumerate(zip(photo_ids, det_ids, strict=True))
+    ]
+    classify_job._store_grouped_predictions(
+        raw_results=raw, job_id="job-mix", model_name="bioclip-2",
+        grouping_window=10, similarity_threshold=0.99, tax=Tax(),
+        db=db, labels_fingerprint="fp-active",
+    )
+
+    rows = db.get_predictions(photo_ids=photo_ids, status="pending")
+    by_det = {r["detection_id"]: r for r in rows}
+    assert set(by_det) == set(det_ids)
+    for det_id, row in by_det.items():
+        assert not row["group_id"], (
+            "a burst whose frames disagree must not be stamped with a "
+            "group_id — a grouped accept would replace the row's own "
+            f"species with the consensus (detection {det_id})"
+        )
+        assert not row["individual"]
+
+    sparrow = by_det[det_ids[2]]
+    assert sparrow["species"] == "Sparrow"
+    result = db.accept_prediction(sparrow["id"])
+    assert result["species"] == "Sparrow", (
+        "accepting the row Browse labels 'Sparrow' tagged a different "
+        "species"
+    )
+    names = {k["name"] for k in db.get_photo_keywords(photo_ids[2])}
+    assert "Sparrow" in names
+    assert "Robin" not in names
+
+
+def test_grouped_burst_consensus_equals_each_row_species(tmp_path, monkeypatch):
+    """The positive half: when a burst IS grouped, its consensus is the row's
+    own species, so a panel labelled from ``pr.species`` tells the truth.
+
+    ``group_reviewable`` only stamps a ``group_id`` on a burst whose frames
+    all fold to one species key, and ``individual`` is built from that same
+    fold — so the consensus ``accept_prediction`` applies is the row's own
+    species by construction, not by coincidence.
+    """
+    from datetime import datetime
+
+    import classify_job
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    folder_id = db.add_folder(str(tmp_path))
+    ws = db.create_workspace("A")
+    db._active_workspace_id = ws
+    db.add_workspace_folder(ws, folder_id)
+    photo_ids = [
+        db.add_photo(
+            folder_id, f"{i}.jpg", extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        for i in range(2)
+    ]
+    det_ids = [
+        db.save_detections(
+            pid,
+            [{
+                "box": {"x": 0, "y": 0, "w": 1, "h": 1},
+                "confidence": 0.9,
+                "category": "animal",
+            }],
+            detector_model="MDV6",
+        )[0]
+        for pid in photo_ids
+    ]
+
+    class Tax:
+        def get_hierarchy(self, _species):
+            return {}
+
+    monkeypatch.setattr("compare.categorize", lambda *_a, **_k: "new")
+
+    raw = [
+        {
+            "photo": {
+                "id": pid, "filename": f"{i}.jpg", "folder_id": folder_id,
+                "timestamp": None, "burst_id": None,
+            },
+            "folder_path": str(tmp_path),
+            "detection_id": did,
+            "prediction": "Robin",
+            "confidence": 0.9 - (0.1 * i),
+            "alternatives": [],
+            "taxonomy": {},
+            "timestamp": datetime(2024, 1, 1, 12, 0, i),
+        }
+        for i, (pid, did) in enumerate(zip(photo_ids, det_ids, strict=True))
+    ]
+    classify_job._store_grouped_predictions(
+        raw_results=raw, job_id="job-uni", model_name="bioclip-2",
+        grouping_window=10, similarity_threshold=0.99, tax=Tax(),
+        db=db, labels_fingerprint="fp-active",
+    )
+
+    rows = db.get_predictions(photo_ids=photo_ids, status="pending")
+    assert rows and all(r["group_id"] for r in rows)
+    for row in rows:
+        assert json.loads(row["individual"]) == {"Robin": 2}, (
+            "a grouped burst's vote JSON must name exactly one species; a "
+            "second key is what would let the consensus diverge from the row"
+        )
+    result = db.accept_prediction(rows[0]["id"])
+    assert result["species"] == rows[0]["species"] == "Robin"
 
 
 def test_ungrouped_burst_clears_stale_group_id_on_reuse(

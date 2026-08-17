@@ -159,12 +159,13 @@
   </div>
   <div class="control-group">
     <label for="perRowSlider">Per row</label>
-    <input type="range" id="perRowSlider" min="1" max="20" value="5">
+    <input type="range" id="perRowSlider" min="1" max="20" value="5"
+           data-view-preference="vireo.highlights.perRow">
     <span class="control-value" id="perRowValue">5</span>
   </div>
   <div class="control-group">
     <label for="sortSelect">Sort</label>
-    <select id="sortSelect">
+    <select id="sortSelect" data-view-preference="vireo.highlights.sort">
       <option value="best" data-default-label="Recommended first" data-advanced-label="Best photo first">Recommended first</option>
       <option value="fewest">Fewest photos</option>
       <option value="most">Most photos</option>
@@ -252,7 +253,6 @@ var rejectedAtLoadSeq = {};
 // flight; without a stamp, an older response can arrive after a newer one and
 // overwrite the fresher photos/ordering keys.
 var bucketRefetchSeq = {};
-
 function escapeAttr(s) {
   if (s === null || s === undefined) return '';
   return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -1439,6 +1439,9 @@ document.addEventListener('lightbox:flagchanged', function(e) {
   }
 });
 
+VireoViewPreferences.restoreAll(document.getElementById('controlsBar'));
+document.getElementById('perRowValue').textContent =
+  document.getElementById('perRowSlider').value;
 updateAdvancedHighlightsOptions();
 loadHighlights();
 </script>

@@ -42,6 +42,9 @@ jobs:
             const python = touchesTestWorkflow || paths.some((path) =>
               path.startsWith("vireo/") ||
               path.startsWith("tests/") ||
+              path.startsWith(".github/actions/") ||
+              path === ".github/workflows/pr-agent.yml" ||
+              path === "docs/pr-agent-routine-prompt.md" ||
               (path.startsWith("scripts/") && path.endsWith(".py")) ||
               ["pyproject.toml", "uv.lock"].includes(path)
             );

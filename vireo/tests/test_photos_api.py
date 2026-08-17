@@ -240,6 +240,209 @@ def test_browse_init_captures_missing_baseline_before_folder_tree(
     )
 
 
+def test_browse_init_reports_focus_photo_index_in_requested_sort(app_and_db):
+    """Deep links can locate a target without probing every preceding page."""
+    app, db = app_and_db
+    january = next(
+        folder for folder in db.get_folder_tree() if folder["name"] == "January"
+    )
+    target_id = db.get_photos(folder_id=january["id"])[0]["id"]
+    db.add_photo(
+        folder_id=january["id"],
+        filename="aaa-before-target.jpg",
+        extension=".jpg",
+        file_size=1000,
+        file_mtime=1,
+        timestamp="2024-01-01T00:00:00",
+    )
+    db.add_photo(
+        folder_id=january["id"],
+        filename="zzz-after-target.jpg",
+        extension=".jpg",
+        file_size=1000,
+        file_mtime=1,
+        timestamp="2025-01-01T00:00:00",
+    )
+
+    response = app.test_client().get(
+        f"/api/browse/init?folder_id={january['id']}"
+        f"&focus_photo_id={target_id}&sort=date"
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["focus_index"] == 1
+    assert payload["focus_page"] == 1
+
+
+def test_browse_init_focus_index_is_null_outside_scope(app_and_db):
+    """A focus id must not leak a position from another Browse folder scope."""
+    app, db = app_and_db
+    folders = db.get_folder_tree()
+    january = next(folder for folder in folders if folder["name"] == "January")
+    outside_id = next(
+        photo["id"]
+        for photo in db.get_photos()
+        if photo["folder_id"] != january["id"]
+    )
+
+    response = app.test_client().get(
+        f"/api/browse/init?folder_id={january['id']}"
+        f"&focus_photo_id={outside_id}"
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["focus_index"] is None
+    assert payload["focus_page"] == 1
+
+
+def test_browse_init_focus_index_skips_ordered_scan_when_target_on_page(
+    app_and_db, monkeypatch
+):
+    """First-page deep links must not materialize every folder ID.
+
+    Materializing all IDs on the critical first-paint path adds
+    O(folder size) latency and memory to the common case (Codex
+    review r3792637103), so the endpoint should compute the index
+    from the fetched page whenever the target is already on it.
+    """
+    from db import Database
+
+    app, db = app_and_db
+    ordered_calls = []
+    original_get_photo_ids = Database.get_photo_ids
+
+    def spy(self, *args, **kwargs):
+        ordered_calls.append(kwargs)
+        return original_get_photo_ids(self, *args, **kwargs)
+
+    monkeypatch.setattr(Database, "get_photo_ids", spy)
+
+    target_id = db.get_photos()[0]["id"]
+    response = app.test_client().get(
+        f"/api/browse/init?focus_photo_id={target_id}&sort=date&per_page=50"
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["focus_index"] is not None
+    assert payload["focus_page"] == 1
+    ids_in_order = [p["id"] for p in payload["photos"]]
+    assert payload["focus_index"] == ids_in_order.index(target_id)
+    assert ordered_calls == []
+
+
+def test_browse_init_focus_index_queries_rank_when_target_off_page(
+    app_and_db, monkeypatch
+):
+    """An off-page target returns one database rank, not every ordered id."""
+    from db import Database
+
+    app, db = app_and_db
+    january = next(
+        folder for folder in db.get_folder_tree() if folder["name"] == "January"
+    )
+    baseline_id = db.get_photos(folder_id=january["id"])[0]["id"]
+    # Insert five photos earlier in the sort order so the baseline no
+    # longer fits on a per_page=1 first page.
+    for i in range(5):
+        db.add_photo(
+            folder_id=january["id"],
+            filename=f"aaa-earlier-{i:02d}.jpg",
+            extension=".jpg",
+            file_size=1000,
+            file_mtime=1,
+            timestamp=f"2023-01-0{i + 1}T00:00:00",
+        )
+
+    ordered_calls = []
+    position_calls = []
+    original_get_photo_ids = Database.get_photo_ids
+    original_get_photo_position = Database.get_photo_position
+
+    def spy(self, *args, **kwargs):
+        ordered_calls.append(kwargs)
+        return original_get_photo_ids(self, *args, **kwargs)
+
+    def position_spy(self, *args, **kwargs):
+        position_calls.append((args, kwargs))
+        return original_get_photo_position(self, *args, **kwargs)
+
+    monkeypatch.setattr(Database, "get_photo_ids", spy)
+    monkeypatch.setattr(Database, "get_photo_position", position_spy)
+
+    response = app.test_client().get(
+        f"/api/browse/init?folder_id={january['id']}"
+        f"&focus_photo_id={baseline_id}&sort=date&per_page=1"
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["focus_index"] == 5
+    assert payload["focus_page"] == 6
+    assert [photo["id"] for photo in payload["photos"]] == [baseline_id]
+    assert ordered_calls == []
+    assert len(position_calls) == 1
+
+
+def test_browse_init_clamps_nonpositive_page_for_focus_index(app_and_db):
+    """A malformed page must not report a negative focused position."""
+    app, db = app_and_db
+    target_id = db.get_photos()[0]["id"]
+
+    response = app.test_client().get(
+        f"/api/browse/init?focus_photo_id={target_id}&page=0&per_page=50"
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["page"] == 1
+    assert payload["focus_index"] >= 0
+    assert payload["focus_page"] == 1
+
+
+def test_browse_init_focus_on_later_requested_page_returns_target_page(app_and_db):
+    """Focused init remains bounded to the page containing the target."""
+    app, db = app_and_db
+    ordered_ids = [photo["id"] for photo in db.get_photos(sort="date")]
+    assert len(ordered_ids) >= 2
+
+    response = app.test_client().get(
+        f"/api/browse/init?focus_photo_id={ordered_ids[1]}"
+        "&page=2&per_page=1&sort=date"
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["focus_index"] == 1
+    assert payload["focus_page"] == 2
+    assert [photo["id"] for photo in payload["photos"]] == [ordered_ids[1]]
+
+
+@pytest.mark.parametrize(
+    "sort",
+    [
+        "date",
+        "date_desc",
+        "name",
+        "name_desc",
+        "rating",
+        "sharpness",
+        "sharpness_asc",
+        "quality",
+    ],
+)
+def test_photo_position_matches_photo_id_order(app_and_db, sort):
+    """The scalar rank query must match every supported Browse sort."""
+    _, db = app_and_db
+    ordered_ids = db.get_photo_ids(sort=sort)
+
+    assert [db.get_photo_position(photo_id, sort=sort) for photo_id in ordered_ids] == list(
+        range(len(ordered_ids))
+    )
+
+
 def test_dashboard_options_flags_degraded_collections(app_and_db):
     """Collections whose rules can't compile are flagged so the scope
     picker can disable them instead of 400ing /api/stats and /api/coverage."""

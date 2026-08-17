@@ -195,7 +195,7 @@ def _tag_all(live_server, photo_ids, species):
 
 
 def test_pipeline_burst_context_open_browse_falls_back_to_current_window(live_server, page):
-    """Open in Browse Mode must still navigate when window.open is ignored."""
+    """Open in Browse must still navigate when window.open is ignored."""
     photo_ids = live_server["data"]["photos"][0:3]
     _write_single_burst_cache(live_server, photo_ids)
 
@@ -214,7 +214,7 @@ def test_pipeline_burst_context_open_browse_falls_back_to_current_window(live_se
 
     menu = page.locator(".vireo-ctx-menu")
     expect(menu).to_be_visible()
-    menu.locator(".vireo-ctx-item", has_text="Open in Browse Mode").click()
+    menu.get_by_text("Open in Browse", exact=True).click()
 
     page.wait_for_function(
         "expectedPid => location.pathname === '/browse'"
@@ -238,7 +238,7 @@ def test_pipeline_burst_loupe_context_open_browse_uses_selected_photo(live_serve
 
     menu = page.locator(".vireo-ctx-menu")
     expect(menu).to_be_visible()
-    menu.locator(".vireo-ctx-item", has_text="Open in Browse Mode").click()
+    menu.get_by_text("Open in Browse", exact=True).click()
 
     page.wait_for_function(
         "expectedPid => location.pathname === '/browse'"

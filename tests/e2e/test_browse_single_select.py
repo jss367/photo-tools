@@ -1118,6 +1118,111 @@ def test_multiselect_shows_and_removes_keyword_shared_by_all_photos(live_server,
     expect(row).to_have_count(0)
 
 
+def test_multiselect_groups_metadata_and_bulk_updates_wildlife_workflow(
+    live_server, page,
+):
+    db = live_server["db"]
+    selected_ids = live_server["data"]["photos"]
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    location_id = db.add_keyword("Grangettes nature reserve", kw_type="location")
+    for photo_id in selected_ids:
+        db.tag_photo(photo_id, species_id)
+        db.tag_photo(photo_id, location_id)
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.wait_for(state="visible")
+    page.evaluate("""
+      photos.forEach(function(p) { selectedPhotos.add(p.id); });
+      renderGrid();
+      updateBatchBar();
+    """)
+
+    taxonomy = page.locator(
+        '.selection-keyword-group[data-keyword-type="taxonomy"]'
+    )
+    location = page.locator(
+        '.selection-keyword-group[data-keyword-type="location"]'
+    )
+    expect(taxonomy.locator(".selection-keyword-group-title")).to_have_text(
+        "Species"
+    )
+    expect(taxonomy).to_contain_text("House Sparrow")
+    expect(location.locator(".selection-keyword-group-title")).to_have_text(
+        "Locations"
+    )
+    expect(location).to_contain_text("Grangettes nature reserve")
+
+    exclude = page.locator("#selectionWildlifeActions button", has_text="Exclude 5")
+    expect(exclude).to_be_visible()
+    exclude.click()
+    page.wait_for_function(
+        """
+        async (photoIds) => {
+          const details = await Promise.all(
+            photoIds.map(id => fetch('/api/photos/' + id).then(r => r.json()))
+          );
+          return details.every(photo => photo.wildlife_excluded);
+        }
+        """,
+        arg=selected_ids,
+    )
+    include = page.locator("#selectionWildlifeActions button", has_text="Include 5")
+    expect(include).to_be_visible()
+
+
+def test_wildlife_batch_completion_refreshes_current_selection(live_server, page):
+    """A slow batch response must not repaint controls for the old selection."""
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.wait_for(state="visible")
+    page.evaluate("""
+      selectedPhotoId = null;
+      selectedPhotos.clear();
+      photos.slice(0, 2).forEach(function(photo) {
+        selectedPhotos.add(photo.id);
+      });
+      updateBatchBar();
+    """)
+    expect(
+        page.locator("#selectionWildlifeActions button", has_text="Exclude 2")
+    ).to_be_visible()
+
+    page.evaluate("""
+      window.__originalApiJson = window.Vireo.api.json;
+      window.Vireo.api.json = function(url, opts, options) {
+        if (url === '/api/batch/wildlife-excluded') {
+          return new Promise(function(resolve, reject) {
+            window.__releaseWildlifeBatch = function() {
+              window.__originalApiJson(url, opts, options).then(resolve, reject);
+            };
+          });
+        }
+        return window.__originalApiJson(url, opts, options);
+      };
+      window.__wildlifeBatchDone = false;
+      setSelectionWildlifeExcluded(true).finally(function() {
+        window.__wildlifeBatchDone = true;
+      });
+      void 0;
+    """)
+    page.wait_for_function("typeof window.__releaseWildlifeBatch === 'function'")
+
+    page.evaluate("""
+      selectedPhotos.clear();
+      photos.slice(2, 5).forEach(function(photo) {
+        selectedPhotos.add(photo.id);
+      });
+      updateBatchBar();
+    """)
+    current_action = page.locator(
+        "#selectionWildlifeActions button", has_text="Exclude 3"
+    )
+    expect(current_action).to_be_visible()
+
+    page.evaluate("window.__releaseWildlifeBatch()")
+    page.wait_for_function("window.__wildlifeBatchDone === true")
+    expect(current_action).to_be_visible()
+
+
 def test_multiselect_shrink_to_focused_photo_restores_detail(live_server, page):
     """Leaving multi-select with a focused photo must restore the detail pane."""
     url = live_server["url"]

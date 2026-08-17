@@ -92,6 +92,24 @@ GOOGLE_MAPS_STUB = """
   }
   function Geocoder() {
     this.geocode = function(request, callback) {
+      if (request.location.lat() >= 40) {
+        function area(placeId, name, type, lat, lng) {
+          return {
+            place_id: placeId,
+            name: name,
+            types: [type, 'political'],
+            formatted_address: name + ', France',
+            address_components: [{long_name: name, short_name: name, types: [type, 'political']}],
+            geometry: {location: new LatLng(lat, lng)}
+          };
+        }
+        callback([
+          area('garrieux', 'Garrieux', 'neighborhood', 42.810, 2.940),
+          area('saint-hippolyte', 'Saint-Hippolyte', 'locality', 42.810, 2.940),
+          area('pyrenees-orientales', 'Pyrénées-Orientales', 'administrative_area_level_2', 42.810, 2.940)
+        ], 'OK');
+        return;
+      }
       if (!window.__locationReviewIncludeRegions) {
         callback([], 'ZERO_RESULTS');
         return;
@@ -260,6 +278,1124 @@ def test_location_review_assigns_a_custom_name_to_coordinate_group(
     ]
 
 
+def test_location_review_reports_and_resumes_batch_assignment_progress(
+    live_server, page,
+):
+    """Large groups report committed chunks and retry only the remainder."""
+    photo_id = live_server["data"]["photos"][0]
+    synthetic_photo_ids = list(range(1, 2502))
+    preview = {
+        "total": len(synthetic_photo_ids),
+        "reviewable": len(synthetic_photo_ids),
+        "unresolved": [],
+        "skipped": [],
+        "groups": [{
+            "photo_ids": synthetic_photo_ids,
+            "photos": [{
+                "id": photo_id,
+                "filename": "batch-example.jpg",
+                "latitude": 33.255,
+                "longitude": -116.405,
+                "timestamp": "2026-08-04T10:17:00",
+            }],
+            "count": len(synthetic_photo_ids),
+            "center": {"lat": 33.255, "lng": -116.405},
+            "bounds": {
+                "south": 33.255,
+                "west": -116.405,
+                "north": 33.255,
+                "east": -116.405,
+            },
+            "spread_m": 0,
+            "captured_from": "2026-08-04T10:17:00",
+            "captured_to": "2026-08-04T10:17:00",
+        }],
+    }
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.route(
+        "**/api/location-review/preview",
+        lambda route: route.fulfill(json=preview),
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text(
+        "2,501 photos"
+    )
+
+    page.locator("#locationReviewSearch").fill("Large batch location")
+    page.locator("#locationReviewCustom").click()
+    page.evaluate(
+        """() => {
+          window.__locationReviewOriginalSafeFetch = window.safeFetch;
+          window.__locationReviewAssignmentRequests = [];
+          window.__locationReviewAssignmentPending = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__locationReviewOriginalSafeFetch(url, opts, options);
+            }
+            window.__locationReviewAssignmentRequests.push(JSON.parse(opts.body));
+            return new Promise(function(resolve, reject) {
+              window.__locationReviewAssignmentPending.push({resolve: resolve, reject: reject});
+            });
+          };
+          window.__settleLocationAssignment = function(result) {
+            var pending = window.__locationReviewAssignmentPending.shift();
+            if (result === 'reject') pending.reject(new Error('Synthetic interruption'));
+            else pending.resolve({ok: true, updated: result});
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function(
+        "() => window.__locationReviewAssignmentRequests.length === 1"
+    )
+    progress = page.locator("#locationReviewAssignmentProgress")
+    progress_bar = page.locator("#locationReviewAssignmentTrack")
+    expect(progress).to_be_visible()
+    expect(page.locator("#locationReviewAssignmentStatus")).to_have_text(
+        "Assigning 0 of 2,501 photos · 0%"
+    )
+    expect(progress_bar).to_have_attribute("aria-valuemax", "2501")
+    expect(progress_bar).to_have_attribute("aria-valuenow", "0")
+    expect(page.locator("#locationReviewSkip")).to_be_disabled()
+
+    page.evaluate("window.__settleLocationAssignment(1000)")
+    page.wait_for_function(
+        "() => window.__locationReviewAssignmentRequests.length === 2"
+    )
+    expect(page.locator("#locationReviewAssignmentStatus")).to_have_text(
+        "Assigning 1,000 of 2,501 photos · 40%"
+    )
+    expect(progress_bar).to_have_attribute("aria-valuenow", "1000")
+
+    page.evaluate("window.__settleLocationAssignment('reject')")
+    expect(page.locator("#locationReviewAssign")).to_have_text(
+        "Retry 1,501 remaining"
+    )
+    expect(page.locator("#locationReviewAssignmentStatus")).to_have_text(
+        "1,000 of 2,501 assigned · 1,501 remaining"
+    )
+    # Skip / Prev / Next stay locked while a partial assignment is pending so
+    # the committed chunks cannot be silently dropped: skipping would splice
+    # the group as "skipped without changes" and navigating away would clear
+    # state.assignment so a later retry reprocesses committed chunks.
+    expect(page.locator("#locationReviewSkip")).to_be_disabled()
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function(
+        "() => window.__locationReviewAssignmentRequests.length === 3"
+    )
+    page.evaluate("window.__settleLocationAssignment(1000)")
+    page.wait_for_function(
+        "() => window.__locationReviewAssignmentRequests.length === 4"
+    )
+    expect(page.locator("#locationReviewAssignmentStatus")).to_have_text(
+        "Assigning 2,000 of 2,501 photos · 80%"
+    )
+    page.evaluate("window.__settleLocationAssignment(501)")
+
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text(
+        "All locations reviewed"
+    )
+    requests = page.evaluate("window.__locationReviewAssignmentRequests")
+    assert [len(request["photo_ids"]) for request in requests] == [
+        1000, 1000, 1000, 501,
+    ]
+    assert requests[2]["photo_ids"] == synthetic_photo_ids[1000:2000]
+
+
+def test_location_review_locks_suggestion_mode_controls_during_assignment(
+    live_server, page,
+):
+    """Suggestion-mode buttons must not clear the selection mid-assignment."""
+    photo_id = live_server["data"]["photos"][0]
+    with live_server["db"].conn:
+        live_server["db"].conn.execute(
+            "UPDATE photos SET latitude = ?, longitude = ? WHERE id = ?",
+            (33.2550, -116.4050, photo_id),
+        )
+
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(json={"google_maps_api_key": "test-key"}),
+    )
+    page.route(
+        "https://maps.googleapis.com/maps/api/js**",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/javascript",
+            body=GOOGLE_MAPS_STUB,
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("1 photo")
+
+    recommended_button = page.locator('[data-suggestion-mode="recommended"]')
+    places_button = page.locator('[data-suggestion-mode="places"]')
+    expect(recommended_button).to_be_enabled()
+    expect(places_button).to_be_enabled()
+
+    page.locator("#locationReviewSearch").fill("Assigned custom place")
+    page.locator("#locationReviewCustom").click()
+    expect(page.locator("#locationReviewAssign")).to_contain_text(
+        "Assign “Assigned custom place”"
+    )
+
+    page.evaluate(
+        """() => {
+          window.__locationReviewOriginalSafeFetch = window.safeFetch;
+          window.__locationReviewAssignmentPending = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__locationReviewOriginalSafeFetch(url, opts, options);
+            }
+            return new Promise(function(resolve, reject) {
+              window.__locationReviewAssignmentPending.push(
+                {resolve: resolve, reject: reject}
+              );
+            });
+          };
+          window.__settleLocationAssignment = function(result) {
+            var pending = window.__locationReviewAssignmentPending.shift();
+            if (result === 'reject') pending.reject(new Error('Synthetic interruption'));
+            else pending.resolve({ok: true, updated: result});
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function(
+        "() => window.__locationReviewAssignmentPending.length === 1"
+    )
+    expect(recommended_button).to_be_disabled()
+    expect(places_button).to_be_disabled()
+
+    places_button.click(force=True)
+    expect(recommended_button).to_have_attribute("aria-pressed", "true")
+    expect(places_button).to_have_attribute("aria-pressed", "false")
+    expect(page.locator("#locationReviewAssign")).to_have_text("Assigning…")
+
+    page.evaluate("window.__settleLocationAssignment('reject')")
+    expect(page.locator("#locationReviewAssign")).to_contain_text(
+        "Retry “Assigned custom place”"
+    )
+    expect(recommended_button).to_be_enabled()
+    expect(places_button).to_be_enabled()
+
+
+def test_location_review_partial_assignment_locks_navigation_and_choice(
+    live_server, page,
+):
+    """After a chunk failure with committed chunks, nav and choice-change are locked."""
+    photo_id = live_server["data"]["photos"][0]
+    other_photo_ids = list(range(2000, 2010))
+    preview = {
+        "total": len(other_photo_ids) + 1,
+        "reviewable": len(other_photo_ids) + 1,
+        "unresolved": [],
+        "skipped": [],
+        "groups": [
+            {
+                "photo_ids": list(range(1, 1501)),
+                "photos": [{
+                    "id": photo_id,
+                    "filename": "batch-example.jpg",
+                    "latitude": 33.255,
+                    "longitude": -116.405,
+                    "timestamp": "2026-08-04T10:17:00",
+                }],
+                "count": 1500,
+                "center": {"lat": 33.255, "lng": -116.405},
+                "bounds": {
+                    "south": 33.255, "west": -116.405,
+                    "north": 33.255, "east": -116.405,
+                },
+                "spread_m": 0,
+                "captured_from": "2026-08-04T10:17:00",
+                "captured_to": "2026-08-04T10:17:00",
+            },
+            {
+                "photo_ids": other_photo_ids,
+                "photos": [{
+                    "id": photo_id,
+                    "filename": "other-group.jpg",
+                    "latitude": 40.0,
+                    "longitude": -105.0,
+                    "timestamp": "2026-08-04T10:20:00",
+                }],
+                "count": len(other_photo_ids),
+                "center": {"lat": 40.0, "lng": -105.0},
+                "bounds": {
+                    "south": 40.0, "west": -105.0,
+                    "north": 40.0, "east": -105.0,
+                },
+                "spread_m": 0,
+                "captured_from": "2026-08-04T10:20:00",
+                "captured_to": "2026-08-04T10:20:00",
+            },
+        ],
+    }
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.route(
+        "**/api/location-review/preview",
+        lambda route: route.fulfill(json=preview),
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("1,500 photos")
+
+    # First, assign a keyword-like custom choice so we have something selected.
+    page.locator("#locationReviewSearch").fill("First location")
+    page.locator("#locationReviewCustom").click()
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetch = window.safeFetch;
+          window.__pending = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__originalSafeFetch(url, opts, options);
+            }
+            return new Promise(function(resolve, reject) {
+              window.__pending.push({resolve: resolve, reject: reject});
+            });
+          };
+          window.__settle = function(result) {
+            var pending = window.__pending.shift();
+            if (result === 'reject') pending.reject(new Error('boom'));
+            else pending.resolve({ok: true, updated: result});
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(1000)")  # First chunk commits.
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle('reject')")  # Second chunk fails.
+
+    # Partial progress: nav & suggestion-mode locked until retry completes.
+    expect(page.locator("#locationReviewAssign")).to_contain_text("Retry 500 remaining")
+    expect(page.locator("#locationReviewSkip")).to_be_disabled()
+    expect(page.locator("#locationReviewNext")).to_be_disabled()
+    expect(page.locator("#locationReviewPrevious")).to_be_disabled()
+    expect(page.locator('[data-suggestion-mode="nature"]')).to_be_disabled()
+    expect(page.locator('[data-suggestion-mode="places"]')).to_be_disabled()
+
+    # Attempting to select a different candidate is refused so the committed
+    # chunks are not silently orphaned. The custom-name button funnels through
+    # selectChoice(), so it's the easiest UI path to trigger a choice change.
+    page.evaluate(
+        """() => {
+          window.__toasts = [];
+          var original = window.showToast;
+          window.showToast = function(message, kind) {
+            window.__toasts.push({message: message, kind: kind});
+            return original ? original(message, kind) : null;
+          };
+        }"""
+    )
+    page.locator("#locationReviewSearch").fill("Different location")
+    page.locator("#locationReviewCustom").click()
+    toasts = page.evaluate("window.__toasts")
+    assert toasts, "expected a warning toast when changing choice mid-partial"
+    assert "First location" in toasts[0]["message"]
+    # The selected choice must be unchanged (button text still describes the
+    # in-flight retry for the original choice).
+    expect(page.locator("#locationReviewAssign")).to_contain_text("Retry 500 remaining")
+
+    # Retrying completes the group and unlocks navigation for the next one.
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(500)")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("10 photos")
+    expect(page.locator("#locationReviewSkip")).to_be_enabled()
+
+
+def test_location_review_partial_assignment_blocks_photo_preview(
+    live_server, page,
+):
+    """Lightbox open is refused mid-partial so a delete can't drop committed chunks.
+
+    Without this guard the lightbox 'photodeleted' handler would call
+    renderCurrentGroup(), nulling state.assignment and unlocking navigation
+    even though earlier chunks already changed photos on disk.
+    """
+    photo_id = live_server["data"]["photos"][0]
+    preview = {
+        "total": 1500,
+        "reviewable": 1500,
+        "unresolved": [],
+        "skipped": [],
+        "groups": [
+            {
+                "photo_ids": list(range(1, 1501)),
+                "photos": [{
+                    "id": photo_id,
+                    "filename": "batch-example.jpg",
+                    "latitude": 33.255,
+                    "longitude": -116.405,
+                    "timestamp": "2026-08-04T10:17:00",
+                }],
+                "count": 1500,
+                "center": {"lat": 33.255, "lng": -116.405},
+                "bounds": {
+                    "south": 33.255, "west": -116.405,
+                    "north": 33.255, "east": -116.405,
+                },
+                "spread_m": 0,
+                "captured_from": "2026-08-04T10:17:00",
+                "captured_to": "2026-08-04T10:17:00",
+            },
+        ],
+    }
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.route(
+        "**/api/location-review/preview",
+        lambda route: route.fulfill(json=preview),
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("1,500 photos")
+
+    page.locator("#locationReviewSearch").fill("Partial location")
+    page.locator("#locationReviewCustom").click()
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetch = window.safeFetch;
+          window.__pending = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__originalSafeFetch(url, opts, options);
+            }
+            return new Promise(function(resolve, reject) {
+              window.__pending.push({resolve: resolve, reject: reject});
+            });
+          };
+          window.__settle = function(result) {
+            var pending = window.__pending.shift();
+            if (result === 'reject') pending.reject(new Error('boom'));
+            else pending.resolve({ok: true, updated: result});
+          };
+          window.__toasts = [];
+          var originalToast = window.showToast;
+          window.showToast = function(message, kind) {
+            window.__toasts.push({message: message, kind: kind});
+            return originalToast ? originalToast(message, kind) : null;
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(1000)")  # First chunk commits.
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle('reject')")  # Second chunk fails.
+
+    expect(page.locator("#locationReviewAssign")).to_contain_text("Retry 500 remaining")
+
+    # Attempting to open a photo via the thumbnail must be refused while a
+    # partial assignment is pending. Otherwise 'lightbox:photodeleted' would
+    # call renderCurrentGroup() and silently orphan the committed chunks.
+    page.locator(
+        f'.location-review-thumb[data-photo-id="{photo_id}"]'
+    ).click()
+
+    expect(page.locator("#lightboxOverlay")).not_to_have_class(
+        "lightbox-overlay active"
+    )
+    toasts = page.evaluate("window.__toasts")
+    assert toasts, "expected a warning toast when opening a photo mid-partial"
+    assert "pending assignment" in toasts[-1]["message"]
+    assert "Partial location" in toasts[-1]["message"]
+
+    # Partial-assignment state must survive the blocked click intact — the
+    # retry button still points at the in-flight remainder and every nav
+    # control stays locked.
+    expect(page.locator("#locationReviewAssign")).to_contain_text("Retry 500 remaining")
+    expect(page.locator("#locationReviewSkip")).to_be_disabled()
+    expect(page.locator("#locationReviewNext")).to_be_disabled()
+    expect(page.locator("#locationReviewPrevious")).to_be_disabled()
+
+    # Retrying completes the group; only then should the lightbox open again.
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(500)")
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text(
+        "All locations reviewed"
+    )
+
+
+def test_location_review_assignment_closes_lightbox_already_open(
+    live_server, page,
+):
+    """A lightbox left open before assignment starts is closed by assignCurrentGroup.
+
+    openPhotoPreview()'s guard only blocks NEW opens once state.isAssigning or
+    hasPartialAssignmentProgress becomes true; a lightbox opened moments before
+    (e.g. a keyboard user tabs from a thumbnail to Assign) survives past those
+    checks. If it survives further, deleting the visible photo mid-assignment
+    would fire lightbox:photodeleted → renderCurrentGroup(), nulling
+    state.assignment while committed chunks are still in flight.
+    """
+    photo_id = live_server["data"]["photos"][0]
+    preview = {
+        "total": 1500,
+        "reviewable": 1500,
+        "unresolved": [],
+        "skipped": [],
+        "groups": [
+            {
+                "photo_ids": list(range(1, 1501)),
+                "photos": [{
+                    "id": photo_id,
+                    "filename": "batch-example.jpg",
+                    "latitude": 33.255,
+                    "longitude": -116.405,
+                    "timestamp": "2026-08-04T10:17:00",
+                }],
+                "count": 1500,
+                "center": {"lat": 33.255, "lng": -116.405},
+                "bounds": {
+                    "south": 33.255, "west": -116.405,
+                    "north": 33.255, "east": -116.405,
+                },
+                "spread_m": 0,
+                "captured_from": "2026-08-04T10:17:00",
+                "captured_to": "2026-08-04T10:17:00",
+            },
+        ],
+    }
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.route(
+        "**/api/location-review/preview",
+        lambda route: route.fulfill(json=preview),
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("1,500 photos")
+
+    page.locator("#locationReviewSearch").fill("Pre-open lightbox")
+    page.locator("#locationReviewCustom").click()
+
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetch = window.safeFetch;
+          window.__pending = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__originalSafeFetch(url, opts, options);
+            }
+            return new Promise(function(resolve, reject) {
+              window.__pending.push({resolve: resolve, reject: reject});
+            });
+          };
+          window.__settle = function(result) {
+            var pending = window.__pending.shift();
+            if (result === 'reject') pending.reject(new Error('boom'));
+            else pending.resolve({ok: true, updated: result});
+          };
+        }"""
+    )
+
+    # Open the lightbox BEFORE the assignment starts — the openPhotoPreview
+    # guard permits this because nothing is in flight yet. Drive openLightbox
+    # directly so this test doesn't depend on the browse-page thumbnail
+    # loading a real photo bitmap.
+    page.evaluate(
+        """photoId => {
+          openLightbox(photoId, 'batch-example.jpg', [
+            {id: photoId, filename: 'batch-example.jpg'}
+          ]);
+        }""",
+        photo_id,
+    )
+    expect(page.locator("#lightboxOverlay")).to_have_class(
+        "lightbox-overlay active"
+    )
+
+    # Simulate the keyboard-tab-to-Assign path: dispatch the click via the DOM
+    # so it reaches the button beneath the overlay. Codex's concern is that
+    # the Assign handler is reachable at all while the lightbox is up, not
+    # the specific interaction that gets there.
+    page.evaluate(
+        "document.getElementById('locationReviewAssign').click()"
+    )
+    page.wait_for_function("() => window.__pending.length === 1")
+
+    # assignCurrentGroup must have closed the lightbox before the first chunk
+    # fired — otherwise a delete would still be able to reset state.assignment.
+    expect(page.locator("#lightboxOverlay")).not_to_have_class(
+        "lightbox-overlay active"
+    )
+    assert page.evaluate("window._lbEscToken == null")
+
+    page.evaluate("window.__settle(1000)")
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(500)")
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text(
+        "All locations reviewed"
+    )
+
+
+def test_location_review_partial_assignment_survives_photodeleted_event(
+    live_server, page,
+):
+    """The lightbox:photodeleted handler preserves state.assignment mid-partial.
+
+    Defense in depth for the primary close-on-assignment fix: even if a
+    photodeleted event somehow fires while a partial batch is waiting for
+    retry, the handler must NOT rebuild the group and null the recorded
+    offset — that would silently reprocess already-committed chunks on retry.
+    """
+    photo_id = live_server["data"]["photos"][0]
+    photo_ids = list(range(1, 1501))
+    preview = {
+        "total": 1500,
+        "reviewable": 1500,
+        "unresolved": [],
+        "skipped": [],
+        "groups": [
+            {
+                "photo_ids": photo_ids,
+                "photos": [
+                    {
+                        "id": photo_id,
+                        "filename": "keep.jpg",
+                        "latitude": 33.255,
+                        "longitude": -116.405,
+                        "timestamp": "2026-08-04T10:17:00",
+                    },
+                    {
+                        "id": photo_id + 9001,
+                        "filename": "drop.jpg",
+                        "latitude": 33.255,
+                        "longitude": -116.405,
+                        "timestamp": "2026-08-04T10:18:00",
+                    },
+                ],
+                "count": 1500,
+                "center": {"lat": 33.255, "lng": -116.405},
+                "bounds": {
+                    "south": 33.255, "west": -116.405,
+                    "north": 33.255, "east": -116.405,
+                },
+                "spread_m": 0,
+                "captured_from": "2026-08-04T10:17:00",
+                "captured_to": "2026-08-04T10:18:00",
+            },
+        ],
+    }
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.route(
+        "**/api/location-review/preview",
+        lambda route: route.fulfill(json=preview),
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("1,500 photos")
+
+    page.locator("#locationReviewSearch").fill("Defensive location")
+    page.locator("#locationReviewCustom").click()
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetch = window.safeFetch;
+          window.__pending = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__originalSafeFetch(url, opts, options);
+            }
+            return new Promise(function(resolve, reject) {
+              window.__pending.push({resolve: resolve, reject: reject});
+            });
+          };
+          window.__settle = function(result) {
+            var pending = window.__pending.shift();
+            if (result === 'reject') pending.reject(new Error('boom'));
+            else pending.resolve({ok: true, updated: result});
+          };
+        }"""
+    )
+
+    page.evaluate(
+        """() => {
+          window.__requestBodies = [];
+          var raw = window.safeFetch;
+          window.safeFetch = function(url, opts, options) {
+            if (url === '/api/batch/location/text') {
+              window.__requestBodies.push(JSON.parse(opts.body));
+            }
+            return raw(url, opts, options);
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(1000)")  # first chunk commits
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle('reject')")  # second chunk fails
+
+    expect(page.locator("#locationReviewAssign")).to_contain_text(
+        "Retry 500 remaining"
+    )
+    assert page.evaluate("window.__requestBodies.length") == 2
+
+    # Synthesize a stray photodeleted event for a photo in the current group.
+    page.evaluate(
+        "photoId => document.dispatchEvent(new CustomEvent('lightbox:photodeleted',"
+        " {detail: {photoId: photoId + 9001}}))",
+        photo_id,
+    )
+
+    # Nav and choice-mode buttons must stay locked — the observable proof that
+    # the handler did NOT rebuild the UI and null state.assignment.
+    expect(page.locator("#locationReviewAssign")).to_contain_text(
+        "Retry 500 remaining"
+    )
+    expect(page.locator("#locationReviewSkip")).to_be_disabled()
+    expect(page.locator("#locationReviewNext")).to_be_disabled()
+    expect(page.locator("#locationReviewPrevious")).to_be_disabled()
+    expect(page.locator('[data-suggestion-mode="nature"]')).to_be_disabled()
+    expect(page.locator('[data-suggestion-mode="places"]')).to_be_disabled()
+
+    # Retry completes at the correct offset — no reprocessing of committed
+    # chunks. If the handler had reset state.assignment, retry would start at
+    # offset 0 and send 1500 photos again across two more chunks.
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(500)")
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text(
+        "All locations reviewed"
+    )
+    request_lengths = page.evaluate(
+        "window.__requestBodies.map(function(body) { return body.photo_ids.length; })"
+    )
+    assert request_lengths == [1000, 500, 500], (
+        f"Retry should resume from offset 1000, got chunks {request_lengths}"
+    )
+    third_chunk_ids = page.evaluate("window.__requestBodies[2].photo_ids")
+    assert third_chunk_ids == list(range(1001, 1501))
+
+
+def test_location_review_partial_assignment_survives_completed_prefix_delete(
+    live_server, page,
+):
+    """A photodeleted event for an already-committed photo mustn't shift the retry offset.
+
+    If lightbox:photodeleted removes a photo from the already-committed
+    prefix of group.photo_ids, the surviving IDs slide left. If the retry
+    loop slices group.photo_ids at the stale offset, the first
+    still-unassigned photo would be skipped and the group silently marked
+    completed. Assignment must slice from an immutable snapshot instead.
+    """
+    photo_id = live_server["data"]["photos"][0]
+    photo_ids = list(range(1, 1501))
+    preview = {
+        "total": 1500,
+        "reviewable": 1500,
+        "unresolved": [],
+        "skipped": [],
+        "groups": [
+            {
+                "photo_ids": photo_ids,
+                "photos": [
+                    {
+                        "id": photo_id,
+                        "filename": "keep.jpg",
+                        "latitude": 33.255,
+                        "longitude": -116.405,
+                        "timestamp": "2026-08-04T10:17:00",
+                    },
+                ],
+                "count": 1500,
+                "center": {"lat": 33.255, "lng": -116.405},
+                "bounds": {
+                    "south": 33.255, "west": -116.405,
+                    "north": 33.255, "east": -116.405,
+                },
+                "spread_m": 0,
+                "captured_from": "2026-08-04T10:17:00",
+                "captured_to": "2026-08-04T10:17:00",
+            },
+        ],
+    }
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.route(
+        "**/api/location-review/preview",
+        lambda route: route.fulfill(json=preview),
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("1,500 photos")
+
+    page.locator("#locationReviewSearch").fill("Prefix delete location")
+    page.locator("#locationReviewCustom").click()
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetch = window.safeFetch;
+          window.__pending = [];
+          window.__requestBodies = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__originalSafeFetch(url, opts, options);
+            }
+            window.__requestBodies.push(JSON.parse(opts.body));
+            return new Promise(function(resolve, reject) {
+              window.__pending.push({resolve: resolve, reject: reject});
+            });
+          };
+          window.__settle = function(result) {
+            var pending = window.__pending.shift();
+            if (result === 'reject') pending.reject(new Error('boom'));
+            else pending.resolve({ok: true, updated: result});
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(1000)")  # first chunk commits
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle('reject')")  # second chunk fails
+
+    expect(page.locator("#locationReviewAssign")).to_contain_text(
+        "Retry 500 remaining"
+    )
+    assert page.evaluate("window.__requestBodies.length") == 2
+
+    # Simulate a photodeleted event for a photo in the already-committed
+    # prefix (ID 500 was in the first chunk, indices 0..999). Before the
+    # snapshot fix, the delete handler's filter left group.photo_ids with
+    # 1499 elements and shifted IDs 501..1500 down to indices 500..1498;
+    # retry would then slice from offset 1000, sending IDs 1002..1500 and
+    # silently skipping ID 1001.
+    page.evaluate(
+        "document.dispatchEvent(new CustomEvent('lightbox:photodeleted',"
+        " {detail: {photoId: 500}}))"
+    )
+
+    # Navigation must stay locked — partial state is still pending.
+    expect(page.locator("#locationReviewSkip")).to_be_disabled()
+    expect(page.locator("#locationReviewNext")).to_be_disabled()
+    expect(page.locator("#locationReviewPrevious")).to_be_disabled()
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(500)")
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text(
+        "All locations reviewed"
+    )
+    request_lengths = page.evaluate(
+        "window.__requestBodies.map(function(body) { return body.photo_ids.length; })"
+    )
+    assert request_lengths == [1000, 500, 500], (
+        f"Retry should resume from offset 1000 with 500 IDs, got chunks {request_lengths}"
+    )
+    third_chunk_ids = page.evaluate("window.__requestBodies[2].photo_ids")
+    assert third_chunk_ids == list(range(1001, 1501)), (
+        "Retry chunk must contain the original pending IDs (1001..1500) — "
+        "the completed-prefix delete must not shift the snapshot."
+    )
+
+
+def test_location_review_partial_assignment_drops_deleted_pending_ids(
+    live_server, page,
+):
+    """Deleting a photo in the retry suffix must not leave its ID in the snapshot.
+
+    Both batch-location endpoints validate every photo_id up front and 404
+    on any that no longer exists. If a lightbox:photodeleted event removes
+    a photo from the still-unassigned suffix while a partial batch waits
+    for retry, the immutable snapshot would keep that ID and every retry
+    would 404 — permanently jamming the group. The reconciled snapshot
+    must drop the deleted ID and its progress counters.
+    """
+    photo_id = live_server["data"]["photos"][0]
+    photo_ids = list(range(1, 1501))
+    preview = {
+        "total": 1500,
+        "reviewable": 1500,
+        "unresolved": [],
+        "skipped": [],
+        "groups": [
+            {
+                "photo_ids": photo_ids,
+                "photos": [
+                    {
+                        "id": photo_id,
+                        "filename": "keep.jpg",
+                        "latitude": 33.255,
+                        "longitude": -116.405,
+                        "timestamp": "2026-08-04T10:17:00",
+                    },
+                ],
+                "count": 1500,
+                "center": {"lat": 33.255, "lng": -116.405},
+                "bounds": {
+                    "south": 33.255, "west": -116.405,
+                    "north": 33.255, "east": -116.405,
+                },
+                "spread_m": 0,
+                "captured_from": "2026-08-04T10:17:00",
+                "captured_to": "2026-08-04T10:17:00",
+            },
+        ],
+    }
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.route(
+        "**/api/location-review/preview",
+        lambda route: route.fulfill(json=preview),
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("1,500 photos")
+
+    page.locator("#locationReviewSearch").fill("Suffix delete location")
+    page.locator("#locationReviewCustom").click()
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetch = window.safeFetch;
+          window.__pending = [];
+          window.__requestBodies = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__originalSafeFetch(url, opts, options);
+            }
+            window.__requestBodies.push(JSON.parse(opts.body));
+            return new Promise(function(resolve, reject) {
+              window.__pending.push({resolve: resolve, reject: reject});
+            });
+          };
+          window.__settle = function(result) {
+            var pending = window.__pending.shift();
+            if (result === 'reject') pending.reject(new Error('boom'));
+            else pending.resolve({ok: true, updated: result});
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(1000)")  # first chunk commits
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle('reject')")  # second chunk fails
+
+    expect(page.locator("#locationReviewAssign")).to_contain_text(
+        "Retry 500 remaining"
+    )
+    assert page.evaluate("window.__requestBodies.length") == 2
+
+    # Simulate a photodeleted event for a photo in the still-unassigned
+    # suffix (ID 1200 was in the pending chunk 1001..1500). Without the
+    # snapshot reconciliation, the retry snapshot would still contain
+    # 1200 and every retry would 404 on the missing photo, leaving the
+    # user stuck behind a locked toolbar.
+    page.evaluate(
+        "document.dispatchEvent(new CustomEvent('lightbox:photodeleted',"
+        " {detail: {photoId: 1200}}))"
+    )
+
+    # Progress and retry button reflect the reconciled remainder (500 - 1).
+    expect(page.locator("#locationReviewAssign")).to_contain_text(
+        "Retry 499 remaining"
+    )
+    expect(page.locator("#locationReviewAssignmentStatus")).to_have_text(
+        "1,000 of 1,499 assigned · 499 remaining"
+    )
+    # Navigation must stay locked — partial state is still pending.
+    expect(page.locator("#locationReviewSkip")).to_be_disabled()
+    expect(page.locator("#locationReviewNext")).to_be_disabled()
+    expect(page.locator("#locationReviewPrevious")).to_be_disabled()
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(499)")
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text(
+        "All locations reviewed"
+    )
+    request_lengths = page.evaluate(
+        "window.__requestBodies.map(function(body) { return body.photo_ids.length; })"
+    )
+    assert request_lengths == [1000, 500, 499], (
+        f"Retry must skip the deleted pending ID, got chunks {request_lengths}"
+    )
+    third_chunk_ids = page.evaluate("window.__requestBodies[2].photo_ids")
+    expected_third = [pid for pid in range(1001, 1501) if pid != 1200]
+    assert third_chunk_ids == expected_third, (
+        "Retry chunk must exclude the deleted pending ID — the snapshot must "
+        "reconcile with lightbox:photodeleted."
+    )
+
+
+def test_location_review_partial_assignment_advances_when_deletion_drains_suffix(
+    live_server, page,
+):
+    """A deletion that empties the retry suffix must advance the group.
+
+    When a partial batch fails and the remaining unassigned photos are
+    then deleted through the lightbox, reconciliation drops those IDs
+    from the snapshot and the pending remainder becomes zero. Those
+    photos that were already committed are saved on the server, so the
+    group is effectively done — re-rendering it as a fresh, unreviewed
+    group would let the user double-assign the already-saved photos
+    under a different name. The queue must advance past the group and
+    the progress counter must reflect the completed assignment.
+    """
+    photo_id = live_server["data"]["photos"][0]
+    photo_ids = list(range(1, 1002))
+    preview = {
+        "total": 1001,
+        "reviewable": 1001,
+        "unresolved": [],
+        "skipped": [],
+        "groups": [
+            {
+                "photo_ids": photo_ids,
+                "photos": [
+                    {
+                        "id": photo_id,
+                        "filename": "keep.jpg",
+                        "latitude": 33.255,
+                        "longitude": -116.405,
+                        "timestamp": "2026-08-04T10:17:00",
+                    },
+                ],
+                "count": 1001,
+                "center": {"lat": 33.255, "lng": -116.405},
+                "bounds": {
+                    "south": 33.255, "west": -116.405,
+                    "north": 33.255, "east": -116.405,
+                },
+                "spread_m": 0,
+                "captured_from": "2026-08-04T10:17:00",
+                "captured_to": "2026-08-04T10:17:00",
+            },
+        ],
+    }
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.route(
+        "**/api/location-review/preview",
+        lambda route: route.fulfill(json=preview),
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("1,001 photos")
+
+    page.locator("#locationReviewSearch").fill("Drained suffix location")
+    page.locator("#locationReviewCustom").click()
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetch = window.safeFetch;
+          window.__pending = [];
+          window.__requestBodies = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__originalSafeFetch(url, opts, options);
+            }
+            window.__requestBodies.push(JSON.parse(opts.body));
+            return new Promise(function(resolve, reject) {
+              window.__pending.push({resolve: resolve, reject: reject});
+            });
+          };
+          window.__settle = function(result) {
+            var pending = window.__pending.shift();
+            if (result === 'reject') pending.reject(new Error('boom'));
+            else pending.resolve({ok: true, updated: result});
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(1000)")  # first chunk (1..1000) commits
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle('reject')")  # second chunk [1001] fails
+
+    expect(page.locator("#locationReviewAssign")).to_contain_text(
+        "Retry 1 remaining"
+    )
+    assert page.evaluate("window.__requestBodies.length") == 2
+
+    # Delete the sole remaining pending photo through the lightbox. After
+    # reconciliation, photoIds == processedIds so pendingRemaining is 0.
+    # Committed photos still sit in group.photos (via the surviving
+    # sample), so the buggy code would keep the group in the queue and
+    # re-render it as an unreviewed group.
+    page.evaluate(
+        "document.dispatchEvent(new CustomEvent('lightbox:photodeleted',"
+        " {detail: {photoId: 1001}}))"
+    )
+
+    # The group must be spliced out of the queue and the empty-state
+    # panel shown — the committed photos are saved and must not be
+    # available for a second assignment.
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text(
+        "All locations reviewed"
+    )
+    # The completed group must count toward the top-level progress.
+    expect(page.locator("#locationReviewProgressText")).to_have_text(
+        "1 of 1 assigned"
+    )
+    # And no further batch requests should have been issued — the retry
+    # button no longer exists once the empty state is shown.
+    assert page.evaluate("window.__requestBodies.length") == 2
+
+
 def test_location_review_missing_google_key_links_to_settings(live_server, page):
     """The empty suggestion state explains how to enable nearby places."""
     photo_id = live_server["data"]["photos"][0]
@@ -333,8 +1469,8 @@ def test_location_review_ranks_saved_and_google_places_by_distance(
     page.goto(f"{live_server['url']}/locations/review?source=selection")
 
     candidates = page.locator(".location-review-candidate")
-    expect(candidates).to_have_count(2)
-    expect(candidates.first).to_contain_text("Nearby Park")
+    expect(candidates).to_have_count(3)
+    expect(candidates.first).to_contain_text("Nearby General Store")
     saved_candidate = candidates.filter(has_text="Far Saved Place")
     expect(saved_candidate.locator(".location-review-candidate-badge")).to_have_text(
         "Previously used"
@@ -343,13 +1479,17 @@ def test_location_review_ranks_saved_and_google_places_by_distance(
         "Saved location"
     )
 
-    coordinate_toggle = page.get_by_label("Include coordinates")
+    coordinate_toggle = page.get_by_label("Show coordinates")
+    expect(page.locator('label[for="locationReviewIncludeCoordinates"]')).to_have_attribute(
+        "title",
+        "Display only. This does not change location assignments or metadata written to XMP.",
+    )
     expect(coordinate_toggle).not_to_be_checked()
     expect(candidates.locator(".location-review-candidate-coordinates")).to_have_count(0)
 
     coordinate_toggle.check()
     expect(candidates.first.locator(".location-review-candidate-coordinates")).to_have_text(
-        "32.751000, -117.001000"
+        "32.750000, -117.000000"
     )
     expect(saved_candidate.locator(".location-review-candidate-coordinates")).to_have_text(
         "32.938000, -117.000000"
@@ -359,10 +1499,10 @@ def test_location_review_ranks_saved_and_google_places_by_distance(
     expect(candidates.locator(".location-review-candidate-coordinates")).to_have_count(0)
 
 
-def test_location_review_suggests_campgrounds_and_can_show_all_nearby_places(
+def test_location_review_filters_nature_and_places_strictly(
     live_server, page,
 ):
-    """Focused suggestions include campgrounds; the toggle broadens categories."""
+    """Category controls filter one shared candidate pool rather than changing queries."""
     photo_id = live_server["data"]["photos"][0]
     with live_server["db"].conn:
         live_server["db"].conn.execute(
@@ -390,9 +1530,10 @@ def test_location_review_suggests_campgrounds_and_can_show_all_nearby_places(
     )
     page.goto(f"{live_server['url']}/locations/review?source=selection")
 
+    recommended_button = page.locator('[data-suggestion-mode="recommended"]')
     nature_button = page.locator('[data-suggestion-mode="nature"]')
-    all_button = page.locator('[data-suggestion-mode="all"]')
-    expect(nature_button).to_have_attribute("aria-pressed", "true")
+    places_button = page.locator('[data-suggestion-mode="places"]')
+    expect(recommended_button).to_have_attribute("aria-pressed", "true")
     campground = page.locator(
         ".location-review-candidate", has_text="Tamarisk Grove Campground"
     )
@@ -401,13 +1542,23 @@ def test_location_review_suggests_campgrounds_and_can_show_all_nearby_places(
         "Campground"
     )
 
-    all_button.click()
+    general_store = page.locator(
+        ".location-review-candidate", has_text="Nearby General Store"
+    )
+    expect(general_store).to_be_visible()
 
-    expect(all_button).to_have_attribute("aria-pressed", "true")
+    nature_button.click()
+
+    expect(nature_button).to_have_attribute("aria-pressed", "true")
+    expect(recommended_button).to_have_attribute("aria-pressed", "false")
+    expect(campground).to_be_visible()
+    expect(general_store).to_have_count(0)
+
+    places_button.click()
+
+    expect(places_button).to_have_attribute("aria-pressed", "true")
     expect(nature_button).to_have_attribute("aria-pressed", "false")
-    expect(
-        page.locator(".location-review-candidate", has_text="Nearby General Store")
-    ).to_be_visible()
+    expect(general_store).to_be_visible()
     expect(campground).to_have_count(0)
 
     requested_types = page.evaluate(
@@ -415,6 +1566,71 @@ def test_location_review_suggests_campgrounds_and_can_show_all_nearby_places(
     )
     assert "campground" in requested_types
     assert None in requested_types
+
+
+def test_location_review_groups_hamlets_and_keeps_a_selection_across_filters(
+    live_server, page,
+):
+    """Local areas such as Garrieux are grouped and remain selectable across filters."""
+    photo_id = live_server["data"]["photos"][0]
+    with live_server["db"].conn:
+        live_server["db"].conn.execute(
+            "UPDATE photos SET latitude = ?, longitude = ? WHERE id = ?",
+            (42.810, 2.940, photo_id),
+        )
+
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(json={"google_maps_api_key": "test-key"}),
+    )
+    page.route(
+        "https://maps.googleapis.com/maps/api/js**",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/javascript",
+            body=GOOGLE_MAPS_STUB,
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+
+    at_photos = page.locator('[data-candidate-group="at"]')
+    expect(at_photos.locator(".location-review-candidate-group-title")).to_have_text(
+        "At the photos"
+    )
+    garrieux = at_photos.locator(
+        ".location-review-candidate", has_text="Garrieux"
+    )
+    expect(garrieux).to_be_visible()
+    expect(garrieux.locator(".location-review-candidate-type")).to_have_text(
+        "Neighborhood"
+    )
+    expect(garrieux.locator(".location-review-candidate-detail")).to_contain_text(
+        "At photo coordinates"
+    )
+    expect(
+        page.locator('[data-candidate-group="broader"]')
+    ).to_contain_text("Pyrénées-Orientales")
+
+    page.locator('[data-suggestion-mode="areas"]').click()
+    expect(page.locator(".location-review-candidate")).to_have_count(3)
+    expect(page.locator(".location-review-candidate", has_text="Nearby Park")).to_have_count(0)
+
+    garrieux = page.locator(".location-review-candidate", has_text="Garrieux")
+    garrieux.click()
+    page.locator('[data-suggestion-mode="nature"]').click()
+
+    expect(garrieux).to_be_visible()
+    expect(page.locator('[data-candidate-group="selected"]')).to_contain_text(
+        "Selected location"
+    )
+    expect(page.locator(".location-review-candidate", has_text="Nearby Park")).to_be_visible()
+    expect(page.locator(".location-review-candidate", has_text="Nearby General Store")).to_have_count(0)
 
 
 def test_location_review_color_codes_place_types(live_server, page):

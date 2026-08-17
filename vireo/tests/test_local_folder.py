@@ -1757,6 +1757,134 @@ def test_ancestor_workspace_materialized_before_stage_rebase(tmp_path):
         db.close()
 
 
+def test_workspace_status_exposes_visible_ancestor_for_missing_local_root(tmp_path):
+    """When a local session's rebased folders.path goes missing (managed local
+    directory unmounted or deleted, so check_folder_health marks it 'missing'
+    and /api/folders drops it), workspace_status must still hand the Browse
+    folder tree an anchor to render the LOCAL ISSUE badge on. The nearest
+    visible ancestor is that anchor; without it the badge disappears exactly
+    when the local copy needs recovery (Codex review r3791982618)."""
+    db = Database(str(tmp_path / "vireo.db"))
+    ws = db.create_workspace("Reviewer")
+    parent = tmp_path / "nas" / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    (child / "bird.jpg").write_bytes(b"original")
+    parent_id = db.add_folder(str(parent), name="parent", link_to_workspace=False)
+    child_id = db.add_folder(str(child), name="child", parent_id=parent_id, link_to_workspace=False)
+    db.add_workspace_folder(ws, parent_id)
+    db.add_workspace_folder(ws, child_id)
+    try:
+        stage_folder(db, child_id, str(tmp_path / "vireo"))
+
+        # Simulate check_folder_health flipping the rebased child's status to
+        # 'missing' after its managed local dir disappears — get_folder_tree
+        # then excludes the row (/api/folders no longer lists it).
+        db.conn.execute(
+            "UPDATE folders SET status='missing' WHERE id=?", (child_id,)
+        )
+        db.conn.commit()
+
+        db.set_active_workspace(ws)
+        visible_ids = {row["id"] for row in db.get_folder_tree()}
+        assert child_id not in visible_ids, "test premise: missing row is dropped"
+        assert parent_id in visible_ids, "test premise: ancestor still visible"
+
+        status = workspace_status(db, ws, str(tmp_path / "vireo"))
+        descendant = next(
+            item for item in status["folders"]
+            if item["requested_folder_id"] == child_id
+        )
+        assert descendant["visible_ancestor_folder_id"] == parent_id
+        # folder_name gives the frontend something to render if it ever needs
+        # to synthesize a tree entry for a top-level missing root.
+        assert descendant["folder_name"] == "child"
+    finally:
+        db.close()
+
+
+def test_workspace_status_ancestor_is_none_for_top_level_missing_root(tmp_path):
+    """A workspace root that goes missing has no ancestor linked to the
+    workspace. workspace_status must expose visible_ancestor_folder_id=None
+    in that case so the frontend knows the badge can't attach to an ancestor
+    and can fall back to whatever it likes (global banner, workspace panel)."""
+    db = Database(str(tmp_path / "vireo.db"))
+    ws = db.create_workspace("Reviewer")
+    source = tmp_path / "nas" / "photos"
+    source.mkdir(parents=True)
+    (source / "bird.jpg").write_bytes(b"original")
+    folder_id = db.add_folder(str(source), name="photos", link_to_workspace=False)
+    db.add_workspace_folder(ws, folder_id)
+    try:
+        stage_folder(db, folder_id, str(tmp_path / "vireo"))
+        db.conn.execute(
+            "UPDATE folders SET status='missing' WHERE id=?", (folder_id,)
+        )
+        db.conn.commit()
+
+        status = workspace_status(db, ws, str(tmp_path / "vireo"))
+        item = next(
+            entry for entry in status["folders"]
+            if entry["requested_folder_id"] == folder_id
+        )
+        assert item["visible_ancestor_folder_id"] is None
+        assert item["folder_name"] == "photos"
+    finally:
+        db.close()
+
+
+def test_workspace_status_counts_unanchored_descendant_session(tmp_path):
+    """A hidden descendant session keeps its count if its ancestor vanishes.
+
+    A workspace can link a remote ancestor while sharing a descendant local
+    session. If both catalog rows go missing, Browse cannot attach the local
+    recovery state to the ancestor and instead synthesizes the descendant as
+    the only visible row. That row needs the session's workspace photo count
+    rather than the usual zero used while an ancestor owns the tally.
+    """
+    db = Database(str(tmp_path / "vireo.db"))
+    parent_ws = db.create_workspace("Parent")
+    child_ws = db.create_workspace("Child")
+    parent = tmp_path / "nas" / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    (child / "bird.jpg").write_bytes(b"original")
+    (child / "fox.jpg").write_bytes(b"original")
+    parent_id = db.add_folder(
+        str(parent), name="parent", link_to_workspace=False
+    )
+    child_id = db.add_folder(
+        str(child), name="child", parent_id=parent_id, link_to_workspace=False
+    )
+    db.add_photo(child_id, "bird.jpg", ".jpg", 1000, 1.0)
+    db.add_photo(child_id, "fox.jpg", ".jpg", 1000, 1.0)
+    db.add_workspace_folder(parent_ws, parent_id)
+    db.add_workspace_folder(child_ws, child_id)
+    try:
+        stage_folder(db, child_id, str(tmp_path / "vireo"))
+        local_path = Path(db.get_folder(child_id)["path"])
+        (local_path / "bird.jpg").unlink()
+        (local_path / "fox.jpg").unlink()
+        local_path.rmdir()
+        db.conn.execute(
+            "UPDATE folders SET status='missing' WHERE id IN (?, ?)",
+            (parent_id, child_id),
+        )
+        db.conn.commit()
+
+        status = workspace_status(db, parent_ws, str(tmp_path / "vireo"))
+        descendant = next(
+            item
+            for item in status["folders"]
+            if item["requested_folder_id"] == child_id
+        )
+        assert descendant["state"] == "recovery"
+        assert descendant["visible_ancestor_folder_id"] is None
+        assert descendant["workspace_photo_count"] == 2
+    finally:
+        db.close()
+
+
 def test_future_ancestor_link_materializes_local_descendants(tmp_path):
     """Linking an ancestor root AFTER a descendant has been staged must still
     discover the rebased descendant. Once staging moves the child's
@@ -2419,6 +2547,7 @@ def test_local_folder_blocker_endpoint_avoids_source_walk(tmp_path, monkeypatch)
         assert response.get_json() == {
             "blocking_job": None,
             "folder_blocking_jobs": {},
+            "residency_fingerprint": "",
         }
 
     import threading
@@ -2455,6 +2584,7 @@ def test_local_folder_blocker_endpoint_avoids_source_walk(tmp_path, monkeypatch)
                         "status": "running",
                     }
                 },
+                "residency_fingerprint": "",
             }
         finally:
             release.set()
@@ -2471,6 +2601,7 @@ def test_local_folder_blocker_endpoint_avoids_source_walk(tmp_path, monkeypatch)
         assert response.get_json() == {
             "blocking_job": None,
             "folder_blocking_jobs": {},
+            "residency_fingerprint": "",
         }
     # Silence unused-variable warning when folder_id isn't referenced.
     assert folder_id
@@ -2681,3 +2812,86 @@ def test_folder_sync_proceeds_while_observational_job_runs(tmp_path, monkeypatch
         finally:
             release.set()
         wait_for_job_via_client(client, probe_id)
+
+
+def test_local_folder_blocker_fingerprint_tracks_residency_transitions(tmp_path, monkeypatch):
+    """Residency fingerprint changes across stage → active → discard.
+
+    The blocker poller compares the endpoint's payload signature to decide
+    when to run a full ``load()``. A stage/sync/discard fired from another
+    tab that starts *and* finishes between two polls leaves no active job
+    behind: both polls report ``blocking_job: None``. Without residency
+    fingerprint the signatures compare equal and the folder-tree badge
+    keeps its pre-job state. The endpoint has to expose a residency
+    fingerprint that changes across every residency transition so cross-tab
+    short jobs still trip a refresh.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from app import create_app
+
+    source = tmp_path / "nas" / "photos"
+    source.mkdir(parents=True)
+    (source / "bird.jpg").write_bytes(b"original")
+    vireo_dir = tmp_path / "vireo"
+    thumbs = vireo_dir / "thumbnails"
+    thumbs.mkdir(parents=True)
+    db_path = str(vireo_dir / "vireo.db")
+
+    db = Database(db_path)
+    workspace_id = db.create_workspace("Owner")
+    folder_id = db.add_folder(str(source), name="photos", link_to_workspace=False)
+    db.add_workspace_folder(workspace_id, folder_id)
+    db.close()
+
+    app = create_app(db_path, thumb_cache_dir=str(thumbs))
+    app.config["TESTING"] = True
+
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{workspace_id}/activate", json={}
+        ).status_code == 200
+
+        remote = client.get(
+            "/api/workspaces/active/local-folders/blocker"
+        ).get_json()
+        assert remote["blocking_job"] is None
+        assert remote["residency_fingerprint"] == ""
+
+        stage = client.post(
+            "/api/workspaces/active/local-folders/stage",
+            json={"folder_ids": [folder_id]},
+        )
+        assert stage.status_code == 202, stage.get_json()
+        assert wait_for_job_via_client(
+            client, stage.get_json()["job_id"]
+        )["status"] == "completed"
+
+        active = client.get(
+            "/api/workspaces/active/local-folders/blocker"
+        ).get_json()
+        assert active["blocking_job"] is None
+        # A new local_folders row makes the fingerprint non-empty, so a
+        # blocker poll landing right after another tab's stage completes
+        # sees a signature change and reruns load(); the folder tree can
+        # transition from REMOTE to LOCAL without waiting for a reload.
+        assert active["residency_fingerprint"] != remote["residency_fingerprint"]
+        assert active["residency_fingerprint"] != ""
+
+        discard = client.post(
+            "/api/workspaces/active/local-folders/discard",
+            json={"folder_ids": [folder_id], "confirm": True},
+        )
+        assert discard.status_code == 202, discard.get_json()
+        assert wait_for_job_via_client(
+            client, discard.get_json()["job_id"]
+        )["status"] == "completed"
+
+        cleared = client.get(
+            "/api/workspaces/active/local-folders/blocker"
+        ).get_json()
+        assert cleared["blocking_job"] is None
+        # Discard removed the row; fingerprint returns to empty, which
+        # still differs from the active-state fingerprint so a poller that
+        # missed the job window still refreshes.
+        assert cleared["residency_fingerprint"] == ""
+        assert cleared["residency_fingerprint"] != active["residency_fingerprint"]

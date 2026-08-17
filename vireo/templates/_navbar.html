@@ -470,17 +470,102 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .lightbox-img-wrap.zoomed img {
   cursor: grab;
 }
-.lightbox-zoom-badge {
+.lightbox-zoom-control {
   position: absolute;
   top: 8px;
   left: 8px;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  cursor: default;
+}
+.lightbox-zoom-badge {
   background: rgba(0,0,0,0.6);
   color: var(--text-primary);
-  padding: 2px 8px;
+  border: 1px solid rgba(255,255,255,0.24);
+  padding: 3px 9px;
   border-radius: 4px;
   font-size: 11px;
-  pointer-events: none;
-  z-index: 1;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.lightbox-zoom-badge:hover,
+.lightbox-zoom-badge[aria-expanded="true"] {
+  background: rgba(28,31,34,0.92);
+  border-color: rgba(255,255,255,0.58);
+}
+.lightbox-zoom-badge:focus-visible,
+.lb-zoom-step:focus-visible,
+.lb-zoom-stop:focus-visible,
+.lightbox-zoom-slider:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+.lightbox-zoom-popover {
+  display: none;
+  align-items: center;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid rgba(255,255,255,0.24);
+  border-radius: 6px;
+  background: rgba(12,14,16,0.92);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.42);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.lightbox-zoom-popover.open { display: flex; }
+.lb-zoom-step {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  padding: 0;
+  border: 1px solid rgba(255,255,255,0.35);
+  border-radius: 4px;
+  background: rgba(255,255,255,0.08);
+  color: #f4f7f8;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+.lb-zoom-step:hover { background: rgba(255,255,255,0.16); }
+.lb-zoom-step:disabled { opacity: 0.45; cursor: default; }
+.lb-zoom-track {
+  position: relative;
+  width: min(180px, 42vw);
+  padding-bottom: 17px;
+}
+.lightbox-zoom-slider {
+  display: block;
+  width: 100%;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.lb-zoom-stop {
+  position: absolute;
+  bottom: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: rgba(244,247,248,0.68);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.lb-zoom-stop:hover { color: #fff; }
+.lb-zoom-stop:disabled { color: rgba(244,247,248,0.32); cursor: default; }
+.lb-zoom-stop-fit { left: 0; }
+.lb-zoom-stop-native { display: none; transform: translateX(-50%); }
+.lb-zoom-max-label {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  color: rgba(244,247,248,0.52);
+  font-size: 10px;
+  line-height: 1;
 }
 .lightbox-flag-status {
   position: absolute;
@@ -528,12 +613,13 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .lightbox-overlay.lb-hide-chrome .lightbox-nav,
 .lightbox-overlay.lb-hide-chrome .lightbox-actions,
 .lightbox-overlay.lb-hide-chrome .lightbox-adjust-panel,
-.lightbox-overlay.lb-hide-chrome .lightbox-view-panel {
+.lightbox-overlay.lb-hide-chrome .lightbox-view-panel,
+.lightbox-overlay.lb-hide-chrome .lightbox-zoom-control {
   display: none !important;
 }
 .lightbox-overlay.lb-hide-info .lightbox-filename,
 .lightbox-overlay.lb-hide-info #lightboxCounter,
-.lightbox-overlay.lb-hide-info .lightbox-zoom-badge {
+.lightbox-overlay.lb-hide-info .lightbox-zoom-control {
   display: none !important;
 }
 .lightbox-bottom-bar {
@@ -1273,6 +1359,33 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .modal-btn-cancel { background: var(--bg-tertiary); color: var(--text-secondary); }
 .modal-error { color: var(--danger); font-size: 13px; margin-top: 8px; display: none; }
 
+.color-label-description-heading {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.color-label-description-swatch {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.22);
+  flex: 0 0 auto;
+}
+.color-label-description-swatch[data-color="red"] { background: #e74c3c; }
+.color-label-description-swatch[data-color="yellow"] { background: #f1c40f; }
+.color-label-description-swatch[data-color="green"] { background: #2ecc71; }
+.color-label-description-swatch[data-color="blue"] { background: #3498db; }
+.color-label-description-swatch[data-color="purple"] { background: #9b59b6; }
+.color-label-description-count {
+  margin-top: 4px;
+  text-align: right;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+/* Editor is reachable from the lightbox context menu, so it must stack above
+   the lightbox layers (overlay 9999, close 10000, nav 10001). */
+#colorLabelDescriptionModal { z-index: 10002; }
+
 /* ---------- Shortcuts Cheat Sheet ---------- */
 /* z-index sits above the lightbox stack (overlay 9999, close 10000, nav 10001)
    so the sheet remains visible when stacked over an active lightbox. */
@@ -1706,7 +1819,7 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   flex: 0 0 auto; padding: 2px 6px; border-radius: 4px;
   cursor: pointer; line-height: 1;
 }
-.vireo-ctx-chip:hover { background: var(--bg-tertiary); }
+.vireo-ctx-chip:hover:not(.vireo-ctx-disabled) { background: var(--bg-tertiary); }
 .vireo-ctx-chip.is-active { background: var(--accent); color: white; }
 
 /* ---------- Openable tabs ---------- */
@@ -1996,6 +2109,34 @@ document.addEventListener('keydown', function(e) {
 <!-- Load keymap.js before any inline <script> blocks below so window.Keymap
      (registry, dispatcher, Esc stack) is available when they run. -->
 <script src="/static/keymap.js"></script>
+
+<!-- Color Label Description Modal -->
+<div class="modal-overlay" id="colorLabelDescriptionModal"
+     onclick="if(event.target===this)VireoColorLabels.closeEditor()">
+  <div class="modal" role="dialog" aria-modal="true"
+       aria-labelledby="colorLabelDescriptionTitle">
+    <h3 class="color-label-description-heading" id="colorLabelDescriptionTitle">
+      <span class="color-label-description-swatch" id="colorLabelDescriptionSwatch"></span>
+      <span id="colorLabelDescriptionHeading">Color label description</span>
+    </h3>
+    <label class="modal-label" for="colorLabelDescriptionInput">Short description</label>
+    <input class="modal-input" id="colorLabelDescriptionInput" type="text"
+           maxlength="120" autocomplete="off"
+           placeholder="For example, Reptiles">
+    <div class="color-label-description-count" id="colorLabelDescriptionCount">0 / 120</div>
+    <div class="modal-hint">
+      Shown in color-label tooltips in this workspace. Leave blank to remove it.
+    </div>
+    <div class="modal-error" id="colorLabelDescriptionError" role="alert"></div>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-cancel" type="button"
+              onclick="VireoColorLabels.closeEditor()">Cancel</button>
+      <button class="modal-btn modal-btn-primary" id="colorLabelDescriptionSave"
+              type="button" onclick="VireoColorLabels.saveEditor()">Save</button>
+    </div>
+  </div>
+</div>
+<script src="/static/vireo-color-labels.js"></script>
 <script>
 // Shared, cross-page handoff for the photo editor (/edit). State lives in
 // localStorage so it survives the full-page navigation into the editor:
@@ -2168,16 +2309,35 @@ function sendReport() {
       row.className = 'vireo-ctx-chips';
       item.chips.forEach(c => {
         const b = document.createElement('span');
-        b.className = 'vireo-ctx-chip' + (c.active ? ' is-active' : '');
+        b.className = 'vireo-ctx-chip' + (c.active ? ' is-active' : '') +
+          (c.disabled ? ' vireo-ctx-disabled' : '');
         b.textContent = c.label;
-        if (c.title) b.title = c.title;
-        b.addEventListener('click', ev => {
-          ev.stopPropagation();
-          closeContextMenu();
-          try { c.onClick && c.onClick(); } catch(err){ console.error(err); }
-        });
+        if (c.disabled && c.disabledHint) b.title = c.disabledHint;
+        else if (c.title) b.title = c.title;
+        if (c.color) {
+          b.dataset.color = c.color;
+          b.setAttribute('data-color-label-control', '');
+          b.dataset.colorLabelBaseTitle = c.colorBaseTitle || c.color;
+          b.dataset.colorLabelBaseAria =
+            (c.colorBaseTitle || c.color) + ' label';
+          b.setAttribute('aria-label', b.dataset.colorLabelBaseAria);
+        }
+        if (!c.disabled) {
+          b.addEventListener('click', ev => {
+            ev.stopPropagation();
+            closeContextMenu();
+            try { c.onClick && c.onClick(); } catch(err){ console.error(err); }
+          });
+        }
         row.appendChild(b);
       });
+      // Fold any already-loaded workspace descriptions into these freshly
+      // built chips so their titles and aria-labels stay in sync with the
+      // rest of the color-label controls even when the menu opens after
+      // descriptions load (no later refreshControls() pass revisits them).
+      if (window.VireoColorLabels && typeof window.VireoColorLabels.refreshControls === 'function') {
+        window.VireoColorLabels.refreshControls(row);
+      }
       return row;
     }
     const d = document.createElement('div');
@@ -2236,15 +2396,31 @@ function sendReport() {
   window.openInBrowse = function(photoId){
     var url = '/browse?photo_id=' + photoId;
     if (typeof isTauri === 'function' && isTauri()) {
+      var tauriBlockedHint = typeof window.getLightboxBrowseDisabledHint === 'function'
+        ? window.getLightboxBrowseDisabledHint(photoId, true)
+        : null;
+      if (tauriBlockedHint) {
+        if (typeof showToast === 'function') showToast(tauriBlockedHint, 'warning');
+        return false;
+      }
       window.location.href = url;
+      return true;
     } else {
       var opened = window.open('about:blank', '_blank');
       if (!opened) {
+        var blockedHint = typeof window.getLightboxBrowseDisabledHint === 'function'
+          ? window.getLightboxBrowseDisabledHint(photoId, true)
+          : null;
+        if (blockedHint) {
+          if (typeof showToast === 'function') showToast(blockedHint, 'warning');
+          return false;
+        }
         window.location.href = url;
-        return;
+        return true;
       }
       try { opened.opener = null; } catch (e) {}
       opened.location = url;
+      return true;
     }
   };
 })();
@@ -2307,6 +2483,7 @@ function sendReport() {
       <span class="spacer"></span>
       <label style="display:flex;align-items:center;gap:4px;" title="Thumbnail size">
         <input type="range" id="missingPhotosThumbSizeSlider" min="40" max="160" step="8" value="56"
+               data-view-preference="vireo.missingPhotos.thumbSize"
                aria-label="Thumbnail size"
                style="width:80px;accent-color:var(--accent);"
                oninput="updateMissingPhotosThumbSize(this.value)">
@@ -3327,6 +3504,8 @@ window.NAV_ALL_PAGES = [
 
 /* ---------- Workspace switcher ---------- */
 var _wsDropdownOpen = false;
+var _wsActiveId = null;
+var _wsMenuLoadGeneration = 0;
 
 function wsEscapeHtml(str) {
   if (str == null) return '';
@@ -3391,33 +3570,56 @@ function renderWsItem(ws, activeId) {
   return div;
 }
 
-async function loadWorkspaceMenu() {
-  try {
-    var workspaces = await safeFetch('/api/workspaces', {}, { toast: false });
-    var active = await safeFetch('/api/workspaces/active', {}, { toast: false });
-    var list = document.getElementById('wsMenuList');
-    list.innerHTML = '';
-    var pinned = workspaces.filter(function(w) { return !!w.pinned_at; });
-    var unpinned = workspaces.filter(function(w) { return !w.pinned_at; });
-    function addHeader(text) {
-      var h = document.createElement('div');
-      h.className = 'ws-menu-header';
-      h.textContent = text;
-      list.appendChild(h);
-    }
-    if (pinned.length > 0) {
-      addHeader('Pinned');
-      pinned.forEach(function(ws) { list.appendChild(renderWsItem(ws, active.id)); });
-      if (unpinned.length > 0) {
-        var divider = document.createElement('div');
-        divider.className = 'ws-menu-divider';
-        list.appendChild(divider);
-        addHeader('Workspaces');
-      }
-    } else {
+function renderWorkspaceMenu(workspaces, activeId) {
+  var list = document.getElementById('wsMenuList');
+  list.innerHTML = '';
+  var pinned = workspaces.filter(function(w) { return !!w.pinned_at; });
+  var unpinned = workspaces.filter(function(w) { return !w.pinned_at; });
+  function addHeader(text) {
+    var h = document.createElement('div');
+    h.className = 'ws-menu-header';
+    h.textContent = text;
+    list.appendChild(h);
+  }
+  if (pinned.length > 0) {
+    addHeader('Pinned');
+    pinned.forEach(function(ws) { list.appendChild(renderWsItem(ws, activeId)); });
+    if (unpinned.length > 0) {
+      var divider = document.createElement('div');
+      divider.className = 'ws-menu-divider';
+      list.appendChild(divider);
       addHeader('Workspaces');
     }
-    unpinned.forEach(function(ws) { list.appendChild(renderWsItem(ws, active.id)); });
+  } else {
+    addHeader('Workspaces');
+  }
+  unpinned.forEach(function(ws) { list.appendChild(renderWsItem(ws, activeId)); });
+}
+
+async function loadWorkspaceMenu() {
+  var generation = ++_wsMenuLoadGeneration;
+
+  // The active-workspace endpoint also loads folder roots and their photo
+  // counts, so it can be much slower than the lightweight workspace list.
+  // Start it in parallel, but never make the names wait for it. Once it
+  // arrives, re-render only to add the current-workspace checkmark.
+  var activePromise = safeFetch('/api/workspaces/active', {}, { toast: false })
+    .catch(function(e) {
+      console.error('Failed to load active workspace', e);
+      return null;
+    });
+
+  try {
+    var workspaces = await safeFetch('/api/workspaces', {}, { toast: false });
+    if (generation !== _wsMenuLoadGeneration) return;
+    renderWorkspaceMenu(workspaces, _wsActiveId);
+
+    activePromise.then(function(active) {
+      if (active && generation === _wsMenuLoadGeneration) {
+        _wsActiveId = active.id;
+        renderWorkspaceMenu(workspaces, active.id);
+      }
+    });
   } catch(e) {
     console.error('Failed to load workspaces', e);
   }
@@ -3531,7 +3733,27 @@ async function createWorkspace() {
   <div id="lightboxPrev" class="lightbox-nav" onclick="event.stopPropagation(); lightboxNav(-1);" style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:36px;color:rgba(255,255,255,0.5);cursor:pointer;padding:16px;user-select:none;z-index:10001;" title="Previous (←)">&#9664;</div>
   <div id="lightboxNext" class="lightbox-nav" onclick="event.stopPropagation(); lightboxNav(1);" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);font-size:36px;color:rgba(255,255,255,0.5);cursor:pointer;padding:16px;user-select:none;z-index:10001;" title="Next (→)">&#9654;</div>
   <div class="lightbox-img-wrap" id="lightboxWrap" onclick="event.stopPropagation(); if (!_lbVisualTransitionPending && Math.abs(_lbZoom - 1.0) < 0.001 && !window._lightboxZoomHandled) toggleLightboxZoom(event); window._lightboxZoomHandled = false;">
-    <span class="lightbox-zoom-badge" id="lightboxZoomBadge" style="display:none;">1:1</span>
+    <div class="lightbox-zoom-control" id="lightboxZoomControl" onclick="event.stopPropagation();">
+      <button type="button" class="lightbox-zoom-badge" id="lightboxZoomBadge"
+              aria-haspopup="true" aria-expanded="false"
+              onclick="toggleLightboxZoomPopover();" title="Zoom controls">Fit</button>
+      <div class="lightbox-zoom-popover" id="lightboxZoomPopover" role="group" aria-label="Zoom controls">
+        <button type="button" class="lb-zoom-step" id="lightboxZoomOut"
+                onclick="stepLightboxZoom(-1);" aria-label="Zoom out" title="Zoom out (−)">−</button>
+        <div class="lb-zoom-track">
+          <input type="range" class="lightbox-zoom-slider" id="lightboxZoomSlider"
+                 min="0" max="1000" step="1" value="0" aria-label="Zoom level"
+                 aria-valuetext="Fit" oninput="setLightboxZoomFromSlider(this.value);">
+          <button type="button" class="lb-zoom-stop lb-zoom-stop-fit"
+                  onclick="setLightboxZoomToFit();">Fit</button>
+          <button type="button" class="lb-zoom-stop lb-zoom-stop-native" id="lightboxZoomNativeStop"
+                  onclick="setLightboxZoomToOneToOne();">1:1</button>
+          <span class="lb-zoom-max-label" id="lightboxZoomMaxLabel">400%</span>
+        </div>
+        <button type="button" class="lb-zoom-step" id="lightboxZoomIn"
+                onclick="stepLightboxZoom(1);" aria-label="Zoom in" title="Zoom in (+)">+</button>
+      </div>
+    </div>
     <div class="lightbox-transform" id="lightboxTransform">
       <img id="lightboxImg" src="" alt="">
       <canvas id="lightboxToneCanvas" class="lb-tone-canvas" aria-hidden="true"></canvas>
@@ -3582,7 +3804,7 @@ async function createWorkspace() {
       Edit Photo
     </button>
     <span class="lb-action-gap" aria-hidden="true"></span>
-    <button class="lb-action-btn lb-action-danger" onclick="lightboxDelete()" title="Delete photo">Delete</button>
+    <button class="lb-action-btn lb-action-danger" id="lightboxDeleteBtn" onclick="lightboxDelete()" title="Delete photo">Delete</button>
     </div>
   </div>
   <div class="lightbox-view-panel" id="lightboxViewPanel" onclick="event.stopPropagation();">
@@ -3759,6 +3981,15 @@ async function createWorkspace() {
 <script>
 var _lightboxPhotoList = [];  // list of {id, filename} for arrow navigation
 var _lightboxCurrentId = null;
+var _lbReadOnly = false;
+var _lbReadOnlyMessage = 'This lightbox is read-only';
+// `_lightboxCurrentId` advances immediately when navigation targets a new
+// photo; the visible bitmap is deliberately held on the previous frame until
+// the replacement finishes decoding. `_lightboxCommittedId` tracks that
+// visible identity — the photo the user is actually looking at — and is what
+// `lightbox:closed` reports so a close mid-navigation reconciles Browse to
+// the photo that was on screen, not the one that was still loading.
+var _lightboxCommittedId = null;
 
 var _lbZoom = 1.0;          // current zoom (1.0 = fit)
 var _lbPanX = 0;            // pan translation in CSS pixels
@@ -3782,6 +4013,8 @@ var _lbOpenSeq = 0;          // increments for every lightbox open so old metada
 var _lbFlagPendingWrites = 0;
 var _lbFlagPendingByPhoto = {};  // count of in-flight flag writes PER photo; lightbox:flagchanged is emitted once a photo's count hits 0 so listeners see its settled flag, not a guessed per-write one
 var _lbConfirmedFlags = {};   // last server-confirmed flag per photo, isolated from optimistic page helpers
+var _lbProvisionalFlags = {}; // page-owned staged flags (for example Group Review before Apply)
+var _lbProvisionalFlagSeq = {}; // edit sequence that produced each staged flag
 var _lbViewportByPhotoId = {};  // per-session lightbox viewport cache keyed by photo id
 var _lbPendingViewportState = null;
 var _lbPendingEyeTrack = null; // destination alignment waiting for image metadata/layout
@@ -3797,6 +4030,47 @@ var _lbEditRecipeWriteSeq = 0;
 var _lbEditRecipeWriteSeqByPhoto = {};
 var _lbPhotoDataByPhoto = {};
 var _lbRenderVersionByPhoto = {};
+
+function _lbGuardReadOnly() {
+  if (!_lbReadOnly) return false;
+  if (typeof showToast === 'function') showToast(_lbReadOnlyMessage, 'warning');
+  return true;
+}
+
+function _lbApplyReadOnlyState() {
+  var controls = [
+    ['lightboxFlagBtn', 'Flag photo (p)'],
+    ['lightboxRejectBtn', 'Reject photo (x)'],
+    ['lightboxNotWildlife', 'Exclude from wildlife detection and classification'],
+    ['lightboxInat', 'Submit to iNaturalist'],
+    ['lightboxAdjustBtn', 'Quick non-destructive adjustments'],
+    ['lightboxDeleteBtn', 'Delete photo'],
+  ];
+  controls.forEach(function(entry) {
+    var button = document.getElementById(entry[0]);
+    if (!button) return;
+    button.disabled = _lbReadOnly;
+    button.title = _lbReadOnly ? _lbReadOnlyMessage : entry[1];
+  });
+  var panel = document.getElementById('lightboxAdjustPanel');
+  if (_lbReadOnly && panel) panel.classList.remove('open');
+  var editButton = document.getElementById('lightboxEditPhoto');
+  if (editButton) {
+    var editHint = _lbReadOnly
+      ? _lbReadOnlyMessage
+      : (typeof window.getLightboxBrowseDisabledHint === 'function'
+        ? window.getLightboxBrowseDisabledHint(_lightboxCurrentId, true)
+        : null);
+    editButton.disabled = !!editHint;
+    editButton.title = editHint || 'Edit photo';
+  }
+}
+
+window.setLightboxReadOnlyMode = function(readOnly, message) {
+  _lbReadOnly = !!readOnly;
+  _lbReadOnlyMessage = message || 'This lightbox is read-only';
+  _lbApplyReadOnlyState();
+};
 
 function _lbSetPhotoTransitionPending(pending) {
   ['lightboxActions', 'lightboxAdjustPanel', 'syncLightboxPanel'].forEach(function(id) {
@@ -3852,6 +4126,8 @@ function _lbRenderLifeListPanel(photoId) {
     } else {
       btn.textContent = 'Set Representative';
     }
+    btn.disabled = _lbReadOnly;
+    if (_lbReadOnly) btn.title = _lbReadOnlyMessage;
     btn.addEventListener('click', function(event) {
       event.stopPropagation();
       setLifeListPhoto(entry.species, photoId, btn);
@@ -3863,6 +4139,7 @@ function _lbRenderLifeListPanel(photoId) {
 }
 
 async function setLifeListPhoto(species, photoId, button) {
+  if (_lbGuardReadOnly()) return false;
   if (!species || !photoId) return;
   if (button) button.disabled = true;
   try {
@@ -5014,6 +5291,7 @@ function _lbSetAdjustmentControl(id, value) {
 }
 
 function _lbSetAdjustmentControlsDisabled(disabled) {
+  disabled = !!disabled || _lbReadOnly;
   [
     'lbAdjExposure',
     'lbAdjHighlights',
@@ -5593,6 +5871,7 @@ function _lbStartAdjustmentRecipeSave(photoId, recipe, inputSeq) {
 }
 
 function _lbSaveAdjustmentRecipe(values) {
+  if (_lbGuardReadOnly()) return false;
   if (!_lightboxCurrentId || !_lbEditRecipeLoaded) return;
   var photoId = _lightboxCurrentId;
   var key = String(photoId);
@@ -5641,6 +5920,7 @@ function _lbWaitForAdjustmentSaveIdle(photoId) {
 }
 
 function onLightboxAdjustmentInput(input) {
+  if (_lbGuardReadOnly()) return false;
   if (!_lbEditRecipeLoaded) {
     _lbSetAdjustmentStatus('Loading recipe...');
     _lbRenderAdjustmentControls();
@@ -5662,6 +5942,7 @@ function onLightboxAdjustmentInput(input) {
 }
 
 function resetLightboxAdjustments() {
+  if (_lbGuardReadOnly()) return false;
   if (!_lbEditRecipeLoaded) {
     _lbSetAdjustmentStatus('Loading recipe...');
     return;
@@ -5688,6 +5969,7 @@ function resetLightboxAdjustments() {
 }
 
 function toggleLightboxAdjustPanel() {
+  if (_lbGuardReadOnly()) return false;
   var panel = document.getElementById('lightboxAdjustPanel');
   var btn = document.getElementById('lightboxAdjustBtn');
   if (!panel) return;
@@ -5886,7 +6168,7 @@ function _lbApplyViewportState(state) {
   var wrap = document.getElementById('lightboxWrap');
   if (!wrap) return false;
 
-  var maxZoom = _lbNativeZoom ? _lbNativeZoom * 4 : 4;
+  var maxZoom = _lbMaxZoom();
   var targetZoom = state.zoom || 1.0;
   if (state.oneToOne) {
     if (_lbNativeZoom) {
@@ -6088,6 +6370,45 @@ function _lbConfirmedFlagFor(photoId) {
   return _lbFlagFromPhotoList(photoId);
 }
 
+function _lbDisplayedFlagFor(photoId) {
+  var key = String(photoId);
+  if (Object.prototype.hasOwnProperty.call(_lbProvisionalFlags, key)) {
+    return _lbProvisionalFlags[key];
+  }
+  return _lbConfirmedFlagFor(photoId);
+}
+
+window.setLightboxProvisionalFlag = function(photoId, flag, editSeq) {
+  var normalized = _lbNormalizeFlag(flag);
+  if (photoId == null || !normalized) return;
+  var key = String(photoId);
+  var seq = Number.isInteger(editSeq) ? editSeq : (_lbFlagEditSeq + 1);
+  if (seq < (_lbProvisionalFlagSeq[key] || 0)) return;
+  _lbFlagEditSeq = Math.max(_lbFlagEditSeq, seq);
+  _lbProvisionalFlags[key] = normalized;
+  _lbProvisionalFlagSeq[key] = seq;
+  if (_lightboxCurrentId === parseInt(photoId, 10)) {
+    _lbSetFlagStatus(normalized);
+  }
+};
+
+// A page that stages flag edits can clear its lightbox-only provisional
+// display when the staging session ends. Forget the confirmed memo too so
+// the page's now-authoritative photo list (persisted on Apply, unchanged on
+// discard) supplies the next visible value.
+window.clearLightboxProvisionalFlags = function(photoIds) {
+  (photoIds || []).forEach(function(photoId) {
+    delete _lbProvisionalFlags[String(photoId)];
+    delete _lbProvisionalFlagSeq[String(photoId)];
+    _lbForgetConfirmedFlag(photoId);
+  });
+  if (_lightboxCurrentId != null && (photoIds || []).some(function(photoId) {
+    return parseInt(photoId, 10) === _lightboxCurrentId;
+  })) {
+    _lbSetFlagStatus(_lbDisplayedFlagFor(_lightboxCurrentId));
+  }
+};
+
 function _lbRecordFlag(photoId, flag) {
   var normalized = _lbNormalizeFlag(flag);
   if (!normalized) return;
@@ -6095,7 +6416,7 @@ function _lbRecordFlag(photoId, flag) {
   if (p) p.flag = normalized;
   _lbRememberConfirmedFlag(photoId, normalized);
   if (_lightboxCurrentId === photoId && !_lbVisualTransitionPending) {
-    _lbSetFlagStatus(normalized);
+    _lbSetFlagStatus(_lbDisplayedFlagFor(photoId));
   }
 }
 
@@ -6139,18 +6460,38 @@ function _lbApplyFlag(photoId, flag) {
 
   // Resolve both success and rejection through one settle path so the per-photo
   // pending count is always balanced and the quiescence event always fires.
-  function settle(landed) {
+  function settle(result) {
+    // Page-local flag helpers may deliberately keep a change provisional
+    // (for example, Process Review's Group Review stages picks/rejects until
+    // Apply). Show that choice in the open lightbox, but do not promote it to
+    // the confirmed cache, mutate the shared photo list, or emit the
+    // persisted-change event. Plain true/undefined remain successful writes;
+    // false remains a failed write for backward compatibility.
+    var provisional = !!(
+      result && typeof result === 'object' && result.provisional === true
+    );
+    var landed = result !== false && !provisional;
     _lbFlagPendingWrites = Math.max(0, _lbFlagPendingWrites - 1);
     var remaining = (_lbFlagPendingByPhoto[photoId] || 1) - 1;
     if (remaining > 0) _lbFlagPendingByPhoto[photoId] = remaining;
     else delete _lbFlagPendingByPhoto[photoId];
 
-    if (landed) {
+    if (provisional) {
+      window.setLightboxProvisionalFlag(photoId, normalized, seq);
+      if (_lightboxCurrentId === photoId && (_lbFlagEditSeq === seq || _lbFlagPendingWrites === 0)) {
+        _lbSetFlagStatus(_lbDisplayedFlagFor(photoId));
+      }
+    } else if (landed) {
+      var provisionalSeq = _lbProvisionalFlagSeq[String(photoId)] || 0;
+      if (provisionalSeq <= seq) {
+        delete _lbProvisionalFlags[String(photoId)];
+        delete _lbProvisionalFlagSeq[String(photoId)];
+      }
       // Cache the confirmed flag even if the user has navigated away, so the
       // quiescence emit below reflects what actually landed for this photo.
       _lbCacheFlag(photoId, normalized);
       if (_lightboxCurrentId === photoId && (_lbFlagEditSeq === seq || _lbFlagPendingWrites === 0)) {
-        _lbSetFlagStatus(normalized);
+        _lbSetFlagStatus(_lbDisplayedFlagFor(photoId));
       }
     } else if (_lightboxCurrentId === photoId && _lbFlagEditSeq === seq) {
       // Write failed: the prior confirmed flag stands; restore the chip to it.
@@ -6162,7 +6503,7 @@ function _lbApplyFlag(photoId, flag) {
     // quiescence — rather than per write — means a landed reject whose
     // superseding clear/flag write later FAILED is still reflected, and rapid
     // same-photo toggling collapses to one correct event instead of a guess.
-    if (!Object.prototype.hasOwnProperty.call(_lbFlagPendingByPhoto, photoId)) {
+    if (!provisional && !Object.prototype.hasOwnProperty.call(_lbFlagPendingByPhoto, photoId)) {
       try {
         document.dispatchEvent(new CustomEvent('lightbox:flagchanged', {
           detail: {
@@ -6176,7 +6517,7 @@ function _lbApplyFlag(photoId, flag) {
   }
 
   Promise.resolve(write)
-    .then(function(ok) { settle(ok !== false); })
+    .then(function(result) { settle(result); })
     .catch(function() { settle(false); });
 
   return true;
@@ -6279,6 +6620,7 @@ function _lbApplyInfoVisibility() {
 
 function toggleLightboxInfo() {
   _lbInfoVisible = !_lbInfoVisible;
+  if (!_lbInfoVisible) _lbSetZoomPopoverOpen(false);
   _lbPersistBool('vireo.lb.infoVisible', _lbInfoVisible);
   _lbApplyInfoVisibility();
 }
@@ -6292,6 +6634,7 @@ function _lbApplyChromeVisibility() {
 
 function toggleLightboxChrome() {
   _lbChromeVisible = !_lbChromeVisible;
+  if (!_lbChromeVisible) _lbSetZoomPopoverOpen(false);
   _lbPersistBool('vireo.lb.chromeVisible', _lbChromeVisible);
   _lbApplyChromeVisibility();
 }
@@ -6937,6 +7280,7 @@ function _cropInitEvents() {
 }
 
 async function openCropEditor() {
+  if (_lbGuardReadOnly()) return false;
   if (!_lightboxCurrentId) return;
   _cropInitEvents();
   var requestedPhotoId = _lightboxCurrentId;
@@ -7025,6 +7369,7 @@ function cropSetAspect(aspect) {
 }
 
 async function saveCropEditor() {
+  if (_lbGuardReadOnly()) return false;
   if (!_cropPhotoId || !_cropRecipe) return;
   var pid = _cropPhotoId;
   var session = _cropSessionSeq;
@@ -7148,10 +7493,19 @@ function openLightbox(photoId, filename, photoList, options) {
     String(_lightboxCurrentId) === String(photoId)
   );
   options = options || {};
+  var nextReadOnly = Object.prototype.hasOwnProperty.call(options, 'readOnly')
+    ? !!options.readOnly
+    : (alreadyOpen && _lbReadOnly);
+  var nextReadOnlyMessage = Object.prototype.hasOwnProperty.call(options, 'readOnlyMessage')
+    ? options.readOnlyMessage
+    : _lbReadOnlyMessage;
   _lbCancelOriginalPreload();
   var fallbackViewportState = options.fallbackViewportState || null;
   var eyeTrackAnchor = options.eyeTrackAnchor || null;
   _lbFlushPendingAdjustmentSave();
+  _lbReadOnly = nextReadOnly;
+  _lbReadOnlyMessage = nextReadOnlyMessage || 'This lightbox is read-only';
+  _lbApplyReadOnlyState();
   if (alreadyOpen && _lightboxCurrentId != null) {
     _lbSaveViewportState(_lightboxCurrentId);
   }
@@ -7211,6 +7565,7 @@ function openLightbox(photoId, filename, photoList, options) {
   _lbDeferredOverlayApply = null;
 
   _lightboxCurrentId = photoId;
+  _lbApplyReadOnlyState();
   if (photoList) _lightboxPhotoList = photoList;
   // Remember the photo being viewed so the Edit page (/edit with no id) can
   // resolve "the photo I was just looking at".
@@ -7232,7 +7587,7 @@ function openLightbox(photoId, filename, photoList, options) {
     _lbForgetConfirmedFlag(photoId);
   }
   _lbCurrentWildlifeExcluded = !!(currentFromList && currentFromList.wildlife_excluded);
-  if (!alreadyOpen) _lbSetFlagStatus(_lbConfirmedFlagFor(photoId));
+  if (!alreadyOpen) _lbSetFlagStatus(_lbDisplayedFlagFor(photoId));
 
   var overlay = document.getElementById('lightboxOverlay');
   var img = document.getElementById('lightboxImg');
@@ -7250,7 +7605,7 @@ function openLightbox(photoId, filename, photoList, options) {
   var visibleIdentityCommitted = false;
   function commitVisiblePhotoIdentity() {
     label.textContent = filename || '';
-    _lbSetFlagStatus(_lbConfirmedFlagFor(photoId));
+    _lbSetFlagStatus(_lbDisplayedFlagFor(photoId));
     _lbApplyWildlifeExcludedButton();
     var counter = document.getElementById('lightboxCounter');
     if (_lightboxPhotoList.length > 1) {
@@ -7266,6 +7621,7 @@ function openLightbox(photoId, filename, photoList, options) {
     }
     if (!visibleIdentityCommitted) {
       visibleIdentityCommitted = true;
+      _lightboxCommittedId = photoId;
       try {
         document.dispatchEvent(new CustomEvent('lightbox:photochanged', {
           detail: { photoId: photoId }
@@ -7280,7 +7636,6 @@ function openLightbox(photoId, filename, photoList, options) {
   wrap.classList.toggle('zoomed', transitionZoom > 1.001);
   wrap.scrollTop = 0;
   wrap.scrollLeft = 0;
-  document.getElementById('lightboxZoomBadge').style.display = 'none';
   // Clear previous detection overlays
   var detContainer = document.getElementById('lightboxDetections');
   if (detContainer) detContainer.innerHTML = '';
@@ -7309,6 +7664,7 @@ function openLightbox(photoId, filename, photoList, options) {
   ) ? 'original' : 'full';
   _lbFullLongEdge = null;
   _lbPending1To1 = restoreWantsOneToOne;
+  _lbUpdateZoomControl();
   // The deferred-1:1 anchor is a client-space click coordinate scoped to the
   // PREVIOUS photo. Clear it on every open so a 1:1-preserving navigation (or a
   // swap still in flight from the prior photo) snaps centered instead of reusing
@@ -7539,6 +7895,14 @@ function openLightbox(photoId, filename, photoList, options) {
   if (editPhotoBtn) {
     editPhotoBtn.onclick = function(e) {
       if (e) e.stopPropagation();
+      if (_lbGuardReadOnly()) return false;
+      var editHint = typeof window.getLightboxBrowseDisabledHint === 'function'
+        ? window.getLightboxBrowseDisabledHint(photoId, true)
+        : null;
+      if (editHint) {
+        if (typeof showToast === 'function') showToast(editHint, 'warning');
+        return false;
+      }
       // Hand the current ordered photo list to the editor so it can offer
       // Prev/Next just like the lightbox does.
       if (window.vireoEditNav) {
@@ -7626,13 +7990,112 @@ function lightboxKeyMatchesConfiguredBrowseShortcut(e) {
   return false;
 }
 
-function toggleLightboxZoom(e) {
-  // Fit to 1:1 toggle. Preserved for existing 'z' shortcut and click-to-zoom.
-  var wrap = document.getElementById('lightboxWrap');
+function _lbMaxZoom() {
+  return _lbNativeZoom ? _lbNativeZoom * 4 : 4;
+}
+
+function _lbZoomSliderPosition(zoom) {
+  var maxZoom = _lbMaxZoom();
+  if (maxZoom <= 1.001) return 0;
+  return Math.max(0, Math.min(1000, Math.log(Math.max(1, zoom)) / Math.log(maxZoom) * 1000));
+}
+
+function _lbZoomFromSliderPosition(position) {
+  var maxZoom = _lbMaxZoom();
+  if (maxZoom <= 1.001) return 1;
+  var ratio = Math.max(0, Math.min(1, Number(position) / 1000));
+  return Math.exp(Math.log(maxZoom) * ratio);
+}
+
+function _lbZoomDisplayText() {
+  if (_lbPending1To1) return 'Loading 1:1';
+  if (_lbZoom <= 1.001) return 'Fit';
+  if (_lbNativeZoom) return Math.round((_lbZoom / _lbNativeZoom) * 100) + '%';
+  var fitMultiple = Math.round(_lbZoom * 10) / 10;
+  return fitMultiple + '\u00d7 Fit';
+}
+
+function _lbNativeSliderPercent() {
+  return _lbNativeZoom ? _lbZoomSliderPosition(_lbNativeZoom) / 10 : 0;
+}
+
+function _lbNativeCoincidesWithFit() {
+  return !!_lbNativeZoom && _lbNativeZoom <= 1.001;
+}
+
+function _lbUpdateZoomControl() {
+  var badge = document.getElementById('lightboxZoomBadge');
+  var slider = document.getElementById('lightboxZoomSlider');
+  var nativeStop = document.getElementById('lightboxZoomNativeStop');
+  var fitStop = document.querySelector('.lb-zoom-stop-fit');
+  var maxLabel = document.getElementById('lightboxZoomMaxLabel');
+  var zoomOut = document.getElementById('lightboxZoomOut');
+  var zoomIn = document.getElementById('lightboxZoomIn');
+  var text = _lbZoomDisplayText();
+
+  if (badge) {
+    badge.textContent = text;
+    badge.title = 'Zoom: ' + text + '. Open zoom controls';
+  }
+  if (slider) {
+    slider.value = String(Math.round(_lbZoomSliderPosition(_lbZoom)));
+    slider.setAttribute('aria-valuetext', text);
+    slider.disabled = !!_lbVisualTransitionPending;
+  }
+  if (zoomOut) zoomOut.disabled = _lbVisualTransitionPending || _lbZoom <= 1.001;
+  if (zoomIn) zoomIn.disabled = _lbVisualTransitionPending || _lbZoom >= _lbMaxZoom() - 0.001;
+
+  var combinedFitNative = _lbNativeCoincidesWithFit();
+  if (fitStop) {
+    fitStop.textContent = combinedFitNative ? 'Fit \u00b7 1:1' : 'Fit';
+    fitStop.disabled = !!_lbVisualTransitionPending;
+  }
+  if (nativeStop) {
+    var nativePosition = _lbNativeSliderPercent();
+    nativeStop.disabled = !!_lbVisualTransitionPending;
+    // When fit and 1:1 are visually indistinguishable, combine the labels at the
+    // left edge. Otherwise keep 1:1 at least 8% along the track so a near-fit
+    // native stop remains separate and clickable without overlapping Fit.
+    nativeStop.style.display = (_lbNativeZoom && !combinedFitNative) ? 'inline-block' : 'none';
+    nativeStop.style.left = Math.max(8, nativePosition) + '%';
+  }
+  if (maxLabel) maxLabel.textContent = _lbNativeZoom ? '400%' : '4\u00d7 Fit';
+}
+
+function _lbSetZoomPopoverOpen(open) {
+  var popover = document.getElementById('lightboxZoomPopover');
+  var badge = document.getElementById('lightboxZoomBadge');
+  if (popover) popover.classList.toggle('open', !!open);
+  if (badge) badge.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function toggleLightboxZoomPopover() {
+  var popover = document.getElementById('lightboxZoomPopover');
+  _lbSetZoomPopoverOpen(!(popover && popover.classList.contains('open')));
+}
+
+function setLightboxZoomFromSlider(position) {
+  if (_lbVisualTransitionPending) return;
+  _lbClearPendingViewportRestore();
+  _lbSetZoom(_lbZoomFromSliderPosition(position), null, null);
+}
+
+function stepLightboxZoom(direction) {
+  if (_lbVisualTransitionPending) return;
+  _lbClearPendingViewportRestore();
+  _lbSetZoom(_lbZoom * (direction > 0 ? 1.25 : 0.8), null, null);
+}
+
+function setLightboxZoomToFit() {
+  if (_lbVisualTransitionPending) return;
+  _lbClearPendingViewportRestore();
+  _lbSetZoom(1.0, null, null);
+}
+
+function setLightboxZoomToOneToOne(e) {
+  if (_lbVisualTransitionPending) return;
   var img = document.getElementById('lightboxImg');
   if (!img) return;
-  // Explicit user zoom toggle ('z' shortcut or click-to-zoom) supersedes any
-  // restore carried over by arrow navigation.
   _lbClearPendingViewportRestore();
 
   // If we don't know native zoom yet (e.g. dimensions fetch still pending),
@@ -7641,40 +8104,47 @@ function toggleLightboxZoom(e) {
     _lbRecomputeNativeZoom();
   }
 
-  // A deferred 1:1 leaves _lbZoom at 1 while the high-res source loads, so treat
-  // a pending 1:1 as "zoomed" too — otherwise a second toggle re-enters the
-  // zoom-in path and the image still snaps to 1:1 once it finishes loading.
-  var isZoomed = _lbZoom > 1.001 || _lbPending1To1;
-  if (isZoomed) {
-    _lbSetZoom(1.0, null, null);
-    _lbPending1To1 = false;
-    _lbPending1To1Anchor = null;
-  } else {
-    // Anchor zoom on click position (or center if no event)
-    var rect = img.getBoundingClientRect();
-    var anchorX = e && e.clientX ? e.clientX : rect.left + rect.width / 2;
-    var anchorY = e && e.clientY ? e.clientY : rect.top + rect.height / 2;
-    if (_lbNativeZoom) {
-      var desiredSource = _lbPickSourceKey(_lbNativeZoom);
-      if (desiredSource !== _lbCurrentSrcKey) {
-        _lbPending1To1 = true;
-        _lbPending1To1Anchor = { x: anchorX, y: anchorY };
-        _lbScheduleSourceSwap(_lbNativeZoom);
-        _lbApplyTransform();
-      } else {
-        _lbSetZoom(_lbNativeZoom, anchorX, anchorY);
-        _lbPending1To1 = false;
-        _lbPending1To1Anchor = null;
-      }
-    } else {
-      // Dimensions unknown. Load the high-resolution source first, then apply
-      // 1:1 after the browser has decoded it; otherwise the user sees an
-      // enlarged preview and reads that as a soft 1:1 view.
+  // Anchor zoom on click position (or center for the slider's 1:1 stop).
+  var rect = img.getBoundingClientRect();
+  var anchorX = e && e.clientX ? e.clientX : rect.left + rect.width / 2;
+  var anchorY = e && e.clientY ? e.clientY : rect.top + rect.height / 2;
+  if (_lbNativeZoom) {
+    var desiredSource = _lbPickSourceKey(_lbNativeZoom);
+    // Compare source ranks (not exact key equality) so an already-sharper
+    // current tier — e.g. /original loaded during a previous 1:1 view when
+    // the picked tier for _lbNativeZoom is /2560 — satisfies 1:1 immediately.
+    // The exact-key check would otherwise enter the deferred path, leave the
+    // badge at 'Loading 1:1' while a lower tier is fetched, and could strand
+    // _lbPending1To1 if that fetch failed.
+    if (_lbSrcRank(_lbCurrentSrcKey) < _lbSrcRank(desiredSource)) {
       _lbPending1To1 = true;
       _lbPending1To1Anchor = { x: anchorX, y: anchorY };
-      _lbScheduleSourceSwap(4);
+      _lbScheduleSourceSwap(_lbNativeZoom);
       _lbApplyTransform();
+    } else {
+      _lbSetZoom(_lbNativeZoom, anchorX, anchorY, true);
+      _lbPending1To1 = false;
+      _lbPending1To1Anchor = null;
     }
+  } else {
+    // Dimensions unknown. Load the high-resolution source first, then apply
+    // 1:1 after the browser has decoded it; otherwise the user sees an
+    // enlarged preview and reads that as a soft 1:1 view.
+    _lbPending1To1 = true;
+    _lbPending1To1Anchor = { x: anchorX, y: anchorY };
+    _lbScheduleSourceSwap(4);
+    _lbApplyTransform();
+  }
+}
+
+function toggleLightboxZoom(e) {
+  // Fit to 1:1 toggle. Preserved for the existing 'z' shortcut and image click.
+  // A deferred 1:1 leaves _lbZoom at fit while the sharp source loads, so treat
+  // that pending state as zoomed and allow a second toggle to cancel it.
+  if (_lbZoom > 1.001 || _lbPending1To1) {
+    setLightboxZoomToFit();
+  } else {
+    setLightboxZoomToOneToOne(e);
   }
 }
 
@@ -7687,6 +8157,7 @@ function toggleLightboxZoom(e) {
     if (!wrap) return;
     // Only react to wheel events over the image wrap
     if (!wrap.contains(e.target) && e.target !== wrap) return;
+    if (e.target.closest('.lightbox-zoom-control')) return;
 
     e.preventDefault();
     if (_lbVisualTransitionPending) return;
@@ -7812,6 +8283,7 @@ function toggleLightboxZoom(e) {
     var wrap = document.getElementById('lightboxWrap');
     if (!wrap || _lbZoom <= 1.001) return;
     if (e.target.tagName === 'BUTTON' || e.target.closest('button')) return;
+    if (e.target.closest('.lightbox-zoom-control')) return;
     if (!wrap.contains(e.target) && e.target !== wrap) return;
     dragging = true;
     didDrag = false;
@@ -7854,6 +8326,13 @@ function toggleLightboxZoom(e) {
 
 function closeLightbox(e) {
   if (e && e.target && e.target.tagName === 'IMG') return;
+  // Use the last committed (visible) identity, not `_lightboxCurrentId` —
+  // that advances immediately at the start of navigation while the outgoing
+  // bitmap is still on screen, so it names a photo the user never actually
+  // viewed if the incoming /full is still loading when the user closes.
+  var closedPhotoId = _lightboxCommittedId != null
+    ? _lightboxCommittedId
+    : _lightboxCurrentId;
   _lbFlushPendingAdjustmentSave();
   if (_lightboxCurrentId != null) _lbSaveViewportState(_lightboxCurrentId);
   var wasOpen = !!window._lbEscToken;
@@ -7879,12 +8358,20 @@ function closeLightbox(e) {
   var adjustBtn = document.getElementById('lightboxAdjustBtn');
   if (adjustBtn) adjustBtn.setAttribute('aria-expanded', 'false');
   toggleLightboxViewMenu(false);
+  _lbSetZoomPopoverOpen(false);
   _lbApplyTransform();
   document.getElementById('lightboxOverlay').classList.remove('active');
   document.getElementById('lightboxImg').src = '';
-  document.getElementById('lightboxZoomBadge').style.display = 'none';
   _lightboxCurrentId = null;
-  try { document.dispatchEvent(new CustomEvent('lightbox:closed')); } catch(_) {}
+  _lbReadOnly = false;
+  _lbReadOnlyMessage = 'This lightbox is read-only';
+  _lbApplyReadOnlyState();
+  _lightboxCommittedId = null;
+  try {
+    document.dispatchEvent(new CustomEvent('lightbox:closed', {
+      detail: { photoId: closedPhotoId }
+    }));
+  } catch(_) {}
   _lbSetFlagStatus(undefined);
   var detContainer = document.getElementById('lightboxDetections');
   if (detContainer) detContainer.innerHTML = '';
@@ -7908,11 +8395,14 @@ function closeLightbox(e) {
  */
 function buildLightboxContextMenu(pid) {
   var has = function(name) { return typeof window[name] === 'function'; };
+  var readOnlyHint = _lbReadOnly ? _lbReadOnlyMessage : null;
 
   var rateChip = function(n) {
     return {
       label: n === 0 ? '\u2606' : String(n),
       title: n === 0 ? 'No rating' : 'Rate ' + n,
+      disabled: !!readOnlyHint,
+      disabledHint: readOnlyHint || undefined,
       onClick: function() {
         if (has('setRatingFor')) window.setRatingFor(pid, n);
         else if (has('setReviewRating')) window.setReviewRating(pid, n);
@@ -7921,21 +8411,32 @@ function buildLightboxContextMenu(pid) {
   };
   var colorChip = function(c, icon, title) {
     return {
-      label: icon, title: title,
+      label: icon,
+      title: c && window.VireoColorLabels
+        ? window.VireoColorLabels.title(c, title)
+        : title,
+      color: c,
+      colorBaseTitle: title,
+      disabled: !!readOnlyHint,
+      disabledHint: readOnlyHint || undefined,
       onClick: function() { if (has('setColorLabelFor')) window.setColorLabelFor(pid, c); },
     };
   };
   var flagChip = function(f, icon, title) {
     return {
       label: icon, title: title,
+      disabled: !!readOnlyHint,
+      disabledHint: readOnlyHint || undefined,
       onClick: function() {
         _lbApplyFlag(pid, f);
       },
     };
   };
-  var toggleItem = function(label, visible, onClick) {
+  var toggleItem = function(label, visible, onClick, disabledHint) {
     return {
       label: label + ': ' + (visible ? 'On' : 'Off'),
+      disabled: !!disabledHint,
+      disabledHint: disabledHint || undefined,
       onClick: onClick,
     };
   };
@@ -7950,6 +8451,7 @@ function buildLightboxContextMenu(pid) {
       colorChip('yellow', '\u25CF', 'Yellow'),
       colorChip('green', '\u25CF', 'Green'),
       colorChip('blue', '\u25CF', 'Blue'),
+      colorChip('purple', '\u25CF', 'Purple'),
     ] });
   }
   items.push({ chips: [
@@ -7964,19 +8466,24 @@ function buildLightboxContextMenu(pid) {
   items.push(toggleItem('Track eye', _lbTrackEyeEnabled, toggleLightboxTrackEye));
   items.push(toggleItem('Filename and counter', _lbInfoVisible, toggleLightboxInfo));
   items.push(toggleItem('Lightbox controls', _lbChromeVisible, toggleLightboxChrome));
-  items.push(toggleItem('Wildlife classification', !_lbCurrentWildlifeExcluded, lightboxToggleWildlifeExcluded));
+  items.push(toggleItem('Wildlife classification', !_lbCurrentWildlifeExcluded,
+    lightboxToggleWildlifeExcluded, readOnlyHint));
   items.push({ separator: true });
-  items.push({ label: 'Open in Browse',
+  var browseDisabledHint = typeof window.getLightboxBrowseDisabledHint === 'function'
+    ? window.getLightboxBrowseDisabledHint(pid)
+    : null;
+  items.push({ label: 'Open in Browse', disabled: !!browseDisabledHint,
+    disabledHint: browseDisabledHint || undefined,
     onClick: function() {
-      window.location.href = '/browse?photo_id=' + encodeURIComponent(pid);
+      window.openInBrowse(pid);
     } });
-  if (typeof window.buildSpeciesHighlightMenuItems === 'function') {
+  if (!_lbReadOnly && typeof window.buildSpeciesHighlightMenuItems === 'function') {
     items = items.concat(window.buildSpeciesHighlightMenuItems([pid], {
       photoById: _lbPhotoDataByPhoto,
       showFetchFallback: true,
     }));
   }
-  if (typeof window.buildSpeciesRepresentativeMenuItems === 'function') {
+  if (!_lbReadOnly && typeof window.buildSpeciesRepresentativeMenuItems === 'function') {
     items = items.concat(window.buildSpeciesRepresentativeMenuItems([pid], {
       photoById: _lbPhotoDataByPhoto,
     }));
@@ -8412,11 +8919,13 @@ async function confirmDelete() {
 
 async function lightboxToggleWildlifeExcluded() {
   if (!_lightboxCurrentId) return;
+  if (_lbGuardReadOnly()) return false;
   var currentId = _lightboxCurrentId;
   var excluded = !_lbCurrentWildlifeExcluded;
   try {
     if (typeof window.setWildlifeExcludedFor === 'function') {
-      await window.setWildlifeExcludedFor(currentId, excluded);
+      var updated = await window.setWildlifeExcludedFor(currentId, excluded);
+      if (updated === false) return false;
     } else {
       await safeFetch('/api/photos/' + currentId + '/wildlife_excluded', {
         method: 'POST',
@@ -8438,6 +8947,7 @@ async function lightboxToggleWildlifeExcluded() {
 }
 
 function lightboxDelete() {
+  if (_lbGuardReadOnly()) return false;
   var overlay = document.getElementById('lightboxOverlay');
   if (
     _lbVisualTransitionPending ||
@@ -8459,6 +8969,20 @@ function lightboxDelete() {
       return;
     }
 
+    // Update the browse grid before touching lightbox state. Otherwise
+    // Browse's `lightbox:closed` handler still finds the deleted row in
+    // `photos` and re-selects it (loading stale detail state that this
+    // block would then null out — leaving the sidebar blank).
+    if (typeof photos !== 'undefined' && typeof renderGrid === 'function') {
+      photos = photos.filter(function(x) { return x.id !== currentId; });
+      selectedPhotos.delete(currentId);
+      if (selectedPhotoId === currentId) selectedPhotoId = null;
+      renderGrid();
+      if (typeof refreshBrowseSidebarCounts === 'function') {
+        refreshBrowseSidebarCounts();
+      }
+    }
+
     // Remove from lightbox photo list
     var idx = _lightboxPhotoList.findIndex(function(x) { return x.id === currentId; });
     _lightboxPhotoList.splice(idx, 1);
@@ -8469,17 +8993,6 @@ function lightboxDelete() {
       var nextIdx = Math.min(idx, _lightboxPhotoList.length - 1);
       var next = _lightboxPhotoList[nextIdx];
       openLightbox(next.id, next.filename, _lightboxPhotoList);
-    }
-
-    // Also update browse grid if we're on the browse page
-    if (typeof photos !== 'undefined' && typeof renderGrid === 'function') {
-      photos = photos.filter(function(x) { return x.id !== currentId; });
-      selectedPhotos.delete(currentId);
-      if (selectedPhotoId === currentId) selectedPhotoId = null;
-      renderGrid();
-      if (typeof refreshBrowseSidebarCounts === 'function') {
-        refreshBrowseSidebarCounts();
-      }
     }
 
     try {
@@ -8579,6 +9092,7 @@ function copyInatQuickUploadUrl(idx) {
 }
 
 async function submitToInat(photoId) {
+  if (_lbGuardReadOnly()) return false;
   try {
     var data = await safeFetch('/api/inat/prepare/' + photoId, {}, { toast: false });
     if (data.error) { alert(data.error); return; }
@@ -8597,6 +9111,7 @@ async function submitToInat(photoId) {
 }
 
 async function submitToInatBatch(photoIds) {
+  if (_lbGuardReadOnly()) return false;
   // Prepare all photos
   inatQueue = [];
   var quickQueue = [];
@@ -8790,6 +9305,7 @@ function closeInatModal() {
 }
 
 async function inatDoSubmit() {
+  if (_lbGuardReadOnly()) return false;
   var btn = document.getElementById('inatSubmitBtn');
   btn.disabled = true;
   btn.textContent = 'Submitting...';
@@ -9078,26 +9594,16 @@ function _lbApplyTransform() {
   var t = document.getElementById('lightboxTransform');
   if (!t) return;
   var metrics = _lbUpdateLayoutMetrics();
-  if (!metrics) return;
+  if (!metrics) {
+    _lbUpdateZoomControl();
+    return;
+  }
   var renderedW = metrics.w * metrics.scale;
   var renderedH = metrics.h * metrics.scale;
   var tx = (metrics.wrapW - renderedW) / 2 + _lbPanX;
   var ty = (metrics.wrapH - renderedH) / 2 + _lbPanY;
   t.style.transform = 'translate(' + tx + 'px, ' + ty + 'px) scale(' + metrics.scale + ')';
-  var badge = document.getElementById('lightboxZoomBadge');
-  if (!badge) return;
-  if (_lbPending1To1) {
-    badge.style.display = '';
-    badge.textContent = 'loading 1:1';
-  } else if (_lbZoom <= 1.001) {
-    badge.style.display = 'none';
-  } else if (_lbNativeZoom) {
-    badge.style.display = '';
-    badge.textContent = Math.round((_lbZoom / _lbNativeZoom) * 100) + '%';
-  } else {
-    badge.style.display = '';
-    badge.textContent = 'zoom';
-  }
+  _lbUpdateZoomControl();
 }
 
 function _lbOrientedPhotoDims(img) {
@@ -9210,14 +9716,32 @@ function _lbRecomputeNativeZoom() {
   _lbApplyTransform();
 }
 
-function _lbSetZoom(newZoom, anchorClientX, anchorClientY) {
+function _lbSyncSourceForZoom(targetZoom, preserveSharperSource) {
+  var desiredSource = _lbPickSourceKey(targetZoom);
+  if (preserveSharperSource && _lbSrcRank(_lbCurrentSrcKey) > _lbSrcRank(desiredSource)) {
+    // The current pixels already exceed this zoom's requirement. Cancel any
+    // queued downgrade and retain them; this is especially important for the
+    // explicit 1:1 stop, where replacing /original with a lower tier adds work
+    // and can leave a failed non-original swap stranded.
+    if (_lbSwapTimer) {
+      clearTimeout(_lbSwapTimer);
+      _lbSwapTimer = null;
+    }
+    _lbDesiredSrcKey = _lbCurrentSrcKey;
+    _lbPrimeAdjacentPhotos(_lbCurrentSrcKey);
+    return;
+  }
+  _lbScheduleSourceSwap(targetZoom);
+}
+
+function _lbSetZoom(newZoom, anchorClientX, anchorClientY, preserveSharperSource) {
   // Any zoom mutation cancels a pending "upgrade to 1:1 on original-load" intent.
   // Callers that still want it (toggleLightboxZoom's fallback path) re-set the flag
   // after calling us.
   _lbPending1To1 = false;
   _lbPending1To1Anchor = null;
   // Clamp to valid range. Max is 4x native (or 4x fit if no nativeZoom).
-  var maxZoom = _lbNativeZoom ? _lbNativeZoom * 4 : 4;
+  var maxZoom = _lbMaxZoom();
   newZoom = Math.max(1.0, Math.min(maxZoom, newZoom));
   var wrap = document.getElementById('lightboxWrap');
   var t = document.getElementById('lightboxTransform');
@@ -9232,7 +9756,7 @@ function _lbSetZoom(newZoom, anchorClientX, anchorClientY) {
     }
     wrap.classList.toggle('zoomed', _lbZoom > 1.001);
     _lbApplyTransform();
-    _lbScheduleSourceSwap();
+    _lbSyncSourceForZoom(newZoom, preserveSharperSource);
     _lbSaveViewportState(_lightboxCurrentId);
     return;
   }
@@ -9268,7 +9792,7 @@ function _lbSetZoom(newZoom, anchorClientX, anchorClientY) {
   _lbClampPan();
   wrap.classList.toggle('zoomed', _lbZoom > 1.001);
   _lbApplyTransform();
-  _lbScheduleSourceSwap();
+  _lbSyncSourceForZoom(newZoom, preserveSharperSource);
   _lbSaveViewportState(_lightboxCurrentId);
 }
 
@@ -9798,6 +10322,9 @@ function findSimilar(photoId) {
       } else {
         var grid = document.createElement('div');
         grid.className = 'similar-grid';
+        var similarPhotoList = data.similar.map(function(item) {
+          return item.photo;
+        });
         data.similar.forEach(function(item) {
           var p = item.photo;
           var pct = Math.round(item.similarity * 100);
@@ -9805,7 +10332,10 @@ function findSimilar(photoId) {
           card.className = 'similar-card';
           card.addEventListener('click', function() {
             closeSimilar();
-            openLightbox(p.id, p.filename || '');
+            var lightboxOptions = typeof window.getLightboxOpenOptions === 'function'
+              ? window.getLightboxOpenOptions(p.id)
+              : undefined;
+            openLightbox(p.id, p.filename || '', similarPhotoList, lightboxOptions);
           });
           var img = document.createElement('img');
           img.src = window.vireoThumbnailUrl
@@ -10027,6 +10557,10 @@ function nativeMenuOpenLightbox() {
   if (typeof openBrowseShortcutPhoto === 'function' && openBrowseShortcutPhoto(false)) return;
   var ids = nativeMenuRequirePhotos('Open in Lightbox');
   if (!ids) return;
+  if (typeof window.openPipelineLightbox === 'function') {
+    window.openPipelineLightbox(ids[0]);
+    return;
+  }
   if (typeof openLightbox === 'function' && typeof photos !== 'undefined') {
     var p = photos.find(function(x) { return x.id === ids[0]; });
     if (p) {
@@ -10044,7 +10578,15 @@ function nativeMenuOpenBrowse() {
     nativeMenuError('Open in Browse needs one selected photo.');
     return;
   }
+  var disabledHint = typeof window.getLightboxBrowseDisabledHint === 'function'
+    ? window.getLightboxBrowseDisabledHint(ids[0], true)
+    : null;
+  if (disabledHint) {
+    nativeMenuError(disabledHint);
+    return false;
+  }
   nativeMenuRoute('/browse?photo_id=' + encodeURIComponent(ids[0]));
+  return true;
 }
 
 function nativeMenuPhotoIdsForWrite() {
@@ -10134,7 +10676,7 @@ async function nativeMenuSetWildlifeExcluded(excluded) {
   var ids = nativeMenuPhotoIdsForWrite();
   if (!ids) return;
   var usePageHelper = typeof window.setWildlifeExcludedFor === 'function';
-  await Promise.all(ids.map(function(id) {
+  var results = await Promise.all(ids.map(function(id) {
     if (usePageHelper) {
       return window.setWildlifeExcludedFor(id, excluded);
     }
@@ -10144,6 +10686,9 @@ async function nativeMenuSetWildlifeExcluded(excluded) {
       body: JSON.stringify({excluded: excluded}),
     }, {toast: false});
   }));
+  if (usePageHelper && results.some(function(result) { return result === false; })) {
+    return false;
+  }
   if (!usePageHelper) nativeMenuRefreshWildlifeExcludedState(ids, excluded);
   if (typeof _lightboxCurrentId !== 'undefined' && ids.indexOf(_lightboxCurrentId) !== -1) {
     _lbCurrentWildlifeExcluded = excluded;
@@ -10479,8 +11024,23 @@ window.invalidateEditorsCache = function() {
   _externalEditorsLoading = null;
 };
 
+function photoExternalEditDisabledHint() {
+  if (_lbReadOnly && typeof nativeMenuLightboxOpen === 'function' &&
+      nativeMenuLightboxOpen()) {
+    return _lbReadOnlyMessage;
+  }
+  return typeof window.getPhotoExternalEditDisabledHint === 'function'
+    ? window.getPhotoExternalEditDisabledHint()
+    : null;
+}
+
 async function openInEditor(photoIds, editorIndex) {
   if (!photoIds || !photoIds.length) return;
+  var disabledHint = photoExternalEditDisabledHint();
+  if (disabledHint) {
+    showToast(disabledHint, 'warning');
+    return false;
+  }
   var body = { photo_ids: photoIds };
   if (typeof editorIndex === 'number') body.editor_index = editorIndex;
   try {
@@ -10501,16 +11061,21 @@ async function openInEditor(photoIds, editorIndex) {
 // inline without a nested submenu.
 window.buildOpenInEditorMenuItems = function(photoIds) {
   var editors = window.getExternalEditorsSync();
+  var disabledHint = photoExternalEditDisabledHint();
   if (editors.length > 1) {
     return editors.map(function(ed, idx) {
       return {
         label: 'Open in ' + ed.name,
+        disabled: !!disabledHint,
+        disabledHint: disabledHint || undefined,
         onClick: function() { window.openInEditor(photoIds, idx); },
       };
     });
   }
   return [{
     label: 'Open in Editor',
+    disabled: !!disabledHint,
+    disabledHint: disabledHint || undefined,
     onClick: function() { window.openInEditor(photoIds); },
   }];
 };
@@ -10534,6 +11099,11 @@ window.buildOpenInEditorMenuItems = function(photoIds) {
  */
 async function developPhotos(photoIds) {
   if (!photoIds || !photoIds.length) return;
+  var disabledHint = photoExternalEditDisabledHint();
+  if (disabledHint) {
+    showToast(disabledHint, 'warning');
+    return false;
+  }
   try {
     var status = await safeFetch('/api/darktable/status', {}, { toast: false });
     if (!status.available) {
@@ -12462,6 +13032,9 @@ function openMissingPhotosModal(folderId, label) {
     folderId: (folderId == null ? null : folderId),
     label: label || '',
   };
+  updateMissingPhotosThumbSize(
+    document.getElementById('missingPhotosThumbSizeSlider').value
+  );
   const note = document.getElementById('missingPhotosScopeNote');
   if (_missingPhotosScope.folderId != null) {
     note.textContent = 'Showing only: ' + (_missingPhotosScope.label || 'selected folder');
@@ -12878,6 +13451,10 @@ async function _deleteMissingPhotoIds(ids, deleteSidecars) {
 }
 </script>
 <script src="/static/vireo-utils.js"></script>
+<!-- Shared by every page that decides predictions (Review, ID Conflicts):
+     the one implementation of "which rows did my earlier request already
+     decide". See vireo-predictions.js. -->
+<script src="/static/vireo-predictions.js"></script>
 <script src="/static/tauri-bridge.js"></script>
 <script>
   /* Updater disabled — startupUpdateCheck skipped until updater is configured */

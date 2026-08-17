@@ -1202,8 +1202,9 @@ Species confirmation uses the assertion model above. The request names the
 target subjects or photos, taxon, operation (add, replace, Not identifiable, or
 False detection), canonical run, and expected revision. The server returns the
 changed photos and encounters, updated completion and summary counts, the new
-`revision`, and the unchanged `structural_revision` so an active pagination
-cursor remains valid. It does not return the complete encounter list.
+`revision`, and the unchanged `structural_revision`; whether an active
+pagination cursor survives follows the per-view rules in the Pagination
+section. It does not return the complete encounter list.
 
 Confirmation never changes structure merely because another species is
 present: multi-species photos and encounters are valid. When credible species
@@ -1589,8 +1590,10 @@ triage, and flag changes. `structural_revision` advances only when encounter
 or burst membership changes: a new Process run, applied regrouping, or an
 explicit structural command such as Split, Extract, Merge, or Separate.
 Decision-only mutations increment `revision` but preserve
-`structural_revision` so pagination cursors, focus, and scroll position
-remain valid.
+`structural_revision` so focus and scroll position remain valid, and so
+pagination cursors remain valid in views whose sort and filters do not read
+decision state (the Pagination section defines the decision-dependent
+cases).
 
 Every encounter and burst has an opaque stable ID. IDs survive labels, flags,
 sorting, filtering, and pagination. A structural regroup may replace IDs;
@@ -1711,18 +1714,40 @@ large collection ID list and intersect it with a second large result payload.
 
 ### Pagination
 
-Pagination is encounter-based and uses an opaque cursor tied to the run,
-`structural_revision`, sort, and filter fingerprint. Decision-only mutations
-such as species confirmation, triage, and flags do not invalidate the
-cursor, so a large review can be edited while continuing to scroll from the
-loaded position. The server observes both a target encounter count and a
-soft target photo count:
+Pagination is encounter-based and uses an opaque keyset cursor tied to the
+run, `structural_revision`, sort, and filter fingerprint. The cursor encodes
+the sort key and stable ID of the last returned encounter — never a bare
+offset — so membership changes elsewhere in the result cannot silently skip a
+successor.
+
+Whether decision-only mutations preserve the cursor depends on the active
+view:
+
+- When the sort and filters read only snapshot data (chronological,
+  newest/oldest first, most/fewest photos, most bursts, with
+  decision-independent filters), decision-only mutations such as species
+  confirmation, triage, and flags do not invalidate the cursor, so a large
+  review can be edited while continuing to scroll from the loaded position.
+- When the sort or a filter reads mutable decision state (`unresolved first`
+  or conflict-severity sorts, triage-status or species-review filters), a
+  decision can move an encounter across the cursor boundary or out of the
+  result set, so cursor reuse could repeat or miss encounters. A decision
+  mutation that changes a sort or filter key of the active view therefore
+  marks the cursor stale, and the next page fetch obtains a fresh cursor
+  anchored at the stable ID of the last loaded encounter. Already-loaded rows
+  stay in place and update through the delta, and the client's ID-keyed maps
+  drop any encounter a re-anchored page would repeat.
+
+The server observes both a target encounter count and a soft target photo
+count:
 
 - never split an encounter;
 - return at least one encounter even when it exceeds the photo target;
 - otherwise stop before adding an encounter that would exceed the soft photo
   target; and
-- invalidate the cursor when `structural_revision` or the query changes.
+- invalidate the cursor when `structural_revision` or the query changes, or
+  when a decision mutation changes a sort or filter key that the
+  cursor-bound view depends on.
 
 The client loads the next page as the user approaches the end of the current
 window. Already loaded pages may be virtualized or discarded outside a bounded
@@ -1749,10 +1774,13 @@ All review mutations use a common delta envelope:
 ```
 
 The client compares the returned `structural_revision` with the one bound to
-its active cursor: an unchanged value means pagination remains valid and no
-requery is required, while a bumped value means the next page fetch must use
-a fresh cursor. The client applies the delta to normalized maps keyed by
-stable IDs. It does not replace or deep-clone the complete review result.
+its active cursor: a bumped value means the next page fetch must use a fresh
+cursor. When the value is unchanged, pagination remains valid unless the
+active view depends on decision state and `view_may_have_changed` reports
+that a sort or filter key changed, in which case the next page fetch
+re-anchors as described in the Pagination section. The client applies the
+delta to normalized maps keyed by stable IDs. It does not replace or
+deep-clone the complete review result.
 
 ### Persistence model
 

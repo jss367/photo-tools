@@ -6,371 +6,372 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
   <title>Process Review page: complete product and interaction design</title>
   <style>
-code{white-space: pre-wrap;}
-span.smallcaps{font-variant: small-caps;}
-div.columns{display: flex; gap: min(4vw, 1.5em);}
-div.column{flex: auto; overflow-x: auto;}
-div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
-
-ul.task-list[class]{list-style: none;}
-ul.task-list li input[type="checkbox"] {
-font-size: inherit;
-width: 0.8em;
-margin: 0 0.8em 0.2em -1.6em;
-vertical-align: middle;
-}
-.display.math{display: block; text-align: center; margin: 0.5rem auto;}
-
-pre > code.sourceCode { white-space: pre; position: relative; }
-pre > code.sourceCode > span { line-height: 1.25; }
-pre > code.sourceCode > span:empty { height: 1.2em; }
-.sourceCode { overflow: visible; }
-code.sourceCode > span { color: inherit; text-decoration: inherit; }
-div.sourceCode { margin: 1em 0; }
-pre.sourceCode { margin: 0; }
-@media screen {
-div.sourceCode { overflow: auto; }
-}
-@media print {
-pre > code.sourceCode { white-space: pre-wrap; }
-pre > code.sourceCode > span { display: inline-block; text-indent: -5em; padding-left: 5em; }
-}
-pre.numberSource code
-{ counter-reset: source-line 0; }
-pre.numberSource code > span
-{ position: relative; left: -4em; counter-increment: source-line; }
-pre.numberSource code > span > a:first-child::before
-{ content: counter(source-line);
-position: relative; left: -1em; text-align: right; vertical-align: baseline;
-border: none; display: inline-block;
--webkit-touch-callout: none; -webkit-user-select: none;
--khtml-user-select: none; -moz-user-select: none;
--ms-user-select: none; user-select: none;
-padding: 0 4px; width: 4em;
-color: #aaaaaa;
-}
-pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa; padding-left: 4px; }
-div.sourceCode
-{ }
-@media screen {
-pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
-}
-code span.al { color: #ff0000; font-weight: bold; }
-code span.an { color: #60a0b0; font-weight: bold; font-style: italic; }
-code span.at { color: #7d9029; }
-code span.bn { color: #40a070; }
-code span.bu { color: #008000; }
-code span.cf { color: #007020; font-weight: bold; }
-code span.ch { color: #4070a0; }
-code span.cn { color: #880000; }
-code span.co { color: #60a0b0; font-style: italic; }
-code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; }
-code span.do { color: #ba2121; font-style: italic; }
-code span.dt { color: #902000; }
-code span.dv { color: #40a070; }
-code span.er { color: #ff0000; font-weight: bold; }
-code span.ex { }
-code span.fl { color: #40a070; }
-code span.fu { color: #06287e; }
-code span.im { color: #008000; font-weight: bold; }
-code span.in { color: #60a0b0; font-weight: bold; font-style: italic; }
-code span.kw { color: #007020; font-weight: bold; }
-code span.op { color: #666666; }
-code span.ot { color: #007020; }
-code span.pp { color: #bc7a00; }
-code span.sc { color: #4070a0; }
-code span.ss { color: #bb6688; }
-code span.st { color: #4070a0; }
-code span.va { color: #19177c; }
-code span.vs { color: #4070a0; }
-code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; }
-</style>
-  <style type="text/css">:root {
-color-scheme: light;
---page: #fafcf9;
---surface: #ffffff;
---ink: #26362e;
---muted: #687970;
---line: #e1e9e3;
---accent: #3a7d62;
---accent-soft: #edf7f1;
---code: #f4f7f5;
---quote: #f7fbf8;
---blue-soft: #eaf3ff;
---amber-soft: #fff4d8;
---violet-soft: #f2edfb;
-}
-* { box-sizing: border-box; }
-html {
-background: var(--page);
-color: var(--ink);
-}
-body {
-display: grid;
-grid-template-columns: 260px minmax(0, 780px);
-column-gap: 64px;
-align-items: start;
-max-width: 1168px;
-margin: 0 auto;
-padding: 52px 32px 96px;
-color: var(--ink);
-font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont,
-"Segoe UI", sans-serif;
-font-size: 17px;
-line-height: 1.68;
-overflow-wrap: break-word;
-text-rendering: optimizeLegibility;
-}
-body > * {
-grid-column: 2;
-min-width: 0;
-}
-header {
-margin: 0 0 32px;
-text-align: left;
-}
-header::before {
-content: "Vireo product design";
-display: block;
-margin-bottom: 10px;
-color: var(--accent);
-font-size: 0.75rem;
-font-weight: 750;
-letter-spacing: 0.12em;
-text-transform: uppercase;
-}
-header .title {
-max-width: 760px;
-margin: 0;
-font-size: clamp(2.25rem, 5vw, 3.6rem);
-line-height: 1.04;
-letter-spacing: -0.045em;
-}
-body > h1 { display: none; }
-body > h1 + p {
-margin: 0 0 52px;
-padding: 20px 22px;
-border: 1px solid var(--line);
-border-radius: 14px;
-background: var(--surface);
-color: var(--muted);
-box-shadow: 0 10px 30px rgba(47, 82, 64, 0.04);
-}
-body > h1 + p strong { color: var(--ink); }
-#TOC {
-grid-column: 1;
-position: fixed;
-left: max(24px, calc(50vw - 552px));
-top: 24px;
-width: 260px;
-max-height: calc(100vh - 48px);
-overflow: auto;
-padding: 18px 16px 20px;
-border: 1px solid var(--line);
-border-radius: 14px;
-background: rgba(255, 255, 255, 0.94);
-box-shadow: 0 12px 30px rgba(47, 82, 64, 0.05);
-backdrop-filter: blur(14px);
-font-size: 0.79rem;
-line-height: 1.35;
-scrollbar-width: thin;
-}
-#TOC::before {
-content: "Contents";
-display: block;
-margin: 0 8px 10px;
-color: var(--muted);
-font-size: 0.7rem;
-font-weight: 750;
-letter-spacing: 0.1em;
-text-transform: uppercase;
-}
-#TOC > ul > li > a { display: none; }
-#TOC ul, #TOC > ul, #TOC > ul > li > ul { margin: 0; padding: 0; }
-#TOC ul ul ul { display: none; }
-#TOC li { margin: 1px 0; list-style: none; }
-#TOC a {
-display: block;
-padding: 6px 8px;
-border-radius: 7px;
-color: var(--muted);
-text-decoration: none;
-}
-#TOC a:hover, #TOC a:focus-visible {
-background: var(--accent-soft);
-color: var(--accent);
-outline: none;
-}
-h2 {
-margin: 68px 0 18px;
-padding-top: 20px;
-border-top: 1px solid var(--line);
-font-size: 1.75rem;
-line-height: 1.2;
-letter-spacing: -0.025em;
-}
-h3 {
-margin: 42px 0 12px;
-color: #315043;
-font-size: 1.22rem;
-line-height: 1.3;
-letter-spacing: -0.01em;
-}
-h4 {
-margin: 30px 0 10px;
-color: var(--accent);
-font-size: 1.02rem;
-}
-h2 + p, h3 + p, h4 + p { margin-top: 0; }
-p { margin: 0.9em 0; }
-a { color: var(--accent); text-underline-offset: 0.16em; }
-a:visited { color: #435e51; }
-strong { font-weight: 720; }
-ol, ul { padding-left: 1.55em; }
-li { margin: 0.38em 0; padding-left: 0.2em; }
-blockquote {
-margin: 22px 0;
-padding: 14px 18px;
-border: 1px solid #d7e8dd;
-border-left: 5px solid var(--accent);
-border-radius: 0 10px 10px 0;
-background: var(--quote);
-color: #496157;
-}
-blockquote p { margin: 0.2em 0; }
-code {
-padding: 0.1em 0.32em;
-border-radius: 5px;
-background: #eef4f0;
-color: #264f3d;
-font-family: Menlo, Monaco, Consolas, monospace;
-font-size: 0.84em;
-}
-div.sourceCode, pre {
-margin: 22px 0;
-overflow: auto;
-border: 1px solid var(--line);
-border-radius: 12px;
-background: var(--code);
-box-shadow: 0 8px 24px rgba(47, 82, 64, 0.05);
-}
-pre { padding: 18px 20px; }
-div.sourceCode pre { margin: 0; padding: 18px 20px; border: 0; box-shadow: none; }
-pre code, div.sourceCode code {
-padding: 0;
-background: transparent;
-color: #294338;
-font-size: 0.82rem;
-line-height: 1.55;
-white-space: pre;
-}
-table {
-display: table;
-width: 100%;
-margin: 24px 0;
-overflow: hidden;
-border: 1px solid var(--line);
-border-collapse: separate;
-border-spacing: 0;
-border-radius: 10px;
-background: var(--surface);
-font-size: 0.92rem;
-font-variant-numeric: tabular-nums;
-}
-th {
-border: 0;
-border-bottom: 1px solid var(--line);
-padding: 11px 14px;
-background: var(--accent-soft);
-color: #264f3d;
-text-align: left;
-vertical-align: top;
-}
-td {
-border: 0;
-border-bottom: 1px solid #edf0ed;
-padding: 11px 14px;
-vertical-align: top;
-}
-tr:last-child td { border-bottom: 0; }
-::selection { background: #c9e8d7; }
-.design-diagram {
-margin: 30px 0 38px;
-border: 1px solid var(--line);
-border-radius: 16px;
-overflow: hidden;
-background: var(--surface);
-box-shadow: 0 14px 36px rgba(47, 82, 64, 0.06);
-}
-.diagram-scroll {
-overflow-x: auto;
-padding: 20px;
-background: linear-gradient(180deg, #ffffff 0%, #f8fbf8 100%);
-}
-.design-diagram svg {
-display: block;
-width: 100%;
-min-width: 720px;
-height: auto;
-}
-.design-diagram figcaption {
-padding: 14px 18px 16px;
-border-top: 1px solid var(--line);
-color: var(--muted);
-font-size: 0.88rem;
-line-height: 1.5;
-}
-.design-diagram figcaption strong { color: var(--ink); }
-.diagram-surface { fill: #ffffff; stroke: #dbe6df; stroke-width: 2; }
-.diagram-panel { fill: #f4f8f5; stroke: #cfddd4; stroke-width: 2; }
-.diagram-accent { fill: #e3f3e9; stroke: #70a98b; stroke-width: 2; }
-.diagram-blue { fill: #eaf3ff; stroke: #82a9d3; stroke-width: 2; }
-.diagram-amber { fill: #fff4d8; stroke: #d2a950; stroke-width: 2; }
-.diagram-violet { fill: #f2edfb; stroke: #a58cc9; stroke-width: 2; }
-.diagram-context { fill: #f3f5f4; stroke: #aebbb4; stroke-width: 2; stroke-dasharray: 6 5; }
-.diagram-match { fill: #dff2e7; stroke: #4d9470; stroke-width: 3; }
-.diagram-photo { fill: #ffffff; stroke: #9eb1a6; stroke-width: 2; }
-.diagram-line { fill: none; stroke: #71857a; stroke-width: 2.5; }
-.diagram-line-accent { fill: none; stroke: #3a7d62; stroke-width: 3; }
-.diagram-divider { stroke: #d7e2db; stroke-width: 2; }
-.diagram-text { fill: #2d4036; font: 600 15px Inter, ui-sans-serif, sans-serif; }
-.diagram-small { fill: #5f7468; font: 500 13px Inter, ui-sans-serif, sans-serif; }
-.diagram-label { fill: #3a7d62; font: 750 13px Inter, ui-sans-serif, sans-serif; letter-spacing: 0.04em; }
-.diagram-title { fill: #26362e; font: 750 19px Inter, ui-sans-serif, sans-serif; }
-.diagram-number { fill: #ffffff; font: 750 13px Inter, ui-sans-serif, sans-serif; text-anchor: middle; dominant-baseline: middle; }
-.diagram-number-circle { fill: #3a7d62; }
-@media (max-width: 980px) {
-body {
-display: flex;
-flex-direction: column;
-align-items: stretch;
-max-width: 820px;
-padding: 32px 24px 80px;
-}
-header { order: -3; }
-body > h1 { order: -2; }
-body > h1 + p { order: -1; }
-#TOC { position: static; width: auto; max-height: none; margin: 0 0 36px; }
-}
-@media (max-width: 600px) {
-html, body { max-width: 100%; overflow-x: hidden; }
-body { padding: 24px 16px 64px; font-size: 16px; }
-header .title { font-size: clamp(2rem, 10vw, 2.3rem); overflow-wrap: anywhere; }
-body > h1 + p { margin-bottom: 38px; padding: 16px; }
-h2 { margin-top: 52px; font-size: 1.5rem; }
-table { display: block; overflow-x: auto; }
-}
-@media print {
-body { display: block; max-width: none; padding: 0; font-size: 12pt; }
-#TOC { position: static; max-height: none; margin-bottom: 32px; box-shadow: none; }
-#TOC ul ul ul { display: block; }
-body > h1 + p, div.sourceCode, pre { box-shadow: none; }
-.design-diagram { break-inside: avoid; page-break-inside: avoid; box-shadow: none; }
-.diagram-scroll { overflow: visible; padding: 10px; }
-.design-diagram svg { width: 100%; min-width: 0; }
-h2, h3, h4 { break-after: avoid; }
-}
-</style>
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+    /* CSS for syntax highlighting */
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { display: inline-block; text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+    <style type="text/css">:root {
+  color-scheme: light;
+  --page: #fafcf9;
+  --surface: #ffffff;
+  --ink: #26362e;
+  --muted: #687970;
+  --line: #e1e9e3;
+  --accent: #3a7d62;
+  --accent-soft: #edf7f1;
+  --code: #f4f7f5;
+  --quote: #f7fbf8;
+  --blue-soft: #eaf3ff;
+  --amber-soft: #fff4d8;
+  --violet-soft: #f2edfb;
+  }
+  * { box-sizing: border-box; }
+  html {
+  background: var(--page);
+  color: var(--ink);
+  }
+  body {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 780px);
+  column-gap: 64px;
+  align-items: start;
+  max-width: 1168px;
+  margin: 0 auto;
+  padding: 52px 32px 96px;
+  color: var(--ink);
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont,
+  "Segoe UI", sans-serif;
+  font-size: 17px;
+  line-height: 1.68;
+  overflow-wrap: break-word;
+  text-rendering: optimizeLegibility;
+  }
+  body > * {
+  grid-column: 2;
+  min-width: 0;
+  }
+  header {
+  margin: 0 0 32px;
+  text-align: left;
+  }
+  header::before {
+  content: "Vireo product design";
+  display: block;
+  margin-bottom: 10px;
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  }
+  header .title {
+  max-width: 760px;
+  margin: 0;
+  font-size: clamp(2.25rem, 5vw, 3.6rem);
+  line-height: 1.04;
+  letter-spacing: -0.045em;
+  }
+  body > h1 { display: none; }
+  body > h1 + p {
+  margin: 0 0 52px;
+  padding: 20px 22px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+  color: var(--muted);
+  box-shadow: 0 10px 30px rgba(47, 82, 64, 0.04);
+  }
+  body > h1 + p strong { color: var(--ink); }
+  #TOC {
+  grid-column: 1;
+  position: fixed;
+  left: max(24px, calc(50vw - 552px));
+  top: 24px;
+  width: 260px;
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  padding: 18px 16px 20px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 12px 30px rgba(47, 82, 64, 0.05);
+  backdrop-filter: blur(14px);
+  font-size: 0.79rem;
+  line-height: 1.35;
+  scrollbar-width: thin;
+  }
+  #TOC::before {
+  content: "Contents";
+  display: block;
+  margin: 0 8px 10px;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 750;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  }
+  #TOC > ul > li > a { display: none; }
+  #TOC ul, #TOC > ul, #TOC > ul > li > ul { margin: 0; padding: 0; }
+  #TOC ul ul ul { display: none; }
+  #TOC li { margin: 1px 0; list-style: none; }
+  #TOC a {
+  display: block;
+  padding: 6px 8px;
+  border-radius: 7px;
+  color: var(--muted);
+  text-decoration: none;
+  }
+  #TOC a:hover, #TOC a:focus-visible {
+  background: var(--accent-soft);
+  color: var(--accent);
+  outline: none;
+  }
+  h2 {
+  margin: 68px 0 18px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+  font-size: 1.75rem;
+  line-height: 1.2;
+  letter-spacing: -0.025em;
+  }
+  h3 {
+  margin: 42px 0 12px;
+  color: #315043;
+  font-size: 1.22rem;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  }
+  h4 {
+  margin: 30px 0 10px;
+  color: var(--accent);
+  font-size: 1.02rem;
+  }
+  h2 + p, h3 + p, h4 + p { margin-top: 0; }
+  p { margin: 0.9em 0; }
+  a { color: var(--accent); text-underline-offset: 0.16em; }
+  a:visited { color: #435e51; }
+  strong { font-weight: 720; }
+  ol, ul { padding-left: 1.55em; }
+  li { margin: 0.38em 0; padding-left: 0.2em; }
+  blockquote {
+  margin: 22px 0;
+  padding: 14px 18px;
+  border: 1px solid #d7e8dd;
+  border-left: 5px solid var(--accent);
+  border-radius: 0 10px 10px 0;
+  background: var(--quote);
+  color: #496157;
+  }
+  blockquote p { margin: 0.2em 0; }
+  code {
+  padding: 0.1em 0.32em;
+  border-radius: 5px;
+  background: #eef4f0;
+  color: #264f3d;
+  font-family: Menlo, Monaco, Consolas, monospace;
+  font-size: 0.84em;
+  }
+  div.sourceCode, pre {
+  margin: 22px 0;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--code);
+  box-shadow: 0 8px 24px rgba(47, 82, 64, 0.05);
+  }
+  pre { padding: 18px 20px; }
+  div.sourceCode pre { margin: 0; padding: 18px 20px; border: 0; box-shadow: none; }
+  pre code, div.sourceCode code {
+  padding: 0;
+  background: transparent;
+  color: #294338;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  white-space: pre;
+  }
+  table {
+  display: table;
+  width: 100%;
+  margin: 24px 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-collapse: separate;
+  border-spacing: 0;
+  border-radius: 10px;
+  background: var(--surface);
+  font-size: 0.92rem;
+  font-variant-numeric: tabular-nums;
+  }
+  th {
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  padding: 11px 14px;
+  background: var(--accent-soft);
+  color: #264f3d;
+  text-align: left;
+  vertical-align: top;
+  }
+  td {
+  border: 0;
+  border-bottom: 1px solid #edf0ed;
+  padding: 11px 14px;
+  vertical-align: top;
+  }
+  tr:last-child td { border-bottom: 0; }
+  ::selection { background: #c9e8d7; }
+  .design-diagram {
+  margin: 30px 0 38px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  overflow: hidden;
+  background: var(--surface);
+  box-shadow: 0 14px 36px rgba(47, 82, 64, 0.06);
+  }
+  .diagram-scroll {
+  overflow-x: auto;
+  padding: 20px;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbf8 100%);
+  }
+  .design-diagram svg {
+  display: block;
+  width: 100%;
+  min-width: 720px;
+  height: auto;
+  }
+  .design-diagram figcaption {
+  padding: 14px 18px 16px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.5;
+  }
+  .design-diagram figcaption strong { color: var(--ink); }
+  .diagram-surface { fill: #ffffff; stroke: #dbe6df; stroke-width: 2; }
+  .diagram-panel { fill: #f4f8f5; stroke: #cfddd4; stroke-width: 2; }
+  .diagram-accent { fill: #e3f3e9; stroke: #70a98b; stroke-width: 2; }
+  .diagram-blue { fill: #eaf3ff; stroke: #82a9d3; stroke-width: 2; }
+  .diagram-amber { fill: #fff4d8; stroke: #d2a950; stroke-width: 2; }
+  .diagram-violet { fill: #f2edfb; stroke: #a58cc9; stroke-width: 2; }
+  .diagram-context { fill: #f3f5f4; stroke: #aebbb4; stroke-width: 2; stroke-dasharray: 6 5; }
+  .diagram-match { fill: #dff2e7; stroke: #4d9470; stroke-width: 3; }
+  .diagram-photo { fill: #ffffff; stroke: #9eb1a6; stroke-width: 2; }
+  .diagram-line { fill: none; stroke: #71857a; stroke-width: 2.5; }
+  .diagram-line-accent { fill: none; stroke: #3a7d62; stroke-width: 3; }
+  .diagram-divider { stroke: #d7e2db; stroke-width: 2; }
+  .diagram-text { fill: #2d4036; font: 600 15px Inter, ui-sans-serif, sans-serif; }
+  .diagram-small { fill: #5f7468; font: 500 13px Inter, ui-sans-serif, sans-serif; }
+  .diagram-label { fill: #3a7d62; font: 750 13px Inter, ui-sans-serif, sans-serif; letter-spacing: 0.04em; }
+  .diagram-title { fill: #26362e; font: 750 19px Inter, ui-sans-serif, sans-serif; }
+  .diagram-number { fill: #ffffff; font: 750 13px Inter, ui-sans-serif, sans-serif; text-anchor: middle; dominant-baseline: middle; }
+  .diagram-number-circle { fill: #3a7d62; }
+  @media (max-width: 980px) {
+  body {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  max-width: 820px;
+  padding: 32px 24px 80px;
+  }
+  header { order: -3; }
+  body > h1 { order: -2; }
+  body > h1 + p { order: -1; }
+  #TOC { position: static; width: auto; max-height: none; margin: 0 0 36px; }
+  }
+  @media (max-width: 600px) {
+  html, body { max-width: 100%; overflow-x: hidden; }
+  body { padding: 24px 16px 64px; font-size: 16px; }
+  header .title { font-size: clamp(2rem, 10vw, 2.3rem); overflow-wrap: anywhere; }
+  body > h1 + p { margin-bottom: 38px; padding: 16px; }
+  h2 { margin-top: 52px; font-size: 1.5rem; }
+  table { display: block; overflow-x: auto; }
+  }
+  @media print {
+  body { display: block; max-width: none; padding: 0; font-size: 12pt; }
+  #TOC { position: static; max-height: none; margin-bottom: 32px; box-shadow: none; }
+  #TOC ul ul ul { display: block; }
+  body > h1 + p, div.sourceCode, pre { box-shadow: none; }
+  .design-diagram { break-inside: avoid; page-break-inside: avoid; box-shadow: none; }
+  .diagram-scroll { overflow: visible; padding: 10px; }
+  .design-diagram svg { width: 100%; min-width: 0; }
+  h2, h3, h4 { break-after: avoid; }
+  }
+  </style>
 </head>
 <body>
 <header id="title-block-header">
@@ -379,14 +380,17 @@ design</h1>
 </header>
 <nav id="TOC" role="doc-toc">
 <ul>
-<li><a href="#process-review-page-complete-product-and-interaction-design" id="toc-process-review-page-complete-product-and-interaction-design">Process
+<li><a
+href="#process-review-page-complete-product-and-interaction-design"
+id="toc-process-review-page-complete-product-and-interaction-design">Process
 Review page: complete product and interaction design</a>
 <ul>
 <li><a href="#summary" id="toc-summary">Summary</a></li>
 <li><a href="#problem" id="toc-problem">Problem</a></li>
 <li><a href="#goals" id="toc-goals">Goals</a></li>
 <li><a href="#non-goals" id="toc-non-goals">Non-goals</a></li>
-<li><a href="#product-principles-and-terminology" id="toc-product-principles-and-terminology">Product principles and
+<li><a href="#product-principles-and-terminology"
+id="toc-product-principles-and-terminology">Product principles and
 terminology</a>
 <ul>
 <li><a href="#product-principles" id="toc-product-principles">Product
@@ -406,17 +410,20 @@ encounter</a></li>
 </ul></li>
 <li><a href="#page-structure" id="toc-page-structure">Page structure</a>
 <ul>
-<li><a href="#page-header-and-destinations" id="toc-page-header-and-destinations">Page header and
+<li><a href="#page-header-and-destinations"
+id="toc-page-header-and-destinations">Page header and
 destinations</a></li>
 <li><a href="#coverage-summary" id="toc-coverage-summary">Coverage
 summary</a></li>
 <li><a href="#summary-strip" id="toc-summary-strip">Summary
 strip</a></li>
-<li><a href="#pending-sidecar-synchronization" id="toc-pending-sidecar-synchronization">Pending sidecar
+<li><a href="#pending-sidecar-synchronization"
+id="toc-pending-sidecar-synchronization">Pending sidecar
 synchronization</a></li>
 <li><a href="#review-toolbar" id="toc-review-toolbar">Review
 toolbar</a></li>
-<li><a href="#advanced-controls-sidebar" id="toc-advanced-controls-sidebar">Advanced controls sidebar</a></li>
+<li><a href="#advanced-controls-sidebar"
+id="toc-advanced-controls-sidebar">Advanced controls sidebar</a></li>
 <li><a href="#encounter-card" id="toc-encounter-card">Encounter
 card</a></li>
 <li><a href="#burst-row" id="toc-burst-row">Burst row</a></li>
@@ -430,83 +437,111 @@ matching</a>
 <li><a href="#example" id="toc-example">Example</a></li>
 <li><a href="#combining-filters" id="toc-combining-filters">Combining
 filters</a></li>
-<li><a href="#explaining-the-view" id="toc-explaining-the-view">Explaining the view</a></li>
+<li><a href="#explaining-the-view"
+id="toc-explaining-the-view">Explaining the view</a></li>
 </ul></li>
-<li><a href="#species-evidence-and-disagreement" id="toc-species-evidence-and-disagreement">Species evidence and
+<li><a href="#species-evidence-and-disagreement"
+id="toc-species-evidence-and-disagreement">Species evidence and
 disagreement</a>
 <ul>
 <li><a href="#evidence-hierarchy" id="toc-evidence-hierarchy">Evidence
 hierarchy</a></li>
-<li><a href="#prediction-source-identity" id="toc-prediction-source-identity">Prediction source identity</a></li>
-<li><a href="#taxon-normalization-and-compatible-predictions" id="toc-taxon-normalization-and-compatible-predictions">Taxon
+<li><a href="#prediction-source-identity"
+id="toc-prediction-source-identity">Prediction source identity</a></li>
+<li><a href="#taxon-normalization-and-compatible-predictions"
+id="toc-taxon-normalization-and-compatible-predictions">Taxon
 normalization and compatible predictions</a></li>
-<li><a href="#label-list-coverage" id="toc-label-list-coverage">Label-list coverage</a></li>
-<li><a href="#exclusive-alternatives-and-multi-label-presence" id="toc-exclusive-alternatives-and-multi-label-presence">Exclusive
+<li><a href="#label-list-coverage"
+id="toc-label-list-coverage">Label-list coverage</a></li>
+<li><a href="#exclusive-alternatives-and-multi-label-presence"
+id="toc-exclusive-alternatives-and-multi-label-presence">Exclusive
 alternatives and multi-label presence</a></li>
-<li><a href="#combining-label-lists-from-the-same-model" id="toc-combining-label-lists-from-the-same-model">Combining label lists
+<li><a href="#combining-label-lists-from-the-same-model"
+id="toc-combining-label-lists-from-the-same-model">Combining label lists
 from the same model</a></li>
-<li><a href="#combining-different-models-for-one-subject" id="toc-combining-different-models-for-one-subject">Combining different
+<li><a href="#combining-different-models-for-one-subject"
+id="toc-combining-different-models-for-one-subject">Combining different
 models for one subject</a></li>
-<li><a href="#multiple-subjects-and-multiple-species-in-one-photo" id="toc-multiple-subjects-and-multiple-species-in-one-photo">Multiple
+<li><a href="#multiple-subjects-and-multiple-species-in-one-photo"
+id="toc-multiple-subjects-and-multiple-species-in-one-photo">Multiple
 subjects and multiple species in one photo</a></li>
-<li><a href="#species-variation-across-a-burst-or-encounter" id="toc-species-variation-across-a-burst-or-encounter">Species variation
+<li><a href="#species-variation-across-a-burst-or-encounter"
+id="toc-species-variation-across-a-burst-or-encounter">Species variation
 across a burst or encounter</a></li>
-<li><a href="#species-confirmation-model" id="toc-species-confirmation-model">Species confirmation model</a></li>
+<li><a href="#species-confirmation-model"
+id="toc-species-confirmation-model">Species confirmation model</a></li>
 <li><a href="#completion-state" id="toc-completion-state">Completion
 state</a></li>
-<li><a href="#species-evidence-interface" id="toc-species-evidence-interface">Species evidence interface</a></li>
+<li><a href="#species-evidence-interface"
+id="toc-species-evidence-interface">Species evidence interface</a></li>
 </ul></li>
 <li><a href="#editing-behavior" id="toc-editing-behavior">Editing
 behavior</a>
 <ul>
 <li><a href="#action-targets" id="toc-action-targets">Action
 targets</a></li>
-<li><a href="#automated-recommendations-and-manual-triage" id="toc-automated-recommendations-and-manual-triage">Automated
+<li><a href="#automated-recommendations-and-manual-triage"
+id="toc-automated-recommendations-and-manual-triage">Automated
 recommendations and manual triage</a></li>
-<li><a href="#species-confirmation" id="toc-species-confirmation">Species confirmation</a></li>
-<li><a href="#flags-and-quality-decisions" id="toc-flags-and-quality-decisions">Flags and quality
+<li><a href="#species-confirmation"
+id="toc-species-confirmation">Species confirmation</a></li>
+<li><a href="#flags-and-quality-decisions"
+id="toc-flags-and-quality-decisions">Flags and quality
 decisions</a></li>
 <li><a href="#structural-editing" id="toc-structural-editing">Structural
 editing</a></li>
 <li><a href="#group-review" id="toc-group-review">Group Review</a></li>
-<li><a href="#species-evidence-panel" id="toc-species-evidence-panel">Species evidence panel</a></li>
-<li><a href="#photo-detail-fallback" id="toc-photo-detail-fallback">Photo detail fallback</a></li>
+<li><a href="#species-evidence-panel"
+id="toc-species-evidence-panel">Species evidence panel</a></li>
+<li><a href="#photo-detail-fallback"
+id="toc-photo-detail-fallback">Photo detail fallback</a></li>
 <li><a href="#undo-and-redo" id="toc-undo-and-redo">Undo and
 redo</a></li>
-<li><a href="#pending-concurrency-and-failure-behavior" id="toc-pending-concurrency-and-failure-behavior">Pending, concurrency,
+<li><a href="#pending-concurrency-and-failure-behavior"
+id="toc-pending-concurrency-and-failure-behavior">Pending, concurrency,
 and failure behavior</a></li>
-<li><a href="#view-movement-after-an-edit" id="toc-view-movement-after-an-edit">View movement after an
+<li><a href="#view-movement-after-an-edit"
+id="toc-view-movement-after-an-edit">View movement after an
 edit</a></li>
 </ul></li>
-<li><a href="#grouping-and-scoring-controls" id="toc-grouping-and-scoring-controls">Grouping and scoring
+<li><a href="#grouping-and-scoring-controls"
+id="toc-grouping-and-scoring-controls">Grouping and scoring
 controls</a></li>
-<li><a href="#navigation-focus-and-shortcuts" id="toc-navigation-focus-and-shortcuts">Navigation, focus, and
+<li><a href="#navigation-focus-and-shortcuts"
+id="toc-navigation-focus-and-shortcuts">Navigation, focus, and
 shortcuts</a></li>
 <li><a href="#primary-workflows" id="toc-primary-workflows">Primary
 workflows</a>
 <ul>
-<li><a href="#enter-or-resume-review" id="toc-enter-or-resume-review">Enter or resume review</a></li>
-<li><a href="#narrow-a-large-review-while-preserving-encounters" id="toc-narrow-a-large-review-while-preserving-encounters">Narrow a
+<li><a href="#enter-or-resume-review"
+id="toc-enter-or-resume-review">Enter or resume review</a></li>
+<li><a href="#narrow-a-large-review-while-preserving-encounters"
+id="toc-narrow-a-large-review-while-preserving-encounters">Narrow a
 large review while preserving encounters</a></li>
 <li><a href="#triage-a-burst" id="toc-triage-a-burst">Triage a
 burst</a></li>
-<li><a href="#resolve-a-species-disagreement" id="toc-resolve-a-species-disagreement">Resolve a species
+<li><a href="#resolve-a-species-disagreement"
+id="toc-resolve-a-species-disagreement">Resolve a species
 disagreement</a></li>
-<li><a href="#confirm-several-species-in-one-image" id="toc-confirm-several-species-in-one-image">Confirm several species in
+<li><a href="#confirm-several-species-in-one-image"
+id="toc-confirm-several-species-in-one-image">Confirm several species in
 one image</a></li>
 <li><a href="#correct-grouping" id="toc-correct-grouping">Correct
 grouping</a></li>
 <li><a href="#finish-or-leave" id="toc-finish-or-leave">Finish or
 leave</a></li>
 </ul></li>
-<li><a href="#downstream-effects-and-page-boundaries" id="toc-downstream-effects-and-page-boundaries">Downstream effects and
+<li><a href="#downstream-effects-and-page-boundaries"
+id="toc-downstream-effects-and-page-boundaries">Downstream effects and
 page boundaries</a></li>
 <li><a href="#data-and-api-design" id="toc-data-and-api-design">Data and
 API design</a>
 <ul>
-<li><a href="#stable-identities-and-revisions" id="toc-stable-identities-and-revisions">Stable identities and
+<li><a href="#stable-identities-and-revisions"
+id="toc-stable-identities-and-revisions">Stable identities and
 revisions</a></li>
-<li><a href="#species-evidence-contract" id="toc-species-evidence-contract">Species evidence contract</a></li>
+<li><a href="#species-evidence-contract"
+id="toc-species-evidence-contract">Species evidence contract</a></li>
 <li><a href="#view-query" id="toc-view-query">View query</a></li>
 <li><a href="#pagination" id="toc-pagination">Pagination</a></li>
 <li><a href="#mutation-response" id="toc-mutation-response">Mutation
@@ -514,25 +549,36 @@ response</a></li>
 <li><a href="#persistence-model" id="toc-persistence-model">Persistence
 model</a></li>
 </ul></li>
-<li><a href="#loading-empty-and-error-states" id="toc-loading-empty-and-error-states">Loading, empty, and error
+<li><a href="#loading-empty-and-error-states"
+id="toc-loading-empty-and-error-states">Loading, empty, and error
 states</a></li>
-<li><a href="#performance-requirements" id="toc-performance-requirements">Performance requirements</a></li>
-<li><a href="#accessibility-and-input-behavior" id="toc-accessibility-and-input-behavior">Accessibility and input
+<li><a href="#performance-requirements"
+id="toc-performance-requirements">Performance requirements</a></li>
+<li><a href="#accessibility-and-input-behavior"
+id="toc-accessibility-and-input-behavior">Accessibility and input
 behavior</a></li>
-<li><a href="#migration-and-delivery" id="toc-migration-and-delivery">Migration and delivery</a></li>
-<li><a href="#alternatives-considered" id="toc-alternatives-considered">Alternatives considered</a>
+<li><a href="#migration-and-delivery"
+id="toc-migration-and-delivery">Migration and delivery</a></li>
+<li><a href="#alternatives-considered"
+id="toc-alternatives-considered">Alternatives considered</a>
 <ul>
-<li><a href="#remove-the-read-only-guard" id="toc-remove-the-read-only-guard">Remove the read-only guard</a></li>
-<li><a href="#filter-the-existing-full-result-only-in-the-browser" id="toc-filter-the-existing-full-result-only-in-the-browser">Filter the
+<li><a href="#remove-the-read-only-guard"
+id="toc-remove-the-read-only-guard">Remove the read-only guard</a></li>
+<li><a href="#filter-the-existing-full-result-only-in-the-browser"
+id="toc-filter-the-existing-full-result-only-in-the-browser">Filter the
 existing full result only in the browser</a></li>
-<li><a href="#continue-regrouping-each-collection" id="toc-continue-regrouping-each-collection">Continue regrouping each
+<li><a href="#continue-regrouping-each-collection"
+id="toc-continue-regrouping-each-collection">Continue regrouping each
 collection</a></li>
-<li><a href="#offer-a-matching-photos-only-mode" id="toc-offer-a-matching-photos-only-mode">Offer a “matching photos
+<li><a href="#offer-a-matching-photos-only-mode"
+id="toc-offer-a-matching-photos-only-mode">Offer a “matching photos
 only” mode</a></li>
-<li><a href="#label-the-control-keep-encounters-intact" id="toc-label-the-control-keep-encounters-intact">Label the control
+<li><a href="#label-the-control-keep-encounters-intact"
+id="toc-label-the-control-keep-encounters-intact">Label the control
 “Keep encounters intact”</a></li>
 </ul></li>
-<li><a href="#acceptance-criteria" id="toc-acceptance-criteria">Acceptance criteria</a></li>
+<li><a href="#acceptance-criteria"
+id="toc-acceptance-criteria">Acceptance criteria</a></li>
 <li><a href="#testing" id="toc-testing">Testing</a>
 <ul>
 <li><a href="#backend" id="toc-backend">Backend</a></li>
@@ -540,22 +586,23 @@ only” mode</a></li>
 integration</a></li>
 <li><a href="#performance" id="toc-performance">Performance</a></li>
 </ul></li>
-<li><a href="#open-implementation-decisions" id="toc-open-implementation-decisions">Open implementation
+<li><a href="#open-implementation-decisions"
+id="toc-open-implementation-decisions">Open implementation
 decisions</a></li>
 </ul></li>
 </ul>
 </nav>
-<h1 id="process-review-page-complete-product-and-interaction-design">Process
+<h1
+id="process-review-page-complete-product-and-interaction-design">Process
 Review page: complete product and interaction design</h1>
-<p><strong>Date:</strong> 2026-08-16<br />
-<strong>Status:</strong> Draft for product and maintainer review<br />
-<strong>Scope:</strong> Define the complete Process Review page,
-including its layout, views, encounter and burst structure, triage,
-species evidence, multi-model and multi-species decisions, comparison
-tools, structural editing, persistence, performance, accessibility, and
-failure behavior. Large review sets can be narrowed without creating
-alternate groupings or disabling edits; complete encounters remain
-intact in every view.</p>
+<p><strong>Date:</strong> 2026-08-16<br> <strong>Status:</strong> Draft
+for product and maintainer review<br> <strong>Scope:</strong> Define the
+complete Process Review page, including its layout, views, encounter and
+burst structure, triage, species evidence, multi-model and multi-species
+decisions, comparison tools, structural editing, persistence,
+performance, accessibility, and failure behavior. Large review sets can
+be narrowed without creating alternate groupings or disabling edits;
+complete encounters remain intact in every view.</p>
 <h2 id="summary">Summary</h2>
 <p>Process Review has one canonical set of results: the output of the
 latest Process run. Collections, triage filters, species-review filters,
@@ -698,7 +745,13 @@ encounters from the canonical Process result.</li>
 <p>The interface uses one verb for one effect. Labels may include the
 affected counts, but must not substitute “split” and “detach” for one
 another.</p>
-<table>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 21%" />
+<col style="width: 21%" />
+<col style="width: 28%" />
+<col style="width: 28%" />
+</colgroup>
 <thead>
 <tr>
 <th>Command</th>
@@ -755,79 +808,101 @@ chronological order</td>
 <figure class="design-diagram" aria-labelledby="structural-ops-caption">
 <div class="diagram-scroll">
 <svg viewBox="0 0 960 700" role="img" aria-labelledby="structural-ops-title structural-ops-desc">
-  <title id="structural-ops-title">Structural editing operations</title>
-  <desc id="structural-ops-desc">Before and after examples distinguish operations that change burst boundaries within one encounter from operations that create or combine encounters.</desc>
-  <text class="diagram-title" x="28" y="34">Change bursts inside one encounter</text>
-  <rect class="diagram-accent" x="22" y="50" width="448" height="420" rx="16" />
-  <text class="diagram-label" x="44" y="82">SPLIT BURST HERE</text>
-  <rect class="diagram-surface" x="42" y="96" width="174" height="78" rx="10" />
-  <rect class="diagram-blue" x="54" y="112" width="150" height="46" rx="8" />
-  <text class="diagram-small" x="72" y="140">A · B · C · D</text>
-  <path class="diagram-line-accent" d="M226 135 L270 135" /><path d="M262 127 L272 135 L262 143" fill="none" stroke="#3a7d62" stroke-width="3" />
-  <rect class="diagram-surface" x="282" y="96" width="166" height="78" rx="10" />
-  <rect class="diagram-blue" x="294" y="112" width="66" height="46" rx="8" />
-  <rect class="diagram-blue" x="370" y="112" width="66" height="46" rx="8" />
-  <text class="diagram-small" x="307" y="140">A · B</text><text class="diagram-small" x="383" y="140">C · D</text>
-  <text class="diagram-small" x="44" y="194">One burst becomes two. The encounter is unchanged.</text>
-
-  <line class="diagram-divider" x1="42" y1="218" x2="448" y2="218"></line>
-  <text class="diagram-label" x="44" y="250">EXTRACT PHOTOS TO NEW BURST</text>
-  <rect class="diagram-surface" x="42" y="264" width="174" height="104" rx="10" />
-  <rect class="diagram-blue" x="54" y="280" width="150" height="54" rx="8" />
-  <rect class="diagram-amber" x="98" y="286" width="62" height="42" rx="7" />
-  <text class="diagram-small" x="66" y="352">select C + D</text>
-  <path class="diagram-line-accent" d="M226 316 L270 316" /><path d="M262 308 L272 316 L262 324" fill="none" stroke="#3a7d62" stroke-width="3" />
-  <rect class="diagram-surface" x="282" y="264" width="166" height="104" rx="10" />
-  <rect class="diagram-blue" x="294" y="280" width="42" height="48" rx="7" />
-  <rect class="diagram-amber" x="346" y="280" width="42" height="48" rx="7" />
-  <rect class="diagram-blue" x="398" y="280" width="38" height="48" rx="7" />
-  <text class="diagram-small" x="299" y="350">AB</text><text class="diagram-small" x="351" y="350">CD</text><text class="diagram-small" x="402" y="350">EF</text>
-  <text class="diagram-small" x="44" y="392">Selected and unselected chronological runs become bursts.</text>
-  <rect class="diagram-panel" x="44" y="414" width="402" height="36" rx="8" />
-  <text class="diagram-small" x="62" y="438">Merge adjacent bursts is the explicit inverse boundary operation.</text>
-  <text class="diagram-title" x="506" y="34">Change encounter boundaries</text>
-  <rect class="diagram-blue" x="490" y="50" width="448" height="420" rx="16" />
-  <text class="diagram-label" x="512" y="82">SPLIT ENCOUNTER HERE</text>
-  <rect class="diagram-surface" x="510" y="96" width="174" height="78" rx="10" />
-  <rect class="diagram-accent" x="522" y="112" width="150" height="46" rx="8" />
-  <text class="diagram-small" x="538" y="140">B1 · B2 · B3</text>
-  <path class="diagram-line-accent" d="M694 135 L738 135" /><path d="M730 127 L740 135 L730 143" fill="none" stroke="#3a7d62" stroke-width="3" />
-  <rect class="diagram-surface" x="750" y="96" width="166" height="78" rx="10" />
-  <rect class="diagram-accent" x="762" y="112" width="54" height="46" rx="8" />
-  <rect class="diagram-accent" x="826" y="112" width="78" height="46" rx="8" />
-  <text class="diagram-small" x="778" y="140">B1</text><text class="diagram-small" x="842" y="140">B2 · B3</text>
-  <text class="diagram-small" x="512" y="194">A boundary cut creates two encounters.</text>
-
-  <line class="diagram-divider" x1="510" y1="218" x2="916" y2="218"></line>
-  <text class="diagram-label" x="512" y="250">SEPARATE BURST AS ENCOUNTER</text>
-  <rect class="diagram-surface" x="510" y="264" width="174" height="104" rx="10" />
-  <rect class="diagram-accent" x="522" y="280" width="150" height="54" rx="8" />
-  <rect class="diagram-amber" x="572" y="286" width="46" height="42" rx="7" />
-  <text class="diagram-small" x="538" y="352">choose middle B2</text>
-  <path class="diagram-line-accent" d="M694 316 L738 316" /><path d="M730 308 L740 316 L730 324" fill="none" stroke="#3a7d62" stroke-width="3" />
-  <rect class="diagram-surface" x="750" y="264" width="166" height="104" rx="10" />
-  <rect class="diagram-accent" x="762" y="280" width="86" height="48" rx="8" />
-  <rect class="diagram-amber" x="858" y="280" width="46" height="48" rx="8" />
-  <text class="diagram-small" x="778" y="350">B1 · B3</text><text class="diagram-small" x="870" y="350">B2</text>
-  <text class="diagram-small" x="512" y="392">One complete burst becomes its own encounter; it is not split.</text>
-  <rect class="diagram-panel" x="512" y="414" width="402" height="36" rx="8" />
-  <text class="diagram-small" x="530" y="438">Merge encounters combines selected encounters without merging bursts.</text>
-
-  <rect class="diagram-surface" x="22" y="494" width="916" height="178" rx="16" />
-  <text class="diagram-label" x="48" y="526">INVARIANT ACROSS EVERY STRUCTURAL COMMAND</text>
-  <circle class="diagram-number-circle" cx="62" cy="558" r="13"></circle><text class="diagram-number" x="62" y="558">1</text>
-  <text class="diagram-text" x="86" y="563">No photos or evidence are discarded</text>
-  <circle class="diagram-number-circle" cx="62" cy="600" r="13"></circle><text class="diagram-number" x="62" y="600">2</text>
-  <text class="diagram-text" x="86" y="605">Species and triage stay with subjects/photos</text>
-  <circle class="diagram-number-circle" cx="510" cy="558" r="13"></circle><text class="diagram-number" x="510" y="558">3</text>
-  <text class="diagram-text" x="534" y="563">Derived summaries are recomputed</text>
-  <circle class="diagram-number-circle" cx="510" cy="600" r="13"></circle><text class="diagram-number" x="510" y="600">4</text>
-  <text class="diagram-text" x="534" y="605">Preview first, then apply with undo</text>
+<title id="structural-ops-title">
+Structural editing operations
+</title>
+<p><desc id="structural-ops-desc">Before and after examples distinguish
+operations that change burst boundaries within one encounter from
+operations that create or combine encounters.</desc>
+<text class="diagram-title" x="28" y="34">Change bursts inside one
+encounter</text>
+<rect class="diagram-accent" x="22" y="50" width="448" height="420" rx="16"/>
+<text class="diagram-label" x="44" y="82">SPLIT BURST HERE</text>
+<rect class="diagram-surface" x="42" y="96" width="174" height="78" rx="10"/>
+<rect class="diagram-blue" x="54" y="112" width="150" height="46" rx="8"/>
+<text class="diagram-small" x="72" y="140">A · B · C · D</text>
+<path class="diagram-line-accent" d="M226 135 L270 135"/><path d="M262 127 L272 135 L262 143" fill="none" stroke="#3a7d62" stroke-width="3"/>
+<rect class="diagram-surface" x="282" y="96" width="166" height="78" rx="10"/>
+<rect class="diagram-blue" x="294" y="112" width="66" height="46" rx="8"/>
+<rect class="diagram-blue" x="370" y="112" width="66" height="46" rx="8"/>
+<text class="diagram-small" x="307" y="140">A ·
+B</text><text class="diagram-small" x="383" y="140">C · D</text>
+<text class="diagram-small" x="44" y="194">One burst becomes two. The
+encounter is unchanged.</text></p>
+<p><line class="diagram-divider" x1="42" y1="218" x2="448" y2="218"/>
+<text class="diagram-label" x="44" y="250">EXTRACT PHOTOS TO NEW
+BURST</text>
+<rect class="diagram-surface" x="42" y="264" width="174" height="104" rx="10"/>
+<rect class="diagram-blue" x="54" y="280" width="150" height="54" rx="8"/>
+<rect class="diagram-amber" x="98" y="286" width="62" height="42" rx="7"/>
+<text class="diagram-small" x="66" y="352">select C + D</text>
+<path class="diagram-line-accent" d="M226 316 L270 316"/><path d="M262 308 L272 316 L262 324" fill="none" stroke="#3a7d62" stroke-width="3"/>
+<rect class="diagram-surface" x="282" y="264" width="166" height="104" rx="10"/>
+<rect class="diagram-blue" x="294" y="280" width="42" height="48" rx="7"/>
+<rect class="diagram-amber" x="346" y="280" width="42" height="48" rx="7"/>
+<rect class="diagram-blue" x="398" y="280" width="38" height="48" rx="7"/>
+<text class="diagram-small" x="299" y="350">AB</text><text class="diagram-small" x="351" y="350">CD</text><text class="diagram-small" x="402" y="350">EF</text>
+<text class="diagram-small" x="44" y="392">Selected and unselected
+chronological runs become bursts.</text>
+<rect class="diagram-panel" x="44" y="414" width="402" height="36" rx="8"/>
+<text class="diagram-small" x="62" y="438">Merge adjacent bursts is the
+explicit inverse boundary operation.</text>
+<text class="diagram-title" x="506" y="34">Change encounter
+boundaries</text>
+<rect class="diagram-blue" x="490" y="50" width="448" height="420" rx="16"/>
+<text class="diagram-label" x="512" y="82">SPLIT ENCOUNTER HERE</text>
+<rect class="diagram-surface" x="510" y="96" width="174" height="78" rx="10"/>
+<rect class="diagram-accent" x="522" y="112" width="150" height="46" rx="8"/>
+<text class="diagram-small" x="538" y="140">B1 · B2 · B3</text>
+<path class="diagram-line-accent" d="M694 135 L738 135"/><path d="M730 127 L740 135 L730 143" fill="none" stroke="#3a7d62" stroke-width="3"/>
+<rect class="diagram-surface" x="750" y="96" width="166" height="78" rx="10"/>
+<rect class="diagram-accent" x="762" y="112" width="54" height="46" rx="8"/>
+<rect class="diagram-accent" x="826" y="112" width="78" height="46" rx="8"/>
+<text class="diagram-small" x="778" y="140">B1</text><text class="diagram-small" x="842" y="140">B2
+· B3</text> <text class="diagram-small" x="512" y="194">A boundary cut
+creates two encounters.</text></p>
+<p><line class="diagram-divider" x1="510" y1="218" x2="916" y2="218"/>
+<text class="diagram-label" x="512" y="250">SEPARATE BURST AS
+ENCOUNTER</text>
+<rect class="diagram-surface" x="510" y="264" width="174" height="104" rx="10"/>
+<rect class="diagram-accent" x="522" y="280" width="150" height="54" rx="8"/>
+<rect class="diagram-amber" x="572" y="286" width="46" height="42" rx="7"/>
+<text class="diagram-small" x="538" y="352">choose middle B2</text>
+<path class="diagram-line-accent" d="M694 316 L738 316"/><path d="M730 308 L740 316 L730 324" fill="none" stroke="#3a7d62" stroke-width="3"/>
+<rect class="diagram-surface" x="750" y="264" width="166" height="104" rx="10"/>
+<rect class="diagram-accent" x="762" y="280" width="86" height="48" rx="8"/>
+<rect class="diagram-amber" x="858" y="280" width="46" height="48" rx="8"/>
+<text class="diagram-small" x="778" y="350">B1 ·
+B3</text><text class="diagram-small" x="870" y="350">B2</text>
+<text class="diagram-small" x="512" y="392">One complete burst becomes
+its own encounter; it is not split.</text>
+<rect class="diagram-panel" x="512" y="414" width="402" height="36" rx="8"/>
+<text class="diagram-small" x="530" y="438">Merge encounters combines
+selected encounters without merging bursts.</text></p>
+<rect class="diagram-surface" x="22" y="494" width="916" height="178" rx="16"/>
+<text class="diagram-label" x="48" y="526">INVARIANT ACROSS EVERY
+STRUCTURAL COMMAND</text>
+<circle class="diagram-number-circle" cx="62" cy="558" r="13"/><text class="diagram-number" x="62" y="558">1</text>
+<text class="diagram-text" x="86" y="563">No photos or evidence are
+discarded</text>
+<circle class="diagram-number-circle" cx="62" cy="600" r="13"/><text class="diagram-number" x="62" y="600">2</text>
+<text class="diagram-text" x="86" y="605">Species and triage stay with
+subjects/photos</text>
+<circle class="diagram-number-circle" cx="510" cy="558" r="13"/><text class="diagram-number" x="510" y="558">3</text>
+<text class="diagram-text" x="534" y="563">Derived summaries are
+recomputed</text>
+<circle class="diagram-number-circle" cx="510" cy="600" r="13"/><text class="diagram-number" x="510" y="600">4</text>
+<text class="diagram-text" x="534" y="605">Preview first, then apply
+with undo</text>
 </svg>
 </div>
-<figcaption id="structural-ops-caption"><strong>Structural operations.</strong> Split and Extract change burst structure inside an encounter. Split encounter and Separate burst change encounter membership. Merge is always explicit and preserves the lower-level objects unless the user is specifically merging them.</figcaption>
+<figcaption id="structural-ops-caption">
+<strong>Structural operations.</strong> Split and Extract change burst
+structure inside an encounter. Split encounter and Separate burst change
+encounter membership. Merge is always explicit and preserves the
+lower-level objects unless the user is specifically merging them.
+</figcaption>
 </figure>
-
 <p>“Detach photo” is replaced in visible copy by <strong>Extract to new
 burst</strong>. “Detach burst” is replaced by <strong>Separate as
 encounter</strong>. The command and event names in the implementation
@@ -840,8 +915,10 @@ state, and supports undo.</p>
 <h2 id="core-concepts">Core concepts</h2>
 <h3 id="process-result">Process result</h3>
 <p>The latest completed Process run creates a canonical result with a
-stable <code>review_run_id</code> and monotonically increasing
-<code>revision</code>. It defines:</p>
+stable <code>review_run_id</code> and two monotonically increasing
+counters: <code>revision</code>, which advances on any review mutation,
+and <code>structural_revision</code>, which advances only when encounter
+or burst membership changes. It defines:</p>
 <ul>
 <li>the photos included in that run;</li>
 <li>encounter and burst boundaries;</li>
@@ -914,63 +991,70 @@ wide evidence matrices may scroll within their own panel.</p>
 <figure class="design-diagram" aria-labelledby="page-anatomy-caption">
 <div class="diagram-scroll">
 <svg viewBox="0 0 960 570" role="img" aria-labelledby="page-anatomy-title page-anatomy-desc">
-  <title id="page-anatomy-title">Process Review page anatomy</title>
-  <desc id="page-anatomy-desc">A desktop layout with advanced controls on the left and, on the right, the page header, summary, review toolbar, complete encounter cards, burst rows, and photo cards.</desc>
-  <rect class="diagram-panel" x="20" y="22" width="218" height="522" rx="16" />
-  <text class="diagram-label" x="44" y="55">ADVANCED CONTROLS</text>
-  <rect class="diagram-surface" x="42" y="76" width="174" height="78" rx="10" />
-  <text class="diagram-text" x="58" y="104">View explanation</text>
-  <text class="diagram-small" x="58" y="128">Matches + context</text>
-  <rect class="diagram-surface" x="42" y="170" width="174" height="88" rx="10" />
-  <text class="diagram-text" x="58" y="199">Scoring suggestions</text>
-  <text class="diagram-small" x="58" y="223">Preview before apply</text>
-  <rect class="diagram-surface" x="42" y="274" width="174" height="106" rx="10" />
-  <text class="diagram-text" x="58" y="303">Grouping settings</text>
-  <text class="diagram-small" x="58" y="327">Preview regrouping</text>
-  <text class="diagram-small" x="58" y="350">Complete result only</text>
-  <rect class="diagram-surface" x="42" y="396" width="174" height="122" rx="10" />
-  <text class="diagram-text" x="58" y="425">Focused trace</text>
-  <path class="diagram-line-accent" d="M62 484 L94 454 L126 470 L158 438 L194 458" />
-
-  <rect class="diagram-blue" x="266" y="22" width="674" height="76" rx="16" />
-  <circle class="diagram-number-circle" cx="292" cy="48" r="13"></circle><text class="diagram-number" x="292" y="48">1</text>
-  <text class="diagram-title" x="318" y="53">Process Review</text>
-  <text class="diagram-small" x="318" y="77">Coverage · run health · destinations · run details</text>
-
-  <rect class="diagram-surface" x="266" y="114" width="674" height="68" rx="12" />
-  <circle class="diagram-number-circle" cx="292" cy="138" r="13"></circle><text class="diagram-number" x="292" y="138">2</text>
-  <text class="diagram-text" x="318" y="143">Process totals</text>
-  <text class="diagram-small" x="318" y="166">Triage · species review · current view · pending sidecars</text>
-
-  <rect class="diagram-accent" x="266" y="198" width="674" height="82" rx="12" />
-  <circle class="diagram-number-circle" cx="292" cy="223" r="13"></circle><text class="diagram-number" x="292" y="223">3</text>
-  <text class="diagram-text" x="318" y="228">Editable review toolbar</text>
-  <text class="diagram-small" x="318" y="253">Triage · species · collection · Any/Every · search · sort · display</text>
-
-  <rect class="diagram-surface" x="266" y="296" width="674" height="226" rx="16" />
-  <circle class="diagram-number-circle" cx="292" cy="322" r="13"></circle><text class="diagram-number" x="292" y="322">4</text>
-  <text class="diagram-title" x="318" y="328">Complete encounter</text>
-  <text class="diagram-small" x="760" y="328">8 photos · 2 bursts · 3 match</text>
-  <line class="diagram-divider" x1="286" y1="348" x2="920" y2="348"></line>
-  <text class="diagram-label" x="292" y="374">BURST 1</text>
-  <rect class="diagram-match" x="292" y="391" width="92" height="68" rx="9" />
-  <rect class="diagram-context" x="396" y="391" width="92" height="68" rx="9" />
-  <rect class="diagram-match" x="500" y="391" width="92" height="68" rx="9" />
-  <text class="diagram-small" x="314" y="482">Match</text>
-  <text class="diagram-small" x="413" y="482">Context</text>
-  <text class="diagram-small" x="522" y="482">Match</text>
-  <rect class="diagram-panel" x="620" y="370" width="286" height="126" rx="12" />
-  <text class="diagram-label" x="642" y="397">BURST 2</text>
-  <rect class="diagram-photo" x="642" y="414" width="70" height="52" rx="8" />
-  <rect class="diagram-photo" x="724" y="414" width="70" height="52" rx="8" />
-  <rect class="diagram-photo" x="806" y="414" width="70" height="52" rx="8" />
-
-  <rect class="diagram-panel" x="266" y="536" width="674" height="18" rx="9" />
+<title id="page-anatomy-title">
+Process Review page anatomy
+</title>
+<p><desc id="page-anatomy-desc">A desktop layout with advanced controls
+on the left and, on the right, the page header, summary, review toolbar,
+complete encounter cards, burst rows, and photo cards.</desc>
+<rect class="diagram-panel" x="20" y="22" width="218" height="522" rx="16"/>
+<text class="diagram-label" x="44" y="55">ADVANCED CONTROLS</text>
+<rect class="diagram-surface" x="42" y="76" width="174" height="78" rx="10"/>
+<text class="diagram-text" x="58" y="104">View explanation</text>
+<text class="diagram-small" x="58" y="128">Matches + context</text>
+<rect class="diagram-surface" x="42" y="170" width="174" height="88" rx="10"/>
+<text class="diagram-text" x="58" y="199">Scoring suggestions</text>
+<text class="diagram-small" x="58" y="223">Preview before apply</text>
+<rect class="diagram-surface" x="42" y="274" width="174" height="106" rx="10"/>
+<text class="diagram-text" x="58" y="303">Grouping settings</text>
+<text class="diagram-small" x="58" y="327">Preview regrouping</text>
+<text class="diagram-small" x="58" y="350">Complete result only</text>
+<rect class="diagram-surface" x="42" y="396" width="174" height="122" rx="10"/>
+<text class="diagram-text" x="58" y="425">Focused trace</text>
+<path class="diagram-line-accent" d="M62 484 L94 454 L126 470 L158 438 L194 458"/></p>
+<p><rect class="diagram-blue" x="266" y="22" width="674" height="76" rx="16"/>
+<circle class="diagram-number-circle" cx="292" cy="48" r="13"/><text class="diagram-number" x="292" y="48">1</text>
+<text class="diagram-title" x="318" y="53">Process Review</text>
+<text class="diagram-small" x="318" y="77">Coverage · run health ·
+destinations · run details</text></p>
+<p><rect class="diagram-surface" x="266" y="114" width="674" height="68" rx="12"/>
+<circle class="diagram-number-circle" cx="292" cy="138" r="13"/><text class="diagram-number" x="292" y="138">2</text>
+<text class="diagram-text" x="318" y="143">Process totals</text>
+<text class="diagram-small" x="318" y="166">Triage · species review ·
+current view · pending sidecars</text></p>
+<p><rect class="diagram-accent" x="266" y="198" width="674" height="82" rx="12"/>
+<circle class="diagram-number-circle" cx="292" cy="223" r="13"/><text class="diagram-number" x="292" y="223">3</text>
+<text class="diagram-text" x="318" y="228">Editable review
+toolbar</text> <text class="diagram-small" x="318" y="253">Triage ·
+species · collection · Any/Every · search · sort · display</text></p>
+<p><rect class="diagram-surface" x="266" y="296" width="674" height="226" rx="16"/>
+<circle class="diagram-number-circle" cx="292" cy="322" r="13"/><text class="diagram-number" x="292" y="322">4</text>
+<text class="diagram-title" x="318" y="328">Complete encounter</text>
+<text class="diagram-small" x="760" y="328">8 photos · 2 bursts · 3
+match</text>
+<line class="diagram-divider" x1="286" y1="348" x2="920" y2="348"/>
+<text class="diagram-label" x="292" y="374">BURST 1</text>
+<rect class="diagram-match" x="292" y="391" width="92" height="68" rx="9"/>
+<rect class="diagram-context" x="396" y="391" width="92" height="68" rx="9"/>
+<rect class="diagram-match" x="500" y="391" width="92" height="68" rx="9"/>
+<text class="diagram-small" x="314" y="482">Match</text>
+<text class="diagram-small" x="413" y="482">Context</text>
+<text class="diagram-small" x="522" y="482">Match</text>
+<rect class="diagram-panel" x="620" y="370" width="286" height="126" rx="12"/>
+<text class="diagram-label" x="642" y="397">BURST 2</text>
+<rect class="diagram-photo" x="642" y="414" width="70" height="52" rx="8"/>
+<rect class="diagram-photo" x="724" y="414" width="70" height="52" rx="8"/>
+<rect class="diagram-photo" x="806" y="414" width="70" height="52" rx="8"/></p>
+<rect class="diagram-panel" x="266" y="536" width="674" height="18" rx="9"/>
 </svg>
 </div>
-<figcaption id="page-anatomy-caption"><strong>Page anatomy.</strong> Advanced computation controls stay out of the routine review path. The main column moves from run context to view controls to complete encounter cards; overlays preserve the user&#39;s place.</figcaption>
+<figcaption id="page-anatomy-caption">
+<strong>Page anatomy.</strong> Advanced computation controls stay out of
+the routine review path. The main column moves from run context to view
+controls to complete encounter cards; overlays preserve the user’s
+place.
+</figcaption>
 </figure>
-
 <h3 id="page-header-and-destinations">Page header and destinations</h3>
 <p>The page title is <strong>Process Review</strong>. The header
 includes:</p>
@@ -1109,14 +1193,14 @@ preferences such as thumbnail size and sidebar state are stored
 separately and do not alter a shared URL.</p>
 <p>Changing a filter keeps the old list visible with an updating
 treatment until the first new page arrives. The page does not blank,
-jump to the top, or lose the user&#39;s focused encounter unless that
+jump to the top, or lose the user’s focused encounter unless that
 encounter no longer qualifies.</p>
 <h3 id="advanced-controls-sidebar">Advanced controls sidebar</h3>
 <p>The sidebar is collapsed by default for routine review and remembers
 its state. It has three sections.</p>
 <p><strong>View explanation</strong> shows why the focused encounter is
 present, which photos matched the current query, and which were included
-as context. It also shows the focused encounter&#39;s grouping trace when
+as context. It also shows the focused encounter’s grouping trace when
 trace data is current.</p>
 <p><strong>Scoring recommendations</strong> adjusts how automated Keep,
 Review, and Reject recommendations are derived. Controls include
@@ -1269,49 +1353,58 @@ same complete encounter.</p>
 <figure class="design-diagram" aria-labelledby="encounter-match-caption">
 <div class="diagram-scroll">
 <svg viewBox="0 0 960 390" role="img" aria-labelledby="encounter-match-title encounter-match-desc">
-  <title id="encounter-match-title">Any photo and Every photo encounter matching</title>
-  <desc id="encounter-match-desc">An encounter contains photos A through D, while only B and C match the filter. Any photo includes the complete encounter with A and D as context. Every photo excludes the encounter because not every member matches.</desc>
-  <text class="diagram-label" x="34" y="34">CANONICAL ENCOUNTER</text>
-  <rect class="diagram-panel" x="28" y="50" width="904" height="92" rx="14" />
-  <rect class="diagram-context" x="178" y="68" width="112" height="56" rx="9" />
-  <rect class="diagram-match" x="306" y="68" width="112" height="56" rx="9" />
-  <rect class="diagram-match" x="434" y="68" width="112" height="56" rx="9" />
-  <rect class="diagram-context" x="562" y="68" width="112" height="56" rx="9" />
-  <text class="diagram-text" x="226" y="102">A</text>
-  <text class="diagram-text" x="354" y="102">B</text>
-  <text class="diagram-text" x="482" y="102">C</text>
-  <text class="diagram-text" x="610" y="102">D</text>
-  <text class="diagram-small" x="704" y="91">B + C match filter</text>
-  <text class="diagram-small" x="704" y="113">A + D are context</text>
-
-  <path class="diagram-line-accent" d="M352 146 L264 188" />
-  <path class="diagram-line" d="M608 146 L704 188" />
-
-  <rect class="diagram-accent" x="28" y="188" width="430" height="172" rx="16" />
-  <text class="diagram-title" x="52" y="220">Any photo</text>
-  <text class="diagram-small" x="52" y="244">At least one member matches → include all four</text>
-  <rect class="diagram-context" x="52" y="266" width="80" height="52" rx="8" />
-  <rect class="diagram-match" x="144" y="266" width="80" height="52" rx="8" />
-  <rect class="diagram-match" x="236" y="266" width="80" height="52" rx="8" />
-  <rect class="diagram-context" x="328" y="266" width="80" height="52" rx="8" />
-  <text class="diagram-text" x="84" y="298">A</text><text class="diagram-text" x="176" y="298">B</text>
-  <text class="diagram-text" x="268" y="298">C</text><text class="diagram-text" x="360" y="298">D</text>
-  <text class="diagram-label" x="52" y="342">SHOWN · COMPLETE + EDITABLE</text>
-
-  <rect class="diagram-surface" x="486" y="188" width="446" height="172" rx="16" />
-  <text class="diagram-title" x="510" y="220">Every photo</text>
-  <text class="diagram-small" x="510" y="244">A and D do not match → exclude the encounter</text>
-  <rect class="diagram-context" x="510" y="266" width="86" height="52" rx="8" />
-  <rect class="diagram-match" x="608" y="266" width="86" height="52" rx="8" />
-  <rect class="diagram-match" x="706" y="266" width="86" height="52" rx="8" />
-  <rect class="diagram-context" x="804" y="266" width="86" height="52" rx="8" />
-  <line x1="510" y1="258" x2="890" y2="326" stroke="#bd6b63" stroke-width="4"></line>
-  <text class="diagram-label" x="510" y="342">NOT SHOWN · NEVER PARTIALLY RENDERED</text>
+<title id="encounter-match-title">
+Any photo and Every photo encounter matching
+</title>
+<p><desc id="encounter-match-desc">An encounter contains photos A
+through D, while only B and C match the filter. Any photo includes the
+complete encounter with A and D as context. Every photo excludes the
+encounter because not every member matches.</desc>
+<text class="diagram-label" x="34" y="34">CANONICAL ENCOUNTER</text>
+<rect class="diagram-panel" x="28" y="50" width="904" height="92" rx="14"/>
+<rect class="diagram-context" x="178" y="68" width="112" height="56" rx="9"/>
+<rect class="diagram-match" x="306" y="68" width="112" height="56" rx="9"/>
+<rect class="diagram-match" x="434" y="68" width="112" height="56" rx="9"/>
+<rect class="diagram-context" x="562" y="68" width="112" height="56" rx="9"/>
+<text class="diagram-text" x="226" y="102">A</text>
+<text class="diagram-text" x="354" y="102">B</text>
+<text class="diagram-text" x="482" y="102">C</text>
+<text class="diagram-text" x="610" y="102">D</text>
+<text class="diagram-small" x="704" y="91">B + C match filter</text>
+<text class="diagram-small" x="704" y="113">A + D are context</text></p>
+<p><path class="diagram-line-accent" d="M352 146 L264 188"/>
+<path class="diagram-line" d="M608 146 L704 188"/></p>
+<p><rect class="diagram-accent" x="28" y="188" width="430" height="172" rx="16"/>
+<text class="diagram-title" x="52" y="220">Any photo</text>
+<text class="diagram-small" x="52" y="244">At least one member matches →
+include all four</text>
+<rect class="diagram-context" x="52" y="266" width="80" height="52" rx="8"/>
+<rect class="diagram-match" x="144" y="266" width="80" height="52" rx="8"/>
+<rect class="diagram-match" x="236" y="266" width="80" height="52" rx="8"/>
+<rect class="diagram-context" x="328" y="266" width="80" height="52" rx="8"/>
+<text class="diagram-text" x="84" y="298">A</text><text class="diagram-text" x="176" y="298">B</text>
+<text class="diagram-text" x="268" y="298">C</text><text class="diagram-text" x="360" y="298">D</text>
+<text class="diagram-label" x="52" y="342">SHOWN · COMPLETE +
+EDITABLE</text></p>
+<rect class="diagram-surface" x="486" y="188" width="446" height="172" rx="16"/>
+<text class="diagram-title" x="510" y="220">Every photo</text>
+<text class="diagram-small" x="510" y="244">A and D do not match →
+exclude the encounter</text>
+<rect class="diagram-context" x="510" y="266" width="86" height="52" rx="8"/>
+<rect class="diagram-match" x="608" y="266" width="86" height="52" rx="8"/>
+<rect class="diagram-match" x="706" y="266" width="86" height="52" rx="8"/>
+<rect class="diagram-context" x="804" y="266" width="86" height="52" rx="8"/>
+<line x1="510" y1="258" x2="890" y2="326" stroke="#bd6b63" stroke-width="4"/>
+<text class="diagram-label" x="510" y="342">NOT SHOWN · NEVER PARTIALLY
+RENDERED</text>
 </svg>
 </div>
-<figcaption id="encounter-match-caption"><strong>Encounter matching.</strong> Any photo is inclusive and adds context; Every photo is strict. Neither mode removes individual photos from an encounter that is shown.</figcaption>
+<figcaption id="encounter-match-caption">
+<strong>Encounter matching.</strong> Any photo is inclusive and adds
+context; Every photo is strict. Neither mode removes individual photos
+from an encounter that is shown.
+</figcaption>
 </figure>
-
 <h3 id="combining-filters">Combining filters</h3>
 <p>Photo-based criteria are combined first to form <code>S</code>. For
 example, Collection “August shorebirds” plus Status “Review” means
@@ -1354,94 +1447,109 @@ must not be flattened into one confidence-weighted species list.</p>
 <figure class="design-diagram" aria-labelledby="species-flow-caption">
 <div class="diagram-scroll">
 <svg viewBox="0 0 960 650" role="img" aria-labelledby="species-flow-title species-flow-desc">
-  <title id="species-flow-title">Species evidence from subjects and prediction sources to human assertions</title>
-  <desc id="species-flow-desc">Subject and photo-level evidence remain separate. Multiple label lists from one model consolidate into one vote. Independent models can disagree. Multi-label photo predictions are evaluated per taxon. Human resolution creates assertions without deleting model evidence.</desc>
-  <text class="diagram-label" x="24" y="34">1 · EVIDENCE TARGETS</text>
-  <text class="diagram-label" x="252" y="34">2 · MODEL / LABEL-LIST SOURCES</text>
-  <text class="diagram-label" x="570" y="34">3 · CONSOLIDATE</text>
-  <text class="diagram-label" x="766" y="34">4 · REVIEW DECISION</text>
-
-  <rect class="diagram-blue" x="20" y="52" width="198" height="518" rx="16" />
-  <text class="diagram-title" x="42" y="86">Photo 812</text>
-  <rect class="diagram-surface" x="42" y="108" width="154" height="154" rx="12" />
-  <rect class="diagram-accent" x="58" y="126" width="58" height="96" rx="10" />
-  <rect class="diagram-amber" x="126" y="148" width="52" height="72" rx="10" />
-  <text class="diagram-small" x="58" y="246">Two subject boxes</text>
-  <rect class="diagram-surface" x="42" y="286" width="154" height="72" rx="10" />
-  <text class="diagram-text" x="58" y="316">Subject 1</text>
-  <text class="diagram-small" x="58" y="340">single animal</text>
-  <rect class="diagram-surface" x="42" y="374" width="154" height="72" rx="10" />
-  <text class="diagram-text" x="58" y="404">Subject 2</text>
-  <text class="diagram-small" x="58" y="428">separate animal</text>
-  <rect class="diagram-violet" x="42" y="462" width="154" height="82" rx="10" />
-  <text class="diagram-text" x="58" y="493">Photo-level target</text>
-  <text class="diagram-small" x="58" y="517">no subject association</text>
-
-  <path class="diagram-line" d="M218 320 L246 126" />
-  <path class="diagram-line" d="M218 320 L246 222" />
-  <path class="diagram-line" d="M218 320 L246 318" />
-  <path class="diagram-line" d="M218 500 L246 450" />
-
-  <rect class="diagram-panel" x="246" y="52" width="294" height="518" rx="16" />
-  <rect class="diagram-accent" x="266" y="74" width="254" height="78" rx="10" />
-  <text class="diagram-text" x="282" y="104">Model A · Birds list</text>
-  <text class="diagram-small" x="282" y="130">Subject 1 → Robin · 0.91</text>
-  <rect class="diagram-accent" x="266" y="168" width="254" height="78" rx="10" />
-  <text class="diagram-text" x="282" y="198">Model A · Vertebrates list</text>
-  <text class="diagram-small" x="282" y="224">Subject 1 → Robin · 0.88</text>
-  <path d="M526 84 L534 84 L534 236 L526 236" fill="none" stroke="#3a7d62" stroke-width="3" />
-  <text class="diagram-small" x="382" y="263">same independence group</text>
-  <rect class="diagram-amber" x="266" y="278" width="254" height="78" rx="10" />
-  <text class="diagram-text" x="282" y="308">Model B · Birds list</text>
-  <text class="diagram-small" x="282" y="334">Subject 1 → Sparrow · 0.82</text>
-  <rect class="diagram-violet" x="266" y="386" width="254" height="134" rx="10" />
-  <text class="diagram-text" x="282" y="416">Model C · multi-label image</text>
-  <text class="diagram-small" x="282" y="443">Photo → Robin present · 0.89</text>
-  <text class="diagram-small" x="282" y="469">Photo → Mallard present · 0.86</text>
-  <text class="diagram-small" x="282" y="498">Independent presence claims</text>
-  <path class="diagram-line-accent" d="M540 154 L564 154" /><path d="M556 146 L566 154 L556 162" fill="none" stroke="#3a7d62" stroke-width="3" />
-  <path class="diagram-line-accent" d="M540 316 L564 316" /><path d="M556 308 L566 316 L556 324" fill="none" stroke="#3a7d62" stroke-width="3" />
-  <path class="diagram-line-accent" d="M540 452 L564 452" /><path d="M556 444 L566 452 L556 460" fill="none" stroke="#3a7d62" stroke-width="3" />
-
-  <rect class="diagram-surface" x="566" y="52" width="176" height="518" rx="16" />
-  <rect class="diagram-accent" x="584" y="82" width="140" height="104" rx="10" />
-  <text class="diagram-text" x="600" y="112">Model A</text>
-  <text class="diagram-small" x="600" y="138">one Robin vote</text>
-  <text class="diagram-small" x="600" y="162">not two votes</text>
-  <rect class="diagram-amber" x="584" y="210" width="140" height="86" rx="10" />
-  <text class="diagram-text" x="600" y="240">Model B</text>
-  <text class="diagram-small" x="600" y="266">one Sparrow vote</text>
-  <rect class="diagram-violet" x="584" y="326" width="140" height="158" rx="10" />
-  <text class="diagram-text" x="600" y="356">Photo presence</text>
-  <text class="diagram-small" x="600" y="384">Robin: supported</text>
-  <text class="diagram-small" x="600" y="410">Mallard: supported</text>
-  <text class="diagram-small" x="600" y="444">evaluated per taxon</text>
-  <text class="diagram-small" x="600" y="468">no subject invented</text>
-  <text class="diagram-small" x="586" y="532">No cross-model</text>
-  <text class="diagram-small" x="586" y="552">confidence average</text>
-  <path class="diagram-line-accent" d="M742 150 L762 150" /><path d="M754 142 L764 150 L754 158" fill="none" stroke="#3a7d62" stroke-width="3" />
-  <path class="diagram-line-accent" d="M742 404 L762 404" /><path d="M754 396 L764 404 L754 412" fill="none" stroke="#3a7d62" stroke-width="3" />
-
-  <rect class="diagram-panel" x="764" y="52" width="176" height="518" rx="16" />
-  <rect class="diagram-amber" x="782" y="82" width="140" height="112" rx="10" />
-  <text class="diagram-text" x="798" y="112">Subject 1</text>
-  <text class="diagram-small" x="798" y="138">Model split</text>
-  <text class="diagram-small" x="798" y="162">explicit review</text>
-  <rect class="diagram-accent" x="782" y="218" width="140" height="102" rx="10" />
-  <text class="diagram-text" x="798" y="248">Human assertion</text>
-  <text class="diagram-small" x="798" y="274">Subject 1 = Robin</text>
-  <text class="diagram-small" x="798" y="298">dissent retained</text>
-  <rect class="diagram-violet" x="782" y="344" width="140" height="122" rx="10" />
-  <text class="diagram-text" x="798" y="374">Photo assertions</text>
-  <text class="diagram-small" x="798" y="400">Robin present</text>
-  <text class="diagram-small" x="798" y="426">Mallard present</text>
-  <rect class="diagram-blue" x="782" y="490" width="140" height="54" rx="10" />
-  <text class="diagram-text" x="798" y="522">2-species roster</text>
+<title id="species-flow-title">
+Species evidence from subjects and prediction sources to human
+assertions
+</title>
+<p><desc id="species-flow-desc">Subject and photo-level evidence remain
+separate. Multiple label lists from one model consolidate into one vote.
+Independent models can disagree. Multi-label photo predictions are
+evaluated per taxon. Human resolution creates assertions without
+deleting model evidence.</desc>
+<text class="diagram-label" x="24" y="34">1 · EVIDENCE TARGETS</text>
+<text class="diagram-label" x="252" y="34">2 · MODEL / LABEL-LIST
+SOURCES</text> <text class="diagram-label" x="570" y="34">3 ·
+CONSOLIDATE</text> <text class="diagram-label" x="766" y="34">4 · REVIEW
+DECISION</text></p>
+<p><rect class="diagram-blue" x="20" y="52" width="198" height="518" rx="16"/>
+<text class="diagram-title" x="42" y="86">Photo 812</text>
+<rect class="diagram-surface" x="42" y="108" width="154" height="154" rx="12"/>
+<rect class="diagram-accent" x="58" y="126" width="58" height="96" rx="10"/>
+<rect class="diagram-amber" x="126" y="148" width="52" height="72" rx="10"/>
+<text class="diagram-small" x="58" y="246">Two subject boxes</text>
+<rect class="diagram-surface" x="42" y="286" width="154" height="72" rx="10"/>
+<text class="diagram-text" x="58" y="316">Subject 1</text>
+<text class="diagram-small" x="58" y="340">single animal</text>
+<rect class="diagram-surface" x="42" y="374" width="154" height="72" rx="10"/>
+<text class="diagram-text" x="58" y="404">Subject 2</text>
+<text class="diagram-small" x="58" y="428">separate animal</text>
+<rect class="diagram-violet" x="42" y="462" width="154" height="82" rx="10"/>
+<text class="diagram-text" x="58" y="493">Photo-level target</text>
+<text class="diagram-small" x="58" y="517">no subject
+association</text></p>
+<p><path class="diagram-line" d="M218 320 L246 126"/>
+<path class="diagram-line" d="M218 320 L246 222"/>
+<path class="diagram-line" d="M218 320 L246 318"/>
+<path class="diagram-line" d="M218 500 L246 450"/></p>
+<p><rect class="diagram-panel" x="246" y="52" width="294" height="518" rx="16"/>
+<rect class="diagram-accent" x="266" y="74" width="254" height="78" rx="10"/>
+<text class="diagram-text" x="282" y="104">Model A · Birds list</text>
+<text class="diagram-small" x="282" y="130">Subject 1 → Robin ·
+0.91</text>
+<rect class="diagram-accent" x="266" y="168" width="254" height="78" rx="10"/>
+<text class="diagram-text" x="282" y="198">Model A · Vertebrates
+list</text> <text class="diagram-small" x="282" y="224">Subject 1 →
+Robin · 0.88</text>
+<path d="M526 84 L534 84 L534 236 L526 236" fill="none" stroke="#3a7d62" stroke-width="3"/>
+<text class="diagram-small" x="382" y="263">same independence
+group</text>
+<rect class="diagram-amber" x="266" y="278" width="254" height="78" rx="10"/>
+<text class="diagram-text" x="282" y="308">Model B · Birds list</text>
+<text class="diagram-small" x="282" y="334">Subject 1 → Sparrow ·
+0.82</text>
+<rect class="diagram-violet" x="266" y="386" width="254" height="134" rx="10"/>
+<text class="diagram-text" x="282" y="416">Model C · multi-label
+image</text> <text class="diagram-small" x="282" y="443">Photo → Robin
+present · 0.89</text> <text class="diagram-small" x="282" y="469">Photo
+→ Mallard present · 0.86</text>
+<text class="diagram-small" x="282" y="498">Independent presence
+claims</text>
+<path class="diagram-line-accent" d="M540 154 L564 154"/><path d="M556 146 L566 154 L556 162" fill="none" stroke="#3a7d62" stroke-width="3"/>
+<path class="diagram-line-accent" d="M540 316 L564 316"/><path d="M556 308 L566 316 L556 324" fill="none" stroke="#3a7d62" stroke-width="3"/>
+<path class="diagram-line-accent" d="M540 452 L564 452"/><path d="M556 444 L566 452 L556 460" fill="none" stroke="#3a7d62" stroke-width="3"/></p>
+<p><rect class="diagram-surface" x="566" y="52" width="176" height="518" rx="16"/>
+<rect class="diagram-accent" x="584" y="82" width="140" height="104" rx="10"/>
+<text class="diagram-text" x="600" y="112">Model A</text>
+<text class="diagram-small" x="600" y="138">one Robin vote</text>
+<text class="diagram-small" x="600" y="162">not two votes</text>
+<rect class="diagram-amber" x="584" y="210" width="140" height="86" rx="10"/>
+<text class="diagram-text" x="600" y="240">Model B</text>
+<text class="diagram-small" x="600" y="266">one Sparrow vote</text>
+<rect class="diagram-violet" x="584" y="326" width="140" height="158" rx="10"/>
+<text class="diagram-text" x="600" y="356">Photo presence</text>
+<text class="diagram-small" x="600" y="384">Robin: supported</text>
+<text class="diagram-small" x="600" y="410">Mallard: supported</text>
+<text class="diagram-small" x="600" y="444">evaluated per taxon</text>
+<text class="diagram-small" x="600" y="468">no subject invented</text>
+<text class="diagram-small" x="586" y="532">No cross-model</text>
+<text class="diagram-small" x="586" y="552">confidence average</text>
+<path class="diagram-line-accent" d="M742 150 L762 150"/><path d="M754 142 L764 150 L754 158" fill="none" stroke="#3a7d62" stroke-width="3"/>
+<path class="diagram-line-accent" d="M742 404 L762 404"/><path d="M754 396 L764 404 L754 412" fill="none" stroke="#3a7d62" stroke-width="3"/></p>
+<rect class="diagram-panel" x="764" y="52" width="176" height="518" rx="16"/>
+<rect class="diagram-amber" x="782" y="82" width="140" height="112" rx="10"/>
+<text class="diagram-text" x="798" y="112">Subject 1</text>
+<text class="diagram-small" x="798" y="138">Model split</text>
+<text class="diagram-small" x="798" y="162">explicit review</text>
+<rect class="diagram-accent" x="782" y="218" width="140" height="102" rx="10"/>
+<text class="diagram-text" x="798" y="248">Human assertion</text>
+<text class="diagram-small" x="798" y="274">Subject 1 = Robin</text>
+<text class="diagram-small" x="798" y="298">dissent retained</text>
+<rect class="diagram-violet" x="782" y="344" width="140" height="122" rx="10"/>
+<text class="diagram-text" x="798" y="374">Photo assertions</text>
+<text class="diagram-small" x="798" y="400">Robin present</text>
+<text class="diagram-small" x="798" y="426">Mallard present</text>
+<rect class="diagram-blue" x="782" y="490" width="140" height="54" rx="10"/>
+<text class="diagram-text" x="798" y="522">2-species roster</text>
 </svg>
 </div>
-<figcaption id="species-flow-caption"><strong>Species evidence flow.</strong> Evidence stays attached to a subject or the photo. Label lists from one underlying model cannot multiply its vote; independent models may split; multi-label image evidence can support several taxa without inventing subjects. Human assertions resolve work while preserving dissent for audit.</figcaption>
+<figcaption id="species-flow-caption">
+<strong>Species evidence flow.</strong> Evidence stays attached to a
+subject or the photo. Label lists from one underlying model cannot
+multiply its vote; independent models may split; multi-label image
+evidence can support several taxa without inventing subjects. Human
+assertions resolve work while preserving dissent for audit.
+</figcaption>
 </figure>
-
 <h3 id="evidence-hierarchy">Evidence hierarchy</h3>
 <p>Species evidence has four explicit levels:</p>
 <ol type="1">
@@ -1454,7 +1562,7 @@ label-list version applied to that subject. Its identity is the pair
 uses the model and label list display names; raw fingerprints appear
 only in diagnostics.</li>
 <li><strong>Photo</strong> — the set of resolved or suggested species
-across that photo&#39;s subjects. More than one subject may produce more
+across that photo’s subjects. More than one subject may produce more
 than one species.</li>
 <li><strong>Burst or encounter</strong> — a coverage summary over its
 photos and subjects, not a new independent prediction.</li>
@@ -1477,7 +1585,8 @@ shape of a top-k response.</p>
 metadata. The same model run against “North American birds” and “All
 vertebrates” produces two model/list-pair sources. The process result
 snapshots the exact source inventory used for that run:</p>
-<div class="sourceCode" id="cb1"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
 <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;source_id&quot;</span><span class="fu">:</span> <span class="st">&quot;source-17&quot;</span><span class="fu">,</span></span>
 <span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;classifier_model&quot;</span><span class="fu">:</span> <span class="st">&quot;timm-inat21-eva02-l&quot;</span><span class="fu">,</span></span>
 <span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;model_display_name&quot;</span><span class="fu">:</span> <span class="st">&quot;iNaturalist EVA-02 Large&quot;</span><span class="fu">,</span></span>
@@ -1540,7 +1649,7 @@ one subject. Only a qualified leading candidate participates in
 automatic consensus. Lower-ranked candidates communicate uncertainty and
 remain selectable during manual review; they are never interpreted as
 additional animals or additional species present in the photo.</p>
-<p>A leading candidate is qualified using that source&#39;s configured
+<p>A leading candidate is qualified using that source’s configured
 confidence and margin requirements. Model-specific calibration may
 override global defaults. Raw confidence values from different models or
 different label lists are shown but are not averaged into a probability
@@ -1605,7 +1714,7 @@ single-model evidence.</li>
 unavailable.</li>
 </ul>
 <p>The interface reports votes and abstentions—for example, “2 of 3
-models agree; 1 uncertain”—alongside each source&#39;s original confidence.
+models agree; 1 uncertain”—alongside each source’s original confidence.
 It does not display an opaque aggregate percentage that implies the
 models are calibrated or independent.</p>
 <p>For photo- or multi-subject-region multi-label evidence, cross-model
@@ -1613,7 +1722,7 @@ consensus also runs per taxon. Several taxa can each receive
 supported-presence suggestions. Incompatible taxa at this level do not
 conflict merely because they differ: multiple species can share an
 image. A disagreement exists when models provide qualified opposing
-evidence about the same taxon&#39;s presence, or when incompatible
+evidence about the same taxon’s presence, or when incompatible
 predictions have been assigned to one subject known to represent a
 single animal.</p>
 <p>A majority suggestion is eligible for the fast confirmation action,
@@ -1631,8 +1740,8 @@ subject.</p>
 species in the photo</strong>, not model disagreement. The photo
 displays a species roster such as:</p>
 <blockquote>
-<p>American Wigeon · subject 1, 2 models<br />
-Mallard · subject 2, 2 models</p>
+<p>American Wigeon · subject 1, 2 models<br> Mallard · subject 2, 2
+models</p>
 </blockquote>
 <p>Two subjects supporting the same taxon display one species with “2
 subjects.” Overlapping duplicate detections must be reconciled by
@@ -1745,7 +1854,7 @@ covered, uncertain, unavailable). Selecting a cell reveals lower-ranked
 alternatives and source diagnostics.</p>
 <p>The Group Review modal keeps its per-photo strip. Multi-subject
 photos expose subject chips and boxes, while the evidence panel shows
-the selected subject&#39;s source matrix and the burst-level species
+the selected subject’s source matrix and the burst-level species
 coverage summary. Users can select subjects or photos and assign,
 confirm, reject, or mark evidence unresolved in bulk.</p>
 <h2 id="editing-behavior">Editing behavior</h2>
@@ -1824,8 +1933,10 @@ audit record.</p>
 names the target subjects or photos, taxon, operation (add, replace, Not
 identifiable, or False detection), canonical run, and expected revision.
 The server returns the changed photos and encounters, updated completion
-and summary counts, and the new revision. It does not return the
-complete encounter list.</p>
+and summary counts, the new <code>revision</code>, and the unchanged
+<code>structural_revision</code>; whether an active pagination cursor
+survives follows the per-view rules in the Pagination section. It does
+not return the complete encounter list.</p>
 <p>Confirmation never changes structure merely because another species
 is present: multi-species photos and encounters are valid. When credible
 species variation aligns with burst boundaries, the interface may
@@ -1912,7 +2023,7 @@ where possible; a canonical regroup may invalidate all cursors.</p>
 <h3 id="group-review">Group Review</h3>
 <p>The Group Review modal always opens a complete canonical burst. It
 remains editable from every view. Applying changes sends command data
-for that burst; it never posts the page&#39;s complete
+for that burst; it never posts the page’s complete
 <code>pipelineResults</code> object back to the server.</p>
 <p>Group Review is the primary high-resolution comparison surface. It
 contains:</p>
@@ -1927,7 +2038,7 @@ selected frames.</li>
 <li><strong>Photo controls.</strong> Thumbnail size, per-photo pan
 offsets, reset offsets, selected-region sharpness, subject chips/boxes,
 mask visibility, and image metadata.</li>
-<li><strong>Species evidence.</strong> The selected subject&#39;s source
+<li><strong>Species evidence.</strong> The selected subject’s source
 matrix, photo-level evidence, burst coverage summary, lower-ranked
 exclusive alternatives, and multi-label presence suggestions.</li>
 <li><strong>Commit footer.</strong> Staged triage count, staged
@@ -2034,7 +2145,7 @@ current view.</li>
 <li>A collection filter never causes grouping to run on only that
 collection.</li>
 </ul>
-<p>If live grouping cannot meet the page&#39;s responsiveness and durability
+<p>If live grouping cannot meet the page’s responsiveness and durability
 requirements at large scale, replace automatic slider requests with an
 Apply button. Do not solve that problem by producing an ephemeral
 collection-only grouping.</p>
@@ -2172,7 +2283,7 @@ do not.</p>
 <h2 id="downstream-effects-and-page-boundaries">Downstream effects and
 page boundaries</h2>
 <ul>
-<li>Keep, Review, and Reject update the library&#39;s effective triage
+<li>Keep, Review, and Reject update the library’s effective triage
 state. Reject marks a photo for downstream culling; Process Review never
 deletes a file.</li>
 <li>Confirmed species assertions update effective taxonomy keywords
@@ -2206,10 +2317,22 @@ implicitly.</li>
 <h3 id="stable-identities-and-revisions">Stable identities and
 revisions</h3>
 <p>Every canonical review result has:</p>
-<div class="sourceCode" id="cb2"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;review_run_id&quot;</span><span class="fu">:</span> <span class="st">&quot;pipeline-1786837933532-107&quot;</span><span class="fu">,</span></span>
-<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;revision&quot;</span><span class="fu">:</span> <span class="dv">42</span></span>
-<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;revision&quot;</span><span class="fu">:</span> <span class="dv">42</span><span class="fu">,</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;structural_revision&quot;</span><span class="fu">:</span> <span class="dv">7</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p><code>revision</code> advances on every review mutation, including
+species confirmation, triage, and flag changes.
+<code>structural_revision</code> advances only when encounter or burst
+membership changes: a new Process run, applied regrouping, or an
+explicit structural command such as Split, Extract, Merge, or Separate.
+Decision-only mutations increment <code>revision</code> but preserve
+<code>structural_revision</code> so focus and scroll position remain
+valid, and so pagination cursors remain valid in views whose sort and
+filters do not read decision state (the Pagination section defines the
+decision-dependent cases).</p>
 <p>Every encounter and burst has an opaque stable ID. IDs survive
 labels, flags, sorting, filtering, and pagination. A structural regroup
 may replace IDs; manual structural commands preserve unaffected IDs and
@@ -2217,15 +2340,16 @@ create IDs for new groups.</p>
 <p>Mutation requests include <code>review_run_id</code>, the expected
 <code>revision</code>, and the target IDs. If a new Process run or
 another structural mutation has made the page stale, the server returns
-<code>409 Conflict</code> with the current run and revision. The page
-refreshes its view and explains that the review changed; it never
-applies a command to whichever group now occupies an old array
-index.</p>
+<code>409 Conflict</code> with the current run, <code>revision</code>,
+and <code>structural_revision</code>. The page refreshes its view and
+explains that the review changed; it never applies a command to
+whichever group now occupies an old array index.</p>
 <h3 id="species-evidence-contract">Species evidence contract</h3>
 <p>The process snapshot stores the source inventory once and references
 compact source IDs from subject evidence. A representative loaded photo
 is:</p>
-<div class="sourceCode" id="cb3"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="dv">812</span><span class="fu">,</span></span>
 <span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;subjects&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
 <span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
@@ -2269,7 +2393,8 @@ and query performance, but the underlying source candidates remain
 available so the UI can explain and audit it.</p>
 <p>Species resolution records are separate from classifier predictions.
 A representative assertion contains:</p>
-<div class="sourceCode" id="cb4"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;assertion_id&quot;</span><span class="fu">:</span> <span class="st">&quot;species-assertion-88&quot;</span><span class="fu">,</span></span>
 <span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;photo_id&quot;</span><span class="fu">:</span> <span class="dv">812</span><span class="fu">,</span></span>
 <span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;subject_id&quot;</span><span class="fu">:</span> <span class="st">&quot;detection-4401&quot;</span><span class="fu">,</span></span>
@@ -2285,7 +2410,8 @@ reconstruct exactly which photo/subject assignments changed.</p>
 <h3 id="view-query">View query</h3>
 <p>A dedicated query accepts the complete view definition. A
 representative request is:</p>
-<div class="sourceCode" id="cb5"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
 <span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;review_run_id&quot;</span><span class="fu">:</span> <span class="st">&quot;pipeline-1786837933532-107&quot;</span><span class="fu">,</span></span>
 <span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;collection_id&quot;</span><span class="fu">:</span> <span class="dv">197</span><span class="fu">,</span></span>
 <span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;status&quot;</span><span class="fu">:</span> <span class="st">&quot;REVIEW&quot;</span><span class="fu">,</span></span>
@@ -2300,7 +2426,8 @@ representative request is:</p>
 <p>The server resolves collection membership and intersects it with the
 canonical process result. It returns:</p>
 <ul>
-<li>canonical run and revision;</li>
+<li>canonical run, <code>revision</code>, and
+<code>structural_revision</code>;</li>
 <li>process-coverage counts;</li>
 <li>match, encounter, context-photo, and confirmation counts;</li>
 <li>a page of complete encounters;</li>
@@ -2312,17 +2439,42 @@ canonical process result. It returns:</p>
 not fetch a large collection ID list and intersect it with a second
 large result payload.</p>
 <h3 id="pagination">Pagination</h3>
-<p>Pagination is encounter-based and uses an opaque cursor tied to the
-run, revision, sort, and filter fingerprint. The server observes both a
-target encounter count and a soft target photo count:</p>
+<p>Pagination is encounter-based and uses an opaque keyset cursor tied
+to the run, <code>structural_revision</code>, sort, and filter
+fingerprint. The cursor encodes the sort key and stable ID of the last
+returned encounter — never a bare offset — so membership changes
+elsewhere in the result cannot silently skip a successor.</p>
+<p>Whether decision-only mutations preserve the cursor depends on the
+active view:</p>
+<ul>
+<li>When the sort and filters read only snapshot data (chronological,
+newest/oldest first, most/fewest photos, most bursts, with
+decision-independent filters), decision-only mutations such as species
+confirmation, triage, and flags do not invalidate the cursor, so a large
+review can be edited while continuing to scroll from the loaded
+position.</li>
+<li>When the sort or a filter reads mutable decision state
+(<code>unresolved first</code> or conflict-severity sorts, triage-status
+or species-review filters), a decision can move an encounter across the
+cursor boundary or out of the result set, so cursor reuse could repeat
+or miss encounters. A decision mutation that changes a sort or filter
+key of the active view therefore marks the cursor stale, and the next
+page fetch obtains a fresh cursor anchored at the stable ID of the last
+loaded encounter. Already-loaded rows stay in place and update through
+the delta, and the client’s ID-keyed maps drop any encounter a
+re-anchored page would repeat.</li>
+</ul>
+<p>The server observes both a target encounter count and a soft target
+photo count:</p>
 <ul>
 <li>never split an encounter;</li>
 <li>return at least one encounter even when it exceeds the photo
 target;</li>
 <li>otherwise stop before adding an encounter that would exceed the soft
 photo target; and</li>
-<li>invalidate the cursor when the structural revision or query
-changes.</li>
+<li>invalidate the cursor when <code>structural_revision</code> or the
+query changes, or when a decision mutation changes a sort or filter key
+that the cursor-bound view depends on.</li>
 </ul>
 <p>The client loads the next page as the user approaches the end of the
 current window. Already loaded pages may be virtualized or discarded
@@ -2331,18 +2483,27 @@ restoration remain correct. Collapsed encounter bodies should not create
 photo-card DOM until expanded. Thumbnail loading remains lazy.</p>
 <h3 id="mutation-response">Mutation response</h3>
 <p>All review mutations use a common delta envelope:</p>
-<div class="sourceCode" id="cb6"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
 <span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;ok&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span></span>
 <span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;review_run_id&quot;</span><span class="fu">:</span> <span class="st">&quot;pipeline-1786837933532-107&quot;</span><span class="fu">,</span></span>
 <span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;revision&quot;</span><span class="fu">:</span> <span class="dv">43</span><span class="fu">,</span></span>
-<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;updated_encounters&quot;</span><span class="fu">:</span> <span class="ot">[]</span><span class="fu">,</span></span>
-<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;removed_encounter_ids&quot;</span><span class="fu">:</span> <span class="ot">[]</span><span class="fu">,</span></span>
-<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;updated_photos&quot;</span><span class="fu">:</span> <span class="ot">[]</span><span class="fu">,</span></span>
-<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;summary_delta&quot;</span><span class="fu">:</span> <span class="fu">{},</span></span>
-<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;view_may_have_changed&quot;</span><span class="fu">:</span> <span class="kw">true</span></span>
-<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
-<p>The client applies the delta to normalized maps keyed by stable IDs.
-It does not replace or deep-clone the complete review result.</p>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;structural_revision&quot;</span><span class="fu">:</span> <span class="dv">7</span><span class="fu">,</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;updated_encounters&quot;</span><span class="fu">:</span> <span class="ot">[]</span><span class="fu">,</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;removed_encounter_ids&quot;</span><span class="fu">:</span> <span class="ot">[]</span><span class="fu">,</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;updated_photos&quot;</span><span class="fu">:</span> <span class="ot">[]</span><span class="fu">,</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;summary_delta&quot;</span><span class="fu">:</span> <span class="fu">{},</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;view_may_have_changed&quot;</span><span class="fu">:</span> <span class="kw">true</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>The client compares the returned <code>structural_revision</code>
+with the one bound to its active cursor: a bumped value means the next
+page fetch must use a fresh cursor. When the value is unchanged,
+pagination remains valid unless the active view depends on decision
+state and <code>view_may_have_changed</code> reports that a sort or
+filter key changed, in which case the next page fetch re-anchors as
+described in the Pagination section. The client applies the delta to
+normalized maps keyed by stable IDs. It does not replace or deep-clone
+the complete review result.</p>
 <h3 id="persistence-model">Persistence model</h3>
 <p>Computed pipeline output and mutable review state must not require a
 complete JSON rewrite for every click.</p>
@@ -2365,6 +2526,10 @@ as authoritative state.</p>
 <h2 id="loading-empty-and-error-states">Loading, empty, and error
 states</h2>
 <table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
 <thead>
 <tr>
 <th>State</th>
@@ -2604,7 +2769,7 @@ integrity is an invariant in both modes.</p>
 <h2 id="acceptance-criteria">Acceptance criteria</h2>
 <ul>
 <li>Selecting a collection never calls live regrouping and never changes
-an encounter&#39;s membership.</li>
+an encounter’s membership.</li>
 <li>Every Collection, status, species-review-state, and search view
 remains editable.</li>
 <li>Any photo mode includes the complete encounter when one member
@@ -2691,7 +2856,8 @@ collection/status criteria.</li>
 <li>Collection intersection with partial canonical process
 coverage.</li>
 <li>Complete encounter and burst membership in every returned page.</li>
-<li>Cursor stability and invalidation after structural revisions.</li>
+<li>Cursor stability across decision-only mutations and invalidation
+after structural revisions.</li>
 <li>Stable-ID targeting for every mutation type.</li>
 <li>Stale run and stale revision conflict responses.</li>
 <li>Delta correctness for single-species and multi-species

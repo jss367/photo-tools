@@ -300,6 +300,33 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
         }"""
     )
 
+    native_stop = page.evaluate(
+        """() => {
+            const wrap = document.getElementById('editorCanvasWrap');
+            const originalStyle = wrap.getAttribute('style');
+            editorState.photo.width = 3000;
+            editorState.photo.height = 2000;
+            wrap.style.width = '3400px';
+            wrap.style.height = '2600px';
+            updateEditorZoomControl();
+            const result = {
+                fit: editorFitZoomPercent(),
+                actualDisplay: document.getElementById('actualBtn').style.display,
+                fitLabel: document.getElementById('fitBtn').textContent
+            };
+            if (originalStyle === null) wrap.removeAttribute('style');
+            else wrap.setAttribute('style', originalStyle);
+            editorState.photo.width = 4000;
+            editorState.photo.height = 3000;
+            applyEditorZoom();
+            updateEditorZoomControl();
+            return result;
+        }"""
+    )
+    assert native_stop["fit"] == 100
+    assert native_stop["actualDisplay"] != "none"
+    assert native_stop["fitLabel"] == "Fit"
+
     one_axis = page.evaluate(
         """() => {
             const wrap = document.getElementById('editorCanvasWrap');
@@ -324,6 +351,13 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
     )
     assert one_axis["overflowX"] != one_axis["overflowY"]
     assert one_axis["fittedAxisError"] < 1
+
+    page.set_viewport_size({"width": 3000, "height": 2000})
+    page.wait_for_function("() => editorState.zoomMode === 'fit'")
+    expect(page.locator("#editorZoomSlider")).to_have_attribute(
+        "aria-valuetext", "Fit"
+    )
+    page.set_viewport_size({"width": 2000, "height": 1000})
 
     page.locator("#actualBtn").click()
     expect(page.locator("#editorZoomSlider")).to_have_attribute(

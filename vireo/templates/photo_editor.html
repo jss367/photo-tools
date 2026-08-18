@@ -1045,6 +1045,14 @@ function editorZoomText() {
     : Math.round(editorState.zoomPercent) + '%';
 }
 
+function editorFitUsesNativeRender() {
+  var photo = editorState.photo || {};
+  var native = Math.max(Number(photo.width) || 0, Number(photo.height) || 0);
+  // Fit requests a 1920px preview. Only a source at or below that tier makes
+  // Fit and 100% equivalent in both display size and delivered detail.
+  return native > 0 && native <= 1920;
+}
+
 function updateEditorZoomControl() {
   var slider = document.getElementById('editorZoomSlider');
   var fitStop = document.getElementById('fitBtn');
@@ -1055,7 +1063,7 @@ function updateEditorZoomControl() {
   var hasPhoto = !!editorState.photoId && !!editorState.photo;
   var disabled = !hasPhoto || !!editorState.loading;
   var fit = editorFitZoomPercent();
-  var combinedFitActual = fit >= 99.5;
+  var combinedFitActual = fit >= 99.5 && editorFitUsesNativeRender();
   var percent = editorState.zoomMode === 'fit' ? fit : editorState.zoomPercent;
   var text = editorZoomText();
 
@@ -2964,8 +2972,17 @@ function initCropDrag() {
     editorState.drag = null;
   });
   window.addEventListener('resize', function() {
+    var snappedToFit = false;
+    if (editorState.zoomMode !== 'fit' &&
+        editorState.zoomPercent <= editorFitZoomPercent()) {
+      editorState.zoomMode = 'fit';
+      snappedToFit = true;
+    }
     applyEditorZoom();
     updateEditorZoomControl();
+    if (snappedToFit && editorState.photoId && !editorState.loading) {
+      schedulePreview();
+    }
     renderCropBox();
     updateHistogramFeedback();
     positionMaskOverlay();

@@ -15793,6 +15793,19 @@ def test_browse_undo_confirmation_uses_success_toast():
     assert "showToast(data.description + ' — Ctrl+Z to undo', 'success')" in body
 
 
+def test_browse_export_started_uses_info_toast():
+    """Starting an export is informational, not an error."""
+    from pathlib import Path
+    src = Path(__file__).parent.parent / "templates" / "browse.html"
+    text = src.read_text(encoding="utf-8")
+    fn_start = text.find("async function startExport")
+    assert fn_start != -1, "startExport function not found"
+    fn_end = text.find("\n}", fn_start)
+    assert fn_end != -1
+    body = text[fn_start:fn_end]
+    assert "showToast('Export started (' + count + ' photos)', 'info')" in body
+
+
 def test_review_switch_collection_does_not_silently_widen_scope():
     """When /api/collections/<id>/photos fails, the review page must not fall
     back to `allPredictions.slice()` — that silently widened the scope back

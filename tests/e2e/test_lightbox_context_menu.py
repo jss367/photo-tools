@@ -69,6 +69,9 @@ def test_lightbox_right_click_opens_menu(live_server, page):
         menu.locator(".vireo-ctx-item", has_text="Copy Path")
     ).to_be_visible()
     expect(
+        menu.locator(".vireo-ctx-item", has_text="Export…")
+    ).to_be_visible()
+    expect(
         menu.locator(".vireo-ctx-item", has_text="Close Lightbox")
     ).to_be_visible()
     expect(
@@ -76,6 +79,58 @@ def test_lightbox_right_click_opens_menu(live_server, page):
     ).to_be_visible()
     # Rating / color / flag chip rows are present (14 chips total).
     assert menu.locator(".vireo-ctx-chip").count() > 5
+
+
+def test_lightbox_export_resolves_photo_when_action_is_invoked(live_server, page):
+    """Lightbox Export targets the displayed photo even after menu-open nav."""
+    url = live_server["url"]
+    _open_lightbox(page, url)
+
+    current_id = page.evaluate("_lightboxCurrentId")
+    page.evaluate(
+        """() => {
+            selectedPhotos.clear();
+            selectedPhotoId = _lightboxCurrentId;
+            window.__exportRequest = null;
+            window.safeFetch = async function(url, options) {
+                if (url === '/api/jobs/export') {
+                    window.__exportRequest = JSON.parse(options.body);
+                    return {job_id: 'lightbox-export-test'};
+                }
+                return {};
+            };
+        }"""
+    )
+
+    _fire_contextmenu_on_lightbox(page)
+    export_photo = page.evaluate(
+        """() => {
+            const next = photos.find(photo => photo.id !== _lightboxCurrentId);
+            _lightboxCurrentId = next.id;
+            _lightboxCommittedId = next.id;
+            // Simulate opening a Find Similar result that is not present in
+            // Browse's currently loaded page. The lightbox retains its own
+            // photo list for metadata-backed export previews.
+            photos = photos.filter(photo => photo.id !== next.id);
+            return {id: next.id, filename: next.filename};
+        }"""
+    )
+    menu = page.locator(".vireo-ctx-menu")
+    menu.locator(".vireo-ctx-item", has_text="Export…").click()
+
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    expect(page.locator("#exportOverlay")).to_be_visible()
+    expect(page.locator("#lightboxOverlay")).to_have_class("lightbox-overlay")
+    expect(page.locator("#exportSubmitBtn")).to_have_text("Export 1 photo")
+    expect(page.locator("#exportPreview")).to_contain_text(
+        export_photo["filename"].rsplit(".", 1)[0]
+    )
+    assert export_photo["id"] != current_id
+    assert page.evaluate("_exportPhotoIds") == [export_photo["id"]]
+
+    page.locator("#exportSubmitBtn").click()
+    page.wait_for_function("window.__exportRequest !== null")
+    assert page.evaluate("window.__exportRequest.photo_ids") == [export_photo["id"]]
 
 
 def test_lightbox_color_description_opens_editor(live_server, page):

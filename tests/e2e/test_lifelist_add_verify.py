@@ -180,6 +180,47 @@ def test_lightbox_panel_hides_after_current_photo_rejected(live_server, page):
     expect(panel).to_be_hidden()
 
 
+def test_life_list_pick_badge_and_live_promotion(live_server, page):
+    db = live_server["db"]
+    hawk1, hawk2 = live_server["data"]["photos"][:2]
+    hawk_keyword = db.conn.execute(
+        "SELECT id FROM keywords WHERE name = 'Red-tailed Hawk'"
+    ).fetchone()["id"]
+    db.tag_photo(hawk2, hawk_keyword)
+    db.conn.execute(
+        "UPDATE photos SET quality_score = CASE id WHEN ? THEN 0.9 ELSE 0.1 END "
+        "WHERE id IN (?, ?)",
+        (hawk1, hawk1, hawk2),
+    )
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/life-list")
+    card = page.locator('.species-card[data-species="Red-tailed Hawk"]')
+    expect(card.locator("img")).to_have_attribute("data-photo-id", str(hawk1))
+    expect(card.locator(".lifelist-pick-badge")).to_have_count(0)
+
+    # Open the lower-scored second photo and use the real P shortcut. Once the
+    # persisted flag event fires, Life List refetches its authoritative order.
+    page.evaluate(
+        """(pid) => {
+          const entry = currentData.species.find(e => e.species === 'Red-tailed Hawk');
+          const photo = entry.photos.find(p => p.id === pid);
+          lifeListLightboxSpecies = entry.species;
+          openLightbox(photo.id, photo.filename, entry.photos);
+        }""",
+        hawk2,
+    )
+    page.wait_for_function("(pid) => window._lightboxCurrentId === pid", arg=hawk2)
+    with page.expect_response(
+        lambda response: f"/api/photos/{hawk2}/flag" in response.url
+        and response.status == 200
+    ):
+        page.keyboard.press("p")
+
+    expect(card.locator("img")).to_have_attribute("data-photo-id", str(hawk2))
+    expect(card.locator(".lifelist-pick-badge")).to_have_text("Pick")
+
+
 def test_default_sort_and_numbering_preferences_persist(live_server, page):
     url = live_server["url"]
     page.goto(f"{url}/life-list")

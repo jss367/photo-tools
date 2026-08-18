@@ -193,18 +193,39 @@ def test_life_list_species_page_validates_species(life_app):
     ).status_code == 404
 
 
-def test_life_list_best_ignores_pick_when_no_preference(life_app):
-    """Life List ranking must stay score-driven — the Highlights-only
-    picked-first ordering must not leak into `_build_life_list_payload`."""
+def test_life_list_pick_promotes_lower_scored_photo(life_app):
+    """A Pick is the lead Life List photo unless a representative overrides it."""
     app, db, ids = life_app
-    # p1's quality_score (0.5) is lower than p2's (0.9). Flagging p1
-    # must NOT promote it above p2 on the Life List.
+    # p1's quality_score (0.5) is lower than p2's (0.9), proving that the
+    # explicit Pick tier, rather than the algorithmic score, promoted it.
     db.update_photo_flag(ids["p1"], "flagged")
 
     data = _get_life_list(app)
     cardinal = _entry(data, "Northern Cardinal")
-    assert cardinal["best"]["id"] == ids["p2"]
-    assert [p["id"] for p in cardinal["photos"]] == [ids["p2"], ids["p1"]]
+    assert cardinal["best"]["id"] == ids["p1"]
+    assert cardinal["best"]["flag"] == "flagged"
+    assert cardinal["best_source"] == "pick"
+    assert [p["id"] for p in cardinal["photos"]] == [ids["p1"], ids["p2"]]
+    assert [p["flag"] for p in cardinal["photos"]] == ["flagged", "none"]
+
+
+def test_life_list_representative_stays_ahead_of_pick(life_app):
+    app, db, ids = life_app
+    db.update_photo_flag(ids["p2"], "flagged")
+
+    resp = app.test_client().post("/api/photo-preferences", json={
+        "purpose": "life_list",
+        "species": "Northern Cardinal",
+        "photo_id": ids["p1"],
+    })
+    assert resp.status_code == 200
+
+    cardinal = _entry(_get_life_list(app), "Northern Cardinal")
+    assert cardinal["best"]["id"] == ids["p1"]
+    assert cardinal["best"]["is_species_representative"] is True
+    assert cardinal["best_source"] == "representative"
+    assert [p["id"] for p in cardinal["photos"]] == [ids["p1"], ids["p2"]]
+    assert cardinal["photos"][1]["flag"] == "flagged"
 
 
 def test_life_list_photo_preference_overrides_best_photo(life_app):

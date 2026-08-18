@@ -15,7 +15,8 @@ drift, that case fails.
 
 It can't execute the actual shader headlessly, but it locks the *formula*:
 sRGB<->linear transfer, the highlight-knee rolloff, the white-balance gains and
-push-gate, and the display-space range/color controls — in the same order.
+push-gate, the perceptual-luminance range curves, and display-space color
+controls — in the same order.
 """
 
 import os
@@ -47,6 +48,22 @@ def test_shader_knee_constant_matches_tone():
     assert float(match.group(1)) == tone.HIGHLIGHT_KNEE
 
 
+def test_shader_range_curve_constants_match_tone():
+    with open(NAVBAR, encoding='utf-8') as f:
+        src = f.read()
+    expected_fragments = (
+        f"x / {tone.SHADOW_PIVOT:.2f}",
+        f"{tone.SHADOW_LIFT:.1f} * positive - "
+        f"{tone.SHADOW_DEEPEN:.2f} * negative",
+        f"x / {tone.BLACK_PIVOT:.2f}",
+        f"{tone.BLACK_PIVOT:.2f} * {tone.BLACK_LIFT:.2f} * positive",
+        f"{tone.BLACK_PIVOT:.2f} * {tone.BLACK_DEEPEN:.2f} * negative",
+        f"smoothstep(0.0, {tone.BLACK_CHROMA_FADE:.10f}, sourceLevel)",
+    )
+    for fragment in expected_fragments:
+        assert fragment in src, f"shader is missing tone.py constant: {fragment}"
+
+
 def _shader_mirror(
     c,
     exposure,
@@ -75,12 +92,53 @@ def _shader_mirror(
         r = KNEE + h * (o / (o + h))
         return np.where(x > KNEE, r, x)
 
-    def blend_range(rgb, amount, mask):
+    def shadow_level_curve(x, amount):
         a = amount / 100.0
-        m = abs(a) * mask
-        if a > 0:
-            return rgb + (1.0 - rgb) * m
-        return rgb - rgb * m
+        positive = max(a, 0.0)
+        negative = max(-a, 0.0)
+        t = np.clip(x / 0.65, 0.0, 1.0)
+        basis = t * (1.0 - t) ** 3
+        delta = 0.65 * basis * (3.0 * positive - 0.85 * negative)
+        return np.where(x < 0.65, x + delta, x)
+
+    def black_level_curve(x, amount):
+        a = amount / 100.0
+        positive = max(a, 0.0)
+        negative = max(-a, 0.0)
+        t = np.clip(x / 0.30, 0.0, 1.0)
+        shoulder = (1.0 - t) ** 2
+        lift = 0.30 * 0.40 * positive * shoulder
+        deepen = 0.30 * 0.90 * negative * t * shoulder
+        return np.where(x < 0.30, x + lift - deepen, x)
+
+    def apply_range_curves(range_lin):
+        luminance = range_lin @ np.array([0.2126, 0.7152, 0.0722])
+        level = linear_to_srgb(luminance)
+        source_level = level
+        level = shadow_level_curve(level, shadows)
+        level = 1.0 - shadow_level_curve(1.0 - level, -highlights)
+        level = black_level_curve(level, blacks)
+        level = 1.0 - black_level_curve(1.0 - level, -whites)
+        target = srgb_to_linear(np.clip(level, 0.0, 1.0))
+        mapped = np.where(
+            (luminance > 1e-7)[..., None],
+            range_lin * (target / np.maximum(luminance, 1e-7))[..., None],
+            target[..., None],
+        )
+        fade_t = np.clip(source_level / (4.0 / 255.0), 0.0, 1.0)
+        chroma_retention = fade_t * fade_t * (3.0 - 2.0 * fade_t)
+        chroma_retention *= chroma_retention
+        chroma_retention = np.where(target > luminance, chroma_retention, 1.0)
+        mapped = target[..., None] + (
+            mapped - target[..., None]
+        ) * chroma_retention[..., None]
+        max_channel = np.max(mapped, axis=-1)
+        denominator = np.maximum(max_channel - target, 1e-7)
+        chroma_scale = np.clip((1.0 - target) / denominator, 0.0, 1.0)
+        mapped = target[..., None] + (
+            mapped - target[..., None]
+        ) * chroma_scale[..., None]
+        return np.clip(mapped, 0.0, 1.0)
 
     def apply_vibrance(rgb, amount):
         a = amount / 100.0
@@ -102,16 +160,9 @@ def _shader_mirror(
         # which keeps the shoulder from darkening pixels below their natural
         # (unrolled) value — see the monotonicity note in apply_adjustments.
         lin = np.maximum(roll(lin), np.minimum(lin_pre, lin))
+    if shadows or highlights or blacks or whites:
+        lin = apply_range_curves(lin)
     disp = linear_to_srgb(lin)
-    range_luma = disp @ np.array([0.2126, 0.7152, 0.0722])
-    if shadows:
-        disp = blend_range(disp, shadows, (1.0 - tone.smoothstep(0.05, 0.65, range_luma))[..., None] * 0.48)
-    if highlights:
-        disp = blend_range(disp, highlights, tone.smoothstep(0.35, 0.95, range_luma)[..., None] * 0.42)
-    if blacks:
-        disp = blend_range(disp, blacks, (1.0 - tone.smoothstep(0.00, 0.30, range_luma))[..., None] * 0.34)
-    if whites:
-        disp = blend_range(disp, whites, tone.smoothstep(0.70, 1.00, range_luma)[..., None] * 0.34)
     disp = (disp - 0.5) * contrast + 0.5
     disp = apply_vibrance(disp, vibrance)
     luma = disp @ np.array([0.2126, 0.7152, 0.0722])

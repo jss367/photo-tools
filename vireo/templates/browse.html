@@ -10364,6 +10364,7 @@ document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') {
       if (openModal.id === 'batchKeywordModal') hideBatchKeywordModal();
       else if (openModal.id === 'batchCollectionModal') hideBatchCollectionModal();
+      else if (openModal.id === 'exportOverlay') closeExportModal();
       else openModal.classList.remove('open');
     }
     return;
@@ -11503,6 +11504,7 @@ async function _runPhotoDeepLink(photoId) {
 
 /* ---------- Export Modal ---------- */
 var exportRequestGeneration = 0;
+var _exportPhotoIds = null;
 
 function setExportControlsBusy(busy) {
   document.querySelectorAll('#exportOverlay input, #exportOverlay select, #exportOverlay button').forEach(function(control) {
@@ -11531,11 +11533,15 @@ function migrateExportCaptureDateTimePreference() {
   );
 }
 
-function openExportModal() {
-  var activeIds = getActiveSelection();
+function openExportModal(photoIds) {
+  var activeIds = Array.isArray(photoIds) ? photoIds.slice() : getActiveSelection();
   if (activeIds.length === 0) return;
   exportRequestGeneration++;
   setExportControlsBusy(false);
+  // Snapshot the requested photos for the lifetime of the modal. In
+  // particular, the lightbox menu exports the displayed photo even when the
+  // Browse grid has a different single- or multi-photo selection behind it.
+  _exportPhotoIds = activeIds;
   document.getElementById('exportSubmitBtn').textContent = 'Export ' + activeIds.length + ' photo' + (activeIds.length === 1 ? '' : 's');
   document.getElementById('exportSubmitBtn').disabled = false;
   document.getElementById('exportPreset').value = 'original-jpg';
@@ -11550,6 +11556,17 @@ function openExportModal() {
   VireoViewPreferences.restoreAll(document.getElementById('exportOverlay'));
   document.getElementById('exportOverlay').classList.add('open');
   updateExportPreview();
+}
+
+// The shared lightbox only offers photo export when its host page exposes
+// this capability. Other pages use openExportModal for unrelated exports
+// (for example Life List data), so the context menu must not key off that
+// generic function name.
+function openPhotoExportModal(photoIds) {
+  if (document.getElementById('lightboxOverlay').classList.contains('active')) {
+    closeLightbox();
+  }
+  openExportModal(photoIds);
 }
 
 function selectedExportMetadataFields() {
@@ -11568,6 +11585,7 @@ function closeExportModal() {
   exportRequestGeneration++;
   setExportControlsBusy(false);
   document.getElementById('exportOverlay').classList.remove('open');
+  _exportPhotoIds = null;
 }
 
 const exportFolderBrowser = new VireoFolderBrowser({
@@ -11667,8 +11685,12 @@ function updateExportPreview() {
   var template = document.getElementById('exportTemplate').value;
   if (!template) { document.getElementById('exportPreview').textContent = ''; return; }
   // Use first selected photo for preview
-  var firstId = getActiveSelection()[0];
+  var firstId = (_exportPhotoIds || getActiveSelection())[0];
   var photo = photos.find(function(p) { return p.id === firstId; });
+  // Find Similar and other shared-lightbox entry points can display photos
+  // outside Browse's currently loaded page. Their metadata remains available
+  // through the lightbox cache/list after the viewer closes for this modal.
+  if (!photo && typeof _lbPhotoData === 'function') photo = _lbPhotoData(firstId);
   if (!photo) { document.getElementById('exportPreview').textContent = ''; return; }
   var stem = photo.filename.replace(/\.[^.]+$/, '');
   var ts = photo.timestamp || '';
@@ -11729,7 +11751,7 @@ async function startExport() {
   var format = document.getElementById('exportFormat').value || 'jpg';
   var template = document.getElementById('exportTemplate').value || '{original}';
   var btn = document.getElementById('exportSubmitBtn');
-  var activeIds = getActiveSelection();
+  var activeIds = (_exportPhotoIds || getActiveSelection()).slice();
   var count = activeIds.length;
   var buttonLabel = 'Export ' + count + ' photo' + (count === 1 ? '' : 's');
   btn.disabled = true;

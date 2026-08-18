@@ -57,6 +57,24 @@ def test_editor_browse_nav_focuses_current_photo(live_server, page):
     expect(page.locator(f'.grid-card[data-id="{next_photo_id}"]')).to_be_visible()
 
 
+def test_editor_numbered_browse_shortcut_focuses_current_photo(live_server, page):
+    """The numbered pinned-tab shortcut preserves the editor photo context."""
+    url = live_server["url"]
+    photo_id = live_server["data"]["photos"][0]
+
+    page.goto(f"{url}/edit/{photo_id}")
+    page.wait_for_selector(".nav-tab[data-nav-id='browse']", timeout=3000)
+    browse_number = page.evaluate(
+        "() => window._navTabs.getTabs().indexOf('browse') + 1"
+    )
+    assert 1 <= browse_number <= 9
+
+    page.keyboard.press(f"ControlOrMeta+{browse_number}")
+
+    expect(page).to_have_url(f"{url}/browse?photo_id={photo_id}")
+    expect(page.locator(f'.grid-card[data-id="{photo_id}"]')).to_be_visible()
+
+
 def test_workspace_dropdown_shows_current(live_server, page):
     """Workspace dropdown displays the current workspace name."""
     url = live_server["url"]

@@ -180,6 +180,7 @@ def test_collect_workload_builds_deltas_targets_and_job_summary():
     assert summary["jobs"][0]["last_status"] == "completed"
     assert summary["jobs"][0]["duration"] == 42.0
     assert summary["jobs"][0]["observed_resource_wait_seconds"] == 2.5
+    assert summary["jobs"][0]["resource_wait_count"] == 2
 
 
 @pytest.mark.parametrize("argument", ["--duration", "--interval", "--timeout"])
@@ -1532,6 +1533,25 @@ def test_discovery_preserves_ipv6_family_for_loopback_listeners(listener_ip):
     server = discover_server(psutil_module=fake)
 
     assert server == {"pid": 4242, "url": "http://[::1]:50222"}
+
+
+def test_discovery_deduplicates_multiple_listeners_from_same_process():
+    proc = _FakeProc(4242, port=None)
+    proc.info = {
+        "pid": 4242, "name": "vireo-server",
+        "cmdline": ["vireo-server"], "create_time": 0,
+    }
+    proc.parents = lambda: []
+    proc.net_connections = lambda kind="tcp": [
+        _FakeConn(50222, ip="127.0.0.1"),
+        _FakeConn(50222, ip="::1"),
+    ]
+    fake = _FakePsutil([proc])
+    fake.process_iter = lambda attrs=None: iter([proc])
+
+    server = discover_server(psutil_module=fake)
+
+    assert server == {"pid": 4242, "url": "http://127.0.0.1:50222"}
 
 
 def test_url_only_discovery_accepts_loopback_hostname_for_local_listener():

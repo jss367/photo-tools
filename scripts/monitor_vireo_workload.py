@@ -596,6 +596,7 @@ def _job_summary(observations):
     # finish between polling intervals — must be tracked.
     baseline_terminal_ids = set()
     baseline_wait_by_id = {}
+    baseline_wait_count_by_id = {}
     if observations:
         _elapsed0, baseline_sample = observations[0]
         for job in baseline_sample.get("jobs", []):
@@ -607,6 +608,9 @@ def _job_summary(observations):
             else:
                 baseline_wait_by_id[job_id] = job.get(
                     "resource_wait_seconds", 0.0,
+                )
+                baseline_wait_count_by_id[job_id] = job.get(
+                    "resource_wait_count", 0,
                 )
     tracked_ids = {
         job.get("id")
@@ -634,6 +638,9 @@ def _job_summary(observations):
                 "first_resource_wait_seconds": baseline_wait_by_id.get(
                     job_id, 0.0,
                 ),
+                "first_resource_wait_count": baseline_wait_count_by_id.get(
+                    job_id, 0,
+                ),
             })
             record.update({
                 "last_observed_seconds": round(elapsed, 3),
@@ -641,7 +648,7 @@ def _job_summary(observations):
                 "finished_at": job.get("finished_at"),
                 "duration": job.get("duration"),
                 "last_resource_wait_seconds": job.get("resource_wait_seconds", 0.0),
-                "resource_wait_count": job.get("resource_wait_count", 0),
+                "last_resource_wait_count": job.get("resource_wait_count", 0),
             })
             progress = job.get("progress") or {}
             if progress:
@@ -651,6 +658,10 @@ def _job_summary(observations):
             record.pop("last_resource_wait_seconds")
             - record.pop("first_resource_wait_seconds"),
             4,
+        )
+        record["resource_wait_count"] = (
+            record.pop("last_resource_wait_count")
+            - record.pop("first_resource_wait_count")
         )
     return sorted(jobs.values(), key=lambda job: (job["first_observed_seconds"], job["id"]))
 
@@ -1167,8 +1178,12 @@ def discover_server(
         hint = " Pass --pid and --url explicitly." if requested_pid or requested_url else ""
         raise RuntimeError(f"no listening local vireo-server found.{hint}")
     candidates.sort(key=lambda item: item["started"], reverse=True)
-    unique = {(item["pid"], item["url"]): item for item in candidates}
-    candidates = list(unique.values())
+    # One process may expose several sockets (for example IPv4 and IPv6).
+    # That is one Vireo instance, not an ambiguity requiring --pid/--url.
+    unique_by_pid = {}
+    for item in candidates:
+        unique_by_pid.setdefault(item["pid"], item)
+    candidates = list(unique_by_pid.values())
     if len(candidates) > 1:
         choices = ", ".join(
             f"PID {item['pid']} at {item['url']}" for item in candidates

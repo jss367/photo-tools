@@ -100,7 +100,7 @@ def test_linux_ext4_removable_disk_is_serialized(tmp_path, monkeypatch):
         return device_number == "8:17"
 
     monkeypatch.setattr(
-        source_scan_policy, "_linux_device_is_removable", removable,
+        source_scan_policy, "_linux_device_is_external", removable,
     )
 
     policy = source_scan_policy.classify_sources(
@@ -122,8 +122,25 @@ def test_linux_removable_metadata_can_live_on_partition_parent(
         source_scan_policy.os.path, "realpath", lambda _path: str(partition),
     )
 
-    assert source_scan_policy._linux_device_is_removable(
+    assert source_scan_policy._linux_device_is_external(
         "8:17", str(tmp_path / "dev" / "block"),
+    ) is True
+
+
+def test_linux_external_usb_disk_is_detected_when_removable_is_zero(
+        tmp_path, monkeypatch):
+    device = (
+        tmp_path / "devices" / "pci0000:00" / "usb2" / "2-1"
+        / "block" / "sdb"
+    )
+    device.mkdir(parents=True)
+    (device / "removable").write_text("0\n")
+    monkeypatch.setattr(
+        source_scan_policy.os.path, "realpath", lambda _path: str(device),
+    )
+
+    assert source_scan_policy._linux_device_is_external(
+        "8:16", str(tmp_path / "dev" / "block"),
     ) is True
 
 

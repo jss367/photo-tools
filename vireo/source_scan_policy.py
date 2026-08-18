@@ -176,27 +176,48 @@ def _darwin_policies(paths, run):
     return policies
 
 
-def _linux_device_is_removable(device_number, sys_dev_block):
-    """Read the block device's sysfs flag, including a partition's parent."""
+def _linux_device_is_external(device_number, sys_dev_block):
+    """Detect removable media or an externally attached block device."""
     try:
         current = os.path.realpath(os.path.join(sys_dev_block, device_number))
     except (OSError, TypeError, ValueError):
         return None
+    # USB HDDs/SSDs commonly report removable=0 because their *media* is not
+    # removable from the enclosure. Their resolved sysfs ancestry still names
+    # the external transport, which is the concurrency distinction we need.
+    components = current.replace("\\", "/").lower().split("/")
+    if any(
+        component in {"usb", "thunderbolt", "firewire", "ieee1394"}
+        or (component.startswith("usb") and component[3:].isdigit())
+        for component in components
+    ):
+        return True
     # A partition (for example sdb1) usually carries the flag on its parent
     # disk (sdb), so walk a bounded number of metadata-only sysfs ancestors.
+    saw_removable_flag = False
     for _ in range(12):
         try:
             with open(os.path.join(current, "removable"), encoding="ascii") as flag:
                 value = flag.read().strip()
         except OSError:
             value = ""
-        if value in {"0", "1"}:
-            return value == "1"
+        if value == "1":
+            return True
+        if value == "0":
+            saw_removable_flag = True
+        try:
+            subsystem = os.path.basename(
+                os.path.realpath(os.path.join(current, "subsystem")),
+            ).lower()
+        except (OSError, TypeError, ValueError):
+            subsystem = ""
+        if subsystem in {"usb", "thunderbolt", "firewire", "ieee1394"}:
+            return True
         parent = os.path.dirname(current)
         if parent == current:
             break
         current = parent
-    return None
+    return False if saw_removable_flag else None
 
 
 def _linux_mounts(mountinfo_path, sys_dev_block):
@@ -216,7 +237,7 @@ def _linux_mounts(mountinfo_path, sys_dev_block):
                     "volume_key": "linux:" + left_fields[2],
                     "mount_point": _unescape_mount_path(left_fields[4]),
                     "fs_type": right_fields[0],
-                    "removable": _linux_device_is_removable(
+                    "removable": _linux_device_is_external(
                         left_fields[2], sys_dev_block,
                     ),
                 })

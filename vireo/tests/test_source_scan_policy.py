@@ -130,11 +130,13 @@ def test_linux_removable_metadata_can_live_on_partition_parent(
 def test_linux_external_usb_disk_is_detected_when_removable_is_zero(
         tmp_path, monkeypatch):
     device = (
-        tmp_path / "devices" / "pci0000:00" / "usb2" / "2-1"
+        tmp_path / "devices" / "pci0000-00" / "usb2" / "2-1"
         / "block" / "sdb"
     )
-    device.mkdir(parents=True)
-    (device / "removable").write_text("0\n")
+    # Transport detection is intentionally based on the resolved sysfs path,
+    # so this pure path fixture needs no Linux-only colon names or symlinks.
+    # Once the USB ancestry is found, a media-removable value of zero cannot
+    # downgrade it to internal storage.
     monkeypatch.setattr(
         source_scan_policy.os.path, "realpath", lambda _path: str(device),
     )

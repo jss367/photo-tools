@@ -6278,25 +6278,32 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             photo_ids = [p["id"] for p in results["photos"]]
             # Chunked: cached pipeline results can span the whole workspace,
             # exceeding SQLite's bound-parameter cap in one IN clause.
-            flag_map = {}
+            live_photo_map = {}
             for chunk in _chunked(photo_ids):
                 placeholders = ",".join("?" for _ in chunk)
                 rows = db.conn.execute(
-                    f"SELECT id, flag, rating FROM photos WHERE id IN ({placeholders})",
+                    f"""SELECT id, flag, rating,
+                               eye_x, eye_y, eye_conf, eye_tenengrad
+                          FROM photos WHERE id IN ({placeholders})""",
                     chunk,
                 ).fetchall()
-                flag_map.update({r["id"]: (r["flag"], r["rating"]) for r in rows})
+                live_photo_map.update({r["id"]: r for r in rows})
             for p in results["photos"]:
-                f, r = flag_map.get(p["id"], ("none", 0))
-                p["flag"] = f
-                p["rating"] = r
+                live = live_photo_map.get(p["id"])
+                p["flag"] = live["flag"] if live else "none"
+                p["rating"] = live["rating"] if live else 0
+                if live:
+                    p["eye_x"] = live["eye_x"]
+                    p["eye_y"] = live["eye_y"]
+                    p["eye_conf"] = live["eye_conf"]
+                    p["eye_tenengrad"] = live["eye_tenengrad"]
             # Overlay representative state onto the cached results so
             # pipeline cards render the badge after a page reload. The
             # cache is written before eligibility runs (and by pipeline
             # runs that predate the badge), so is_species_representative
             # is otherwise absent and every card renders unbadged even
             # when the DB says the photo is the species rep. The flag
-            # overlay above is what makes this call correct — the shared
+            # live overlay above is what makes this call correct — the shared
             # attacher short-circuits rejected photos, and the overlay
             # ensures p["flag"] reflects the live DB, not a stale cache.
             _attach_species_representatives(db, results["photos"])

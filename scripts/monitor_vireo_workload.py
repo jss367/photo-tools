@@ -289,10 +289,10 @@ class ProcessTreeSampler:
             "command_name": os.path.basename(command[0]) if command else None,
         }
 
-    def metadata(self):
-        self._assert_root_alive()
+    def _metadata_snapshot(self, *, identity_verified):
         return {
             **self._metadata,
+            "identity_verified": identity_verified,
             "initial_rss_bytes": self._initial_rss_bytes,
             "initial_executable_exists": self._initial_executable_exists,
             "cpu_accounting_complete": self._cpu_accounting_complete,
@@ -300,6 +300,14 @@ class ProcessTreeSampler:
                 os.path.exists(self.executable) if self.executable else None
             ),
         }
+
+    def metadata(self):
+        self._assert_root_alive()
+        return self._metadata_snapshot(identity_verified=True)
+
+    def metadata_unverified(self):
+        """Return diagnostics after a late identity check has failed."""
+        return self._metadata_snapshot(identity_verified=False)
 
     def _assert_root_alive(self):
         try:
@@ -679,6 +687,10 @@ def build_summary(baseline, samples, *, process_metadata=None):
     )
     if process_metadata and "executable_exists" in process_metadata:
         executable_states.append(process_metadata["executable_exists"])
+    if process_metadata and process_metadata.get("identity_verified") is False:
+        # A late exit/replacement means process presence was not verified for
+        # the complete run even if the executable path still exists on disk.
+        executable_states.append(False)
     if not executable_states or any(state is False for state in executable_states):
         executable_present = False
     elif all(state is True for state in executable_states):
@@ -770,7 +782,23 @@ def collect_workload(
             elapsed = monotonic() - started
             process_sample = process_sampler.sample()
             system_sample = system_sampler.sample()
-            api_sample = api_client.sample()
+            try:
+                api_sample = api_client.sample()
+            except KeyboardInterrupt:
+                interrupted = True
+                api_sample = {
+                    "status": None,
+                    "latency_seconds": None,
+                    "error": "interrupted during GET /api/jobs",
+                }
+                samples.append({
+                    "captured_at": _utc_now(),
+                    "elapsed_seconds": round(elapsed, 3),
+                    "process": process_sample,
+                    "system": system_sample,
+                    "api": api_sample,
+                })
+                break
             # The API request can outlive the selected process. Recheck after
             # it completes so a replacement server on the same URL cannot
             # contribute the terminal Jobs payload to the original PID's
@@ -804,24 +832,26 @@ def collect_workload(
             next_sample = min(next_sample, deadline)
     except KeyboardInterrupt:
         interrupted = True
-    if not samples:
-        process_sample = process_sampler.sample()
-        system_sample = system_sampler.sample()
-        api_sample = api_client.sample()
-        process_sampler.verify_identity()
-        samples.append({
-            "captured_at": _utc_now(),
-            "elapsed_seconds": round(monotonic() - started, 3),
-            "process": process_sample,
-            "system": system_sample,
-            "api": api_sample,
-        })
-    process_metadata = process_sampler.metadata()
+    process_exit_error = None
+    try:
+        process_metadata = process_sampler.metadata()
+    except RuntimeError as exc:
+        # Samples whose post-request identity checks succeeded remain valid.
+        # Preserve a long-running report if the process exits only between the
+        # last accepted poll and final metadata collection.
+        process_exit_error = str(exc)
+        metadata_unverified = getattr(
+            process_sampler,
+            "metadata_unverified",
+            lambda: {"identity_verified": False},
+        )
+        process_metadata = metadata_unverified()
     return {
         "schema_version": SCHEMA_VERSION,
         "started_at": started_at,
         "finished_at": _utc_now(),
         "interrupted": interrupted,
+        "process_exit_error": process_exit_error,
         "requested_duration_seconds": duration,
         "interval_seconds": interval,
         "process": process_metadata,
@@ -985,9 +1015,10 @@ def discover_server(
                 host = connection.laddr.ip
                 if host in {"0.0.0.0", "::", "::1"}:
                     host = "127.0.0.1"
+                url_host = f"[{host}]" if ":" in host else host
                 candidates.append({
                     "pid": process.pid,
-                    "url": f"http://{host}:{port}",
+                    "url": f"http://{url_host}:{port}",
                     "started": process.info.get("create_time") or 0,
                 })
         except (OSError, psutil_module.Error):

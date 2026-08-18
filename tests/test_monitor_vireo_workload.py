@@ -620,6 +620,100 @@ def test_process_identity_is_rechecked_after_terminal_api_poll():
         )
 
 
+def test_interrupted_api_poll_retains_resource_sample_and_marks_failure():
+    clock = _FakeClock()
+
+    class _InterruptedApi:
+        def __init__(self):
+            self.calls = 0
+
+        def authenticate(self):
+            pass
+
+        def sample(self):
+            self.calls += 1
+            if self.calls == 2:
+                raise KeyboardInterrupt
+            return _api_sample(
+                latency=0.001, wait_count=0, wait_seconds=0.0,
+                producer_starts=0, waiter_joins=0,
+            )
+
+    process = _SequenceSampler(
+        [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True}],
+        {"pid": 123, "executable_exists": True},
+    )
+    system = _SequenceSampler(
+        [{"cpu_idle_percent": 50.0}],
+        {"logical_cpu_count": 16},
+    )
+
+    report = collect_workload(
+        duration=1.0,
+        interval=1.0,
+        api_client=_InterruptedApi(),
+        process_sampler=process,
+        system_sampler=system,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert report["interrupted"] is True
+    assert len(report["samples"]) == 1
+    assert report["samples"][0]["process"]["cpu_percent"] == 100.0
+    assert report["samples"][0]["api"]["error"].startswith("interrupted")
+    assert report["summary"]["api_failure_count"] == 1
+    assert report["summary"]["targets"]["jobs_api_p95_below_500ms"] is False
+
+
+def test_late_process_exit_preserves_report_and_fails_trust_gate():
+    clock = _FakeClock()
+    api = _SequenceApi([
+        _api_sample(
+            latency=0.001, wait_count=0, wait_seconds=0.0,
+            producer_starts=0, waiter_joins=0,
+        ),
+        _api_sample(
+            latency=0.001, wait_count=0, wait_seconds=0.0,
+            producer_starts=0, waiter_joins=0,
+        ),
+    ])
+
+    class _LateExitSampler(_SequenceSampler):
+        def metadata(self):
+            raise RuntimeError("monitored Vireo PID 123 exited")
+
+        def metadata_unverified(self):
+            return {
+                "pid": 123,
+                "identity_verified": False,
+                "executable_exists": True,
+            }
+
+    process = _LateExitSampler(
+        [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True}],
+        {},
+    )
+    system = _SequenceSampler(
+        [{"cpu_idle_percent": 50.0}],
+        {"logical_cpu_count": 16},
+    )
+
+    report = collect_workload(
+        duration=1.0,
+        interval=1.0,
+        api_client=api,
+        process_sampler=process,
+        system_sampler=system,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert report["process_exit_error"] == "monitored Vireo PID 123 exited"
+    assert len(report["samples"]) == 1
+    assert report["summary"]["targets"]["vireo_executable_present_throughout"] is False
+
+
 def test_latency_target_fails_when_api_samples_fail():
     """A run with one fast success and one long timeout used to report
     ``jobs_api_p95_below_500ms: true`` because failed requests were excluded
@@ -1183,6 +1277,21 @@ def test_url_only_discovery_rejects_host_that_local_listener_does_not_serve():
             psutil_module=fake,
             resolver=resolver,
         )
+
+
+def test_discovery_brackets_specific_ipv6_listener_address():
+    proc = _FakeProc(4242, port=50222, listener_ip="2001:db8::1")
+    proc.info = {
+        "pid": 4242, "name": "vireo-server",
+        "cmdline": ["vireo-server"], "create_time": 0,
+    }
+    proc.parents = lambda: []
+    fake = _FakePsutil([proc])
+    fake.process_iter = lambda attrs=None: iter([proc])
+
+    server = discover_server(psutil_module=fake)
+
+    assert server == {"pid": 4242, "url": "http://[2001:db8::1]:50222"}
 
 
 def test_url_only_discovery_accepts_loopback_hostname_for_local_listener():

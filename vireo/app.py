@@ -19579,6 +19579,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     # and `app.run(threaded=True)` two concurrent requests can read the same
     # snapshot and the later writer drops the earlier change.
     _settings_write_lock = threading.Lock()
+    _inat_token_request_generation = 0
 
     @app.route("/api/settings/global", methods=["PATCH"])
     def api_settings_global_patch():
@@ -23806,6 +23807,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/inat/token", methods=["POST"])
     def api_inat_save_token():
         """Validate and save an iNaturalist token from the submission modal."""
+        nonlocal _inat_token_request_generation
+
         import config as cfg
         import inat
 
@@ -23813,6 +23816,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         token = str(body.get("token") or "").strip()
         if not token:
             return json_error("Token is required")
+        with _settings_write_lock:
+            _inat_token_request_generation += 1
+            request_generation = _inat_token_request_generation
         try:
             user = inat.validate_token(token)
         except inat.InatApiError as exc:
@@ -23823,7 +23829,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # Preserve the raw config shape instead of writing cfg.load(), which
         # would pin every default into config.json.  Invalid tokens never reach
         # disk; validation and persistence are one user action in this flow.
+        # Only the newest validation request may persist: remote validation can
+        # finish out of order when a modal is closed and reopened, and an older
+        # response must not overwrite the token chosen by the newer flow.
         with _settings_write_lock:
+            if request_generation != _inat_token_request_generation:
+                return json_error(
+                    "A newer token validation superseded this request", 409,
+                )
             raw = _read_raw_config_file()
             raw["inat_token"] = token
             cfg.save(raw)

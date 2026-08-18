@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 
 import pytest
 
@@ -407,6 +408,42 @@ def test_api_inat_token_does_not_save_invalid_value(app_and_db):
 
     assert resp.status_code == 401
     assert cfg.load()["inat_token"] == "previous-token"
+
+
+def test_api_inat_token_only_saves_latest_overlapping_request(app_and_db):
+    app, _db, _pid = app_and_db
+    import config as cfg
+
+    old_started = threading.Event()
+    release_old = threading.Event()
+    responses = {}
+
+    def validate(token):
+        if token == "older-token":
+            old_started.set()
+            assert release_old.wait(timeout=5)
+            return {"login": "older-user"}
+        return {"login": "newer-user"}
+
+    def send_old_request():
+        responses["old"] = app.test_client().post(
+            "/api/inat/token", json={"token": "older-token"},
+        )
+
+    with patch("inat.validate_token", side_effect=validate):
+        old_thread = threading.Thread(target=send_old_request)
+        old_thread.start()
+        assert old_started.wait(timeout=5)
+        newer = app.test_client().post(
+            "/api/inat/token", json={"token": "newer-token"},
+        )
+        release_old.set()
+        old_thread.join(timeout=5)
+
+    assert not old_thread.is_alive()
+    assert newer.status_code == 200
+    assert responses["old"].status_code == 409
+    assert cfg.load()["inat_token"] == "newer-token"
 
 
 def test_api_inat_export_uses_only_checked_metadata(app_and_db, tmp_path):

@@ -1089,7 +1089,7 @@ function updateEditorZoomControl() {
   var hasPhoto = !!editorState.photoId && !!editorState.photo;
   var disabled = !hasPhoto || !!editorState.loading;
   var fit = editorFitZoomPercent();
-  var combinedFitActual = fit >= 99.5 && editorFitUsesNativeRender();
+  var combinedFitActual = fit >= 100 && editorFitUsesNativeRender();
   var percent = editorState.zoomMode === 'fit' ? fit : editorState.zoomPercent;
   var text = editorZoomText();
 
@@ -3012,10 +3012,13 @@ function initCropDrag() {
     editorState.drag = null;
   });
   window.addEventListener('resize', function() {
-    var clampedCustomZoom = editorClampCustomZoomToFit();
+    editorClampCustomZoomToFit();
     applyEditorZoom();
     updateEditorZoomControl();
-    if (clampedCustomZoom && editorState.photoId && !editorState.loading) {
+    // Fit can cross into a larger source-render bucket when the viewport
+    // grows. The debounced preview update is a no-op when the URL is already
+    // correct, so also schedule it when no custom-zoom clamp was needed.
+    if (editorState.photoId && !editorState.loading) {
       schedulePreview();
     }
     renderCropBox();

@@ -314,6 +314,9 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
     assert stale_ratio == {"width": 3000, "height": 4000}
 
     page.set_viewport_size({"width": 5000, "height": 4000})
+    page.wait_for_function(
+        "() => document.getElementById('editorImg').src.includes('size=4000')"
+    )
     native_stop = page.evaluate(
         """() => {
             updateEditorZoomControl();
@@ -328,11 +331,32 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
             return result;
         }"""
     )
+    near_native_stop = page.evaluate(
+        """() => {
+            const wrap = document.getElementById('editorCanvasWrap');
+            const style = getComputedStyle(wrap);
+            const availableW = wrap.clientWidth - parseFloat(style.paddingLeft) -
+                parseFloat(style.paddingRight);
+            editorState.photo.width = availableW / 0.9975;
+            editorState.photo.height = editorState.photo.width * 0.75;
+            updateEditorZoomControl();
+            const result = {
+                fit: editorFitZoomPercent(),
+                actualDisplay: document.getElementById('actualBtn').style.display
+            };
+            editorState.photo.width = 4000;
+            editorState.photo.height = 3000;
+            updateEditorZoomControl();
+            return result;
+        }"""
+    )
     page.set_viewport_size({"width": 2000, "height": 1000})
     assert native_stop["fit"] == 100
     assert native_stop["renderSize"] == 4000
     assert native_stop["actualDisplay"] == "none"
     assert native_stop["fitLabel"] == "Fit · 100%"
+    assert 99.5 < near_native_stop["fit"] < 100
+    assert near_native_stop["actualDisplay"] != "none"
 
     one_axis = page.evaluate(
         """() => {

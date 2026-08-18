@@ -206,6 +206,58 @@ def test_photo_editor_search_revert_to_in_flight_query_refetches(live_server, pa
     expect(page.locator("#editorSearchStatus")).to_have_text("1 match")
 
 
+def test_photo_editor_100_percent_keeps_edits_panel_scrollable(live_server, page):
+    """A native-size image must scroll inside the stage, not grow the grid row."""
+    url = live_server["url"]
+    hawk_id = live_server["data"]["photos"][0]
+    preview_svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' width='6000' height='4000'>"
+        "<rect width='6000' height='4000' fill='green'/>"
+        "</svg>"
+    )
+
+    page.set_viewport_size({"width": 1400, "height": 800})
+    page.route(
+        "**/photos/*/edit-preview**",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="image/svg+xml",
+            body=preview_svg,
+        ),
+    )
+    page.goto(f"{url}/edit/{hawk_id}")
+    expect(page.locator("#editorFilename")).to_have_text("hawk1.jpg")
+    page.wait_for_function(
+        "() => document.getElementById('editorImg').naturalWidth > 0"
+    )
+
+    page.locator("#actualBtn").click()
+    page.wait_for_function(
+        "() => document.getElementById('editorCanvasWrap')"
+        ".classList.contains('zoom-actual')"
+    )
+
+    layout = page.evaluate(
+        """() => {
+            const shell = document.querySelector('.editor-shell');
+            const panel = document.querySelector('.editor-panel');
+            const canvas = document.querySelector('.editor-canvas-wrap');
+            return {
+                shellClientHeight: shell.clientHeight,
+                shellScrollHeight: shell.scrollHeight,
+                panelClientHeight: panel.clientHeight,
+                panelScrollHeight: panel.scrollHeight,
+                canvasClientHeight: canvas.clientHeight,
+                canvasScrollHeight: canvas.scrollHeight,
+            };
+        }"""
+    )
+
+    assert layout["shellScrollHeight"] == layout["shellClientHeight"]
+    assert layout["panelScrollHeight"] > layout["panelClientHeight"]
+    assert layout["canvasScrollHeight"] > layout["canvasClientHeight"]
+
+
 def test_photo_editor_crop_lock_keeps_current_aspect(live_server, page):
     """The crop ratio lock should preserve the current crop aspect while resizing."""
     url = live_server["url"]

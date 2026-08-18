@@ -997,6 +997,7 @@ def test_api_photo_detail_includes_on_disk_path(app_and_db):
     data = resp.get_json()
     assert 'path' in data, "photo detail should expose full on-disk path"
     assert data['path'] == expected_path
+    assert data['folder_name'] == _os.path.basename(folder_row['path'])
 
 
 def test_photo_detail_life_list_lists_eligible_species(app_and_db):
@@ -1010,6 +1011,7 @@ def test_photo_detail_life_list_lists_eligible_species(app_and_db):
     db.tag_photo(pid, kid)
 
     data = client.get(f"/api/photos/{pid}").get_json()
+    assert data["species"] == ["American Robin"]
     assert data["life_list"] == [
         {
             "species": "American Robin",
@@ -4063,6 +4065,8 @@ def test_photo_editor_page_renders(client_with_photo):
     assert "Photo Editor" in html
     assert "Edit History" in html
     assert "Save Changes" in html
+    assert "Export&hellip;" in html
+    assert "Export Photo" in html
     assert "Feedback" in html
     assert "histogramCanvas" in html
     assert "shadowClipValue" in html

@@ -33,6 +33,76 @@ def test_navbar_links_navigate_to_browse(live_server, page):
     expect(page).to_have_url(f"{url}/browse")
 
 
+def test_editor_browse_nav_focuses_current_photo(live_server, page):
+    """Browse navigation from Edit carries the photo being edited."""
+    url = live_server["url"]
+    photo_id = live_server["data"]["photos"][0]
+    next_photo_id = live_server["data"]["photos"][1]
+
+    page.goto(f"{url}/edit/{photo_id}")
+    expect(page.locator("#editorFilename")).to_have_text("hawk1.jpg")
+
+    # The editor changes photos in place, so verify the Browse target follows
+    # the current photo instead of retaining the route used on first render.
+    page.evaluate("photoId => loadPhoto(photoId)", next_photo_id)
+    expect(page).to_have_url(f"{url}/edit/{next_photo_id}")
+
+    browse_link = page.locator("[data-testid='nav-browse']")
+    expect(browse_link).to_have_attribute(
+        "href", f"/browse?photo_id={next_photo_id}"
+    )
+    browse_link.click()
+
+    expect(page).to_have_url(f"{url}/browse?photo_id={next_photo_id}")
+    expect(page.locator(f'.grid-card[data-id="{next_photo_id}"]')).to_be_visible()
+
+
+def test_editor_numbered_browse_shortcut_focuses_current_photo(live_server, page):
+    """The numbered pinned-tab shortcut preserves the editor photo context."""
+    url = live_server["url"]
+    photo_id = live_server["data"]["photos"][0]
+
+    page.goto(f"{url}/edit/{photo_id}")
+    page.wait_for_selector(".nav-tab[data-nav-id='browse']", timeout=3000)
+    browse_number = page.evaluate(
+        "() => window._navTabs.getTabs().indexOf('browse') + 1"
+    )
+    assert 1 <= browse_number <= 9
+
+    page.keyboard.press(f"ControlOrMeta+{browse_number}")
+
+    expect(page).to_have_url(f"{url}/browse?photo_id={photo_id}")
+    expect(page.locator(f'.grid-card[data-id="{photo_id}"]')).to_be_visible()
+
+
+def test_closing_ephemeral_editor_into_browse_focuses_current_photo(
+    live_server, page
+):
+    """Closing an ephemeral Edit tab preserves context when Browse is adjacent."""
+    url = live_server["url"]
+    photo_id = live_server["data"]["photos"][0]
+
+    page.goto(f"{url}/edit/{photo_id}")
+    page.wait_for_selector(".nav-tab[data-nav-id='edit'].is-ephemeral", timeout=3000)
+    page.wait_for_selector(".nav-tab[data-nav-id='browse']", timeout=3000)
+    page.evaluate(
+        """async () => {
+            const tabs = window._navTabs.getTabs();
+            const reordered = tabs.filter(id => id !== 'browse');
+            reordered.push('browse');
+            await window._navTabs.setTabs(reordered);
+        }"""
+    )
+    page.wait_for_function(
+        "() => window._navTabs.getTabs().at(-1) === 'browse'"
+    )
+
+    page.locator(".nav-tab[data-nav-id='edit'] .nav-tab-close").click()
+
+    expect(page).to_have_url(f"{url}/browse?photo_id={photo_id}")
+    expect(page.locator(f'.grid-card[data-id="{photo_id}"]')).to_be_visible()
+
+
 def test_workspace_dropdown_shows_current(live_server, page):
     """Workspace dropdown displays the current workspace name."""
     url = live_server["url"]

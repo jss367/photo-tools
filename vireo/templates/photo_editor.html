@@ -130,6 +130,73 @@ body {
   border-color: var(--accent);
   font-weight: 600;
 }
+.editor-zoom-control {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.editor-zoom-step {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  padding: 0;
+  border: 1px solid var(--border-secondary);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+}
+.editor-zoom-step:hover { border-color: var(--accent); }
+.editor-zoom-step:disabled { opacity: 0.45; cursor: default; }
+.editor-zoom-track {
+  position: relative;
+  width: 150px;
+  padding-bottom: 17px;
+}
+.editor-zoom-slider {
+  display: block;
+  width: 100%;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.editor-zoom-slider:disabled { cursor: default; }
+.editor-zoom-stop,
+.editor-zoom-max {
+  position: absolute;
+  bottom: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.editor-zoom-stop { cursor: pointer; }
+.editor-zoom-stop:hover { color: var(--text-primary); }
+.editor-zoom-stop.active { color: var(--accent); font-weight: 600; }
+.editor-zoom-stop:disabled { opacity: 0.45; cursor: default; }
+.editor-zoom-stop-fit { left: 0; }
+.editor-zoom-stop-actual { transform: translateX(-50%); }
+.editor-zoom-max { right: 0; }
+.editor-zoom-value {
+  width: 65px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.editor-zoom-step:focus-visible,
+.editor-zoom-stop:focus-visible,
+.editor-zoom-slider:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .editor-canvas-wrap {
   min-height: 0;
   overflow: auto;
@@ -138,7 +205,7 @@ body {
   justify-content: center;
   padding: 24px;
 }
-.editor-canvas-wrap.zoom-actual {
+.editor-canvas-wrap.zoom-custom {
   align-items: flex-start;
   justify-content: flex-start;
   cursor: grab;
@@ -162,9 +229,13 @@ body {
   max-height: 100%;
   line-height: 0;
 }
-.editor-canvas-wrap.zoom-actual .editor-canvas {
+.editor-canvas-wrap.zoom-custom .editor-canvas {
   max-width: none;
   max-height: none;
+  /* Auto margins consume spare room independently on each flex axis, while
+     collapsing to zero on an overflowing axis. This keeps the image centered
+     on the axis that still fits without making overflow unreachable. */
+  margin: auto;
 }
 .editor-canvas.show-before .crop-box { pointer-events: none; }
 #editorImg {
@@ -176,7 +247,7 @@ body {
   background: #111;
   user-select: none;
 }
-.editor-canvas-wrap.zoom-actual #editorImg {
+.editor-canvas-wrap.zoom-custom #editorImg {
   max-width: none;
   max-height: none;
 }
@@ -498,8 +569,17 @@ body {
       </div>
       <div class="editor-status" id="editorStatus"></div>
       <button class="editor-btn" id="beforeBtn" type="button" onclick="toggleBeforePreview()">Before</button>
-      <button class="editor-btn" id="fitBtn" type="button" onclick="setZoomMode('fit')">Fit</button>
-      <button class="editor-btn" id="actualBtn" type="button" onclick="setZoomMode('actual')">100%</button>
+      <div class="editor-zoom-control" role="group" aria-label="Zoom controls">
+        <button class="editor-zoom-step" id="editorZoomOut" type="button" onclick="stepEditorZoom(-1)" aria-label="Zoom out" title="Zoom out">&minus;</button>
+        <div class="editor-zoom-track">
+          <input class="editor-zoom-slider" id="editorZoomSlider" type="range" min="0" max="1000" step="1" value="0" aria-label="Zoom level" aria-valuetext="Fit" oninput="setEditorZoomFromSlider(this.value)">
+          <button class="editor-zoom-stop editor-zoom-stop-fit" id="fitBtn" type="button" onclick="setEditorZoomToFit()">Fit</button>
+          <button class="editor-zoom-stop editor-zoom-stop-actual" id="actualBtn" type="button" onclick="setEditorZoomToActual()">100%</button>
+          <span class="editor-zoom-max">400%</span>
+        </div>
+        <button class="editor-zoom-step" id="editorZoomIn" type="button" onclick="stepEditorZoom(1)" aria-label="Zoom in" title="Zoom in">+</button>
+        <output class="editor-zoom-value" id="editorZoomValue">Fit</output>
+      </div>
       <button class="editor-btn" id="copySettingsBtn" type="button" onclick="copyEditSettings()" title="Copy these edit settings to paste onto other photos">Copy Settings</button>
       <button class="editor-btn" id="resetAllBtn" type="button" onclick="resetAllEdits()">Reset All</button>
       <button class="editor-btn primary" id="saveBtn" type="button" onclick="saveRecipe()" disabled>Save Changes</button>
@@ -819,6 +899,7 @@ var editorState = {
   spacePan: false,
   showBefore: false,
   zoomMode: 'fit',
+  zoomPercent: 100,
   cropAspect: null,
   navIds: [],
   baseNavIds: [],
@@ -848,6 +929,7 @@ function setEditorLoading(loading) {
   if (resetAll) resetAll.disabled = !!loading;
   var copyBtn = document.getElementById('copySettingsBtn');
   if (copyBtn) copyBtn.disabled = !!loading;
+  updateEditorZoomControl();
   updateAspectButtons();
 }
 
@@ -880,8 +962,6 @@ function setButtonDisabled(id, disabled) {
 
 function updateFeedbackControls() {
   setButtonActive('beforeBtn', editorState.showBefore);
-  setButtonActive('fitBtn', editorState.zoomMode === 'fit');
-  setButtonActive('actualBtn', editorState.zoomMode === 'actual');
   var beforeBtn = document.getElementById('beforeBtn');
   if (beforeBtn) beforeBtn.textContent = editorState.showBefore ? 'After' : 'Before';
   var canvas = document.getElementById('editorCanvas');
@@ -890,19 +970,268 @@ function updateFeedbackControls() {
   if (note) {
     note.textContent = editorState.showBefore ? 'Approximate saved preview' : 'Approximate current preview';
   }
+  updateEditorZoomControl();
   updateAspectButtons();
 }
 
-function setZoomMode(mode) {
-  var next = mode === 'actual' ? 'actual' : 'fit';
-  var changed = next !== editorState.zoomMode;
-  editorState.zoomMode = next;
+var EDITOR_MAX_ZOOM_PERCENT = 400;
+
+function editorZoomRecipe() {
+  return editorState.showBefore ? editorState.savedRecipe : editorState.recipe;
+}
+
+function editorImageMatchesZoomRecipe(img) {
+  if (!img || !editorState.photoId) return false;
+  try {
+    var url = new URL(img.currentSrc || img.src, window.location.href);
+    if (url.pathname !== '/photos/' + editorState.photoId + '/edit-preview') {
+      return false;
+    }
+    var loadedRecipe = JSON.parse(url.searchParams.get('recipe') || '{}');
+    return recipeKey(loadedRecipe) ===
+      recipeKey(previewRecipeFor(editorZoomRecipe() || {}));
+  } catch (_) {
+    return false;
+  }
+}
+
+function editorNativeDisplayDimensions() {
+  var photo = editorState.photo || {};
+  var width = Number(photo.width) || 0;
+  var height = Number(photo.height) || 0;
+  if (!width || !height) {
+    var fallback = document.getElementById('editorImg');
+    return fallback && fallback.naturalWidth && fallback.naturalHeight
+      ? {width: fallback.naturalWidth, height: fallback.naturalHeight}
+      : null;
+  }
+  var rotation = Number((editorZoomRecipe() || {}).rotation || 0);
+  rotation = ((rotation % 360) + 360) % 360;
+  if (rotation === 90 || rotation === 270) {
+    var swap = width;
+    width = height;
+    height = swap;
+  }
+  // Straightening can alter the rendered aspect slightly. Preserve the
+  // source's native long edge while following the preview's authoritative
+  // post-transform aspect ratio once it is available.
+  var img = document.getElementById('editorImg');
+  if (img && img.complete && img.naturalWidth && img.naturalHeight &&
+      editorImageMatchesZoomRecipe(img)) {
+    var nativeLong = Math.max(width, height);
+    var loadedSize = 0;
+    try {
+      loadedSize = Number(new URL(img.currentSrc || img.src, window.location.href)
+        .searchParams.get('size')) || 0;
+    } catch (_) {}
+    // If the complete native tier was delivered, it is the authority for
+    // 1:1. For sources above the render safety cap, the capped preview is only
+    // the pixel source: keep the metadata long edge below so zoom continues
+    // scaling toward the native 100% size.
+    if (nativeLong <= 16384 && loadedSize >= nativeLong) {
+      return {width: img.naturalWidth, height: img.naturalHeight};
+    }
+    var longEdge = Math.max(width, height);
+    var ratio = img.naturalWidth / img.naturalHeight;
+    if (ratio >= 1) {
+      width = longEdge;
+      height = longEdge / ratio;
+    } else {
+      height = longEdge;
+      width = longEdge * ratio;
+    }
+  }
+  return {width: width, height: height};
+}
+
+function editorFitZoomPercent() {
   var wrap = document.getElementById('editorCanvasWrap');
-  if (wrap) wrap.classList.toggle('zoom-actual', editorState.zoomMode === 'actual');
-  updateFeedbackControls();
+  var dims = editorNativeDisplayDimensions();
+  if (!wrap || !dims || !dims.width || !dims.height) return 100;
+  var style = getComputedStyle(wrap);
+  var availableW = wrap.clientWidth - (parseFloat(style.paddingLeft) || 0) -
+    (parseFloat(style.paddingRight) || 0);
+  var availableH = wrap.clientHeight - (parseFloat(style.paddingTop) || 0) -
+    (parseFloat(style.paddingBottom) || 0);
+  if (availableW <= 0 || availableH <= 0) return 100;
+  return Math.max(0.1, Math.min(100, availableW / dims.width * 100,
+    availableH / dims.height * 100));
+}
+
+function editorZoomSliderPosition(percent) {
+  var fit = editorFitZoomPercent();
+  if (!Number.isFinite(percent) || percent <= fit) return 0;
+  if (EDITOR_MAX_ZOOM_PERCENT <= fit) return 0;
+  return Math.max(0, Math.min(1000,
+    Math.log(percent / fit) / Math.log(EDITOR_MAX_ZOOM_PERCENT / fit) * 1000));
+}
+
+function editorZoomFromSliderPosition(position) {
+  var pos = Math.max(0, Math.min(1000, Number(position) || 0));
+  if (pos <= 0) return null;
+  var fit = editorFitZoomPercent();
+  return fit * Math.exp(Math.log(EDITOR_MAX_ZOOM_PERCENT / fit) * pos / 1000);
+}
+
+function editorZoomText() {
+  return editorState.zoomMode === 'fit'
+    ? 'Fit (' + Math.round(editorFitZoomPercent()) + '%)'
+    : Math.round(editorState.zoomPercent) + '%';
+}
+
+function editorClampCustomZoomToFit() {
+  if (editorState.zoomMode === 'fit') return false;
+  var fit = editorFitZoomPercent();
+  if (editorState.zoomPercent >= fit) return false;
+  editorState.zoomPercent = fit;
+  // A retained percentage that no longer fills the viewport is Fit, both
+  // visually and semantically. Exact equality that the user selected is
+  // still kept as a custom zoom.
+  editorState.zoomMode = 'fit';
+  return true;
+}
+
+function editorFitUsesNativeRender() {
+  var photo = editorState.photo || {};
+  var native = Math.max(Number(photo.width) || 0, Number(photo.height) || 0);
+  return native > 0 && editorFitRenderSize() >= Math.min(16384, native);
+}
+
+function updateEditorZoomControl() {
+  var slider = document.getElementById('editorZoomSlider');
+  var fitStop = document.getElementById('fitBtn');
+  var actualStop = document.getElementById('actualBtn');
+  var zoomOut = document.getElementById('editorZoomOut');
+  var zoomIn = document.getElementById('editorZoomIn');
+  var value = document.getElementById('editorZoomValue');
+  var hasPhoto = !!editorState.photoId && !!editorState.photo;
+  var disabled = !hasPhoto || !!editorState.loading;
+  var fit = editorFitZoomPercent();
+  var combinedFitActual = fit >= 100 && editorFitUsesNativeRender();
+  var percent = editorState.zoomMode === 'fit' ? fit : editorState.zoomPercent;
+  var text = editorZoomText();
+
+  if (slider) {
+    slider.value = String(editorState.zoomMode === 'fit'
+      ? 0 : Math.round(editorZoomSliderPosition(percent)));
+    slider.setAttribute('aria-valuetext', text);
+    slider.disabled = disabled;
+  }
+  if (fitStop) {
+    fitStop.textContent = combinedFitActual ? 'Fit · 100%' : 'Fit';
+    fitStop.classList.toggle('active', editorState.zoomMode === 'fit');
+    fitStop.disabled = disabled;
+  }
+  if (actualStop) {
+    actualStop.style.display = combinedFitActual ? 'none' : '';
+    actualStop.style.left = Math.max(9, editorZoomSliderPosition(100) / 10) + '%';
+    actualStop.classList.toggle('active', editorState.zoomMode !== 'fit' &&
+      Math.abs(editorState.zoomPercent - 100) < 0.5);
+    actualStop.disabled = disabled;
+  }
+  if (zoomOut) {
+    zoomOut.disabled = disabled || editorState.zoomMode === 'fit';
+  }
+  if (zoomIn) {
+    zoomIn.disabled = disabled || (editorState.zoomMode !== 'fit' &&
+      editorState.zoomPercent >= EDITOR_MAX_ZOOM_PERCENT - 0.5);
+  }
+  if (value) value.textContent = text;
+}
+
+function applyEditorZoom() {
+  var wrap = document.getElementById('editorCanvasWrap');
+  var img = document.getElementById('editorImg');
+  if (!wrap || !img) return;
+  editorClampCustomZoomToFit();
+  var custom = editorState.zoomMode !== 'fit';
+  var wasCustom = wrap.classList.contains('zoom-custom');
+  var focusX = 0.5;
+  var focusY = 0.5;
+  if (wasCustom && img.clientWidth && img.clientHeight) {
+    var oldImgRect = img.getBoundingClientRect();
+    var oldWrapRect = wrap.getBoundingClientRect();
+    focusX = (oldWrapRect.left + wrap.clientWidth / 2 - oldImgRect.left) /
+      oldImgRect.width;
+    focusY = (oldWrapRect.top + wrap.clientHeight / 2 - oldImgRect.top) /
+      oldImgRect.height;
+    focusX = Math.max(0, Math.min(1, focusX));
+    focusY = Math.max(0, Math.min(1, focusY));
+  }
+  wrap.classList.toggle('zoom-custom', custom);
+  if (!custom) {
+    var fitDims = editorNativeDisplayDimensions();
+    var fitPercent = editorFitZoomPercent();
+    if (fitDims) {
+      img.style.width = (fitDims.width * fitPercent / 100) + 'px';
+      img.style.height = (fitDims.height * fitPercent / 100) + 'px';
+    }
+    wrap.scrollLeft = 0;
+    wrap.scrollTop = 0;
+  } else {
+    var dims = editorNativeDisplayDimensions();
+    if (dims) {
+      img.style.width = (dims.width * editorState.zoomPercent / 100) + 'px';
+      img.style.height = (dims.height * editorState.zoomPercent / 100) + 'px';
+      // Keep the point at the middle of the viewport stable as the slider
+      // moves. Entering zoom from Fit begins at the image centre instead of
+      // jumping to its top-left corner.
+      var newImgRect = img.getBoundingClientRect();
+      var newWrapRect = wrap.getBoundingClientRect();
+      wrap.scrollLeft += newImgRect.left + focusX * newImgRect.width -
+        (newWrapRect.left + wrap.clientWidth / 2);
+      wrap.scrollTop += newImgRect.top + focusY * newImgRect.height -
+        (newWrapRect.top + wrap.clientHeight / 2);
+    }
+  }
   renderCropBox();
-  // The two zoom modes request different render sizes.
+  positionMaskOverlay();
+}
+
+function setEditorZoom(percent) {
+  var wasMode = editorState.zoomMode;
+  var wasPercent = editorState.zoomPercent;
+  if (percent === null || percent === 'fit') {
+    editorState.zoomMode = 'fit';
+  } else {
+    var numeric = Number(percent);
+    if (!Number.isFinite(numeric)) return;
+    editorState.zoomMode = 'custom';
+    editorState.zoomPercent = Math.max(editorFitZoomPercent(),
+      Math.min(EDITOR_MAX_ZOOM_PERCENT, numeric));
+  }
+  applyEditorZoom();
+  updateEditorZoomControl();
+  var changed = wasMode !== editorState.zoomMode ||
+    wasPercent !== editorState.zoomPercent;
   if (changed && editorState.photoId && !editorState.loading) schedulePreview();
+}
+
+function setEditorZoomFromSlider(position) {
+  setEditorZoom(editorZoomFromSliderPosition(position));
+}
+
+function setEditorZoomToFit() {
+  setEditorZoom(null);
+}
+
+function setEditorZoomToActual() {
+  setEditorZoom(100);
+}
+
+function stepEditorZoom(direction) {
+  var fit = editorFitZoomPercent();
+  var current = editorState.zoomMode === 'fit' ? fit : editorState.zoomPercent;
+  var next = current * (direction > 0 ? 1.25 : 0.8);
+  if (direction < 0 && next <= fit * 1.02) setEditorZoomToFit();
+  else setEditorZoom(next);
+}
+
+// Backward-compatible entry point for the old two-button control and any
+// saved browser automation that invokes it directly.
+function setZoomMode(mode) {
+  if (mode === 'actual') setEditorZoomToActual();
+  else setEditorZoomToFit();
 }
 
 function toggleBeforePreview() {
@@ -1352,20 +1681,34 @@ function updateHistogramFeedback() {
   setClip('highlight', clippedHigh);
 }
 
-function previewRenderSize() {
-  // 100% zoom asks for a native-resolution render so 1:1 shows the photo's
-  // real pixels; fit zoom keeps the cheaper 1920 render. Falls back to the
-  // old 3840 request when the native dimensions are unknown.
-  if (editorState.zoomMode !== 'actual') return 1920;
+function editorRenderSizeForPercent(percent) {
   var p = editorState.photo || {};
   var native = Math.max(Number(p.width) || 0, Number(p.height) || 0);
-  return native > 0 ? Math.min(16384, Math.max(256, native)) : 3840;
+  if (!native) return percent >= 100 ? 3840 : 1920;
+  var requested = native * Math.min(100, percent) / 100;
+  requested = Math.ceil(Math.max(1920, requested) / 256) * 256;
+  return Math.min(16384, native, requested);
+}
+
+function editorFitRenderSize() {
+  return editorRenderSizeForPercent(editorFitZoomPercent());
+}
+
+function previewRenderSize() {
+  // Request enough source pixels for the displayed Fit or custom scale,
+  // reaching the native source at 100% and reusing it above 100%. Sizes are
+  // bucketed so moving one slider pixel does not create a new server render.
+  var percent = editorState.zoomMode === 'fit'
+    ? editorFitZoomPercent()
+    : editorState.zoomPercent;
+  return editorRenderSizeForPercent(percent);
 }
 
 function previewStatusText(img) {
-  // At 100% the render size is the whole point of the view — state the
-  // actual delivered dimensions rather than implying "100%" on its own.
-  var suffix = editorState.zoomMode === 'actual' && img && img.naturalWidth
+  // At and above 100% the render size is the whole point of the view — state
+  // the delivered dimensions rather than implying "100%" on its own.
+  var suffix = editorState.zoomMode !== 'fit' && editorState.zoomPercent >= 99.5 &&
+    img && img.naturalWidth
     ? ' (' + img.naturalWidth + '×' + img.naturalHeight + ' render)'
     : '';
   return (editorState.showBefore
@@ -1376,6 +1719,7 @@ function previewStatusText(img) {
 function updatePreview() {
   if (!editorState.photoId) return;
   var img = document.getElementById('editorImg');
+  editorClampCustomZoomToFit();
   updateFeedbackControls();
   var recipe = editorState.showBefore ? previewRecipeFor(editorState.savedRecipe) : previewRecipe();
   var url = '/photos/' + editorState.photoId + '/edit-preview?size=' + previewRenderSize() +
@@ -1386,6 +1730,8 @@ function updatePreview() {
     // refresh the dependent UI.
     editorState.previewSeq++;
     document.getElementById('previewStatus').textContent = previewStatusText(img);
+    applyEditorZoom();
+    updateEditorZoomControl();
     renderCropBox();
     updateHistogramFeedback();
     refreshMaskOverlay();
@@ -1396,9 +1742,23 @@ function updatePreview() {
   img.onload = function() {
     if (seq !== editorState.previewSeq) return;
     document.getElementById('previewStatus').textContent = previewStatusText(img);
+    applyEditorZoom();
+    updateEditorZoomControl();
     renderCropBox();
     updateHistogramFeedback();
     refreshMaskOverlay();
+    var loadedRenderSize = 0;
+    try {
+      loadedRenderSize = Number(new URL(img.currentSrc || img.src,
+        window.location.href).searchParams.get('size')) || 0;
+    } catch (_) {}
+    // The decoded image can reveal authoritative orientation/aspect geometry
+    // that moves Fit into another source-render bucket. Re-request that tier
+    // instead of indefinitely stretching the just-loaded preview.
+    if (editorState.zoomMode === 'fit' && loadedRenderSize &&
+        previewRenderSize() !== loadedRenderSize) {
+      schedulePreview();
+    }
   };
   img.onerror = function() {
     if (seq !== editorState.previewSeq) return;
@@ -2743,6 +3103,15 @@ function initCropDrag() {
     editorState.drag = null;
   });
   window.addEventListener('resize', function() {
+    editorClampCustomZoomToFit();
+    applyEditorZoom();
+    updateEditorZoomControl();
+    // Fit can cross into a larger source-render bucket when the viewport
+    // grows. The debounced preview update is a no-op when the URL is already
+    // correct, so also schedule it when no custom-zoom clamp was needed.
+    if (editorState.photoId && !editorState.loading) {
+      schedulePreview();
+    }
     renderCropBox();
     updateHistogramFeedback();
     positionMaskOverlay();
@@ -2918,7 +3287,8 @@ function editorEmptyState() {
   if (img) img.removeAttribute('src');
   var box = document.getElementById('editorCropBox');
   if (box) box.style.display = 'none';
-  ['prevBtn', 'nextBtn', 'copySettingsBtn', 'beforeBtn', 'fitBtn', 'actualBtn', 'saveBtn'].forEach(function(id) {
+  ['prevBtn', 'nextBtn', 'copySettingsBtn', 'beforeBtn', 'fitBtn', 'actualBtn',
+   'editorZoomOut', 'editorZoomIn', 'editorZoomSlider', 'saveBtn'].forEach(function(id) {
     var b = document.getElementById(id);
     if (b) b.disabled = true;
   });
@@ -2940,7 +3310,8 @@ async function loadPhoto(photoId, opts) {
   editorState.recipe = {};
   var saveBtn = document.getElementById('saveBtn');
   if (saveBtn) saveBtn.disabled = true;
-  ['copySettingsBtn', 'beforeBtn', 'fitBtn', 'actualBtn'].forEach(function(id) {
+  ['copySettingsBtn', 'beforeBtn', 'fitBtn', 'actualBtn', 'editorZoomOut',
+   'editorZoomIn', 'editorZoomSlider'].forEach(function(id) {
     var b = document.getElementById(id);
     if (b) b.disabled = false;
   });

@@ -120,7 +120,12 @@ def test_collect_workload_builds_deltas_targets_and_job_summary():
             {"cpu_percent": 800.0, "rss_bytes": 100, "executable_exists": True},
             {"cpu_percent": 900.0, "rss_bytes": 120, "executable_exists": True},
         ],
-        {"pid": 123, "initial_rss_bytes": 80, "executable_exists": True},
+        {
+            "pid": 123,
+            "initial_rss_bytes": 80,
+            "cpu_accounting_complete": False,
+            "executable_exists": True,
+        },
     )
     system = _SequenceSampler(
         [
@@ -147,6 +152,7 @@ def test_collect_workload_builds_deltas_targets_and_job_summary():
     assert summary["jobs_api_latency_seconds"]["p95"] == 0.02
     assert summary["system_cpu_idle_percent"]["p05"] == 20.0
     assert summary["vireo_process_tree_rss_bytes"]["growth"] == 40
+    assert summary["vireo_process_tree_cpu_percent"]["accounting_complete"] is False
     assert summary["resource_wait_delta"] == {
         "wait_count": 2,
         "wait_seconds": 2.5,
@@ -907,6 +913,7 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
         root.pid,
         psutil_module=_CpuPsutil(root),
         monotonic=clock.monotonic,
+        platform_system=lambda: "Linux",
     )
     sampler.prime()
 
@@ -922,6 +929,7 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
     assert sample["cpu_percent"] == 70.0
     assert sample["rss_bytes"] == 300
     assert sample["process_count"] == 2
+    assert sample["cpu_accounting_complete"] is True
     assert sampler.metadata()["initial_rss_bytes"] == 100
 
     # A helper spawned and reaped by the still-live child contributes through
@@ -994,6 +1002,7 @@ def test_process_sampler_counts_children_reaped_between_polls():
         root.pid,
         psutil_module=_CpuPsutil(root),
         monotonic=clock.monotonic,
+        platform_system=lambda: "Linux",
     )
     sampler.prime()
 
@@ -1004,6 +1013,16 @@ def test_process_sampler_counts_children_reaped_between_polls():
     clock.sleep(1.0)
 
     assert sampler.sample()["cpu_percent"] == 40.0
+    assert sampler.metadata()["cpu_accounting_complete"] is True
+
+    incomplete = ProcessTreeSampler(
+        root.pid,
+        psutil_module=_CpuPsutil(root),
+        monotonic=clock.monotonic,
+        platform_system=lambda: "Darwin",
+    )
+    incomplete.prime()
+    assert incomplete.metadata()["cpu_accounting_complete"] is False
 
 
 class _FakeConn:

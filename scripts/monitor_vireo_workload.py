@@ -238,13 +238,23 @@ def _is_successful_jobs_sample(sample):
 
 
 class ProcessTreeSampler:
-    def __init__(self, pid, *, psutil_module=psutil, monotonic=time.monotonic):
+    def __init__(
+        self,
+        pid,
+        *,
+        psutil_module=psutil,
+        monotonic=time.monotonic,
+        platform_system=platform.system,
+    ):
         if psutil_module is None:
             raise RuntimeError(
                 "psutil is required; install the Vireo development dependencies"
             )
         self.psutil = psutil_module
         self.monotonic = monotonic
+        self._cpu_accounting_complete = platform_system() not in {
+            "Darwin", "Windows",
+        }
         self.root = psutil_module.Process(pid)
         self.processes = {}
         self._cpu_times = {}
@@ -285,6 +295,7 @@ class ProcessTreeSampler:
             **self._metadata,
             "initial_rss_bytes": self._initial_rss_bytes,
             "initial_executable_exists": self._initial_executable_exists,
+            "cpu_accounting_complete": self._cpu_accounting_complete,
             "executable_exists": (
                 os.path.exists(self.executable) if self.executable else None
             ),
@@ -315,6 +326,17 @@ class ProcessTreeSampler:
         """Abort if process metrics and API samples can no longer be paired."""
         self._assert_root_alive()
 
+    def _reaped_cpu_seconds(self, cpu_times):
+        if not self._cpu_accounting_complete:
+            return 0.0
+        if not (
+            hasattr(cpu_times, "children_user")
+            and hasattr(cpu_times, "children_system")
+        ):
+            self._cpu_accounting_complete = False
+            return 0.0
+        return cpu_times.children_user + cpu_times.children_system
+
     def _current_processes(self):
         discovered = [self.root]
         with contextlib.suppress(self.psutil.Error):
@@ -340,10 +362,7 @@ class ProcessTreeSampler:
                 identity = (process.pid, process.create_time())
                 cpu = process.cpu_times()
                 total_cpu_seconds = cpu.user + cpu.system
-                reaped_cpu_seconds = (
-                    getattr(cpu, "children_user", 0.0)
-                    + getattr(cpu, "children_system", 0.0)
-                )
+                reaped_cpu_seconds = self._reaped_cpu_seconds(cpu)
                 self._cpu_times[identity] = total_cpu_seconds
                 self._reaped_children_cpu_times[identity] = reaped_cpu_seconds
                 if process.pid != self.root.pid:
@@ -378,10 +397,7 @@ class ProcessTreeSampler:
                 identity = (process.pid, process.create_time())
                 cpu = process.cpu_times()
                 total_cpu_seconds = cpu.user + cpu.system
-                reaped_cpu_seconds = (
-                    getattr(cpu, "children_user", 0.0)
-                    + getattr(cpu, "children_system", 0.0)
-                )
+                reaped_cpu_seconds = self._reaped_cpu_seconds(cpu)
                 current_cpu_times[identity] = total_cpu_seconds
                 current_reaped_children_cpu_times[identity] = reaped_cpu_seconds
                 if process.pid != self.root.pid:
@@ -441,6 +457,7 @@ class ProcessTreeSampler:
             "rss_bytes": rss_bytes,
             "process_count": process_count,
             "thread_count": thread_count,
+            "cpu_accounting_complete": self._cpu_accounting_complete,
             "executable_exists": metadata["executable_exists"],
         }
 
@@ -603,6 +620,11 @@ def build_summary(baseline, samples, *, process_metadata=None):
     api_failure_count = len(samples) - len(successful)
     api_latencies = [sample["api"]["latency_seconds"] for sample in successful]
     process_cpu = [sample["process"]["cpu_percent"] for sample in samples]
+    cpu_summary = _number_summary(process_cpu)
+    if cpu_summary is not None:
+        cpu_summary["accounting_complete"] = (
+            (process_metadata or {}).get("cpu_accounting_complete")
+        )
     process_rss = [sample["process"]["rss_bytes"] for sample in samples]
     initial_rss = (process_metadata or {}).get("initial_rss_bytes")
     system_idle = [sample["system"]["cpu_idle_percent"] for sample in samples]
@@ -659,7 +681,7 @@ def build_summary(baseline, samples, *, process_metadata=None):
     return {
         "sample_count": len(samples),
         "api_failure_count": api_failure_count,
-        "vireo_process_tree_cpu_percent": _number_summary(process_cpu),
+        "vireo_process_tree_cpu_percent": cpu_summary,
         "vireo_process_tree_rss_bytes": {
             **(_number_summary(process_rss) or {}),
             "growth": (
@@ -1038,7 +1060,9 @@ def main(argv=None):
         f"Vireo CPU p95={cpu.get('p95', 'n/a')}%, "
         f"system idle p05={idle.get('p05', 'n/a')}%, "
         f"Jobs API p95={api.get('p95', 'n/a')}s, "
-        f"API failures={summary['api_failure_count']}"
+        f"API failures={summary['api_failure_count']}, "
+        f"CPU accounting="
+        f"{'complete' if cpu.get('accounting_complete') else 'incomplete'}"
     )
 
 

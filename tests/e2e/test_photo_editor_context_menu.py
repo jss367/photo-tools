@@ -75,15 +75,40 @@ def test_photo_editor_context_disables_save_while_request_is_pending(
         }"""
     )
 
-    save_item = page.evaluate(
+    pending_items = page.evaluate(
         """() => {
-          const item = buildPhotoEditorContextMenu().find(
-            entry => entry.label === 'Save Changes'
-          );
-          return {disabled: item.disabled, hint: item.disabledHint};
+          const wanted = new Set([
+            'Save Changes', 'Revert to Saved', 'Export…', 'Send to iNaturalist'
+          ]);
+          return buildPhotoEditorContextMenu()
+            .filter(entry => wanted.has(entry.label))
+            .map(entry => ({
+              label: entry.label,
+              disabled: entry.disabled,
+              hint: entry.disabledHint,
+            }));
         }"""
     )
-    assert save_item == {"disabled": True, "hint": "Saving changes"}
+    assert {item["label"] for item in pending_items} == {
+        "Save Changes", "Revert to Saved", "Export…", "Send to iNaturalist"
+    }
+    assert all(item["disabled"] is True for item in pending_items)
+    assert all(item["hint"] == "Saving changes" for item in pending_items)
+
+    # Saving must remain an independent state even if the working recipe
+    # temporarily becomes clean while the request is unresolved.
+    page.evaluate(
+        """() => {
+          editorState.recipe = cloneRecipe(editorState.savedRecipe);
+          ensureCrop(editorState.recipe);
+          syncControls();
+        }"""
+    )
+    assert page.evaluate(
+        """() => buildPhotoEditorContextMenu()
+          .filter(item => item.label === 'Export…' || item.label === 'Send to iNaturalist')
+          .every(item => item.disabled && item.disabledHint === 'Saving changes')"""
+    ) is True
 
     page.evaluate("() => window.__resolveEditorSave({recipe: {rotation: 90}})")
     page.wait_for_function("() => !isEditorDirty()")

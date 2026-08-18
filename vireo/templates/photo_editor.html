@@ -920,6 +920,7 @@ var editorState = {
   // `searchSeq`, this mismatch tells us the in-flight response was already
   // invalidated so a replacement fetch is required.
   searchQuerySeq: 0,
+  savingPhotoIds: {},
   suppressUnloadPrompt: false,
 };
 
@@ -2943,10 +2944,12 @@ function resetAllEdits() {
 
 async function saveRecipe(description) {
   if (!editorState.photoId) return;
+  if (editorState.savingPhotoIds[String(editorState.photoId)]) return;
   // Capture the photo being saved so a Prev/Next during the PUT can't make us
   // write the previous photo's returned recipe back into the editor state for
   // a different photo (or refresh the cache under the wrong photoId).
   var savedPhotoId = editorState.photoId;
+  editorState.savingPhotoIds[String(savedPhotoId)] = true;
   var acceptingCropEdit = editorState.cropEditing &&
     !!recipeForSave(editorState.recipe).crop;
   var btn = document.getElementById('saveBtn');
@@ -2991,6 +2994,8 @@ async function saveRecipe(description) {
       btn.disabled = false;
       setStatus(e.message || 'Save failed', true);
     }
+  } finally {
+    delete editorState.savingPhotoIds[String(savedPhotoId)];
   }
 }
 
@@ -3441,7 +3446,8 @@ function copyEditSettings() {
 }
 
 function revertUnsavedEdits() {
-  if (editorState.loading || !isEditorDirty()) return;
+  if (editorState.loading || editorState.savingPhotoIds[String(editorState.photoId)] ||
+      !isEditorDirty()) return;
   if (!window.confirm('Discard unsaved edits and return to the last saved version?')) return;
   editorState.recipe = cloneRecipe(editorState.savedRecipe);
   ensureCrop(editorState.recipe);
@@ -3457,7 +3463,8 @@ function revertUnsavedEdits() {
 }
 
 function exportCurrentEditedPhoto() {
-  if (!editorState.photoId || editorState.loading || isEditorDirty()) return;
+  if (!editorState.photoId || editorState.loading ||
+      editorState.savingPhotoIds[String(editorState.photoId)] || isEditorDirty()) return;
   // Browse owns the full export dialog (format, resize, naming, metadata, and
   // destination). Hand it the current photo explicitly, then have its
   // deep-link loader select the photo and open that same dialog.
@@ -3466,7 +3473,8 @@ function exportCurrentEditedPhoto() {
 }
 
 function sendCurrentEditedPhotoToInat() {
-  if (!editorState.photoId || editorState.loading || isEditorDirty()) return;
+  if (!editorState.photoId || editorState.loading ||
+      editorState.savingPhotoIds[String(editorState.photoId)] || isEditorDirty()) return;
   if (typeof window.submitToInat === 'function') {
     window.submitToInat(editorState.photoId);
   }
@@ -3475,8 +3483,8 @@ function sendCurrentEditedPhotoToInat() {
 function buildPhotoEditorContextMenu() {
   var unavailable = !editorState.photoId || editorState.loading;
   var dirty = !unavailable && isEditorDirty();
-  var saveButton = document.getElementById('saveBtn');
-  var savePending = dirty && saveButton && saveButton.disabled;
+  var savePending = !unavailable &&
+    !!editorState.savingPhotoIds[String(editorState.photoId)];
   var recipe = unavailable ? {} : recipeForSave(editorState.recipe);
   var hasEdits = Object.keys(recipe || {}).length > 0;
   var beforeLabel = editorState.showBefore ? 'Show Current Edits' : 'Show Saved Version';
@@ -3492,8 +3500,10 @@ function buildPhotoEditorContextMenu() {
     },
     {
       label: 'Revert to Saved',
-      disabled: !dirty,
-      disabledHint: unavailable ? 'No photo is ready to edit' : 'No unsaved changes',
+      disabled: !dirty || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : 'No unsaved changes'),
       onClick: revertUnsavedEdits,
     },
     { separator: true },
@@ -3576,18 +3586,19 @@ function buildPhotoEditorContextMenu() {
     { separator: true },
     {
       label: 'Export\u2026',
-      disabled: unavailable || dirty,
+      disabled: unavailable || dirty || savePending,
       disabledHint: unavailable
         ? 'No photo is ready to export'
-        : (dirty ? 'Save changes before exporting' : undefined),
+        : (savePending ? 'Saving changes' : (dirty ? 'Save changes before exporting' : undefined)),
       onClick: exportCurrentEditedPhoto,
     },
     {
       label: 'Send to iNaturalist',
-      disabled: unavailable || dirty,
+      disabled: unavailable || dirty || savePending,
       disabledHint: unavailable
         ? 'No photo is ready to send'
-        : (dirty ? 'Save changes before sending to iNaturalist' : undefined),
+        : (savePending ? 'Saving changes' :
+          (dirty ? 'Save changes before sending to iNaturalist' : undefined)),
       onClick: sendCurrentEditedPhotoToInat,
     },
   ];

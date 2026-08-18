@@ -212,6 +212,61 @@ def test_photo_editor_context_revert_restores_saved_stale_mask_state(
     expect(page.locator("#localStaleBanner")).to_be_visible()
 
 
+def test_photo_editor_context_revert_ignores_pending_mask_update(
+    live_server, page
+):
+    _open_editor(live_server, page)
+    page.evaluate(
+        """() => {
+          const saved = cloneRecipe(editorState.savedRecipe);
+          saved.local = {
+            mask: {ref: 'saved-mask', source_digest: 'saved-digest'},
+            regions: [
+              {region: 'subject', adjustments: {exposure: 0.5}}
+            ],
+          };
+          editorState.savedRecipe = saved;
+          editorState.savedRecipeSeq += 1;
+          editorState.recipe = cloneRecipe(saved);
+          editorState.savedLocalStale = true;
+          editorState.localStale = true;
+          syncControls();
+          rotateRecipe(90);
+
+          const originalSafeFetch = window.safeFetch;
+          window.safeFetch = function(url, options, config) {
+            if (url.includes('/local-mask/snapshot') &&
+                options && options.method === 'POST') {
+              return new Promise(resolve => {
+                window.__resolvePendingMaskUpdate = resolve;
+              });
+            }
+            return originalSafeFetch(url, options, config);
+          };
+          window.__pendingMaskUpdate = updateLocalMask();
+        }"""
+    )
+
+    page.once("dialog", lambda dialog: dialog.accept())
+    page.locator("#editorCanvasWrap").click(button="right", position={"x": 20, "y": 20})
+    page.locator(".vireo-ctx-menu").get_by_text("Revert to Saved", exact=True).click()
+
+    page.wait_for_function("() => !isEditorDirty()")
+    page.evaluate(
+        """() => {
+          window.__resolvePendingMaskUpdate({
+            mask: {ref: 'new-mask', source_digest: 'new-digest'},
+          });
+          return window.__pendingMaskUpdate;
+        }"""
+    )
+
+    assert page.evaluate("() => !isEditorDirty()") is True
+    assert page.evaluate("() => editorState.recipe.local.mask.ref") == "saved-mask"
+    assert page.evaluate("() => editorState.localMask.ref") == "saved-mask"
+    assert page.evaluate("() => editorState.localStale") is True
+
+
 def test_photo_editor_keeps_native_menu_for_inputs(live_server, page):
     _open_editor(live_server, page)
 

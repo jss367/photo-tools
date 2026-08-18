@@ -1050,6 +1050,7 @@ var editorState = {
   localDraft: {subject: {}, background: {}, feather: 0},
   localMask: null,
   localMaskPromise: null,
+  localMaskUpdateSeq: 0,
   localAvailable: false,
   localStale: false,
   savedLocalStale: false,
@@ -2803,12 +2804,14 @@ function resetLocal() {
 
 async function updateLocalMask() {
   var photoId = editorState.photoId;
+  var updateSeq = ++editorState.localMaskUpdateSeq;
   try {
     var data = await safeFetch(
       '/api/photos/' + photoId + '/local-mask/snapshot',
       {method: 'POST'}, {toast: false}
     );
-    if (editorState.photoId !== photoId) return;
+    if (editorState.photoId !== photoId ||
+        editorState.localMaskUpdateSeq !== updateSeq) return;
     editorState.localMask = data.mask;
     editorState.localStale = false;
     rebuildLocalSection();
@@ -2818,6 +2821,8 @@ async function updateLocalMask() {
       showToast('Subject mask updated — save to keep it', 'success');
     }
   } catch (e) {
+    if (editorState.photoId !== photoId ||
+        editorState.localMaskUpdateSeq !== updateSeq) return;
     if (typeof showToast === 'function') {
       showToast(e.message || 'Could not update the subject mask', 'error');
     }
@@ -3874,6 +3879,9 @@ function revertUnsavedEdits() {
   if (editorState.loading || editorState.savingPhotoIds[String(editorState.photoId)] ||
       !isEditorDirty()) return;
   if (!window.confirm('Discard unsaved edits and return to the last saved version?')) return;
+  // A mask update may still be awaiting its snapshot POST. Its result belongs
+  // to the discarded working state and must not make the restored recipe dirty.
+  editorState.localMaskUpdateSeq++;
   editorState.recipe = cloneRecipe(editorState.savedRecipe);
   editorState.localStale = editorState.savedLocalStale;
   ensureCrop(editorState.recipe);
@@ -4075,6 +4083,7 @@ async function loadPhoto(photoId, opts) {
   // Rapid Next/Prev can leave multiple /api/photos/:id requests in flight; the
   // seq lets a stale resolution bail out instead of overwriting newer state.
   var seq = ++editorState.loadSeq;
+  editorState.localMaskUpdateSeq++;
   editorState.photoId = photoId;
   editorState.photo = null;
   // Reset recipe state so a Save click during the load window can't write the

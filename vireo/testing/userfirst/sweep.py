@@ -17,7 +17,6 @@ DEFAULT_PAGES = [
     "/cull",
     "/pipeline",
     "/pipeline/review",
-    "/variants",
     "/workspace",
     "/id-conflicts",
     "/settings",

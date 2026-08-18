@@ -495,7 +495,7 @@ NO_LOCATION_INFORMATION_RULES = {
 ALL_NAV_IDS = frozenset({
     "import",
     "pipeline", "jobs", "pipeline_review", "pipeline_rapid_review", "review", "cull",
-    "misses", "highlights", "life_list", "browse", "edit", "map", "location_review", "variants",
+    "misses", "highlights", "life_list", "browse", "edit", "map", "location_review",
     "dashboard", "storage", "audit", "card_cleanup", "move", "id_conflicts",
     "settings", "workspace", "lightroom", "shortcuts",
     "keywords", "duplicates", "logs",
@@ -17172,7 +17172,7 @@ class Database:
             base_conditions.append("COALESCE(pr_rev.status, 'pending') = ?")
             base_params.append(status)
         # Latest-fingerprint-per-(detection, classifier_model) filter — same
-        # pattern used by /api/species/summary and get_top_prediction_for_photo.
+        # pattern used by get_top_prediction_for_photo.
         base_conditions.append(
             "pr.labels_fingerprint = ("
             "SELECT pr2.labels_fingerprint FROM predictions pr2 "

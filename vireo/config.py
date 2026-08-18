@@ -182,7 +182,6 @@ DEFAULTS = {
             "cull": "",
             "browse": "",
             "map": "",
-            "variants": "",
             "dashboard": "",
             "storage": "",
             "audit": "",

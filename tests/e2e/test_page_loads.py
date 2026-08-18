@@ -13,7 +13,6 @@ PAGES = [
     "/pipeline",
     "/pipeline/review",
     "/pipeline/rapid-review",
-    "/variants",
     "/workspace",
     "/id-conflicts",
     "/storage",

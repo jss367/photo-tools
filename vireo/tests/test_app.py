@@ -3740,7 +3740,7 @@ def test_pages_include_vireo_utils(app_and_db):
     client = app.test_client()
     pages = ['/browse', '/lightroom', '/audit', '/logs',
              '/settings', '/storage', '/workspace', '/pipeline', '/dashboard',
-             '/review', '/cull', '/variants', '/id-conflicts', '/map']
+             '/review', '/cull', '/id-conflicts', '/map']
     for page in pages:
         resp = client.get(page)
         assert resp.status_code == 200, f"{page} returned {resp.status_code}"
@@ -3762,7 +3762,7 @@ def test_pages_no_inline_escapeHtml(app_and_db):
     client = app.test_client()
     pages = ['/browse', '/lightroom', '/audit', '/logs',
              '/settings', '/storage', '/workspace', '/pipeline', '/dashboard',
-             '/review', '/cull', '/variants', '/id-conflicts', '/map']
+             '/review', '/cull', '/id-conflicts', '/map']
     for page in pages:
         resp = client.get(page)
         html = resp.data.decode()

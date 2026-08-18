@@ -145,20 +145,9 @@ def test_photo_editor_export_opens_standard_export_for_current_photo(
     page.locator("#editorCanvasWrap").click(button="right", position={"x": 20, "y": 20})
     page.locator(".vireo-ctx-menu").get_by_text("Export…", exact=True).click()
 
-    page.wait_for_url(re.compile(r"/browse\?photo_id=\d+$"))
     expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
-    assert page.evaluate("() => getActiveSelection()") == [photo_id]
-    expect(page.locator("#exportSubmitBtn")).to_have_text("Export 1 photo")
-
-
-def test_export_handoff_does_not_open_for_failed_photo_deep_link(
-    live_server, page
-):
-    page.goto(f"{live_server['url']}/browse?photo_id=999999999&action=export")
-    page.wait_for_function("() => !loading")
-
-    expect(page.locator("#exportOverlay")).not_to_have_class("modal-overlay open")
-    assert page.evaluate("() => getActiveSelection()") == []
+    assert page.evaluate("() => editorState.photoId") == photo_id
+    expect(page.locator("#exportSubmitBtn")).to_have_text("Export Photo")
 
 
 def test_photo_editor_context_sends_current_photo_to_inaturalist(
@@ -181,13 +170,21 @@ def test_photo_editor_context_sends_current_photo_to_inaturalist(
     assert page.evaluate("() => window.__inatTarget") == photo_id
 
 
-def test_photo_editor_export_actions_require_saved_changes(live_server, page):
+def test_photo_editor_inaturalist_requires_saved_changes_but_export_saves_them(
+    live_server, page
+):
     _open_editor(live_server, page)
     page.evaluate("() => rotateRecipe(90)")
 
     page.locator("#editorCanvasWrap").click(button="right", position={"x": 20, "y": 20})
     menu = page.locator(".vireo-ctx-menu")
-    for label in ("Export…", "Send to iNaturalist"):
-        item = menu.get_by_text(label, exact=True)
-        expect(item).to_have_class(re.compile(r"vireo-ctx-disabled"))
-        expect(item).to_have_attribute("title", re.compile("Save changes"))
+    expect(menu.get_by_text("Export…", exact=True)).not_to_have_class(
+        re.compile(r"vireo-ctx-disabled")
+    )
+    inat_item = menu.get_by_text("Send to iNaturalist", exact=True)
+    expect(inat_item).to_have_class(re.compile(r"vireo-ctx-disabled"))
+    expect(inat_item).to_have_attribute("title", re.compile("Save changes"))
+
+    menu.get_by_text("Export…", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    page.wait_for_function("() => !isEditorDirty()")

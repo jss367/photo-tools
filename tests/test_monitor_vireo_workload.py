@@ -370,6 +370,7 @@ def test_job_summary_tracks_history_only_jobs_and_ignores_baseline_history():
         "started_at": "2026-08-17T12:00:00.500+00:00",
         "finished_at": "2026-08-17T12:00:00.800+00:00",
         "duration": 0.3,
+        "resource_wait_seconds": 1.25,
     }
     empty_metrics = {"embedding_cache": {}}
     baseline_payload = {
@@ -414,6 +415,9 @@ def test_job_summary_tracks_history_only_jobs_and_ignores_baseline_history():
     assert scenario["all_observed_jobs_terminal"] is True
     # Makespan is derived from the short-lived job's own timestamps.
     assert scenario["workload_makespan_seconds"] == 0.3
+    # The job was absent at baseline, so wait already accrued when it first
+    # appears still belongs to the monitored workload.
+    assert report["summary"]["jobs"][0]["observed_resource_wait_seconds"] == 1.25
 
 
 def test_single_flight_target_is_unknown_when_any_api_sample_fails():
@@ -545,6 +549,33 @@ def test_compact_jobs_payload_removes_paths_configs_results_and_filenames():
         "current": 2,
         "total": 10,
     }
+
+
+def test_compact_jobs_payload_retains_terminal_ephemeral_jobs_once():
+    ephemeral = {
+        "id": "walk-1",
+        "type": "new_images_walk",
+        "status": "completed",
+        "duration": 0.2,
+    }
+    persisted = {
+        "id": "pipeline-1",
+        "type": "pipeline",
+        "status": "completed",
+        "duration": 10.0,
+    }
+
+    compact = compact_jobs_payload({
+        # A persisted job may briefly be present in both lists. An ephemeral
+        # job has no history row, so its terminal active record must survive.
+        "active": [ephemeral, persisted],
+        "history": [persisted],
+    })
+
+    assert [(job["id"], job["source"]) for job in compact["jobs"]] == [
+        ("walk-1", "active"),
+        ("pipeline-1", "history"),
+    ]
 
 
 def test_compact_jobs_payload_omits_user_derived_step_labels():

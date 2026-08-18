@@ -131,14 +131,23 @@ def _compact_job(job, source):
 
 def compact_jobs_payload(payload):
     """Remove paths, workspace names, configs, results, and filenames."""
+    history_jobs = payload.get("history", [])
+    history_ids = {job.get("id") for job in history_jobs if job.get("id")}
     active = [
         _compact_job(job, "active")
         for job in payload.get("active", [])
-        if job.get("status") not in TERMINAL_STATUSES
+        # Ephemeral jobs never enter persisted history, so their terminal
+        # record in ``active`` is the only evidence that they completed.
+        # Persisted jobs can briefly appear in both lists; prefer the history
+        # record in that case to keep one observation per job.
+        if (
+            job.get("status") not in TERMINAL_STATUSES
+            or job.get("id") not in history_ids
+        )
     ]
     history = [
         _compact_job(job, "history")
-        for job in payload.get("history", [])
+        for job in history_jobs
     ]
     return {
         "jobs": active + history,
@@ -355,23 +364,30 @@ def _resource_delta(first, last):
 
 
 def _job_summary(observations):
-    # The first observation is the baseline: any job that appears there
-    # as `history` completed before monitoring began and is not part of
-    # the workload.  Everything else — including jobs that start and
-    # finish between two polling intervals and therefore appear only in
-    # `history` — must be tracked so per-job outcomes and the scenario
-    # makespan reflect the full workload, not just the active-view slice.
-    baseline_history_ids = set()
+    # The first observation is the baseline. Any terminal job already there
+    # completed before monitoring began and is not part of the workload;
+    # this includes ephemeral jobs whose only terminal record remains in the
+    # API's `active` list. Everything else — including jobs that start and
+    # finish between polling intervals — must be tracked.
+    baseline_terminal_ids = set()
+    baseline_wait_by_id = {}
     if observations:
         _elapsed0, baseline_sample = observations[0]
         for job in baseline_sample.get("jobs", []):
-            if job.get("source") == "history" and job.get("id"):
-                baseline_history_ids.add(job["id"])
+            job_id = job.get("id")
+            if not job_id:
+                continue
+            if job.get("status") in TERMINAL_STATUSES:
+                baseline_terminal_ids.add(job_id)
+            else:
+                baseline_wait_by_id[job_id] = job.get(
+                    "resource_wait_seconds", 0.0,
+                )
     tracked_ids = {
         job.get("id")
         for _elapsed, api_sample in observations
         for job in api_sample.get("jobs", [])
-        if job.get("id") and job["id"] not in baseline_history_ids
+        if job.get("id") and job["id"] not in baseline_terminal_ids
     }
     jobs = {}
     for elapsed, api_sample in observations:
@@ -386,7 +402,13 @@ def _job_summary(observations):
                 "first_observed_seconds": round(elapsed, 3),
                 "first_status": job.get("status"),
                 "started_at": job.get("started_at"),
-                "first_resource_wait_seconds": job.get("resource_wait_seconds", 0.0),
+                # Jobs present and active at baseline may already have accrued
+                # wait outside this benchmark window. Jobs absent from the
+                # baseline started during the window, so all wait visible at
+                # their first sample belongs to this run.
+                "first_resource_wait_seconds": baseline_wait_by_id.get(
+                    job_id, 0.0,
+                ),
             })
             record.update({
                 "last_observed_seconds": round(elapsed, 3),

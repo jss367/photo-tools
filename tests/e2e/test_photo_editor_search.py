@@ -470,6 +470,33 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
         "renderSize": 6000,
     }
 
+    fractional_crop_size = page.evaluate(
+        """() => {
+            const originalPhoto = cloneRecipe(editorState.photo);
+            const originalRecipe = cloneRecipe(editorState.recipe);
+            const originalCropEditing = editorState.cropEditing;
+            const originalZoomMode = editorState.zoomMode;
+            const originalZoomPercent = editorState.zoomPercent;
+            editorState.photo.width = 800;
+            editorState.photo.height = 600;
+            editorState.photo.metadata = null;
+            editorState.recipe = {
+                crop: {x: 0, y: 0, w: 0.333, h: 0.333}
+            };
+            editorState.cropEditing = false;
+            editorState.zoomMode = 'custom';
+            editorState.zoomPercent = 100;
+            const renderSize = previewRenderSize();
+            editorState.photo = originalPhoto;
+            editorState.recipe = originalRecipe;
+            editorState.cropEditing = originalCropEditing;
+            editorState.zoomMode = originalZoomMode;
+            editorState.zoomPercent = originalZoomPercent;
+            return renderSize;
+        }"""
+    )
+    assert fractional_crop_size == 267
+
     page.set_viewport_size({"width": 5000, "height": 4000})
     page.wait_for_function(
         "() => document.getElementById('editorImg').src.includes('size=4000')"

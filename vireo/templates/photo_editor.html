@@ -1772,7 +1772,11 @@ function editorRenderSizeForPercent(percent) {
   if (!native) return percent >= 100 ? 3840 : 1920;
   var requested = native * Math.min(100, percent) / 100;
   requested = Math.ceil(Math.max(1920, requested) / 256) * 256;
-  return Math.min(16384, native, requested);
+  // A normalized crop can produce a fractional native long edge (for
+  // example 800 * 0.333 = 266.4), but the preview endpoint accepts only an
+  // integer size. Round upward so 100% never requests fewer source pixels
+  // than the cropped native frame needs.
+  return Math.max(1, Math.ceil(Math.min(16384, native, requested)));
 }
 
 function editorFitRenderSize() {

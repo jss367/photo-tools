@@ -1051,6 +1051,7 @@ var editorState = {
   localMaskPromise: null,
   localAvailable: false,
   localStale: false,
+  savedLocalStale: false,
   maskOverlay: false,
   maskOverlaySeq: 0,
   maskOverlayTimer: null,
@@ -3166,6 +3167,7 @@ async function saveRecipe(description) {
     if (editorState.photoId !== savedPhotoId) return false;
     editorState.savedRecipe = cloneRecipe(data.recipe || {});
     editorState.recipe = cloneRecipe(data.recipe || {});
+    editorState.savedLocalStale = editorState.localStale;
     ensureCrop(editorState.recipe);
     editorState.cropEditing = !recipeForSave(editorState.recipe).crop;
     if (acceptingCropEdit && !editorState.cropEditing) {
@@ -3870,6 +3872,7 @@ function revertUnsavedEdits() {
       !isEditorDirty()) return;
   if (!window.confirm('Discard unsaved edits and return to the last saved version?')) return;
   editorState.recipe = cloneRecipe(editorState.savedRecipe);
+  editorState.localStale = editorState.savedLocalStale;
   ensureCrop(editorState.recipe);
   editorState.showBefore = false;
   editorState.cropEditing = !recipeForSave(editorState.recipe).crop;
@@ -4102,6 +4105,7 @@ async function loadPhoto(photoId, opts) {
     editorState.localMaskPromise = null;
     editorState.localAvailable = false;
     editorState.localStale = false;
+    editorState.savedLocalStale = false;
     editorState.maskOverlay = false;
     setButtonActive('maskOverlayBtn', false);
     refreshMaskOverlay();
@@ -4116,6 +4120,7 @@ async function loadPhoto(photoId, opts) {
         .then(function(d) {
           if (editorState.photoId !== photoId) return;
           editorState.localStale = !!d.local_mask_stale;
+          editorState.savedLocalStale = editorState.localStale;
           updateLocalBandVisibility();
         }).catch(function() {});
     }

@@ -128,6 +128,27 @@ def test_photo_editor_context_revert_restores_saved_recipe(live_server, page):
     expect(page.locator("#saveBtn")).to_be_disabled()
 
 
+def test_photo_editor_context_revert_restores_saved_stale_mask_state(
+    live_server, page
+):
+    _open_editor(live_server, page)
+    page.evaluate(
+        """() => {
+          editorState.savedLocalStale = true;
+          editorState.localStale = false;
+          editorState.localAvailable = true;
+          rotateRecipe(90);
+        }"""
+    )
+
+    page.once("dialog", lambda dialog: dialog.accept())
+    page.locator("#editorCanvasWrap").click(button="right", position={"x": 20, "y": 20})
+    page.locator(".vireo-ctx-menu").get_by_text("Revert to Saved", exact=True).click()
+
+    assert page.evaluate("() => editorState.localStale") is True
+    expect(page.locator("#localStaleBanner")).to_be_visible()
+
+
 def test_photo_editor_keeps_native_menu_for_inputs(live_server, page):
     _open_editor(live_server, page)
 

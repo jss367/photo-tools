@@ -71,6 +71,59 @@ def test_browse_lightbox_arrows_navigate(live_server, page):
     expect(keywords.locator(".lightbox-keyword")).to_have_text("Red-tailed Hawk")
 
 
+def test_browse_lightbox_autoloads_next_page_at_navigation_boundary(
+    live_server, page,
+):
+    """Next continues through Browse's lazy-loaded page boundary."""
+    page.add_init_script(
+        """
+        class NoopIntersectionObserver {
+          observe() {}
+          unobserve() {}
+          disconnect() {}
+        }
+        window.IntersectionObserver = NoopIntersectionObserver;
+        """
+    )
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(
+            json={"photos_per_page": 2, "keyboard_shortcuts": {}}
+        ),
+    )
+    page.route(
+        "**/photos/*/full",
+        lambda route: route.fulfill(
+            body=base64.b64decode(_PNG_1X1), content_type="image/png"
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+
+    cards = page.locator(".grid-card")
+    cards.nth(1).wait_for(state="visible")
+    page.wait_for_function("photos.length === 2 && totalPhotos > photos.length")
+    boundary_id = int(cards.nth(1).get_attribute("data-id"))
+
+    cards.nth(1).dblclick()
+    page.wait_for_function(
+        "photoId => window._lightboxCommittedId === photoId", arg=boundary_id
+    )
+    page.wait_for_function("photos.length > 2", timeout=5000)
+    loaded_count = page.evaluate("photos.length")
+    expect(page.locator("#lightboxCounter")).to_contain_text(
+        f"2 / {loaded_count}"
+    )
+    page.evaluate("lightboxNav(1)")
+
+    page.wait_for_function(
+        "photoId => window._lightboxCurrentId !== photoId",
+        arg=boundary_id,
+        timeout=5000,
+    )
+    assert page.evaluate("window._lightboxPhotoList === photos") is True
+    assert page.evaluate("window._lightboxCurrentId === photos[2].id") is True
+
+
 def test_browse_lightbox_close_selects_current_photo(live_server, page):
     """Closing after lightbox navigation focuses the last-viewed grid photo."""
     page.route(

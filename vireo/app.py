@@ -8148,6 +8148,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         keywords = db.get_photo_keywords(photo_id)
         result["keywords"] = [dict(k) for k in keywords]
+        # Export naming uses the species-rank keyword list, which is narrower
+        # than the detail payload's life-list identifications (that list can
+        # also contain genus/family rows). Expose the exact export metadata so
+        # editor filename previews agree with the file the worker will write.
+        result["species"] = db.get_species_keywords_for_photos(
+            [photo_id]
+        ).get(photo_id, [])
 
         # Representative block: the photo's eligible species plus whether this
         # photo is the primary species representative. Only the primary (item 0
@@ -8196,6 +8203,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # right-click action can read a real filesystem path from the
             # detail response.
             result["path"] = os.path.join(folder["path"], photo["filename"])
+            result["folder_name"] = os.path.basename(folder["path"])
             xmp_path = os.path.join(
                 folder["path"],
                 os.path.splitext(photo["filename"])[0] + ".xmp",
@@ -8211,6 +8219,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             result["xmp_path"] = xmp_path
         else:
             result["path"] = ""
+            result["folder_name"] = ""
             result["xmp_exists"] = False
             result["xmp_keywords"] = []
             result["xmp_path"] = ""

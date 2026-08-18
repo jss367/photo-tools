@@ -89,24 +89,42 @@ def test_linux_uses_mount_identity_and_unescapes_mount_points(tmp_path):
     assert policies[1]["volume_key"] == policies[2]["volume_key"] == "linux:0:44"
 
 
-def test_linux_ext4_removable_disk_is_serialized(tmp_path):
+def test_linux_ext4_removable_disk_is_serialized(tmp_path, monkeypatch):
     mountinfo = tmp_path / "mountinfo"
     mountinfo.write_text(
         "22 20 8:17 / /media/me/SSD rw - ext4 /dev/sdb1 rw\n")
-    sys_dev_block = tmp_path / "sys" / "dev" / "block"
-    partition = tmp_path / "sys" / "devices" / "block" / "sdb" / "sdb1"
-    partition.mkdir(parents=True)
-    (partition.parent / "removable").write_text("1\n")
-    sys_dev_block.mkdir(parents=True)
-    (sys_dev_block / "8:17").symlink_to(partition)
+    seen_devices = []
+
+    def removable(device_number, _sys_dev_block):
+        seen_devices.append(device_number)
+        return device_number == "8:17"
+
+    monkeypatch.setattr(
+        source_scan_policy, "_linux_device_is_removable", removable,
+    )
 
     policy = source_scan_policy.classify_sources(
         ["/media/me/SSD/Photos"], platform="linux",
-        mountinfo_path=str(mountinfo), sys_dev_block=str(sys_dev_block),
+        mountinfo_path=str(mountinfo),
     )[0]
 
+    assert "8:17" in seen_devices
     assert policy["storage"] == "removable"
     assert policy["max_parallel"] == 1
+
+
+def test_linux_removable_metadata_can_live_on_partition_parent(
+        tmp_path, monkeypatch):
+    partition = tmp_path / "devices" / "block" / "sdb" / "sdb1"
+    partition.mkdir(parents=True)
+    (partition.parent / "removable").write_text("1\n")
+    monkeypatch.setattr(
+        source_scan_policy.os.path, "realpath", lambda _path: str(partition),
+    )
+
+    assert source_scan_policy._linux_device_is_removable(
+        "8:17", str(tmp_path / "dev" / "block"),
+    ) is True
 
 
 def test_windows_distinguishes_fixed_remote_and_removable_drives():

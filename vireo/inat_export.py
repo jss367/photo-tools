@@ -129,12 +129,44 @@ def write_inat_metadata(path: str, metadata: dict) -> None:
         raise InatExportError(f"Could not write photo metadata: {detail}")
 
 
-def _reserve_destination(path: str) -> str:
+def _destination_name_limit(destination: str) -> int:
+    """Return the destination filesystem's filename-component limit."""
+    try:
+        return int(os.pathconf(destination or os.curdir, "PC_NAME_MAX"))
+    except (AttributeError, OSError, ValueError):
+        return 255
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    """Truncate text without splitting a UTF-8 code point."""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _reserve_destination(path: str, *, preserve_suffix: str = "") -> str:
     """Atomically reserve a deduplicated destination with an empty file."""
-    stem, extension = os.path.splitext(path)
+    destination = os.path.dirname(path)
+    stem, extension = os.path.splitext(os.path.basename(path))
+    if preserve_suffix and stem.endswith(preserve_suffix):
+        variable_stem = stem[:-len(preserve_suffix)]
+    else:
+        variable_stem = stem
+        preserve_suffix = ""
+    name_limit = _destination_name_limit(destination)
     index = 1
     while True:
-        candidate = path if index == 1 else f"{stem}_{index}{extension}"
+        dedupe_suffix = "" if index == 1 else f"_{index}"
+        fixed_name = f"{preserve_suffix}{dedupe_suffix}{extension}"
+        max_stem_bytes = name_limit - len(fixed_name.encode("utf-8"))
+        if max_stem_bytes < 1:
+            raise OSError("Destination filename limit is too small")
+        bounded_stem = _truncate_utf8(variable_stem, max_stem_bytes)
+        candidate = os.path.join(
+            destination,
+            f"{bounded_stem}{fixed_name}",
+        )
         try:
             fd = os.open(
                 candidate,
@@ -197,6 +229,7 @@ def export_inat_photo(
         try:
             final_path = _reserve_destination(
                 os.path.join(destination, filename),
+                preserve_suffix="-iNaturalist",
             )
             stage_fd, staged_path = tempfile.mkstemp(
                 prefix=".inat-", suffix=".tmp", dir=destination,

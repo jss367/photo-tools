@@ -78,6 +78,23 @@ def test_reserve_destination_is_atomic_across_concurrent_exports(tmp_path):
     assert all(os.path.isfile(path) for path in reserved)
 
 
+def test_reserve_destination_bounds_utf8_name_and_preserves_suffix(tmp_path):
+    requested = str(tmp_path / ("é" * 20 + "-iNaturalist.jpg"))
+
+    with patch("inat_export._destination_name_limit", return_value=24):
+        first = _reserve_destination(
+            requested, preserve_suffix="-iNaturalist",
+        )
+        second = _reserve_destination(
+            requested, preserve_suffix="-iNaturalist",
+        )
+
+    assert len(os.path.basename(first).encode("utf-8")) <= 24
+    assert len(os.path.basename(second).encode("utf-8")) <= 24
+    assert first.endswith("-iNaturalist.jpg")
+    assert second.endswith("-iNaturalist_2.jpg")
+
+
 def test_write_inat_metadata_replaces_existing_metadata(tmp_path):
     path = tmp_path / "export.jpg"
     path.write_bytes(b"jpeg")
@@ -178,7 +195,7 @@ def test_export_inat_photo_uses_bounded_staging_filename(tmp_path):
     db.set_active_workspace(workspace_id)
     source_dir = tmp_path / "photos"
     source_dir.mkdir()
-    long_stem = "b" * 226
+    long_stem = "b" * 240
     source = source_dir / f"{long_stem}.jpg"
     Image.new("RGB", (32, 24), (190, 30, 20)).save(source)
     folder_id = db.add_folder(str(source_dir), name="photos")
@@ -193,7 +210,14 @@ def test_export_inat_photo_uses_bounded_staging_filename(tmp_path):
     destination = tmp_path / "exports"
 
     with patch("inat_export.write_inat_metadata"):
-        output = export_inat_photo(
+        first_output = export_inat_photo(
+            db,
+            str(tmp_path / "cache"),
+            photo_id,
+            str(destination),
+            {},
+        )
+        second_output = export_inat_photo(
             db,
             str(tmp_path / "cache"),
             photo_id,
@@ -201,8 +225,14 @@ def test_export_inat_photo_uses_bounded_staging_filename(tmp_path):
             {},
         )
 
-    assert output == str(destination / f"{long_stem}-iNaturalist.jpg")
-    assert os.path.isfile(output)
+    first_name = os.path.basename(first_output)
+    second_name = os.path.basename(second_output)
+    assert first_name.endswith("-iNaturalist.jpg")
+    assert second_name.endswith("-iNaturalist_2.jpg")
+    assert len(first_name.encode("utf-8")) <= os.pathconf(destination, "PC_NAME_MAX")
+    assert len(second_name.encode("utf-8")) <= os.pathconf(destination, "PC_NAME_MAX")
+    assert os.path.isfile(first_output)
+    assert os.path.isfile(second_output)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")

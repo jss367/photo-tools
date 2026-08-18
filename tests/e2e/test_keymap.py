@@ -158,7 +158,7 @@ def test_default_navigation_shortcuts_are_not_registered_as_bare_keys(live_serve
 
 
 def test_legacy_bare_navigation_shortcut_is_ignored(live_server, page):
-    """Existing configs with bare nav letters must not steal page-local keys."""
+    """Bare nav letters assigned to page actions must not steal those actions."""
     page.route(
         "**/api/config",
         lambda route: route.fulfill(
@@ -171,6 +171,71 @@ def test_legacy_bare_navigation_shortcut_is_ignored(live_server, page):
     page.keyboard.press("b")
     page.wait_for_timeout(300)
     assert page.url.endswith("/cull"), f"Expected to stay on /cull, got {page.url}"
+
+
+def test_fixed_browse_view_key_is_reserved_from_navigation(live_server, page):
+    """Browse's fixed E action must take precedence over a bare nav binding."""
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(
+            json={"keyboard_shortcuts": {"navigation": {"dashboard": "e"}}}
+        ),
+    )
+    url = live_server["url"]
+    page.goto(f"{url}/browse", timeout=15000)
+    page.wait_for_load_state("networkidle")
+
+    navigation_names = page.evaluate("""
+        window.Keymap.shortcutsForScope('global')
+            .filter(s => s.category === 'Navigation')
+            .map(s => s.name)
+    """)
+    assert "dashboard" not in navigation_names
+
+
+def test_non_letter_bare_keys_are_reserved_from_navigation(live_server, page):
+    """Bare navigation cannot replace fixed controls or browser focus traversal."""
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(
+            json={
+                "keyboard_shortcuts": {
+                    "navigation": {
+                        "dashboard": "f1",
+                        "workspace": "\\",
+                        "id_conflicts": "tab",
+                    }
+                }
+            }
+        ),
+    )
+    url = live_server["url"]
+    page.goto(f"{url}/browse", timeout=15000)
+    page.wait_for_load_state("networkidle")
+
+    navigation_names = page.evaluate("""
+        window.Keymap.shortcutsForScope('global')
+            .filter(s => s.category === 'Navigation')
+            .map(s => s.name)
+    """)
+    assert "dashboard" not in navigation_names
+    assert "workspace" not in navigation_names
+    assert "id_conflicts" not in navigation_names
+
+
+def test_unreserved_bare_navigation_shortcut_navigates(live_server, page):
+    """An otherwise-unused bare letter remains available for navigation."""
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(
+            json={"keyboard_shortcuts": {"navigation": {"dashboard": "d"}}}
+        ),
+    )
+    url = live_server["url"]
+    page.goto(f"{url}/cull", timeout=15000)
+    page.wait_for_load_state("networkidle")
+    page.keyboard.press("d")
+    page.wait_for_url(f"{url}/dashboard", timeout=3000)
 
 
 def test_modified_navigation_shortcut_still_navigates(live_server, page):
@@ -671,6 +736,25 @@ def test_shortcut_capture_does_not_navigate(live_server, page):
     assert page.url.endswith("/shortcuts"), (
         f"Expected to stay on /shortcuts during capture, got {page.url}"
     )
+
+
+def test_shortcut_editor_captures_unreserved_bare_navigation_key(live_server, page):
+    """Clicking an unassigned navigation binding accepts a plain unused letter."""
+    url = live_server["url"]
+    page.goto(f"{url}/shortcuts", timeout=15000)
+    page.wait_for_load_state("networkidle")
+    page.wait_for_function(
+        "document.querySelector('.shortcut-key-btn') !== null", timeout=2000
+    )
+
+    button = page.locator(
+        ".shortcut-key-btn[onclick*=\"'navigation', 'dashboard'\"]"
+    )
+    button.click()
+    page.keyboard.press("d")
+
+    assert button.text_content() == "D"
+    assert page.evaluate("currentShortcuts.navigation.dashboard") == "d"
 
 
 def test_help_modal_unlocks_scroll_when_keymap_unavailable(live_server, page):

@@ -3057,10 +3057,38 @@ window.NAV_ALL_PAGES = [
     return !sc.ctrl && !sc.meta && !sc.shift && !sc.alt;
   }
 
-  function navigationShortcutOrEmpty(keyStr) {
-    // Bare keys are reserved for page/window-local actions, not global
-    // navigation. Modifier chords remain valid for users who customize them.
-    return isBareShortcut(keyStr) ? '' : keyStr;
+  function isBarePageShortcut(keyStr, shortcuts) {
+    if (!isBareShortcut(keyStr)) return false;
+    var key = parseShortcut(keyStr).key;
+
+    // Bare navigation shortcuts are intentionally limited to unused letters.
+    // Non-letter keys retain their browser or page behavior unless combined
+    // with a modifier.
+    if (!/^[a-z]$/.test(key)) return true;
+
+    // Keep default and fixed page-local letters available in their owning views.
+    var reservedDefaults = [
+      'a', 'b', 'c', 'e', 'f', 'g', 'h', 'j', 'k', 'p', 's', 'u', 'x', 'z'
+    ];
+    if (reservedDefaults.indexOf(key) !== -1) {
+      return true;
+    }
+
+    // Reserve bare keys that are assigned to configurable page actions. Bare
+    // letters unused by a page action remain available for navigation.
+    for (var ctx in shortcuts) {
+      if (ctx === 'navigation') continue;
+      var pageShortcuts = shortcuts[ctx] || {};
+      for (var action in pageShortcuts) {
+        var shortcut = pageShortcuts[action];
+        if (isBareShortcut(shortcut) && parseShortcut(shortcut).key === key) return true;
+      }
+    }
+    return false;
+  }
+
+  function navigationShortcutOrEmpty(keyStr, shortcuts) {
+    return isBarePageShortcut(keyStr, shortcuts) ? '' : keyStr;
   }
 
   // Build reverse map: href → shortcut action name
@@ -3225,7 +3253,9 @@ window.NAV_ALL_PAGES = [
       if (shortcuts.navigation) {
         for (var key in shortcuts.navigation) navShortcuts[key] = shortcuts.navigation[key];
       }
-      for (var key in navShortcuts) navShortcuts[key] = navigationShortcutOrEmpty(navShortcuts[key]);
+      for (var key in navShortcuts) {
+        navShortcuts[key] = navigationShortcutOrEmpty(navShortcuts[key], shortcuts);
+      }
       // Store for other scripts to access
       if (!window._vireoShortcuts) window._vireoShortcuts = shortcuts;
       window._vireoShortcuts.navigation = navShortcuts;

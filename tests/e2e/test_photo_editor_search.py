@@ -388,7 +388,7 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
             Object.defineProperty(img, 'currentSrc', {
                 configurable: true,
                 get: () => '/photos/' + editorState.photoId +
-                    '/edit-preview?size=' + loadedSize + '&recipe=' +
+                    '/edit-preview?size=' + loadedSize + '&apply_crop=0&recipe=' +
                     encodeURIComponent(JSON.stringify(previewRecipeFor(editorState.recipe)))
             });
             Object.defineProperty(img, 'naturalWidth', {
@@ -438,6 +438,64 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
         }"""
     )
     assert stale_ratio == {"width": 3000, "height": 4000}
+
+    exif_oriented_crop = page.evaluate(
+        """() => {
+            const originalPhoto = cloneRecipe(editorState.photo);
+            const originalRecipe = cloneRecipe(editorState.recipe);
+            const originalCropEditing = editorState.cropEditing;
+            const originalZoomMode = editorState.zoomMode;
+            const originalZoomPercent = editorState.zoomPercent;
+            editorState.photo.width = 6000;
+            editorState.photo.height = 4000;
+            editorState.photo.metadata = {EXIF: {Orientation: 6}};
+            editorState.recipe = {
+                crop: {x: 0, y: 0, w: 0.25, h: 1}
+            };
+            editorState.cropEditing = false;
+            editorState.zoomMode = 'custom';
+            editorState.zoomPercent = 100;
+            const dims = editorNativeDisplayDimensions();
+            const renderSize = previewRenderSize();
+            editorState.photo = originalPhoto;
+            editorState.recipe = originalRecipe;
+            editorState.cropEditing = originalCropEditing;
+            editorState.zoomMode = originalZoomMode;
+            editorState.zoomPercent = originalZoomPercent;
+            return {dims, renderSize};
+        }"""
+    )
+    assert exif_oriented_crop == {
+        "dims": {"width": 1000, "height": 6000},
+        "renderSize": 6000,
+    }
+
+    fractional_crop_size = page.evaluate(
+        """() => {
+            const originalPhoto = cloneRecipe(editorState.photo);
+            const originalRecipe = cloneRecipe(editorState.recipe);
+            const originalCropEditing = editorState.cropEditing;
+            const originalZoomMode = editorState.zoomMode;
+            const originalZoomPercent = editorState.zoomPercent;
+            editorState.photo.width = 800;
+            editorState.photo.height = 600;
+            editorState.photo.metadata = null;
+            editorState.recipe = {
+                crop: {x: 0, y: 0, w: 0.333, h: 0.333}
+            };
+            editorState.cropEditing = false;
+            editorState.zoomMode = 'custom';
+            editorState.zoomPercent = 100;
+            const renderSize = previewRenderSize();
+            editorState.photo = originalPhoto;
+            editorState.recipe = originalRecipe;
+            editorState.cropEditing = originalCropEditing;
+            editorState.zoomMode = originalZoomMode;
+            editorState.zoomPercent = originalZoomPercent;
+            return renderSize;
+        }"""
+    )
+    assert fractional_crop_size == 267
 
     page.set_viewport_size({"width": 5000, "height": 4000})
     page.wait_for_function(
@@ -686,6 +744,23 @@ def test_photo_editor_enter_saves_crop_after_drag_from_focused_input(
     assert response.value.request.method == "PUT"
     assert response.value.status == 200
     expect(page.locator("#saveBtn")).to_be_disabled()
+    page.wait_for_function(
+        "() => document.getElementById('editorImg').src.includes('apply_crop=1')"
+    )
+    committed = page.evaluate(
+        """() => ({
+            cropEditing: editorState.cropEditing,
+            zoomMode: editorState.zoomMode,
+            cropVisible: getComputedStyle(
+                document.getElementById('editorCropBox')
+            ).display !== 'none'
+        })"""
+    )
+    assert committed == {
+        "cropEditing": False,
+        "zoomMode": "fit",
+        "cropVisible": False,
+    }
 
     recipe = page.evaluate(
         """async (photoId) => {
@@ -696,3 +771,58 @@ def test_photo_editor_enter_saves_crop_after_drag_from_focused_input(
     )
     assert recipe["crop"]["w"] < 1
     assert recipe["crop"]["h"] < 1
+
+    # Saving an unrelated adjustment on an already-cropped photo must retain
+    # the user's zoom; Fit is only selected when an active crop is accepted.
+    page.evaluate(
+        """() => {
+            editorState.zoomMode = 'custom';
+            editorState.zoomPercent = 100;
+            applyEditorZoom();
+            updateEditorZoomControl();
+        }"""
+    )
+    page.locator("#exposureRange").evaluate(
+        """el => {
+            el.value = '0.5';
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+        }"""
+    )
+    expect(page.locator("#saveBtn")).to_be_enabled()
+    with page.expect_response(
+        f"**/api/photos/{hawk_id}/edit-recipe"
+    ) as adjustment_response:
+        page.locator("#saveBtn").click()
+    assert adjustment_response.value.status == 200
+    expect(page.locator("#saveBtn")).to_be_disabled()
+    assert page.evaluate("() => editorState.zoomMode") == "custom"
+    assert page.evaluate("() => editorState.zoomPercent") == 100
+
+    page.locator("#editCropBtn").click()
+    page.wait_for_function(
+        "() => document.getElementById('editorImg').src.includes('apply_crop=0')"
+    )
+    expect(page.locator("#editorCropBox")).to_be_visible()
+
+    # Accepting an unchanged saved crop exits crop editing without creating a
+    # redundant history entry or requiring the disabled Save button.
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        "() => document.getElementById('editorImg').src.includes('apply_crop=1')"
+    )
+    expect(page.locator("#editorCropBox")).to_be_hidden()
+
+    crop_width = page.locator("#cropW")
+    crop_width.focus()
+    crop_width.fill("60")
+    with page.expect_response(
+        f"**/api/photos/{hawk_id}/edit-recipe"
+    ) as numeric_response:
+        page.keyboard.press("Enter")
+    assert numeric_response.value.request.method == "PUT"
+    assert numeric_response.value.status == 200
+    page.wait_for_function(
+        "() => document.getElementById('editorImg').src.includes('apply_crop=1')"
+    )
+    expect(page.locator("#editorCropBox")).to_be_hidden()
+    assert page.evaluate("() => editorState.recipe.crop.w") == 0.6

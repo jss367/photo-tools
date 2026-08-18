@@ -26729,6 +26729,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             result["revealed"] = bool(
                 reveal_after_export
                 and exported_files
+                and not runner.is_cancelled(job["id"])
                 and reveal_exported_files(exported_files)
             )
             return result

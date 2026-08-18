@@ -1138,6 +1138,48 @@ def test_job_export_reveals_successful_output(
     assert output.is_file()
 
 
+def test_job_export_does_not_reveal_after_cancellation(
+    client_with_photo, tmp_path, monkeypatch,
+):
+    """Cancellation after rendering suppresses the file-manager launch."""
+    import export as export_module
+
+    app, _db, photo_id = client_with_photo
+    destination = tmp_path / "cancelled-exports"
+    runner = app._job_runner
+    real_export_photos = export_module.export_photos
+    reveal_calls = []
+
+    def cancel_after_export(*args, **kwargs):
+        result = real_export_photos(*args, **kwargs)
+        job_id = next(
+            job_id
+            for job_id, job in runner._jobs.items()
+            if job["type"] == "export" and job["status"] == "running"
+        )
+        assert runner.cancel_job(job_id) is True
+        return result
+
+    monkeypatch.setattr(export_module, "export_photos", cancel_after_export)
+    monkeypatch.setattr(
+        export_module, "reveal_exported_files", reveal_calls.append,
+    )
+    response = app.test_client().post("/api/jobs/export", json={
+        "photo_ids": [photo_id],
+        "destination": str(destination),
+        "reveal_after_export": True,
+    })
+    assert response.status_code == 200
+
+    job = wait_for_job_via_client(
+        app.test_client(), response.get_json()["job_id"],
+    )
+    assert job["status"] == "cancelled"
+    assert job["result"]["revealed"] is False
+    assert reveal_calls == []
+    assert (destination / "test.jpg").is_file()
+
+
 def test_job_export_relative_destination(app_and_db):
     """POST /api/jobs/export with relative destination returns 400."""
     app, _ = app_and_db

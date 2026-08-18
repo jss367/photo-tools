@@ -210,7 +210,7 @@ body {
   justify-content: flex-start;
   cursor: grab;
 }
-.editor-canvas-wrap.zoom-actual .crop-box {
+.editor-canvas-wrap.zoom-custom .crop-box {
   cursor: grab;
 }
 .editor-canvas-wrap.space-pan,
@@ -1146,6 +1146,10 @@ function editorZoomText() {
 function editorIsActualZoom() {
   return editorState.zoomMode !== 'fit' &&
     Math.abs(editorState.zoomPercent - 100) < 0.5;
+}
+
+function editorCanDragToPan() {
+  return editorState.zoomMode !== 'fit';
 }
 
 function editorClampCustomZoomToFit() {
@@ -3175,7 +3179,7 @@ function initCropDrag() {
   };
 
   wrap.addEventListener('pointerdown', function(e) {
-    if (editorIsActualZoom() || editorState.spacePan) startPan(e);
+    if (editorCanDragToPan() || editorState.spacePan) startPan(e);
   });
   wrap.addEventListener('pointermove', movePan);
   wrap.addEventListener('pointerup', finishPan);
@@ -3195,9 +3199,9 @@ function initCropDrag() {
     try { box.focus({preventScroll: true}); }
     catch (_) { box.focus(); }
     var handle = e.target && e.target.dataset ? e.target.dataset.handle : '';
-    // At 100%, dragging the photo pans it. Corner handles keep resizing the
-    // crop, unless Space is held as an explicit pan override.
-    if (editorState.spacePan || (editorIsActualZoom() && !handle)) return;
+    // At any zoom above Fit, dragging the photo pans it. Corner handles keep
+    // resizing the crop, unless Space is held as an explicit pan override.
+    if (editorState.spacePan || (editorCanDragToPan() && !handle)) return;
     editorState.drag = {
       handle: handle || 'move',
       startX: e.clientX,

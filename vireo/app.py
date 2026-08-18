@@ -39,7 +39,7 @@ import card_cleanup
 import path_guard
 import places
 import remote_setup
-import source_scan_policy
+import source_discovery
 from db import (
     _LIFE_LIST_ANCESTOR_SUPPRESSION_CLAUSE,
     KEYWORD_TYPES,
@@ -21640,96 +21640,29 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         except Exception as e:
             return json_error(str(e), 500)
 
-    @app.route("/api/import/folder-preview", methods=["POST"])
-    def api_import_folder_preview():
-        """Discover files in source folders and return metadata for preview."""
+    @app.route("/api/import/folder-preview-stream", methods=["POST"])
+    def api_import_folder_preview_stream():
+        """One storage-aware traversal streams per-folder scan progress and
+        ends with the preview payload — the source-row counters and the
+        preview grid share a single walk instead of scanning twice."""
         body = request.get_json(silent=True) or {}
         folders = body.get("folders", [])
-        file_types = body.get("file_types", [])
-        summary_only = bool(body.get("summary_only"))
-        if not folders:
-            return json_error("folders required", 400)
-
-        from ingest import discover_source_files
-
-        all_files = []
-        source_counts = {}
-        type_breakdown = {}
-        total_size = 0
-        multi_source = len(folders) > 1
-
-        # Compute unique display names for each source folder.
-        # Use shortest trailing path segments that are unique across
-        # all sources (e.g. /mnt/cardA/DCIM and /mnt/cardB/DCIM
-        # become cardA/DCIM and cardB/DCIM).
-        root_names = {}
-        if multi_source:
-            parts = [Path(f).parts for f in folders]
-            for depth in range(1, max(len(p) for p in parts) + 1):
-                suffixes = [str(Path(*p[-depth:])) for p in parts]
-                if len(set(suffixes)) == len(suffixes):
-                    for folder_path, suffix in zip(folders, suffixes, strict=True):
-                        root_names[folder_path] = suffix
-                    break
-            else:
-                for folder_path in folders:
-                    root_names[folder_path] = folder_path
-
-        for folder in folders:
-            root_name = root_names.get(folder, os.path.basename(folder.rstrip("/")))
-            discovered = discover_source_files(folder, file_types=file_types if file_types else "both", recursive=body.get("recursive", True))
-            source_counts[folder] = len(discovered)
-            for f in discovered:
-                stat = f.stat()
-                ext = f.suffix.lower()
-                type_breakdown[ext] = type_breakdown.get(ext, 0) + 1
-                total_size += stat.st_size
-                if summary_only:
-                    continue
-                # Determine subfolder relative to the source root
-                try:
-                    rel = f.parent.relative_to(folder)
-                    subfolder = str(rel) if str(rel) != "." else root_name
-                except ValueError:
-                    subfolder = root_name
-                # Prefix with source root name when multiple sources to
-                # prevent collisions (e.g. two cards with DCIM/100CANON)
-                if multi_source and subfolder != root_name:
-                    subfolder = os.path.join(root_name, subfolder)
-
-                all_files.append({
-                    "path": str(f),
-                    "filename": f.name,
-                    "subfolder": subfolder,
-                    "size": stat.st_size,
-                    "extension": ext,
-                    "mtime": stat.st_mtime,
-                    "thumb_url": "/api/import/folder-preview/thumbnail?path=" + quote(str(f)),
-                })
-
-        return jsonify({
-            "total_count": sum(type_breakdown.values()) if summary_only else len(all_files),
-            "total_size": total_size,
-            "type_breakdown": type_breakdown,
-            "duplicate_count": 0,
-            "files": all_files,
-            "source_counts": source_counts,
-        })
-
-    @app.route("/api/import/source-scan-policy", methods=["POST"])
-    def api_import_source_scan_policy():
-        """Return bounded folder-count concurrency grouped by storage volume."""
-        body = request.get_json(silent=True)
-        if not isinstance(body, dict):
-            return json_error("JSON body must be an object", 400)
-        folders = body.get("folders")
         if (
             not isinstance(folders, list)
             or not folders
             or any(not isinstance(path, str) or not path for path in folders)
         ):
             return json_error("folders must be a non-empty list of paths", 400)
-        return jsonify({"sources": source_scan_policy.classify_sources(folders)})
+        file_types = body.get("file_types", [])
+        return Response(
+            source_discovery.stream_folder_preview(
+                folders,
+                file_types=file_types if file_types else "both",
+                recursive=bool(body.get("recursive", True)),
+            ),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.route("/api/import/new-images-preview", methods=["POST"])
     def api_import_new_images_preview():

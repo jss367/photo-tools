@@ -300,32 +300,26 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
         }"""
     )
 
+    page.set_viewport_size({"width": 5000, "height": 4000})
     native_stop = page.evaluate(
         """() => {
-            const wrap = document.getElementById('editorCanvasWrap');
-            const originalStyle = wrap.getAttribute('style');
-            editorState.photo.width = 3000;
-            editorState.photo.height = 2000;
-            wrap.style.width = '3400px';
-            wrap.style.height = '2600px';
             updateEditorZoomControl();
             const result = {
                 fit: editorFitZoomPercent(),
+                renderSize: previewRenderSize(),
                 actualDisplay: document.getElementById('actualBtn').style.display,
                 fitLabel: document.getElementById('fitBtn').textContent
             };
-            if (originalStyle === null) wrap.removeAttribute('style');
-            else wrap.setAttribute('style', originalStyle);
-            editorState.photo.width = 4000;
-            editorState.photo.height = 3000;
             applyEditorZoom();
             updateEditorZoomControl();
             return result;
         }"""
     )
+    page.set_viewport_size({"width": 2000, "height": 1000})
     assert native_stop["fit"] == 100
-    assert native_stop["actualDisplay"] != "none"
-    assert native_stop["fitLabel"] == "Fit"
+    assert native_stop["renderSize"] == 4000
+    assert native_stop["actualDisplay"] == "none"
+    assert native_stop["fitLabel"] == "Fit · 100%"
 
     one_axis = page.evaluate(
         """() => {
@@ -353,12 +347,28 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
     assert one_axis["fittedAxisError"] < 1
 
     page.set_viewport_size({"width": 3000, "height": 2000})
-    page.wait_for_function("() => editorState.zoomMode === 'fit'")
-    expect(page.locator("#editorZoomSlider")).to_have_attribute(
-        "aria-valuetext", "Fit"
+    page.wait_for_function(
+        """() => editorState.zoomMode === 'custom' &&
+            editorState.zoomPercent >= editorFitZoomPercent() - 0.01"""
     )
+    resize_state = page.evaluate(
+        """() => {
+            const before = editorState.zoomPercent;
+            window.dispatchEvent(new Event('resize'));
+            return {
+                mode: editorState.zoomMode,
+                before,
+                after: editorState.zoomPercent,
+                fit: editorFitZoomPercent()
+            };
+        }"""
+    )
+    assert resize_state["mode"] == "custom"
+    assert abs(resize_state["after"] - resize_state["before"]) < 0.01
+    assert resize_state["after"] >= resize_state["fit"] - 0.01
     page.set_viewport_size({"width": 2000, "height": 1000})
 
+    page.locator("#fitBtn").click()
     page.locator("#actualBtn").click()
     expect(page.locator("#editorZoomSlider")).to_have_attribute(
         "aria-valuetext", "100%"
@@ -408,12 +418,14 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
     fit = page.evaluate(
         """() => ({
             mode: editorState.zoomMode,
-            inlineWidth: document.getElementById('editorImg').style.width,
+            width: document.getElementById('editorImg').clientWidth,
             zoomed: document.getElementById('editorCanvasWrap')
                 .classList.contains('zoom-custom')
         })"""
     )
-    assert fit == {"mode": "fit", "inlineWidth": "", "zoomed": False}
+    assert fit["mode"] == "fit"
+    assert fit["width"] > 0
+    assert fit["zoomed"] is False
 
 
 def test_photo_editor_enter_saves_crop_after_drag_from_focused_input(

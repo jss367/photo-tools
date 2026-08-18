@@ -1048,9 +1048,7 @@ function editorZoomText() {
 function editorFitUsesNativeRender() {
   var photo = editorState.photo || {};
   var native = Math.max(Number(photo.width) || 0, Number(photo.height) || 0);
-  // Fit requests a 1920px preview. Only a source at or below that tier makes
-  // Fit and 100% equivalent in both display size and delivered detail.
-  return native > 0 && native <= 1920;
+  return native > 0 && editorFitRenderSize() >= Math.min(16384, native);
 }
 
 function updateEditorZoomControl() {
@@ -1115,8 +1113,12 @@ function applyEditorZoom() {
   }
   wrap.classList.toggle('zoom-custom', custom);
   if (!custom) {
-    img.style.removeProperty('width');
-    img.style.removeProperty('height');
+    var fitDims = editorNativeDisplayDimensions();
+    var fitPercent = editorFitZoomPercent();
+    if (fitDims) {
+      img.style.width = (fitDims.width * fitPercent / 100) + 'px';
+      img.style.height = (fitDims.height * fitPercent / 100) + 'px';
+    }
     wrap.scrollLeft = 0;
     wrap.scrollTop = 0;
   } else {
@@ -1632,19 +1634,27 @@ function updateHistogramFeedback() {
   setClip('highlight', clippedHigh);
 }
 
-function previewRenderSize() {
-  // Fit keeps the cheaper 1920 render. Continuous zoom requests enough source
-  // pixels for the selected display scale, reaching the native source at 100%
-  // and reusing it for magnification above 100%.
-  if (editorState.zoomMode === 'fit') return 1920;
+function editorRenderSizeForPercent(percent) {
   var p = editorState.photo || {};
   var native = Math.max(Number(p.width) || 0, Number(p.height) || 0);
-  if (!native) return editorState.zoomPercent >= 100 ? 3840 : 1920;
-  var requested = native * Math.min(100, editorState.zoomPercent) / 100;
-  // Bucket intermediate sizes to avoid generating a new server render for
-  // every single slider pixel while still keeping the preview sharp.
+  if (!native) return percent >= 100 ? 3840 : 1920;
+  var requested = native * Math.min(100, percent) / 100;
   requested = Math.ceil(Math.max(1920, requested) / 256) * 256;
   return Math.min(16384, native, requested);
+}
+
+function editorFitRenderSize() {
+  return editorRenderSizeForPercent(editorFitZoomPercent());
+}
+
+function previewRenderSize() {
+  // Request enough source pixels for the displayed Fit or custom scale,
+  // reaching the native source at 100% and reusing it above 100%. Sizes are
+  // bucketed so moving one slider pixel does not create a new server render.
+  var percent = editorState.zoomMode === 'fit'
+    ? editorFitZoomPercent()
+    : editorState.zoomPercent;
+  return editorRenderSizeForPercent(percent);
 }
 
 function previewStatusText(img) {
@@ -2972,15 +2982,15 @@ function initCropDrag() {
     editorState.drag = null;
   });
   window.addEventListener('resize', function() {
-    var snappedToFit = false;
+    var clampedCustomZoom = false;
     if (editorState.zoomMode !== 'fit' &&
-        editorState.zoomPercent <= editorFitZoomPercent()) {
-      editorState.zoomMode = 'fit';
-      snappedToFit = true;
+        editorState.zoomPercent < editorFitZoomPercent()) {
+      editorState.zoomPercent = editorFitZoomPercent();
+      clampedCustomZoom = true;
     }
     applyEditorZoom();
     updateEditorZoomControl();
-    if (snappedToFit && editorState.photoId && !editorState.loading) {
+    if (clampedCustomZoom && editorState.photoId && !editorState.loading) {
       schedulePreview();
     }
     renderCropBox();

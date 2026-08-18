@@ -10,8 +10,20 @@ def _exiftool_command(commands):
     return next(
         command
         for command in commands
-        if command and os.path.basename(command[0]) == "exiftool"
+        if command
+        and any(
+            os.path.basename(argument).lower() in {"exiftool", "exiftool.exe"}
+            for argument in command[:2]
+        )
     )
+
+
+def test_exiftool_command_accepts_supported_launchers():
+    perl_command = ["/usr/bin/perl", "/opt/vireo/exiftool", "-json"]
+    windows_command = ["exiftool.exe", "-json"]
+
+    assert _exiftool_command([["/usr/sbin/sysctl"], perl_command]) == perl_command
+    assert _exiftool_command([["wmic"], windows_command]) == windows_command
 
 
 def test_capture_time_offset_validation_rejects_invalid_extremes():

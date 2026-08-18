@@ -178,6 +178,7 @@ class VireoApiClient:
         self.clock = clock
         self.host_header = host_header
         self.opener = opener or urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
             urllib.request.HTTPCookieProcessor(CookieJar())
         )
 

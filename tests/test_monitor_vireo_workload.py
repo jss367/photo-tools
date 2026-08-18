@@ -2,6 +2,7 @@ import http.client
 import json
 import socket
 import threading
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -1306,6 +1307,21 @@ def test_api_client_establishes_browser_cookie_before_reading_jobs():
     assert sample["status"] == 200
     assert sample["resource_budget"] == {"waiters": 0}
     assert host_headers == ["localhost", "localhost"]
+
+
+def test_api_client_disables_environment_proxies(monkeypatch):
+    monkeypatch.setattr(
+        urllib.request,
+        "getproxies",
+        lambda: {"http": "http://proxy.example:8080"},
+    )
+
+    client = VireoApiClient("http://127.0.0.1:50222")
+
+    assert not any(
+        isinstance(handler, urllib.request.ProxyHandler)
+        for handler in client.opener.handlers
+    )
 
 
 def test_api_client_returns_failure_for_truncated_http_body():

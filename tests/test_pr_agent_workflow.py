@@ -184,22 +184,23 @@ def test_human_and_codex_merge_authorizations_are_head_bound():
     assert 'live_head" != "$REVIEW_HEAD' in workflow
     assert 'live_head" != "$approved_head"*' in workflow
 
-    # Reactions have no webhook, so discovery runs on the paired Codex comment,
+    # Reactions have no webhook, so discovery runs on an optional Codex comment,
     # successful Tests, and a polling fallback. A generic +1 comment is never
-    # considered authorization.
+    # considered authorization, and the exact-head Tests run prevents a stale
+    # reaction from authorizing a later push.
     assert 'cron: "*/15 * * * *"' in workflow
     assert "workflow_dispatch:" in workflow
     assert "discover-codex-merge-authorizations:" in workflow
     assert "github.actor == 'chatgpt-codex-connector[bot]'" in workflow
     assert "github.event.workflow_run.conclusion == 'success'" in workflow
     assert 'select(.content == "+1")' in workflow
-    assert 'select(.created_at == $comment.created_at)' in workflow
-    assert 'select(.created_at == .updated_at)' in workflow
-    assert "Codex Review: Didn\\u0027t find any major issues." in workflow
-    assert "Reviewed commit:" in workflow
-    assert 'select($reviewed_head != "" and ($head | startswith($reviewed_head)))' in workflow
+    assert 'select(.created_at > $tests_started_at)' in workflow
+    assert '--json databaseId,headSha,createdAt' in workflow
+    assert 'select((.headSha | ascii_downcase) == $head)' in workflow
+    assert 'tests_run_id: $authorization' not in workflow
+    assert 'tests_run_id: $tests_run_id' in workflow
     assert "codex-reaction-id: ${{ matrix.target.reaction_id }}" in workflow
-    assert "codex-review-comment-id: ${{ matrix.target.review_comment_id }}" in workflow
+    assert "codex-tests-run-id: ${{ matrix.target.tests_run_id }}" in workflow
 
 
 def test_merge_gate_requires_live_head_and_resolved_current_threads():
@@ -219,13 +220,12 @@ def test_merge_gate_requires_live_head_and_resolved_current_threads():
     assert 'reaction_actor" != "chatgpt-codex-connector[bot]"' in action
     assert 'reaction_content" != "+1"' in action
     assert 'reaction_time" != "$AUTHORIZED_AT"' in action
-    assert "repos/${REPO}/issues/comments/${CODEX_REVIEW_COMMENT_ID}" in action
-    assert 'codex_actor" != "chatgpt-codex-connector[bot]"' in action
-    assert 'codex_body" != "Codex Review: Didn\'t find any major issues."*' in action
-    assert 'head_sha" != "$codex_reviewed_head"*' in action
-    assert 'codex_created_at" != "$AUTHORIZED_AT"' in action
-    assert 'codex_updated_at" != "$AUTHORIZED_AT"' in action
-    assert 'select(.id != $codex_review_comment_id)' in action
+    assert 'gh run view "$CODEX_TESTS_RUN_ID"' in action
+    assert 'codex_tests_head" != "$head_sha"' in action
+    assert 'codex_tests_event" != "pull_request"' in action
+    assert 'codex_tests_workflow" != "Tests"' in action
+    assert 'reaction_time" < "$codex_tests_started_at"' in action
+    assert 'reaction_time" == "$codex_tests_started_at"' in action
     assert "reviewThreads(first:100" in action
     assert ".isResolved == false and .isOutdated == false" in action
     assert 'if [[ "$unresolved" -gt 0 ]]' in action

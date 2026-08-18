@@ -30,7 +30,7 @@ The GitHub workflow no longer calls `claude-code-action` and does not use
    endpoint with a plain-text description of what needs to be done.
 2. **Merge jobs** — pure bash, no LLM. Handle squash-merge after a human
    approval, an explicit `/merge <head-sha>` command, or a Codex connector
-   👍 paired with its no-findings review of the current head, with a live
+   👍 posted after the current head's Tests run begins, with a live
    unresolved-thread gate.
 
 The routine itself holds the prompt that was previously inlined into the
@@ -106,10 +106,10 @@ Actions merge jobs do not need these secrets.
 
 The forwarder workflow reads `HUMAN_MERGE_ACTORS` at the top of
 `pr-agent.yml`. Keep this list human-only. `CODEX_MERGE_ACTOR` separately
-identifies the connector account whose 👍 reaction can authorize a merge when
-it is paired with an unedited no-findings summary naming the current head.
-Keeping the two settings separate prevents an arbitrary bot review or reaction
-from being treated like a human approval.
+identifies the connector account whose 👍 reaction can authorize a merge after
+the exact head's Tests run has started. Keeping the two settings separate
+prevents an arbitrary bot review or reaction from being treated like a human
+approval.
 
 ## Payload format
 
@@ -151,8 +151,8 @@ forge.
   `UNKNOWN` mergeability is left for explicit `/claude-fix` rather than firing
   speculatively.
 - A human approving review, an exact `/merge <head-sha>` command from a
-  configured human, or the Codex connector reacting 👍 while posting an
-  unedited no-findings summary for the current commit: synchronously
+  configured human, or the Codex connector reacting 👍 after the current
+  commit's Tests run begins: synchronously
   squash-merges only when the authorized head is still current, every
   non-outdated review thread is resolved, and the Tests workflow succeeded for
   that exact head. If authorization arrives while Tests is running, the
@@ -161,15 +161,16 @@ forge.
   authorization requires a fresh approval or exact merge command before the
   head can merge. The live gate also confirms that the exact approval remains
   active, the exact merge-command comment still exists unchanged, or the exact
-  Codex summary/reaction pair remains live and still names the current head.
+  Codex reaction remains live and its binding Tests run still belongs to the
+  current head.
 
 GitHub does not publish a workflow event for issue reactions. The workflow
-therefore checks for a Codex authorization when the paired summary comment is
+therefore checks for a Codex authorization when an optional Codex comment is
 created, when Tests succeeds, and every 15 minutes as a fallback. The reaction
-and summary must have the same creation timestamp, the summary must be
-unedited, and its `Reviewed commit` marker must match the full live PR head.
-The summary comment itself is excluded from the newer-feedback gate; any other
-accepted feedback at or after that timestamp still blocks the merge.
+must be newer than the first Tests run for the full live PR head. The live gate
+re-fetches that run and confirms its workflow, event, and head before merging,
+so a reaction left on an earlier head cannot authorize a later push. Any
+accepted feedback at or after the reaction still blocks the merge.
 
 Created and edited comments and reviews are wakeups. Merge authorization is
 ordered against comment and review update timestamps, so adding feedback to an
@@ -296,11 +297,11 @@ the exact current head (a 7-40 character prefix is accepted):
 /merge daecbb28
 ```
 
-Ambiguous `+1` comments and reactions do not authorize merges. The only bot
-reaction accepted is a 👍 from `CODEX_MERGE_ACTOR` paired at the same timestamp
-with its unedited no-findings summary naming the current commit. Every approval
-path re-queries the current head, requires a successful Tests run for that
-head, paginates all review threads, and merges synchronously without leaving an
+Ambiguous `+1` comments and reactions from other actors do not authorize
+merges. The only bot reaction accepted is a 👍 from `CODEX_MERGE_ACTOR` posted
+after a Tests run for the exact current head begins. Every approval path
+re-queries the current head, requires a successful Tests run for that head,
+paginates all review threads, and merges synchronously without leaving an
 auto-merge request armed.
 
 ## Rollback

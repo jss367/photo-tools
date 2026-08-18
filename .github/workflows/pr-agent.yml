@@ -617,9 +617,9 @@ jobs:
           gh pr edit "$PR" --repo "$REPO" --add-label "$AGENT_LABEL"
 
   # GitHub does not emit a workflow event for issue reactions. Discover a
-  # Codex approval when its summary comment arrives, when Tests succeeds, and
-  # on a short polling fallback. The reaction authorizes only the commit named
-  # in the paired, unedited "no major issues" summary at the same timestamp.
+  # Codex approval when its optional summary comment arrives, when Tests
+  # succeeds, and on a short polling fallback. Bind the reaction to the exact
+  # head through that head's first Tests run so a later push invalidates it.
   discover-codex-merge-authorizations:
     if: >-
       github.event_name == 'schedule'
@@ -658,10 +658,11 @@ jobs:
           targets='[]'
           for pr in $candidates; do
             pr_json=$(gh pr view "$pr" --repo "$REPO" \
-              --json state,isDraft,headRefOid,baseRefName,headRepositoryOwner,headRepository)
+              --json state,isDraft,headRefOid,headRefName,baseRefName,headRepositoryOwner,headRepository)
             state=$(jq -r '.state' <<< "$pr_json")
             draft=$(jq -r '.isDraft' <<< "$pr_json")
             head_sha=$(jq -r '.headRefOid | ascii_downcase' <<< "$pr_json")
+            head_ref=$(jq -r '.headRefName' <<< "$pr_json")
             base_ref=$(jq -r '.baseRefName' <<< "$pr_json")
             head_repo=$(jq -r '.headRepositoryOwner.login + "/" + .headRepository.name' <<< "$pr_json")
 
@@ -674,34 +675,33 @@ jobs:
               continue
             fi
 
-            comments=$(gh api --paginate "repos/${REPO}/issues/${pr}/comments" \
-              --slurp | jq 'add // []')
+            test_runs=$(gh run list --repo "$REPO" --workflow Tests \
+              --branch "$head_ref" --event pull_request --limit 100 \
+              --json databaseId,headSha,createdAt)
+            first_head_test=$(jq -c --arg head "$head_sha" '
+              [ .[] | select((.headSha | ascii_downcase) == $head) ]
+              | sort_by(.createdAt)
+              | first // empty' <<< "$test_runs")
+            if [[ -z "$first_head_test" ]]; then
+              echo "PR #${pr} has no Tests run that can bind a Codex reaction to ${head_sha}."
+              continue
+            fi
+            tests_run_id=$(jq -r '.databaseId' <<< "$first_head_test")
+            tests_started_at=$(jq -r '.createdAt' <<< "$first_head_test")
+
             reactions=$(gh api --paginate "repos/${REPO}/issues/${pr}/reactions" \
               --slurp | jq 'add // []')
             authorization=$(jq -cn \
-              --argjson comments "$comments" \
               --argjson reactions "$reactions" \
               --arg bot "$CODEX_MERGE_ACTOR" \
-              --arg head "$head_sha" '
-                [ $comments[]
-                  | select(.user.login == $bot)
-                  | select(.created_at == .updated_at)
-                  | select(.body | startswith("Codex Review: Didn\u0027t find any major issues."))
-                  | . as $comment
-                  | (try ($comment.body
-                      | capture("\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-fA-F]{7,40})`")
-                      | .sha
-                      | ascii_downcase)
-                    catch "") as $reviewed_head
-                  | select($reviewed_head != "" and ($head | startswith($reviewed_head)))
-                  | $reactions[]
+              --arg tests_started_at "$tests_started_at" '
+                [ $reactions[]
                   | select(.user.login == $bot)
                   | select(.content == "+1")
-                  | select(.created_at == $comment.created_at)
+                  | select(.created_at > $tests_started_at)
                   | {
                       authorized_at: .created_at,
-                      reaction_id: .id,
-                      review_comment_id: $comment.id
+                      reaction_id: .id
                     }
                 ]
                 | sort_by(.authorized_at)
@@ -714,13 +714,14 @@ jobs:
             targets=$(jq -c \
               --argjson pr "$pr" \
               --arg head "$head_sha" \
+              --argjson tests_run_id "$tests_run_id" \
               --argjson authorization "$authorization" \
               '. + [{
                 pr: $pr,
                 head: $head,
                 authorized_at: $authorization.authorized_at,
                 reaction_id: $authorization.reaction_id,
-                review_comment_id: $authorization.review_comment_id
+                tests_run_id: $tests_run_id
               }]' <<< "$targets")
           done
 
@@ -758,7 +759,7 @@ jobs:
           approved-head: ${{ matrix.target.head }}
           authorized-at: ${{ matrix.target.authorized_at }}
           codex-reaction-id: ${{ matrix.target.reaction_id }}
-          codex-review-comment-id: ${{ matrix.target.review_comment_id }}
+          codex-tests-run-id: ${{ matrix.target.tests_run_id }}
 
       - name: Squash-merge Codex-approved head
         if: steps.ready.outputs.ready == 'true'

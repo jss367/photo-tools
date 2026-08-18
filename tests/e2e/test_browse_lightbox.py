@@ -264,6 +264,77 @@ def test_browse_lightbox_delete_preserves_live_pagination_list(live_server, page
     assert page.evaluate("window._lightboxPhotoList === photos") is True
 
 
+def test_browse_lightbox_stale_boundary_retry_does_not_advance_reopened_session(
+    live_server, page,
+):
+    """A pending page load cannot navigate a newly reopened lightbox."""
+    page.add_init_script(
+        """
+        class NoopIntersectionObserver {
+          observe() {}
+          unobserve() {}
+          disconnect() {}
+        }
+        window.IntersectionObserver = NoopIntersectionObserver;
+        """
+    )
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(
+            json={"photos_per_page": 2, "keyboard_shortcuts": {}}
+        ),
+    )
+    page.route(
+        "**/photos/*/full",
+        lambda route: route.fulfill(
+            body=base64.b64decode(_PNG_1X1), content_type="image/png"
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+    page.wait_for_function("photos.length === 2 && totalPhotos > photos.length")
+    boundary_id = page.evaluate("photos[1].id")
+    page.evaluate(
+        """() => {
+          const originalSafeFetch = window.safeFetch;
+          window.safeFetch = async function(url, options, behavior) {
+            const body = options && options.body ? JSON.parse(options.body) : null;
+            if (url === '/api/photos/query' && body && body.page === 2) {
+              const response = originalSafeFetch.call(this, url, options, behavior);
+              await new Promise(resolve => { window.__releaseNextPage = resolve; });
+              return response;
+            }
+            return originalSafeFetch.call(this, url, options, behavior);
+          };
+        }"""
+    )
+
+    page.locator(f'.grid-card[data-id="{boundary_id}"]').dblclick()
+    page.wait_for_function(
+        "photoId => window._lightboxCommittedId === photoId", arg=boundary_id
+    )
+    page.wait_for_function("loading === true && !!window.__releaseNextPage")
+    page.evaluate("lightboxNav(1)")
+    original_session = page.evaluate("browseLightboxSession")
+
+    page.evaluate("closeLightbox()")
+    page.evaluate(
+        """photoId => {
+          const photo = photos.find(item => item.id === photoId);
+          openLightbox(photo.id, photo.filename || '', photos);
+        }""",
+        boundary_id,
+    )
+    page.wait_for_function(
+        "photoId => window._lightboxCommittedId === photoId", arg=boundary_id
+    )
+    assert page.evaluate("browseLightboxSession") == original_session + 1
+
+    page.evaluate("window.__releaseNextPage()")
+    page.wait_for_function("loading === false && photos.length > 2", timeout=5000)
+    page.wait_for_timeout(100)
+    assert page.evaluate("window._lightboxCurrentId") == boundary_id
+
+
 def test_browse_lightbox_close_selects_current_photo(live_server, page):
     """Closing after lightbox navigation focuses the last-viewed grid photo."""
     page.route(

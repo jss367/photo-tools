@@ -6120,6 +6120,7 @@ function browseKeyMatchesConfiguredShortcut(e) {
    If the user reaches an edge before the request finishes, retry at the same
    boundary and advance as soon as the page is available. */
 var browseLightboxBoundaryRetry = null;
+var browseLightboxSession = 0;
 
 function browseLightboxOwnsLoadedWindow() {
   return (
@@ -6145,7 +6146,8 @@ function refreshBrowseLightboxCounter() {
   counter.style.display = '';
 }
 
-function continueBrowseLightboxAcrossBoundary(delta, currentId) {
+function continueBrowseLightboxAcrossBoundary(delta, currentId, session) {
+  if (session !== browseLightboxSession) return;
   if (!browseLightboxOwnsLoadedWindow() || window._lightboxCurrentId !== currentId) return;
   var index = photos.findIndex(function(photo) { return photo.id === currentId; });
   if (index < 0) return;
@@ -6161,7 +6163,7 @@ function continueBrowseLightboxAcrossBoundary(delta, currentId) {
   if (loading) {
     clearTimeout(browseLightboxBoundaryRetry);
     browseLightboxBoundaryRetry = setTimeout(function() {
-      continueBrowseLightboxAcrossBoundary(delta, currentId);
+      continueBrowseLightboxAcrossBoundary(delta, currentId, session);
     }, 50);
     return;
   }
@@ -6171,6 +6173,7 @@ function continueBrowseLightboxAcrossBoundary(delta, currentId) {
     : prependPreviousPhotos({ silent: true });
   Promise.resolve(request).then(function(loaded) {
     if (loaded !== true) return;
+    if (session !== browseLightboxSession) return;
     if (!browseLightboxOwnsLoadedWindow() || window._lightboxCurrentId !== currentId) return;
     lightboxNav(delta);
   });
@@ -6189,7 +6192,15 @@ document.addEventListener('lightbox:navigationboundary', function(event) {
   var detail = event && event.detail || {};
   if (detail.delta !== 1 && detail.delta !== -1) return;
   if (!browseLightboxOwnsLoadedWindow()) return;
-  continueBrowseLightboxAcrossBoundary(detail.delta, detail.photoId);
+  continueBrowseLightboxAcrossBoundary(
+    detail.delta, detail.photoId, browseLightboxSession
+  );
+});
+
+document.addEventListener('lightbox:closed', function() {
+  browseLightboxSession++;
+  clearTimeout(browseLightboxBoundaryRetry);
+  browseLightboxBoundaryRetry = null;
 });
 
 /* ---------- Infinite Scroll ---------- */

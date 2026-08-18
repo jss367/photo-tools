@@ -92,10 +92,15 @@ def test_lightbox_export_resolves_photo_when_action_is_invoked(live_server, page
             selectedPhotos.clear();
             selectedPhotoId = _lightboxCurrentId;
             window.__exportRequest = null;
+            window.__resolveExport = null;
             window.safeFetch = async function(url, options) {
                 if (url === '/api/jobs/export') {
                     window.__exportRequest = JSON.parse(options.body);
-                    return {job_id: 'lightbox-export-test'};
+                    return new Promise(function(resolve) {
+                        window.__resolveExport = function() {
+                            resolve({job_id: 'lightbox-export-test'});
+                        };
+                    });
                 }
                 return {};
             };
@@ -131,6 +136,13 @@ def test_lightbox_export_resolves_photo_when_action_is_invoked(live_server, page
     page.locator("#exportSubmitBtn").click()
     page.wait_for_function("window.__exportRequest !== null")
     assert page.evaluate("window.__exportRequest.photo_ids") == [export_photo["id"]]
+    expect(page.get_by_role("button", name="Cancel", exact=True)).to_be_disabled()
+    page.keyboard.press("Escape")
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    page.evaluate("document.getElementById('exportOverlay').click()")
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    page.evaluate("window.__resolveExport()")
+    expect(page.locator("#exportOverlay")).not_to_have_class("modal-overlay open")
 
 
 def test_lightbox_color_description_opens_editor(live_server, page):

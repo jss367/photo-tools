@@ -1597,6 +1597,17 @@ def _destination_path_identity(path):
     )
 
 
+def _nearest_existing_directory(path):
+    """Return the directory whose filesystem will contain a planned path."""
+    existing_path = os.path.realpath(path)
+    while not os.path.isdir(existing_path):
+        parent = os.path.dirname(existing_path)
+        if parent == existing_path:
+            break
+        existing_path = parent
+    return existing_path
+
+
 class _DestinationPathReservations:
     """Mirror planned paths on the destination volume to detect aliases."""
 
@@ -1759,16 +1770,19 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
         ):
             continue
 
-        reservation_key = _destination_path_identity(photo_destination)
+        reservation_destination = _nearest_existing_directory(
+            os.path.dirname(requested_path)
+        )
+        reservation_key = _destination_path_identity(reservation_destination)
         if reservation_key not in destination_reservations:
             destination_reservations[reservation_key] = (
-                _DestinationPathReservations(photo_destination)
+                _DestinationPathReservations(reservation_destination)
             )
         reservations = destination_reservations[reservation_key]
 
         def is_reserved(
             candidate,
-            current_destination=photo_destination,
+            current_destination=reservation_destination,
             current_reservations=reservations,
         ):
             return current_reservations.contains(candidate, current_destination)
@@ -1777,7 +1791,7 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
             requested_path,
             is_reserved=is_reserved,
         )
-        reservations.add(export_path, photo_destination)
+        reservations.add(export_path, reservation_destination)
         if export_path != requested_path:
             renames.append({
                 "photo_id": pid,

@@ -1449,6 +1449,64 @@ def test_preview_export_renames_respects_case_insensitive_destination(
     ]
 
 
+def test_preview_export_renames_probes_nested_output_filesystem(
+    export_env, monkeypatch,
+):
+    """A mounted template subdirectory supplies its own filename semantics."""
+    env = export_env
+    destination = env["tmp_path"] / "export_out"
+    mounted_output = destination / "mounted"
+    mounted_output.mkdir(parents=True)
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = 'Photo.jpg' WHERE id = ?",
+        (env["p1"],),
+    )
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = 'photo.jpg' WHERE id = ?",
+        (env["p2"],),
+    )
+    env["db"].conn.commit()
+    observed_destinations = []
+
+    class MountedReservations:
+        def __init__(self, reservation_destination):
+            self.destination = os.path.realpath(reservation_destination)
+            self.paths = set()
+            observed_destinations.append(self.destination)
+
+        def contains(self, candidate, destination=None):
+            relative = os.path.relpath(candidate, destination or self.destination)
+            return relative.lower() in self.paths
+
+        def add(self, candidate, destination=None):
+            relative = os.path.relpath(candidate, destination or self.destination)
+            self.paths.add(relative.lower())
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        export_mod, "_DestinationPathReservations", MountedReservations,
+    )
+    monkeypatch.setattr(
+        export_mod,
+        "_select_export_source",
+        lambda **_kwargs: str(env["src"] / "bird1.jpg"),
+    )
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=str(destination),
+        options={"naming_template": "mounted/{original}", "format": "jpg"},
+    )
+
+    assert observed_destinations == [os.path.realpath(mounted_output)]
+    assert [(item["requested_name"], item["export_name"]) for item in renames] == [
+        ("photo.jpg", "photo_2.jpg"),
+    ]
+
+
 def test_preview_export_renames_keeps_case_twins_on_empty_linux_target(
     export_env, monkeypatch,
 ):

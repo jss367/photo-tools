@@ -3188,6 +3188,7 @@ async function saveRecipe(description) {
 }
 
 var editorExportRequestGeneration = 0;
+var editorExportDismissible = true;
 
 function setExportControlsBusy(busy) {
   document.querySelectorAll('#exportOverlay input, #exportOverlay select, #exportOverlay button').forEach(function(control) {
@@ -3199,6 +3200,13 @@ function setExportControlsBusy(busy) {
       control.disabled = control.getAttribute('data-export-was-disabled') === '1';
       control.removeAttribute('data-export-was-disabled');
     }
+  });
+}
+
+function setExportDismissible(dismissible) {
+  editorExportDismissible = dismissible;
+  document.querySelectorAll('#exportOverlay [data-export-cancel]').forEach(function(control) {
+    control.disabled = !dismissible;
   });
 }
 
@@ -3247,6 +3255,7 @@ async function openExportModal() {
   document.getElementById('exportSubfolder').checked = false;
   editorExportRequestGeneration++;
   setExportControlsBusy(false);
+  setExportDismissible(true);
   document.getElementById('exportSubmitBtn').disabled = false;
   document.getElementById('exportSubmitBtn').textContent = 'Export Photo';
   document.getElementById('exportOverlay').classList.add('open');
@@ -3254,6 +3263,7 @@ async function openExportModal() {
 }
 
 function closeExportModal() {
+  if (!editorExportDismissible) return;
   editorExportRequestGeneration++;
   setExportControlsBusy(false);
   document.getElementById('exportOverlay').classList.remove('open');
@@ -3434,6 +3444,7 @@ async function startExport() {
     }
 
     button.textContent = 'Starting export…';
+    setExportDismissible(false);
     var data = await safeFetch('/api/jobs/export', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -3442,10 +3453,12 @@ async function startExport() {
     if (requestGeneration !== editorExportRequestGeneration ||
         !document.getElementById('exportOverlay').classList.contains('open')) return;
     if (data.error) throw new Error(data.error);
+    setExportDismissible(true);
     closeExportModal();
     if (typeof showToast === 'function') showToast('Export started', 'info');
   } catch (error) {
     if (requestGeneration !== editorExportRequestGeneration) return;
+    setExportDismissible(true);
     if (typeof showToast === 'function') showToast('Export failed: ' + error.message, 'error');
     else setStatus('Export failed: ' + error.message, true);
     setExportControlsBusy(false);

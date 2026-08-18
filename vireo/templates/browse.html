@@ -11504,6 +11504,7 @@ async function _runPhotoDeepLink(photoId) {
 
 /* ---------- Export Modal ---------- */
 var exportRequestGeneration = 0;
+var exportDismissible = true;
 var _exportPhotoIds = null;
 
 function setExportControlsBusy(busy) {
@@ -11516,6 +11517,13 @@ function setExportControlsBusy(busy) {
       control.disabled = control.getAttribute('data-export-was-disabled') === '1';
       control.removeAttribute('data-export-was-disabled');
     }
+  });
+}
+
+function setExportDismissible(dismissible) {
+  exportDismissible = dismissible;
+  document.querySelectorAll('#exportOverlay [data-export-cancel]').forEach(function(control) {
+    control.disabled = !dismissible;
   });
 }
 
@@ -11538,6 +11546,7 @@ function openExportModal(photoIds) {
   if (activeIds.length === 0) return;
   exportRequestGeneration++;
   setExportControlsBusy(false);
+  setExportDismissible(true);
   // Snapshot the requested photos for the lifetime of the modal. In
   // particular, the lightbox menu exports the displayed photo even when the
   // Browse grid has a different single- or multi-photo selection behind it.
@@ -11582,6 +11591,7 @@ function selectedExportMetadataFields() {
 }
 
 function closeExportModal() {
+  if (!exportDismissible) return;
   exportRequestGeneration++;
   setExportControlsBusy(false);
   document.getElementById('exportOverlay').classList.remove('open');
@@ -11806,6 +11816,7 @@ async function startExport() {
     }
 
     btn.textContent = 'Starting export…';
+    setExportDismissible(false);
     var data = await safeFetch('/api/jobs/export', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -11814,16 +11825,19 @@ async function startExport() {
     if (requestGeneration !== exportRequestGeneration ||
         !document.getElementById('exportOverlay').classList.contains('open')) return;
     if (data.error) {
+      setExportDismissible(true);
       alert('Export error: ' + data.error);
       setExportControlsBusy(false);
       btn.disabled = false;
       btn.textContent = buttonLabel;
       return;
     }
+    setExportDismissible(true);
     closeExportModal();
     showToast('Export started (' + count + ' photos)', 'info');
   } catch(err) {
     if (requestGeneration !== exportRequestGeneration) return;
+    setExportDismissible(true);
     alert('Export failed: ' + err.message);
     setExportControlsBusy(false);
     btn.disabled = false;

@@ -100,6 +100,7 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
           window.__editorExportRequest = null;
           window.__editorPreflightRequest = null;
           window.__resolveEditorPreflight = null;
+          window.__resolveEditorExport = null;
           const originalSafeFetch = window.safeFetch;
           window.safeFetch = async function(url, options, config) {
             if (url === '/api/jobs/export/preflight') {
@@ -112,7 +113,11 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
             }
             if (url === '/api/jobs/export') {
               window.__editorExportRequest = JSON.parse(options.body);
-              return {job_id: 'editor-export-test'};
+              return new Promise(function(resolve) {
+                window.__resolveEditorExport = function() {
+                  resolve({job_id: 'editor-export-test'});
+                };
+              });
             }
             return originalSafeFetch(url, options, config);
           };
@@ -139,6 +144,12 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
     assert request["max_size"] == 1600
     assert request["metadata_fields"] == ["rating"]
     assert page.evaluate("window.__editorPreflightRequest") == request
+    expect(page.get_by_role("button", name="Cancel", exact=True)).to_be_disabled()
+    page.keyboard.press("Escape")
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    page.evaluate("document.getElementById('exportOverlay').click()")
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    page.evaluate("window.__resolveEditorExport()")
     expect(page.locator("#exportOverlay")).not_to_have_class("modal-overlay open")
 
 

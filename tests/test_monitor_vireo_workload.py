@@ -563,6 +563,38 @@ def test_malformed_200_jobs_response_counts_as_api_failure():
     assert report["summary"]["targets"]["jobs_api_p95_below_500ms"] is False
 
 
+def test_interrupt_before_poll_marks_api_targets_unknown():
+    clock = _FakeClock()
+    api = _SequenceApi([
+        _api_sample(
+            latency=0.001, wait_count=0, wait_seconds=0.0,
+            producer_starts=0, waiter_joins=0,
+        ),
+    ])
+    process = _SequenceSampler([], {"pid": 123, "executable_exists": True})
+    system = _SequenceSampler([], {"logical_cpu_count": 16})
+
+    def interrupted_sleep(_seconds):
+        raise KeyboardInterrupt
+
+    report = collect_workload(
+        duration=1.0,
+        interval=1.0,
+        api_client=api,
+        process_sampler=process,
+        system_sampler=system,
+        monotonic=clock.monotonic,
+        sleep=interrupted_sleep,
+    )
+
+    assert report["interrupted"] is True
+    assert report["samples"] == []
+    assert report["summary"]["targets"]["jobs_api_p95_below_500ms"] is None
+    assert report["summary"]["targets"][
+        "no_embedding_single_flight_violations"
+    ] is None
+
+
 def test_malformed_200_jobs_baseline_is_rejected():
     api = _SequenceApi([{
         "status": 200,
@@ -670,7 +702,7 @@ def test_interrupted_api_poll_retains_resource_sample_and_marks_failure():
     assert report["samples"][0]["process"]["cpu_percent"] == 100.0
     assert report["samples"][0]["api"]["error"].startswith("interrupted")
     assert report["summary"]["api_failure_count"] == 1
-    assert report["summary"]["targets"]["jobs_api_p95_below_500ms"] is False
+    assert report["summary"]["targets"]["jobs_api_p95_below_500ms"] is None
 
 
 def test_late_process_exit_preserves_report_and_fails_trust_gate():
@@ -1297,6 +1329,37 @@ def test_explicit_server_accepted_when_listener_binds_all_interfaces():
     )
 
     assert server == {"pid": 4242, "url": "http://127.0.0.1:50222"}
+
+
+def test_wildcard_listener_accepts_verified_local_lan_address():
+    proc = _FakeProc(4242, port=50222, listener_ip="0.0.0.0")
+    fake = _FakePsutil([proc])
+    resolver = _fake_resolver({"vireo.local": ["192.168.1.20"]})
+
+    server = discover_server(
+        requested_pid=4242,
+        requested_url="http://vireo.local:50222",
+        psutil_module=fake,
+        resolver=resolver,
+        local_addresses={"192.168.1.20"},
+    )
+
+    assert server == {"pid": 4242, "url": "http://vireo.local:50222"}
+
+
+def test_wildcard_listener_rejects_remote_address():
+    proc = _FakeProc(4242, port=50222, listener_ip="0.0.0.0")
+    fake = _FakePsutil([proc])
+    resolver = _fake_resolver({"remote-host": ["192.168.1.50"]})
+
+    with pytest.raises(RuntimeError, match="does not own"):
+        discover_server(
+            requested_pid=4242,
+            requested_url="http://remote-host:50222",
+            psutil_module=fake,
+            resolver=resolver,
+            local_addresses={"192.168.1.20"},
+        )
 
 
 def test_explicit_server_rejected_when_pid_does_not_own_url_port():

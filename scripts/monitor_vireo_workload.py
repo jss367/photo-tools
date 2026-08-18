@@ -673,7 +673,13 @@ def _scenario_summary(jobs):
     }
 
 
-def build_summary(baseline, samples, *, process_metadata=None):
+def build_summary(
+    baseline,
+    samples,
+    *,
+    process_metadata=None,
+    interrupted=False,
+):
     successful = [
         sample for sample in samples
         if _is_successful_jobs_sample(sample["api"])
@@ -788,7 +794,7 @@ def build_summary(baseline, samples, *, process_metadata=None):
                 latency_summary is not None
                 and latency_summary["p95"] < 0.5
                 and api_failure_count == 0
-            ),
+            ) if not interrupted else None,
             "system_idle_cpu_p05_at_least_10_percent": (
                 idle_summary is not None and idle_summary["p05"] >= 10.0
             ),
@@ -799,7 +805,11 @@ def build_summary(baseline, samples, *, process_metadata=None):
             # rather than falsely reporting it verified.
             "no_embedding_single_flight_violations": (
                 embedding_delta.get("single_flight_violations", 0) == 0
-                if has_embedding_diagnostics and api_failure_count == 0
+                if (
+                    has_embedding_diagnostics
+                    and api_failure_count == 0
+                    and not interrupted
+                )
                 else None
             ),
             "vireo_executable_present_throughout": executable_present,
@@ -924,6 +934,7 @@ def collect_workload(
             baseline,
             samples,
             process_metadata=process_metadata,
+            interrupted=interrupted,
         ),
         "samples": samples,
     }
@@ -947,7 +958,13 @@ def _resolve_hostname(hostname, *, resolver=socket.getaddrinfo):
     return frozenset(info[4][0] for info in infos if info and info[4])
 
 
-def _listener_reachable_via(host, listener_ip, *, resolver=socket.getaddrinfo):
+def _listener_reachable_via(
+    host,
+    listener_ip,
+    *,
+    resolver=socket.getaddrinfo,
+    local_addresses=None,
+):
     """Return True if a connection to ``host`` would reach ``listener_ip``.
 
     A listener bound to ``0.0.0.0``/``::`` accepts any local address, so
@@ -959,6 +976,10 @@ def _listener_reachable_via(host, listener_ip, *, resolver=socket.getaddrinfo):
     if not resolved:
         return False
     all_bind = listener_ip in {"0.0.0.0", "::"}
+    if all_bind and local_addresses is None:
+        local_addresses = _resolve_hostname(
+            socket.gethostname(), resolver=resolver,
+        )
     try:
         listener_addr = ipaddress.ip_address(listener_ip)
     except ValueError:
@@ -972,12 +993,22 @@ def _listener_reachable_via(host, listener_ip, *, resolver=socket.getaddrinfo):
             if all_bind or (listener_addr is not None and listener_addr.is_loopback):
                 return True
             continue
+        if all_bind and addr_str in (local_addresses or ()):
+            return True
         if not all_bind and addr_str == listener_ip:
             return True
     return False
 
 
-def _process_owns_url(process, port, host, *, psutil_module, resolver=socket.getaddrinfo):
+def _process_owns_url(
+    process,
+    port,
+    host,
+    *,
+    psutil_module,
+    resolver=socket.getaddrinfo,
+    local_addresses=None,
+):
     candidates = [process]
     with contextlib.suppress(OSError, psutil_module.Error):
         candidates.extend(process.children(recursive=True))
@@ -991,7 +1022,12 @@ def _process_owns_url(process, port, host, *, psutil_module, resolver=socket.get
                 continue
             if connection.laddr.port != port:
                 continue
-            if _listener_reachable_via(host, connection.laddr.ip, resolver=resolver):
+            if _listener_reachable_via(
+                host,
+                connection.laddr.ip,
+                resolver=resolver,
+                local_addresses=local_addresses,
+            ):
                 return candidate
     return None
 
@@ -1018,6 +1054,7 @@ def discover_server(
     requested_url=None,
     psutil_module=psutil,
     resolver=socket.getaddrinfo,
+    local_addresses=None,
 ):
     if psutil_module is None:
         raise RuntimeError(
@@ -1041,6 +1078,7 @@ def discover_server(
             requested_hostname,
             psutil_module=psutil_module,
             resolver=resolver,
+            local_addresses=local_addresses,
         )
         if owner is None:
             raise RuntimeError(
@@ -1086,7 +1124,10 @@ def discover_server(
                 # be selected while the URL fetches from the remote one,
                 # pairing local CPU/RSS with remote Jobs data.
                 if requested_hostname is not None and not _listener_reachable_via(
-                    requested_hostname, connection.laddr.ip, resolver=resolver,
+                    requested_hostname,
+                    connection.laddr.ip,
+                    resolver=resolver,
+                    local_addresses=local_addresses,
                 ):
                     continue
                 host = connection.laddr.ip

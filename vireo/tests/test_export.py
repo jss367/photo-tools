@@ -249,6 +249,37 @@ def test_export_photos_location_metadata_is_opt_in(export_env):
     assert metadata["Composite"]["GPSPosition"] == "-33.86 -117.25"
 
 
+def test_export_photos_uses_assigned_keyword_location(export_env):
+    from metadata import exiftool_available, extract_metadata
+
+    if not exiftool_available():
+        pytest.skip("ExifTool is not available")
+
+    env = export_env
+    location_id = env["db"].add_keyword("Torrey Pines", kw_type="location")
+    env["db"].conn.execute(
+        "UPDATE keywords SET latitude=?, longitude=? WHERE id=?",
+        (32.92, -117.25, location_id),
+    )
+    env["db"].tag_photo(env["p1"], location_id)
+    env["db"].conn.commit()
+
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={"metadata_fields": ["location"]},
+    )
+
+    assert result["exported"] == 1
+    output = os.path.join(env["dest"], "bird1.jpg")
+    metadata = extract_metadata([output])[output]
+    assert metadata["EXIF"]["GPSLatitude"] == pytest.approx(32.92)
+    assert metadata["EXIF"]["GPSLongitude"] == pytest.approx(117.25)
+    assert metadata["Composite"]["GPSPosition"] == "32.92 -117.25"
+
+
 def test_export_photos_resize(export_env):
     """export_photos resizes photos to max_size."""
     env = export_env

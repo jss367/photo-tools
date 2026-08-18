@@ -195,6 +195,13 @@ def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_
     camera_data_map = (
         _get_photo_camera_data(db, photo_ids) if "camera" in metadata_fields else {}
     )
+    location_map = (
+        {
+            pid: db.get_effective_photo_location(pid, verify_workspace=False)
+            for pid in photo_ids
+        }
+        if "location" in metadata_fields else {}
+    )
 
     # Get species keywords for all photos in one query
     species_map = db.get_species_keywords_for_photos(photo_ids)
@@ -422,6 +429,7 @@ def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_
                         photo,
                         species_list,
                         camera_data_map.get(pid, {}),
+                        location_map.get(pid),
                     )
                 except Exception:
                     # A checked metadata option is part of the requested
@@ -543,7 +551,9 @@ def _metadata_assignment(tag, value):
     return f"-{tag}={text}"
 
 
-def _write_export_metadata(out_path, fields, photo, species, camera_data):
+def _write_export_metadata(
+    out_path, fields, photo, species, camera_data, location_data=None,
+):
     """Embed selected catalog metadata into one rendered export via ExifTool."""
     from metadata import _exiftool_command, find_exiftool
 
@@ -599,8 +609,9 @@ def _write_export_metadata(out_path, fields, photo, species, camera_data):
             args.append(_metadata_assignment("XMP-xmp:Rating", int(rating)))
 
     if "location" in selected:
-        latitude = _photo_value(photo, "latitude")
-        longitude = _photo_value(photo, "longitude")
+        location_source = location_data if location_data is not None else photo
+        latitude = _photo_value(location_source, "latitude")
+        longitude = _photo_value(location_source, "longitude")
         if latitude is not None and longitude is not None:
             latitude = float(latitude)
             longitude = float(longitude)

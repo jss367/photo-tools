@@ -1734,10 +1734,11 @@ large collection ID list and intersect it with a second large result payload.
 ### Pagination
 
 Pagination is encounter-based and uses an opaque keyset cursor tied to the
-run, `structural_revision`, sort, and filter fingerprint. The cursor encodes
-the sort key and stable ID of the last returned encounter — never a bare
-offset — so membership changes elsewhere in the result cannot silently skip a
-successor.
+run, `structural_revision`, sort, and filter fingerprint. When a sort or filter
+reads mutable decision state, the cursor also carries a
+`decision_snapshot_revision` equal to the global `revision` at issuance. The
+cursor encodes the sort key and stable ID of the last returned encounter —
+never a bare offset.
 
 Whether decision-only mutations preserve the cursor depends on the active
 view:
@@ -1750,20 +1751,16 @@ view:
 - When the sort or a filter reads mutable decision state (`unresolved first`
   or conflict-severity sorts, triage-status or species-review filters), a
   decision can move an encounter across the cursor boundary or out of the
-  result set, so cursor reuse could repeat or miss encounters. A decision
-  mutation that changes a sort or filter key of the active view therefore
-  marks the cursor stale, and the next page fetch requests a replacement
-  cursor built from the stale cursor's recorded keyset tuple — the boundary
-  sort-key values captured when the page was served, plus the stable ID —
-  never from the anchor row's current values. Deriving the boundary from the
-  moved row would lose ground: resolving the anchor under `unresolved first`
-  would re-anchor inside the resolved partition and skip unseen unresolved
-  encounters, and resolving it under a needs-review filter would remove the
-  anchor from the result entirely. Because the recorded tuple is the
-  boundary, the server resumes strictly after it in the current ordering
-  even when no row matches the tuple anymore. Already-loaded rows stay in
-  place and update through the delta, and the client's ID-keyed maps drop
-  any already-seen encounter that a refreshed page returns again.
+  result set, including before an already-served boundary. On every next-page
+  request, the server compares `decision_snapshot_revision` with the current
+  global `revision`. Any intervening decision mutation—local or from another
+  session—makes that cursor stale. The client then restarts pagination at the
+  beginning of the current view with a new snapshot revision and discards
+  already-loaded encounter IDs until it reaches the first unseen record. This
+  conservative restart prevents a newly qualifying encounter before the old
+  boundary from being skipped. The global `revision` is used here only as a
+  query-snapshot generation; it remains irrelevant to whether a mutation may
+  update unrelated target records.
 
 The server observes both a target encounter count and a soft target photo
 count:
@@ -1774,16 +1771,15 @@ count:
   target; and
 - invalidate every outstanding cursor when `structural_revision` changes,
   invalidate the affected view's cursor when its query changes, and invalidate
-  a cursor when a decision mutation changes a sort or filter key that its
-  cursor-bound view depends on.
+  a cursor carrying `decision_snapshot_revision` whenever the global
+  `revision` changes.
 
-After structural invalidation, loaded records remain visible through the
-mutation delta, but pagination restarts at the beginning of the updated view
-with a cursor bound to the new `structural_revision`. The client's ID-keyed
-maps discard already-loaded encounters as it advances to the first unseen
-record. Structural edits are comparatively rare, so this bounded replay is
-preferred to a scope-generation scheme that could skip a newly moved or
-created encounter.
+After invalidation, loaded records remain visible through mutation deltas, but
+pagination restarts at the beginning of the updated view with a cursor bound
+to the current structural and decision snapshot revisions. The client's
+ID-keyed maps discard already-loaded encounters as it advances to the first
+unseen record. This bounded replay is preferred to resuming after a stale
+boundary that could skip a newly moved, created, or qualifying encounter.
 
 The client loads the next page as the user approaches the end of the current
 window. Already loaded pages may be virtualized or discarded outside a bounded
@@ -1804,20 +1800,18 @@ All review mutations use a common delta envelope:
   "updated_encounters": [],
   "removed_encounter_ids": [],
   "updated_photos": [],
-  "summary_delta": {},
-  "view_may_have_changed": true
+  "summary_delta": {}
 }
 ```
 
 The client compares the returned `structural_revision` with the one bound to
 its active cursor: a bumped value means the next page fetch must use a fresh
-cursor. When the value is unchanged, pagination remains valid unless the
-active view depends on decision state and `view_may_have_changed` reports
-that a sort or filter key changed, in which case the next page fetch
-refreshes the cursor from its recorded keyset boundary as described in the
-Pagination section. The client applies the
-delta to normalized maps keyed by stable IDs. It does not replace or
-deep-clone the complete review result.
+cursor. When the active cursor carries `decision_snapshot_revision`, any
+returned `revision` change also marks it stale immediately; a change from
+another session is detected when the server rejects the next-page cursor with
+the current revision. Refresh follows the restart-and-ID-deduplication rule in
+the Pagination section. The client applies the delta to normalized maps keyed
+by stable IDs. It does not replace or deep-clone the complete review result.
 
 ### Persistence model
 
@@ -1860,7 +1854,7 @@ state.
 | Encounter larger than page budget | Return that one complete encounter, warn that expansion may be slower, and virtualize its burst/photo content without splitting pagination |
 | Page request failed | Keep already loaded encounters, show an inline retry at the failed boundary, and do not duplicate prior pages |
 | Mutation failed | Roll back optimistic state, retain selection/focus, explain the affected action, and offer retry |
-| Stale revision | Refresh affected targets, show the intervening change, and require explicit retry |
+| Stale run or target version | Refresh affected targets, show the intervening change, and require explicit retry; a global revision change alone is not a mutation conflict |
 | Offline | Keep loaded data readable, disable mutation controls with an offline explanation, and retry connectivity without changing the view |
 | End of view | Report complete encounter and shown-photo totals; do not use an infinite spinner |
 
@@ -2062,8 +2056,9 @@ invariant in both modes.
   grouping automatically.
 - Encounter- and burst-level actions name and mutate the complete target;
   matching-only bulk actions are explicitly labeled.
-- Mutation endpoints reject stale run or revision targets rather than applying
-  them by array index.
+- Mutation endpoints reject a stale `review_run_id` or expected target-record
+  `version` rather than applying by array index; an unrelated global
+  `revision` advance is accepted.
 - No review action accepts or returns the complete canonical review payload.
 - No encounter is split across pages or virtualized windows.
 - The 15,000-photo performance requirements are covered by an automated

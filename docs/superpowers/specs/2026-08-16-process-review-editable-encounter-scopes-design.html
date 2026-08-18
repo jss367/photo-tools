@@ -2498,9 +2498,11 @@ large result payload.</p>
 <h3 id="pagination">Pagination</h3>
 <p>Pagination is encounter-based and uses an opaque keyset cursor tied
 to the run, <code>structural_revision</code>, sort, and filter
-fingerprint. The cursor encodes the sort key and stable ID of the last
-returned encounter — never a bare offset — so membership changes
-elsewhere in the result cannot silently skip a successor.</p>
+fingerprint. When a sort or filter reads mutable decision state, the
+cursor also carries a <code>decision_snapshot_revision</code> equal to
+the global <code>revision</code> at issuance. The cursor encodes the sort
+key and stable ID of the last returned encounter — never a bare
+offset.</p>
 <p>Whether decision-only mutations preserve the cursor depends on the
 active view:</p>
 <ul>
@@ -2513,21 +2515,18 @@ position.</li>
 <li>When the sort or a filter reads mutable decision state
 (<code>unresolved first</code> or conflict-severity sorts, triage-status
 or species-review filters), a decision can move an encounter across the
-cursor boundary or out of the result set, so cursor reuse could repeat
-or miss encounters. A decision mutation that changes a sort or filter
-key of the active view therefore marks the cursor stale, and the next
-page fetch requests a replacement cursor built from the stale cursor’s
-recorded keyset tuple — the boundary sort-key values captured when the
-page was served, plus the stable ID — never from the anchor row’s
-current values. Deriving the boundary from the moved row would lose
-ground: resolving the anchor under <code>unresolved first</code> would
-re-anchor inside the resolved partition and skip unseen unresolved
-encounters, and resolving it under a needs-review filter would remove
-the anchor from the result entirely. Because the recorded tuple is the
-boundary, the server resumes strictly after it in the current ordering
-even when no row matches the tuple anymore. Already-loaded rows stay in
-place and update through the delta, and the client’s ID-keyed maps drop
-any already-seen encounter that a refreshed page returns again.</li>
+cursor boundary or out of the result set, including before an
+already-served boundary. On every next-page request, the server compares
+<code>decision_snapshot_revision</code> with the current global
+<code>revision</code>. Any intervening decision mutation—local or from
+another session—makes that cursor stale. The client then restarts
+pagination at the beginning of the current view with a new snapshot
+revision and discards already-loaded encounter IDs until it reaches the
+first unseen record. This conservative restart prevents a newly
+qualifying encounter before the old boundary from being skipped. The
+global <code>revision</code> is used here only as a query-snapshot
+generation; it remains irrelevant to whether a mutation may update
+unrelated target records.</li>
 </ul>
 <p>The server observes both a target encounter count and a soft target
 photo count:</p>
@@ -2539,18 +2538,17 @@ target;</li>
 photo target; and</li>
 <li>invalidate every outstanding cursor when
 <code>structural_revision</code> changes, invalidate the affected view’s
-cursor when its query changes, and invalidate a cursor when a decision
-mutation changes a sort or filter key that its cursor-bound view depends
-on.</li>
+cursor when its query changes, and invalidate a cursor carrying
+<code>decision_snapshot_revision</code> whenever the global
+<code>revision</code> changes.</li>
 </ul>
-<p>After structural invalidation, loaded records remain visible through
-the mutation delta, but pagination restarts at the beginning of the
-updated view with a cursor bound to the new
-<code>structural_revision</code>. The client’s ID-keyed maps discard
-already-loaded encounters as it advances to the first unseen record.
-Structural edits are comparatively rare, so this bounded replay is
-preferred to a scope-generation scheme that could skip a newly moved or
-created encounter.</p>
+<p>After invalidation, loaded records remain visible through mutation
+deltas, but pagination restarts at the beginning of the updated view
+with a cursor bound to the current structural and decision snapshot
+revisions. The client’s ID-keyed maps discard already-loaded encounters
+as it advances to the first unseen record. This bounded replay is
+preferred to resuming after a stale boundary that could skip a newly
+moved, created, or qualifying encounter.</p>
 <p>The client loads the next page as the user approaches the end of the
 current window. Already loaded pages may be virtualized or discarded
 outside a bounded window, provided focus, selection, and scroll
@@ -2567,18 +2565,18 @@ class="sourceCode json"><code class="sourceCode json"><span id="cb6-1"><a href="
 <span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;updated_encounters&quot;</span><span class="fu">:</span> <span class="ot">[]</span><span class="fu">,</span></span>
 <span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;removed_encounter_ids&quot;</span><span class="fu">:</span> <span class="ot">[]</span><span class="fu">,</span></span>
 <span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;updated_photos&quot;</span><span class="fu">:</span> <span class="ot">[]</span><span class="fu">,</span></span>
-<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;summary_delta&quot;</span><span class="fu">:</span> <span class="fu">{},</span></span>
-<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;view_may_have_changed&quot;</span><span class="fu">:</span> <span class="kw">true</span></span>
-<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;summary_delta&quot;</span><span class="fu">:</span> <span class="fu">{}</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
 <p>The client compares the returned <code>structural_revision</code>
 with the one bound to its active cursor: a bumped value means the next
-page fetch must use a fresh cursor. When the value is unchanged,
-pagination remains valid unless the active view depends on decision
-state and <code>view_may_have_changed</code> reports that a sort or
-filter key changed, in which case the next page fetch refreshes the
-cursor from its recorded keyset boundary as described in the Pagination
-section. The client applies the delta to normalized maps keyed by stable
-IDs. It does not replace or deep-clone the complete review result.</p>
+page fetch must use a fresh cursor. When the active cursor carries
+<code>decision_snapshot_revision</code>, any returned
+<code>revision</code> change also marks it stale immediately; a change
+from another session is detected when the server rejects the next-page
+cursor with the current revision. Refresh follows the
+restart-and-ID-deduplication rule in the Pagination section. The client
+applies the delta to normalized maps keyed by stable IDs. It does not
+replace or deep-clone the complete review result.</p>
 <h3 id="persistence-model">Persistence model</h3>
 <p>Computed pipeline output and mutable review state must not require a
 complete JSON rewrite for every click.</p>
@@ -2685,9 +2683,10 @@ boundary, and do not duplicate prior pages</td>
 affected action, and offer retry</td>
 </tr>
 <tr>
-<td>Stale revision</td>
+<td>Stale run or target version</td>
 <td>Refresh affected targets, show the intervening change, and require
-explicit retry</td>
+explicit retry; a global revision change alone is not a mutation
+conflict</td>
 </tr>
 <tr>
 <td>Offline</td>
@@ -2912,8 +2911,10 @@ cannot hide an unresolved minority subject.</li>
 changes grouping automatically.</li>
 <li>Encounter- and burst-level actions name and mutate the complete
 target; matching-only bulk actions are explicitly labeled.</li>
-<li>Mutation endpoints reject stale run or revision targets rather than
-applying them by array index.</li>
+<li>Mutation endpoints reject a stale <code>review_run_id</code> or
+expected target-record <code>version</code> rather than applying by array
+index; an unrelated global <code>revision</code> advance is
+accepted.</li>
 <li>No review action accepts or returns the complete canonical review
 payload.</li>
 <li>No encounter is split across pages or virtualized windows.</li>

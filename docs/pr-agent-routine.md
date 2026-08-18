@@ -170,7 +170,9 @@ created, when Tests succeeds, and every 15 minutes as a fallback. The reaction
 must be newer than the first Tests run for the full live PR head. The live gate
 re-fetches that run and confirms its workflow, event, and head before merging,
 so a reaction already present before a later push cannot authorize that push.
-Any accepted feedback at or after the reaction still blocks the merge.
+An unedited canonical no-findings summary naming the live head is not treated as
+feedback; any other accepted feedback at or after the reaction still blocks
+the merge.
 
 Created and edited comments and reviews are wakeups. Merge authorization is
 ordered against comment and review update timestamps, so adding feedback to an

@@ -196,14 +196,29 @@ runs:
         # comment must be reconciled and followed by fresh authorization.
         newer_comment_feedback=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
           --slurp | jq \
-            --arg authorized_at "$AUTHORIZED_AT" '
+            --arg authorized_at "$AUTHORIZED_AT" \
+            --arg codex_actor "chatgpt-codex-connector[bot]" \
+            --arg head "$head_sha" '
             (add // [])
             | [ .[]
                 | select(.updated_at >= $authorized_at)
                 | select(
+                    (.user.login == $codex_actor
+                      and .created_at == .updated_at
+                      and (.body | startswith("Codex Review: Didn\u0027t find any major issues."))
+                      and ((try (.body
+                        | capture("\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-fA-F]{7,40})`")
+                        | .sha
+                        | ascii_downcase)
+                      catch "") as $reviewed_head
+                        | $reviewed_head != ""
+                        and ($head | startswith($reviewed_head))))
+                    | not
+                  )
+                | select(
                     .author_association == "OWNER"
                     or .author_association == "COLLABORATOR"
-                    or .user.login == "chatgpt-codex-connector[bot]"
+                    or .user.login == $codex_actor
                   )
                 | select(.body != "+1" and .body != "👍")
                 | select(.body | endswith("<!-- pr-agent-generated -->") | not)

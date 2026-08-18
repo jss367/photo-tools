@@ -228,6 +228,9 @@ def test_merge_gate_requires_live_head_and_resolved_current_threads():
     assert 'codex_tests_workflow" != "Tests"' in action
     assert 'reaction_time" < "$codex_tests_started_at"' in action
     assert 'reaction_time" == "$codex_tests_started_at"' in action
+    assert 'and .created_at == .updated_at' in action
+    assert 'startswith("Codex Review: Didn\\u0027t find any major issues.")' in action
+    assert '$head | startswith($reviewed_head)' in action
     assert "reviewThreads(first:100" in action
     assert ".isResolved == false and .isOutdated == false" in action
     assert 'if [[ "$unresolved" -gt 0 ]]' in action

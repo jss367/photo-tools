@@ -515,20 +515,22 @@ def _photo_value(photo, key, default=None):
 
 
 def _export_timestamp_parts(timestamp):
-    """Return (date, time, EXIF datetime, XMP datetime) for an ISO timestamp."""
+    """Return date/time fields for a catalog ISO timestamp."""
     value = str(timestamp or "").strip()
     match = re.match(
-        r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(.*)$",
+        r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})"
+        r"(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})?$",
         value,
     )
     if not match:
-        return None, None, None, None
-    year, month, day, hour, minute, second, suffix = match.groups()
+        return None, None, None, None, None
+    year, month, day, hour, minute, second, subsecond, offset = match.groups()
     date = f"{year}:{month}:{day}"
     capture_time = f"{hour}:{minute}:{second}"
     exif_datetime = f"{date} {capture_time}"
+    suffix = (f".{subsecond}" if subsecond else "") + (offset or "")
     xmp_datetime = f"{year}-{month}-{day}T{hour}:{minute}:{second}{suffix}"
-    return date, capture_time, exif_datetime, xmp_datetime
+    return date, capture_time, exif_datetime, xmp_datetime, subsecond
 
 
 def _metadata_assignment(tag, value):
@@ -553,9 +555,13 @@ def _write_export_metadata(out_path, fields, photo, species, camera_data):
                 f"-IPTC:Keywords{operator}{clean}",
             ])
 
-    date, capture_time, exif_datetime, xmp_datetime = _export_timestamp_parts(
-        _photo_value(photo, "timestamp")
-    )
+    (
+        date,
+        capture_time,
+        exif_datetime,
+        xmp_datetime,
+        subsecond,
+    ) = _export_timestamp_parts(_photo_value(photo, "timestamp"))
     if "capture_date" in selected and date:
         args.append(_metadata_assignment("IPTC:DateCreated", date))
     if "capture_time" in selected and capture_time:
@@ -571,6 +577,11 @@ def _write_export_metadata(out_path, fields, photo, species, camera_data):
             _metadata_assignment("XMP-exif:DateTimeOriginal", xmp_datetime),
             _metadata_assignment("XMP-xmp:CreateDate", xmp_datetime),
         ])
+        if subsecond:
+            args.extend([
+                _metadata_assignment("EXIF:SubSecTimeOriginal", subsecond),
+                _metadata_assignment("EXIF:SubSecTimeDigitized", subsecond),
+            ])
 
     if "rating" in selected:
         rating = _photo_value(photo, "rating")

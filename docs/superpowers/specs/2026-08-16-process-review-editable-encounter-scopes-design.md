@@ -1720,8 +1720,8 @@ request is:
 The server resolves collection membership and intersects it with the canonical
 process result. It returns:
 
-- canonical run, `revision`, `structural_revision`, and the resolved
-  collection's `collection_membership_revision` when applicable;
+- canonical run, `revision`, `structural_revision`, and an opaque
+  `collection_snapshot_id` when a collection is active;
 - process-coverage counts;
 - match, encounter, context-photo, and confirmation counts;
 - a page of complete encounters;
@@ -1729,19 +1729,25 @@ process result. It returns:
 - matching photo IDs for explanation/highlighting; and
 - an opaque next cursor.
 
-Collection membership is evaluated on the server. The browser must not fetch a
-large collection ID list and intersect it with a second large result payload.
+Collection membership is evaluated once for the query generation and frozen as
+an immutable server-side snapshot. The resolver implements the collection's
+complete semantics: metadata rules, manual inclusions/exclusions, and any
+stored visual-search clause. A visual clause uses the same model, index, and
+threshold semantics as Browse before intersecting with the canonical Process
+result. If that model or index is unavailable or stale, the resolver returns a
+structured unavailable state and the chooser explains it; it never falls back
+to metadata-only membership. The browser must not fetch a large collection ID
+list and intersect it with a second large result payload.
 
 ### Pagination
 
 Pagination is encounter-based and uses an opaque keyset cursor tied to the
 run, `structural_revision`, sort, and filter fingerprint. When a sort or filter
 reads mutable decision state, the cursor also carries a
-`decision_snapshot_revision` equal to the global `revision` at issuance. The
-cursor for a collection-backed view also carries the collection's
-`collection_membership_revision`, which advances whenever its rules or manual
-membership change. The cursor encodes the sort key and stable ID of the last
-returned encounter — never a bare offset.
+`decision_snapshot_revision` equal to the global `revision` at issuance. A
+collection-backed cursor also carries the opaque `collection_snapshot_id`
+resolved for its first page. The cursor encodes the sort key and stable ID of
+the last returned encounter — never a bare offset.
 
 Whether decision-only mutations preserve the cursor depends on the active
 view:
@@ -1764,12 +1770,13 @@ view:
   boundary from being skipped. The global `revision` is used here only as a
   query-snapshot generation; it remains irrelevant to whether a mutation may
   update unrelated target records.
-- On every next-page request for a collection-backed view, the server compares
-  the cursor's `collection_membership_revision` with the collection resolver's
-  current value. A rule edit, manual addition, or manual removal makes the
-  cursor stale even though it does not mutate the canonical Process result.
-  Pagination restarts and deduplicates loaded IDs by the same rule so a newly
-  qualifying encounter before the old boundary cannot be skipped.
+- Every page in a collection-backed query reads the same frozen membership
+  snapshot. Collection rule edits, manual membership changes, photo metadata
+  changes, and visual-index updates cannot alter that snapshot mid-pagination.
+  Such a change may show **Collection changed—refresh view** through the normal
+  collection event channel, but the current query remains internally
+  consistent until the user refreshes or starts a new query generation. A new
+  generation resolves a new `collection_snapshot_id` and recalculates counts.
 
 The server observes both a target encounter count and a soft target photo
 count:
@@ -1781,16 +1788,15 @@ count:
 - invalidate every outstanding cursor when `structural_revision` changes,
   invalidate the affected view's cursor when its query changes, and invalidate
   a cursor carrying `decision_snapshot_revision` whenever the global
-  `revision` changes; invalidate a collection-backed cursor when its
-  `collection_membership_revision` changes.
+  `revision` changes.
 
 After invalidation, loaded records remain visible through mutation deltas, but
 pagination restarts at the beginning of the updated view with a cursor bound
-to the current structural, decision snapshot, and collection membership
-revisions that apply. The client's ID-keyed maps discard already-loaded
-encounters as it advances to the first unseen record. This bounded replay is
-preferred to resuming after a stale boundary that could skip a newly moved,
-created, or qualifying encounter.
+to the current structural and decision snapshot revisions and, when present,
+the current query's frozen collection snapshot. The client's ID-keyed maps
+discard already-loaded encounters as it advances to the first unseen record.
+This bounded replay is preferred to resuming after a stale boundary that could
+skip a newly moved, created, or qualifying encounter.
 
 The client loads the next page as the user approaches the end of the current
 window. Already loaded pages may be virtualized or discarded outside a bounded
@@ -2085,8 +2091,11 @@ invariant in both modes.
 - Any photo and Every photo truth tables, including mixed collection/status
   criteria.
 - Collection intersection with partial canonical process coverage.
-- Collection-membership revision invalidation when rules or manual membership
-  change between pages.
+- Stable collection snapshot paging while rules, manual membership, referenced
+  photo metadata, or the visual index change; a refreshed query resolves the
+  updated membership.
+- Visual-collection resolution, including structured unavailable behavior when
+  its model or index cannot be used and no metadata-only widening.
 - Complete encounter and burst membership in every returned page.
 - Cursor stability across decision-only mutations and invalidation after
   structural revisions.

@@ -2484,8 +2484,8 @@ class="sourceCode json"><code class="sourceCode json"><span id="cb5-1"><a href="
 canonical process result. It returns:</p>
 <ul>
 <li>canonical run, <code>revision</code>,
-<code>structural_revision</code>, and the resolved collection’s
-<code>collection_membership_revision</code> when applicable;</li>
+<code>structural_revision</code>, and an opaque
+<code>collection_snapshot_id</code> when a collection is active;</li>
 <li>process-coverage counts;</li>
 <li>match, encounter, context-photo, and confirmation counts;</li>
 <li>a page of complete encounters;</li>
@@ -2493,19 +2493,25 @@ canonical process result. It returns:</p>
 <li>matching photo IDs for explanation/highlighting; and</li>
 <li>an opaque next cursor.</li>
 </ul>
-<p>Collection membership is evaluated on the server. The browser must
-not fetch a large collection ID list and intersect it with a second
-large result payload.</p>
+<p>Collection membership is evaluated once for the query generation and
+frozen as an immutable server-side snapshot. The resolver implements
+the collection’s complete semantics: metadata rules, manual
+inclusions/exclusions, and any stored visual-search clause. A visual
+clause uses the same model, index, and threshold semantics as Browse
+before intersecting with the canonical Process result. If that model or
+index is unavailable or stale, the resolver returns a structured
+unavailable state and the chooser explains it; it never falls back to
+metadata-only membership. The browser must not fetch a large collection
+ID list and intersect it with a second large result payload.</p>
 <h3 id="pagination">Pagination</h3>
 <p>Pagination is encounter-based and uses an opaque keyset cursor tied
 to the run, <code>structural_revision</code>, sort, and filter
 fingerprint. When a sort or filter reads mutable decision state, the
 cursor also carries a <code>decision_snapshot_revision</code> equal to
-the global <code>revision</code> at issuance. The cursor for a
-collection-backed view also carries the collection’s
-<code>collection_membership_revision</code>, which advances whenever its
-rules or manual membership change. The cursor encodes the sort key and
-stable ID of the last returned encounter — never a bare offset.</p>
+the global <code>revision</code> at issuance. A collection-backed cursor
+also carries the opaque <code>collection_snapshot_id</code> resolved for
+its first page. The cursor encodes the sort key and stable ID of the
+last returned encounter — never a bare offset.</p>
 <p>Whether decision-only mutations preserve the cursor depends on the
 active view:</p>
 <ul>
@@ -2530,13 +2536,15 @@ qualifying encounter before the old boundary from being skipped. The
 global <code>revision</code> is used here only as a query-snapshot
 generation; it remains irrelevant to whether a mutation may update
 unrelated target records.</li>
-<li>On every next-page request for a collection-backed view, the server
-compares the cursor’s <code>collection_membership_revision</code> with
-the collection resolver’s current value. A rule edit, manual addition,
-or manual removal makes the cursor stale even though it does not mutate
-the canonical Process result. Pagination restarts and deduplicates
-loaded IDs by the same rule so a newly qualifying encounter before the
-old boundary cannot be skipped.</li>
+<li>Every page in a collection-backed query reads the same frozen
+membership snapshot. Collection rule edits, manual membership changes,
+photo metadata changes, and visual-index updates cannot alter that
+snapshot mid-pagination. Such a change may show <strong>Collection
+changed—refresh view</strong> through the normal collection event
+channel, but the current query remains internally consistent until the
+user refreshes or starts a new query generation. A new generation
+resolves a new <code>collection_snapshot_id</code> and recalculates
+counts.</li>
 </ul>
 <p>The server observes both a target encounter count and a soft target
 photo count:</p>
@@ -2550,17 +2558,16 @@ photo target; and</li>
 <code>structural_revision</code> changes, invalidate the affected view’s
 cursor when its query changes, and invalidate a cursor carrying
 <code>decision_snapshot_revision</code> whenever the global
-<code>revision</code> changes; invalidate a collection-backed cursor
-when its <code>collection_membership_revision</code> changes.</li>
+<code>revision</code> changes.</li>
 </ul>
 <p>After invalidation, loaded records remain visible through mutation
 deltas, but pagination restarts at the beginning of the updated view
-with a cursor bound to the current structural, decision snapshot, and
-collection membership revisions that apply. The client’s ID-keyed maps
-discard already-loaded encounters as it advances to the first unseen
-record. This bounded replay is preferred to resuming after a stale
-boundary that could skip a newly moved, created, or qualifying
-encounter.</p>
+with a cursor bound to the current structural and decision snapshot
+revisions and, when present, the current query’s frozen collection
+snapshot. The client’s ID-keyed maps discard already-loaded encounters
+as it advances to the first unseen record. This bounded replay is
+preferred to resuming after a stale boundary that could skip a newly
+moved, created, or qualifying encounter.</p>
 <p>The client loads the next page as the user approaches the end of the
 current window. Already loaded pages may be virtualized or discarded
 outside a bounded window, provided focus, selection, and scroll
@@ -2943,8 +2950,12 @@ the same canonical revisions without a private cache.</li>
 collection/status criteria.</li>
 <li>Collection intersection with partial canonical process
 coverage.</li>
-<li>Collection-membership revision invalidation when rules or manual
-membership change between pages.</li>
+<li>Stable collection snapshot paging while rules, manual membership,
+referenced photo metadata, or the visual index change; a refreshed query
+resolves the updated membership.</li>
+<li>Visual-collection resolution, including structured unavailable
+behavior when its model or index cannot be used and no metadata-only
+widening.</li>
 <li>Complete encounter and burst membership in every returned page.</li>
 <li>Cursor stability across decision-only mutations and invalidation
 after structural revisions.</li>

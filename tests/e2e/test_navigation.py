@@ -75,6 +75,34 @@ def test_editor_numbered_browse_shortcut_focuses_current_photo(live_server, page
     expect(page.locator(f'.grid-card[data-id="{photo_id}"]')).to_be_visible()
 
 
+def test_closing_ephemeral_editor_into_browse_focuses_current_photo(
+    live_server, page
+):
+    """Closing an ephemeral Edit tab preserves context when Browse is adjacent."""
+    url = live_server["url"]
+    photo_id = live_server["data"]["photos"][0]
+
+    page.goto(f"{url}/edit/{photo_id}")
+    page.wait_for_selector(".nav-tab[data-nav-id='edit'].is-ephemeral", timeout=3000)
+    page.wait_for_selector(".nav-tab[data-nav-id='browse']", timeout=3000)
+    page.evaluate(
+        """async () => {
+            const tabs = window._navTabs.getTabs();
+            const reordered = tabs.filter(id => id !== 'browse');
+            reordered.push('browse');
+            await window._navTabs.setTabs(reordered);
+        }"""
+    )
+    page.wait_for_function(
+        "() => window._navTabs.getTabs().at(-1) === 'browse'"
+    )
+
+    page.locator(".nav-tab[data-nav-id='edit'] .nav-tab-close").click()
+
+    expect(page).to_have_url(f"{url}/browse?photo_id={photo_id}")
+    expect(page.locator(f'.grid-card[data-id="{photo_id}"]')).to_be_visible()
+
+
 def test_workspace_dropdown_shows_current(live_server, page):
     """Workspace dropdown displays the current workspace name."""
     url = live_server["url"]

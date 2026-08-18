@@ -2914,7 +2914,9 @@ window.NAV_ALL_PAGES = [
     const nextId = isOnTab ? adjacentTabId(navId) : null;
     postJSON('/api/workspace/tabs/unpin', {nav_id: navId}).then(() => {
       if (isOnTab) {
-        window.location.href = nextId ? pageById[nextId].href : '/browse';
+        window.location.href = window.vireoResolveNavigationHref(
+          nextId ? pageById[nextId].href : '/browse'
+        );
       } else {
         return fetchAndRender();
       }
@@ -2941,7 +2943,9 @@ window.NAV_ALL_PAGES = [
     }
     if (!adjId && TABS.length) adjId = TABS[TABS.length - 1];
     const next = adjId ? pageById[adjId] : null;
-    window.location.href = next ? next.href : '/browse';
+    window.location.href = window.vireoResolveNavigationHref(
+      next ? next.href : '/browse'
+    );
   }
 
   window.pinTab = function(navId) {

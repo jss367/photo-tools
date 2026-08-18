@@ -1402,6 +1402,80 @@ def test_browse_lightbox_reserves_space_for_bottom_controls(live_server, page):
     )
 
 
+def test_browse_lightbox_conditional_controls_keep_fitted_photo_size_stable(
+    live_server, page,
+):
+    """Conditional bottom controls must not resize the fitted photo.
+
+    A species-eligible photo shows a representative control in the lightbox.
+    Rejecting that photo hides the control after the flag write settles.  The
+    bottom chrome may change internally, but its reserved viewport must remain
+    stable so culling does not make the photo jump in size.
+    """
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" '
+        'viewBox="0 0 1600 1200"><rect width="1600" height="1200" fill="#274"/></svg>'
+    )
+    page.route(
+        "**/photos/*/full",
+        lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
+    )
+    page.set_viewport_size({"width": 1000, "height": 800})
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+
+    expect(page.locator(".lifelist-lb-panel")).to_be_visible()
+    page.wait_for_function(
+        """() => {
+            const img = document.getElementById('lightboxImg');
+            return img && img.complete && img.naturalWidth === 1600;
+        }"""
+    )
+    before = page.evaluate(
+        """() => ({
+            wrapHeight: document.getElementById('lightboxWrap').clientHeight,
+            fitScale: window._lbFitScale,
+        })"""
+    )
+
+    second_id = live_server["data"]["photos"][1]
+    page.keyboard.press("ArrowRight")
+    page.wait_for_function(
+        "photoId => window._lightboxCommittedId === photoId", arg=second_id
+    )
+    expect(page.locator(".lifelist-lb-panel")).to_be_hidden()
+    page.wait_for_timeout(250)  # allow the debounced ResizeObserver refresh
+    after_navigation = page.evaluate(
+        """() => ({
+            wrapHeight: document.getElementById('lightboxWrap').clientHeight,
+            fitScale: window._lbFitScale,
+        })"""
+    )
+    assert after_navigation["wrapHeight"] == before["wrapHeight"]
+    assert abs(after_navigation["fitScale"] - before["fitScale"]) < 0.001
+
+    first_id = live_server["data"]["photos"][0]
+    page.keyboard.press("ArrowLeft")
+    page.wait_for_function(
+        "photoId => window._lightboxCommittedId === photoId", arg=first_id
+    )
+    expect(page.locator(".lifelist-lb-panel")).to_be_visible()
+
+    page.keyboard.press("x")
+    expect(page.locator("#lightboxFlagStatus")).to_have_text("Rejected")
+    expect(page.locator(".lifelist-lb-panel")).to_be_hidden()
+    page.wait_for_timeout(250)  # allow the debounced ResizeObserver refresh
+
+    after = page.evaluate(
+        """() => ({
+            wrapHeight: document.getElementById('lightboxWrap').clientHeight,
+            fitScale: window._lbFitScale,
+        })"""
+    )
+    assert after["wrapHeight"] == before["wrapHeight"]
+    assert abs(after["fitScale"] - before["fitScale"]) < 0.001
+
+
 def test_browse_lightbox_view_menu_tracks_wrapping_action_bar(live_server, page):
     """An open View menu stays anchored through viewport and control changes."""
     page.set_viewport_size({"width": 1000, "height": 700})

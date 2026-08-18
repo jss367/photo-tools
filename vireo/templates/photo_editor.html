@@ -217,6 +217,10 @@ body {
 .editor-canvas-wrap.zoom-custom .editor-canvas {
   max-width: none;
   max-height: none;
+  /* Auto margins consume spare room independently on each flex axis, while
+     collapsing to zero on an overflowing axis. This keeps the image centered
+     on the axis that still fits without making overflow unreachable. */
+  margin: auto;
 }
 .editor-canvas.show-before .crop-box { pointer-events: none; }
 #editorImg {

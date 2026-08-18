@@ -300,6 +300,31 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
         }"""
     )
 
+    one_axis = page.evaluate(
+        """() => {
+            const wrap = document.getElementById('editorCanvasWrap');
+            const style = getComputedStyle(wrap);
+            const availableW = wrap.clientWidth - parseFloat(style.paddingLeft) -
+                parseFloat(style.paddingRight);
+            const availableH = wrap.clientHeight - parseFloat(style.paddingTop) -
+                parseFloat(style.paddingBottom);
+            const dims = editorNativeDisplayDimensions();
+            const fitX = availableW / dims.width * 100;
+            const fitY = availableH / dims.height * 100;
+            setEditorZoom((Math.min(fitX, fitY) + Math.max(fitX, fitY)) / 2);
+            const img = document.getElementById('editorImg').getBoundingClientRect();
+            const viewport = wrap.getBoundingClientRect();
+            const overflowX = img.width > availableW;
+            const overflowY = img.height > availableH;
+            const fittedAxisError = overflowX
+                ? Math.abs(img.top + img.height / 2 - (viewport.top + wrap.clientHeight / 2))
+                : Math.abs(img.left + img.width / 2 - (viewport.left + wrap.clientWidth / 2));
+            return {overflowX, overflowY, fittedAxisError};
+        }"""
+    )
+    assert one_axis["overflowX"] != one_axis["overflowY"]
+    assert one_axis["fittedAxisError"] < 1
+
     page.locator("#actualBtn").click()
     expect(page.locator("#editorZoomSlider")).to_have_attribute(
         "aria-valuetext", "100%"

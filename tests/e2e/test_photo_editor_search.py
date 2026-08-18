@@ -772,6 +772,32 @@ def test_photo_editor_enter_saves_crop_after_drag_from_focused_input(
     assert recipe["crop"]["w"] < 1
     assert recipe["crop"]["h"] < 1
 
+    # Saving an unrelated adjustment on an already-cropped photo must retain
+    # the user's zoom; Fit is only selected when an active crop is accepted.
+    page.evaluate(
+        """() => {
+            editorState.zoomMode = 'custom';
+            editorState.zoomPercent = 100;
+            applyEditorZoom();
+            updateEditorZoomControl();
+        }"""
+    )
+    page.locator("#exposureRange").evaluate(
+        """el => {
+            el.value = '0.5';
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+        }"""
+    )
+    expect(page.locator("#saveBtn")).to_be_enabled()
+    with page.expect_response(
+        f"**/api/photos/{hawk_id}/edit-recipe"
+    ) as adjustment_response:
+        page.locator("#saveBtn").click()
+    assert adjustment_response.value.status == 200
+    expect(page.locator("#saveBtn")).to_be_disabled()
+    assert page.evaluate("() => editorState.zoomMode") == "custom"
+    assert page.evaluate("() => editorState.zoomPercent") == 100
+
     page.locator("#editCropBtn").click()
     page.wait_for_function(
         "() => document.getElementById('editorImg').src.includes('apply_crop=0')"

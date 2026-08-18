@@ -2947,6 +2947,8 @@ async function saveRecipe(description) {
   // write the previous photo's returned recipe back into the editor state for
   // a different photo (or refresh the cache under the wrong photoId).
   var savedPhotoId = editorState.photoId;
+  var acceptingCropEdit = editorState.cropEditing &&
+    !!recipeForSave(editorState.recipe).crop;
   var btn = document.getElementById('saveBtn');
   btn.disabled = true;
   setStatus('Saving...');
@@ -2975,7 +2977,9 @@ async function saveRecipe(description) {
     editorState.recipe = cloneRecipe(data.recipe || {});
     ensureCrop(editorState.recipe);
     editorState.cropEditing = !recipeForSave(editorState.recipe).crop;
-    if (!editorState.cropEditing) editorState.zoomMode = 'fit';
+    if (acceptingCropEdit && !editorState.cropEditing) {
+      editorState.zoomMode = 'fit';
+    }
     syncControls();
     updatePreview();
     loadHistory();

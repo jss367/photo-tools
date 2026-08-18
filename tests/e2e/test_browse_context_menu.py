@@ -1,5 +1,10 @@
 from playwright.sync_api import expect
 
+_PNG_1X1 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"
+    "/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
+
 
 def test_right_click_photo_opens_menu(live_server, page):
     """Right-clicking a grid card opens the context menu with chips + key actions."""
@@ -63,6 +68,83 @@ def test_browse_selection_opens_burst_review(live_server, page):
         timeout=5000,
     )
     expect(page.locator("#grmCount")).to_contain_text("unsorted")
+
+
+def test_browse_selection_review_marks_the_active_photos_eye(live_server, page):
+    """The eye marker follows the active photo within a selected review set."""
+    page.goto(f"{live_server['url']}/browse")
+
+    cards = page.locator(".grid-card")
+    cards.first.wait_for(state="visible")
+    photo_ids = [int(cards.nth(i).get_attribute("data-id")) for i in range(2)]
+    db = live_server["db"]
+    db.conn.execute(
+        "UPDATE photos SET eye_x = 0.2, eye_y = 0.4, eye_conf = 0.98 WHERE id = ?",
+        (photo_ids[0],),
+    )
+    db.conn.execute(
+        "UPDATE photos SET eye_x = 0.8, eye_y = 0.4, eye_conf = 0.98 WHERE id = ?",
+        (photo_ids[1],),
+    )
+    db.conn.commit()
+
+    cards.nth(0).click(modifiers=["Meta"])
+    cards.nth(1).click(modifiers=["Meta"])
+    page.locator("#burstReviewBtn").click()
+    page.wait_for_function(
+        "() => document.querySelector('#grmOverlay.open')",
+        timeout=5000,
+    )
+    page.evaluate(
+        "png => { window.grmPhotoUrl = () => 'data:image/png;base64,' + png; }",
+        _PNG_1X1,
+    )
+    page.evaluate(
+        """() => {
+          grmState.selected = null;
+          grmState.selectedIds.clear();
+          grmState.selectionAnchor = null;
+          renderGroupModal();
+          grmRefreshSelectedLoupe();
+        }"""
+    )
+
+    first = page.locator(
+        f'#grmOverlay .grm-card[data-photo-id="{photo_ids[0]}"]'
+    )
+    second = page.locator(
+        f'#grmOverlay .grm-card[data-photo-id="{photo_ids[1]}"]'
+    )
+    first.click()
+    marker = page.locator("#grmSelectedEyeCrosshair")
+    page.wait_for_function(
+        """() => {
+          const img = document.getElementById('grmLoupePhoto');
+          return img.complete && img.naturalWidth > 0;
+        }"""
+    )
+    expect(marker).to_be_visible()
+    first_left = marker.evaluate("el => parseFloat(el.style.left)")
+
+    second.click(modifiers=["Meta"])
+    page.wait_for_function(
+        "left => parseFloat(document.getElementById('grmSelectedEyeCrosshair').style.left) !== left",
+        arg=first_left,
+    )
+    assert page.evaluate("grmState.selectedIds.size") == 2
+    assert marker.evaluate("el => parseFloat(el.style.left)") > first_left
+
+    loupe_box = page.locator("#grmLoupeImg").bounding_box()
+    assert loupe_box is not None
+    drag_x = loupe_box["x"] + loupe_box["width"] / 2
+    drag_y = loupe_box["y"] + loupe_box["height"] / 2
+    page.mouse.move(drag_x, drag_y)
+    before_drag = marker.evaluate("el => parseFloat(el.style.left)")
+    page.mouse.down()
+    page.mouse.move(drag_x + 24, drag_y)
+    page.mouse.up()
+    after_drag = marker.evaluate("el => parseFloat(el.style.left)")
+    assert after_drag > before_drag + 20
 
 
 def test_right_click_rating_applies(live_server, page):

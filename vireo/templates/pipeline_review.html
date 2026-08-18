@@ -1518,6 +1518,41 @@ input[type="range"]::-moz-range-thumb {
   background: rgba(78, 204, 163, 0.4);
   pointer-events: none;
 }
+.grm-loupe-eye-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.grm-loupe-eye-crosshair {
+  position: absolute;
+  display: none;
+  width: 28px;
+  height: 28px;
+  margin-left: -14px;
+  margin-top: -14px;
+  z-index: 2;
+}
+.grm-loupe-eye-crosshair::before,
+.grm-loupe-eye-crosshair::after {
+  content: "";
+  position: absolute;
+  background: #4db8ff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55);
+}
+.grm-loupe-eye-crosshair::before {
+  left: 50%;
+  top: 0;
+  width: 2px;
+  height: 100%;
+  margin-left: -1px;
+}
+.grm-loupe-eye-crosshair::after {
+  top: 50%;
+  left: 0;
+  width: 100%;
+  height: 2px;
+  margin-top: -1px;
+}
 
 /* Zoomed strip thumbnails */
 .grm-card.zoomed img {
@@ -1939,6 +1974,9 @@ input[type="range"]::-moz-range-thumb {
         <img id="grmLoupePhoto" alt="" onload="grmLoupeImgLoaded(this)" draggable="false">
         <div class="grm-loupe-crosshair-h" id="grmCrosshairH"></div>
         <div class="grm-loupe-crosshair-v" id="grmCrosshairV"></div>
+        <div class="grm-loupe-eye-layer" id="grmSelectedEyeLayer" aria-hidden="true">
+          <div class="grm-loupe-eye-crosshair" id="grmSelectedEyeCrosshair"></div>
+        </div>
       </div>
       <div class="grm-loupe-info" id="grmLoupeInfo">Select a photo to preview. Hover to compare sharpness across all frames.</div>
       <button type="button" class="grm-reset-offsets-btn" id="grmResetAllOffsets" onclick="grmResetAllOffsets()">Reset pan offsets</button>
@@ -2372,6 +2410,7 @@ function grmApplyLoupeZoom() {
   var y = _grmLastHoverY == null ? 50 : _grmLastHoverY;
   img.style.transformOrigin = x + '% ' + y + '%';
   img.style.transform = 'scale(' + _grmLoupeZoomLevel + ')';
+  grmUpdateSelectedEyeCrosshair();
 }
 
 function _grmAfterLoupeSourceChange() {
@@ -2449,6 +2488,7 @@ function _grmSetOriginalResolutionForLoupe() {
 }
 
 function grmLoupeImgLoaded(img) {
+  grmUpdateSelectedEyeCrosshair();
   if (_grmLoupePendingOneToOne) {
     _grmFinishLoupeOneToOne();
   }
@@ -6402,8 +6442,11 @@ function grmRefreshSelectedLoupe() {
   if (grmState.selected) {
     var nextSrc = grmPhotoUrl(grmState.selected);
     if (loupeImg.getAttribute('src') !== nextSrc) {
+      grmHideSelectedEyeCrosshair();
       loupeImg.src = nextSrc;
       _grmAfterLoupeSourceChange();
+    } else {
+      grmUpdateSelectedEyeCrosshair();
     }
     var photo = grmState.items.find(function(p) { return p.id === grmState.selected; });
     if (photo) {
@@ -6414,6 +6457,7 @@ function grmRefreshSelectedLoupe() {
     }
     grmUpdateResLabel();
   } else {
+    grmHideSelectedEyeCrosshair();
     loupeImg.removeAttribute('src');
     loupeInfo.textContent = 'Select a photo to preview. Hover to compare sharpness across all frames.';
     detailEl.innerHTML = '';
@@ -6908,6 +6952,7 @@ function grmApplyCardTransforms() {
     var box = img.parentElement;
     if (box) box.classList.toggle('zoomed', t.zoomed);
   });
+  grmUpdateSelectedEyeCrosshair();
 }
 
 function _grmApplyCardTransform(card) {
@@ -6917,6 +6962,9 @@ function _grmApplyCardTransform(card) {
   img.style.transform = t.transform;
   var box = img.parentElement;
   if (box) box.classList.toggle('zoomed', t.zoomed);
+  if (grmState && String(card.dataset.photoId) === String(grmState.selected)) {
+    grmUpdateSelectedEyeCrosshair();
+  }
 }
 
 // `grmBaseScale()` retained for any external callers / tests. Reports the
@@ -6954,6 +7002,69 @@ function grmPositionCrosshair(x, y) {
   if (ch) ch.style.top = y + '%';
   if (cv) cv.style.left = x + '%';
 }
+
+function grmHideSelectedEyeCrosshair() {
+  var marker = document.getElementById('grmSelectedEyeCrosshair');
+  if (marker) marker.style.display = 'none';
+}
+
+function grmUpdateSelectedEyeCrosshair() {
+  var marker = document.getElementById('grmSelectedEyeCrosshair');
+  var box = document.getElementById('grmLoupeImg');
+  var img = document.getElementById('grmLoupePhoto');
+  if (!marker || !box || !img || !grmState || !grmState.selected) return;
+
+  var photo = grmState.items.find(function(item) {
+    return item.id === grmState.selected;
+  });
+  var eyeX = photo && Number(photo.eye_x);
+  var eyeY = photo && Number(photo.eye_y);
+  if (!photo || photo.eye_x == null || photo.eye_y == null ||
+      !isFinite(eyeX) || !isFinite(eyeY) ||
+      eyeX < 0 || eyeX > 1 || eyeY < 0 || eyeY > 1 ||
+      !img.complete || !img.naturalWidth || !img.naturalHeight) {
+    grmHideSelectedEyeCrosshair();
+    return;
+  }
+
+  // The loupe image uses object-fit: contain. Place the detected-eye marker
+  // inside the actual rendered photo, not in the surrounding letterbox. The
+  // marker is then moved through the same zoom transform as the image (while
+  // keeping its stroke a constant screen size). Include the selected photo's
+  // comparison-strip pan so blue shows where that eye will land after the
+  // adjustment while the yellow alignment target stays fixed.
+  var boxW = box.clientWidth;
+  var boxH = box.clientHeight;
+  if (!boxW || !boxH) {
+    grmHideSelectedEyeCrosshair();
+    return;
+  }
+  var containScale = Math.min(
+    boxW / img.naturalWidth,
+    boxH / img.naturalHeight
+  );
+  var renderedW = img.naturalWidth * containScale;
+  var renderedH = img.naturalHeight * containScale;
+  var unzoomedX = (boxW - renderedW) / 2 + eyeX * renderedW;
+  var unzoomedY = (boxH - renderedH) / 2 + eyeY * renderedH;
+  var originX = ((_grmLastHoverX == null ? 50 : _grmLastHoverX) / 100) * boxW;
+  var originY = ((_grmLastHoverY == null ? 50 : _grmLastHoverY) / 100) * boxH;
+  var card = document.querySelector(
+    '#grmOverlay .grm-card[data-photo-id="' + grmState.selected + '"]'
+  );
+  var offset = _grmOffsets[String(grmState.selected)] ||
+    _grmOffsets[grmState.selected] || { tx: 0, ty: 0 };
+  var cardScale = card ? _grmCardDisplayedScale(card) : 0;
+  marker.style.left = (
+    originX + (unzoomedX - originX) * _grmLoupeZoomLevel + offset.tx * cardScale
+  ) + 'px';
+  marker.style.top = (
+    originY + (unzoomedY - originY) * _grmLoupeZoomLevel + offset.ty * cardScale
+  ) + 'px';
+  marker.style.display = 'block';
+}
+
+window.addEventListener('resize', grmUpdateSelectedEyeCrosshair);
 
 function grmLoupeToggleLock(e) {
   if (_grmSuppressLoupeClick) {

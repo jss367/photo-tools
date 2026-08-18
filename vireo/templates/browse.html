@@ -1869,8 +1869,7 @@ body.sidebar-resizing {
         <label style="font-size:12px;color:var(--text-secondary);display:block;margin-bottom:7px;">Include metadata in exported files</label>
         <div class="export-metadata-options">
           <label class="export-metadata-option"><input id="exportMetadataSpecies" type="checkbox" value="species" data-view-preference="vireo.browse.export.metadata.species"> Species</label>
-          <label class="export-metadata-option"><input id="exportMetadataCaptureDate" type="checkbox" value="capture_date" data-view-preference="vireo.browse.export.metadata.captureDate"> Capture date</label>
-          <label class="export-metadata-option"><input id="exportMetadataCaptureTime" type="checkbox" value="capture_time" data-view-preference="vireo.browse.export.metadata.captureTime"> Capture time</label>
+          <label class="export-metadata-option"><input id="exportMetadataCaptureDateTime" type="checkbox" value="capture_date_time" data-view-preference="vireo.browse.export.metadata.captureDateTime"> Capture date &amp; time</label>
           <label class="export-metadata-option"><input id="exportMetadataRating" type="checkbox" value="rating" data-view-preference="vireo.browse.export.metadata.rating"> Rating</label>
           <label class="export-metadata-option"><input id="exportMetadataLocation" type="checkbox" value="location" data-view-preference="vireo.browse.export.metadata.location"> Location</label>
           <label class="export-metadata-option"><input id="exportMetadataCamera" type="checkbox" value="camera" data-view-preference="vireo.browse.export.metadata.camera"> Camera &amp; exposure</label>
@@ -5513,13 +5512,17 @@ async function prependPreviousPhotos(options) {
     var oldFirstCard = oldFirstPhoto ? getGridCard(oldFirstPhoto.id) : null;
     var oldFirstTop = oldFirstCard ? oldFirstCard.getBoundingClientRect().top : null;
 
-    photos = preceding.concat(photos);
+    // Keep the array identity stable. The shared lightbox holds this same
+    // object while it is open, so mutating it lets Previous navigation see
+    // the newly prepended page without closing and reopening the viewer.
+    Array.prototype.unshift.apply(photos, preceding);
     earliestPage = requestedPage;
     prependGridPhotos(preceding);
     updatePreviousPhotosButton();
     allLoaded = loadedWindowOffset() + photos.length >= totalPhotos;
     updateGridTail();
     updateFilterSummary();
+    refreshBrowseLightboxCounter();
 
     // Adding rows changes scrollHeight. Compensate by the anchor's exact
     // layout delta so there is no visual jump, even with a responsive number
@@ -5606,7 +5609,9 @@ async function loadPhotos(options) {
     if (data.photos.length === 0) {
       allLoaded = true;
     } else {
-      photos = photos.concat(data.photos);
+      // Keep the array identity stable. The shared lightbox navigates the
+      // same object and can therefore continue into this newly loaded page.
+      Array.prototype.push.apply(photos, data.photos);
       currentPage += chunk;
       // A deep-link window starts partway in, so it is exhausted when it
       // reaches the end of the dataset — not when it holds ``totalPhotos``
@@ -5619,6 +5624,7 @@ async function loadPhotos(options) {
     browseDatasetReady = true;
     updateGridTail();
     updateFilterSummary();
+    refreshBrowseLightboxCounter();
 
     // Refresh appended cards once async metadata resolves — appendGridPhotos
     // only renders each page once, so badges/labels would otherwise stay
@@ -6106,6 +6112,96 @@ function browseKeyMatchesConfiguredShortcut(e) {
   }
   return false;
 }
+
+/* Keep Browse's lightbox navigation moving across lazy-loaded page edges.
+   The grid and lightbox share the same ``photos`` array while Browse owns the
+   viewer. ``loadPhotos``/``prependPreviousPhotos`` mutate that array in place,
+   so a prefetched page becomes available to the shared lightbox immediately.
+   If the user reaches an edge before the request finishes, retry at the same
+   boundary and advance as soon as the page is available. */
+var browseLightboxBoundaryRetry = null;
+var browseLightboxSession = 0;
+
+function browseLightboxOwnsLoadedWindow() {
+  return (
+    typeof window._lightboxPhotoList !== 'undefined' &&
+    window._lightboxPhotoList === photos &&
+    typeof window._lightboxCurrentId !== 'undefined' &&
+    window._lightboxCurrentId != null
+  );
+}
+
+function refreshBrowseLightboxCounter() {
+  if (!browseLightboxOwnsLoadedWindow()) return;
+  var visibleId = window._lightboxCommittedId != null
+    ? window._lightboxCommittedId
+    : window._lightboxCurrentId;
+  var index = photos.findIndex(function(photo) { return photo.id === visibleId; });
+  var counter = document.getElementById('lightboxCounter');
+  if (index < 0 || !counter || photos.length < 2) return;
+  var filename = photos[index].filename || '';
+  counter.textContent = (index + 1) + ' / ' + photos.length
+    + (filename ? ' \u00b7 ' + filename : '');
+  counter.title = filename;
+  counter.style.display = '';
+}
+
+function continueBrowseLightboxAcrossBoundary(delta, currentId, session) {
+  if (session !== browseLightboxSession) return;
+  if (!browseLightboxOwnsLoadedWindow() || window._lightboxCurrentId !== currentId) return;
+  var index = photos.findIndex(function(photo) { return photo.id === currentId; });
+  if (index < 0) return;
+
+  var nextIndex = index + delta;
+  if (nextIndex >= 0 && nextIndex < photos.length) {
+    lightboxNav(delta);
+    return;
+  }
+
+  var canLoad = delta > 0 ? !allLoaded : earliestPage > 1;
+  if (!canLoad) return;
+  if (loading) {
+    clearTimeout(browseLightboxBoundaryRetry);
+    browseLightboxBoundaryRetry = setTimeout(function() {
+      continueBrowseLightboxAcrossBoundary(delta, currentId, session);
+    }, 50);
+    return;
+  }
+
+  var request = delta > 0
+    ? loadPhotos({ silent: true })
+    : prependPreviousPhotos({ silent: true });
+  Promise.resolve(request).then(function(loaded) {
+    if (loaded !== true) return;
+    if (session !== browseLightboxSession) return;
+    if (!browseLightboxOwnsLoadedWindow() || window._lightboxCurrentId !== currentId) return;
+    lightboxNav(delta);
+  });
+}
+
+document.addEventListener('lightbox:photochanged', function(event) {
+  if (!browseLightboxOwnsLoadedWindow() || loading) return;
+  var photoId = event && event.detail && event.detail.photoId;
+  var index = photos.findIndex(function(photo) { return photo.id === photoId; });
+  if (index < 0) return;
+  if (!allLoaded && index >= photos.length - 3) loadPhotos({ silent: true });
+  if (earliestPage > 1 && index <= 2) prependPreviousPhotos({ silent: true });
+});
+
+document.addEventListener('lightbox:navigationboundary', function(event) {
+  var detail = event && event.detail || {};
+  if (detail.delta !== 1 && detail.delta !== -1) return;
+  if (!browseLightboxOwnsLoadedWindow()) return;
+  continueBrowseLightboxAcrossBoundary(
+    detail.delta, detail.photoId, browseLightboxSession
+  );
+});
+
+document.addEventListener('lightbox:closed', function() {
+  browseLightboxSession++;
+  clearTimeout(browseLightboxBoundaryRetry);
+  browseLightboxBoundaryRetry = null;
+});
 
 /* ---------- Infinite Scroll ---------- */
 var gridContainer = document.getElementById('gridContainer');
@@ -11400,6 +11496,20 @@ async function _runPhotoDeepLink(photoId) {
 /* ---------- Export Modal ---------- */
 var _exportPhotoIds = null;
 
+function migrateExportCaptureDateTimePreference() {
+  var combinedKey = 'vireo.browse.export.metadata.captureDateTime';
+  if (VireoViewPreferences.read(combinedKey) !== null) return;
+
+  var legacyDate = VireoViewPreferences.read('vireo.browse.export.metadata.captureDate');
+  var legacyTime = VireoViewPreferences.read('vireo.browse.export.metadata.captureTime');
+  if (legacyDate === null && legacyTime === null) return;
+
+  VireoViewPreferences.write(
+    combinedKey,
+    legacyDate === '1' || legacyTime === '1' ? '1' : '0'
+  );
+}
+
 function openExportModal(photoIds) {
   var activeIds = Array.isArray(photoIds) ? photoIds.slice() : getActiveSelection();
   if (activeIds.length === 0) return;
@@ -11417,6 +11527,7 @@ function openExportModal(photoIds) {
   });
   document.getElementById('exportDest').value = '';
   document.getElementById('exportSubfolder').checked = false;
+  migrateExportCaptureDateTimePreference();
   VireoViewPreferences.restoreAll(document.getElementById('exportOverlay'));
   document.getElementById('exportOverlay').classList.add('open');
   updateExportPreview();
@@ -11435,7 +11546,14 @@ function openPhotoExportModal(photoIds) {
 
 function selectedExportMetadataFields() {
   return Array.from(document.querySelectorAll('.export-metadata-option input:checked'))
-    .map(function(input) { return input.value; });
+    .reduce(function(fields, input) {
+      if (input.value === 'capture_date_time') {
+        fields.push('capture_date', 'capture_time');
+      } else {
+        fields.push(input.value);
+      }
+      return fields;
+    }, []);
 }
 
 function closeExportModal() {

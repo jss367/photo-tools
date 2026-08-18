@@ -2120,7 +2120,9 @@ document.addEventListener('keydown', function(e) {
     if (idx < tabs.length) {
       e.preventDefault();
       const target = all.find(p => p.id === tabs[idx]);
-      if (target) window.location.href = target.href;
+      if (target) {
+        window.location.href = window.vireoResolveNavigationHref(target.href);
+      }
     }
   }
   // cmd+W → close current tab (pinned or ephemeral)
@@ -2652,6 +2654,16 @@ function sendReport() {
 
 <script>
 /* ---------- Unified tab strip + ephemeral slot + overflow ---------- */
+// Preserve the photo context when leaving the editor for Browse. Browse's
+// existing photo_id deep link owns the folder switch, bounded page load,
+// centering, and highlight; navigation surfaces only need to hand it the
+// editor photo currently shown in the URL.
+window.vireoResolveNavigationHref = function(path) {
+  if (path !== '/browse') return path;
+  var match = window.location.pathname.match(/^\/edit\/(\d+)\/?$/);
+  return match ? '/browse?photo_id=' + encodeURIComponent(match[1]) : path;
+};
+
 // Hardcoded fallbacks so the strip has something to render even when
 // /api/workspace/tabs fails (network error, 5xx, invalid JSON). Without
 // these, a transient fetch failure on first load leaves the navbar
@@ -2734,7 +2746,13 @@ window.NAV_ALL_PAGES = [
 
   function buildTabAnchor(page, opts) {
     const a = document.createElement('a');
-    a.href = page.href;
+    a.href = window.vireoResolveNavigationHref(page.href);
+    // The editor swaps photos with history.replaceState(), without rebuilding
+    // the tab strip. Resolve again at activation time so Prev/Next and search
+    // navigation cannot leave Browse pointing at the previous photo.
+    a.addEventListener('click', () => {
+      a.href = window.vireoResolveNavigationHref(page.href);
+    });
     a.draggable = false;
     a.className = 'nav-tab';
     if (opts && opts.ephemeral) a.classList.add('is-ephemeral');
@@ -2850,7 +2868,7 @@ window.NAV_ALL_PAGES = [
       item.dataset.navId = page.id;
       item.appendChild(document.createTextNode(page.label));
       item.addEventListener('click', () => {
-        window.location.href = page.href;
+        window.location.href = window.vireoResolveNavigationHref(page.href);
       });
       menu.appendChild(item);
     });
@@ -2896,7 +2914,9 @@ window.NAV_ALL_PAGES = [
     const nextId = isOnTab ? adjacentTabId(navId) : null;
     postJSON('/api/workspace/tabs/unpin', {nav_id: navId}).then(() => {
       if (isOnTab) {
-        window.location.href = nextId ? pageById[nextId].href : '/browse';
+        window.location.href = window.vireoResolveNavigationHref(
+          nextId ? pageById[nextId].href : '/browse'
+        );
       } else {
         return fetchAndRender();
       }
@@ -2923,7 +2943,9 @@ window.NAV_ALL_PAGES = [
     }
     if (!adjId && TABS.length) adjId = TABS[TABS.length - 1];
     const next = adjId ? pageById[adjId] : null;
-    window.location.href = next ? next.href : '/browse';
+    window.location.href = window.vireoResolveNavigationHref(
+      next ? next.href : '/browse'
+    );
   }
 
   window.pinTab = function(navId) {
@@ -2988,6 +3010,14 @@ window.NAV_ALL_PAGES = [
       return postJSON('/api/workspace/tabs/reorder', {tabs: newOrder})
         .then(() => fetchAndRender());
     },
+  };
+
+  window.vireoRefreshNavigationHrefs = function() {
+    const browse = pageById.browse;
+    if (!browse) return;
+    document.querySelectorAll('.nav-tab[data-nav-id="browse"]').forEach(a => {
+      a.href = window.vireoResolveNavigationHref(browse.href);
+    });
   };
 
   // The tab strip only needs the navbar DOM above, not the full page. Start it
@@ -3325,7 +3355,7 @@ window.NAV_ALL_PAGES = [
           }
           // Don't navigate if we're already on this page.
           if (window.location.pathname === route) return false;
-          window.location.href = route;
+          window.location.href = window.vireoResolveNavigationHref(route);
         }
       });
     });
@@ -7479,24 +7509,39 @@ function cropResetFrame() {
   _cropRenderBox();
 }
 
+function _cropBoxForAspect(crop, normalizedRatio) {
+  var current = _cropClampBox(crop);
+  if (!Number.isFinite(normalizedRatio) || normalizedRatio <= 0) return current;
+  var centerX = current.x + current.w / 2;
+  var centerY = current.y + current.h / 2;
+  var w = current.w;
+  var h = current.h;
+  // Fit the requested ratio inside the user's current crop instead of
+  // replacing their latest drag with a new full-frame-centered crop. Only
+  // the minimum-size floor below is allowed to grow beyond that selection.
+  if (w / h > normalizedRatio) w = h * normalizedRatio;
+  else h = w / normalizedRatio;
+  // Keep the shared editor's per-axis 2% clamp from changing the ratio.
+  var minScale = Math.max(1, 0.02 / w, 0.02 / h);
+  w *= minScale;
+  h *= minScale;
+  return _cropClampBox({
+    x: centerX - w / 2,
+    y: centerY - h / 2,
+    w: w,
+    h: h,
+  });
+}
+
 function cropSetAspect(aspect) {
   if (!_cropRecipe) return;
   var img = document.getElementById('cropEditorImg');
   if (!img || !img.clientWidth || !img.clientHeight) return;
   var imageAspect = img.clientWidth / img.clientHeight;
   var normalizedRatio = aspect / imageAspect;
-  var w = 0.9;
-  var h = w / normalizedRatio;
-  if (h > 0.9) {
-    h = 0.9;
-    w = h * normalizedRatio;
-  }
-  _cropRecipe.crop = {
-    x: (1 - w) / 2,
-    y: (1 - h) / 2,
-    w: w,
-    h: h,
-  };
+  _cropRecipe.crop = _cropBoxForAspect(
+    _cropDefaultCrop(_cropRecipe), normalizedRatio
+  );
   _cropRenderBox();
 }
 
@@ -8096,7 +8141,10 @@ function openLightbox(photoId, filename, photoList, options) {
 }
 
 function lightboxNav(delta) {
-  if (_lightboxPhotoList.length < 2) return;
+  // A one-photo list can still be one page of a larger lazy-loaded dataset.
+  // Let the normal boundary event fire so the owning page can fetch the next
+  // or previous page instead of swallowing the first navigation attempt.
+  if (_lightboxPhotoList.length === 0) return;
   var idx = _lightboxPhotoList.findIndex(function(p) { return p.id === _lightboxCurrentId; });
   if (idx === -1) return;
   var newIdx = idx + delta;
@@ -9147,12 +9195,22 @@ function lightboxDelete() {
       return;
     }
 
+    // Capture the lightbox position before Browse updates its grid. Browse's
+    // lazy-loaded lightbox deliberately shares the same array object, so a
+    // grid removal may also remove the lightbox entry in one splice.
+    var idx = _lightboxPhotoList.findIndex(function(x) { return x.id === currentId; });
+    var removedFromSharedLightboxList = false;
+
     // Update the browse grid before touching lightbox state. Otherwise
     // Browse's `lightbox:closed` handler still finds the deleted row in
     // `photos` and re-selects it (loading stale detail state that this
     // block would then null out — leaving the sidebar blank).
     if (typeof photos !== 'undefined' && typeof renderGrid === 'function') {
-      photos = photos.filter(function(x) { return x.id !== currentId; });
+      var browseIdx = photos.findIndex(function(x) { return x.id === currentId; });
+      if (browseIdx >= 0) {
+        removedFromSharedLightboxList = photos === _lightboxPhotoList;
+        photos.splice(browseIdx, 1);
+      }
       selectedPhotos.delete(currentId);
       if (selectedPhotoId === currentId) selectedPhotoId = null;
       renderGrid();
@@ -9161,9 +9219,11 @@ function lightboxDelete() {
       }
     }
 
-    // Remove from lightbox photo list
-    var idx = _lightboxPhotoList.findIndex(function(x) { return x.id === currentId; });
-    _lightboxPhotoList.splice(idx, 1);
+    // Remove from a page-specific lightbox list. When Browse shared its live
+    // array, the grid splice above already performed this removal.
+    if (!removedFromSharedLightboxList && idx >= 0) {
+      _lightboxPhotoList.splice(idx, 1);
+    }
 
     if (_lightboxPhotoList.length === 0) {
       closeLightbox(null);
@@ -10898,7 +10958,7 @@ function showRevealFeedback(data) {
 }
 
 function nativeMenuRoute(path) {
-  window.location.href = path;
+  window.location.href = window.vireoResolveNavigationHref(path);
 }
 
 function nativeMenuLightboxOpen() {
@@ -13970,7 +14030,7 @@ async function _deleteMissingPhotoIds(ids, deleteSidecars) {
 
   function navigateTo(page) {
     window.closeCommandPalette();
-    window.location.href = page.href;
+    window.location.href = window.vireoResolveNavigationHref(page.href);
   }
 
   // Wire input handlers

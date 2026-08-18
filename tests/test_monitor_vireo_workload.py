@@ -135,6 +135,7 @@ def test_collect_workload_builds_deltas_targets_and_job_summary():
         {"logical_cpu_count": 16},
     )
 
+    ready_states = []
     report = collect_workload(
         duration=2.0,
         interval=1.0,
@@ -143,8 +144,12 @@ def test_collect_workload_builds_deltas_targets_and_job_summary():
         system_sampler=system,
         monotonic=clock.monotonic,
         sleep=clock.sleep,
+        on_ready=lambda: ready_states.append(
+            (api.authenticated, process.primed, system.primed)
+        ),
     )
 
+    assert ready_states == [(True, True, True)]
     assert api.authenticated
     assert process.primed and system.primed
     assert [sample["elapsed_seconds"] for sample in report["samples"]] == [1.0, 2.0]
@@ -937,6 +942,13 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
     child.reaped_cpu_seconds = 0.3
     clock.sleep(1.0)
     assert sampler.sample()["cpu_percent"] == 30.0
+
+    # Reusing the child's PID produces a new identity and uses the newly
+    # discovered process object rather than stale cached counters.
+    replacement = _CpuProcess(101, 3.0, 0.2, 150)
+    root.child_processes = [replacement]
+    clock.sleep(1.0)
+    assert sampler.sample()["cpu_percent"] == 20.0
 
     root.alive = False
     with pytest.raises(RuntimeError, match="exited or was replaced"):

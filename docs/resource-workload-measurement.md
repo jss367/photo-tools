@@ -38,8 +38,9 @@ python scripts/monitor_vireo_workload.py --duration 1800
 
 The monitor discovers the listening `vireo-server`, authenticates through the
 normal local browser-session flow, and writes a timestamped report under
-`.context/benchmarks/`. Start the jobs in Vireo after the monitor begins. Press
-Ctrl-C to save a partial report early.
+`.context/benchmarks/`. Wait for the `Monitoring Vireo...` message, which is
+printed after the baseline and resource samplers are ready, and then start the
+jobs in Vireo. Press Ctrl-C to save a partial report early.
 
 If more than one Vireo server is running, identify the intended instance:
 

@@ -343,7 +343,14 @@ class ProcessTreeSampler:
             discovered.extend(self.root.children(recursive=True))
         live = {}
         for process in discovered:
-            live[process.pid] = self.processes.get(process.pid, process)
+            try:
+                identity = (process.pid, process.create_time())
+            except (OSError, self.psutil.Error):
+                continue
+            # A descendant PID can be reused between polls. Reuse a cached
+            # psutil object only when its creation time still identifies the
+            # same process; otherwise retain the newly discovered object.
+            live[identity] = self.processes.get(identity, process)
         self.processes = live
         return list(live.values())
 
@@ -736,6 +743,7 @@ def collect_workload(
     system_sampler,
     monotonic=time.monotonic,
     sleep=time.sleep,
+    on_ready=None,
 ):
     api_client.authenticate()
     baseline = api_client.sample()
@@ -746,6 +754,8 @@ def collect_workload(
         )
     process_sampler.prime()
     system_sampler.prime()
+    if on_ready is not None:
+        on_ready()
     started_at = _utc_now()
     started = monotonic()
     deadline = started + duration
@@ -1032,17 +1042,17 @@ def main(argv=None):
         api_client = VireoApiClient(server["url"], timeout=args.timeout)
         process_sampler = ProcessTreeSampler(server["pid"])
         system_sampler = SystemSampler()
-        print(
-            f"Monitoring Vireo PID {server['pid']} at {server['url']} for "
-            f"{args.duration:g}s; press Ctrl-C to save early.",
-            file=sys.stderr,
-        )
         report = collect_workload(
             duration=args.duration,
             interval=args.interval,
             api_client=api_client,
             process_sampler=process_sampler,
             system_sampler=system_sampler,
+            on_ready=lambda: print(
+                f"Monitoring Vireo PID {server['pid']} at {server['url']} for "
+                f"{args.duration:g}s; press Ctrl-C to save early.",
+                file=sys.stderr,
+            ),
         )
     except (OSError, RuntimeError) as exc:
         raise SystemExit(f"error: {exc}") from exc

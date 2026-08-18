@@ -388,7 +388,7 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
             Object.defineProperty(img, 'currentSrc', {
                 configurable: true,
                 get: () => '/photos/' + editorState.photoId +
-                    '/edit-preview?size=' + loadedSize + '&recipe=' +
+                    '/edit-preview?size=' + loadedSize + '&apply_crop=0&recipe=' +
                     encodeURIComponent(JSON.stringify(previewRecipeFor(editorState.recipe)))
             });
             Object.defineProperty(img, 'naturalWidth', {
@@ -686,6 +686,23 @@ def test_photo_editor_enter_saves_crop_after_drag_from_focused_input(
     assert response.value.request.method == "PUT"
     assert response.value.status == 200
     expect(page.locator("#saveBtn")).to_be_disabled()
+    page.wait_for_function(
+        "() => document.getElementById('editorImg').src.includes('apply_crop=1')"
+    )
+    committed = page.evaluate(
+        """() => ({
+            cropEditing: editorState.cropEditing,
+            zoomMode: editorState.zoomMode,
+            cropVisible: getComputedStyle(
+                document.getElementById('editorCropBox')
+            ).display !== 'none'
+        })"""
+    )
+    assert committed == {
+        "cropEditing": False,
+        "zoomMode": "fit",
+        "cropVisible": False,
+    }
 
     recipe = page.evaluate(
         """async (photoId) => {
@@ -696,3 +713,17 @@ def test_photo_editor_enter_saves_crop_after_drag_from_focused_input(
     )
     assert recipe["crop"]["w"] < 1
     assert recipe["crop"]["h"] < 1
+
+    page.locator("#editCropBtn").click()
+    page.wait_for_function(
+        "() => document.getElementById('editorImg').src.includes('apply_crop=0')"
+    )
+    expect(page.locator("#editorCropBox")).to_be_visible()
+
+    # Accepting an unchanged saved crop exits crop editing without creating a
+    # redundant history entry or requiring the disabled Save button.
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        "() => document.getElementById('editorImg').src.includes('apply_crop=1')"
+    )
+    expect(page.locator("#editorCropBox")).to_be_hidden()

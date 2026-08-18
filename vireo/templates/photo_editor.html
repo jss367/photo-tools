@@ -623,6 +623,7 @@ body {
     <div class="panel-band">
       <div class="panel-title">Crop</div>
       <div class="button-row">
+        <button class="editor-btn" type="button" id="editCropBtn" onclick="beginCropEdit()">Edit Crop</button>
         <button class="editor-btn" type="button" onclick="resetCrop()">Full Frame</button>
         <button class="editor-btn" type="button" id="aspectLockBtn" onclick="toggleAspectLock()" title="Keep the current crop aspect ratio while resizing">Lock Ratio</button>
         <button class="editor-btn" type="button" id="aspect32Btn" onclick="setAspect(1.5)" title="Set a 3:2 crop and lock the ratio; click again to unlock">3:2</button>
@@ -630,10 +631,10 @@ body {
         <button class="editor-btn" type="button" id="aspect11Btn" onclick="setAspect(1)" title="Set a 1:1 crop and lock the ratio; click again to unlock">1:1</button>
       </div>
       <div class="crop-meta">
-        <div><label for="cropX">x</label><input id="cropX" type="number" min="0" max="100" step="0.1" value="0" onchange="setCropField('x', this.value)" aria-label="Crop x (percent)"></div>
-        <div><label for="cropY">y</label><input id="cropY" type="number" min="0" max="100" step="0.1" value="0" onchange="setCropField('y', this.value)" aria-label="Crop y (percent)"></div>
-        <div><label for="cropW">w</label><input id="cropW" type="number" min="2" max="100" step="0.1" value="100" onchange="setCropField('w', this.value)" aria-label="Crop width (percent)"></div>
-        <div><label for="cropH">h</label><input id="cropH" type="number" min="2" max="100" step="0.1" value="100" onchange="setCropField('h', this.value)" aria-label="Crop height (percent)"></div>
+        <div><label for="cropX">x</label><input id="cropX" type="number" min="0" max="100" step="0.1" value="0" onfocus="beginCropEdit()" onchange="setCropField('x', this.value)" aria-label="Crop x (percent)"></div>
+        <div><label for="cropY">y</label><input id="cropY" type="number" min="0" max="100" step="0.1" value="0" onfocus="beginCropEdit()" onchange="setCropField('y', this.value)" aria-label="Crop y (percent)"></div>
+        <div><label for="cropW">w</label><input id="cropW" type="number" min="2" max="100" step="0.1" value="100" onfocus="beginCropEdit()" onchange="setCropField('w', this.value)" aria-label="Crop width (percent)"></div>
+        <div><label for="cropH">h</label><input id="cropH" type="number" min="2" max="100" step="0.1" value="100" onfocus="beginCropEdit()" onchange="setCropField('h', this.value)" aria-label="Crop height (percent)"></div>
       </div>
     </div>
 
@@ -898,6 +899,11 @@ var editorState = {
   pan: null,
   spacePan: false,
   showBefore: false,
+  // Crop handles live on the uncropped source while a crop is being edited.
+  // Once saved, the editor switches to the actual cropped render and fits it
+  // in the stage; Edit Crop reopens the full source when another change is
+  // needed.
+  cropEditing: true,
   zoomMode: 'fit',
   zoomPercent: 100,
   cropAspect: null,
@@ -980,6 +986,10 @@ function editorZoomRecipe() {
   return editorState.showBefore ? editorState.savedRecipe : editorState.recipe;
 }
 
+function editorPreviewAppliesCrop() {
+  return editorState.showBefore || !editorState.cropEditing;
+}
+
 function editorImageMatchesZoomRecipe(img) {
   if (!img || !editorState.photoId) return false;
   try {
@@ -988,29 +998,46 @@ function editorImageMatchesZoomRecipe(img) {
       return false;
     }
     var loadedRecipe = JSON.parse(url.searchParams.get('recipe') || '{}');
-    return recipeKey(loadedRecipe) ===
-      recipeKey(previewRecipeFor(editorZoomRecipe() || {}));
+    var loadedAppliesCrop = url.searchParams.get('apply_crop') === '1';
+    return loadedAppliesCrop === editorPreviewAppliesCrop() &&
+      recipeKey(loadedRecipe) === recipeKey(previewRecipeFor(
+        editorZoomRecipe() || {}, loadedAppliesCrop
+      ));
   } catch (_) {
     return false;
   }
 }
 
-function editorNativeDisplayDimensions() {
+function editorNativeRecipeDimensions(recipe, applyCrop) {
   var photo = editorState.photo || {};
   var width = Number(photo.width) || 0;
   var height = Number(photo.height) || 0;
-  if (!width || !height) {
-    var fallback = document.getElementById('editorImg');
-    return fallback && fallback.naturalWidth && fallback.naturalHeight
-      ? {width: fallback.naturalWidth, height: fallback.naturalHeight}
-      : null;
-  }
-  var rotation = Number((editorZoomRecipe() || {}).rotation || 0);
+  if (!width || !height) return null;
+  var rotation = Number((recipe || {}).rotation || 0);
   rotation = ((rotation % 360) + 360) % 360;
   if (rotation === 90 || rotation === 270) {
     var swap = width;
     width = height;
     height = swap;
+  }
+  var crop = applyCrop && recipe && recipe.crop;
+  if (crop && !isFullCrop(crop)) {
+    width *= Number(crop.w) || 1;
+    height *= Number(crop.h) || 1;
+  }
+  return {width: width, height: height};
+}
+
+function editorNativeDisplayDimensions() {
+  var recipe = editorZoomRecipe() || {};
+  var dims = editorNativeRecipeDimensions(recipe, editorPreviewAppliesCrop());
+  var width = dims ? dims.width : 0;
+  var height = dims ? dims.height : 0;
+  if (!width || !height) {
+    var fallback = document.getElementById('editorImg');
+    return fallback && fallback.naturalWidth && fallback.naturalHeight
+      ? {width: fallback.naturalWidth, height: fallback.naturalHeight}
+      : null;
   }
   // Straightening can alter the rendered aspect slightly. Preserve the
   // source's native long edge while following the preview's authoritative
@@ -1097,8 +1124,10 @@ function editorClampCustomZoomToFit() {
 }
 
 function editorFitUsesNativeRender() {
-  var photo = editorState.photo || {};
-  var native = Math.max(Number(photo.width) || 0, Number(photo.height) || 0);
+  var dims = editorNativeRecipeDimensions(
+    editorZoomRecipe() || {}, editorPreviewAppliesCrop()
+  );
+  var native = dims ? Math.max(dims.width, dims.height) : 0;
   return native > 0 && editorFitRenderSize() >= Math.min(16384, native);
 }
 
@@ -1310,8 +1339,15 @@ function rotatePointInBox(point, clockwiseDegrees, aspect) {
 
 function imageAspectForTransform(delta) {
   var img = document.getElementById('editorImg');
-  if (!img || !img.clientWidth || !img.clientHeight) return null;
-  var current = img.clientWidth / img.clientHeight;
+  var dims = editorNativeRecipeDimensions(editorState.recipe || {}, false);
+  // A committed preview contains only the crop, but crop-coordinate
+  // transforms are defined against the whole post-transform source.
+  var useLoadedImage = !editorPreviewAppliesCrop() && img &&
+    img.clientWidth && img.clientHeight && editorImageMatchesZoomRecipe(img);
+  var width = useLoadedImage ? img.clientWidth : (dims && dims.width);
+  var height = useLoadedImage ? img.clientHeight : (dims && dims.height);
+  if (!width || !height) return null;
+  var current = width / height;
   var normalizedDelta = ((Number(delta) || 0) % 360 + 360) % 360;
   return {
     current: current,
@@ -1568,14 +1604,14 @@ function syncControls() {
   updateDirtyState();
 }
 
-function previewRecipeFor(recipe) {
+function previewRecipeFor(recipe, applyCrop) {
   var r = recipeForSave(recipe || {});
-  delete r.crop;
+  if (!applyCrop) delete r.crop;
   return r;
 }
 
 function previewRecipe() {
-  return previewRecipeFor(editorState.recipe);
+  return previewRecipeFor(editorState.recipe, editorPreviewAppliesCrop());
 }
 
 function clearHistogramFeedback() {
@@ -1608,9 +1644,11 @@ function updateHistogramFeedback() {
   // the frame the user is keeping — the preview render is uncropped, and a
   // blown sky the user already cropped away must not keep warning about
   // highlight clipping. Mirrors Auto Tone's _lumaStats sampling.
-  var crop = editorState.showBefore
-    ? clampCrop(Object.assign({x: 0, y: 0, w: 1, h: 1}, editorState.savedRecipe.crop || {}))
-    : ensureCrop(editorState.recipe);
+  var crop = editorPreviewAppliesCrop()
+    ? {x: 0, y: 0, w: 1, h: 1}
+    : (editorState.showBefore
+      ? clampCrop(Object.assign({x: 0, y: 0, w: 1, h: 1}, editorState.savedRecipe.crop || {}))
+      : ensureCrop(editorState.recipe));
   var sx = 0, sy = 0;
   var sW = img.naturalWidth, sH = img.naturalHeight;
   if (!isFullCrop(crop)) {
@@ -1690,8 +1728,10 @@ function updateHistogramFeedback() {
 }
 
 function editorRenderSizeForPercent(percent) {
-  var p = editorState.photo || {};
-  var native = Math.max(Number(p.width) || 0, Number(p.height) || 0);
+  var dims = editorNativeRecipeDimensions(
+    editorZoomRecipe() || {}, editorPreviewAppliesCrop()
+  );
+  var native = dims ? Math.max(dims.width, dims.height) : 0;
   if (!native) return percent >= 100 ? 3840 : 1920;
   var requested = native * Math.min(100, percent) / 100;
   requested = Math.ceil(Math.max(1920, requested) / 256) * 256;
@@ -1729,8 +1769,12 @@ function updatePreview() {
   var img = document.getElementById('editorImg');
   editorClampCustomZoomToFit();
   updateFeedbackControls();
-  var recipe = editorState.showBefore ? previewRecipeFor(editorState.savedRecipe) : previewRecipe();
+  var applyCrop = editorPreviewAppliesCrop();
+  var recipe = editorState.showBefore
+    ? previewRecipeFor(editorState.savedRecipe, applyCrop)
+    : previewRecipe();
   var url = '/photos/' + editorState.photoId + '/edit-preview?size=' + previewRenderSize() +
+    '&apply_crop=' + (applyCrop ? '1' : '0') +
     '&recipe=' + encodeURIComponent(JSON.stringify(recipe));
   if (img.getAttribute('src') === url && img.complete && img.naturalWidth) {
     // Identical render already on screen (e.g. Before toggled twice, or a
@@ -1813,14 +1857,18 @@ function scheduleMaskOverlayRefresh() {
 function renderCropBox(forceInputs) {
   var img = document.getElementById('editorImg');
   var box = document.getElementById('editorCropBox');
-  if (!img || !box || !img.complete || !img.clientWidth || !img.clientHeight) return;
+  if (!box) return;
   var crop = editorState.showBefore
     ? Object.assign({x: 0, y: 0, w: 1, h: 1}, editorState.savedRecipe.crop || {})
     : ensureCrop(editorState.recipe);
-  box.style.left = (crop.x * img.clientWidth) + 'px';
-  box.style.top = (crop.y * img.clientHeight) + 'px';
-  box.style.width = (crop.w * img.clientWidth) + 'px';
-  box.style.height = (crop.h * img.clientHeight) + 'px';
+  var showCropBox = editorState.cropEditing && !editorState.showBefore &&
+    editorImageMatchesZoomRecipe(img);
+  box.style.display = showCropBox ? '' : 'none';
+  var editBtn = document.getElementById('editCropBtn');
+  if (editBtn) {
+    editBtn.disabled = !!editorState.loading || !!editorState.showBefore || editorState.cropEditing;
+    editBtn.classList.toggle('active', editorState.cropEditing);
+  }
   ['x', 'y', 'w', 'h'].forEach(function(key) {
     var input = document.getElementById('crop' + key.toUpperCase());
     if (!input) return;
@@ -1831,10 +1879,30 @@ function renderCropBox(forceInputs) {
     }
     input.disabled = !!editorState.showBefore;
   });
+  if (!showCropBox || !img || !img.complete || !img.clientWidth || !img.clientHeight) return;
+  box.style.left = (crop.x * img.clientWidth) + 'px';
+  box.style.top = (crop.y * img.clientHeight) + 'px';
+  box.style.width = (crop.w * img.clientWidth) + 'px';
+  box.style.height = (crop.h * img.clientHeight) + 'px';
+}
+
+function activateCropEditing() {
+  if (editorState.loading || editorState.showBefore || editorState.cropEditing) return false;
+  editorState.cropEditing = true;
+  editorState.zoomMode = 'fit';
+  updateEditorZoomControl();
+  renderCropBox();
+  return true;
+}
+
+function beginCropEdit() {
+  if (!activateCropEditing()) return;
+  updatePreview();
 }
 
 function setCropField(key, raw) {
   if (editorState.loading || editorState.showBefore) return;
+  var reopenedCrop = activateCropEditing();
   var v = Number(raw);
   if (!Number.isFinite(v)) { renderCropBox(true); return; }
   v = Math.max(0, Math.min(100, v)) / 100;
@@ -1842,8 +1910,13 @@ function setCropField(key, raw) {
   crop[key] = v;
   if (editorState.cropAspect && (key === 'w' || key === 'h')) {
     var img = document.getElementById('editorImg');
-    if (img && img.clientWidth && img.clientHeight) {
-      var k = editorState.cropAspect * img.clientHeight / img.clientWidth;
+    var dims = editorNativeRecipeDimensions(editorState.recipe || {}, false);
+    var useLoadedImage = img && img.clientWidth && img.clientHeight &&
+      editorImageMatchesZoomRecipe(img);
+    var imageWidth = useLoadedImage ? img.clientWidth : (dims && dims.width);
+    var imageHeight = useLoadedImage ? img.clientHeight : (dims && dims.height);
+    if (imageWidth && imageHeight) {
+      var k = editorState.cropAspect * imageHeight / imageWidth;
       // Cap the edited dimension so the paired one still fits in the frame.
       // Otherwise clampCrop would clamp only the overflowing side (w=100 on
       // a 1:1 lock over a 2:1 landscape → h clipped to 1, w stays 1) and
@@ -1858,15 +1931,20 @@ function setCropField(key, raw) {
     }
   }
   editorState.recipe.crop = clampCrop(crop);
-  markChanged(false);
+  markChanged(reopenedCrop);
   renderCropBox(true);
 }
 
 function currentCropAspect() {
   var img = document.getElementById('editorImg');
-  if (!img || !img.clientWidth || !img.clientHeight) return null;
+  var dims = editorNativeRecipeDimensions(editorState.recipe || {}, false);
+  var useLoadedImage = img && img.clientWidth && img.clientHeight &&
+    editorImageMatchesZoomRecipe(img);
+  var imageWidth = useLoadedImage ? img.clientWidth : (dims && dims.width);
+  var imageHeight = useLoadedImage ? img.clientHeight : (dims && dims.height);
+  if (!imageWidth || !imageHeight) return null;
   var crop = ensureCrop(editorState.recipe);
-  var aspect = (crop.w * img.clientWidth) / (crop.h * img.clientHeight);
+  var aspect = (crop.w * imageWidth) / (crop.h * imageHeight);
   return Number.isFinite(aspect) && aspect > 0 ? aspect : null;
 }
 
@@ -1933,25 +2011,33 @@ function updateAspectButtons() {
 }
 
 function resetCrop() {
+  var reopenedCrop = activateCropEditing();
   editorState.cropAspect = null;
   updateAspectButtons();
   editorState.recipe.crop = { x: 0, y: 0, w: 1, h: 1 };
-  markChanged(false);
+  markChanged(reopenedCrop);
 }
 
 function setAspect(aspect) {
   if (editorState.loading || editorState.showBefore) return;
+  var reopenedCrop = activateCropEditing();
   var img = document.getElementById('editorImg');
-  if (!img || !img.clientWidth || !img.clientHeight) return;
+  var dims = editorNativeRecipeDimensions(editorState.recipe || {}, false);
+  var useLoadedImage = !reopenedCrop && img && img.clientWidth &&
+    img.clientHeight && editorImageMatchesZoomRecipe(img);
+  var imageWidth = useLoadedImage ? img.clientWidth : (dims && dims.width);
+  var imageHeight = useLoadedImage ? img.clientHeight : (dims && dims.height);
+  if (!imageWidth || !imageHeight) return;
   if (Math.abs(Number(editorState.cropAspect || 0) - aspect) < 0.0001) {
     // Second click on the active ratio unlocks it and leaves the crop alone.
     editorState.cropAspect = null;
     updateAspectButtons();
+    if (reopenedCrop) updatePreview();
     return;
   }
   editorState.cropAspect = aspect;
   updateAspectButtons();
-  var imageAspect = img.clientWidth / img.clientHeight;
+  var imageAspect = imageWidth / imageHeight;
   var normalizedRatio = aspect / imageAspect;
   var w = 0.9;
   var h = w / normalizedRatio;
@@ -1960,11 +2046,12 @@ function setAspect(aspect) {
     w = h * normalizedRatio;
   }
   editorState.recipe.crop = { x: (1 - w) / 2, y: (1 - h) / 2, w: w, h: h };
-  markChanged(false);
+  markChanged(reopenedCrop);
 }
 
 function toggleAspectLock() {
   if (editorState.loading || editorState.showBefore) return;
+  var reopenedCrop = activateCropEditing();
   if (editorState.cropAspect) {
     editorState.cropAspect = null;
   } else {
@@ -1973,6 +2060,7 @@ function toggleAspectLock() {
     editorState.cropAspect = aspect;
   }
   updateAspectButtons();
+  if (reopenedCrop) updatePreview();
 }
 
 function setAdjustment(key, value) {
@@ -2539,7 +2627,8 @@ function refreshMaskOverlay() {
   // render — a full-res RGBA weight map would just burn memory and encode time.
   var size = Math.min(previewRenderSize(), 3840);
   var url = '/photos/' + editorState.photoId + '/edit-mask-preview?size=' +
-    size + '&recipe=' + encodeURIComponent(JSON.stringify(recipe));
+    size + '&apply_crop=' + (editorPreviewAppliesCrop() ? '1' : '0') +
+    '&recipe=' + encodeURIComponent(JSON.stringify(recipe));
   if (overlay.getAttribute('src') === url && overlay.complete && overlay.naturalWidth) {
     // Identical overlay already loaded — just make sure it's placed and shown.
     editorState.maskOverlaySeq++;
@@ -2844,6 +2933,8 @@ async function saveRecipe(description) {
     editorState.savedRecipe = cloneRecipe(data.recipe || {});
     editorState.recipe = cloneRecipe(data.recipe || {});
     ensureCrop(editorState.recipe);
+    editorState.cropEditing = !recipeForSave(editorState.recipe).crop;
+    if (!editorState.cropEditing) editorState.zoomMode = 'fit';
     syncControls();
     updatePreview();
     loadHistory();
@@ -2855,6 +2946,23 @@ async function saveRecipe(description) {
       btn.disabled = false;
       setStatus(e.message || 'Save failed', true);
     }
+  }
+}
+
+function commitCropView() {
+  var saveBtn = document.getElementById('saveBtn');
+  if (saveBtn && !saveBtn.disabled) {
+    saveRecipe();
+    return;
+  }
+  // Re-entering an existing saved crop does not make the recipe dirty. Enter
+  // still means "accept this crop", so return to the fitted committed view
+  // without issuing a redundant history-writing PUT.
+  if (editorState.cropEditing && recipeForSave(editorState.recipe).crop) {
+    editorState.cropEditing = false;
+    editorState.zoomMode = 'fit';
+    syncControls();
+    updatePreview();
   }
 }
 
@@ -3324,6 +3432,7 @@ async function loadPhoto(photoId, opts) {
     if (b) b.disabled = false;
   });
   editorState.showBefore = false;
+  editorState.cropEditing = true;
   editorState.cropAspect = null;
   updateAspectButtons();
   if (window.vireoEditNav) window.vireoEditNav.setLastPhoto(photoId);
@@ -3342,6 +3451,7 @@ async function loadPhoto(photoId, opts) {
     editorState.savedRecipe = cloneRecipe(photo.edit_recipe || {});
     editorState.recipe = cloneRecipe(photo.edit_recipe || {});
     ensureCrop(editorState.recipe);
+    editorState.cropEditing = !recipeForSave(editorState.recipe).crop;
     editorState.localMask = null;
     editorState.localMaskPromise = null;
     editorState.localAvailable = false;
@@ -3411,11 +3521,16 @@ function initEditorKeyboard() {
       // committing the working recipe — same as clicking Save Changes. Skip
       // when focus is on a control with native Enter activation (button, link,
       // summary, role="button") so tabbing to Reset All / Back / a transform
-      // button and pressing Enter still triggers that control. No-op when
-      // there's nothing to save so it doesn't fire on an unchanged photo.
+      // button and pressing Enter still triggers that control. An unchanged
+      // reopened crop can still be accepted without writing another history
+      // entry; otherwise this is a no-op when there is nothing to save.
       if (isActivationControl(t, tag)) return;
       var saveBtn = document.getElementById('saveBtn');
-      if (saveBtn && !saveBtn.disabled) { e.preventDefault(); saveRecipe(); }
+      if ((saveBtn && !saveBtn.disabled) ||
+          (editorState.cropEditing && recipeForSave(editorState.recipe).crop)) {
+        e.preventDefault();
+        commitCropView();
+      }
     }
   });
   document.addEventListener('keyup', function(e) {

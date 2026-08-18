@@ -32,7 +32,7 @@ def _headers(token):
 
 
 def validate_token(token):
-    """Validate iNat API token. Returns user dict on success, None on failure."""
+    """Return the iNat user, or ``None`` only for an invalid token."""
     try:
         resp = requests.get(
             f"{INAT_RAILS}/users/edit.json",
@@ -42,8 +42,22 @@ def validate_token(token):
     except requests.RequestException as exc:
         raise InatApiError(f"Could not contact iNaturalist: {exc}") from exc
     if resp.status_code == 200:
-        return resp.json()
-    return None
+        try:
+            user = resp.json()
+        except ValueError as exc:
+            raise InatApiError(
+                "iNaturalist returned an invalid token-validation response",
+            ) from exc
+        if not isinstance(user, dict):
+            raise InatApiError(
+                "iNaturalist returned an invalid token-validation response",
+            )
+        return user
+    if resp.status_code in (401, 403):
+        return None
+    raise InatApiError(
+        f"iNaturalist API error ({resp.status_code}): {resp.text[:200]}",
+    )
 
 
 def create_observation(token, taxon_name=None, observed_on=None,

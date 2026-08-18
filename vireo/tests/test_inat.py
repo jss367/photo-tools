@@ -75,6 +75,28 @@ def test_validate_token_invalid():
         assert result is None
 
 
+@pytest.mark.parametrize("status_code", [429, 500])
+def test_validate_token_surfaces_non_auth_api_errors(status_code):
+    from inat import InatApiError, validate_token
+    mock_resp = MagicMock(status_code=status_code, text="try again later")
+
+    with patch(
+        "inat.requests.get", return_value=mock_resp,
+    ), pytest.raises(InatApiError, match=rf"API error \({status_code}\)"):
+        validate_token("valid-token")
+
+
+def test_validate_token_rejects_invalid_success_response():
+    from inat import InatApiError, validate_token
+    mock_resp = MagicMock(status_code=200)
+    mock_resp.json.return_value = []
+
+    with patch(
+        "inat.requests.get", return_value=mock_resp,
+    ), pytest.raises(InatApiError, match="invalid token-validation response"):
+        validate_token("valid-token")
+
+
 def test_validate_token_wraps_connection_errors():
     import requests
     from inat import InatApiError, validate_token

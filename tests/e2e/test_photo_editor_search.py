@@ -355,3 +355,68 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
         })"""
     )
     assert fit == {"mode": "fit", "inlineWidth": "", "zoomed": False}
+
+
+def test_photo_editor_enter_saves_crop_after_drag_from_focused_input(
+    live_server, page
+):
+    """Dragging a crop handle should give Enter back to the save shortcut."""
+    url = live_server["url"]
+    hawk_id = live_server["data"]["photos"][0]
+    preview_svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' width='400' height='400'>"
+        "<rect width='400' height='400' fill='green'/>"
+        "</svg>"
+    )
+
+    page.route(
+        "**/photos/*/edit-preview**",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="image/svg+xml",
+            body=preview_svg,
+        ),
+    )
+    page.goto(f"{url}/edit/{hawk_id}")
+    expect(page.locator("#editorFilename")).to_have_text("hawk1.jpg")
+    page.wait_for_function(
+        "() => document.getElementById('editorImg').naturalWidth > 0"
+    )
+
+    # A prior interaction can leave an input focused. Because the crop drag
+    # prevents pointerdown's default action, the browser will not blur that
+    # input unless the crop surface explicitly takes focus.
+    page.locator("#cropW").focus()
+    handle = page.locator(".crop-handle.se").bounding_box()
+    assert handle is not None
+    page.mouse.move(
+        handle["x"] + handle["width"] / 2,
+        handle["y"] + handle["height"] / 2,
+    )
+    page.mouse.down()
+    page.mouse.move(
+        handle["x"] + handle["width"] / 2 - 30,
+        handle["y"] + handle["height"] / 2 - 20,
+        steps=4,
+    )
+    page.mouse.up()
+
+    expect(page.locator("#saveBtn")).to_be_enabled()
+    assert page.evaluate("() => document.activeElement.id") == "editorCropBox"
+    with page.expect_response(
+        f"**/api/photos/{hawk_id}/edit-recipe"
+    ) as response:
+        page.keyboard.press("Enter")
+    assert response.value.request.method == "PUT"
+    assert response.value.status == 200
+    expect(page.locator("#saveBtn")).to_be_disabled()
+
+    recipe = page.evaluate(
+        """async (photoId) => {
+            const response = await fetch('/api/photos/' + photoId + '/edit-recipe');
+            return (await response.json()).recipe;
+        }""",
+        hawk_id,
+    )
+    assert recipe["crop"]["w"] < 1
+    assert recipe["crop"]["h"] < 1

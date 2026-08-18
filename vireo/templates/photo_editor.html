@@ -244,23 +244,32 @@ body {
 .crop-box::after {
   content: "";
   position: absolute;
+  inset: 0;
   pointer-events: none;
 }
 .crop-box::before {
-  left: 33.333%;
-  top: 0;
-  bottom: 0;
-  width: 33.333%;
-  border-left: 1px solid rgba(255,255,255,0.45);
-  border-right: 1px solid rgba(255,255,255,0.45);
+  background: linear-gradient(to right,
+    transparent 0,
+    transparent calc(33.333333% - 0.5px),
+    rgba(255,255,255,0.45) calc(33.333333% - 0.5px),
+    rgba(255,255,255,0.45) calc(33.333333% + 0.5px),
+    transparent calc(33.333333% + 0.5px),
+    transparent calc(66.666667% - 0.5px),
+    rgba(255,255,255,0.45) calc(66.666667% - 0.5px),
+    rgba(255,255,255,0.45) calc(66.666667% + 0.5px),
+    transparent calc(66.666667% + 0.5px));
 }
 .crop-box::after {
-  top: 33.333%;
-  left: 0;
-  right: 0;
-  height: 33.333%;
-  border-top: 1px solid rgba(255,255,255,0.45);
-  border-bottom: 1px solid rgba(255,255,255,0.45);
+  background: linear-gradient(to bottom,
+    transparent 0,
+    transparent calc(33.333333% - 0.5px),
+    rgba(255,255,255,0.45) calc(33.333333% - 0.5px),
+    rgba(255,255,255,0.45) calc(33.333333% + 0.5px),
+    transparent calc(33.333333% + 0.5px),
+    transparent calc(66.666667% - 0.5px),
+    rgba(255,255,255,0.45) calc(66.666667% - 0.5px),
+    rgba(255,255,255,0.45) calc(66.666667% + 0.5px),
+    transparent calc(66.666667% + 0.5px));
 }
 .crop-handle {
   position: absolute;
@@ -561,7 +570,7 @@ body {
       <div class="editor-canvas" id="editorCanvas">
         <img id="editorImg" alt="">
         <img id="maskOverlayImg" alt="" aria-hidden="true" style="display:none">
-        <div class="crop-box" id="editorCropBox">
+        <div class="crop-box" id="editorCropBox" tabindex="-1">
           <span class="crop-handle nw" data-handle="nw"></span>
           <span class="crop-handle ne" data-handle="ne"></span>
           <span class="crop-handle sw" data-handle="sw"></span>
@@ -2877,6 +2886,14 @@ function initCropDrag() {
     if (editorState.loading) return;
     var img = document.getElementById('editorImg');
     if (!img || !img.clientWidth || !img.clientHeight) return;
+    // pointerdown is prevented below so the crop gesture does not select or
+    // drag the underlying image. That also suppresses the browser's normal
+    // focus change, however, which can leave a search/number input active.
+    // In that state Enter belongs to the stale input instead of the editor's
+    // "Save Changes" shortcut. Explicitly focus the crop surface when the
+    // gesture starts so Enter commits the crop the user just adjusted.
+    try { box.focus({preventScroll: true}); }
+    catch (_) { box.focus(); }
     var handle = e.target && e.target.dataset ? e.target.dataset.handle : '';
     editorState.drag = {
       handle: handle || 'move',

@@ -797,6 +797,9 @@ def test_process_exit_before_resource_sample_preserves_prior_samples():
     assert report["summary"]["vireo_process_tree_cpu_percent"][
         "accounting_complete"
     ] is False
+    assert report["summary"]["targets"][
+        "system_idle_cpu_p05_at_least_10_percent"
+    ] is None
 
 
 def test_terminal_api_overrun_marks_resource_interval_incomplete():
@@ -848,6 +851,9 @@ def test_terminal_api_overrun_marks_resource_interval_incomplete():
     assert report["summary"]["vireo_process_tree_cpu_percent"][
         "accounting_complete"
     ] is False
+    assert report["summary"]["targets"][
+        "system_idle_cpu_p05_at_least_10_percent"
+    ] is None
 
 
 def test_interrupted_api_poll_retains_resource_sample_and_marks_failure():
@@ -907,6 +913,9 @@ def test_interrupted_api_poll_retains_resource_sample_and_marks_failure():
     assert report["summary"]["vireo_process_tree_cpu_percent"][
         "accounting_complete"
     ] is False
+    assert report["summary"]["targets"][
+        "system_idle_cpu_p05_at_least_10_percent"
+    ] is None
 
 
 def test_late_process_exit_preserves_report_and_fails_trust_gate():
@@ -1075,7 +1084,7 @@ def test_compact_jobs_payload_retains_terminal_ephemeral_jobs_once():
     ]
 
 
-def test_saturated_history_window_marks_job_observation_incomplete():
+def test_full_history_window_without_prior_overlap_marks_observation_incomplete():
     history = [
         {
             "id": f"completed-{index}",
@@ -1088,13 +1097,14 @@ def test_saturated_history_window_marks_job_observation_incomplete():
     ]
     compact = compact_jobs_payload({"active": [], "history": history})
 
-    assert compact["history_window_saturated"] is True
+    assert compact["history_window_full"] is True
 
     baseline = {
         "status": 200,
         "latency_seconds": 0.001,
         "jobs": [],
-        "history_window_saturated": False,
+        "history_job_ids": [],
+        "history_window_full": False,
     }
     poll = {"status": 200, "latency_seconds": 0.001, **compact}
     clock = _FakeClock()
@@ -1118,6 +1128,55 @@ def test_saturated_history_window_marks_job_observation_incomplete():
     assert scenario["job_observation_complete"] is False
     assert scenario["observed_job_count"] == 10
     assert scenario["workload_makespan_seconds"] is None
+
+
+def test_full_history_window_with_prior_overlap_remains_complete():
+    history = [
+        {
+            "id": f"completed-{index}",
+            "type": "pipeline",
+            "status": "completed",
+            "started_at": f"2026-08-17T12:00:{index:02d}+00:00",
+            "finished_at": f"2026-08-17T12:00:{index + 1:02d}+00:00",
+        }
+        for index in range(10)
+    ]
+    baseline_compact = compact_jobs_payload({"active": [], "history": history})
+    replacement = {
+        "id": "completed-new",
+        "type": "pipeline",
+        "status": "completed",
+        "started_at": "2026-08-17T12:01:00+00:00",
+        "finished_at": "2026-08-17T12:01:01+00:00",
+    }
+    poll_compact = compact_jobs_payload({
+        "active": [],
+        "history": [replacement, *history[:9]],
+    })
+    clock = _FakeClock()
+    report = collect_workload(
+        duration=1.0,
+        interval=1.0,
+        api_client=_SequenceApi([
+            {"status": 200, "latency_seconds": 0.001, **baseline_compact},
+            {"status": 200, "latency_seconds": 0.001, **poll_compact},
+        ]),
+        process_sampler=_SequenceSampler(
+            [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True}],
+            {"pid": 123, "executable_exists": True},
+        ),
+        system_sampler=_SequenceSampler(
+            [{"cpu_idle_percent": 50.0}],
+            {"logical_cpu_count": 16},
+        ),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    scenario = report["summary"]["scenario"]
+    assert scenario["job_observation_complete"] is True
+    assert scenario["observed_job_count"] == 1
+    assert scenario["workload_makespan_seconds"] == 1.0
 
 
 def test_compact_jobs_payload_omits_user_derived_step_labels():

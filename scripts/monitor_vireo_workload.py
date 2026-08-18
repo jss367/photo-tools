@@ -153,10 +153,10 @@ def compact_jobs_payload(payload):
     ]
     return {
         "jobs": active + history,
-        # GET /api/jobs requests exactly this many persisted rows. Reaching
-        # the bound is therefore ambiguous: more completed jobs may have
-        # fallen out of the window since the previous poll.
-        "history_window_saturated": len(history_jobs) >= JOBS_HISTORY_LIMIT,
+        "history_job_ids": [
+            job.get("id") for job in history_jobs if job.get("id")
+        ],
+        "history_window_full": len(history_jobs) >= JOBS_HISTORY_LIMIT,
         "resource_budget": payload.get("resource_budget"),
         "workload_metrics": payload.get("workload_metrics", {}),
         "keeping_awake": payload.get("keeping_awake"),
@@ -702,6 +702,24 @@ def _scenario_summary(jobs, *, job_observation_complete):
     }
 
 
+def _history_continuity_lost(observations):
+    """Return whether a full bounded history window lost its prior cursor."""
+    previous_ids = None
+    for _elapsed, payload in observations:
+        current_ids = set(payload.get("history_job_ids") or ())
+        if (
+            previous_ids is not None
+            and payload.get("history_window_full") is True
+            and not current_ids.intersection(previous_ids)
+        ):
+            # Ten or more jobs replaced the complete prior window between
+            # polls. The endpoint cannot prove whether additional jobs also
+            # fell through the bounded window, so continuity is lost.
+            return True
+        previous_ids = current_ids
+    return False
+
+
 def build_summary(
     baseline,
     samples,
@@ -714,6 +732,17 @@ def build_summary(
         if _is_successful_jobs_sample(sample["api"])
     ]
     api_failure_count = len(samples) - len(successful)
+    process_identity_lost = (
+        (process_metadata or {}).get("identity_verified") is False
+    )
+    resource_sampling_complete = (
+        not interrupted
+        and not process_identity_lost
+        and all(
+            sample.get("resource_interval_complete") is not False
+            for sample in samples
+        )
+    )
     api_latencies = [sample["api"]["latency_seconds"] for sample in successful]
     complete_process_samples = [
         sample for sample in samples
@@ -725,15 +754,10 @@ def build_summary(
     cpu_summary = _number_summary(process_cpu)
     if cpu_summary is not None:
         cpu_summary["accounting_complete"] = bool(
-            not interrupted
-            and (process_metadata or {}).get("identity_verified") is not False
+            resource_sampling_complete
             and (process_metadata or {}).get("cpu_accounting_complete")
             and all(
                 sample["process"].get("cpu_accounting_complete") is not False
-                for sample in samples
-            )
-            and all(
-                sample.get("resource_interval_complete") is not False
                 for sample in samples
             )
         )
@@ -750,11 +774,8 @@ def build_summary(
     job_observation_complete = (
         not interrupted
         and api_failure_count == 0
-        and (process_metadata or {}).get("identity_verified") is not False
-        and not any(
-            sample["api"].get("history_window_saturated") is True
-            for sample in samples
-        )
+        and not process_identity_lost
+        and not _history_continuity_lost(observations)
     )
     queued_counts = [
         sum(job.get("status") == "queued" for job in sample["api"].get("jobs", []))
@@ -790,9 +811,6 @@ def build_summary(
     has_embedding_diagnostics = bool(
         baseline.get("workload_metrics", {}).get("embedding_cache")
         and final_api.get("workload_metrics", {}).get("embedding_cache")
-    )
-    process_identity_lost = (
-        (process_metadata or {}).get("identity_verified") is False
     )
     # `executable_exists` is tri-state: True (verified present), False
     # (verified missing at some point), or None (unknown — e.g. psutil
@@ -856,7 +874,7 @@ def build_summary(
             ) if not interrupted and not process_identity_lost else None,
             "system_idle_cpu_p05_at_least_10_percent": (
                 idle_summary is not None and idle_summary["p05"] >= 10.0
-            ),
+            ) if resource_sampling_complete else None,
             # `embedding_delta` is computed from the last *successful* API
             # sample.  If polling failed at some point, any single-flight
             # violation that occurred after that last success would be

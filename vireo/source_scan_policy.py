@@ -231,12 +231,25 @@ def _linux_mounts(mountinfo_path, sys_dev_block):
                     continue
                 left_fields = left.split()
                 right_fields = right.split()
-                if len(left_fields) < 5 or not right_fields:
+                if len(left_fields) < 5 or len(right_fields) < 2:
                     continue
+                fs_type = right_fields[0]
+                if fs_type.strip().lower() in _NETWORK_FS:
+                    # Independently mounted aliases of one remote share can
+                    # have different major:minor values. Key network lanes by
+                    # the (hashed) mount source so they still serialize without
+                    # exposing a potentially credential-bearing source string.
+                    identity = hashlib.sha256(
+                        (fs_type + "\0" + _unescape_mount_path(right_fields[1]))
+                        .encode("utf-8", "surrogatepass")
+                    ).hexdigest()[:16]
+                    volume_key = "linux:network:" + identity
+                else:
+                    volume_key = "linux:" + left_fields[2]
                 mounts.append({
-                    "volume_key": "linux:" + left_fields[2],
+                    "volume_key": volume_key,
                     "mount_point": _unescape_mount_path(left_fields[4]),
-                    "fs_type": right_fields[0],
+                    "fs_type": fs_type,
                     "removable": _linux_device_is_external(
                         left_fields[2], sys_dev_block,
                     ),

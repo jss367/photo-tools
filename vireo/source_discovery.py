@@ -30,6 +30,31 @@ GLOBAL_SCAN_LIMIT = 4
 PROGRESS_MIN_INTERVAL_SECONDS = 0.25
 HEARTBEAT_SECONDS = 0.5
 
+# A stream-local scheduler is insufficient when a disconnected walker is
+# blocked inside the filesystem: another request could otherwise immediately
+# start a replacement walk on the same slow volume. Keep lane occupancy until
+# the worker itself exits, across every preview stream in this process.
+_VOLUME_LANES_LOCK = threading.Lock()
+_ACTIVE_VOLUME_LANES = {}
+
+
+def _try_acquire_volume_lane(volume_key, max_parallel):
+    with _VOLUME_LANES_LOCK:
+        active = _ACTIVE_VOLUME_LANES.get(volume_key, 0)
+        if active >= max_parallel:
+            return False
+        _ACTIVE_VOLUME_LANES[volume_key] = active + 1
+        return True
+
+
+def _release_volume_lane(volume_key):
+    with _VOLUME_LANES_LOCK:
+        active = _ACTIVE_VOLUME_LANES.get(volume_key, 0)
+        if active <= 1:
+            _ACTIVE_VOLUME_LANES.pop(volume_key, None)
+        else:
+            _ACTIVE_VOLUME_LANES[volume_key] = active - 1
+
 
 def unique_root_names(folders):
     """Shortest trailing path segments that are unique across sources.
@@ -192,21 +217,27 @@ def stream_folder_preview(folders, file_types="both", recursive=True,
         return f"data: {json.dumps(payload)}\n\n"
 
     def worker(folder):
+        policy = policies[folder]
         try:
-            result = _walk_folder(
-                folder,
-                root_names.get(folder, os.path.basename(folder.rstrip("/"))),
-                multi_source,
-                file_types,
-                recursive,
-                cancel,
-                events.put,
+            try:
+                result = _walk_folder(
+                    folder,
+                    root_names.get(folder, os.path.basename(folder.rstrip("/"))),
+                    multi_source,
+                    file_types,
+                    recursive,
+                    cancel,
+                    events.put,
+                )
+            except Exception:
+                # A walker must never die silently: the scheduler would wait
+                # on its completion forever. Surface the folder as unavailable.
+                result = _empty_result(folder, error=True)
+            events.put({"_completed": folder, "_result": result})
+        finally:
+            _release_volume_lane(
+                policy["volume_key"],
             )
-        except Exception:
-            # A walker must never die silently: the scheduler would wait on
-            # its completion forever. Surface the folder as unavailable.
-            result = _empty_result(folder, error=True)
-        events.put({"_completed": folder, "_result": result})
 
     try:
         yield frame({
@@ -234,6 +265,9 @@ def stream_folder_preview(folders, file_types="both", recursive=True,
                     )
                     if active_on_volume >= policy["max_parallel"]:
                         continue
+                    if not _try_acquire_volume_lane(
+                            policy["volume_key"], policy["max_parallel"]):
+                        continue
                     pending.remove(folder)
                     thread = threading.Thread(
                         target=worker, args=(folder,), daemon=True,
@@ -241,12 +275,17 @@ def stream_folder_preview(folders, file_types="both", recursive=True,
                     running[folder] = thread
                     # Yield started before the thread runs so the client
                     # never sees progress for a folder it wasn't told about.
-                    yield frame({
-                        "type": "folder_started",
-                        "path": folder,
-                        "storage": policy["storage"],
-                    })
-                    thread.start()
+                    try:
+                        yield frame({
+                            "type": "folder_started",
+                            "path": folder,
+                            "storage": policy["storage"],
+                        })
+                        thread.start()
+                    except BaseException:
+                        running.pop(folder, None)
+                        _release_volume_lane(policy["volume_key"])
+                        raise
                     launched = True
                     break
             try:

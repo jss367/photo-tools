@@ -73,6 +73,51 @@ def test_closing_the_stream_cancels_running_walkers(monkeypatch):
     assert walker_exited.wait(timeout=5), "walker kept running after close"
 
 
+def test_volume_lane_is_shared_across_preview_streams(monkeypatch):
+    """A replacement request waits for a blocked cancelled walker to exit."""
+    first_started = threading.Event()
+    first_exited = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+
+    def fake_discover(folder, **_kwargs):
+        if folder == "/slow/first":
+            first_started.set()
+            release_first.wait(timeout=5)
+            first_exited.set()
+            raise ScanCancelled("cancelled after filesystem call returned")
+        second_started.set()
+        return []
+
+    monkeypatch.setattr(
+        source_discovery, "discover_source_files", fake_discover)
+    first = source_discovery.stream_folder_preview(
+        ["/slow/first"], classify=_serial_network_policy)
+    second = source_discovery.stream_folder_preview(
+        ["/slow/second"], classify=_serial_network_policy)
+
+    next(first)  # policy
+    next(first)  # folder_started
+    next(first)  # starts worker, then heartbeat
+    assert first_started.wait(timeout=5)
+
+    next(second)  # policy
+    assert next(second).startswith(": ping")
+    assert not second_started.is_set()
+
+    first.close()
+    assert not first_exited.wait(timeout=0.05)
+    assert next(second).startswith(": ping")
+    assert not second_started.is_set()
+
+    release_first.set()
+    assert first_exited.wait(timeout=5)
+    started = next(second)
+    assert json.loads(started[len("data: "):])["type"] == "folder_started"
+    list(second)
+    assert second_started.is_set()
+
+
 def test_stream_survives_a_crashing_walker(monkeypatch):
     """A walker that dies unexpectedly yields an error row, not a hang."""
 

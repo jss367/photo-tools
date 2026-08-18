@@ -86,7 +86,24 @@ def test_linux_uses_mount_identity_and_unescapes_mount_points(tmp_path):
         "local", "network", "network", "removable",
     ]
     assert [policy["max_parallel"] for policy in policies] == [2, 1, 1, 1]
-    assert policies[1]["volume_key"] == policies[2]["volume_key"] == "linux:0:44"
+    assert policies[1]["volume_key"] == policies[2]["volume_key"]
+    assert policies[1]["volume_key"].startswith("linux:network:")
+
+
+def test_linux_groups_separate_mounts_of_the_same_network_share(tmp_path):
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text("\n".join([
+        "21 20 0:44 / /mnt/photos-a rw - cifs //nas/photos rw",
+        "22 20 0:45 / /mnt/photos-b rw - cifs //nas/photos rw",
+    ]))
+
+    policies = source_scan_policy.classify_sources([
+        "/mnt/photos-a/2025", "/mnt/photos-b/2026",
+    ], platform="linux", mountinfo_path=str(mountinfo))
+
+    assert [policy["storage"] for policy in policies] == ["network", "network"]
+    assert policies[0]["volume_key"] == policies[1]["volume_key"]
+    assert "//nas/photos" not in policies[0]["volume_key"]
 
 
 def test_linux_ext4_removable_disk_is_serialized(tmp_path, monkeypatch):

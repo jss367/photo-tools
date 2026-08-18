@@ -249,7 +249,7 @@ class ProcessTreeSampler:
         self.processes = {}
         self._cpu_times = {}
         self._last_cpu_sample_at = None
-        self._last_reaped_children_cpu = 0.0
+        self._reaped_children_cpu_times = {}
         self._known_child_cpu_lifetimes = {}
         self._unreconciled_departed_child_cpu = 0.0
         self._initial_rss_bytes = None
@@ -280,6 +280,7 @@ class ProcessTreeSampler:
         }
 
     def metadata(self):
+        self._assert_root_alive()
         return {
             **self._metadata,
             "initial_rss_bytes": self._initial_rss_bytes,
@@ -310,6 +311,10 @@ class ProcessTreeSampler:
                 f"monitored Vireo PID {self.root.pid} exited or was replaced"
             )
 
+    def verify_identity(self):
+        """Abort if process metrics and API samples can no longer be paired."""
+        self._assert_root_alive()
+
     def _current_processes(self):
         discovered = [self.root]
         with contextlib.suppress(self.psutil.Error):
@@ -326,6 +331,7 @@ class ProcessTreeSampler:
             os.path.exists(self.executable) if self.executable else None
         )
         self._cpu_times = {}
+        self._reaped_children_cpu_times = {}
         self._known_child_cpu_lifetimes = {}
         initial_rss_bytes = 0
         process_count = 0
@@ -334,14 +340,16 @@ class ProcessTreeSampler:
                 identity = (process.pid, process.create_time())
                 cpu = process.cpu_times()
                 total_cpu_seconds = cpu.user + cpu.system
+                reaped_cpu_seconds = (
+                    getattr(cpu, "children_user", 0.0)
+                    + getattr(cpu, "children_system", 0.0)
+                )
                 self._cpu_times[identity] = total_cpu_seconds
-                if process.pid == self.root.pid:
-                    self._last_reaped_children_cpu = (
-                        getattr(cpu, "children_user", 0.0)
-                        + getattr(cpu, "children_system", 0.0)
+                self._reaped_children_cpu_times[identity] = reaped_cpu_seconds
+                if process.pid != self.root.pid:
+                    self._known_child_cpu_lifetimes[identity] = (
+                        total_cpu_seconds + reaped_cpu_seconds
                     )
-                else:
-                    self._known_child_cpu_lifetimes[identity] = total_cpu_seconds
                 initial_rss_bytes += process.memory_info().rss
                 process_count += 1
             except (OSError, self.psutil.Error):
@@ -360,8 +368,8 @@ class ProcessTreeSampler:
         )
         cpu_seconds = 0.0
         current_cpu_times = {}
+        current_reaped_children_cpu_times = {}
         current_child_cpu_lifetimes = {}
-        reaped_children_cpu = self._last_reaped_children_cpu
         rss_bytes = 0
         thread_count = 0
         process_count = 0
@@ -370,14 +378,16 @@ class ProcessTreeSampler:
                 identity = (process.pid, process.create_time())
                 cpu = process.cpu_times()
                 total_cpu_seconds = cpu.user + cpu.system
+                reaped_cpu_seconds = (
+                    getattr(cpu, "children_user", 0.0)
+                    + getattr(cpu, "children_system", 0.0)
+                )
                 current_cpu_times[identity] = total_cpu_seconds
-                if process.pid == self.root.pid:
-                    reaped_children_cpu = (
-                        getattr(cpu, "children_user", 0.0)
-                        + getattr(cpu, "children_system", 0.0)
+                current_reaped_children_cpu_times[identity] = reaped_cpu_seconds
+                if process.pid != self.root.pid:
+                    current_child_cpu_lifetimes[identity] = (
+                        total_cpu_seconds + reaped_cpu_seconds
                     )
-                else:
-                    current_child_cpu_lifetimes[identity] = total_cpu_seconds
                 # A child first discovered after prime() was spawned during
                 # this sampling window. Its cumulative process CPU time is
                 # therefore the correct delta from zero; psutil.cpu_percent
@@ -402,12 +412,17 @@ class ProcessTreeSampler:
         )
         # On platforms that expose cumulative CPU for reaped children, this
         # closes two gaps in live process enumeration: CPU accrued after a
-        # child's last observation, and helpers created and reaped entirely
-        # between polls. Subtract full lifetimes of departed children already
-        # observed live so their work is not double-counted.
-        reaped_delta = max(
-            reaped_children_cpu - self._last_reaped_children_cpu,
-            0.0,
+        # descendant's last observation, and helpers created and reaped
+        # entirely between polls. Read it from every live process so helpers
+        # reaped by long-lived workers are included too. Subtract full
+        # lifetimes of departed descendants already observed live so their
+        # work is not double-counted when an ancestor later reaps them.
+        reaped_delta = sum(
+            max(
+                total - self._reaped_children_cpu_times.get(identity, 0.0),
+                0.0,
+            )
+            for identity, total in current_reaped_children_cpu_times.items()
         )
         reconciled = min(
             reaped_delta,
@@ -416,8 +431,8 @@ class ProcessTreeSampler:
         cpu_seconds += reaped_delta - reconciled
         self._unreconciled_departed_child_cpu -= reconciled
         self._cpu_times = current_cpu_times
+        self._reaped_children_cpu_times = current_reaped_children_cpu_times
         self._known_child_cpu_lifetimes = current_child_cpu_lifetimes
-        self._last_reaped_children_cpu = reaped_children_cpu
         self._last_cpu_sample_at = sampled_at
         cpu_percent = cpu_seconds / elapsed * 100.0 if elapsed > 0 else 0.0
         metadata = self.metadata()
@@ -721,12 +736,20 @@ def collect_workload(
             if sleep_for > 0:
                 sleep(sleep_for)
             elapsed = monotonic() - started
+            process_sample = process_sampler.sample()
+            system_sample = system_sampler.sample()
+            api_sample = api_client.sample()
+            # The API request can outlive the selected process. Recheck after
+            # it completes so a replacement server on the same URL cannot
+            # contribute the terminal Jobs payload to the original PID's
+            # process samples.
+            process_sampler.verify_identity()
             samples.append({
                 "captured_at": _utc_now(),
                 "elapsed_seconds": round(elapsed, 3),
-                "process": process_sampler.sample(),
-                "system": system_sampler.sample(),
-                "api": api_client.sample(),
+                "process": process_sample,
+                "system": system_sample,
+                "api": api_sample,
             })
             if monotonic() >= deadline:
                 break
@@ -750,12 +773,16 @@ def collect_workload(
     except KeyboardInterrupt:
         interrupted = True
     if not samples:
+        process_sample = process_sampler.sample()
+        system_sample = system_sampler.sample()
+        api_sample = api_client.sample()
+        process_sampler.verify_identity()
         samples.append({
             "captured_at": _utc_now(),
             "elapsed_seconds": round(monotonic() - started, 3),
-            "process": process_sampler.sample(),
-            "system": system_sampler.sample(),
-            "api": api_client.sample(),
+            "process": process_sample,
+            "system": system_sample,
+            "api": api_sample,
         })
     process_metadata = process_sampler.metadata()
     return {

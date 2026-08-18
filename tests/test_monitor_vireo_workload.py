@@ -48,6 +48,9 @@ class _SequenceSampler:
     def sample(self):
         return next(self.samples)
 
+    def verify_identity(self):
+        pass
+
     def metadata(self):
         return self._metadata
 
@@ -559,6 +562,53 @@ def test_malformed_200_jobs_baseline_is_rejected():
         )
 
 
+def test_process_identity_is_rechecked_after_terminal_api_poll():
+    clock = _FakeClock()
+    exited = False
+
+    class _ExitDuringPollApi:
+        def __init__(self):
+            self.calls = 0
+
+        def authenticate(self):
+            pass
+
+        def sample(self):
+            nonlocal exited
+            self.calls += 1
+            if self.calls == 2:
+                exited = True
+            return _api_sample(
+                latency=0.001, wait_count=0, wait_seconds=0.0,
+                producer_starts=0, waiter_joins=0,
+            )
+
+    class _IdentitySampler(_SequenceSampler):
+        def verify_identity(self):
+            if exited:
+                raise RuntimeError("monitored Vireo PID 123 exited")
+
+    process = _IdentitySampler(
+        [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True}],
+        {"pid": 123, "executable_exists": True},
+    )
+    system = _SequenceSampler(
+        [{"cpu_idle_percent": 50.0}],
+        {"logical_cpu_count": 16},
+    )
+
+    with pytest.raises(RuntimeError, match="PID 123 exited"):
+        collect_workload(
+            duration=1.0,
+            interval=1.0,
+            api_client=_ExitDuringPollApi(),
+            process_sampler=process,
+            system_sampler=system,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+
 def test_latency_target_fails_when_api_samples_fail():
     """A run with one fast success and one long timeout used to report
     ``jobs_api_p95_below_500ms: true`` because failed requests were excluded
@@ -864,7 +914,8 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
     # newly spawned worker consumes 0.5. Its first sample must contribute its
     # lifetime CPU instead of psutil's first-call cpu_percent() zero.
     root.cpu_seconds = 1.2
-    root.child_processes = [_CpuProcess(101, 2.0, 0.5, 200)]
+    child = _CpuProcess(101, 2.0, 0.5, 200)
+    root.child_processes = [child]
     clock.sleep(1.0)
     sample = sampler.sample()
 
@@ -872,6 +923,12 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
     assert sample["rss_bytes"] == 300
     assert sample["process_count"] == 2
     assert sampler.metadata()["initial_rss_bytes"] == 100
+
+    # A helper spawned and reaped by the still-live child contributes through
+    # that child's cumulative children CPU counter on the next interval.
+    child.reaped_cpu_seconds = 0.3
+    clock.sleep(1.0)
+    assert sampler.sample()["cpu_percent"] == 30.0
 
     root.alive = False
     with pytest.raises(RuntimeError, match="exited or was replaced"):

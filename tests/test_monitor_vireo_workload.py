@@ -1,4 +1,5 @@
 import json
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1518,6 +1519,31 @@ def test_wildcard_listener_accepts_verified_local_lan_address():
         psutil_module=fake,
         resolver=resolver,
         local_addresses={"192.168.1.20"},
+    )
+
+    assert server == {"pid": 4242, "url": "http://vireo.local:50222"}
+
+
+def test_wildcard_listener_uses_interface_address_not_hostname_only():
+    proc = _FakeProc(4242, port=50222, listener_ip="0.0.0.0")
+    fake = _FakePsutil([proc])
+    fake.net_if_addrs = lambda: {
+        "en0": [type("InterfaceAddress", (), {
+            "family": socket.AF_INET,
+            "address": "192.168.1.20",
+        })()],
+    }
+    resolver = _fake_resolver({
+        "vireo.local": ["192.168.1.20"],
+        # Deliberately omit the machine hostname to model /etc/hosts setups
+        # where hostname resolution does not expose the LAN interface.
+    })
+
+    server = discover_server(
+        requested_pid=4242,
+        requested_url="http://vireo.local:50222",
+        psutil_module=fake,
+        resolver=resolver,
     )
 
     assert server == {"pid": 4242, "url": "http://vireo.local:50222"}

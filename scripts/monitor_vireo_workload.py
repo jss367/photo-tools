@@ -982,6 +982,22 @@ def _resolve_hostname(hostname, *, resolver=socket.getaddrinfo):
     return frozenset(info[4][0] for info in infos if info and info[4])
 
 
+def _local_interface_addresses(*, psutil_module, resolver=socket.getaddrinfo):
+    addresses = set(_resolve_hostname(socket.gethostname(), resolver=resolver))
+    try:
+        interfaces = psutil_module.net_if_addrs()
+    except (AttributeError, OSError, psutil_module.Error):
+        return frozenset(addresses)
+    for interface_addresses in interfaces.values():
+        for address in interface_addresses:
+            if address.family not in {socket.AF_INET, socket.AF_INET6}:
+                continue
+            # psutil may include an IPv6 scope suffix (e.g. ``%en0``), while
+            # getaddrinfo and listener addresses are compared without it.
+            addresses.add(address.address.split("%", 1)[0])
+    return frozenset(addresses)
+
+
 def _listener_reachable_address(
     host,
     listener_ip,
@@ -1108,6 +1124,11 @@ def discover_server(
     if psutil_module is None:
         raise RuntimeError(
             "psutil is required; install the Vireo development dependencies"
+        )
+    if local_addresses is None:
+        local_addresses = _local_interface_addresses(
+            psutil_module=psutil_module,
+            resolver=resolver,
         )
     if requested_pid is not None and requested_url:
         parsed, requested_hostname, requested_port = _parse_server_url(

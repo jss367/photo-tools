@@ -648,6 +648,31 @@ def test_api_inat_export_includes_zero_coordinates(app_and_db, tmp_path):
     assert metadata["longitude"] == 0.0
 
 
+@pytest.mark.parametrize(
+    ("latitude", "longitude"),
+    [([], 1), (1, {}), ("nan", 1), (1, "inf"), (None, 1), (True, 1)],
+)
+def test_api_inat_export_rejects_invalid_coordinate_snapshots(
+    app_and_db, tmp_path, latitude, longitude,
+):
+    app, _db, pid = app_and_db
+
+    response = app.test_client().post("/api/inat/export", json={
+        "destination": str(tmp_path),
+        "submissions": [{
+            "photo_id": pid,
+            "latitude": latitude,
+            "longitude": longitude,
+            "include_location": True,
+        }],
+    })
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == (
+        "latitude and longitude must be finite numbers"
+    )
+
+
 def _add_out_of_workspace_photo(db):
     active_ws = db._active_workspace_id
     base_dir = db.conn.execute("SELECT path FROM folders LIMIT 1").fetchone()["path"]

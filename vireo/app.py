@@ -23897,6 +23897,26 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 return json_error("photo_id must be an integer")
             normalized = dict(item)
             normalized["photo_id"] = photo_id
+            if normalized.get("include_location", False):
+                latitude = normalized.get("latitude")
+                longitude = normalized.get("longitude")
+                if isinstance(latitude, bool) or isinstance(longitude, bool):
+                    return json_error(
+                        "latitude and longitude must be finite numbers",
+                    )
+                try:
+                    latitude = float(latitude)
+                    longitude = float(longitude)
+                except (TypeError, ValueError):
+                    return json_error(
+                        "latitude and longitude must be finite numbers",
+                    )
+                if not math.isfinite(latitude) or not math.isfinite(longitude):
+                    return json_error(
+                        "latitude and longitude must be finite numbers",
+                    )
+                normalized["latitude"] = latitude
+                normalized["longitude"] = longitude
             normalized_submissions.append(normalized)
         submissions = normalized_submissions
 

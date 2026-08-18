@@ -1,13 +1,16 @@
 """Photo export with resize, quality control, and template-based naming."""
 
+import contextlib
 import hashlib
 import logging
 import os
 import re
 import shutil
+import subprocess
 
 from image_edits import apply_recipe_to_loaded_image
 from image_loader import RAW_DECODE_PRESERVE_HIGHLIGHTS, RAW_EXTENSIONS, load_image
+from proc import no_window_kwargs
 from render_source import (
     companion_image_can_replace_raw_result,
     image_is_smaller_than_expected,
@@ -32,6 +35,14 @@ _OUTPUT_FORMATS = {
     "tif": {"extension": "tiff", "pil_format": "TIFF", "quality": False},
     "tiff": {"extension": "tiff", "pil_format": "TIFF", "quality": False},
 }
+EXPORT_METADATA_FIELDS = frozenset({
+    "species",
+    "capture_date",
+    "capture_time",
+    "rating",
+    "location",
+    "camera",
+})
 
 
 def sanitize_filename(name):
@@ -61,6 +72,22 @@ def normalize_quality(quality, default=92):
     if value < 1 or value > 100:
         raise ValueError("quality must be an integer from 1 to 100")
     return value
+
+
+def normalize_metadata_fields(fields):
+    """Validate and deduplicate requested export metadata fields."""
+    if fields in (None, ""):
+        return []
+    if not isinstance(fields, (list, tuple, set)):
+        raise ValueError("metadata_fields must be a list")
+    normalized = []
+    for field in fields:
+        if not isinstance(field, str) or field not in EXPORT_METADATA_FIELDS:
+            supported = ", ".join(sorted(EXPORT_METADATA_FIELDS))
+            raise ValueError(f"metadata_fields entries must be one of: {supported}")
+        if field not in normalized:
+            normalized.append(field)
+    return normalized
 
 
 def resolve_template(template, photo, species=None, seq=1):
@@ -136,6 +163,10 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
                 <developed_dir>/<stem>.<ext> is also probed so libraries
                 developed before the per-folder nesting convention was
                 introduced still pick up their developed outputs.
+            metadata_fields: list of metadata names to embed in each rendered
+                file. Supported values are species, capture_date,
+                capture_time, rating, location, and camera. The default is an
+                empty list, preserving the existing metadata-free export.
             export_to_subfolder: bool -- create an ``exported`` directory
                 beneath the shared destination or each original photo's
                 folder.
@@ -159,6 +190,7 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
     except (ValueError, TypeError):
         wc_max = 4096
     developed_dir = options.get("developed_dir") or ""
+    metadata_fields = normalize_metadata_fields(options.get("metadata_fields"))
     subfolder = "exported" if options.get("export_to_subfolder") else ""
 
     if destination:
@@ -167,6 +199,13 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
     photos_map = db.get_photos_by_ids(photo_ids)
     folders = {f["id"]: f["path"] for f in db.get_folder_tree()}
     exif_data_map = _get_photo_exif_data(db, photo_ids)
+    camera_data_map = (
+        _get_photo_camera_data(db, photo_ids) if "camera" in metadata_fields else {}
+    )
+    location_map = (
+        db.get_effective_photo_locations(photo_ids, verify_workspace=False)
+        if "location" in metadata_fields else {}
+    )
 
     # Get species keywords for all photos in one query
     species_map = db.get_species_keywords_for_photos(photo_ids)
@@ -176,6 +215,7 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
     seq_counters = {}
     exported = 0
     errors = []
+    metadata_jobs = []
 
     # Per-export cache of developed-directory scans. Keyed by directory
     # path; each value is the (stem, ext_lower) → absolute-path map that
@@ -412,13 +452,41 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
                 )
             _save_export_image(img, out_path, format_info, quality)
             img.close()
-            exported += 1
+            if metadata_fields:
+                try:
+                    metadata_args = _export_metadata_args(
+                        metadata_fields,
+                        photo,
+                        species_list,
+                        camera_data_map.get(pid, {}),
+                        location_map.get(pid),
+                    )
+                except Exception:
+                    # A checked metadata option is part of the requested
+                    # output contract. Do not leave behind an apparently
+                    # successful but silently untagged derivative.
+                    with contextlib.suppress(OSError):
+                        os.unlink(out_path)
+                    raise
+                if metadata_args:
+                    metadata_jobs.append((out_path, photo["filename"], metadata_args))
+                else:
+                    exported += 1
+            else:
+                exported += 1
         except Exception as exc:
             log.warning("Export failed for %s: %s", photo["filename"], exc)
             errors.append(f"{photo['filename']}: {exc}")
 
         if progress_cb:
             progress_cb(i + 1, len(photo_ids), photo["filename"])
+
+    if metadata_jobs:
+        metadata_exported, metadata_errors = _write_export_metadata_batch(
+            metadata_jobs,
+        )
+        exported += metadata_exported
+        errors.extend(metadata_errors)
 
     return {
         "exported": exported,
@@ -472,6 +540,240 @@ def _get_photo_exif_data(db, photo_ids):
         for row in rows:
             out[row["id"]] = row["exif_data"]
     return out
+
+
+def _get_photo_camera_data(db, photo_ids):
+    """Return promoted camera/exposure fields for an export selection."""
+    if not photo_ids or not hasattr(db, "conn"):
+        return {}
+    out = {}
+    for i in range(0, len(photo_ids), 999):
+        chunk = photo_ids[i:i + 999]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = db.conn.execute(
+            f"""SELECT id, camera_make, camera_model, lens, focal_length,
+                       aperture, shutter_speed, iso
+                FROM photos WHERE id IN ({placeholders})""",
+            list(chunk),
+        ).fetchall()
+        for row in rows:
+            out[row["id"]] = dict(row)
+    return out
+
+
+def _photo_value(photo, key, default=None):
+    """Read a value from either a sqlite Row or a plain mapping."""
+    try:
+        return photo[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _export_timestamp_parts(timestamp):
+    """Return date/time fields for a catalog ISO timestamp."""
+    value = str(timestamp or "").strip()
+    match = re.match(
+        r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})"
+        r"(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})?$",
+        value,
+    )
+    if not match:
+        return None, None, None, None, None, None
+    year, month, day, hour, minute, second, subsecond, offset = match.groups()
+    if offset == "Z":
+        offset = "+00:00"
+    date = f"{year}:{month}:{day}"
+    capture_time = f"{hour}:{minute}:{second}{offset or ''}"
+    suffix = (f".{subsecond}" if subsecond else "") + (offset or "")
+    xmp_datetime = f"{year}-{month}-{day}T{hour}:{minute}:{second}{suffix}"
+    # EXIF stores the offset in separate tags, so keep its base timestamp
+    # timezone-free even though IPTC and XMP carry the suffix inline.
+    exif_datetime = f"{date} {hour}:{minute}:{second}"
+    return date, capture_time, exif_datetime, xmp_datetime, subsecond, offset
+
+
+def _metadata_assignment(tag, value):
+    """Build an ExifTool assignment while rejecting line-oriented arguments."""
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    return f"-{tag}={text}"
+
+
+def _export_metadata_args(fields, photo, species, camera_data, location_data=None):
+    """Build ExifTool assignments for one rendered export."""
+    args = []
+    selected = set(fields)
+
+    if "species" in selected:
+        for index, name in enumerate(species):
+            operator = "=" if index == 0 else "+="
+            clean = str(name).replace("\r", " ").replace("\n", " ")
+            args.extend([
+                f"-XMP-dc:Subject{operator}{clean}",
+                f"-IPTC:Keywords{operator}{clean}",
+            ])
+
+    (
+        date,
+        capture_time,
+        exif_datetime,
+        xmp_datetime,
+        subsecond,
+        offset,
+    ) = _export_timestamp_parts(_photo_value(photo, "timestamp"))
+    if "capture_date" in selected and date:
+        args.append(_metadata_assignment("IPTC:DateCreated", date))
+    if "capture_time" in selected and capture_time:
+        args.append(_metadata_assignment("IPTC:TimeCreated", capture_time))
+    if (
+        "capture_date" in selected
+        and "capture_time" in selected
+        and exif_datetime
+    ):
+        args.extend([
+            _metadata_assignment("EXIF:DateTimeOriginal", exif_datetime),
+            _metadata_assignment("EXIF:CreateDate", exif_datetime),
+            _metadata_assignment("XMP-exif:DateTimeOriginal", xmp_datetime),
+            _metadata_assignment("XMP-xmp:CreateDate", xmp_datetime),
+        ])
+        if subsecond:
+            args.extend([
+                _metadata_assignment("EXIF:SubSecTimeOriginal", subsecond),
+                _metadata_assignment("EXIF:SubSecTimeDigitized", subsecond),
+            ])
+        if offset:
+            args.extend([
+                _metadata_assignment("EXIF:OffsetTimeOriginal", offset),
+                _metadata_assignment("EXIF:OffsetTimeDigitized", offset),
+            ])
+
+    if "rating" in selected:
+        rating = _photo_value(photo, "rating")
+        if rating is not None:
+            args.append(_metadata_assignment("XMP-xmp:Rating", int(rating)))
+
+    if "location" in selected:
+        location_source = location_data if location_data is not None else photo
+        latitude = _photo_value(location_source, "latitude")
+        longitude = _photo_value(location_source, "longitude")
+        if latitude is not None and longitude is not None:
+            latitude = float(latitude)
+            longitude = float(longitude)
+            args.extend([
+                _metadata_assignment("EXIF:GPSLatitude", abs(latitude)),
+                _metadata_assignment(
+                    "EXIF:GPSLatitudeRef", "N" if latitude >= 0 else "S"
+                ),
+                _metadata_assignment("EXIF:GPSLongitude", abs(longitude)),
+                _metadata_assignment(
+                    "EXIF:GPSLongitudeRef", "E" if longitude >= 0 else "W"
+                ),
+            ])
+
+    if "camera" in selected:
+        camera_tags = (
+            ("EXIF:Make", camera_data.get("camera_make")),
+            ("EXIF:Model", camera_data.get("camera_model")),
+            ("EXIF:LensModel", camera_data.get("lens")),
+            ("EXIF:FocalLength", camera_data.get("focal_length")),
+            ("EXIF:FNumber", camera_data.get("aperture")),
+            ("EXIF:ExposureTime", camera_data.get("shutter_speed")),
+            ("EXIF:ISO", camera_data.get("iso")),
+        )
+        args.extend(
+            _metadata_assignment(tag, value)
+            for tag, value in camera_tags
+            if value not in (None, "")
+        )
+
+    # A selected field can legitimately be unavailable for one photo. In
+    # that case there is nothing to write and the image itself still exports.
+    return args
+
+
+def _exiftool_argfile_path(path):
+    """Encode a path as one ExifTool argfile C-string line."""
+    escaped = str(path).replace("\\", "\\\\")
+    escaped = escaped.replace("\r", "\\r").replace("\n", "\\n")
+    return f"#[CSTR]{escaped}"
+
+
+def _write_export_metadata_batch(jobs):
+    """Write per-file metadata commands through one ExifTool process."""
+    from metadata import _exiftool_command, find_exiftool
+
+    exiftool = find_exiftool()
+    if not exiftool:
+        detail = "ExifTool is required to include export metadata"
+        return _fail_export_metadata_jobs(jobs, detail)
+
+    argfile_lines = []
+    marker_prefix = "VIREO_METADATA_STATUS_"
+    for index, (out_path, _filename, args) in enumerate(jobs, start=1):
+        argfile_lines.extend([
+            "-overwrite_original",
+            "-n",
+            *args,
+            _exiftool_argfile_path(os.path.abspath(out_path)),
+            "-echo3",
+            f"{marker_prefix}{index}_${{status}}",
+            f"-execute{index}",
+        ])
+
+    timeout = max(120, min(3600, len(jobs) * 5))
+    try:
+        result = subprocess.run(
+            [*_exiftool_command(exiftool), "-@", "-"],
+            input="\n".join(argfile_lines) + "\n",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
+            **no_window_kwargs(),
+        )
+    except subprocess.TimeoutExpired:
+        return _fail_export_metadata_jobs(jobs, "ExifTool metadata write timed out")
+    except OSError as exc:
+        return _fail_export_metadata_jobs(
+            jobs, f"ExifTool could not start: {exc}"
+        )
+    except UnicodeError as exc:
+        return _fail_export_metadata_jobs(
+            jobs, f"ExifTool metadata could not be encoded: {exc}"
+        )
+
+    statuses = {
+        int(index): int(status)
+        for index, status in re.findall(
+            rf"^{marker_prefix}(\d+)_(\d+)$", result.stdout, re.MULTILINE,
+        )
+    }
+    invocation_failed = result.returncode != 0 and not statuses
+    error_lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+    exported = 0
+    errors = []
+    for index, (out_path, filename, _args) in enumerate(jobs, start=1):
+        status = statuses.get(index)
+        if not invocation_failed and status == 0:
+            exported += 1
+            continue
+        detail = next(
+            (line for line in error_lines if out_path in line),
+            error_lines[0] if error_lines else "ExifTool could not write export metadata",
+        )
+        with contextlib.suppress(OSError):
+            os.unlink(out_path)
+        errors.append(f"{filename}: {detail}")
+    return exported, errors
+
+
+def _fail_export_metadata_jobs(jobs, detail):
+    """Remove derivatives for a failed metadata batch and return job errors."""
+    errors = []
+    for out_path, filename, _args in jobs:
+        with contextlib.suppress(OSError):
+            os.unlink(out_path)
+        errors.append(f"{filename}: {detail}")
+    return 0, errors
 
 
 def _recipe_result_dimensions(width, height, recipe):

@@ -9052,61 +9052,101 @@ class Database:
         ``type='location'`` keyword coordinates. Returns ``None`` when neither
         source has a complete coordinate pair.
         """
+        return self.get_effective_photo_locations(
+            [photo_id], verify_workspace=verify_workspace
+        ).get(photo_id)
+
+    def get_effective_photo_locations(self, photo_ids, verify_workspace=True):
+        """Return effective locations for many photos keyed by photo ID.
+
+        Each chunk uses one query while preserving the single-photo lookup's
+        EXIF-pair preference and linked-location fallback. Photos without a
+        complete coordinate pair are omitted from the returned mapping.
+        """
+        if not photo_ids:
+            return {}
+
+        photo_ids = list(dict.fromkeys(photo_ids))
+        result = {}
+        seen_ids = set()
+        for chunk in _chunks(photo_ids):
+            selected_values = ",".join("(?)" for _ in chunk)
+            workspace_join = ""
+            params = list(chunk)
+            if verify_workspace:
+                workspace_join = """
+                    JOIN workspace_folders wf
+                      ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
+                """
+                params.append(self._ws_id())
+            rows = self.conn.execute(
+                f"""
+                WITH selected(id) AS (VALUES {selected_values}),
+                ranked_locations AS (
+                    SELECT pk_loc.photo_id, k_loc.name, k_loc.place_id,
+                           k_loc.latitude, k_loc.longitude,
+                           ROW_NUMBER() OVER (
+                             PARTITION BY pk_loc.photo_id
+                             ORDER BY (k_loc.parent_id IS NULL) ASC, k_loc.id DESC
+                           ) AS rn
+                    FROM photo_keywords pk_loc
+                    JOIN selected s ON s.id = pk_loc.photo_id
+                    JOIN keywords k_loc ON k_loc.id = pk_loc.keyword_id
+                    WHERE k_loc.type = 'location'
+                      AND k_loc.latitude IS NOT NULL
+                      AND k_loc.longitude IS NOT NULL
+                )
+                SELECT p.id,
+                       p.latitude AS photo_latitude,
+                       p.longitude AS photo_longitude,
+                       kl.latitude AS keyword_latitude,
+                       kl.longitude AS keyword_longitude,
+                       kl.name AS keyword_location_name,
+                       kl.place_id AS place_id
+                FROM selected s
+                JOIN photos p ON p.id = s.id
+                {workspace_join}
+                LEFT JOIN ranked_locations kl
+                  ON kl.photo_id = p.id AND kl.rn = 1
+                """,
+                params,
+            ).fetchall()
+            seen_ids.update(row["id"] for row in rows)
+            for row in rows:
+                if (
+                    row["photo_latitude"] is not None
+                    and row["photo_longitude"] is not None
+                ):
+                    result[row["id"]] = {
+                        "photo_id": row["id"],
+                        "latitude": row["photo_latitude"],
+                        "longitude": row["photo_longitude"],
+                        "source": "exif",
+                        "keyword_location_name": None,
+                        "place_id": None,
+                    }
+                elif (
+                    row["keyword_latitude"] is not None
+                    and row["keyword_longitude"] is not None
+                ):
+                    result[row["id"]] = {
+                        "photo_id": row["id"],
+                        "latitude": row["keyword_latitude"],
+                        "longitude": row["keyword_longitude"],
+                        "source": "keyword",
+                        "keyword_location_name": row["keyword_location_name"],
+                        "place_id": row["place_id"],
+                    }
+
         if verify_workspace:
-            self._verify_photo_in_workspace(photo_id)
-
-        row = self.conn.execute(
-            """
-            SELECT p.id,
-                   p.latitude AS photo_latitude,
-                   p.longitude AS photo_longitude,
-                   kl.latitude AS keyword_latitude,
-                   kl.longitude AS keyword_longitude,
-                   kl.name AS keyword_location_name,
-                   kl.place_id AS place_id
-            FROM photos p
-            LEFT JOIN (
-                SELECT pk_loc.photo_id, k_loc.name, k_loc.place_id,
-                       k_loc.latitude, k_loc.longitude,
-                       ROW_NUMBER() OVER (
-                         PARTITION BY pk_loc.photo_id
-                         ORDER BY (k_loc.parent_id IS NULL) ASC, k_loc.id DESC
-                       ) AS rn
-                FROM photo_keywords pk_loc
-                JOIN keywords k_loc ON k_loc.id = pk_loc.keyword_id
-                WHERE pk_loc.photo_id = ?
-                  AND k_loc.type = 'location'
-                  AND k_loc.latitude IS NOT NULL
-                  AND k_loc.longitude IS NOT NULL
-            ) kl ON kl.photo_id = p.id AND kl.rn = 1
-            WHERE p.id = ?
-            """,
-            (photo_id, photo_id),
-        ).fetchone()
-        if row is None:
-            return None
-
-        if row["photo_latitude"] is not None and row["photo_longitude"] is not None:
-            return {
-                "photo_id": row["id"],
-                "latitude": row["photo_latitude"],
-                "longitude": row["photo_longitude"],
-                "source": "exif",
-                "keyword_location_name": None,
-                "place_id": None,
-            }
-
-        if row["keyword_latitude"] is not None and row["keyword_longitude"] is not None:
-            return {
-                "photo_id": row["id"],
-                "latitude": row["keyword_latitude"],
-                "longitude": row["keyword_longitude"],
-                "source": "keyword",
-                "keyword_location_name": row["keyword_location_name"],
-                "place_id": row["place_id"],
-            }
-
-        return None
+            missing_id = next(
+                (pid for pid in photo_ids if pid not in seen_ids), None
+            )
+            if missing_id is not None:
+                raise ValueError(
+                    f"Photo {missing_id} does not belong to the active workspace"
+                )
+        return result
 
     def get_accepted_species(self):
         """Return distinct marker species from geolocated photos in the active workspace.

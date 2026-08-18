@@ -1642,6 +1642,27 @@ body.sidebar-resizing {
   border-color: var(--accent);
   color: var(--accent);
 }
+.export-metadata-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px 16px;
+  margin: 0 0 6px;
+}
+.export-metadata-option {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+.export-metadata-option input { margin: 0; }
+.export-metadata-help {
+  margin: 0 0 12px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
 .inat-badge {
   position: absolute; top: 4px; right: 4px;
   background: rgba(116,172,0,0.85); color: var(--text-primary);
@@ -1843,6 +1864,17 @@ body.sidebar-resizing {
           <button class="export-var-pill" onclick="insertTemplateVar('{folder}')">{folder}</button>
         </div>
         <div id="exportPreview" style="font-size:11px;color:var(--text-muted);margin-bottom:12px;font-family:monospace;"></div>
+
+        <label style="font-size:12px;color:var(--text-secondary);display:block;margin-bottom:7px;">Include metadata in exported files</label>
+        <div class="export-metadata-options">
+          <label class="export-metadata-option"><input id="exportMetadataSpecies" type="checkbox" value="species"> Species</label>
+          <label class="export-metadata-option"><input id="exportMetadataCaptureDate" type="checkbox" value="capture_date"> Capture date</label>
+          <label class="export-metadata-option"><input id="exportMetadataCaptureTime" type="checkbox" value="capture_time"> Capture time</label>
+          <label class="export-metadata-option"><input id="exportMetadataRating" type="checkbox" value="rating"> Rating</label>
+          <label class="export-metadata-option"><input id="exportMetadataLocation" type="checkbox" value="location"> Location</label>
+          <label class="export-metadata-option"><input id="exportMetadataCamera" type="checkbox" value="camera"> Camera &amp; exposure</label>
+        </div>
+        <p class="export-metadata-help">Unchecked details are left out. Location stays off unless you explicitly select it.</p>
 
         <div class="modal-actions">
           <button id="exportSubmitBtn" class="modal-btn modal-btn-primary" onclick="startExport()">Export</button>
@@ -11228,10 +11260,18 @@ function openExportModal() {
   document.getElementById('exportPreset').value = 'original-jpg';
   applyExportPreset('original-jpg');
   document.getElementById('exportTemplate').value = '{original}';
+  document.querySelectorAll('.export-metadata-option input').forEach(function(input) {
+    input.checked = false;
+  });
   document.getElementById('exportDest').value = '';
   document.getElementById('exportSubfolder').checked = false;
   document.getElementById('exportOverlay').classList.add('open');
   updateExportPreview();
+}
+
+function selectedExportMetadataFields() {
+  return Array.from(document.querySelectorAll('.export-metadata-option input:checked'))
+    .map(function(input) { return input.value; });
 }
 
 function closeExportModal() {
@@ -11411,6 +11451,7 @@ async function startExport() {
         max_size: maxSize,
         quality: quality,
         format: format,
+        metadata_fields: selectedExportMetadataFields(),
       }),
     });
     if (data.error) { alert('Export error: ' + data.error); btn.disabled = false; return; }

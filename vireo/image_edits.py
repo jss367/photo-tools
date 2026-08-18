@@ -24,7 +24,8 @@ SCHEMA_VERSION = 1
 #   2 — linear-light pipeline with gated highlight shoulder.
 #   3 — expanded tone controls: highlights/shadows/whites/blacks/vibrance.
 #   4 — RAW edit renders demosaic with auto-bright off + highlight blending.
-EDIT_MATH_VERSION = 4
+#   5 — monotonic, linear-luminance range curves with chroma preservation.
+EDIT_MATH_VERSION = 5
 
 _ADJUSTMENT_RANGES = {
     "exposure": (-5.0, 5.0),

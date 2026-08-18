@@ -789,6 +789,9 @@ def build_summary(
         baseline.get("workload_metrics", {}).get("embedding_cache")
         and final_api.get("workload_metrics", {}).get("embedding_cache")
     )
+    process_identity_lost = (
+        (process_metadata or {}).get("identity_verified") is False
+    )
     # `executable_exists` is tri-state: True (verified present), False
     # (verified missing at some point), or None (unknown — e.g. psutil
     # `AccessDenied` on `Process.exe()`).  Treating unknown as True would
@@ -848,7 +851,7 @@ def build_summary(
                 latency_summary is not None
                 and latency_summary["p95"] < 0.5
                 and api_failure_count == 0
-            ) if not interrupted else None,
+            ) if not interrupted and not process_identity_lost else None,
             "system_idle_cpu_p05_at_least_10_percent": (
                 idle_summary is not None and idle_summary["p05"] >= 10.0
             ),
@@ -863,6 +866,7 @@ def build_summary(
                     has_embedding_diagnostics
                     and api_failure_count == 0
                     and not interrupted
+                    and not process_identity_lost
                 )
                 else None
             ),

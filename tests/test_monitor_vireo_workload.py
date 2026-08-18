@@ -781,6 +781,10 @@ def test_process_exit_before_resource_sample_preserves_prior_samples():
     assert report["process_exit_error"] == "monitored Vireo PID 123 exited"
     assert len(report["samples"]) == 1
     assert report["summary"]["scenario"]["job_observation_complete"] is False
+    assert report["summary"]["targets"]["jobs_api_p95_below_500ms"] is None
+    assert report["summary"]["targets"][
+        "no_embedding_single_flight_violations"
+    ] is None
 
 
 def test_terminal_api_overrun_marks_resource_interval_incomplete():
@@ -927,6 +931,10 @@ def test_late_process_exit_preserves_report_and_fails_trust_gate():
     assert report["process_exit_error"] == "monitored Vireo PID 123 exited"
     assert len(report["samples"]) == 1
     assert report["summary"]["scenario"]["job_observation_complete"] is False
+    assert report["summary"]["targets"]["jobs_api_p95_below_500ms"] is None
+    assert report["summary"]["targets"][
+        "no_embedding_single_flight_violations"
+    ] is None
     assert report["summary"]["targets"]["vireo_executable_present_throughout"] is False
 
 

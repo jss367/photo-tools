@@ -274,6 +274,7 @@ POST         /api/jobs/download-hf-model
 POST         /api/jobs/download-model
 POST         /api/jobs/download-taxonomy
 POST         /api/jobs/export
+POST         /api/jobs/export/preflight
 POST         /api/jobs/extract-masks
 POST         /api/jobs/fetch-labels
 POST         /api/jobs/import

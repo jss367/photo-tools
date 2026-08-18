@@ -1487,6 +1487,35 @@ def test_destination_reservations_resolve_directory_symlinks(tmp_path):
     assert set(destination.iterdir()) == {real_directory, alias_directory}
 
 
+def test_preview_export_renames_shares_aliased_destination_roots(export_env):
+    """Beside-original aliases share one set of planned export paths."""
+    env = export_env
+    alias_directory = env["tmp_path"] / "src-alias"
+    try:
+        alias_directory.symlink_to(env["src"], target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+    alias_folder_id = env["db"].add_folder(
+        str(alias_directory), name="Safari alias",
+    )
+    env["db"].conn.execute(
+        "UPDATE photos SET folder_id = ?, filename = ? WHERE id = ?",
+        (alias_folder_id, "bird1.jpg", env["p2"]),
+    )
+    env["db"].conn.commit()
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=None,
+        options={"naming_template": "photo", "format": "jpg"},
+    )
+
+    assert [(item["requested_name"], item["export_name"]) for item in renames] == [
+        ("photo.jpg", "photo_2.jpg"),
+    ]
+
+
 def test_preview_export_renames_respects_unicode_equivalent_destination(
     export_env, monkeypatch,
 ):

@@ -1685,11 +1685,12 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
         ):
             continue
 
-        if photo_destination not in destination_reservations:
-            destination_reservations[photo_destination] = (
+        reservation_key = os.path.realpath(photo_destination)
+        if reservation_key not in destination_reservations:
+            destination_reservations[reservation_key] = (
                 _DestinationPathReservations(photo_destination)
             )
-        reservations = destination_reservations[photo_destination]
+        reservations = destination_reservations[reservation_key]
 
         export_path = _deduplicate_path(
             requested_path,

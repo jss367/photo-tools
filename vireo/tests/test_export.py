@@ -152,6 +152,9 @@ def test_export_photos_basic(export_env):
     )
     assert result["exported"] == 2
     assert result["errors"] == []
+    assert result["destination"] == env["dest"]
+    assert result["destinations"] == [env["dest"]]
+    assert result["destination_mode"] == "custom"
     assert os.path.isfile(os.path.join(env["dest"], "bird1.jpg"))
     assert os.path.isfile(os.path.join(env["dest"], "bird2.jpg"))
 
@@ -170,9 +173,46 @@ def test_export_photos_defaults_to_original_folder(export_env):
 
     assert result["exported"] == 1
     assert result["errors"] == []
+    assert result["destination"] == str(env["src"])
+    assert result["destinations"] == [str(env["src"])]
+    assert result["destination_mode"] == "original"
     # The original JPEG is preserved; collision handling gives the rendered
     # export a new name in the same directory.
     assert os.path.isfile(env["src"] / "bird1_2.jpg")
+
+
+def test_export_photos_reports_every_original_folder(export_env):
+    """Beside-original exports expose every resolved output directory."""
+    env = export_env
+    second_src = env["tmp_path"] / "second-src"
+    second_src.mkdir()
+    Image.new("RGB", (640, 480), color="green").save(
+        str(second_src / "bird3.jpg"), "JPEG", quality=95,
+    )
+    second_folder_id = env["db"].add_folder(
+        str(second_src), name="Second Safari",
+    )
+    third_photo_id = env["db"].add_photo(
+        folder_id=second_folder_id,
+        filename="bird3.jpg",
+        extension=".jpg",
+        file_size=500,
+        file_mtime=3.0,
+        timestamp="2024-06-17T10:00:00",
+    )
+
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"], third_photo_id],
+        destination="",
+        options={"naming_template": "{original}"},
+    )
+
+    assert result["exported"] == 2
+    assert result["destination"] == ""
+    assert result["destinations"] == [str(env["src"]), str(second_src)]
+    assert result["destination_mode"] == "original"
 
 
 def test_export_photos_can_use_subfolder_beside_originals(export_env):
@@ -192,6 +232,8 @@ def test_export_photos_can_use_subfolder_beside_originals(export_env):
 
     assert result["exported"] == 2
     assert result["errors"] == []
+    assert result["destination"] == str(env["src"] / "exported")
+    assert result["destinations"] == [str(env["src"] / "exported")]
     assert os.path.isfile(env["src"] / "exported" / "bird1.jpg")
     assert os.path.isfile(env["src"] / "exported" / "bird2.jpg")
 
@@ -213,6 +255,10 @@ def test_export_photos_can_use_subfolder_under_custom_destination(export_env):
 
     assert result["exported"] == 1
     assert result["errors"] == []
+    assert result["destination"] == os.path.join(env["dest"], "exported")
+    assert result["destinations"] == [
+        os.path.join(env["dest"], "exported"),
+    ]
     assert os.path.isfile(os.path.join(env["dest"], "exported", "bird1.jpg"))
 
 

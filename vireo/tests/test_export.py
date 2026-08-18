@@ -1394,7 +1394,9 @@ def test_preview_export_renames_keeps_case_twins_on_empty_linux_target(
         (env["p2"],),
     )
     env["db"].conn.commit()
-    monkeypatch.setattr(export_mod, "is_case_insensitive_platform", lambda: False)
+    monkeypatch.setattr(
+        export_mod, "_destination_case_insensitive", lambda _path: False,
+    )
     monkeypatch.setattr(
         export_mod,
         "_select_export_source",
@@ -1409,6 +1411,23 @@ def test_preview_export_renames_keeps_case_twins_on_empty_linux_target(
     )
 
     assert renames == []
+
+
+def test_destination_case_probe_matches_empty_volume(tmp_path):
+    """Case behavior comes from the selected volume, not the host platform."""
+    destination = tmp_path / "empty-destination"
+    destination.mkdir()
+
+    detected = export_mod._destination_case_insensitive(str(destination))
+
+    probe = destination / "VireoCaseCheck"
+    probe.write_text("probe")
+    try:
+        observed = (destination / "vIREOcASEcHECK").exists()
+    finally:
+        probe.unlink()
+    assert detected is observed
+    assert list(destination.iterdir()) == []
 
 
 def test_preview_export_renames_skips_missing_source_before_sequence(

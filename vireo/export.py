@@ -7,10 +7,10 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 
 from image_edits import apply_recipe_to_loaded_image
 from image_loader import RAW_DECODE_PRESERVE_HIGHLIGHTS, RAW_EXTENSIONS, load_image
-from path_guard import is_case_insensitive_platform
 from proc import no_window_kwargs
 from render_source import (
     companion_image_can_replace_raw_result,
@@ -1507,8 +1507,6 @@ def _deduplicate_path(path, reserved_paths=None, path_key=None):
 
 def _destination_case_insensitive(path):
     """Return whether the existing volume containing ``path`` folds case."""
-    if is_case_insensitive_platform():
-        return True
     probe_path = os.path.realpath(path)
     while not os.path.isdir(probe_path):
         parent = os.path.dirname(probe_path)
@@ -1516,32 +1514,26 @@ def _destination_case_insensitive(path):
             break
         probe_path = parent
     try:
-        entries = os.listdir(probe_path)
+        descriptor, probe_file = tempfile.mkstemp(
+            prefix=".VireoCaseProbe-", dir=probe_path,
+        )
     except OSError:
-        return False
-    for name in entries:
-        for index, char in enumerate(name):
-            if not char.isalpha():
-                continue
-            swapped = name[:index] + char.swapcase() + name[index + 1:]
-            if swapped == name:
-                continue
-            original = os.path.join(probe_path, name)
-            case_variant = os.path.join(probe_path, swapped)
-            try:
-                os.stat(case_variant)
-            except FileNotFoundError:
-                return False
-            except OSError:
-                return False
-            try:
-                return os.path.samefile(original, case_variant)
-            except OSError:
-                return False
-    # Unlike a safety containment guard, an export preview must match what the
-    # writer will actually do. On an inconclusive Linux probe, keep distinct
-    # case spellings distinct rather than predicting a rename that won't occur.
-    return False
+        # Export will report a permission/storage error separately. If the
+        # volume cannot be probed, retain the host's path-comparison behavior.
+        return os.path.normcase("Vireo") == os.path.normcase("vireo")
+    os.close(descriptor)
+    try:
+        probe_dir, probe_name = os.path.split(probe_file)
+        case_variant = os.path.join(probe_dir, probe_name.swapcase())
+        if case_variant == probe_file or not os.path.exists(case_variant):
+            return False
+        try:
+            return os.path.samefile(probe_file, case_variant)
+        except OSError:
+            return False
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(probe_file)
 
 
 def _export_path_key(path, case_insensitive):
@@ -1553,10 +1545,10 @@ def _export_path_key(path, case_insensitive):
 def preview_export_renames(db, photo_ids, destination=None, options=None):
     """Return filename changes that export collision handling would make.
 
-    This is a read-only preflight for the export dialog. It mirrors export's
-    destination, template, sequence, and deduplication rules without loading or
-    rendering image bytes. A later filesystem change can still introduce a new
-    collision, so the dialog also states the non-overwrite policy permanently.
+    This preflight mirrors export's source, destination, template, sequence,
+    and deduplication rules without rendering output files. A later filesystem
+    change can still introduce a new collision, so the dialog also states the
+    non-overwrite policy permanently.
     """
     options = options or {}
     template = options.get("naming_template", "{original}")

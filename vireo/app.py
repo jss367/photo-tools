@@ -23795,10 +23795,135 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         token = body.get("token", "")
         if not token:
             return json_error("Token is required")
-        result = inat.validate_token(token)
+        try:
+            result = inat.validate_token(token)
+        except inat.InatApiError as exc:
+            return json_error(str(exc), 502)
         if result is None:
             return json_error("Invalid or expired token", 401)
         return jsonify(result)
+
+    @app.route("/api/inat/token", methods=["POST"])
+    def api_inat_save_token():
+        """Validate and save an iNaturalist token from the submission modal."""
+        import config as cfg
+        import inat
+
+        body = request.get_json(silent=True) or {}
+        token = str(body.get("token") or "").strip()
+        if not token:
+            return json_error("Token is required")
+        try:
+            user = inat.validate_token(token)
+        except inat.InatApiError as exc:
+            return json_error(str(exc), 502)
+        if user is None:
+            return json_error("Invalid or expired token", 401)
+
+        # Preserve the raw config shape instead of writing cfg.load(), which
+        # would pin every default into config.json.  Invalid tokens never reach
+        # disk; validation and persistence are one user action in this flow.
+        with _settings_write_lock:
+            raw = _read_raw_config_file()
+            raw["inat_token"] = token
+            cfg.save(raw)
+        return jsonify({"ok": True, "login": user.get("login")})
+
+    @app.route("/api/inat/export", methods=["POST"])
+    def api_inat_export():
+        """Export edited JPEGs with only the selected iNaturalist metadata."""
+        import config as cfg
+        from inat_export import (
+            InatExportError,
+            export_inat_photo,
+            reveal_inat_exports,
+        )
+
+        body = request.get_json(silent=True) or {}
+        destination = str(body.get("destination") or "").strip()
+        submissions = body.get("submissions")
+        if not destination:
+            return json_error("destination is required")
+        if not os.path.isabs(destination):
+            return json_error("destination must be an absolute path")
+        if not isinstance(submissions, list) or not submissions:
+            return json_error("submissions array is required")
+        if len(submissions) > _MAX_SELECTION_PHOTOS:
+            return json_error("too many photos in selection", 400)
+
+        db = _get_db()
+        effective_cfg = db.get_effective_config(cfg.load())
+        min_conf = effective_cfg.get("detector_confidence", 0.2)
+        quality = effective_cfg.get("working_copy_quality", 92)
+        wc_max_size = effective_cfg.get("working_copy_max_size", 4096)
+        developed_dir = effective_cfg.get("darktable_output_dir", "") or ""
+        vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+
+        exported = []
+        errors = []
+        for item in submissions:
+            if not isinstance(item, dict):
+                errors.append({"photo_id": None, "error": "Invalid submission"})
+                continue
+            try:
+                photo_id = int(item.get("photo_id"))
+            except (TypeError, ValueError):
+                errors.append({"photo_id": item.get("photo_id"), "error": "Invalid photo id"})
+                continue
+            photo = db.get_photo(photo_id, verify_workspace=True)
+            if not photo:
+                errors.append({"photo_id": photo_id, "error": "Photo not found"})
+                continue
+
+            pred = db.get_top_prediction_for_photo(
+                photo_id, min_detector_confidence=min_conf,
+            )
+            location = db.get_effective_photo_location(photo_id)
+            metadata = {}
+            if item.get("include_taxon", False) and pred:
+                metadata["taxon_name"] = (
+                    pred["scientific_name"] or pred["species"]
+                )
+            if item.get("include_date", False):
+                metadata["timestamp"] = photo["timestamp"]
+            if item.get("include_location", False) and location:
+                metadata["latitude"] = location["latitude"]
+                metadata["longitude"] = location["longitude"]
+            if item.get("include_description", False):
+                description = str(item.get("description") or "").strip()
+                if description:
+                    metadata["description"] = description[:10000]
+
+            try:
+                path = export_inat_photo(
+                    db,
+                    vireo_dir,
+                    photo_id,
+                    destination,
+                    metadata,
+                    quality=quality,
+                    working_copy_max_size=wc_max_size,
+                    developed_dir=developed_dir,
+                )
+                exported.append({
+                    "photo_id": photo_id,
+                    "path": path,
+                    "filename": os.path.basename(path),
+                })
+            except (InatExportError, OSError, ValueError) as exc:
+                errors.append({"photo_id": photo_id, "error": str(exc)})
+
+        revealed = False
+        if exported and body.get("reveal", False):
+            revealed = reveal_inat_exports(
+                [item["path"] for item in exported], destination,
+            )
+        return jsonify({
+            "exported": exported,
+            "errors": errors,
+            "destination": destination,
+            "revealed": revealed,
+        })
 
     def _inat_edit_recipe_source(photo, recipe, fallback_path):
         from image_loader import RAW_EXTENSIONS

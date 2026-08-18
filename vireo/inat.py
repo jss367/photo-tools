@@ -33,7 +33,14 @@ def _headers(token):
 
 def validate_token(token):
     """Validate iNat API token. Returns user dict on success, None on failure."""
-    resp = requests.get(f"{INAT_RAILS}/users/edit.json", headers=_headers(token), timeout=INAT_TIMEOUT)
+    try:
+        resp = requests.get(
+            f"{INAT_RAILS}/users/edit.json",
+            headers=_headers(token),
+            timeout=INAT_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise InatApiError(f"Could not contact iNaturalist: {exc}") from exc
     if resp.status_code == 200:
         return resp.json()
     return None

@@ -137,7 +137,8 @@ def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_
         progress_cb: optional callback(current, total, current_file)
 
     Returns:
-        dict with keys: exported (int), errors (list of str), destination (str)
+        dict with keys: exported (int), files (list of output paths),
+        errors (list of str), destination (str)
     """
     options = options or {}
     template = options.get("naming_template", "{original}")
@@ -168,6 +169,7 @@ def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_
     # Track sequence numbers per subdirectory
     seq_counters = {}
     exported = 0
+    exported_files = []
     errors = []
 
     # Per-export cache of developed-directory scans. Keyed by directory
@@ -380,6 +382,7 @@ def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_
             _save_export_image(img, out_path, format_info, quality)
             img.close()
             exported += 1
+            exported_files.append(out_path)
         except Exception as exc:
             log.warning("Export failed for %s: %s", photo["filename"], exc)
             errors.append(f"{photo['filename']}: {exc}")
@@ -387,7 +390,12 @@ def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_
         if progress_cb:
             progress_cb(i + 1, len(photo_ids), photo["filename"])
 
-    return {"exported": exported, "errors": errors, "destination": destination}
+    return {
+        "exported": exported,
+        "files": exported_files,
+        "errors": errors,
+        "destination": destination,
+    }
 
 
 def _save_export_image(img, out_path, format_info, quality):

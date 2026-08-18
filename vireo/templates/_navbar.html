@@ -9093,6 +9093,7 @@ function lightboxDelete() {
 var inatQueue = [];  // [{photo_id, taxon_name, observed_on, latitude, longitude, description, geoprivacy, filename, already_submitted, existing_url}]
 var _inatSubmitting = false;  // true while inatDoSubmit's loop is running
 var _inatCancelled = false;   // set by closeInatModal to stop the loop gracefully
+var _inatQuickFailures = [];
 
 function _inatQueueItem(photoId, data) {
   return {
@@ -9236,13 +9237,15 @@ async function openInatQuickModal(items, failures) {
   window._inatEscToken = Keymap.pushEsc(function() { closeInatModal(); });
 
   inatQueue = items.slice();
-  var title = items.length === 1 ? 'Open in iNaturalist' : 'Open ' + items.length + ' iNaturalist uploads';
+  _inatQuickFailures = (failures || []).slice();
+  var title = items.length === 1 ? 'Send to iNaturalist' : 'Send ' + items.length + ' photos to iNaturalist';
   document.getElementById('inatModalTitle').textContent = title;
   document.getElementById('inatProgress').style.display = 'none';
 
   var submitBtn = document.getElementById('inatSubmitBtn');
-  submitBtn.style.display = 'none';
+  submitBtn.style.display = '';
   submitBtn.disabled = true;
+  submitBtn.textContent = items.length === 1 ? 'Send to iNaturalist' : 'Send All to iNaturalist';
 
   var cancelBtn = document.querySelector('#inatActions .modal-btn-cancel');
   if (cancelBtn) cancelBtn.textContent = 'Close';
@@ -9265,7 +9268,7 @@ async function openInatQuickModal(items, failures) {
       ? String(item.latitude) + ', ' + String(item.longitude)
       : 'No location';
     return '<fieldset style="border:0;padding:0;margin:12px 0 0;display:flex;flex-direction:column;gap:8px;">' +
-      '<legend style="font-size:13px;color:var(--text-primary);margin-bottom:7px;">Include in the upload link</legend>' +
+      '<legend style="font-size:13px;color:var(--text-primary);margin-bottom:7px;">Include with this photo</legend>' +
       '<label style="font-size:13px;color:var(--text-secondary);display:flex;align-items:center;gap:8px;">' +
         '<input id="inatIncludeTaxon' + idx + '" type="checkbox"' + (hasTaxon ? ' checked' : ' disabled') + '> Taxon: ' + escapeHtml(taxonText) +
       '</label>' +
@@ -9275,10 +9278,25 @@ async function openInatQuickModal(items, failures) {
       '<label style="font-size:13px;color:var(--text-secondary);display:flex;align-items:center;gap:8px;">' +
         '<input id="inatIncludeLocation' + idx + '" type="checkbox"' + (hasLocation ? ' checked' : ' disabled') + '> Location: ' + escapeHtml(locationText) +
       '</label>' +
+      '<label style="font-size:13px;color:var(--text-secondary);display:flex;align-items:center;gap:8px;">' +
+        '<input id="inatIncludeDescription' + idx + '" type="checkbox"> Description' +
+      '</label>' +
+      '<textarea id="inatQuickDescription' + idx + '" placeholder="Description (optional)" style="width:100%;min-height:48px;box-sizing:border-box;background:var(--bg-secondary);color:var(--text-primary);border:1px solid var(--border-secondary);border-radius:3px;padding:6px 8px;font-size:12px;resize:vertical;"></textarea>' +
     '</fieldset>';
   }
 
-  var html = '';
+  var html = '<div class="inat-card" id="inatTokenSetup">' +
+    '<div style="font-size:13px;color:var(--text-primary);font-weight:600;margin-bottom:5px;">Direct submission needs an iNaturalist token</div>' +
+    '<div style="font-size:12px;line-height:1.5;color:var(--text-secondary);margin-bottom:9px;">' +
+      'Paste a token below and Vireo will validate it before saving. iNaturalist tokens expire after 24 hours. ' +
+      '<a href="https://www.inaturalist.org/users/api_token" target="_blank" rel="noopener" onclick="return openExternalLink(event, this.href)" style="color:var(--accent);">Get a token</a>' +
+    '</div>' +
+    '<div style="display:flex;gap:8px;align-items:center;">' +
+      '<input id="inatQuickToken" type="password" autocomplete="off" placeholder="Paste iNaturalist token" style="flex:1;min-width:0;background:var(--bg-secondary);color:var(--text-primary);border:1px solid var(--border-secondary);border-radius:3px;padding:7px 8px;font-size:12px;font-family:monospace;">' +
+      '<button type="button" class="modal-btn modal-btn-primary" id="inatQuickTokenBtn" onclick="validateAndSaveInatToken()">Validate &amp; Save</button>' +
+    '</div>' +
+    '<div class="inat-card-status" id="inatQuickTokenStatus">The Send button will be enabled after validation.</div>' +
+  '</div>';
   if (items.length === 1) {
     html += '<div class="inat-card">' +
       '<div class="inat-card-header">' +
@@ -9289,7 +9307,7 @@ async function openInatQuickModal(items, failures) {
         '</div>' +
       '</div>' +
       '<div style="font-size:13px;line-height:1.5;color:var(--text-secondary);">' +
-        'Choose which details Vireo should add to the iNaturalist upload link.' +
+        'Choose which details Vireo should add to the exported JPEG and upload link.' +
       '</div>' +
       _inatQuickOptions(items[0], 0) +
       '<div style="margin-top:12px;">' +
@@ -9300,7 +9318,7 @@ async function openInatQuickModal(items, failures) {
   } else {
     html += '<div class="inat-card">' +
       '<div style="font-size:13px;line-height:1.5;color:var(--text-secondary);margin-bottom:10px;">' +
-        'Direct uploads need an iNaturalist token in Settings. Open the iNaturalist upload page for each photo below.' +
+        'Use the token field above for direct submission, or export the JPEGs and open an upload page for each photo below.' +
       '</div>';
     items.forEach(function(item, idx) {
       html += '<div style="display:flex;flex-direction:column;gap:4px;padding:8px 0;border-top:1px solid var(--border-primary);">' +
@@ -9324,8 +9342,113 @@ async function openInatQuickModal(items, failures) {
       '</div>';
   }
 
+  var exportLabel = items.length === 1 ? 'Export JPEG\u2026' : 'Export ' + items.length + ' JPEGs\u2026';
+  html += '<div class="inat-card">' +
+    '<div style="font-size:13px;color:var(--text-primary);font-weight:600;margin-bottom:5px;">Upload through your browser</div>' +
+    '<div style="font-size:12px;line-height:1.5;color:var(--text-secondary);margin-bottom:9px;">' +
+      'Export edited JPEG' + (items.length === 1 ? '' : 's') + ' with only the checked metadata, then add ' + (items.length === 1 ? 'it' : 'them') + ' on the iNaturalist upload page.' +
+    '</div>' +
+    '<button type="button" class="modal-btn modal-btn-primary" id="inatQuickExportBtn" onclick="exportInatQuickPhotos()">' + escapeHtml(exportLabel) + '</button>' +
+    '<div class="inat-card-status" id="inatQuickExportStatus"></div>' +
+  '</div>';
+
   document.getElementById('inatCards').innerHTML = html;
   document.getElementById('inatModal').classList.add('open');
+}
+
+async function validateAndSaveInatToken() {
+  var input = document.getElementById('inatQuickToken');
+  var status = document.getElementById('inatQuickTokenStatus');
+  var button = document.getElementById('inatQuickTokenBtn');
+  var token = input ? input.value.trim() : '';
+  if (!token) {
+    status.className = 'inat-card-status error';
+    status.textContent = 'Paste a token first.';
+    return;
+  }
+  button.disabled = true;
+  button.textContent = 'Validating\u2026';
+  status.className = 'inat-card-status';
+  status.textContent = 'Checking with iNaturalist\u2026';
+  try {
+    var data = await safeFetch('/api/inat/token', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token: token}),
+    }, { toast: false });
+    status.className = 'inat-card-status success';
+    status.textContent = '\u2713 Valid token' + (data.login ? ' for ' + data.login : '') + '. Opening direct submission\u2026';
+    openInatModal(_inatQuickFailures);
+  } catch(e) {
+    status.className = 'inat-card-status error';
+    status.textContent = '\u2717 ' + e.message;
+    button.disabled = false;
+    button.textContent = 'Validate & Save';
+  }
+}
+
+function _inatQuickExportSubmissions() {
+  return inatQueue.map(function(item, idx) {
+    var description = document.getElementById('inatQuickDescription' + idx);
+    return {
+      photo_id: item.photo_id,
+      include_taxon: !!(document.getElementById('inatIncludeTaxon' + idx) || {}).checked,
+      include_date: !!(document.getElementById('inatIncludeDate' + idx) || {}).checked,
+      include_location: !!(document.getElementById('inatIncludeLocation' + idx) || {}).checked,
+      include_description: !!(document.getElementById('inatIncludeDescription' + idx) || {}).checked,
+      description: description ? description.value.trim() : '',
+    };
+  });
+}
+
+async function exportInatQuickPhotos() {
+  var status = document.getElementById('inatQuickExportStatus');
+  var button = document.getElementById('inatQuickExportBtn');
+  var destination = null;
+  try {
+    if (typeof pickDirectory === 'function' && typeof isTauri === 'function' && isTauri()) {
+      destination = await pickDirectory('Export for iNaturalist');
+    } else {
+      destination = window.prompt('Export folder path:');
+    }
+  } catch(e) {
+    status.className = 'inat-card-status error';
+    status.textContent = '\u2717 Could not open the folder picker: ' + e.message;
+    return;
+  }
+  if (!destination) return;
+
+  button.disabled = true;
+  button.textContent = 'Exporting\u2026';
+  status.className = 'inat-card-status';
+  status.textContent = 'Rendering edited JPEG' + (inatQueue.length === 1 ? '' : 's') + ' and writing metadata\u2026';
+  try {
+    var result = await safeFetch('/api/inat/export', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        destination: destination,
+        submissions: _inatQuickExportSubmissions(),
+        reveal: typeof isTauri === 'function' && isTauri(),
+      }),
+    }, { toast: false });
+    var count = (result.exported || []).length;
+    var failed = (result.errors || []).length;
+    if (!count) {
+      var firstError = failed ? result.errors[0].error : 'No photos were exported.';
+      throw new Error(firstError);
+    }
+    status.className = failed ? 'inat-card-status warning' : 'inat-card-status success';
+    status.textContent = '\u2713 Exported ' + count + ' JPEG' + (count === 1 ? '' : 's') +
+      (failed ? '; ' + failed + ' failed.' : '.') +
+      (result.revealed ? ' Revealed in the file manager.' : '');
+  } catch(e) {
+    status.className = 'inat-card-status error';
+    status.textContent = '\u2717 ' + e.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = inatQueue.length === 1 ? 'Export JPEG\u2026' : 'Export ' + inatQueue.length + ' JPEGs\u2026';
+  }
 }
 
 function openInatModal(failures) {
@@ -9338,7 +9461,7 @@ function openInatModal(failures) {
   var submitBtn = document.getElementById('inatSubmitBtn');
   submitBtn.style.display = '';
   submitBtn.disabled = false;
-  submitBtn.textContent = inatQueue.length === 1 ? 'Submit' : 'Submit All';
+  submitBtn.textContent = inatQueue.length === 1 ? 'Send to iNaturalist' : 'Send All to iNaturalist';
   var cancelBtn = document.querySelector('#inatActions .modal-btn-cancel');
   if (cancelBtn) cancelBtn.textContent = 'Cancel';
 
@@ -9388,6 +9511,7 @@ function closeInatModal() {
     _inatCancelled = true;
   } else {
     inatQueue = [];
+    _inatQuickFailures = [];
   }
 }
 

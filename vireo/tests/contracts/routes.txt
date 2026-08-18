@@ -255,8 +255,10 @@ POST         /api/import/folder-preview-stream
 POST         /api/import/new-images-preview
 POST         /api/import/orphaned-staging/verify
 POST         /api/import/preview
+POST         /api/inat/export
 POST         /api/inat/submit
 POST         /api/inat/submit-batch
+POST         /api/inat/token
 POST         /api/inat/validate-token
 POST         /api/jobs/<job_id>/cancel
 POST         /api/jobs/<job_id>/pause

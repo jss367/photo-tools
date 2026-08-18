@@ -74,6 +74,17 @@ def test_validate_token_invalid():
         assert result is None
 
 
+def test_validate_token_wraps_connection_errors():
+    import requests
+    from inat import InatApiError, validate_token
+
+    with patch(
+        "inat.requests.get",
+        side_effect=requests.ConnectionError("network unavailable"),
+    ), pytest.raises(InatApiError, match="Could not contact iNaturalist"):
+        validate_token("token")
+
+
 def test_create_observation_success():
     from inat import create_observation
     mock_resp = MagicMock()
@@ -368,6 +379,102 @@ def test_api_inat_prepare_marks_direct_mode_with_token(app_and_db):
     assert data["mode"] == "direct"
     assert data["direct_upload_enabled"] is True
     assert data["photo_upload_requires_token"] is False
+
+
+def test_api_inat_token_validates_before_saving(app_and_db):
+    app, _db, _pid = app_and_db
+    import config as cfg
+
+    with patch("inat.validate_token", return_value={"login": "birder42"}):
+        resp = app.test_client().post(
+            "/api/inat/token", json={"token": "valid-token"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "login": "birder42"}
+    assert cfg.load()["inat_token"] == "valid-token"
+
+
+def test_api_inat_token_does_not_save_invalid_value(app_and_db):
+    app, _db, _pid = app_and_db
+    import config as cfg
+    cfg.save({"inat_token": "previous-token"})
+
+    with patch("inat.validate_token", return_value=None):
+        resp = app.test_client().post(
+            "/api/inat/token", json={"token": "invalid-token"},
+        )
+
+    assert resp.status_code == 401
+    assert cfg.load()["inat_token"] == "previous-token"
+
+
+def test_api_inat_export_uses_only_checked_metadata(app_and_db, tmp_path):
+    app, db, pid = app_and_db
+    destination = str(tmp_path / "exports")
+    kid = db.conn.execute(
+        "INSERT INTO keywords (name, type, latitude, longitude) "
+        "VALUES (?, 'location', ?, ?)",
+        ("Backyard", 38.9, -77.0),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        (pid, kid),
+    )
+    db.conn.commit()
+    expected_path = os.path.join(destination, "bird-iNaturalist.jpg")
+
+    with patch(
+        "inat_export.export_inat_photo", return_value=expected_path,
+    ) as export_photo:
+        resp = app.test_client().post("/api/inat/export", json={
+            "destination": destination,
+            "submissions": [{
+                "photo_id": pid,
+                "include_taxon": True,
+                "include_date": True,
+                "include_location": False,
+                "include_description": True,
+                "description": "At the feeder",
+            }],
+            "reveal": False,
+        })
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["exported"][0]["filename"] == "bird-iNaturalist.jpg"
+    metadata = export_photo.call_args.args[4]
+    assert metadata == {
+        "taxon_name": "Cardinalis cardinalis",
+        "timestamp": "2024-06-01T10:00:00",
+        "description": "At the feeder",
+    }
+
+
+def test_api_inat_export_includes_zero_coordinates(app_and_db, tmp_path):
+    app, db, pid = app_and_db
+    db.conn.execute(
+        "UPDATE photos SET latitude = 0.0, longitude = 0.0 WHERE id = ?",
+        (pid,),
+    )
+    db.conn.commit()
+
+    with patch(
+        "inat_export.export_inat_photo",
+        return_value=str(tmp_path / "bird-iNaturalist.jpg"),
+    ) as export_photo:
+        resp = app.test_client().post("/api/inat/export", json={
+            "destination": str(tmp_path),
+            "submissions": [{
+                "photo_id": pid,
+                "include_location": True,
+            }],
+        })
+
+    assert resp.status_code == 200
+    metadata = export_photo.call_args.args[4]
+    assert metadata["latitude"] == 0.0
+    assert metadata["longitude"] == 0.0
 
 
 def _add_out_of_workspace_photo(db):

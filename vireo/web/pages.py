@@ -16,7 +16,6 @@ _TEMPLATES = {
     "/pipeline": "pipeline.html",
     "/pipeline/review": "pipeline_review.html",
     "/pipeline/rapid-review": "pipeline_rapid_review.html",
-    "/variants": "variants.html",
     "/workspace": "workspace.html",
     "/id-conflicts": "id_conflicts.html",
     "/settings": "settings.html",

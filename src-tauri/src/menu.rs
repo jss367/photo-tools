@@ -17,7 +17,6 @@ pub mod ids {
     pub const NAV_MISSES: &str = "nav_misses";
     pub const NAV_HIGHLIGHTS: &str = "nav_highlights";
     pub const NAV_MAP: &str = "nav_map";
-    pub const NAV_VARIANTS: &str = "nav_variants";
     pub const NAV_AUDIT: &str = "nav_audit";
     pub const NAV_ID_CONFLICTS: &str = "nav_id_conflicts";
     pub const NAV_JOBS: &str = "nav_jobs";
@@ -97,7 +96,6 @@ pub fn route_for_id(id: &str) -> Option<&'static str> {
         ids::NAV_MISSES => Some("/misses"),
         ids::NAV_HIGHLIGHTS => Some("/highlights"),
         ids::NAV_MAP => Some("/map"),
-        ids::NAV_VARIANTS => Some("/variants"),
         ids::NAV_AUDIT => Some("/audit"),
         ids::NAV_ID_CONFLICTS => Some("/id-conflicts"),
         ids::NAV_JOBS => Some("/jobs"),
@@ -287,11 +285,6 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry
         .item(
             &MenuItemBuilder::with_id(ids::NAV_MAP, "Map")
                 .accelerator("CmdOrCtrl+7")
-                .build(app)?,
-        )
-        .item(
-            &MenuItemBuilder::with_id(ids::NAV_VARIANTS, "Variants")
-                .accelerator("CmdOrCtrl+8")
                 .build(app)?,
         )
         .item(

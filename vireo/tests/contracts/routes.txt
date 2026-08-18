@@ -125,9 +125,7 @@ GET          /api/settings/export
 GET          /api/settings/schema
 GET          /api/settings/values
 GET          /api/species
-GET          /api/species/<path:species_name>/clusters
 GET          /api/species/search
-GET          /api/species/summary
 GET          /api/stats
 GET          /api/storage
 GET          /api/storage/files
@@ -199,7 +197,6 @@ GET          /shortcuts
 GET          /stats
 GET          /storage
 GET          /thumbnails/<filename>
-GET          /variants
 GET          /welcome
 GET          /workspace
 GET,POST     /api/edit-presets
@@ -372,7 +369,6 @@ POST         /api/settings/import
 POST         /api/setup/complete
 POST         /api/shutdown
 POST         /api/species-highlights
-POST         /api/species/label-cluster
 POST         /api/storage/clear
 POST         /api/storage/clear-safe
 POST         /api/storage/delete-files

@@ -168,7 +168,6 @@ ALL_PAGES = [
     {"id": "map",             "label": "Map",             "href": "/map"},
     {"id": "location_review", "label": "Review Photo Locations", "href": "/locations/review",
      "keywords": "location review map coordinates collections gps places"},
-    {"id": "variants",        "label": "Variants",        "href": "/variants"},
     {"id": "dashboard",       "label": "Dashboard",       "href": "/dashboard"},
     {"id": "storage",         "label": "Storage",         "href": "/storage"},
     {"id": "audit",           "label": "Audit",           "href": "/audit"},
@@ -17494,9 +17493,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         that the rule has one implementation for both endpoints, so accept and
         reject cannot drift on what "current" means.
 
-        The latest-fingerprint expression is the one ``get_predictions``,
-        ``/api/species/summary`` and ``get_top_prediction_for_photo`` all use:
-        newest ``created_at``, ties broken by ``id``.
+        The latest-fingerprint expression is the one ``get_predictions`` and
+        ``get_top_prediction_for_photo`` both use: newest ``created_at``, ties
+        broken by ``id``.
 
         Chunked for the same reason every other id query here is (see
         ``_SQL_PARAM_CHUNK``).
@@ -17596,8 +17595,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         restates every prediction of the photo, so one stale member
         invalidates the whole photo's write, not just its own row.
 
-        The latest-fingerprint expression is the one ``_superseded_prediction_ids``,
-        ``get_predictions``, ``/api/species/summary`` and
+        The latest-fingerprint expression is the one
+        ``_superseded_prediction_ids``, ``get_predictions`` and
         ``get_top_prediction_for_photo`` all use: newest ``created_at``, ties
         broken by ``id``. Keeping one definition of "current" everywhere is
         the property the rest of this PR's precondition family relies on.
@@ -32133,229 +32132,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 log.exception("Failed to persist thumb_path for photo %s", photo_id)
 
         return _send_cached(thumb_dir, cache_filename)
-
-    @app.route("/api/species/<path:species_name>/clusters")
-    def api_species_clusters(species_name):
-        """Cluster photos of a species by visual similarity to find variants.
-
-        Uses agglomerative clustering on BioCLIP embeddings to discover
-        sub-groups (male/female, juvenile/adult, etc.).
-        """
-        import numpy as np
-
-        db = _get_db()
-        import config as cfg
-        ws = db._active_workspace_id
-        min_conf = db.get_effective_config(cfg.load()).get(
-            "detector_confidence", 0.2
-        )
-        distance_threshold = request.args.get("threshold", 0.4, type=float)
-
-        # Cluster within a single classifier model. A workspace whose
-        # detections were classified under both BioCLIP-2 and BioCLIP-3
-        # would otherwise emit one prediction row per model, double-count
-        # the photo, and cluster vectors from incompatible model spaces.
-        from models import get_active_model
-        active_model = get_active_model()
-        if not active_model or active_model.get("model_type", "bioclip") == "timm":
-            return jsonify({
-                "species": species_name,
-                "clusters": [],
-                "total_photos": 0,
-            })
-        classifier_model = active_model["name"]
-
-        # Find all photos with this species prediction in the active
-        # workspace. Predictions are global but membership in the
-        # workspace is expressed through workspace_folders.
-        #
-        # Fingerprint filter: for the chosen classifier_model surface only
-        # rows from the most recent labels_fingerprint. Without this, a
-        # workspace that rotated label sets would cluster stale species
-        # rows alongside current ones, distorting cluster membership /
-        # counts / variant labels and duplicating the same photo embedding.
-        rows = db.conn.execute(
-            """SELECT d.photo_id, pe.embedding, p.filename, p.thumb_path,
-                      pr.confidence, pr.taxonomy_order, pr.taxonomy_family
-               FROM predictions pr
-               JOIN detections d ON d.id = pr.detection_id
-               JOIN photos p ON p.id = d.photo_id
-               JOIN workspace_folders wf
-                 ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
-               JOIN photo_embeddings pe
-                 ON pe.photo_id = d.photo_id
-                AND pe.model = pr.classifier_model
-                AND pe.variant = ''
-               WHERE pr.species = ?
-                 AND pr.classifier_model = ?
-                 AND d.detector_confidence >= ?
-                 AND pr.labels_fingerprint = (
-                    SELECT pr2.labels_fingerprint FROM predictions pr2
-                    WHERE pr2.detection_id = pr.detection_id
-                      AND pr2.classifier_model = pr.classifier_model
-                    ORDER BY pr2.created_at DESC, pr2.id DESC
-                    LIMIT 1
-                 )""",
-            (ws, species_name, classifier_model, min_conf),
-        ).fetchall()
-
-        if len(rows) < 2:
-            # Not enough photos to cluster
-            photos = []
-            for r in rows:
-                photo = db.get_photo(r["photo_id"])
-                if photo:
-                    photos.append({"photo": dict(photo), "cluster": 0})
-            _attach_nested_edit_recipes(db, photos)
-            return jsonify(
-                {
-                    "species": species_name,
-                    "clusters": (
-                        [{"id": 0, "label": "", "photos": photos}] if photos else []
-                    ),
-                    "total_photos": len(rows),
-                }
-            )
-
-        # Load embeddings
-        photo_data = []
-        embeddings = []
-        for r in rows:
-            emb = np.frombuffer(r["embedding"], dtype=np.float32)
-            embeddings.append(emb)
-            photo = db.get_photo(r["photo_id"])
-            if photo:
-                photo_data.append(dict(photo))
-            else:
-                photo_data.append({"id": r["photo_id"], "filename": r["filename"]})
-        _attach_nested_edit_recipes(db, photo_data)
-
-        emb_matrix = np.stack(embeddings)
-
-        # Cosine distance matrix (1 - similarity)
-        # Embeddings are normalized, so dot product = cosine similarity
-        sim_matrix = emb_matrix @ emb_matrix.T
-        dist_matrix = np.maximum(1.0 - sim_matrix, 0.0)
-        np.fill_diagonal(dist_matrix, 0)
-
-        # Agglomerative clustering
-        from scipy.cluster.hierarchy import fcluster, linkage
-        from scipy.spatial.distance import squareform
-
-        condensed = squareform(dist_matrix, checks=False)
-        Z = linkage(condensed, method="average")
-        labels = fcluster(Z, t=distance_threshold, criterion="distance")
-
-        # Group photos by cluster
-        cluster_map = {}
-        for i, label in enumerate(labels):
-            cid = int(label) - 1
-            if cid not in cluster_map:
-                cluster_map[cid] = []
-            cluster_map[cid].append(
-                {
-                    "photo": photo_data[i],
-                    "cluster": cid,
-                }
-            )
-
-        # Sort clusters by size (largest first)
-        clusters = []
-        for cid in sorted(cluster_map.keys(), key=lambda k: -len(cluster_map[k])):
-            clusters.append(
-                {
-                    "id": cid,
-                    "label": "",
-                    "count": len(cluster_map[cid]),
-                    "photos": cluster_map[cid],
-                }
-            )
-
-        return jsonify(
-            {
-                "species": species_name,
-                "clusters": clusters,
-                "total_photos": len(rows),
-                "num_clusters": len(clusters),
-                "distance_threshold": distance_threshold,
-            }
-        )
-
-    @app.route("/api/species/label-cluster", methods=["POST"])
-    def api_label_cluster():
-        """Apply a label (e.g. 'male', 'juvenile') to all photos in a cluster."""
-        db = _get_db()
-        body = request.get_json(silent=True) or {}
-        photo_ids = body.get("photo_ids", [])
-        label = body.get("label", "").strip()
-        if not photo_ids or not label:
-            return json_error("photo_ids and label required")
-
-        try:
-            kid = db.add_keyword(label)
-        except ValueError as exc:
-            return json_error(str(exc))
-        # Queue/record the stored spelling (see api_add_keyword).
-        stored = db.conn.execute(
-            "SELECT name FROM keywords WHERE id = ?", (kid,)
-        ).fetchone()
-        if stored and stored["name"]:
-            label = stored["name"]
-        for pid in photo_ids:
-            db.tag_photo(pid, kid, source="manual")
-            db.queue_change(pid, "keyword_add", label)
-
-        items = [{'photo_id': pid, 'old_value': '', 'new_value': str(kid)} for pid in photo_ids]
-        db.record_edit('keyword_add', f'Labeled {len(photo_ids)} photos as "{label}"',
-                       str(kid), items, is_batch=len(photo_ids) > 1)
-
-        log.info("Labeled %d photos as '%s'", len(photo_ids), label)
-        return jsonify({"ok": True, "updated": len(photo_ids), "keyword_id": kid})
-
-    @app.route("/api/species/summary")
-    def api_species_list():
-        """List all species with prediction counts, for the variant explorer.
-
-        Scoped to photos in the active workspace via ``workspace_folders`` and
-        filtered at read time by the workspace-effective
-        ``detector_confidence`` threshold. Review status is sourced from the
-        workspace-scoped ``prediction_review`` table; rejected predictions
-        are excluded. Predictions are filtered to the most recent
-        ``labels_fingerprint`` per ``(detection, classifier_model)`` so that
-        stale species from old label sets do not contaminate counts after
-        re-classification.
-        """
-        db = _get_db()
-        import config as cfg
-        ws = db._active_workspace_id
-        min_conf = db.get_effective_config(cfg.load()).get(
-            "detector_confidence", 0.2
-        )
-        rows = db.conn.execute(
-            """SELECT pr.species, COUNT(DISTINCT d.photo_id) as photo_count,
-                      pr.taxonomy_order, pr.taxonomy_family, pr.taxonomy_genus,
-                      pr.scientific_name
-               FROM predictions pr
-               JOIN detections d ON d.id = pr.detection_id
-               JOIN photos p ON p.id = d.photo_id
-               JOIN workspace_folders wf
-                 ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
-               LEFT JOIN prediction_review pr_rev
-                 ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
-               WHERE d.detector_confidence >= ?
-                 AND COALESCE(pr_rev.status, 'pending') != 'rejected'
-                 AND pr.labels_fingerprint = (
-                    SELECT pr2.labels_fingerprint FROM predictions pr2
-                    WHERE pr2.detection_id = pr.detection_id
-                      AND pr2.classifier_model = pr.classifier_model
-                    ORDER BY pr2.created_at DESC, pr2.id DESC
-                    LIMIT 1
-                 )
-               GROUP BY pr.species
-               ORDER BY photo_count DESC""",
-            (ws, ws, min_conf),
-        ).fetchall()
-        return jsonify([dict(r) for r in rows])
 
     # -- Culling API --
 

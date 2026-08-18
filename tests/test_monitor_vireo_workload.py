@@ -1,3 +1,4 @@
+import http.client
 import json
 import socket
 import threading
@@ -1055,6 +1056,33 @@ def test_api_client_establishes_browser_cookie_before_reading_jobs():
 
     assert sample["status"] == 200
     assert sample["resource_budget"] == {"waiters": 0}
+
+
+def test_api_client_returns_failure_for_truncated_http_body():
+    class _TruncatedResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def read(self):
+            raise http.client.IncompleteRead(b'{"active":', 100)
+
+    class _Opener:
+        def open(self, _url, timeout):
+            assert timeout == 5.0
+            return _TruncatedResponse()
+
+    result = VireoApiClient(
+        "http://127.0.0.1:50222",
+        opener=_Opener(),
+    )._request("/api/jobs")
+
+    assert result["status"] is None
+    assert "IncompleteRead" in result["error"]
 
 
 def test_process_sampler_counts_cpu_for_newly_discovered_child():

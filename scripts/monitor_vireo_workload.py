@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import http.client
 import ipaddress
 import json
 import math
@@ -175,10 +176,10 @@ class VireoApiClient:
                 body = response.read()
                 status = response.status
         except urllib.error.HTTPError as exc:
-            body = exc.read()
+            body = b""
             status = exc.code
             error = f"HTTP {exc.code}"
-        except (OSError, urllib.error.URLError) as exc:
+        except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
             return {
                 "latency_seconds": round(self.clock() - started, 6),
                 "status": None,

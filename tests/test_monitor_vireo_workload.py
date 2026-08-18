@@ -1264,7 +1264,7 @@ def test_api_client_establishes_browser_cookie_before_reading_jobs():
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             host_headers.append(self.headers.get("Host"))
-            if self.path == "/":
+            if self.path == "/welcome?force=1":
                 self.send_response(200)
                 self.send_header("Set-Cookie", "vireo_session=test; Path=/; HttpOnly")
                 self.end_headers()

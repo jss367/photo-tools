@@ -228,7 +228,10 @@ class VireoApiClient:
         }
 
     def authenticate(self):
-        result = self._request("/")
+        # The root route redirects to /browse or /welcome. urllib does not
+        # preserve a custom Host header across that redirect, so bootstrap
+        # the browser-session cookie from the forced welcome HTML directly.
+        result = self._request("/welcome?force=1")
         if result.get("status") != 200:
             raise RuntimeError(
                 f"could not establish a Vireo browser session: "

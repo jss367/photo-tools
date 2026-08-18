@@ -1345,8 +1345,12 @@ Inside Group Review:
 - Up and Down move one lane at a time;
 - Left and Right change the active photo;
 - `Z` toggles the preview between fit and 1:1;
-- Delete stages **Extract photos to new burst**, never deletion from the
-  library; and
+- Delete stages **Extract photos to new burst** only when the selection is a
+  nonempty proper subset of the active burst; it never deletes library files.
+  When every burst photo is selected, Delete is disabled with **A complete
+  burst cannot be extracted** and offers **Separate burst as encounter** when
+  that command is valid. A sole-burst encounter offers neither structural
+  action; and
 - Escape requests close, warning first when staged changes exist.
 
 The footer has independently reviewable sections for **Apply triage**,
@@ -1706,6 +1710,7 @@ request is:
 {
   "review_run_id": "pipeline-1786837933532-107",
   "collection_id": 197,
+  "collection_snapshot_id": null,
   "status": "REVIEW",
   "species_review": "needs_review",
   "encounter_match": "any",
@@ -1748,6 +1753,19 @@ reads mutable decision state, the cursor also carries a
 collection-backed cursor also carries the opaque `collection_snapshot_id`
 resolved for its first page. The cursor encodes the sort key and stable ID of
 the last returned encounter — never a bare offset.
+
+`collection_snapshot_id` is also a top-level request field. A new query
+generation sends null, causing the server to resolve membership and return a
+new snapshot ID. Page requests carry that ID in their cursor. If a decision or
+structural revision makes the cursor stale, the client restarts from the first
+page with `cursor: null` and the same non-null `collection_snapshot_id`; the
+server then replays the updated canonical result against the same frozen
+membership. Changing collection, filters, or sort—or explicitly accepting
+**Collection changed—refresh view**—starts a new query generation and sends a
+null snapshot ID. The server retains a referenced snapshot for the documented
+review-session lifetime. If it has expired, it returns
+`collection_snapshot_expired`; the client explains that membership must be
+refreshed and starts a new generation instead of mixing snapshots.
 
 Whether decision-only mutations preserve the cursor depends on the active
 view:
@@ -2094,6 +2112,9 @@ invariant in both modes.
 - Stable collection snapshot paging while rules, manual membership, referenced
   photo metadata, or the visual index change; a refreshed query resolves the
   updated membership.
+- Decision- and structural-revision cursor restarts that preserve the active
+  `collection_snapshot_id`, plus explicit expired-snapshot recovery that never
+  mixes old and new membership.
 - Visual-collection resolution, including structured unavailable behavior when
   its model or index cannot be used and no metadata-only widening.
 - Complete encounter and burst membership in every returned page.

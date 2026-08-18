@@ -2103,8 +2103,12 @@ large preview; multi-photo actions target the selected set.</p>
 <li>Up and Down move one lane at a time;</li>
 <li>Left and Right change the active photo;</li>
 <li><code>Z</code> toggles the preview between fit and 1:1;</li>
-<li>Delete stages <strong>Extract photos to new burst</strong>, never
-deletion from the library; and</li>
+<li>Delete stages <strong>Extract photos to new burst</strong> only when
+the selection is a nonempty proper subset of the active burst; it never
+deletes library files. When every burst photo is selected, Delete is
+disabled with <strong>A complete burst cannot be extracted</strong> and
+offers <strong>Separate burst as encounter</strong> when that command is
+valid. A sole-burst encounter offers neither structural action; and</li>
 <li>Escape requests close, warning first when staged changes exist.</li>
 </ul>
 <p>The footer has independently reviewable sections for <strong>Apply
@@ -2471,15 +2475,16 @@ representative request is:</p>
 class="sourceCode json"><code class="sourceCode json"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
 <span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;review_run_id&quot;</span><span class="fu">:</span> <span class="st">&quot;pipeline-1786837933532-107&quot;</span><span class="fu">,</span></span>
 <span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;collection_id&quot;</span><span class="fu">:</span> <span class="dv">197</span><span class="fu">,</span></span>
-<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;status&quot;</span><span class="fu">:</span> <span class="st">&quot;REVIEW&quot;</span><span class="fu">,</span></span>
-<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;species_review&quot;</span><span class="fu">:</span> <span class="st">&quot;needs_review&quot;</span><span class="fu">,</span></span>
-<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;encounter_match&quot;</span><span class="fu">:</span> <span class="st">&quot;any&quot;</span><span class="fu">,</span></span>
-<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;search&quot;</span><span class="fu">:</span> <span class="st">&quot;sandpiper&quot;</span><span class="fu">,</span></span>
-<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;search_options&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;match_case&quot;</span><span class="fu">:</span> <span class="kw">false</span><span class="fu">,</span> <span class="dt">&quot;whole_word&quot;</span><span class="fu">:</span> <span class="kw">false</span><span class="fu">},</span></span>
-<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;sort&quot;</span><span class="fu">:</span> <span class="st">&quot;chronological&quot;</span><span class="fu">,</span></span>
-<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;cursor&quot;</span><span class="fu">:</span> <span class="kw">null</span><span class="fu">,</span></span>
-<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;page_budget&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;encounters&quot;</span><span class="fu">:</span> <span class="dv">40</span><span class="fu">,</span> <span class="dt">&quot;photos&quot;</span><span class="fu">:</span> <span class="dv">600</span><span class="fu">}</span></span>
-<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;collection_snapshot_id&quot;</span><span class="fu">:</span> <span class="kw">null</span><span class="fu">,</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;status&quot;</span><span class="fu">:</span> <span class="st">&quot;REVIEW&quot;</span><span class="fu">,</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;species_review&quot;</span><span class="fu">:</span> <span class="st">&quot;needs_review&quot;</span><span class="fu">,</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;encounter_match&quot;</span><span class="fu">:</span> <span class="st">&quot;any&quot;</span><span class="fu">,</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;search&quot;</span><span class="fu">:</span> <span class="st">&quot;sandpiper&quot;</span><span class="fu">,</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;search_options&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;match_case&quot;</span><span class="fu">:</span> <span class="kw">false</span><span class="fu">,</span> <span class="dt">&quot;whole_word&quot;</span><span class="fu">:</span> <span class="kw">false</span><span class="fu">},</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;sort&quot;</span><span class="fu">:</span> <span class="st">&quot;chronological&quot;</span><span class="fu">,</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;cursor&quot;</span><span class="fu">:</span> <span class="kw">null</span><span class="fu">,</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;page_budget&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;encounters&quot;</span><span class="fu">:</span> <span class="dv">40</span><span class="fu">,</span> <span class="dt">&quot;photos&quot;</span><span class="fu">:</span> <span class="dv">600</span><span class="fu">}</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
 <p>The server resolves collection membership and intersects it with the
 canonical process result. It returns:</p>
 <ul>
@@ -2512,6 +2517,21 @@ the global <code>revision</code> at issuance. A collection-backed cursor
 also carries the opaque <code>collection_snapshot_id</code> resolved for
 its first page. The cursor encodes the sort key and stable ID of the
 last returned encounter — never a bare offset.</p>
+<p><code>collection_snapshot_id</code> is also a top-level request
+field. A new query generation sends null, causing the server to resolve
+membership and return a new snapshot ID. Page requests carry that ID in
+their cursor. If a decision or structural revision makes the cursor
+stale, the client restarts from the first page with
+<code>cursor: null</code> and the same non-null
+<code>collection_snapshot_id</code>; the server then replays the updated
+canonical result against the same frozen membership. Changing
+collection, filters, or sort—or explicitly accepting <strong>Collection
+changed—refresh view</strong>—starts a new query generation and sends a
+null snapshot ID. The server retains a referenced snapshot for the
+documented review-session lifetime. If it has expired, it returns
+<code>collection_snapshot_expired</code>; the client explains that
+membership must be refreshed and starts a new generation instead of
+mixing snapshots.</p>
 <p>Whether decision-only mutations preserve the cursor depends on the
 active view:</p>
 <ul>
@@ -2953,6 +2973,9 @@ coverage.</li>
 <li>Stable collection snapshot paging while rules, manual membership,
 referenced photo metadata, or the visual index change; a refreshed query
 resolves the updated membership.</li>
+<li>Decision- and structural-revision cursor restarts that preserve the
+active <code>collection_snapshot_id</code>, plus explicit expired-snapshot
+recovery that never mixes old and new membership.</li>
 <li>Visual-collection resolution, including structured unavailable
 behavior when its model or index cannot be used and no metadata-only
 widening.</li>

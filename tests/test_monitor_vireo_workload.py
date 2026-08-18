@@ -10,6 +10,7 @@ from scripts.monitor_vireo_workload import (
     collect_workload,
     compact_jobs_payload,
     discover_server,
+    parse_args,
 )
 
 
@@ -179,6 +180,12 @@ def test_collect_workload_builds_deltas_targets_and_job_summary():
     assert summary["jobs"][0]["last_status"] == "completed"
     assert summary["jobs"][0]["duration"] == 42.0
     assert summary["jobs"][0]["observed_resource_wait_seconds"] == 2.5
+
+
+@pytest.mark.parametrize("argument", ["--duration", "--interval", "--timeout"])
+def test_sampling_cli_rejects_non_finite_values(argument):
+    with pytest.raises(SystemExit):
+        parse_args([argument, "nan"])
 
 
 def test_slow_poll_skips_missed_slots_instead_of_firing_back_to_back():
@@ -964,6 +971,7 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
             self.alive = True
             self.status_value = "running"
             self.child_processes = []
+            self.children_error = False
 
         def exe(self):
             return "/tmp/vireo-server"
@@ -981,6 +989,8 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
             return self.status_value
 
         def children(self, recursive=False):
+            if self.children_error:
+                raise RuntimeError("transient enumeration failure")
             return list(self.child_processes)
 
         def cpu_times(self):
@@ -1043,6 +1053,19 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
     root.child_processes = [replacement]
     clock.sleep(1.0)
     assert sampler.sample()["cpu_percent"] == 20.0
+
+    # A transient children() error reuses the cached child and retains its
+    # baseline while marking the interval unsuitable for distributions.
+    root.children_error = True
+    replacement.cpu_seconds = 0.3
+    clock.sleep(1.0)
+    incomplete_sample = sampler.sample()
+    assert incomplete_sample["cpu_percent"] == 10.0
+    assert incomplete_sample["process_tree_complete"] is False
+    root.children_error = False
+    replacement.cpu_seconds = 0.4
+    clock.sleep(1.0)
+    assert sampler.sample()["cpu_percent"] == 10.0
 
     root.alive = False
     with pytest.raises(RuntimeError, match="exited or was replaced"):

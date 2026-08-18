@@ -347,8 +347,16 @@ class ProcessTreeSampler:
 
     def _current_processes(self):
         discovered = [self.root]
-        with contextlib.suppress(self.psutil.Error):
+        enumeration_complete = True
+        try:
             discovered.extend(self.root.children(recursive=True))
+        except (OSError, self.psutil.Error):
+            enumeration_complete = False
+            discovered.extend(
+                process
+                for process in self.processes.values()
+                if process.pid != self.root.pid
+            )
         live = {}
         for process in discovered:
             try:
@@ -360,7 +368,7 @@ class ProcessTreeSampler:
             # same process; otherwise retain the newly discovered object.
             live[identity] = self.processes.get(identity, process)
         self.processes = live
-        return list(live.values())
+        return list(live.values()), enumeration_complete
 
     def prime(self):
         self._assert_root_alive()
@@ -372,7 +380,12 @@ class ProcessTreeSampler:
         self._known_child_cpu_lifetimes = {}
         initial_rss_bytes = 0
         process_count = 0
-        for process in self._current_processes():
+        processes, enumeration_complete = self._current_processes()
+        if not enumeration_complete:
+            raise RuntimeError(
+                "could not enumerate the Vireo process tree before sampling"
+            )
+        for process in processes:
             try:
                 identity = (process.pid, process.create_time())
                 cpu = process.cpu_times()
@@ -407,7 +420,8 @@ class ProcessTreeSampler:
         rss_bytes = 0
         thread_count = 0
         process_count = 0
-        for process in self._current_processes():
+        processes, process_tree_complete = self._current_processes()
+        for process in processes:
             try:
                 identity = (process.pid, process.create_time())
                 cpu = process.cpu_times()
@@ -432,7 +446,18 @@ class ProcessTreeSampler:
                 thread_count += process.num_threads()
                 process_count += 1
             except (OSError, self.psutil.Error):
+                process_tree_complete = False
                 continue
+        if not process_tree_complete:
+            # An enumeration/read failure is not evidence that a cached child
+            # departed. Keep its cumulative baselines so a later successful
+            # poll does not charge its entire lifetime again from zero.
+            for identity, value in self._cpu_times.items():
+                current_cpu_times.setdefault(identity, value)
+            for identity, value in self._reaped_children_cpu_times.items():
+                current_reaped_children_cpu_times.setdefault(identity, value)
+            for identity, value in self._known_child_cpu_lifetimes.items():
+                current_child_cpu_lifetimes.setdefault(identity, value)
         departed = (
             self._known_child_cpu_lifetimes.keys()
             - current_child_cpu_lifetimes.keys()
@@ -472,7 +497,10 @@ class ProcessTreeSampler:
             "rss_bytes": rss_bytes,
             "process_count": process_count,
             "thread_count": thread_count,
-            "cpu_accounting_complete": self._cpu_accounting_complete,
+            "process_tree_complete": process_tree_complete,
+            "cpu_accounting_complete": (
+                self._cpu_accounting_complete and process_tree_complete
+            ),
             "executable_exists": metadata["executable_exists"],
         }
 
@@ -634,13 +662,25 @@ def build_summary(baseline, samples, *, process_metadata=None):
     ]
     api_failure_count = len(samples) - len(successful)
     api_latencies = [sample["api"]["latency_seconds"] for sample in successful]
-    process_cpu = [sample["process"]["cpu_percent"] for sample in samples]
+    complete_process_samples = [
+        sample for sample in samples
+        if sample["process"].get("process_tree_complete") is not False
+    ]
+    process_cpu = [
+        sample["process"]["cpu_percent"] for sample in complete_process_samples
+    ]
     cpu_summary = _number_summary(process_cpu)
     if cpu_summary is not None:
-        cpu_summary["accounting_complete"] = (
+        cpu_summary["accounting_complete"] = bool(
             (process_metadata or {}).get("cpu_accounting_complete")
+            and all(
+                sample["process"].get("cpu_accounting_complete") is not False
+                for sample in samples
+            )
         )
-    process_rss = [sample["process"]["rss_bytes"] for sample in samples]
+    process_rss = [
+        sample["process"]["rss_bytes"] for sample in complete_process_samples
+    ]
     initial_rss = (process_metadata or {}).get("initial_rss_bytes")
     system_idle = [sample["system"]["cpu_idle_percent"] for sample in samples]
     observations = [(0.0, baseline)] + [
@@ -658,6 +698,8 @@ def build_summary(baseline, samples, *, process_metadata=None):
     ]
     cpu_cap_violations = 0
     for sample in successful:
+        if sample["process"].get("process_tree_complete") is False:
+            continue
         capacity = (
             (sample["api"].get("resource_budget") or {})
             .get("cpu", {})
@@ -699,6 +741,9 @@ def build_summary(baseline, samples, *, process_metadata=None):
         executable_present = None
     return {
         "sample_count": len(samples),
+        "incomplete_process_sample_count": (
+            len(samples) - len(complete_process_samples)
+        ),
         "api_failure_count": api_failure_count,
         "vireo_process_tree_cpu_percent": cpu_summary,
         "vireo_process_tree_rss_bytes": {
@@ -1057,11 +1102,11 @@ def parse_args(argv=None):
     parser.add_argument("--timeout", type=float, default=5.0, help="per-request timeout in seconds (default: 5)")
     parser.add_argument("--output", type=Path, help="JSON report path (default: .context/benchmarks/...)")
     args = parser.parse_args(argv)
-    if args.duration <= 0:
+    if not math.isfinite(args.duration) or args.duration <= 0:
         parser.error("--duration must be greater than zero")
-    if args.interval <= 0:
+    if not math.isfinite(args.interval) or args.interval <= 0:
         parser.error("--interval must be greater than zero")
-    if args.timeout <= 0:
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--timeout must be greater than zero")
     return args
 

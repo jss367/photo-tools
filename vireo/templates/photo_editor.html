@@ -1008,11 +1008,48 @@ function editorImageMatchesZoomRecipe(img) {
   }
 }
 
+function editorMetadataOrientation(metadata) {
+  if (!metadata || typeof metadata !== 'object') return null;
+  var groups = ['EXIF', 'IFD0', 'TIFF', 'File'];
+  for (var i = 0; i < groups.length; i++) {
+    var group = metadata[groups[i]];
+    if (group && Object.prototype.hasOwnProperty.call(group, 'Orientation')) {
+      return group.Orientation;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(metadata, 'Orientation')) {
+    return metadata.Orientation;
+  }
+  return null;
+}
+
+function editorOrientationSwapsAxes(orientation) {
+  if (orientation == null || typeof orientation === 'boolean') return false;
+  if (typeof orientation === 'number') {
+    return [5, 6, 7, 8].indexOf(Math.round(orientation)) !== -1;
+  }
+  var text = String(orientation).trim().toLowerCase();
+  if (!text) return false;
+  var parsed = Number(text);
+  if (Number.isFinite(parsed)) {
+    return [5, 6, 7, 8].indexOf(Math.round(parsed)) !== -1;
+  }
+  return text.indexOf('90') !== -1 || text.indexOf('270') !== -1;
+}
+
 function editorNativeRecipeDimensions(recipe, applyCrop) {
   var photo = editorState.photo || {};
   var width = Number(photo.width) || 0;
   var height = Number(photo.height) || 0;
   if (!width || !height) return null;
+  // Stored dimensions use the sensor axes, while load_image applies EXIF
+  // orientation before the editor's recipe. Match the server's
+  // recipe_source_dimensions contract before applying rotation and crop.
+  if (editorOrientationSwapsAxes(editorMetadataOrientation(photo.metadata))) {
+    var exifSwap = width;
+    width = height;
+    height = exifSwap;
+  }
   var rotation = Number((recipe || {}).rotation || 0);
   rotation = ((rotation % 360) + 360) % 360;
   if (rotation === 90 || rotation === 270) {
@@ -3505,6 +3542,9 @@ function initEditorKeyboard() {
     var tag = t && t.tagName ? t.tagName.toLowerCase() : '';
     var isTextEntry = tag === 'input' || tag === 'textarea' || tag === 'select' ||
       (t && t.isContentEditable);
+    var cropFieldKey = tag === 'input' && t && {
+      cropX: 'x', cropY: 'y', cropW: 'w', cropH: 'h'
+    }[t.id];
     if ((e.key === ' ' || e.code === 'Space') && !e.metaKey && !e.ctrlKey && !e.altKey &&
         !isTextEntry && !isActivationControl(t, tag)) {
       // Skip when focus is on a button/link/summary/role="button" so Space
@@ -3513,7 +3553,17 @@ function initEditorKeyboard() {
       e.preventDefault();
       return;
     }
-    if (e.metaKey || e.ctrlKey || e.altKey || isTextEntry) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'Enter' && cropFieldKey) {
+      // These fields themselves reopen crop editing on focus. Apply the
+      // pending typed value before accepting the crop; relying on change/blur
+      // would commit the previous value because keydown fires first.
+      e.preventDefault();
+      setCropField(cropFieldKey, t.value);
+      commitCropView();
+      return;
+    }
+    if (isTextEntry) return;
     if (e.key === 'ArrowLeft') { e.preventDefault(); editorNav(-1); }
     else if (e.key === 'ArrowRight') { e.preventDefault(); editorNav(1); }
     else if (e.key === 'Enter') {

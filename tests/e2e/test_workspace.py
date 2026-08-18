@@ -97,8 +97,9 @@ def test_sync_back_replaces_folder_actions_with_live_progress(
         page.get_by_role("button", name="Sync Back", exact=True).click()
 
         row = page.locator(".workspace-folder-row-stacked")
-        status = row.locator(".workspace-folder-job")
+        status = row.locator(".workspace-folder-job").first
         expect(status).to_be_visible(timeout=5000)
+        expect(status).to_have_attribute("data-local-folder-root-id", str(folder_id))
         expect(status).to_contain_text("Syncing inline-progress-source to source")
         expect(status).to_contain_text("3 / 10 files")
         assert progress_sent.is_set()
@@ -107,6 +108,33 @@ def test_sync_back_replaces_folder_actions_with_live_progress(
         )
         expect(row.get_by_role("button", name="Sync Back", exact=True)).to_have_count(0)
         expect(row.get_by_role("button", name="Discard", exact=True)).to_have_count(0)
+
+        # A bulk job gives several rows the same job ID. Progress for one root
+        # must not overwrite another root's status.
+        page.evaluate(
+            """([jobId, rootId]) => {
+                const current = document.querySelector('.workspace-folder-job');
+                const other = current.cloneNode(true);
+                other.id = 'other-folder-job';
+                other.dataset.localFolderRootId = String(Number(rootId) + 1);
+                other.querySelector('.workspace-folder-job-phase').textContent = 'Waiting for its turn';
+                current.parentElement.appendChild(other);
+                window.dispatchEvent(new CustomEvent('vireo:local-folder-job-progress', {
+                    detail: {
+                        jobId,
+                        progress: {
+                            root_folder_id: rootId,
+                            phase: 'Publishing this folder',
+                            current: 4,
+                            total: 10
+                        }
+                    }
+                }));
+            }""",
+            [status.get_attribute("data-local-folder-job-id"), folder_id],
+        )
+        expect(status).to_contain_text("Publishing this folder")
+        expect(page.locator("#other-folder-job")).to_contain_text("Waiting for its turn")
     finally:
         release_sync.set()
 

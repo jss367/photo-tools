@@ -277,7 +277,8 @@ async function loadWsFolders() {
                 Number(jobProgress.total).toLocaleString() + ' files'
               : '';
             html += '<div class="workspace-folder-job" role="status" aria-live="polite" data-local-folder-job-id="' +
-              escapeAttr(localJob.id) + '">';
+              escapeAttr(localJob.id) + '" data-local-folder-root-id="' +
+              escapeAttr(local.root_folder_id) + '">';
             html += '<span class="btn-spinner" aria-hidden="true"></span>';
             html += '<span class="workspace-folder-job-phase">' + escapeHtml(jobPhase) + '</span>';
             html += '<span class="workspace-folder-job-progress">' + escapeHtml(jobCount) + '</span>';
@@ -306,20 +307,25 @@ async function loadWsFolders() {
 window.addEventListener('vireo:local-folder-job-progress', function(event) {
   var detail = event.detail || {};
   var jobId = String(detail.jobId || '');
-  var status = Array.from(document.querySelectorAll('[data-local-folder-job-id]')).find(
-    function(candidate) { return candidate.dataset.localFolderJobId === jobId; }
-  );
-  if (!status) return;
   var progress = detail.progress || {};
-  var phase = status.querySelector('.workspace-folder-job-phase');
-  var count = status.querySelector('.workspace-folder-job-progress');
-  if (phase && progress.phase) phase.textContent = progress.phase;
-  if (count) {
-    count.textContent = progress.total
-      ? Number(progress.current || 0).toLocaleString() + ' / ' +
-        Number(progress.total).toLocaleString() + ' files'
-      : '';
-  }
+  var progressRootId = progress.root_folder_id == null
+    ? null
+    : String(Number(progress.root_folder_id));
+  Array.from(document.querySelectorAll('[data-local-folder-job-id]')).forEach(
+    function(status) {
+      if (status.dataset.localFolderJobId !== jobId) return;
+      if (progressRootId !== null && status.dataset.localFolderRootId !== progressRootId) return;
+      var phase = status.querySelector('.workspace-folder-job-phase');
+      var count = status.querySelector('.workspace-folder-job-progress');
+      if (phase && progress.phase) phase.textContent = progress.phase;
+      if (count) {
+        count.textContent = progress.total
+          ? Number(progress.current || 0).toLocaleString() + ' / ' +
+            Number(progress.total).toLocaleString() + ' files'
+          : '';
+      }
+    }
+  );
 });
 
 async function removeFolderFromWs(wsId, folderId) {

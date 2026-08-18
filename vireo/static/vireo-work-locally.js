@@ -234,7 +234,9 @@
       return (candidate.folder_ids || []).map(Number).indexOf(rootId) >= 0;
     }) || null;
     if (!job || !activeJob || activeJob.id !== job.id) return job;
-    return Object.assign({}, job, {progress: activeJob.progress});
+    return Object.assign({}, job, {
+      progress: activeJob.progressByRoot[String(rootId)] || null
+    });
   }
 
   function folderName(path) {
@@ -665,17 +667,26 @@
     } catch (_error) {}
   }
 
+  function applyJobProgress(watch, progress) {
+    if (!progress || activeJob !== watch) return;
+    var rootId = Number(progress.root_folder_id);
+    if (Number.isFinite(rootId)) {
+      watch.progressByRoot[String(rootId)] = progress;
+    }
+    render();
+    publishJobProgress(watch.id, progress);
+  }
+
   function watchJob(jobId) {
     if (activeJob && activeJob.id === jobId) return;
     if (activeJob && activeJob.source) activeJob.source.close();
-    var watch = {id: jobId, progress: null, source: null};
+    var watch = {id: jobId, progressByRoot: {}, source: null, eventCount: 0};
     activeJob = watch;
     watch.source = safeEventSource('/api/jobs/' + encodeURIComponent(jobId) + '/stream', {
       onProgress: function(progress) {
         if (activeJob !== watch) return;
-        watch.progress = progress;
-        render();
-        publishJobProgress(jobId, progress);
+        watch.eventCount += 1;
+        applyJobProgress(watch, progress);
       },
       onComplete: async function(event) {
         if (activeJob !== watch) return;
@@ -694,6 +705,18 @@
       }
     });
     render();
+    // A worker can publish its first update before the POST response gives us
+    // the job ID. The event stream is intentionally live-only, so seed this
+    // watcher from the job snapshot unless a newer SSE update wins the race.
+    Vireo.api.json(
+      '/api/jobs/' + encodeURIComponent(jobId), {}, {toast: false}
+    ).then(function(snapshot) {
+      if (activeJob !== watch || watch.eventCount || !snapshot) return;
+      var progress = snapshot.progress || {};
+      if (progress.phase || progress.root_folder_id != null) {
+        applyJobProgress(watch, progress);
+      }
+    }).catch(function() {});
   }
 
   async function load() {

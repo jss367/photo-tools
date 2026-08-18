@@ -77,6 +77,12 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
     expect(page.locator("#exportPreview")).to_have_text(
         "Preview: Red-tailed Hawk.jpg"
     )
+    page.locator("#exportTemplate").fill(
+        "{folder}_{folder}_{species}_{species}"
+    )
+    expect(page.locator("#exportPreview")).to_have_text(
+        "Preview: park_park_Red-tailed Hawk_Red-tailed Hawk.jpg"
+    )
     page.locator("#exportTemplate").fill("{original}")
 
     page.get_by_role("button", name="Browse…", exact=True).click()

@@ -3284,6 +3284,10 @@ function markExportCustom() {
   document.getElementById('exportPreset').value = 'custom';
 }
 
+function sanitizeExportFilenamePart(value) {
+  return String(value || '').replace(/[<>:"/|?*\\]/g, '_');
+}
+
 function updateExportPreview() {
   var template = document.getElementById('exportTemplate').value;
   var photo = editorState.photo;
@@ -3296,14 +3300,19 @@ function updateExportPreview() {
   var datePart = timestamp ? timestamp.substring(0, 10) : 'unknown-date';
   var timePart = timestamp.length >= 19 ? timestamp.substring(11, 19).replace(/:/g, '') : '000000';
   var species = Array.isArray(photo.species) && photo.species.length ? photo.species[0] : 'unknown';
-  var preview = template
-    .replace('{original}', stem)
-    .replace('{date}', datePart)
-    .replace('{datetime}', datePart + '_' + timePart)
-    .replace('{species}', species)
-    .replace('{rating}', String(photo.rating || 0))
-    .replace('{seq}', '0001')
-    .replace('{folder}', '');
+  var replacements = {
+    original: stem,
+    date: datePart,
+    datetime: datePart + '_' + timePart,
+    species: sanitizeExportFilenamePart(species),
+    rating: String(photo.rating || 0),
+    seq: '0001',
+    folder: sanitizeExportFilenamePart(photo.folder_name),
+  };
+  var preview = template;
+  Object.keys(replacements).forEach(function(key) {
+    preview = preview.split('{' + key + '}').join(replacements[key]);
+  });
   var extension = exportExtensionForFormat(document.getElementById('exportFormat').value);
   document.getElementById('exportPreview').textContent = 'Preview: ' + preview + '.' + extension;
 }

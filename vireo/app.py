@@ -8203,6 +8203,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # right-click action can read a real filesystem path from the
             # detail response.
             result["path"] = os.path.join(folder["path"], photo["filename"])
+            result["folder_name"] = os.path.basename(folder["path"])
             xmp_path = os.path.join(
                 folder["path"],
                 os.path.splitext(photo["filename"])[0] + ".xmp",
@@ -8218,6 +8219,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             result["xmp_path"] = xmp_path
         else:
             result["path"] = ""
+            result["folder_name"] = ""
             result["xmp_exists"] = False
             result["xmp_keywords"] = []
             result["xmp_path"] = ""

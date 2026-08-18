@@ -696,7 +696,7 @@ def test_process_identity_is_rechecked_after_terminal_api_poll():
         def sample(self):
             nonlocal exited
             self.calls += 1
-            if self.calls == 2:
+            if self.calls == 3:
                 exited = True
             return _api_sample(
                 latency=0.001, wait_count=0, wait_seconds=0.0,
@@ -709,24 +709,33 @@ def test_process_identity_is_rechecked_after_terminal_api_poll():
                 raise RuntimeError("monitored Vireo PID 123 exited")
 
     process = _IdentitySampler(
-        [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True}],
+        [
+            {"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True},
+            {"cpu_percent": 200.0, "rss_bytes": 200, "executable_exists": True},
+        ],
         {"pid": 123, "executable_exists": True},
     )
     system = _SequenceSampler(
-        [{"cpu_idle_percent": 50.0}],
+        [{"cpu_idle_percent": 50.0}, {"cpu_idle_percent": 25.0}],
         {"logical_cpu_count": 16},
     )
 
-    with pytest.raises(RuntimeError, match="PID 123 exited"):
-        collect_workload(
-            duration=1.0,
-            interval=1.0,
-            api_client=_ExitDuringPollApi(),
-            process_sampler=process,
-            system_sampler=system,
-            monotonic=clock.monotonic,
-            sleep=clock.sleep,
-        )
+    report = collect_workload(
+        duration=2.0,
+        interval=1.0,
+        api_client=_ExitDuringPollApi(),
+        process_sampler=process,
+        system_sampler=system,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert report["process_exit_error"] == "monitored Vireo PID 123 exited"
+    assert len(report["samples"]) == 1
+    assert report["samples"][0]["elapsed_seconds"] == 1.0
+    assert report["summary"]["targets"][
+        "vireo_executable_present_throughout"
+    ] is False
 
 
 def test_interrupted_api_poll_retains_resource_sample_and_marks_failure():

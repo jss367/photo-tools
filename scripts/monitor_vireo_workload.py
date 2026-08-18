@@ -872,6 +872,7 @@ def collect_workload(
     next_sample = min(started + interval, deadline)
     samples = []
     interrupted = False
+    process_exit_error = None
     try:
         while True:
             sleep_for = next_sample - monotonic()
@@ -901,7 +902,15 @@ def collect_workload(
             # it completes so a replacement server on the same URL cannot
             # contribute the terminal Jobs payload to the original PID's
             # process samples.
-            process_sampler.verify_identity()
+            try:
+                process_sampler.verify_identity()
+            except RuntimeError as exc:
+                # The process sample and Jobs payload straddle an identity
+                # change, so neither belongs in the report. Preserve the
+                # earlier, post-request-verified samples and finish with the
+                # process-presence target failed.
+                process_exit_error = str(exc)
+                break
             samples.append({
                 "captured_at": _utc_now(),
                 "elapsed_seconds": round(elapsed, 3),
@@ -930,20 +939,22 @@ def collect_workload(
             next_sample = min(next_sample, deadline)
     except KeyboardInterrupt:
         interrupted = True
-    process_exit_error = None
-    try:
-        process_metadata = process_sampler.metadata()
-    except RuntimeError as exc:
-        # Samples whose post-request identity checks succeeded remain valid.
-        # Preserve a long-running report if the process exits only between the
-        # last accepted poll and final metadata collection.
-        process_exit_error = str(exc)
-        metadata_unverified = getattr(
-            process_sampler,
-            "metadata_unverified",
-            lambda: {"identity_verified": False},
-        )
+    metadata_unverified = getattr(
+        process_sampler,
+        "metadata_unverified",
+        lambda: {"identity_verified": False},
+    )
+    if process_exit_error is not None:
         process_metadata = metadata_unverified()
+    else:
+        try:
+            process_metadata = process_sampler.metadata()
+        except RuntimeError as exc:
+            # Samples whose post-request identity checks succeeded remain valid.
+            # Preserve a long-running report if the process exits only between the
+            # last accepted poll and final metadata collection.
+            process_exit_error = str(exc)
+            process_metadata = metadata_unverified()
     return {
         "schema_version": SCHEMA_VERSION,
         "started_at": started_at,

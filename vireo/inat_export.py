@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -202,6 +203,12 @@ def export_inat_photo(
             )
             os.close(stage_fd)
             shutil.copy2(rendered_path, staged_path)
+            # Preserve the normal umask-derived mode of the rendered export;
+            # mkstemp starts the staging file at owner-only permissions.
+            os.chmod(
+                staged_path,
+                stat.S_IMODE(os.stat(rendered_path).st_mode),
+            )
             os.replace(staged_path, final_path)
             staged_path = None
         except OSError as exc:

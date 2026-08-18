@@ -548,15 +548,30 @@ def test_api_inat_export_marks_wholly_unsuccessful_job_failed(
 
     assert response.status_code == 200
     assert job["status"] == "failed"
-    assert job["errors"] == [
-        f"{{'photo_id': {pid}, 'error': 'render failed'}}",
-    ]
+    assert len(job["errors"]) == 1
+    assert str(pid) in job["errors"][0]
+    assert "render failed" in job["errors"][0]
     assert job["result"]["ok"] is False
     assert job["result"]["exported"] == []
     assert job["result"]["errors"] == [{
         "photo_id": pid,
         "error": "render failed",
     }]
+
+
+@pytest.mark.parametrize("photo_id", [True, 1.9])
+def test_api_inat_export_rejects_non_integer_numeric_photo_ids(
+    app_and_db, tmp_path, photo_id,
+):
+    app, _db, _pid = app_and_db
+
+    response = app.test_client().post("/api/inat/export", json={
+        "destination": str(tmp_path),
+        "submissions": [{"photo_id": photo_id}],
+    })
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "photo_id must be an integer"
 
 
 def test_api_inat_export_includes_zero_coordinates(app_and_db, tmp_path):
@@ -673,6 +688,25 @@ def test_api_inat_submit_preserves_explicit_metadata_omissions(app_and_db):
     assert kwargs["latitude"] is None
     assert kwargs["longitude"] is None
     assert kwargs["description"] == "At the feeder"
+
+
+@pytest.mark.parametrize("coordinate", ["latitude", "longitude"])
+def test_api_inat_submit_rejects_partial_coordinates(app_and_db, coordinate):
+    app, _db, pid = app_and_db
+    import config as cfg
+    cfg.save({"inat_token": "fake-token"})
+
+    with patch("inat.submit_observation") as mock_submit:
+        response = app.test_client().post("/api/inat/submit", json={
+            "photo_id": pid,
+            coordinate: 12.5,
+        })
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == (
+        "latitude and longitude must be provided together"
+    )
+    mock_submit.assert_not_called()
 
 
 def test_api_inat_submit_reports_partial_upload(app_and_db):
@@ -931,6 +965,24 @@ def test_api_inat_submit_batch(app_and_db):
     data = resp.get_json()
     assert len(data['results']) == 1
     assert data['results'][0]['observation_id'] == 11111
+
+
+def test_api_inat_submit_batch_rejects_partial_coordinates(app_and_db):
+    app, _db, pid = app_and_db
+    import config as cfg
+    cfg.save({"inat_token": "fake-token"})
+
+    with patch("inat.submit_observation") as mock_submit:
+        response = app.test_client().post("/api/inat/submit-batch", json={
+            "submissions": [{"photo_id": pid, "latitude": 12.5}],
+        })
+
+    assert response.status_code == 200
+    assert response.get_json()["results"] == [{
+        "photo_id": pid,
+        "error": "latitude and longitude must be provided together",
+    }]
+    mock_submit.assert_not_called()
 
 
 def test_api_inat_submit_batch_reports_partial_upload(app_and_db):

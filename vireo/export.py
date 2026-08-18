@@ -178,6 +178,8 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
     Returns:
         dict with keys: exported (int), errors (list of str), destination
         (str), plus files (list of output paths) when collect_files is true.
+        The files list contains only successful outputs and is not guaranteed
+        to remain positionally aligned with photo_ids.
     """
     options = options or {}
     template = options.get("naming_template", "{original}")

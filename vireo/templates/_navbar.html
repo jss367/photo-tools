@@ -9095,6 +9095,13 @@ var _inatSubmitting = false;  // true while inatDoSubmit's loop is running
 var _inatCancelled = false;   // set by closeInatModal to stop the loop gracefully
 var _inatQuickFailures = [];
 var _inatModalGeneration = 0;
+var _inatExportStream = null;
+
+function _closeInatExportStream() {
+  if (!_inatExportStream) return;
+  try { _inatExportStream.close(); } catch(e) {}
+  _inatExportStream = null;
+}
 
 function _inatQueueItem(photoId, data) {
   return {
@@ -9235,6 +9242,7 @@ async function submitToInatBatch(photoIds) {
 
 async function openInatQuickModal(items, failures) {
   _inatModalGeneration++;
+  _closeInatExportStream();
   if (window._inatEscToken) Keymap.popEsc(window._inatEscToken);
   window._inatEscToken = Keymap.pushEsc(function() { closeInatModal(); });
 
@@ -9283,7 +9291,7 @@ async function openInatQuickModal(items, failures) {
       '<label style="font-size:13px;color:var(--text-secondary);display:flex;align-items:center;gap:8px;">' +
         '<input id="inatIncludeDescription' + idx + '" type="checkbox"> Description' +
       '</label>' +
-      '<textarea id="inatQuickDescription' + idx + '" placeholder="Description (optional)" style="width:100%;min-height:48px;box-sizing:border-box;background:var(--bg-secondary);color:var(--text-primary);border:1px solid var(--border-secondary);border-radius:3px;padding:6px 8px;font-size:12px;resize:vertical;"></textarea>' +
+      '<textarea id="inatQuickDescription' + idx + '" aria-label="Description" placeholder="Description (optional)" style="width:100%;min-height:48px;box-sizing:border-box;background:var(--bg-secondary);color:var(--text-primary);border:1px solid var(--border-secondary);border-radius:3px;padding:6px 8px;font-size:12px;resize:vertical;"></textarea>' +
     '</fieldset>';
   }
 
@@ -9467,13 +9475,23 @@ async function exportInatQuickPhotos() {
         reveal: typeof isTauri === 'function' && isTauri(),
       }),
     }, { toast: false });
-    safeEventSource('/api/jobs/' + started.job_id + '/stream', {
+    if (generation !== _inatModalGeneration || inatQueue !== queue) return;
+    _closeInatExportStream();
+    var exportStream = safeEventSource('/api/jobs/' + started.job_id + '/stream', {
       onProgress: function(progress) {
+        if (
+          generation !== _inatModalGeneration ||
+          _inatExportStream !== exportStream
+        ) return;
         var current = progress.current || 0;
         var total = progress.total || itemCount;
         status.textContent = 'Exporting ' + current + ' of ' + total + '\u2026';
       },
       onComplete: function(done) {
+        var isCurrentStream = _inatExportStream === exportStream;
+        if (!isCurrentStream || generation !== _inatModalGeneration) return;
+        try { exportStream.close(); } catch(e) {}
+        _inatExportStream = null;
         var result = done.result || {};
         var count = (result.exported || []).length;
         var failed = (result.errors || []).length;
@@ -9495,13 +9513,19 @@ async function exportInatQuickPhotos() {
         button.textContent = itemCount === 1 ? 'Export JPEG\u2026' : 'Export ' + itemCount + ' JPEGs\u2026';
       },
       onError: function() {
+        var isCurrentStream = _inatExportStream === exportStream;
+        if (!isCurrentStream || generation !== _inatModalGeneration) return;
+        try { exportStream.close(); } catch(e) {}
+        _inatExportStream = null;
         status.className = 'inat-card-status error';
         status.textContent = '\u2717 Lost the export progress connection.';
         button.disabled = false;
         button.textContent = itemCount === 1 ? 'Export JPEG\u2026' : 'Export ' + itemCount + ' JPEGs\u2026';
       },
     });
+    _inatExportStream = exportStream;
   } catch(e) {
+    if (generation !== _inatModalGeneration) return;
     status.className = 'inat-card-status error';
     status.textContent = '\u2717 ' + e.message;
     button.disabled = false;
@@ -9511,6 +9535,7 @@ async function exportInatQuickPhotos() {
 
 function openInatModal(failures) {
   _inatModalGeneration++;
+  _closeInatExportStream();
   if (window._inatEscToken) Keymap.popEsc(window._inatEscToken);
   window._inatEscToken = Keymap.pushEsc(function() { closeInatModal(); });
 
@@ -9562,6 +9587,7 @@ function openInatModal(failures) {
 
 function closeInatModal() {
   _inatModalGeneration++;
+  _closeInatExportStream();
   if (window._inatEscToken) { Keymap.popEsc(window._inatEscToken); window._inatEscToken = null; }
   document.getElementById('inatModal').classList.remove('open');
   if (_inatSubmitting) {

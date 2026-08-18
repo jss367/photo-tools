@@ -23875,8 +23875,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         for item in submissions:
             if not isinstance(item, dict):
                 return json_error("each submission must be an object")
+            raw_photo_id = item.get("photo_id")
+            if isinstance(raw_photo_id, (bool, float)):
+                return json_error("photo_id must be an integer")
             try:
-                photo_id = int(item.get("photo_id"))
+                photo_id = int(raw_photo_id)
             except (TypeError, ValueError):
                 return json_error("photo_id must be an integer")
             normalized = dict(item)
@@ -24283,8 +24286,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         loc = db.get_effective_photo_location(photo_id)
         photo_lat = loc["latitude"] if loc else None
         photo_lng = loc["longitude"] if loc else None
-        lat = data.get("latitude", photo_lat)
-        lng = data.get("longitude", photo_lng)
+        has_latitude = "latitude" in data
+        has_longitude = "longitude" in data
+        if has_latitude != has_longitude:
+            return json_error(
+                "latitude and longitude must be provided together", 400,
+            )
+        if has_latitude:
+            lat = data["latitude"]
+            lng = data["longitude"]
+        else:
+            lat = photo_lat
+            lng = photo_lng
 
         try:
             obs_id, obs_url = inat.submit_observation(
@@ -24337,6 +24350,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         results = []
         for sub in submissions:
             photo_id = sub.get("photo_id")
+            has_latitude = "latitude" in sub
+            has_longitude = "longitude" in sub
+            if has_latitude != has_longitude:
+                results.append({
+                    "photo_id": photo_id,
+                    "error": "latitude and longitude must be provided together",
+                })
+                continue
             photo = db.conn.execute(
                 """SELECT p.*, f.path as folder_path FROM photos p
                    JOIN folders f ON f.id = p.folder_id WHERE p.id = ?""",
@@ -24389,8 +24410,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             loc = db.get_effective_photo_location(photo_id)
             photo_lat = loc["latitude"] if loc else None
             photo_lng = loc["longitude"] if loc else None
-            lat = sub.get("latitude", photo_lat)
-            lng = sub.get("longitude", photo_lng)
+            if has_latitude:
+                lat = sub["latitude"]
+                lng = sub["longitude"]
+            else:
+                lat = photo_lat
+                lng = photo_lng
 
             try:
                 obs_id, obs_url = inat.submit_observation(

@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+import stat
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -201,3 +203,42 @@ def test_export_inat_photo_uses_bounded_staging_filename(tmp_path):
 
     assert output == str(destination / f"{long_stem}-iNaturalist.jpg")
     assert os.path.isfile(output)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_export_inat_photo_restores_rendered_file_mode(tmp_path):
+    db = Database(str(tmp_path / "vireo.db"))
+    workspace_id = db.ensure_default_workspace()
+    db.set_active_workspace(workspace_id)
+    source_dir = tmp_path / "photos"
+    source_dir.mkdir()
+    source = source_dir / "cardinal.jpg"
+    Image.new("RGB", (32, 24), (190, 30, 20)).save(source)
+    folder_id = db.add_folder(str(source_dir), name="photos")
+    photo_id = db.add_photo(
+        folder_id=folder_id,
+        filename=source.name,
+        extension=".jpg",
+        file_size=source.stat().st_size,
+        file_mtime=source.stat().st_mtime,
+        timestamp="2024-06-01T10:00:00",
+    )
+    rendered_modes = []
+
+    def copy_without_mode(source_path, destination_path):
+        rendered_modes.append(stat.S_IMODE(os.stat(source_path).st_mode))
+        return shutil.copyfile(source_path, destination_path)
+
+    with (
+        patch("inat_export.write_inat_metadata"),
+        patch("inat_export.shutil.copy2", side_effect=copy_without_mode),
+    ):
+        output = export_inat_photo(
+            db,
+            str(tmp_path / "cache"),
+            photo_id,
+            str(tmp_path / "exports"),
+            {},
+        )
+
+    assert stat.S_IMODE(os.stat(output).st_mode) == rendered_modes[0]

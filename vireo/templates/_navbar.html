@@ -7479,24 +7479,39 @@ function cropResetFrame() {
   _cropRenderBox();
 }
 
+function _cropBoxForAspect(crop, normalizedRatio) {
+  var current = _cropClampBox(crop);
+  if (!Number.isFinite(normalizedRatio) || normalizedRatio <= 0) return current;
+  var centerX = current.x + current.w / 2;
+  var centerY = current.y + current.h / 2;
+  var w = current.w;
+  var h = current.h;
+  // Fit the requested ratio inside the user's current crop instead of
+  // replacing their latest drag with a new full-frame-centered crop. Only
+  // the minimum-size floor below is allowed to grow beyond that selection.
+  if (w / h > normalizedRatio) w = h * normalizedRatio;
+  else h = w / normalizedRatio;
+  // Keep the shared editor's per-axis 2% clamp from changing the ratio.
+  var minScale = Math.max(1, 0.02 / w, 0.02 / h);
+  w *= minScale;
+  h *= minScale;
+  return _cropClampBox({
+    x: centerX - w / 2,
+    y: centerY - h / 2,
+    w: w,
+    h: h,
+  });
+}
+
 function cropSetAspect(aspect) {
   if (!_cropRecipe) return;
   var img = document.getElementById('cropEditorImg');
   if (!img || !img.clientWidth || !img.clientHeight) return;
   var imageAspect = img.clientWidth / img.clientHeight;
   var normalizedRatio = aspect / imageAspect;
-  var w = 0.9;
-  var h = w / normalizedRatio;
-  if (h > 0.9) {
-    h = 0.9;
-    w = h * normalizedRatio;
-  }
-  _cropRecipe.crop = {
-    x: (1 - w) / 2,
-    y: (1 - h) / 2,
-    w: w,
-    h: h,
-  };
+  _cropRecipe.crop = _cropBoxForAspect(
+    _cropDefaultCrop(_cropRecipe), normalizedRatio
+  );
   _cropRenderBox();
 }
 

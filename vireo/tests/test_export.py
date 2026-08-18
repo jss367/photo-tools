@@ -5,6 +5,7 @@ import errno
 import json
 import os
 import sys
+from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -174,6 +175,45 @@ def test_export_photos_collects_paths_only_when_requested(export_env):
     assert result["files"] == [
         os.path.join(env["dest"], "bird1.jpg"),
         os.path.join(env["dest"], "bird2.jpg"),
+    ]
+
+
+def test_reveal_single_export_selects_file_on_macos(tmp_path, monkeypatch):
+    import export as export_module
+
+    exported = tmp_path / "bird.jpg"
+    exported.write_bytes(b"image")
+    run = MagicMock(return_value=MagicMock(returncode=0))
+    monkeypatch.setattr(export_module.sys, "platform", "darwin")
+    monkeypatch.setattr(export_module.subprocess, "run", run)
+
+    assert export_module.reveal_exported_files([str(exported)]) is True
+    assert run.call_args.args[0] == ["open", "-R", "--", str(exported)]
+
+
+def test_reveal_export_batch_opens_each_output_folder_on_linux(
+    tmp_path, monkeypatch,
+):
+    import export as export_module
+
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = first_dir / "bird1.jpg"
+    second = second_dir / "bird2.jpg"
+    first.write_bytes(b"image")
+    second.write_bytes(b"image")
+    run = MagicMock(return_value=MagicMock(returncode=0))
+    monkeypatch.setattr(export_module.sys, "platform", "linux")
+    monkeypatch.setattr(export_module.subprocess, "run", run)
+
+    assert export_module.reveal_exported_files(
+        [str(first), str(second)],
+    ) is True
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["xdg-open", str(first_dir)],
+        ["xdg-open", str(second_dir)],
     ]
 
 

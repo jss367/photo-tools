@@ -26637,6 +26637,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         quality = body.get("quality", 92)
         output_format = body.get("format", body.get("output_format", "jpg"))
         metadata_fields = body.get("metadata_fields", [])
+        reveal_after_export = body.get("reveal_after_export", False)
 
         if not raw_ids:
             return json_error("photo_ids required")
@@ -26651,6 +26652,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error("destination must be an absolute path")
         if not isinstance(export_to_subfolder, bool):
             return json_error("export_to_subfolder must be a boolean")
+        if not isinstance(reveal_after_export, bool):
+            return json_error("reveal_after_export must be a boolean")
         if max_size in ("", 0):
             max_size = None
         if max_size is not None:
@@ -26703,7 +26706,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         developed_dir = effective_cfg.get("darktable_output_dir", "") or ""
 
         def work(job):
-            from export import export_photos
+            from export import export_photos, reveal_exported_files
 
             thread_db = Database(db_path)
             thread_db.set_active_workspace(active_ws)
@@ -26725,7 +26728,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "phase": "Exporting photos",
                 })
 
-            return export_photos(
+            result = export_photos(
                 db=thread_db,
                 vireo_dir=vireo_dir,
                 photo_ids=photo_ids,
@@ -26739,9 +26742,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "developed_dir": developed_dir,
                     "metadata_fields": metadata_fields,
                     "export_to_subfolder": export_to_subfolder,
+                    "collect_files": reveal_after_export,
                 },
                 progress_cb=progress_cb,
             )
+            exported_files = result.pop("files", [])
+            result["revealed"] = bool(
+                reveal_after_export
+                and exported_files
+                and not runner.is_cancelled(job["id"])
+                and reveal_exported_files(exported_files)
+            )
+            return result
 
         job_id = runner.start(
             "export", work,
@@ -26753,6 +26765,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "naming_template": naming_template,
                 "format": output_format,
                 "metadata_fields": metadata_fields,
+                "reveal_after_export": reveal_after_export,
             },
             workspace_id=active_ws,
         )

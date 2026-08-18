@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 
 from image_edits import apply_recipe_to_loaded_image
 from image_loader import RAW_DECODE_PRESERVE_HIGHLIGHTS, RAW_EXTENSIONS, load_image
@@ -43,6 +44,63 @@ EXPORT_METADATA_FIELDS = frozenset({
     "location",
     "camera",
 })
+
+
+def reveal_exported_files(paths):
+    """Show successful exports in the platform's file manager.
+
+    A single export is selected when the platform supports it. For a batch,
+    open each resolved output directory so the user is not sent to an image
+    viewer and exports beside originals remain discoverable across folders.
+    Returns true when every file-manager command was dispatched successfully.
+    """
+    existing_paths = [
+        os.path.abspath(path)
+        for path in paths or []
+        if path and os.path.isfile(path)
+    ]
+    if not existing_paths:
+        return False
+
+    if len(existing_paths) == 1:
+        targets = [(existing_paths[0], False)]
+    else:
+        candidate_dirs = [os.path.dirname(path) for path in existing_paths]
+        # Preserve export order while avoiding duplicate file-manager windows.
+        targets = [(path, True) for path in dict.fromkeys(candidate_dirs)]
+
+    all_revealed = True
+    for target, is_directory in targets:
+        try:
+            if sys.platform == "darwin":
+                command = (
+                    ["open", "--", target]
+                    if is_directory
+                    else ["open", "-R", "--", target]
+                )
+            elif sys.platform.startswith("win"):
+                command = (
+                    ["explorer", target]
+                    if is_directory
+                    else ["explorer", f"/select,{target}"]
+                )
+            else:
+                folder = target if is_directory else os.path.dirname(target)
+                command = ["xdg-open", os.path.abspath(folder)]
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+                **no_window_kwargs(),
+            )
+            # Explorer commonly returns 1 even after opening successfully.
+            if not sys.platform.startswith("win") and result.returncode != 0:
+                all_revealed = False
+        except (OSError, subprocess.TimeoutExpired):
+            all_revealed = False
+    return all_revealed
 
 
 def sanitize_filename(name):

@@ -1568,12 +1568,12 @@ def _deduplicate_path(
             return is_reserved(candidate)
         return path_key(candidate) in reserved_paths
 
-    if not os.path.exists(path) and not reserved(path):
+    if not os.path.lexists(path) and not reserved(path):
         return path
     stem, ext = os.path.splitext(path)
     counter = 2
     while (
-        os.path.exists(f"{stem}_{counter}{ext}")
+        os.path.lexists(f"{stem}_{counter}{ext}")
         or reserved(f"{stem}_{counter}{ext}")
     ):
         counter += 1

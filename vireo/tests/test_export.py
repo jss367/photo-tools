@@ -1408,6 +1408,33 @@ def test_preview_export_renames_reports_existing_file(export_env):
     }]
 
 
+def test_preview_export_renames_treats_dangling_symlinks_as_occupied(export_env):
+    """Preflight must match exclusive creation for dangling directory entries."""
+    env = export_env
+    os.makedirs(env["dest"])
+    requested = os.path.join(env["dest"], "bird1.jpg")
+    numbered = os.path.join(env["dest"], "bird1_2.jpg")
+    try:
+        os.symlink("missing-requested-target", requested)
+        os.symlink("missing-numbered-target", numbered)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "format": "jpg"},
+    )
+
+    assert renames == [{
+        "photo_id": env["p1"],
+        "requested_name": "bird1.jpg",
+        "export_name": "bird1_3.jpg",
+        "destination": env["dest"],
+    }]
+
+
 def test_preview_export_renames_reports_same_batch_collision(export_env):
     """Preflight also predicts collisions created by earlier batch entries."""
     env = export_env

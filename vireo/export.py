@@ -523,14 +523,18 @@ def _export_timestamp_parts(timestamp):
         value,
     )
     if not match:
-        return None, None, None, None, None
+        return None, None, None, None, None, None
     year, month, day, hour, minute, second, subsecond, offset = match.groups()
+    if offset == "Z":
+        offset = "+00:00"
     date = f"{year}:{month}:{day}"
-    capture_time = f"{hour}:{minute}:{second}"
-    exif_datetime = f"{date} {capture_time}"
+    capture_time = f"{hour}:{minute}:{second}{offset or ''}"
     suffix = (f".{subsecond}" if subsecond else "") + (offset or "")
     xmp_datetime = f"{year}-{month}-{day}T{hour}:{minute}:{second}{suffix}"
-    return date, capture_time, exif_datetime, xmp_datetime, subsecond
+    # EXIF stores the offset in separate tags, so keep its base timestamp
+    # timezone-free even though IPTC and XMP carry the suffix inline.
+    exif_datetime = f"{date} {hour}:{minute}:{second}"
+    return date, capture_time, exif_datetime, xmp_datetime, subsecond, offset
 
 
 def _metadata_assignment(tag, value):
@@ -561,6 +565,7 @@ def _write_export_metadata(out_path, fields, photo, species, camera_data):
         exif_datetime,
         xmp_datetime,
         subsecond,
+        offset,
     ) = _export_timestamp_parts(_photo_value(photo, "timestamp"))
     if "capture_date" in selected and date:
         args.append(_metadata_assignment("IPTC:DateCreated", date))
@@ -581,6 +586,11 @@ def _write_export_metadata(out_path, fields, photo, species, camera_data):
             args.extend([
                 _metadata_assignment("EXIF:SubSecTimeOriginal", subsecond),
                 _metadata_assignment("EXIF:SubSecTimeDigitized", subsecond),
+            ])
+        if offset:
+            args.extend([
+                _metadata_assignment("EXIF:OffsetTimeOriginal", offset),
+                _metadata_assignment("EXIF:OffsetTimeDigitized", offset),
             ])
 
     if "rating" in selected:

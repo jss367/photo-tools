@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import pytest
 from db import Database
 from export import (
+    _export_timestamp_parts,
     developed_folder_key,
     export_photos,
     normalize_metadata_fields,
@@ -87,6 +88,17 @@ def test_normalize_metadata_fields_validates_and_deduplicates():
         normalize_metadata_fields(["copyright"])
 
 
+def test_export_timestamp_parts_normalizes_utc_suffix():
+    assert _export_timestamp_parts("2024-06-15T14:30:22.5Z") == (
+        "2024:06:15",
+        "14:30:22+00:00",
+        "2024:06:15 14:30:22",
+        "2024-06-15T14:30:22.5+00:00",
+        "5",
+        "+00:00",
+    )
+
+
 @pytest.fixture
 def export_env(tmp_path):
     """Set up a DB with photos and real image files for export testing."""
@@ -154,7 +166,7 @@ def test_export_photos_embeds_only_selected_metadata(export_env):
     env = export_env
     env["db"].conn.execute(
         "UPDATE photos SET timestamp=? WHERE id=?",
-        ("2024-06-15T14:30:22.123456", env["p1"]),
+        ("2024-06-15T14:30:22.123456-07:00", env["p1"]),
     )
     env["db"].conn.execute(
         """UPDATE photos
@@ -192,13 +204,18 @@ def test_export_photos_embeds_only_selected_metadata(export_env):
     assert metadata["XMP"]["Rating"] == 5
     assert metadata["EXIF"]["DateTimeOriginal"] == "2024:06:15 14:30:22"
     assert metadata["EXIF"]["SubSecTimeOriginal"] == 123456
+    assert metadata["EXIF"]["OffsetTimeOriginal"] == "-07:00"
+    assert metadata["EXIF"]["OffsetTimeDigitized"] == "-07:00"
     from scanner import _extract_timestamp
     assert _extract_timestamp(metadata["EXIF"]) == "2024-06-15T14:30:22.123456"
     assert metadata["IPTC"]["DateCreated"] == "2024:06:15"
-    assert metadata["IPTC"]["TimeCreated"].startswith("14:30:22")
+    assert metadata["IPTC"]["TimeCreated"] == "14:30:22-07:00"
     assert metadata["EXIF"]["Make"] == "Nikon"
     assert metadata["EXIF"]["Model"] == "Z 8"
+    assert metadata["EXIF"]["LensModel"] == "NIKKOR Z 400mm f/4.5 VR S"
     assert metadata["EXIF"]["FocalLength"] == 400
+    assert metadata["EXIF"]["FNumber"] == 5.6
+    assert metadata["EXIF"]["ExposureTime"] == 0.002
     assert metadata["EXIF"]["ISO"] == 800
     assert "GPSLatitude" not in metadata["EXIF"]
 

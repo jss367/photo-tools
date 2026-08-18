@@ -225,6 +225,18 @@
     }) || null;
   }
 
+  function jobFor(folderId) {
+    var item = statusFor(folderId);
+    var rootId = Number(item && item.root_folder_id != null
+      ? item.root_folder_id
+      : folderId);
+    var job = ((data && data.jobs) || []).find(function(candidate) {
+      return (candidate.folder_ids || []).map(Number).indexOf(rootId) >= 0;
+    }) || null;
+    if (!job || !activeJob || activeJob.id !== job.id) return job;
+    return Object.assign({}, job, {progress: activeJob.progress});
+  }
+
   function folderName(path) {
     var parts = String(path || '').replace(/[\\/]+$/, '').split(/[\\/]/);
     return parts[parts.length - 1] || 'Folder';
@@ -639,6 +651,18 @@
     });
     data.jobs = jobs;
     publishFolderStatus();
+    // Workspace folder rows are rendered independently from the Work Locally
+    // panel. Refresh them as soon as the server accepts a transition so the
+    // button the user clicked cannot continue to look idle.
+    if (typeof loadWsFolders === 'function') loadWsFolders();
+  }
+
+  function publishJobProgress(jobId, progress) {
+    try {
+      window.dispatchEvent(new CustomEvent('vireo:local-folder-job-progress', {
+        detail: {jobId: jobId, progress: progress}
+      }));
+    } catch (_error) {}
   }
 
   function watchJob(jobId) {
@@ -651,6 +675,7 @@
         if (activeJob !== watch) return;
         watch.progress = progress;
         render();
+        publishJobProgress(jobId, progress);
       },
       onComplete: async function(event) {
         if (activeJob !== watch) return;
@@ -806,6 +831,7 @@
       });
       watchJob(result.job_id);
       trackStartedJob(result, 'work-locally-folder-sync');
+      showToast('Sync started. Progress is shown here and in Jobs.', 'info');
     } catch (_error) {
       await load();
     } finally {
@@ -1017,6 +1043,7 @@
   window.vireoLocalFolders = {
     load: load,
     statusFor: statusFor,
+    jobFor: jobFor,
     blockingJob: function() { return data && data.blocking_job; },
     blockingJobFor: blockingJobForFolder,
     blockingMessage: blockingJobMessage,

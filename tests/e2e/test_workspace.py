@@ -48,6 +48,73 @@ def test_work_locally_full_cycle(live_server, page, tmp_path):
     assert restored == str(source)
 
 
+def test_sync_back_replaces_folder_actions_with_live_progress(
+    live_server, page, tmp_path, monkeypatch
+):
+    """The folder row acknowledges a sync immediately and tracks its job."""
+    import threading
+
+    import web.local_folder as local_folder_web
+
+    db = live_server["db"]
+    source = tmp_path / "inline-progress-source"
+    source.mkdir()
+    (source / "bird.jpg").write_bytes(b"original")
+    workspace_id = db.create_workspace("Inline Sync Progress")
+    db.set_active_workspace(workspace_id)
+    folder_id = db.add_folder(str(source), name="inline-progress-source")
+    assert page.request.post(
+        f"{live_server['url']}/api/workspaces/{workspace_id}/activate"
+    ).ok
+
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.goto(f"{live_server['url']}/workspace", timeout=5000)
+    page.get_by_role("button", name="Work Locally", exact=True).click()
+    modal = page.locator("#stageLocalFoldersModal")
+    destination = tmp_path / "inline-progress-local"
+    modal.locator("[data-local-destination-base]").fill(str(destination))
+    modal.get_by_role("button", name="Copy Locally", exact=True).click()
+    expect(page.get_by_text("Local", exact=True)).to_be_visible(timeout=15000)
+
+    local_path = db.conn.execute(
+        "SELECT path FROM folders WHERE id=?", (folder_id,)
+    ).fetchone()["path"]
+    Path(local_path, "bird.jpg").write_bytes(b"edited")
+
+    real_sync_folder = local_folder_web.sync_folder
+    progress_sent = threading.Event()
+    release_sync = threading.Event()
+
+    def paused_sync_folder(*args, **kwargs):
+        kwargs["progress"](3, 10, "bird.jpg")
+        progress_sent.set()
+        assert release_sync.wait(timeout=10)
+        return real_sync_folder(*args, **kwargs)
+
+    monkeypatch.setattr(local_folder_web, "sync_folder", paused_sync_folder)
+
+    try:
+        page.get_by_role("button", name="Sync Back", exact=True).click()
+
+        row = page.locator(".workspace-folder-row-stacked")
+        status = row.locator(".workspace-folder-job")
+        expect(status).to_be_visible(timeout=5000)
+        expect(status).to_contain_text("Syncing inline-progress-source to source")
+        expect(status).to_contain_text("3 / 10 files")
+        assert progress_sent.is_set()
+        expect(status.get_by_role("link", name="View Jobs")).to_have_attribute(
+            "href", "/jobs"
+        )
+        expect(row.get_by_role("button", name="Sync Back", exact=True)).to_have_count(0)
+        expect(row.get_by_role("button", name="Discard", exact=True)).to_have_count(0)
+    finally:
+        release_sync.set()
+
+    expect(
+        page.get_by_role("button", name="Work Locally", exact=True)
+    ).to_be_visible(timeout=15000)
+
+
 def test_work_locally_explains_processing_blocker(live_server, page, tmp_path):
     """A running pipeline disables local-copy controls with a visible reason."""
     import threading

@@ -748,6 +748,16 @@ def create_local_folder_blueprint(
                 for root_id in root_ids:
                     step_id = f"folder-{root_id}"
                     runner.update_step(job["id"], step_id, status="running")
+                    job["progress"].update(
+                        {
+                            "current": 0,
+                            "total": 0,
+                            "current_file": "",
+                            "phase": f"Checking {root_names[root_id]} for conflicts",
+                            "root_folder_id": root_id,
+                        }
+                    )
+                    runner.push_event(job["id"], "progress", dict(job["progress"]))
 
                     def report(
                         current, total, path,

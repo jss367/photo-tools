@@ -1818,6 +1818,11 @@ body.sidebar-resizing {
           Put exports in an “exported” subfolder
         </label>
 
+        <label style="display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text-secondary);margin-bottom:12px;cursor:pointer;">
+          <input id="exportRevealAfter" type="checkbox">
+          Show exported files in the file manager when finished
+        </label>
+
         <label style="font-size:12px;color:var(--text-secondary);display:block;margin-bottom:4px;">Preset</label>
         <select id="exportPreset" class="modal-input" style="cursor:pointer;">
           <option value="original-jpg">Full-size JPEG</option>
@@ -11409,6 +11414,7 @@ function openExportModal() {
   });
   document.getElementById('exportDest').value = '';
   document.getElementById('exportSubfolder').checked = false;
+  document.getElementById('exportRevealAfter').checked = false;
   document.getElementById('exportOverlay').classList.add('open');
   updateExportPreview();
 }
@@ -11566,6 +11572,7 @@ document.getElementById('exportQuality').addEventListener('input', function() {
 async function startExport() {
   var dest = document.getElementById('exportDest').value.trim();
   var exportToSubfolder = document.getElementById('exportSubfolder').checked;
+  var revealAfterExport = document.getElementById('exportRevealAfter').checked;
 
   var resizeSelect = document.getElementById('exportResize').value;
   var maxSize = null;
@@ -11596,6 +11603,7 @@ async function startExport() {
         quality: quality,
         format: format,
         metadata_fields: selectedExportMetadataFields(),
+        reveal_after_export: revealAfterExport,
       }),
     });
     if (data.error) { alert('Export error: ' + data.error); btn.disabled = false; return; }

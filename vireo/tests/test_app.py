@@ -104,6 +104,15 @@ def test_browse_export_offers_embedded_metadata_checkboxes(app_and_db):
     assert "Unchecked details are left out." in html
 
 
+def test_browse_export_offers_reveal_after_export(app_and_db):
+    app, _ = app_and_db
+    html = app.test_client().get('/browse').get_data(as_text=True)
+
+    assert 'id="exportRevealAfter"' in html
+    assert "Show exported files in the file manager when finished" in html
+    assert "reveal_after_export: revealAfterExport" in html
+
+
 def test_shared_context_menu_scrolls_within_viewport(app_and_db):
     """The unified action menu can exceed the viewport height at Tauri's
     supported 600px minimum. Without a max-height + overflow-y fallback,

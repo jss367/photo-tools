@@ -1090,6 +1090,54 @@ def test_job_export_subfolder_option_must_be_boolean(app_and_db):
     assert "must be a boolean" in resp.get_json()["error"]
 
 
+def test_job_export_reveal_option_must_be_boolean(app_and_db):
+    """POST /api/jobs/export rejects ambiguous reveal values."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()
+
+    resp = client.post("/api/jobs/export", json={
+        "photo_ids": [photo["id"]],
+        "reveal_after_export": "yes",
+    })
+
+    assert resp.status_code == 400
+    assert "must be a boolean" in resp.get_json()["error"]
+
+
+def test_job_export_reveals_successful_output(
+    client_with_photo, tmp_path, monkeypatch,
+):
+    """The opt-in reveal runs after rendering and receives the output path."""
+    import export as export_module
+
+    app, _db, photo_id = client_with_photo
+    destination = tmp_path / "exports"
+    reveal_calls = []
+
+    def fake_reveal(paths, destinations):
+        reveal_calls.append((paths, destinations))
+        return True
+
+    monkeypatch.setattr(export_module, "reveal_exported_files", fake_reveal)
+    response = app.test_client().post("/api/jobs/export", json={
+        "photo_ids": [photo_id],
+        "destination": str(destination),
+        "reveal_after_export": True,
+    })
+    assert response.status_code == 200
+
+    job = wait_for_job_via_client(
+        app.test_client(), response.get_json()["job_id"],
+    )
+    output = destination / "test.jpg"
+    assert job["status"] == "completed"
+    assert job["result"]["revealed"] is True
+    assert "files" not in job["result"]
+    assert reveal_calls == [([str(output)], [str(destination)])]
+    assert output.is_file()
+
+
 def test_job_export_relative_destination(app_and_db):
     """POST /api/jobs/export with relative destination returns 400."""
     app, _ = app_and_db

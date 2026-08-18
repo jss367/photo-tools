@@ -2934,7 +2934,9 @@ coverage.</li>
 <li>Cursor stability across decision-only mutations and invalidation
 after structural revisions.</li>
 <li>Stable-ID targeting for every mutation type.</li>
-<li>Stale run and stale revision conflict responses.</li>
+<li>Stale <code>review_run_id</code> and stale expected target-record
+<code>version</code> conflict responses, plus acceptance of unrelated
+mutations that advanced only the global <code>revision</code>.</li>
 <li>Delta correctness for single-species and multi-species
 confirmation.</li>
 <li>Membership, derived-summary, provenance, revision, and undo truth

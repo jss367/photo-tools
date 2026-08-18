@@ -2083,7 +2083,9 @@ invariant in both modes.
 - Cursor stability across decision-only mutations and invalidation after
   structural revisions.
 - Stable-ID targeting for every mutation type.
-- Stale run and stale revision conflict responses.
+- Stale `review_run_id` and stale expected target-record `version` conflict
+  responses, plus acceptance of unrelated mutations that advanced only the
+  global `revision`.
 - Delta correctness for single-species and multi-species confirmation.
 - Membership, derived-summary, provenance, revision, and undo truth tables for
   Split burst, Extract photos, Merge adjacent bursts, Split encounter,

@@ -1973,9 +1973,10 @@ audit record.</p>
 <h3 id="species-confirmation">Species confirmation</h3>
 <p>Species confirmation uses the assertion model above. The request
 names the target subjects or photos, taxon, operation (add, replace, Not
-identifiable, or False detection), canonical run, and expected revision.
-The server returns the changed photos and encounters, updated completion
-and summary counts, the new <code>revision</code>, and the unchanged
+identifiable, or False detection), canonical run, and expected versions
+of the target records. The server returns the changed photos and
+encounters, updated completion and summary counts, the new
+<code>revision</code>, and the unchanged
 <code>structural_revision</code>; whether an active pagination cursor
 survives follows the per-view rules in the Pagination section. It does
 not return the complete encounter list.</p>
@@ -1994,9 +1995,9 @@ state and updated counts only.</p>
 <p>Every structural action opens a preview with a compact before/after
 diagram, photo and burst counts, affected species summaries, and the
 resulting position in chronological order. The user may cancel without
-mutation. Apply uses the canonical run, expected revision, stable target
-IDs, and an explicit ordered membership result; it never uses a
-filtered-array index.</p>
+mutation. Apply uses the canonical run, expected versions of every
+affected group and boundary neighbor, stable target IDs, and an explicit
+ordered membership result; it never uses a filtered-array index.</p>
 <h4 id="split-burst-here">Split burst here</h4>
 <p>The user chooses a gap between two chronologically adjacent photos.
 The left photos remain in the original burst and the right photos form a
@@ -2059,9 +2060,11 @@ preserved. The result may legitimately be a multi-species encounter.</p>
 <p>A successful command returns removed, added, and updated
 encounter/burst records plus the new revision. The page re-evaluates the
 current view. If a new encounter does not match, the success message
-still states where it went and offers <strong>Show result</strong>.
-Structural changes invalidate only affected cursors and group traces
-where possible; a canonical regroup may invalidate all cursors.</p>
+still states where it went and offers <strong>Show result</strong>. Every
+structural change increments the global
+<code>structural_revision</code> and invalidates all outstanding
+pagination cursors. Affected group traces are invalidated; a canonical
+regroup invalidates all group traces.</p>
 <h3 id="group-review">Group Review</h3>
 <p>The Group Review modal always opens a complete canonical burst. It
 remains editable from every view. Applying changes sends command data
@@ -2158,11 +2161,13 @@ actions may continue. Double activation sends one idempotent command ID
 and cannot duplicate a split, assertion, or keyword.</p>
 <p>On a network failure, optimistic state rolls back and the page
 retains focus. On <code>409 Conflict</code>, the page fetches changed
-target records, explains that the review revision advanced, and asks the
-user to retry after showing the updated target. It never silently
-retargets by position. Offline mode is read-only only because
-persistence is unavailable, not because of the selected view; the page
-labels this as <strong>Offline—changes cannot be saved</strong>.</p>
+target records, explains which target version advanced, and asks the
+user to retry after showing the updated target. An unrelated mutation
+may advance the global review revision without causing a conflict. The
+page never silently retargets by position. Offline mode is read-only
+only because persistence is unavailable, not because of the selected
+view; the page labels this as <strong>Offline—changes cannot be
+saved</strong>.</p>
 <h3 id="view-movement-after-an-edit">View movement after an edit</h3>
 <p>An edit may cause an encounter to stop matching the current view—for
 example, resolving the last unresolved subject while viewing Needs
@@ -2379,13 +2384,23 @@ decision-dependent cases).</p>
 labels, flags, sorting, filtering, and pagination. A structural regroup
 may replace IDs; manual structural commands preserve unaffected IDs and
 create IDs for new groups.</p>
-<p>Mutation requests include <code>review_run_id</code>, the expected
-<code>revision</code>, and the target IDs. If a new Process run or
-another structural mutation has made the page stale, the server returns
-<code>409 Conflict</code> with the current run, <code>revision</code>,
-and <code>structural_revision</code>. The page refreshes its view and
-explains that the review changed; it never applies a command to
-whichever group now occupies an old array index.</p>
+<p>Every mutable subject, photo, burst, and encounter record also carries
+an opaque <code>version</code>. Mutation requests include
+<code>review_run_id</code>, stable target IDs, and the expected versions
+of the target records. Structural requests include the expected versions
+of every source group and boundary neighbor whose membership or ordering
+the command depends on. The global <code>revision</code> is an ordering
+and audit token returned by mutations, not a precondition that makes
+unrelated targets conflict.</p>
+<p>The server returns <code>409 Conflict</code> only when
+<code>review_run_id</code> was replaced by a new Process run, a target no
+longer exists, or an expected target version does not match. It returns
+the current target records plus <code>revision</code> and
+<code>structural_revision</code> so the page can explain and refresh the
+conflict. If a different photo or encounter changed while these targets
+remained at their expected versions, the mutation may proceed and
+receives the next global <code>revision</code>. The page never applies a
+command to whichever group now occupies an old array index.</p>
 <h3 id="species-evidence-contract">Species evidence contract</h3>
 <p>The process snapshot stores the source inventory once and references
 compact source IDs from subject evidence. A representative loaded photo
@@ -2522,10 +2537,20 @@ photo count:</p>
 target;</li>
 <li>otherwise stop before adding an encounter that would exceed the soft
 photo target; and</li>
-<li>invalidate the cursor when <code>structural_revision</code> or the
-query changes, or when a decision mutation changes a sort or filter key
-that the cursor-bound view depends on.</li>
+<li>invalidate every outstanding cursor when
+<code>structural_revision</code> changes, invalidate the affected view’s
+cursor when its query changes, and invalidate a cursor when a decision
+mutation changes a sort or filter key that its cursor-bound view depends
+on.</li>
 </ul>
+<p>After structural invalidation, loaded records remain visible through
+the mutation delta, but pagination restarts at the beginning of the
+updated view with a cursor bound to the new
+<code>structural_revision</code>. The client’s ID-keyed maps discard
+already-loaded encounters as it advances to the first unseen record.
+Structural edits are comparatively rare, so this bounded replay is
+preferred to a scope-generation scheme that could skip a newly moved or
+created encounter.</p>
 <p>The client loads the next page as the user approaches the end of the
 current window. Already loaded pages may be virtualized or discarded
 outside a bounded window, provided focus, selection, and scroll

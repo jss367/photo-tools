@@ -725,7 +725,9 @@ def build_summary(
     cpu_summary = _number_summary(process_cpu)
     if cpu_summary is not None:
         cpu_summary["accounting_complete"] = bool(
-            (process_metadata or {}).get("cpu_accounting_complete")
+            not interrupted
+            and (process_metadata or {}).get("identity_verified") is not False
+            and (process_metadata or {}).get("cpu_accounting_complete")
             and all(
                 sample["process"].get("cpu_accounting_complete") is not False
                 for sample in samples

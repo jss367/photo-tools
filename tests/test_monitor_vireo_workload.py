@@ -751,7 +751,11 @@ def test_process_exit_before_resource_sample_preserves_prior_samples():
             return super().sample()
 
         def metadata_unverified(self):
-            return {"pid": 123, "identity_verified": False}
+            return {
+                "pid": 123,
+                "identity_verified": False,
+                "cpu_accounting_complete": True,
+            }
 
     report = collect_workload(
         duration=2.0,
@@ -767,7 +771,12 @@ def test_process_exit_before_resource_sample_preserves_prior_samples():
             ),
         ]),
         process_sampler=_ExitBeforeSecondSample(
-            [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True}],
+            [{
+                "cpu_percent": 100.0,
+                "rss_bytes": 100,
+                "executable_exists": True,
+                "cpu_accounting_complete": True,
+            }],
             {"pid": 123, "executable_exists": True},
         ),
         system_sampler=_SequenceSampler(
@@ -785,6 +794,9 @@ def test_process_exit_before_resource_sample_preserves_prior_samples():
     assert report["summary"]["targets"][
         "no_embedding_single_flight_violations"
     ] is None
+    assert report["summary"]["vireo_process_tree_cpu_percent"][
+        "accounting_complete"
+    ] is False
 
 
 def test_terminal_api_overrun_marks_resource_interval_incomplete():
@@ -858,8 +870,17 @@ def test_interrupted_api_poll_retains_resource_sample_and_marks_failure():
             )
 
     process = _SequenceSampler(
-        [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True}],
-        {"pid": 123, "executable_exists": True},
+        [{
+            "cpu_percent": 100.0,
+            "rss_bytes": 100,
+            "executable_exists": True,
+            "cpu_accounting_complete": True,
+        }],
+        {
+            "pid": 123,
+            "executable_exists": True,
+            "cpu_accounting_complete": True,
+        },
     )
     system = _SequenceSampler(
         [{"cpu_idle_percent": 50.0}],
@@ -883,6 +904,9 @@ def test_interrupted_api_poll_retains_resource_sample_and_marks_failure():
     assert report["summary"]["api_failure_count"] == 1
     assert report["summary"]["scenario"]["job_observation_complete"] is False
     assert report["summary"]["targets"]["jobs_api_p95_below_500ms"] is None
+    assert report["summary"]["vireo_process_tree_cpu_percent"][
+        "accounting_complete"
+    ] is False
 
 
 def test_late_process_exit_preserves_report_and_fails_trust_gate():

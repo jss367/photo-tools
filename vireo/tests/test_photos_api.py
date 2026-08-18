@@ -4063,6 +4063,8 @@ def test_photo_editor_page_renders(client_with_photo):
     assert "Photo Editor" in html
     assert "Edit History" in html
     assert "Save Changes" in html
+    assert "Export&hellip;" in html
+    assert "Export Photo" in html
     assert "Feedback" in html
     assert "histogramCanvas" in html
     assert "shadowClipValue" in html

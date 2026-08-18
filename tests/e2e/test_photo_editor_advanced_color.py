@@ -53,6 +53,61 @@ def test_photo_editor_saves_and_restores_advanced_color(live_server, page):
     expect(page.locator("#colorGradeSaturationRange")).to_have_value("18")
 
 
+def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
+    live_server, page,
+):
+    url = live_server["url"]
+    photo_id = live_server["data"]["photos"][0]
+    page.goto(f"{url}/edit/{photo_id}")
+    expect(page.locator("#editorFilename")).to_have_text("hawk1.jpg")
+    expect(page.locator("#exportBtn")).to_be_enabled()
+
+    _set_range(page, "#exposureRange", 1.2)
+    expect(page.locator("#saveBtn")).to_be_enabled()
+
+    with page.expect_response(
+        f"**/api/photos/{photo_id}/edit-recipe"
+    ) as save_response:
+        page.locator("#exportBtn").click()
+    assert save_response.value.status == 200
+    expect(page.locator("#saveBtn")).to_be_disabled()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    expect(page.locator("#exportPreview")).to_have_text("Preview: hawk1.jpg")
+
+    page.get_by_role("button", name="Browse…", exact=True).click()
+    expect(page.locator("#folderBrowser")).to_have_class(
+        "folder-browser-overlay open"
+    )
+    page.keyboard.press("Escape")
+    expect(page.locator("#folderBrowser")).not_to_have_class(
+        "folder-browser-overlay open"
+    )
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+
+    page.evaluate(
+        """() => {
+          window.__editorExportRequest = null;
+          const originalSafeFetch = window.safeFetch;
+          window.safeFetch = async function(url, options, config) {
+            if (url === '/api/jobs/export') {
+              window.__editorExportRequest = JSON.parse(options.body);
+              return {job_id: 'editor-export-test'};
+            }
+            return originalSafeFetch(url, options, config);
+          };
+        }"""
+    )
+    page.locator("#exportMetadataRating").check()
+    page.locator("#exportSubmitBtn").click()
+    page.wait_for_function("() => window.__editorExportRequest !== null")
+    request = page.evaluate("window.__editorExportRequest")
+    assert request["photo_ids"] == [photo_id]
+    assert request["destination"] == ""
+    assert request["format"] == "jpg"
+    assert request["metadata_fields"] == ["rating"]
+    expect(page.locator("#exportOverlay")).not_to_have_class("modal-overlay open")
+
+
 def test_reset_adjustments_preserves_advanced_color(live_server, page):
     url = live_server["url"]
     photo_id = live_server["data"]["photos"][0]

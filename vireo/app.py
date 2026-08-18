@@ -26613,6 +26613,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         export_to_subfolder = body.get("export_to_subfolder", False)
         naming_template = body.get("naming_template", "{original}")
         output_format = body.get("format", body.get("output_format", "jpg"))
+        max_size = body.get("max_size")
 
         if not raw_ids:
             return json_error("photo_ids required")
@@ -26629,6 +26630,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error("export_to_subfolder must be a boolean")
         if not isinstance(naming_template, str):
             return json_error("naming_template must be a string")
+        if max_size in ("", 0):
+            max_size = None
+        if max_size is not None:
+            if isinstance(max_size, bool):
+                return json_error("max_size must be a positive integer")
+            try:
+                max_size = int(max_size)
+            except (TypeError, ValueError):
+                return json_error("max_size must be a positive integer")
+            if max_size < 1 or max_size > 50000:
+                return json_error("max_size must be between 1 and 50000")
 
         try:
             from export import normalize_output_format, preview_export_renames
@@ -26652,6 +26664,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not photo_ids:
             return json_error("no exportable photos in current workspace")
 
+        vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+        effective_cfg = db.get_effective_config(cfg.load())
+
         renames = preview_export_renames(
             db=db,
             photo_ids=photo_ids,
@@ -26660,6 +26675,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "naming_template": naming_template,
                 "format": output_format,
                 "export_to_subfolder": export_to_subfolder,
+                "max_size": max_size,
+                "working_copy_max_size": effective_cfg.get(
+                    "working_copy_max_size", 4096,
+                ),
+                "vireo_dir": vireo_dir,
+                "developed_dir": (
+                    effective_cfg.get("darktable_output_dir", "") or ""
+                ),
             },
         )
         return jsonify({

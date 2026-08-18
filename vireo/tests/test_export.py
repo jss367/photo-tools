@@ -1360,6 +1360,11 @@ def test_preview_export_renames_respects_case_insensitive_destination(
     monkeypatch.setattr(
         export_mod, "_destination_case_insensitive", lambda _path: True,
     )
+    monkeypatch.setattr(
+        export_mod,
+        "_select_export_source",
+        lambda **_kwargs: str(env["src"] / "bird1.jpg"),
+    )
 
     renames = preview_export_renames(
         db=env["db"],
@@ -1370,6 +1375,69 @@ def test_preview_export_renames_respects_case_insensitive_destination(
 
     assert [(item["requested_name"], item["export_name"]) for item in renames] == [
         ("photo.jpg", "photo_2.jpg"),
+    ]
+
+
+def test_preview_export_renames_keeps_case_twins_on_empty_linux_target(
+    export_env, monkeypatch,
+):
+    """An empty case-sensitive target must not produce a phantom rename."""
+    env = export_env
+    empty_destination = env["tmp_path"] / "empty-export"
+    empty_destination.mkdir()
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = 'Photo.jpg' WHERE id = ?",
+        (env["p1"],),
+    )
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = 'photo.jpg' WHERE id = ?",
+        (env["p2"],),
+    )
+    env["db"].conn.commit()
+    monkeypatch.setattr(export_mod, "is_case_insensitive_platform", lambda: False)
+    monkeypatch.setattr(
+        export_mod,
+        "_select_export_source",
+        lambda **_kwargs: str(env["src"] / "bird1.jpg"),
+    )
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=str(empty_destination),
+        options={"naming_template": "{original}", "format": "jpg"},
+    )
+
+    assert renames == []
+
+
+def test_preview_export_renames_skips_missing_source_before_sequence(
+    export_env,
+):
+    """Missing photos do not shift sequence numbers used by real exports."""
+    env = export_env
+    missing_id = env["db"].add_photo(
+        folder_id=env["fid"],
+        filename="missing.jpg",
+        extension=".jpg",
+        file_size=0,
+        file_mtime=0,
+        timestamp="2024-06-14T10:00:00",
+    )
+    os.makedirs(env["dest"])
+    Image.new("RGB", (20, 20)).save(
+        os.path.join(env["dest"], "bird1_0001.jpg"), "JPEG",
+    )
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[missing_id, env["p1"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}_{seq}", "format": "jpg"},
+    )
+
+    assert [(item["requested_name"], item["export_name"]) for item in renames] == [
+        ("bird1_0001.jpg", "bird1_0001_2.jpg"),
     ]
 
 

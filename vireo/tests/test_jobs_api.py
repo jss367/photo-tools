@@ -1058,8 +1058,16 @@ def test_job_export_preflight_reports_numbered_collision_name(
     app, db = app_and_db
     client = app.test_client()
     photo = db.conn.execute(
-        "SELECT id FROM photos WHERE filename = 'bird1.jpg'"
+        "SELECT id, folder_id FROM photos WHERE filename = 'bird1.jpg'"
     ).fetchone()
+    source = tmp_path / "source"
+    source.mkdir()
+    Image.new("RGB", (20, 20)).save(source / "bird1.jpg", "JPEG")
+    db.conn.execute(
+        "UPDATE folders SET path = ? WHERE id = ?",
+        (str(source), photo["folder_id"]),
+    )
+    db.conn.commit()
     destination = tmp_path / "export_out"
     destination.mkdir()
     Image.new("RGB", (20, 20)).save(destination / "bird1.jpg", "JPEG")

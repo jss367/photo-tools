@@ -10,7 +10,7 @@ import subprocess
 
 from image_edits import apply_recipe_to_loaded_image
 from image_loader import RAW_DECODE_PRESERVE_HIGHLIGHTS, RAW_EXTENSIONS, load_image
-from path_guard import fs_is_case_insensitive, is_case_insensitive_platform
+from path_guard import is_case_insensitive_platform
 from proc import no_window_kwargs
 from render_source import (
     companion_image_can_replace_raw_result,
@@ -265,49 +265,19 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
         folder_path = folders.get(photo["folder_id"], "")
         recipe = edit_recipes.get(pid)
         exif_data = exif_data_map.get(pid)
-        source_path = None
-        for dev_candidate in _iter_developed_outputs(
-            photo["filename"],
-            folder_path,
-            developed_dir,
-            developed_index,
-            preferred_exts=_developed_ext_preference(output_ext),
-        ):
-            # Guard against silent downscaling: darktable's develop job
-            # can write the output at --width=N, so a developed file may
-            # be smaller than the original. Keep trying lower-preference
-            # developed candidates before falling through to the working
-            # copy / original source.
-            if _developed_can_satisfy_size(
-                dev_candidate, photo, max_size, recipe, exif_data=exif_data
-            ):
-                source_path = dev_candidate
-                break
-        if not source_path:
-            use_wc = _working_copy_can_satisfy_export(
-                photo, recipe, max_size, wc_max, vireo_dir,
-                exif_data=exif_data, folder_path=folder_path,
-            )
-            source_path = None
-            if not use_wc:
-                primary_path = (
-                    os.path.join(folder_path, photo["filename"])
-                    if folder_path else ""
-                )
-                primary_is_raw = (
-                    os.path.splitext(photo["filename"])[1].lower()
-                    in RAW_EXTENSIONS
-                )
-                source_path = _companion_can_satisfy_export(
-                    photo, folder_path, recipe, max_size, exif_data=exif_data,
-                    skip_raw_primary=(
-                        not primary_is_raw or os.path.isfile(primary_path)
-                    ),
-                )
-            if not source_path:
-                source_path = _resolve_source(
-                    photo, vireo_dir, folders, use_working_copy=use_wc,
-                )
+        source_path = _select_export_source(
+            photo=photo,
+            folder_path=folder_path,
+            folders=folders,
+            recipe=recipe,
+            max_size=max_size,
+            wc_max=wc_max,
+            vireo_dir=vireo_dir,
+            developed_dir=developed_dir,
+            developed_index=developed_index,
+            output_ext=output_ext,
+            exif_data=exif_data,
+        )
         if not source_path or not os.path.isfile(source_path):
             errors.append(f"{photo['filename']}: source file missing")
             if progress_cb:
@@ -1473,6 +1443,52 @@ def _resolve_source(photo, vireo_dir, folders, use_working_copy=False):
     return os.path.join(folder_path, photo["filename"])
 
 
+def _select_export_source(
+    *, photo, folder_path, folders, recipe, max_size, wc_max, vireo_dir,
+    developed_dir, developed_index, output_ext, exif_data,
+):
+    """Resolve the source candidate used before export allocates a filename."""
+    for dev_candidate in _iter_developed_outputs(
+        photo["filename"],
+        folder_path,
+        developed_dir,
+        developed_index,
+        preferred_exts=_developed_ext_preference(output_ext),
+    ):
+        if _developed_can_satisfy_size(
+            dev_candidate, photo, max_size, recipe, exif_data=exif_data,
+        ):
+            return dev_candidate
+
+    use_wc = _working_copy_can_satisfy_export(
+        photo, recipe, max_size, wc_max, vireo_dir,
+        exif_data=exif_data, folder_path=folder_path,
+    )
+    if not use_wc:
+        primary_path = (
+            os.path.join(folder_path, photo["filename"])
+            if folder_path else ""
+        )
+        primary_is_raw = (
+            os.path.splitext(photo["filename"])[1].lower() in RAW_EXTENSIONS
+        )
+        companion = _companion_can_satisfy_export(
+            photo,
+            folder_path,
+            recipe,
+            max_size,
+            exif_data=exif_data,
+            skip_raw_primary=(
+                not primary_is_raw or os.path.isfile(primary_path)
+            ),
+        )
+        if companion:
+            return companion
+    return _resolve_source(
+        photo, vireo_dir, folders, use_working_copy=use_wc,
+    )
+
+
 def _deduplicate_path(path, reserved_paths=None, path_key=None):
     """Append _2, _3, etc. if a path exists or is reserved by this batch."""
     reserved_paths = reserved_paths or set()
@@ -1499,7 +1515,33 @@ def _destination_case_insensitive(path):
         if parent == probe_path:
             break
         probe_path = parent
-    return fs_is_case_insensitive(probe_path)
+    try:
+        entries = os.listdir(probe_path)
+    except OSError:
+        return False
+    for name in entries:
+        for index, char in enumerate(name):
+            if not char.isalpha():
+                continue
+            swapped = name[:index] + char.swapcase() + name[index + 1:]
+            if swapped == name:
+                continue
+            original = os.path.join(probe_path, name)
+            case_variant = os.path.join(probe_path, swapped)
+            try:
+                os.stat(case_variant)
+            except FileNotFoundError:
+                return False
+            except OSError:
+                return False
+            try:
+                return os.path.samefile(original, case_variant)
+            except OSError:
+                return False
+    # Unlike a safety containment guard, an export preview must match what the
+    # writer will actually do. On an inconclusive Linux probe, keep distinct
+    # case spellings distinct rather than predicting a rename that won't occur.
+    return False
 
 
 def _export_path_key(path, case_insensitive):
@@ -1521,11 +1563,23 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
     output_ext = normalize_output_format(
         options.get("format", options.get("output_format", "jpg"))
     )["extension"]
+    max_size = options.get("max_size")
+    if max_size is not None:
+        max_size = int(max_size)
+    try:
+        wc_max = int(options.get("working_copy_max_size", 4096))
+    except (ValueError, TypeError):
+        wc_max = 4096
+    vireo_dir = options.get("vireo_dir") or ""
+    developed_dir = options.get("developed_dir") or ""
     subfolder = "exported" if options.get("export_to_subfolder") else ""
 
     photos_map = db.get_photos_by_ids(photo_ids)
     folders = {folder["id"]: folder["path"] for folder in db.get_folder_tree()}
     species_map = db.get_species_keywords_for_photos(photo_ids)
+    exif_data_map = _get_photo_exif_data(db, photo_ids)
+    edit_recipes = db.get_photo_edit_recipes(photo_ids)
+    developed_index = _DevelopedDirIndex()
     seq_counters = {}
     reserved_path_keys = set()
     destination_case_map = {}
@@ -1537,8 +1591,26 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
             continue
 
         folder_path = folders.get(photo["folder_id"], "")
+        source_path = _select_export_source(
+            photo=photo,
+            folder_path=folder_path,
+            folders=folders,
+            recipe=edit_recipes.get(pid),
+            max_size=max_size,
+            wc_max=wc_max,
+            vireo_dir=vireo_dir,
+            developed_dir=developed_dir,
+            developed_index=developed_index,
+            output_ext=output_ext,
+            exif_data=exif_data_map.get(pid),
+        )
+        if not source_path or not os.path.isfile(source_path):
+            continue
+
         destination_base = destination or folder_path
         if not destination_base:
+            continue
+        if not destination and not os.path.isdir(destination_base):
             continue
         photo_destination = os.path.normpath(
             os.path.join(destination_base, subfolder)

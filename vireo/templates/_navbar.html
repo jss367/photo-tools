@@ -927,19 +927,32 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .crop-box::after {
   content: "";
   position: absolute;
+  inset: 0;
   pointer-events: none;
 }
 .crop-box::before {
-  inset: 33.333% 0 auto 0;
-  height: 33.333%;
-  border-top: 1px solid rgba(255, 255, 255, 0.55);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.55);
+  background: linear-gradient(to right,
+    transparent 0,
+    transparent calc(33.333333% - 0.5px),
+    rgba(255, 255, 255, 0.55) calc(33.333333% - 0.5px),
+    rgba(255, 255, 255, 0.55) calc(33.333333% + 0.5px),
+    transparent calc(33.333333% + 0.5px),
+    transparent calc(66.666667% - 0.5px),
+    rgba(255, 255, 255, 0.55) calc(66.666667% - 0.5px),
+    rgba(255, 255, 255, 0.55) calc(66.666667% + 0.5px),
+    transparent calc(66.666667% + 0.5px));
 }
 .crop-box::after {
-  inset: 0 33.333% 0 auto;
-  width: 33.333%;
-  border-left: 1px solid rgba(255, 255, 255, 0.55);
-  border-right: 1px solid rgba(255, 255, 255, 0.55);
+  background: linear-gradient(to bottom,
+    transparent 0,
+    transparent calc(33.333333% - 0.5px),
+    rgba(255, 255, 255, 0.55) calc(33.333333% - 0.5px),
+    rgba(255, 255, 255, 0.55) calc(33.333333% + 0.5px),
+    transparent calc(33.333333% + 0.5px),
+    transparent calc(66.666667% - 0.5px),
+    rgba(255, 255, 255, 0.55) calc(66.666667% - 0.5px),
+    rgba(255, 255, 255, 0.55) calc(66.666667% + 0.5px),
+    transparent calc(66.666667% + 0.5px));
 }
 .crop-handle {
   position: absolute;

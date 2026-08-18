@@ -30,7 +30,7 @@ inputs:
     description: Issue-reaction ID when authorization came from Codex review.
     required: false
   codex-tests-run-id:
-    description: Tests run ID that binds a Codex reaction to the approved head.
+    description: Tests run ID anchoring a Codex reaction after the approved head.
     required: false
 
 outputs:

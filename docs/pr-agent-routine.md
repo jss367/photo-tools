@@ -169,8 +169,8 @@ therefore checks for a Codex authorization when an optional Codex comment is
 created, when Tests succeeds, and every 15 minutes as a fallback. The reaction
 must be newer than the first Tests run for the full live PR head. The live gate
 re-fetches that run and confirms its workflow, event, and head before merging,
-so a reaction left on an earlier head cannot authorize a later push. Any
-accepted feedback at or after the reaction still blocks the merge.
+so a reaction already present before a later push cannot authorize that push.
+Any accepted feedback at or after the reaction still blocks the merge.
 
 Created and edited comments and reviews are wakeups. Merge authorization is
 ordered against comment and review update timestamps, so adding feedback to an
@@ -303,6 +303,13 @@ after a Tests run for the exact current head begins. Every approval path
 re-queries the current head, requires a successful Tests run for that head,
 paginates all review threads, and merges synchronously without leaving an
 auto-merge request armed.
+
+GitHub's issue-reaction API does not include the commit Codex reviewed. This
+automation therefore treats the configured Codex connector's bare reaction as
+a PR-level approval made at its creation time; the Tests-run timestamp rejects
+pre-existing reactions but cannot independently prove which commit an
+in-flight connector review examined. Use a human approval or `/merge <sha>`
+when explicit commit-bearing authorization is required.
 
 ## Rollback
 

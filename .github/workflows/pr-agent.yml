@@ -618,8 +618,10 @@ jobs:
 
   # GitHub does not emit a workflow event for issue reactions. Discover a
   # Codex approval when its optional summary comment arrives, when Tests
-  # succeeds, and on a short polling fallback. Bind the reaction to the exact
-  # head through that head's first Tests run so a later push invalidates it.
+  # succeeds, and on a short polling fallback. A bare reaction has no reviewed
+  # SHA, so trust the configured connector's PR-level approval semantics while
+  # requiring it to postdate the current head's first Tests run. That makes a
+  # reaction already present before a later push stale.
   discover-codex-merge-authorizations:
     if: >-
       github.event_name == 'schedule'

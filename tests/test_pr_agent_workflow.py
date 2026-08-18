@@ -186,8 +186,10 @@ def test_human_and_codex_merge_authorizations_are_head_bound():
 
     # Reactions have no webhook, so discovery runs on an optional Codex comment,
     # successful Tests, and a polling fallback. A generic +1 comment is never
-    # considered authorization, and the exact-head Tests run prevents a stale
-    # reaction from authorizing a later push.
+    # considered authorization. Codex reactions carry no reviewed SHA, so the
+    # trusted connector is treated as approving the live PR state; requiring
+    # the reaction to postdate an exact-head Tests run invalidates reactions
+    # that were already present before a later push.
     assert 'cron: "*/15 * * * *"' in workflow
     assert "workflow_dispatch:" in workflow
     assert "discover-codex-merge-authorizations:" in workflow

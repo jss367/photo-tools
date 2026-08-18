@@ -1,3 +1,5 @@
+import re
+
 from playwright.sync_api import expect
 
 
@@ -359,24 +361,25 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
 
     page.set_viewport_size({"width": 3000, "height": 2000})
     page.wait_for_function(
-        """() => editorState.zoomMode === 'custom' &&
-            editorState.zoomPercent >= editorFitZoomPercent() - 0.01"""
+        """() => editorState.zoomMode === 'fit' &&
+            Math.abs(editorState.zoomPercent - editorFitZoomPercent()) < 0.01"""
     )
     resize_state = page.evaluate(
         """() => {
-            const before = editorState.zoomPercent;
+            editorState.zoomMode = 'custom';
+            editorState.zoomPercent = editorFitZoomPercent();
             window.dispatchEvent(new Event('resize'));
             return {
                 mode: editorState.zoomMode,
-                before,
                 after: editorState.zoomPercent,
                 fit: editorFitZoomPercent()
             };
         }"""
     )
+    # A resize that raises Fit above the retained percentage switches to Fit;
+    # an exact custom selection remains custom on a subsequent resize.
     assert resize_state["mode"] == "custom"
-    assert abs(resize_state["after"] - resize_state["before"]) < 0.01
-    assert resize_state["after"] >= resize_state["fit"] - 0.01
+    assert abs(resize_state["after"] - resize_state["fit"]) < 0.01
     page.set_viewport_size({"width": 2000, "height": 1000})
 
     page.locator("#fitBtn").click()
@@ -424,7 +427,7 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
 
     page.locator("#fitBtn").click()
     expect(page.locator("#editorZoomSlider")).to_have_attribute(
-        "aria-valuetext", "Fit"
+        "aria-valuetext", re.compile(r"Fit \(\d+%\)")
     )
     fit = page.evaluate(
         """() => ({

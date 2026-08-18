@@ -183,7 +183,7 @@ body {
 .editor-zoom-stop-actual { transform: translateX(-50%); }
 .editor-zoom-max { right: 0; }
 .editor-zoom-value {
-  width: 39px;
+  width: 65px;
   color: var(--text-muted);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
@@ -1057,8 +1057,20 @@ function editorZoomFromSliderPosition(position) {
 
 function editorZoomText() {
   return editorState.zoomMode === 'fit'
-    ? 'Fit'
+    ? 'Fit (' + Math.round(editorFitZoomPercent()) + '%)'
     : Math.round(editorState.zoomPercent) + '%';
+}
+
+function editorClampCustomZoomToFit() {
+  if (editorState.zoomMode === 'fit') return false;
+  var fit = editorFitZoomPercent();
+  if (editorState.zoomPercent >= fit) return false;
+  editorState.zoomPercent = fit;
+  // A retained percentage that no longer fills the viewport is Fit, both
+  // visually and semantically. Exact equality that the user selected is
+  // still kept as a custom zoom.
+  editorState.zoomMode = 'fit';
+  return true;
 }
 
 function editorFitUsesNativeRender() {
@@ -1113,6 +1125,7 @@ function applyEditorZoom() {
   var wrap = document.getElementById('editorCanvasWrap');
   var img = document.getElementById('editorImg');
   if (!wrap || !img) return;
+  editorClampCustomZoomToFit();
   var custom = editorState.zoomMode !== 'fit';
   var wasCustom = wrap.classList.contains('zoom-custom');
   var focusX = 0.5;
@@ -1688,6 +1701,7 @@ function previewStatusText(img) {
 function updatePreview() {
   if (!editorState.photoId) return;
   var img = document.getElementById('editorImg');
+  editorClampCustomZoomToFit();
   updateFeedbackControls();
   var recipe = editorState.showBefore ? previewRecipeFor(editorState.savedRecipe) : previewRecipe();
   var url = '/photos/' + editorState.photoId + '/edit-preview?size=' + previewRenderSize() +
@@ -2998,12 +3012,7 @@ function initCropDrag() {
     editorState.drag = null;
   });
   window.addEventListener('resize', function() {
-    var clampedCustomZoom = false;
-    if (editorState.zoomMode !== 'fit' &&
-        editorState.zoomPercent < editorFitZoomPercent()) {
-      editorState.zoomPercent = editorFitZoomPercent();
-      clampedCustomZoom = true;
-    }
+    var clampedCustomZoom = editorClampCustomZoomToFit();
     applyEditorZoom();
     updateEditorZoomControl();
     if (clampedCustomZoom && editorState.photoId && !editorState.loading) {

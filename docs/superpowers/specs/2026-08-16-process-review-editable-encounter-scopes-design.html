@@ -2550,12 +2550,12 @@ already-served boundary. On every next-page request, the server compares
 <code>revision</code>. Any intervening decision mutation—local or from
 another session—makes that cursor stale. The client then restarts
 pagination at the beginning of the current view with a new snapshot
-revision and discards already-loaded encounter IDs until it reaches the
-first unseen record. This conservative restart prevents a newly
-qualifying encounter before the old boundary from being skipped. The
-global <code>revision</code> is used here only as a query-snapshot
-generation; it remains irrelevant to whether a mutation may update
-unrelated target records.</li>
+revision and rebuilds the ordered view-membership window as described
+below. This conservative restart prevents a newly qualifying encounter
+before the old boundary from being skipped. The global
+<code>revision</code> is used here only as a query-snapshot generation;
+it remains irrelevant to whether a mutation may update unrelated target
+records.</li>
 <li>Every page in a collection-backed query reads the same frozen
 membership snapshot. Collection rule edits, manual membership changes,
 photo metadata changes, and visual-index updates cannot alter that
@@ -2580,14 +2580,22 @@ cursor when its query changes, and invalidate a cursor carrying
 <code>decision_snapshot_revision</code> whenever the global
 <code>revision</code> changes.</li>
 </ul>
-<p>After invalidation, loaded records remain visible through mutation
-deltas, but pagination restarts at the beginning of the updated view
+<p>After invalidation, the previously rendered window may remain visible
+with an updating treatment, but it is no longer authoritative view
+membership. Pagination restarts at the beginning of the updated view
 with a cursor bound to the current structural and decision snapshot
 revisions and, when present, the current query’s frozen collection
-snapshot. The client’s ID-keyed maps discard already-loaded encounters
-as it advances to the first unseen record. This bounded replay is
-preferred to resuming after a stale boundary that could skip a newly
-moved, created, or qualifying encounter.</p>
+snapshot. The client builds a separate ordered replacement-ID buffer
+and replays until it contains at least the number of encounters in the
+previously loaded window or reaches the end of the view. It then
+atomically replaces the displayed membership and continues from the
+replacement cursor. Encounters that no longer qualify disappear; newly
+qualifying or reordered encounters take their current positions. Entity
+data may remain in normalized caches, but IDs absent from the
+replacement buffer are not rendered. Deduplication applies within the
+replacement buffer, not against the stale membership list. This bounded
+replay is preferred to resuming after a stale boundary that could skip a
+newly moved, created, or qualifying encounter.</p>
 <p>The client loads the next page as the user approaches the end of the
 current window. Already loaded pages may be virtualized or discarded
 outside a bounded window, provided focus, selection, and scroll
@@ -2677,8 +2685,9 @@ run the missing stage</td>
 </tr>
 <tr>
 <td>View updating</td>
-<td>Retain the prior list with an updating treatment until the first new
-page arrives; ignore stale responses by query generation</td>
+<td>Retain the prior list with an updating treatment until the
+replacement membership window is reconciled; then atomically swap it
+and ignore stale responses by query generation</td>
 </tr>
 <tr>
 <td>No matches</td>
@@ -2976,6 +2985,9 @@ resolves the updated membership.</li>
 <li>Decision- and structural-revision cursor restarts that preserve the
 active <code>collection_snapshot_id</code>, plus explicit expired-snapshot
 recovery that never mixes old and new membership.</li>
+<li>Cross-session decision and structural changes that remove, insert,
+or reorder encounters already in the loaded window; restart replay must
+replace view membership rather than leave excluded IDs rendered.</li>
 <li>Visual-collection resolution, including structured unavailable
 behavior when its model or index cannot be used and no metadata-only
 widening.</li>

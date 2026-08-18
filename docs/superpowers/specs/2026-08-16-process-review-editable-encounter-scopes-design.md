@@ -1782,12 +1782,12 @@ view:
   request, the server compares `decision_snapshot_revision` with the current
   global `revision`. Any intervening decision mutation—local or from another
   session—makes that cursor stale. The client then restarts pagination at the
-  beginning of the current view with a new snapshot revision and discards
-  already-loaded encounter IDs until it reaches the first unseen record. This
-  conservative restart prevents a newly qualifying encounter before the old
-  boundary from being skipped. The global `revision` is used here only as a
-  query-snapshot generation; it remains irrelevant to whether a mutation may
-  update unrelated target records.
+  beginning of the current view with a new snapshot revision and rebuilds the
+  ordered view-membership window as described below. This conservative restart
+  prevents a newly qualifying encounter before the old boundary from being
+  skipped. The global `revision` is used here only as a query-snapshot
+  generation; it remains irrelevant to whether a mutation may update unrelated
+  target records.
 - Every page in a collection-backed query reads the same frozen membership
   snapshot. Collection rule edits, manual membership changes, photo metadata
   changes, and visual-index updates cannot alter that snapshot mid-pagination.
@@ -1808,13 +1808,21 @@ count:
   a cursor carrying `decision_snapshot_revision` whenever the global
   `revision` changes.
 
-After invalidation, loaded records remain visible through mutation deltas, but
-pagination restarts at the beginning of the updated view with a cursor bound
-to the current structural and decision snapshot revisions and, when present,
-the current query's frozen collection snapshot. The client's ID-keyed maps
-discard already-loaded encounters as it advances to the first unseen record.
-This bounded replay is preferred to resuming after a stale boundary that could
-skip a newly moved, created, or qualifying encounter.
+After invalidation, the previously rendered window may remain visible with an
+updating treatment, but it is no longer authoritative view membership.
+Pagination restarts at the beginning of the updated view with a cursor bound to
+the current structural and decision snapshot revisions and, when present, the
+current query's frozen collection snapshot. The client builds a separate
+ordered replacement-ID buffer and replays until it contains at least the
+number of encounters in the previously loaded window or reaches the end of the
+view. It then atomically replaces the displayed membership and continues from
+the replacement cursor. Encounters that no longer qualify disappear; newly
+qualifying or reordered encounters take their current positions. Entity data
+may remain in normalized caches, but IDs absent from the replacement buffer are
+not rendered. Deduplication applies within the replacement buffer, not against
+the stale membership list. This bounded replay is preferred to resuming after
+a stale boundary that could skip a newly moved, created, or qualifying
+encounter.
 
 The client loads the next page as the user approaches the end of the current
 window. Already loaded pages may be virtualized or discarded outside a bounded
@@ -1880,7 +1888,7 @@ state.
 | No completed Process result | Explain that Process Review needs a completed run and offer **Open Process** |
 | Process failed | Show the last successful review separately from the failed run and link to its failure details |
 | Optional feature missing | Keep review available, name affected photos/features, and offer to run the missing stage |
-| View updating | Retain the prior list with an updating treatment until the first new page arrives; ignore stale responses by query generation |
+| View updating | Retain the prior list with an updating treatment until the replacement membership window is reconciled; then atomically swap it and ignore stale responses by query generation |
 | No matches | Say **No encounters match this view**, list active criteria, and offer **Clear view filters** |
 | Collection outside run | State how many collection photos fall outside the Process result and offer **Open Process**; do not compute implicitly |
 | Invalid/deleted collection | Remove only that filter, announce the reset, and keep the canonical review available |
@@ -2115,6 +2123,9 @@ invariant in both modes.
 - Decision- and structural-revision cursor restarts that preserve the active
   `collection_snapshot_id`, plus explicit expired-snapshot recovery that never
   mixes old and new membership.
+- Cross-session decision and structural changes that remove, insert, or reorder
+  encounters already in the loaded window; restart replay must replace view
+  membership rather than leave excluded IDs rendered.
 - Visual-collection resolution, including structured unavailable behavior when
   its model or index cannot be used and no metadata-only widening.
 - Complete encounter and burst membership in every returned page.

@@ -36,24 +36,31 @@ HEARTBEAT_SECONDS = 0.5
 # the worker itself exits, across every preview stream in this process.
 _VOLUME_LANES_LOCK = threading.Lock()
 _ACTIVE_VOLUME_LANES = {}
+_ACTIVE_SCAN_COUNT = 0
 
 
 def _try_acquire_volume_lane(volume_key, max_parallel):
+    global _ACTIVE_SCAN_COUNT
     with _VOLUME_LANES_LOCK:
         active = _ACTIVE_VOLUME_LANES.get(volume_key, 0)
-        if active >= max_parallel:
+        if active >= max_parallel or _ACTIVE_SCAN_COUNT >= GLOBAL_SCAN_LIMIT:
             return False
         _ACTIVE_VOLUME_LANES[volume_key] = active + 1
+        _ACTIVE_SCAN_COUNT += 1
         return True
 
 
 def _release_volume_lane(volume_key):
+    global _ACTIVE_SCAN_COUNT
     with _VOLUME_LANES_LOCK:
         active = _ACTIVE_VOLUME_LANES.get(volume_key, 0)
+        if active <= 0:
+            return
         if active <= 1:
             _ACTIVE_VOLUME_LANES.pop(volume_key, None)
         else:
             _ACTIVE_VOLUME_LANES[volume_key] = active - 1
+        _ACTIVE_SCAN_COUNT -= 1
 
 
 def unique_root_names(folders):

@@ -118,6 +118,20 @@ def test_volume_lane_is_shared_across_preview_streams(monkeypatch):
     assert second_started.is_set()
 
 
+def test_global_scan_limit_is_shared_across_preview_streams():
+    """Distinct volume lanes still share one process-wide worker cap."""
+    acquired = []
+    try:
+        for index in range(source_discovery.GLOBAL_SCAN_LIMIT):
+            volume_key = f"volume-{index}"
+            assert source_discovery._try_acquire_volume_lane(volume_key, 2)
+            acquired.append(volume_key)
+        assert not source_discovery._try_acquire_volume_lane("one-too-many", 2)
+    finally:
+        for volume_key in acquired:
+            source_discovery._release_volume_lane(volume_key)
+
+
 def test_stream_survives_a_crashing_walker(monkeypatch):
     """A walker that dies unexpectedly yields an error row, not a hang."""
 

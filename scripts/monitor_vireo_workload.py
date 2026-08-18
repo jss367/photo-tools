@@ -380,6 +380,7 @@ class ProcessTreeSampler:
         self._known_child_cpu_lifetimes = {}
         initial_rss_bytes = 0
         process_count = 0
+        prime_complete = True
         processes, enumeration_complete = self._current_processes()
         if not enumeration_complete:
             raise RuntimeError(
@@ -400,7 +401,11 @@ class ProcessTreeSampler:
                 initial_rss_bytes += process.memory_info().rss
                 process_count += 1
             except (OSError, self.psutil.Error):
-                continue
+                prime_complete = False
+        if not prime_complete:
+            raise RuntimeError(
+                "could not capture a complete Vireo process-tree baseline"
+            )
         self._unreconciled_departed_child_cpu = 0.0
         self._initial_rss_bytes = initial_rss_bytes if process_count else None
         self._last_cpu_sample_at = self.monotonic()

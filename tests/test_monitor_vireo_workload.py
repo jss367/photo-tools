@@ -972,6 +972,7 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
             self.status_value = "running"
             self.child_processes = []
             self.children_error = False
+            self.cpu_error = False
 
         def exe(self):
             return "/tmp/vireo-server"
@@ -994,6 +995,8 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
             return list(self.child_processes)
 
         def cpu_times(self):
+            if self.cpu_error:
+                raise RuntimeError("transient CPU read failure")
             return type("CpuTimes", (), {
                 "user": self.cpu_seconds,
                 "system": 0.0,
@@ -1066,6 +1069,19 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
     replacement.cpu_seconds = 0.4
     clock.sleep(1.0)
     assert sampler.sample()["cpu_percent"] == 10.0
+
+    bad_root = _CpuProcess(200, 1.0, 1.0, 100)
+    bad_child = _CpuProcess(201, 1.5, 0.2, 100)
+    bad_child.cpu_error = True
+    bad_root.child_processes = [bad_child]
+    incomplete_prime = ProcessTreeSampler(
+        bad_root.pid,
+        psutil_module=_CpuPsutil(bad_root),
+        monotonic=clock.monotonic,
+        platform_system=lambda: "Linux",
+    )
+    with pytest.raises(RuntimeError, match="complete Vireo process-tree baseline"):
+        incomplete_prime.prime()
 
     root.alive = False
     with pytest.raises(RuntimeError, match="exited or was replaced"):

@@ -3826,9 +3826,6 @@ async function createWorkspace() {
     <button class="lb-action-btn" id="lightboxRejectBtn" aria-pressed="false" onclick="event.stopPropagation(); lightboxSetFlagAction('rejected');" title="Reject photo (x)">
       Reject
     </button>
-    <button class="lb-action-btn" id="lightboxNotWildlife" onclick="event.stopPropagation(); lightboxToggleWildlifeExcluded();" title="Exclude from wildlife detection and classification">
-      Not Wildlife
-    </button>
     <span class="lb-action-sep" aria-hidden="true"></span>
     <button class="lb-action-btn" id="lightboxInat" onclick="">
       iNaturalist
@@ -4084,7 +4081,6 @@ function _lbApplyReadOnlyState() {
   var controls = [
     ['lightboxFlagBtn', 'Flag photo (p)'],
     ['lightboxRejectBtn', 'Reject photo (x)'],
-    ['lightboxNotWildlife', 'Exclude from wildlife detection and classification'],
     ['lightboxInat', 'Submit to iNaturalist'],
     ['lightboxAdjustBtn', 'Quick non-destructive adjustments'],
     ['lightboxDeleteBtn', 'Delete photo'],
@@ -7066,16 +7062,6 @@ function _lbApplyMaskToggleButton() {
   if (note) note.textContent = available ? '' : 'unavailable for edited photos';
 }
 
-function _lbApplyWildlifeExcludedButton() {
-  var btn = document.getElementById('lightboxNotWildlife');
-  if (!btn) return;
-  btn.textContent = _lbCurrentWildlifeExcluded ? 'Include Wildlife' : 'Not Wildlife';
-  btn.title = _lbCurrentWildlifeExcluded
-    ? 'Include this photo in wildlife detection and classification'
-    : 'Exclude from wildlife detection and classification';
-  btn.setAttribute('aria-label', btn.title);
-}
-
 function toggleLightboxMasks() {
   _lbMasksVisible = !_lbMasksVisible;
   _lbPersistBool('vireo.lb.masksVisible', _lbMasksVisible);
@@ -7693,7 +7679,6 @@ function openLightbox(photoId, filename, photoList, options) {
   function commitVisiblePhotoIdentity() {
     label.textContent = filename || '';
     _lbSetFlagStatus(_lbDisplayedFlagFor(photoId));
-    _lbApplyWildlifeExcludedButton();
     var counter = document.getElementById('lightboxCounter');
     if (_lightboxPhotoList.length > 1) {
       var idx = _lightboxPhotoList.findIndex(function(p) { return p.id === photoId; });
@@ -7857,7 +7842,6 @@ function openLightbox(photoId, filename, photoList, options) {
         _lbSetAdjustmentControlsDisabled(false);
         _lbSetAdjustmentStatus('');
       }
-      _lbApplyWildlifeExcludedButton();
       _lbRecordFetchedFlag(photoId, data.flag, flagFetchSeq);
       // Metadata commonly wins the race with image decoding. Updating the
       // transform here would lay out the still-visible outgoing bitmap using
@@ -8005,7 +7989,6 @@ function openLightbox(photoId, filename, photoList, options) {
   _lbApplyEyeVisibility();
   _lbApplyTrackEyeState();
   _lbApplyMaskToggleButton();
-  _lbApplyWildlifeExcludedButton();
 
   _lbApplyBoxesVisibility();
 
@@ -9021,7 +9004,6 @@ async function lightboxToggleWildlifeExcluded() {
       }, { toast: false });
     }
     _lbCurrentWildlifeExcluded = excluded;
-    _lbApplyWildlifeExcludedButton();
     if (window.toast) {
       window.toast(
         excluded ? 'Excluded from wildlife classification' : 'Included in wildlife classification',
@@ -10780,7 +10762,6 @@ async function nativeMenuSetWildlifeExcluded(excluded) {
   if (!usePageHelper) nativeMenuRefreshWildlifeExcludedState(ids, excluded);
   if (typeof _lightboxCurrentId !== 'undefined' && ids.indexOf(_lightboxCurrentId) !== -1) {
     _lbCurrentWildlifeExcluded = excluded;
-    if (typeof _lbApplyWildlifeExcludedButton === 'function') _lbApplyWildlifeExcludedButton();
   }
   nativeMenuInfo(excluded ? 'Excluded from wildlife classification' : 'Marked as wildlife');
 }

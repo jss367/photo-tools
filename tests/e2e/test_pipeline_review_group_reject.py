@@ -2067,7 +2067,6 @@ def test_read_only_scope_disables_lightbox_and_native_mutations(live_server, pag
     )
 
     for selector in (
-        "#lightboxNotWildlife",
         "#lightboxInat",
         "#lightboxAdjustBtn",
         "#lightboxDeleteBtn",
@@ -2606,7 +2605,6 @@ def test_apply_time_lightbox_read_only_refreshes_over_full_apply_lifecycle(
         assert page.evaluate("_lbReadOnly") is False
         expect(page.locator("#lightboxDeleteBtn")).to_be_enabled()
         expect(page.locator("#lightboxAdjustBtn")).to_be_enabled()
-        expect(page.locator("#lightboxNotWildlife")).to_be_enabled()
     finally:
         page.evaluate(
             "() => { window.safeFetch = window.__originalSafeFetchForReadOnlyLifecycle; }"

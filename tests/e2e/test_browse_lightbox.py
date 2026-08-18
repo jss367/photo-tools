@@ -124,6 +124,146 @@ def test_browse_lightbox_autoloads_next_page_at_navigation_boundary(
     assert page.evaluate("window._lightboxCurrentId === photos[2].id") is True
 
 
+def test_browse_lightbox_single_photo_window_waits_for_previous_page(
+    live_server, page,
+):
+    """Previous is honored while a one-photo deep-link page is prepending."""
+    db = live_server["db"]
+    folder_id = live_server["data"]["folders"][0]
+    existing = len(db.get_photos(folder_id=folder_id))
+    for idx in range(50 - existing):
+        db.add_photo(
+            folder_id=folder_id,
+            filename=f"newer-{idx:02d}.jpg",
+            extension=".jpg",
+            file_size=1000,
+            file_mtime=100 + idx,
+            timestamp=f"2025-01-{(idx % 28) + 1:02d}T12:00:00",
+        )
+    target_id = db.add_photo(
+        folder_id=folder_id,
+        filename="newest-target.jpg",
+        extension=".jpg",
+        file_size=1000,
+        file_mtime=1,
+        timestamp="2099-01-01T00:00:00",
+    )
+
+    page.add_init_script(
+        """
+        class NoopIntersectionObserver {
+          observe() {}
+          unobserve() {}
+          disconnect() {}
+        }
+        window.IntersectionObserver = NoopIntersectionObserver;
+        """
+    )
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(
+            json={"photos_per_page": 50, "keyboard_shortcuts": {}}
+        ),
+    )
+    page.route(
+        "**/photos/*/full",
+        lambda route: route.fulfill(
+            body=base64.b64decode(_PNG_1X1), content_type="image/png"
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse?photo_id={target_id}")
+    page.wait_for_function("photos.length === 1 && earliestPage === 2")
+    page.evaluate(
+        """() => {
+          const originalSafeFetch = window.safeFetch;
+          window.safeFetch = async function(url, options, behavior) {
+            const body = options && options.body ? JSON.parse(options.body) : null;
+            if (url === '/api/photos/query' && body && body.page === 1) {
+              const response = originalSafeFetch.call(this, url, options, behavior);
+              await new Promise(resolve => { window.__releasePreviousPage = resolve; });
+              return response;
+            }
+            return originalSafeFetch.call(this, url, options, behavior);
+          };
+        }"""
+    )
+
+    page.locator(f'.grid-card[data-id="{target_id}"]').dblclick()
+    page.wait_for_function(
+        "photoId => window._lightboxCommittedId === photoId", arg=target_id
+    )
+    page.wait_for_function("loading === true && !!window.__releasePreviousPage")
+    page.evaluate("lightboxNav(-1)")
+    page.evaluate("window.__releasePreviousPage()")
+
+    page.wait_for_function(
+        "photoId => photos.length === 51 && window._lightboxCurrentId !== photoId",
+        arg=target_id,
+        timeout=5000,
+    )
+    assert page.evaluate("window._lightboxPhotoList === photos") is True
+    assert page.evaluate("window._lightboxCurrentId === photos[49].id") is True
+
+
+def test_browse_lightbox_delete_preserves_live_pagination_list(live_server, page):
+    """Deleting a loaded photo keeps Browse and the lightbox on one array."""
+    page.add_init_script(
+        """
+        class NoopIntersectionObserver {
+          observe() {}
+          unobserve() {}
+          disconnect() {}
+        }
+        window.IntersectionObserver = NoopIntersectionObserver;
+        """
+    )
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(
+            json={"photos_per_page": 2, "keyboard_shortcuts": {}}
+        ),
+    )
+    page.route(
+        "**/photos/*/full",
+        lambda route: route.fulfill(
+            body=base64.b64decode(_PNG_1X1), content_type="image/png"
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+    page.wait_for_function("photos.length === 2 && totalPhotos > photos.length")
+    deleted_id, remaining_id = page.evaluate("[photos[0].id, photos[1].id]")
+    page.evaluate("allLoaded = true")
+
+    page.locator(f'.grid-card[data-id="{deleted_id}"]').dblclick()
+    page.wait_for_function(
+        "photoId => window._lightboxCommittedId === photoId", arg=deleted_id
+    )
+    page.evaluate(
+        """() => {
+          window.lightboxDelete();
+          const callback = _deleteCallback;
+          hideDeleteModal();
+          callback({deleted: 1, failed_photo_ids: []});
+        }"""
+    )
+    page.wait_for_function(
+        "photoId => window._lightboxCommittedId === photoId", arg=remaining_id
+    )
+    assert page.evaluate("window._lightboxPhotoList === photos") is True
+    assert page.evaluate("photos.length") == 1
+
+    page.evaluate(
+        """() => {
+          allLoaded = false;
+          document.dispatchEvent(new CustomEvent('lightbox:photochanged', {
+            detail: {photoId: window._lightboxCurrentId}
+          }));
+        }"""
+    )
+    page.wait_for_function("photos.length > 1", timeout=5000)
+    assert page.evaluate("window._lightboxPhotoList === photos") is True
+
+
 def test_browse_lightbox_close_selects_current_photo(live_server, page):
     """Closing after lightbox navigation focuses the last-viewed grid photo."""
     page.route(

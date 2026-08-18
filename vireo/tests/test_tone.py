@@ -1,3 +1,4 @@
+import itertools
 import os
 import sys
 
@@ -139,6 +140,71 @@ def test_whites_and_blacks_target_extreme_ranges():
     assert out[0, 0, 0] < rgb[0, 0, 0]
     assert abs(float(out[0, 1, 0] - rgb[0, 1, 0])) < 0.02
     assert out[0, 2, 0] > rgb[0, 2, 0]
+
+
+def _grey_ramp(steps=2049):
+    levels = np.linspace(0.0, 1.0, steps, dtype=np.float32)
+    return np.repeat(levels[:, None], 3, axis=1)[None, ...]
+
+
+def _assert_monotonic_grey(rgb):
+    # Allow only float32 round-trip noise; a real reversal is many orders of
+    # magnitude larger than this tolerance.
+    assert float(np.min(np.diff(rgb[0, :, 0]))) >= -2e-6
+
+
+def test_each_range_control_is_monotonic_at_every_slider_value():
+    ramp = _grey_ramp()
+    for name in ("shadows", "highlights", "blacks", "whites"):
+        for amount in range(-100, 101):
+            _assert_monotonic_grey(apply_adjustments(ramp, **{name: amount}))
+
+
+def test_extreme_range_control_combinations_remain_monotonic():
+    # Composition is where the former fixed-mask blends failed earliest:
+    # Shadows +45 with Blacks +45 could already reverse the tone ramp.
+    ramp = _grey_ramp(1025)
+    names = ("shadows", "highlights", "blacks", "whites")
+    for values in itertools.product((-100, -50, 0, 50, 100), repeat=4):
+        adjustments = dict(zip(names, values, strict=True))
+        _assert_monotonic_grey(apply_adjustments(ramp, **adjustments))
+
+
+def test_shadows_and_highlights_preserve_black_and_white_endpoints():
+    endpoints = np.array([[[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]], dtype=np.float32)
+    for name in ("shadows", "highlights"):
+        for amount in (-100, -50, 50, 100):
+            out = apply_adjustments(endpoints, **{name: amount})
+            assert np.allclose(out, endpoints, atol=1e-6)
+
+
+def test_blacks_and_whites_deliberately_move_only_their_endpoint_direction():
+    endpoints = np.array([[[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]], dtype=np.float32)
+    lifted_black = apply_adjustments(endpoints, blacks=100)
+    lowered_white = apply_adjustments(endpoints, whites=-100)
+    assert 0.10 < float(lifted_black[0, 0, 0]) < 0.15
+    assert np.allclose(lifted_black[0, 1], 1.0, atol=1e-6)
+    assert 0.85 < float(lowered_white[0, 1, 0]) < 0.90
+    assert np.allclose(lowered_white[0, 0], 0.0, atol=1e-6)
+
+
+def test_shadow_lift_preserves_linear_rgb_ratios_when_in_gamut():
+    rgb = np.array([[[0.18, 0.07, 0.025]]], dtype=np.float32)
+    out = apply_adjustments(rgb, shadows=80)
+    channel_gains = srgb_to_linear(out) / srgb_to_linear(rgb)
+    assert float(np.ptp(channel_gains)) < 1e-4
+    assert np.all(out > rgb)
+
+
+def test_lifted_black_neutralizes_one_code_chroma_noise():
+    rgb = np.array(
+        [[[0.0, 0.0, 0.0], [0.0, 0.0, 1.0 / 255.0]]],
+        dtype=np.float32,
+    )
+    out = apply_adjustments(rgb, blacks=100)
+    exact_black, blue_noise = out[0]
+    assert float(np.ptp(blue_noise)) < 0.01
+    assert np.max(np.abs(blue_noise - exact_black)) < 0.01
 
 
 def test_positive_vibrance_prefers_less_saturated_colors():

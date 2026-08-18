@@ -17,8 +17,10 @@ flat white. This pipeline therefore:
   1. de-gammas sRGB -> linear light,
   2. applies the scene-referred ops (exposure, white balance) in linear,
   3. rolls highlights off with a smooth shoulder (no hard clip to 1.0),
-  4. re-encodes linear -> sRGB,
-  5. applies the display-referred ops (range controls, contrast, color) in sRGB.
+  4. remaps perceptual luminance for the range controls and reconstructs RGB
+     in linear light,
+  5. re-encodes linear -> sRGB,
+  6. applies the remaining display-referred ops (contrast and color) in sRGB.
 
 Data ceiling: this operates on whatever RGB source it is handed. JPEGs and
 legacy working copies are still 8-bit and cannot *recover* highlights that were
@@ -65,6 +67,22 @@ WB_MIN_GAIN = 0.05
 LUMA_R = 0.2126
 LUMA_G = 0.7152
 LUMA_B = 0.0722
+
+# Perceptual tone-range curve constants.  The range controls operate on an
+# sRGB-like encoding of *linear-light luminance*, then reconstruct linear RGB
+# at the new luminance.  This keeps the controls perceptually placed while
+# preserving chromaticity instead of blending each channel toward grey.
+SHADOW_PIVOT = 0.65
+SHADOW_LIFT = 3.0
+SHADOW_DEEPEN = 0.85
+BLACK_PIVOT = 0.30
+BLACK_LIFT = 0.40
+BLACK_DEEPEN = 0.90
+# Preserve chromaticity normally, but fade chroma smoothly below four sRGB
+# luminance code values when a range control raises luminance.  That prevents
+# sensor or quantization noise from becoming a saturated speck beside neutral
+# black while retaining color once the source has meaningful luminance.
+BLACK_CHROMA_FADE = 4.0 / 255.0
 
 
 def srgb_to_linear(c):
@@ -125,44 +143,126 @@ def _luma(rgb):
     )[..., None]
 
 
-def _blend_range(rgb, amount, mask):
-    """Move masked pixels toward white or black without hard clipping.
+def _unit_amount(amount):
+    """Return a scalar/array adjustment normalized from [-100, 100]."""
+    return np.asarray(amount, dtype=np.float32) / np.float32(100.0)
 
-    ``amount`` is a scalar in [-100, 100], or a per-pixel array of the same
-    (broadcastable) shape for local (mask-weighted) adjustments.
+
+def _shadow_level_curve(level, amount):
+    """Monotonic toe curve; positive values lift shadows without lifting black.
+
+    The basis ``t * (1-t)^3`` and bounded strengths below guarantee a
+    non-negative derivative for every amount in [-100, 100].  It also reaches
+    the identity curve with matching slope at ``SHADOW_PIVOT``, avoiding a
+    visible seam.  ``amount`` may be a per-pixel map for local adjustments.
     """
-    if np.ndim(amount) > 0:
-        amount = np.asarray(amount, dtype=np.float32) / 100.0
-        scaled = mask * np.abs(amount)
-        return np.where(
-            amount > 0, rgb + (1.0 - rgb) * scaled, rgb - rgb * scaled
-        )
-    amount = float(amount) / 100.0
-    if abs(amount) < 1e-9:
-        return rgb
-    mask = mask * abs(amount)
-    if amount > 0:
-        return rgb + (1.0 - rgb) * mask
-    return rgb - rgb * mask
+    amount = _unit_amount(amount)
+    positive = np.maximum(amount, 0.0)
+    negative = np.maximum(-amount, 0.0)
+    t = np.clip(level / np.float32(SHADOW_PIVOT), 0.0, 1.0)
+    basis = t * (1.0 - t) ** 3
+    delta = np.float32(SHADOW_PIVOT) * basis * (
+        np.float32(SHADOW_LIFT) * positive
+        - np.float32(SHADOW_DEEPEN) * negative
+    )
+    return np.where(level < SHADOW_PIVOT, level + delta, level)
+
+
+def _black_level_curve(level, amount):
+    """Monotonic black-point/toe curve with a smooth join at BLACK_PIVOT."""
+    amount = _unit_amount(amount)
+    positive = np.maximum(amount, 0.0)
+    negative = np.maximum(-amount, 0.0)
+    t = np.clip(level / np.float32(BLACK_PIVOT), 0.0, 1.0)
+    shoulder = (1.0 - t) ** 2
+    lift = np.float32(BLACK_PIVOT * BLACK_LIFT) * positive * shoulder
+    deepen = (
+        np.float32(BLACK_PIVOT * BLACK_DEEPEN)
+        * negative * t * shoulder
+    )
+    return np.where(level < BLACK_PIVOT, level + lift - deepen, level)
+
+
+def _compress_linear_gamut(rgb, luminance):
+    """Fit linear RGB into display gamut while retaining target luminance.
+
+    Uniform luminance scaling preserves chromaticity unless a channel exceeds
+    display white.  In that case, reduce chroma toward neutral just enough to
+    fit, rather than clipping channels independently and shifting hue.
+    """
+    max_channel = np.max(rgb, axis=-1, keepdims=True)
+    denominator = np.maximum(max_channel - luminance, np.float32(1e-7))
+    chroma_scale = np.minimum(
+        1.0,
+        np.maximum(0.0, (1.0 - luminance) / denominator),
+    )
+    return luminance + (rgb - luminance) * chroma_scale
 
 
 def apply_range_adjustments(
     rgb, *, highlights=0.0, shadows=0.0, whites=0.0, blacks=0.0
 ):
-    """Apply display-space tonal range controls with smooth luma masks."""
-    out = np.asarray(rgb, dtype=np.float32)
-    lum = _luma(out)
+    """Apply monotonic, chromaticity-preserving tonal range controls.
+
+    Each control transforms the current perceptual luminance with a monotonic
+    scalar curve.  Composing those curves therefore remains monotonic even at
+    extreme combinations.  Shadows/highlights anchor true black/white; the
+    blacks/whites controls deliberately move those endpoints.
+    """
+    src = np.asarray(rgb, dtype=np.float32)
+    if not (
+        np.any(shadows) or np.any(highlights) or np.any(blacks) or np.any(whites)
+    ):
+        return src
+    mapped = _apply_range_adjustments_linear(
+        srgb_to_linear(src),
+        highlights=highlights,
+        shadows=shadows,
+        whites=whites,
+        blacks=blacks,
+    )
+    return np.clip(linear_to_srgb(mapped), 0.0, 1.0)
+
+
+def _apply_range_adjustments_linear(
+    linear, *, highlights=0.0, shadows=0.0, whites=0.0, blacks=0.0
+):
+    """Linear-RGB implementation shared by the main pipeline and wrapper."""
+    luminance = _luma(linear)
+    level = linear_to_srgb(luminance)
+    source_level = level
 
     if np.any(shadows):
-        out = _blend_range(out, shadows, (1.0 - smoothstep(0.05, 0.65, lum)) * 0.48)
+        level = _shadow_level_curve(level, shadows)
     if np.any(highlights):
-        out = _blend_range(out, highlights, smoothstep(0.35, 0.95, lum) * 0.42)
-    if blacks:
-        out = _blend_range(out, blacks, (1.0 - smoothstep(0.00, 0.30, lum)) * 0.34)
-    if whites:
-        out = _blend_range(out, whites, smoothstep(0.70, 1.00, lum) * 0.34)
+        # Mirror the shadow curve around white.  Negative highlights use the
+        # strong recovery branch; positive highlights use the gentler branch.
+        level = 1.0 - _shadow_level_curve(
+            1.0 - level, -np.asarray(highlights, dtype=np.float32)
+        )
+    if np.any(blacks):
+        level = _black_level_curve(level, blacks)
+    if np.any(whites):
+        level = 1.0 - _black_level_curve(
+            1.0 - level, -np.asarray(whites, dtype=np.float32)
+        )
 
-    return np.clip(out, 0.0, 1.0)
+    target_luminance = srgb_to_linear(np.clip(level, 0.0, 1.0))
+    scale = target_luminance / np.maximum(luminance, np.float32(1e-7))
+    mapped = linear * scale
+    # A truly black input has no chromaticity to preserve.  Blacks > 0 assigns
+    # it the requested neutral lifted endpoint; every non-black pixel follows
+    # the chromaticity-preserving scale above.
+    mapped = np.where(luminance > 1e-7, mapped, target_luminance)
+    chroma_retention = smoothstep(0.0, BLACK_CHROMA_FADE, source_level)
+    chroma_retention = chroma_retention * chroma_retention
+    chroma_retention = np.where(
+        target_luminance > luminance, chroma_retention, 1.0
+    )
+    mapped = target_luminance + (
+        mapped - target_luminance
+    ) * chroma_retention
+    return _compress_linear_gamut(mapped, target_luminance)
 
 
 def apply_vibrance(rgb, vibrance=0.0):
@@ -363,10 +463,10 @@ def apply_adjustments(
         rgb: float array shaped ``(..., 3)`` with sRGB-encoded values in [0,1].
         exposure: stops of exposure (linear gain ``2 ** exposure``).
         white_balance: dict with ``temperature``/``tint`` in [-100, 100], or None.
-        highlights: [-100, 100]; display-space highlight range adjustment.
-        shadows: [-100, 100]; display-space shadow range adjustment.
-        whites: [-100, 100]; display-space white point range adjustment.
-        blacks: [-100, 100]; display-space black point range adjustment.
+        highlights: [-100, 100]; perceptual-luminance highlight adjustment.
+        shadows: [-100, 100]; perceptual-luminance shadow adjustment.
+        whites: [-100, 100]; perceptual-luminance white point adjustment.
+        blacks: [-100, 100]; perceptual-luminance black point adjustment.
         contrast: [-100, 100]; a linear contrast around mid-grey (0.5).
         vibrance: [-100, 100]; luma-preserving selective saturation.
         saturation: [-100, 100]; luma-preserving saturation in display space.
@@ -440,16 +540,18 @@ def apply_adjustments(
         rolled = highlight_rolloff(lin)
         lin = np.maximum(rolled, np.minimum(lin_pre, lin))
 
-    # --- display-referred ops, in sRGB ---
-    disp = linear_to_srgb(lin)
+    # --- perceptually placed range curves, reconstructed in linear RGB ---
     if highlights or shadows or whites or blacks:
-        disp = apply_range_adjustments(
-            disp,
+        lin = _apply_range_adjustments_linear(
+            lin,
             highlights=highlights,
             shadows=shadows,
             whites=whites,
             blacks=blacks,
         )
+
+    # --- display-referred ops, in sRGB ---
+    disp = linear_to_srgb(lin)
     if contrast:
         c = np.float32(1.0 + float(contrast) / 100.0)
         disp = (disp - 0.5) * c + 0.5
@@ -530,20 +632,22 @@ def _apply_adjustments_weighted(
         rolled = highlight_rolloff(lin)
         lin = np.maximum(rolled, np.minimum(lin_pre, lin))
 
-    # --- display-referred ops, in sRGB ---
-    disp = linear_to_srgb(lin)
+    # --- perceptually placed range curves, reconstructed in linear RGB ---
     hi_amt = amount_map("highlights", highlights)
     sh_amt = amount_map("shadows", shadows)
     hi_arg = highlights if hi_amt is None else hi_amt
     sh_arg = shadows if sh_amt is None else sh_amt
     if np.any(hi_arg) or np.any(sh_arg) or whites or blacks:
-        disp = apply_range_adjustments(
-            disp,
+        lin = _apply_range_adjustments_linear(
+            lin,
             highlights=hi_arg,
             shadows=sh_arg,
             whites=whites,
             blacks=blacks,
         )
+
+    # --- display-referred ops, in sRGB ---
+    disp = linear_to_srgb(lin)
     c_amt = amount_map("contrast", contrast)
     if c_amt is not None:
         disp = (disp - 0.5) * (1.0 + c_amt / 100.0) + 0.5

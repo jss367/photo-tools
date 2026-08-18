@@ -252,6 +252,10 @@ def test_token_free_export_uses_checked_metadata(live_server, page):
     )
     assert captured["submissions"] == [{
         "photo_id": 1,
+        "taxon_name": "Corvus corax",
+        "observed_on": "2026-07-12",
+        "latitude": 47.61,
+        "longitude": -122.33,
         "include_taxon": True,
         "include_date": True,
         "include_location": False,

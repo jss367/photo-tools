@@ -66,17 +66,21 @@ def _metadata_args(metadata: dict) -> list[str]:
             f"-XMP-dc:Subject={taxon}",
         ])
 
-    exif_date, offset = _exif_datetime(metadata.get("timestamp"))
-    if exif_date:
-        args.extend([
-            f"-EXIF:DateTimeOriginal={exif_date}",
-            f"-EXIF:CreateDate={exif_date}",
-        ])
-        if offset:
+    timestamp = str(metadata.get("timestamp") or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", timestamp):
+        args.append(f"-IPTC:DateCreated={timestamp.replace('-', ':')}")
+    else:
+        exif_date, offset = _exif_datetime(timestamp)
+        if exif_date:
             args.extend([
-                f"-EXIF:OffsetTimeOriginal={offset}",
-                f"-EXIF:OffsetTimeDigitized={offset}",
+                f"-EXIF:DateTimeOriginal={exif_date}",
+                f"-EXIF:CreateDate={exif_date}",
             ])
+            if offset:
+                args.extend([
+                    f"-EXIF:OffsetTimeOriginal={offset}",
+                    f"-EXIF:OffsetTimeDigitized={offset}",
+                ])
 
     latitude = metadata.get("latitude")
     longitude = metadata.get("longitude")

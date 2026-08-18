@@ -9488,6 +9488,10 @@ function _inatQuickExportSubmissions() {
     var description = document.getElementById('inatQuickDescription' + idx);
     return {
       photo_id: item.photo_id,
+      taxon_name: item.taxon_name || '',
+      observed_on: item.observed_on || '',
+      latitude: item.latitude,
+      longitude: item.longitude,
       include_taxon: !!(document.getElementById('inatIncludeTaxon' + idx) || {}).checked,
       include_date: !!(document.getElementById('inatIncludeDate' + idx) || {}).checked,
       include_location: !!(document.getElementById('inatIncludeLocation' + idx) || {}).checked,

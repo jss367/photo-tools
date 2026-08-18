@@ -65,6 +65,14 @@ def test_metadata_args_strip_unselected_location_and_date():
     assert not any("DateTimeOriginal" in arg for arg in args)
 
 
+def test_metadata_args_date_only_does_not_invent_capture_time():
+    args = _metadata_args({"timestamp": "2024-06-01"})
+
+    assert "-IPTC:DateCreated=2024:06:01" in args
+    assert not any("DateTimeOriginal" in arg for arg in args)
+    assert not any("CreateDate=2024:06:01 00:00:00" in arg for arg in args)
+
+
 def test_reserve_destination_is_atomic_across_concurrent_exports(tmp_path):
     requested = str(tmp_path / "bird-iNaturalist.jpg")
 

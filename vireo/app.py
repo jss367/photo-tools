@@ -19413,6 +19413,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             elif "HF_TOKEN" in os.environ:
                 del os.environ["HF_TOKEN"]
             cfg.save(current)
+            if "inat_token" in body:
+                _advance_inat_token_generation()
             # If the user shrunk the preview cache quota, evict immediately to the
             # new size rather than waiting for the next cache write. No-op when
             # already under quota, so always safe to call.
@@ -19581,6 +19583,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     _settings_write_lock = threading.Lock()
     _inat_token_request_generation = 0
 
+    def _advance_inat_token_generation():
+        """Invalidate in-flight modal validations after any token write."""
+        nonlocal _inat_token_request_generation
+        _inat_token_request_generation += 1
+
     @app.route("/api/settings/global", methods=["PATCH"])
     def api_settings_global_patch():
         """Set a single global config value (validated against SCHEMA)."""
@@ -19612,6 +19619,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             raw = _read_raw_config_file()
             schema.set_dotted(raw, key, value)
             cfg.save(raw)
+            if key == "inat_token":
+                _advance_inat_token_generation()
             _settings_post_save_side_effects(cfg.load())
         return jsonify({"ok": True, "key": key, "value": value})
 
@@ -19628,6 +19637,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             raw = _read_raw_config_file()
             schema.delete_dotted(raw, key)
             cfg.save(raw)
+            if key == "inat_token":
+                _advance_inat_token_generation()
             _settings_post_save_side_effects(cfg.load())
         return jsonify({"ok": True, "key": key})
 
@@ -19981,6 +19992,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 if existing is not _MISSING:
                     schema.set_dotted(payload, secret_key, existing)
             cfg.save(payload)
+            if "inat_token" in payload:
+                _advance_inat_token_generation()
             _settings_post_save_side_effects(cfg.load())
         return jsonify({"ok": True})
 
@@ -23817,7 +23830,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not token:
             return json_error("Token is required")
         with _settings_write_lock:
-            _inat_token_request_generation += 1
+            _advance_inat_token_generation()
             request_generation = _inat_token_request_generation
             token_at_validation_start = _read_raw_config_file().get(
                 "inat_token", "",
@@ -23889,7 +23902,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         db = _get_db()
         effective_cfg = db.get_effective_config(cfg.load())
-        min_conf = effective_cfg.get("detector_confidence", 0.2)
         quality = effective_cfg.get("working_copy_quality", 92)
         wc_max_size = effective_cfg.get("working_copy_max_size", 4096)
         developed_dir = effective_cfg.get("darktable_output_dir", "") or ""
@@ -23927,20 +23939,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         })
                         continue
 
-                    pred = thread_db.get_top_prediction_for_photo(
-                        photo_id, min_detector_confidence=min_conf,
-                    )
-                    location = thread_db.get_effective_photo_location(photo_id)
                     metadata = {}
-                    if item.get("include_taxon", False) and pred:
-                        metadata["taxon_name"] = (
-                            pred["scientific_name"] or pred["species"]
-                        )
+                    if item.get("include_taxon", False):
+                        taxon_name = str(
+                            item.get("taxon_name") or ""
+                        ).strip()
+                        if taxon_name:
+                            metadata["taxon_name"] = taxon_name
                     if item.get("include_date", False):
-                        metadata["timestamp"] = photo["timestamp"]
-                    if item.get("include_location", False) and location:
-                        metadata["latitude"] = location["latitude"]
-                        metadata["longitude"] = location["longitude"]
+                        observed_on = str(
+                            item.get("observed_on") or ""
+                        ).strip()
+                        if observed_on:
+                            # The modal discloses a calendar date, not capture
+                            # time or timezone, so export only that snapshot.
+                            metadata["timestamp"] = observed_on[:10]
+                    if item.get("include_location", False):
+                        latitude = item.get("latitude")
+                        longitude = item.get("longitude")
+                        if (
+                            latitude not in (None, "")
+                            and longitude not in (None, "")
+                        ):
+                            metadata["latitude"] = latitude
+                            metadata["longitude"] = longitude
                     if item.get("include_description", False):
                         description = str(
                             item.get("description") or ""

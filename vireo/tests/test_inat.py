@@ -480,6 +480,45 @@ def test_api_inat_token_does_not_overwrite_settings_write(app_and_db):
     assert cfg.load()["inat_token"] == "settings-token"
 
 
+def test_api_inat_token_rejects_aba_settings_writes(app_and_db):
+    app, _db, _pid = app_and_db
+    import config as cfg
+    cfg.save({"inat_token": "original-token"})
+
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    responses = {}
+
+    def validate(_token):
+        validation_started.set()
+        assert release_validation.wait(timeout=5)
+        return {"login": "modal-user"}
+
+    def send_modal_request():
+        responses["modal"] = app.test_client().post(
+            "/api/inat/token", json={"token": "modal-token"},
+        )
+
+    with patch("inat.validate_token", side_effect=validate):
+        modal_thread = threading.Thread(target=send_modal_request)
+        modal_thread.start()
+        assert validation_started.wait(timeout=5)
+        first_write = app.test_client().post(
+            "/api/config", json={"inat_token": "temporary-token"},
+        )
+        second_write = app.test_client().post(
+            "/api/config", json={"inat_token": "original-token"},
+        )
+        release_validation.set()
+        modal_thread.join(timeout=5)
+
+    assert not modal_thread.is_alive()
+    assert first_write.status_code == 200
+    assert second_write.status_code == 200
+    assert responses["modal"].status_code == 409
+    assert cfg.load()["inat_token"] == "original-token"
+
+
 def test_api_inat_export_uses_only_checked_metadata(app_and_db, tmp_path):
     app, db, pid = app_and_db
     destination = str(tmp_path / "exports")
@@ -502,6 +541,8 @@ def test_api_inat_export_uses_only_checked_metadata(app_and_db, tmp_path):
             "destination": destination,
             "submissions": [{
                 "photo_id": pid,
+                "taxon_name": "Corvus corax",
+                "observed_on": "2024-06-01",
                 "include_taxon": True,
                 "include_date": True,
                 "include_location": False,
@@ -521,8 +562,8 @@ def test_api_inat_export_uses_only_checked_metadata(app_and_db, tmp_path):
     assert data["exported"][0]["filename"] == "bird-iNaturalist.jpg"
     metadata = export_photo.call_args.args[4]
     assert metadata == {
-        "taxon_name": "Cardinalis cardinalis",
-        "timestamp": "2024-06-01T10:00:00",
+        "taxon_name": "Corvus corax",
+        "timestamp": "2024-06-01",
         "description": "At the feeder",
     }
 
@@ -577,7 +618,7 @@ def test_api_inat_export_rejects_non_integer_numeric_photo_ids(
 def test_api_inat_export_includes_zero_coordinates(app_and_db, tmp_path):
     app, db, pid = app_and_db
     db.conn.execute(
-        "UPDATE photos SET latitude = 0.0, longitude = 0.0 WHERE id = ?",
+        "UPDATE photos SET latitude = 12.0, longitude = 34.0 WHERE id = ?",
         (pid,),
     )
     db.conn.commit()
@@ -590,6 +631,8 @@ def test_api_inat_export_includes_zero_coordinates(app_and_db, tmp_path):
             "destination": str(tmp_path),
             "submissions": [{
                 "photo_id": pid,
+                "latitude": 0.0,
+                "longitude": 0.0,
                 "include_location": True,
             }],
         })

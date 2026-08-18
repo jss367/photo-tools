@@ -1551,7 +1551,11 @@ def _export_path_key(path, case_insensitive, normalization_insensitive=False):
     resolved = os.path.realpath(path)
     if normalization_insensitive:
         resolved = unicodedata.normalize("NFC", resolved)
-    return resolved.casefold() if case_insensitive else resolved
+    # ``casefold`` performs linguistic expansions (for example ß -> ss) that
+    # filesystems such as NTFS do not, which would invent batch collisions.
+    # ``lower`` preserves those distinct spellings while matching ordinary
+    # case aliases observed by the destination probe.
+    return resolved.lower() if case_insensitive else resolved
 
 
 def preview_export_renames(db, photo_ids, destination=None, options=None):

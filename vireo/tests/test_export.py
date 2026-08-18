@@ -1474,6 +1474,41 @@ def test_preview_export_renames_respects_unicode_equivalent_destination(
     ]
 
 
+def test_preview_export_renames_preserves_non_equivalent_casefold_names(
+    export_env, monkeypatch,
+):
+    """Case-insensitive targets do not equate linguistic ß/ss spellings."""
+    env = export_env
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = ? WHERE id = ?",
+        ("straße.jpg", env["p1"]),
+    )
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = ? WHERE id = ?",
+        ("strasse.jpg", env["p2"]),
+    )
+    env["db"].conn.commit()
+    monkeypatch.setattr(
+        export_mod,
+        "_destination_filename_behavior",
+        lambda _path: (True, False),
+    )
+    monkeypatch.setattr(
+        export_mod,
+        "_select_export_source",
+        lambda **_kwargs: str(env["src"] / "bird1.jpg"),
+    )
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "format": "jpg"},
+    )
+
+    assert renames == []
+
+
 def test_preview_export_renames_skips_missing_source_before_sequence(
     export_env,
 ):

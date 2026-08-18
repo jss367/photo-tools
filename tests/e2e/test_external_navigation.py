@@ -314,6 +314,43 @@ def test_folder_picker_result_does_not_export_replacement_modal(live_server, pag
     expect(page.locator("#inatQuickExportBtn")).to_be_enabled()
 
 
+def test_export_button_guards_pending_folder_picker(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+    _mock_tauri(page)
+    page.evaluate(
+        """
+        () => {
+          window.__TAURI_INTERNALS__.invoke = (command, args) => {
+            window.__externalTest.invokes.push({ command, args });
+            if (command === 'plugin:dialog|open') {
+              return new Promise(resolve => {
+                window.__externalTest.resolveExportDirectory = resolve;
+              });
+            }
+            return Promise.resolve(null);
+          };
+        }
+        """
+    )
+    page.evaluate("item => openInatQuickModal([item], [])", _item())
+
+    page.evaluate("() => { exportInatQuickPhotos(); exportInatQuickPhotos(); }")
+    page.wait_for_function(
+        "typeof window.__externalTest.resolveExportDirectory === 'function'"
+    )
+
+    assert len([
+        call for call in page.evaluate("window.__externalTest.invokes")
+        if call["command"] == "plugin:dialog|open"
+    ]) == 1
+    expect(page.locator("#inatQuickExportBtn")).to_be_disabled()
+    expect(page.locator("#inatQuickExportBtn")).to_have_text("Choosing folder…")
+
+    page.evaluate("window.__externalTest.resolveExportDirectory(null)")
+    expect(page.locator("#inatQuickExportBtn")).to_be_enabled()
+    expect(page.locator("#inatQuickExportBtn")).to_have_text("Export JPEG…")
+
+
 def test_closing_quick_modal_closes_export_stream(live_server, page):
     page.goto(f"{live_server['url']}/browse")
     _mock_tauri(page)

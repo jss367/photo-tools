@@ -673,6 +673,31 @@ def test_api_inat_export_rejects_invalid_coordinate_snapshots(
     )
 
 
+@pytest.mark.parametrize(
+    ("latitude", "longitude"),
+    [(90.01, 1), (-90.01, 1), (1, 180.01), (1, -180.01)],
+)
+def test_api_inat_export_rejects_out_of_range_coordinate_snapshots(
+    app_and_db, tmp_path, latitude, longitude,
+):
+    app, _db, pid = app_and_db
+
+    response = app.test_client().post("/api/inat/export", json={
+        "destination": str(tmp_path),
+        "submissions": [{
+            "photo_id": pid,
+            "latitude": latitude,
+            "longitude": longitude,
+            "include_location": True,
+        }],
+    })
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == (
+        "latitude or longitude is out of range"
+    )
+
+
 def _add_out_of_workspace_photo(db):
     active_ws = db._active_workspace_id
     base_dir = db.conn.execute("SELECT path FROM folders LIMIT 1").fetchone()["path"]

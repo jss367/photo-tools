@@ -23915,6 +23915,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     return json_error(
                         "latitude and longitude must be finite numbers",
                     )
+                if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+                    return json_error(
+                        "latitude or longitude is out of range",
+                    )
                 normalized["latitude"] = latitude
                 normalized["longitude"] = longitude
             normalized_submissions.append(normalized)

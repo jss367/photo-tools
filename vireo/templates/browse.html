@@ -11396,6 +11396,20 @@ async function _runPhotoDeepLink(photoId) {
 })();
 
 /* ---------- Export Modal ---------- */
+function migrateExportCaptureDateTimePreference() {
+  var combinedKey = 'vireo.browse.export.metadata.captureDateTime';
+  if (VireoViewPreferences.read(combinedKey) !== null) return;
+
+  var legacyDate = VireoViewPreferences.read('vireo.browse.export.metadata.captureDate');
+  var legacyTime = VireoViewPreferences.read('vireo.browse.export.metadata.captureTime');
+  if (legacyDate === null && legacyTime === null) return;
+
+  VireoViewPreferences.write(
+    combinedKey,
+    legacyDate === '1' || legacyTime === '1' ? '1' : '0'
+  );
+}
+
 function openExportModal() {
   var activeIds = getActiveSelection();
   if (activeIds.length === 0) return;
@@ -11409,6 +11423,7 @@ function openExportModal() {
   });
   document.getElementById('exportDest').value = '';
   document.getElementById('exportSubfolder').checked = false;
+  migrateExportCaptureDateTimePreference();
   VireoViewPreferences.restoreAll(document.getElementById('exportOverlay'));
   document.getElementById('exportOverlay').classList.add('open');
   updateExportPreview();

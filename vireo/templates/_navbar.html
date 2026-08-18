@@ -8141,7 +8141,10 @@ function openLightbox(photoId, filename, photoList, options) {
 }
 
 function lightboxNav(delta) {
-  if (_lightboxPhotoList.length < 2) return;
+  // A one-photo list can still be one page of a larger lazy-loaded dataset.
+  // Let the normal boundary event fire so the owning page can fetch the next
+  // or previous page instead of swallowing the first navigation attempt.
+  if (_lightboxPhotoList.length === 0) return;
   var idx = _lightboxPhotoList.findIndex(function(p) { return p.id === _lightboxCurrentId; });
   if (idx === -1) return;
   var newIdx = idx + delta;
@@ -9179,12 +9182,22 @@ function lightboxDelete() {
       return;
     }
 
+    // Capture the lightbox position before Browse updates its grid. Browse's
+    // lazy-loaded lightbox deliberately shares the same array object, so a
+    // grid removal may also remove the lightbox entry in one splice.
+    var idx = _lightboxPhotoList.findIndex(function(x) { return x.id === currentId; });
+    var removedFromSharedLightboxList = false;
+
     // Update the browse grid before touching lightbox state. Otherwise
     // Browse's `lightbox:closed` handler still finds the deleted row in
     // `photos` and re-selects it (loading stale detail state that this
     // block would then null out — leaving the sidebar blank).
     if (typeof photos !== 'undefined' && typeof renderGrid === 'function') {
-      photos = photos.filter(function(x) { return x.id !== currentId; });
+      var browseIdx = photos.findIndex(function(x) { return x.id === currentId; });
+      if (browseIdx >= 0) {
+        removedFromSharedLightboxList = photos === _lightboxPhotoList;
+        photos.splice(browseIdx, 1);
+      }
       selectedPhotos.delete(currentId);
       if (selectedPhotoId === currentId) selectedPhotoId = null;
       renderGrid();
@@ -9193,9 +9206,11 @@ function lightboxDelete() {
       }
     }
 
-    // Remove from lightbox photo list
-    var idx = _lightboxPhotoList.findIndex(function(x) { return x.id === currentId; });
-    _lightboxPhotoList.splice(idx, 1);
+    // Remove from a page-specific lightbox list. When Browse shared its live
+    // array, the grid splice above already performed this removal.
+    if (!removedFromSharedLightboxList && idx >= 0) {
+      _lightboxPhotoList.splice(idx, 1);
+    }
 
     if (_lightboxPhotoList.length === 0) {
       closeLightbox(null);

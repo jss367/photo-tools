@@ -131,6 +131,66 @@ def test_export_photos_basic(export_env):
     assert os.path.isfile(os.path.join(env["dest"], "bird2.jpg"))
 
 
+def test_export_photos_defaults_to_original_folder(export_env):
+    """An empty destination exports beside each photo's original."""
+    env = export_env
+
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination="",
+        options={"naming_template": "{original}"},
+    )
+
+    assert result["exported"] == 1
+    assert result["errors"] == []
+    # The original JPEG is preserved; collision handling gives the rendered
+    # export a new name in the same directory.
+    assert os.path.isfile(env["src"] / "bird1_2.jpg")
+
+
+def test_export_photos_can_use_subfolder_beside_originals(export_env):
+    """The optional export subfolder is resolved per original folder."""
+    env = export_env
+
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination="",
+        options={
+            "naming_template": "{original}",
+            "export_to_subfolder": True,
+        },
+    )
+
+    assert result["exported"] == 2
+    assert result["errors"] == []
+    assert os.path.isfile(env["src"] / "exported" / "bird1.jpg")
+    assert os.path.isfile(env["src"] / "exported" / "bird2.jpg")
+
+
+def test_export_photos_can_use_subfolder_under_custom_destination(export_env):
+    """A selected custom destination remains compatible with the checkbox."""
+    env = export_env
+
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={
+            "naming_template": "{original}",
+            "export_to_subfolder": True,
+        },
+    )
+
+    assert result["exported"] == 1
+    assert result["errors"] == []
+    assert os.path.isfile(os.path.join(env["dest"], "exported", "bird1.jpg"))
+
+
 def test_export_photos_resize(export_env):
     """export_photos resizes photos to max_size."""
     env = export_env

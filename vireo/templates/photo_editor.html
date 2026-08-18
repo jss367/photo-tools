@@ -3958,46 +3958,60 @@ function buildPhotoEditorContextMenu() {
     { separator: true },
     {
       label: 'Auto Tone',
-      disabled: unavailable,
-      disabledHint: unavailable ? 'No photo is ready to edit' : undefined,
+      disabled: unavailable || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : undefined),
       onClick: autoTone,
     },
     {
       label: 'Edit Crop',
-      disabled: unavailable || editorState.cropEditing || editorState.showBefore,
+      disabled: unavailable || savePending || editorState.cropEditing || editorState.showBefore,
       disabledHint: unavailable
         ? 'No photo is ready to edit'
-        : (editorState.showBefore ? 'Return to the current edit first' : 'Crop editing is already active'),
+        : (savePending
+          ? 'Saving changes'
+          : (editorState.showBefore ? 'Return to the current edit first' : 'Crop editing is already active')),
       onClick: beginCropEdit,
     },
     {
       label: 'Full Frame',
-      disabled: unavailable || !recipe.crop,
-      disabledHint: unavailable ? 'No photo is ready to edit' : 'The full frame is already selected',
+      disabled: unavailable || savePending || !recipe.crop,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : 'The full frame is already selected'),
       onClick: resetCrop,
     },
     {
       label: 'Rotate Left',
-      disabled: unavailable,
-      disabledHint: unavailable ? 'No photo is ready to edit' : undefined,
+      disabled: unavailable || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : undefined),
       onClick: function() { rotateRecipe(-90); },
     },
     {
       label: 'Rotate Right',
-      disabled: unavailable,
-      disabledHint: unavailable ? 'No photo is ready to edit' : undefined,
+      disabled: unavailable || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : undefined),
       onClick: function() { rotateRecipe(90); },
     },
     {
       label: 'Flip Horizontal',
-      disabled: unavailable,
-      disabledHint: unavailable ? 'No photo is ready to edit' : undefined,
+      disabled: unavailable || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : undefined),
       onClick: function() { flipRecipe('horizontal'); },
     },
     {
       label: 'Flip Vertical',
-      disabled: unavailable,
-      disabledHint: unavailable ? 'No photo is ready to edit' : undefined,
+      disabled: unavailable || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : undefined),
       onClick: function() { flipRecipe('vertical'); },
     },
     { separator: true },
@@ -4009,8 +4023,10 @@ function buildPhotoEditorContextMenu() {
     },
     {
       label: 'Reset All Edits',
-      disabled: unavailable || !hasEdits,
-      disabledHint: unavailable ? 'No photo is ready to edit' : 'There are no edits to reset',
+      disabled: unavailable || savePending || !hasEdits,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : 'There are no edits to reset'),
       onClick: resetAllEdits,
     },
     { separator: true },

@@ -78,7 +78,9 @@ def test_photo_editor_context_disables_save_while_request_is_pending(
     pending_items = page.evaluate(
         """() => {
           const wanted = new Set([
-            'Save Changes', 'Revert to Saved', 'Export…', 'Send to iNaturalist'
+            'Save Changes', 'Revert to Saved', 'Auto Tone', 'Edit Crop',
+            'Full Frame', 'Rotate Left', 'Rotate Right', 'Flip Horizontal',
+            'Flip Vertical', 'Reset All Edits', 'Export…', 'Send to iNaturalist'
           ]);
           return buildPhotoEditorContextMenu()
             .filter(entry => wanted.has(entry.label))
@@ -90,7 +92,18 @@ def test_photo_editor_context_disables_save_while_request_is_pending(
         }"""
     )
     assert {item["label"] for item in pending_items} == {
-        "Save Changes", "Revert to Saved", "Export…", "Send to iNaturalist"
+        "Save Changes",
+        "Revert to Saved",
+        "Auto Tone",
+        "Edit Crop",
+        "Full Frame",
+        "Rotate Left",
+        "Rotate Right",
+        "Flip Horizontal",
+        "Flip Vertical",
+        "Reset All Edits",
+        "Export…",
+        "Send to iNaturalist",
     }
     assert all(item["disabled"] is True for item in pending_items)
     assert all(item["hint"] == "Saving changes" for item in pending_items)

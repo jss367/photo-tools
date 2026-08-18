@@ -217,19 +217,38 @@ class VireoApiClient:
         result = self._request("/api/jobs")
         payload = result.pop("payload", None)
         if payload is not None:
-            result.update(compact_jobs_payload(payload))
+            if (
+                not isinstance(payload, dict)
+                or not isinstance(payload.get("active"), list)
+                or not isinstance(payload.get("history"), list)
+            ):
+                result["error"] = "invalid Jobs API payload"
+            else:
+                result.update(compact_jobs_payload(payload))
         return result
 
 
+def _is_successful_jobs_sample(sample):
+    """Return whether a Jobs API sample is usable for workload analysis."""
+    return (
+        sample.get("status") == 200
+        and not sample.get("error")
+        and isinstance(sample.get("jobs"), list)
+    )
+
+
 class ProcessTreeSampler:
-    def __init__(self, pid, *, psutil_module=psutil):
+    def __init__(self, pid, *, psutil_module=psutil, monotonic=time.monotonic):
         if psutil_module is None:
             raise RuntimeError(
                 "psutil is required; install the Vireo development dependencies"
             )
         self.psutil = psutil_module
+        self.monotonic = monotonic
         self.root = psutil_module.Process(pid)
         self.processes = {}
+        self._cpu_times = {}
+        self._last_cpu_sample_at = None
         try:
             self.executable = self.root.exe()
         except (OSError, self.psutil.Error):
@@ -272,25 +291,51 @@ class ProcessTreeSampler:
         return list(live.values())
 
     def prime(self):
+        self._cpu_times = {}
         for process in self._current_processes():
             try:
-                process.cpu_percent(interval=None)
-            except self.psutil.Error:
+                identity = (process.pid, process.create_time())
+                cpu = process.cpu_times()
+                self._cpu_times[identity] = cpu.user + cpu.system
+            except (OSError, self.psutil.Error):
                 continue
+        self._last_cpu_sample_at = self.monotonic()
 
     def sample(self):
-        cpu_percent = 0.0
+        sampled_at = self.monotonic()
+        elapsed = (
+            sampled_at - self._last_cpu_sample_at
+            if self._last_cpu_sample_at is not None
+            else 0.0
+        )
+        cpu_seconds = 0.0
+        current_cpu_times = {}
         rss_bytes = 0
         thread_count = 0
         process_count = 0
         for process in self._current_processes():
             try:
-                cpu_percent += process.cpu_percent(interval=None)
+                identity = (process.pid, process.create_time())
+                cpu = process.cpu_times()
+                total_cpu_seconds = cpu.user + cpu.system
+                current_cpu_times[identity] = total_cpu_seconds
+                # A child first discovered after prime() was spawned during
+                # this sampling window. Its cumulative process CPU time is
+                # therefore the correct delta from zero; psutil.cpu_percent
+                # would instead return a synthetic zero on this first call.
+                previous_cpu_seconds = self._cpu_times.get(identity, 0.0)
+                cpu_seconds += max(
+                    total_cpu_seconds - previous_cpu_seconds,
+                    0.0,
+                )
                 rss_bytes += process.memory_info().rss
                 thread_count += process.num_threads()
                 process_count += 1
-            except self.psutil.Error:
+            except (OSError, self.psutil.Error):
                 continue
+        self._cpu_times = current_cpu_times
+        self._last_cpu_sample_at = sampled_at
+        cpu_percent = cpu_seconds / elapsed * 100.0 if elapsed > 0 else 0.0
         metadata = self.metadata()
         return {
             "cpu_percent": round(cpu_percent, 2),
@@ -452,7 +497,10 @@ def _scenario_summary(jobs):
 
 
 def build_summary(baseline, samples):
-    successful = [sample for sample in samples if sample["api"].get("status") == 200]
+    successful = [
+        sample for sample in samples
+        if _is_successful_jobs_sample(sample["api"])
+    ]
     api_failure_count = len(samples) - len(successful)
     api_latencies = [sample["api"]["latency_seconds"] for sample in successful]
     process_cpu = [sample["process"]["cpu_percent"] for sample in samples]
@@ -558,7 +606,7 @@ def collect_workload(
 ):
     api_client.authenticate()
     baseline = api_client.sample()
-    if baseline.get("status") != 200:
+    if not _is_successful_jobs_sample(baseline):
         raise RuntimeError(
             f"GET /api/jobs failed before sampling: "
             f"{baseline.get('error') or baseline.get('status')}"

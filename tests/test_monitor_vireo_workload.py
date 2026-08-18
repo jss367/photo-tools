@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from scripts.monitor_vireo_workload import (
+    ProcessTreeSampler,
     VireoApiClient,
     collect_workload,
     compact_jobs_payload,
@@ -465,6 +466,60 @@ def test_single_flight_target_is_unknown_when_any_api_sample_fails():
     assert targets["no_embedding_single_flight_violations"] is None
 
 
+def test_malformed_200_jobs_response_counts_as_api_failure():
+    clock = _FakeClock()
+    api = _SequenceApi([
+        _api_sample(
+            latency=0.001, wait_count=0, wait_seconds=0.0,
+            producer_starts=0, waiter_joins=0,
+        ),
+        {
+            "status": 200,
+            "latency_seconds": 0.01,
+            "error": "invalid JSON: malformed response",
+        },
+    ])
+    process = _SequenceSampler(
+        [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True}],
+        {"pid": 123, "executable_exists": True},
+    )
+    system = _SequenceSampler(
+        [{"cpu_idle_percent": 50.0}],
+        {"logical_cpu_count": 16},
+    )
+
+    report = collect_workload(
+        duration=1.0,
+        interval=1.0,
+        api_client=api,
+        process_sampler=process,
+        system_sampler=system,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert report["summary"]["api_failure_count"] == 1
+    assert report["summary"]["jobs_api_latency_seconds"] is None
+    assert report["summary"]["targets"]["jobs_api_p95_below_500ms"] is False
+
+
+def test_malformed_200_jobs_baseline_is_rejected():
+    api = _SequenceApi([{
+        "status": 200,
+        "latency_seconds": 0.001,
+        "error": "invalid JSON: malformed response",
+    }])
+
+    with pytest.raises(RuntimeError, match="invalid JSON"):
+        collect_workload(
+            duration=1.0,
+            interval=1.0,
+            api_client=api,
+            process_sampler=None,
+            system_sampler=None,
+        )
+
+
 def test_latency_target_fails_when_api_samples_fail():
     """A run with one fast success and one long timeout used to report
     ``jobs_api_p95_below_500ms: true`` because failed requests were excluded
@@ -698,6 +753,72 @@ def test_api_client_establishes_browser_cookie_before_reading_jobs():
 
     assert sample["status"] == 200
     assert sample["resource_budget"] == {"waiters": 0}
+
+
+def test_process_sampler_counts_cpu_for_newly_discovered_child():
+    clock = _FakeClock()
+
+    class _CpuProcess:
+        def __init__(self, pid, created_at, cpu_seconds, rss):
+            self.pid = pid
+            self.created_at = created_at
+            self.cpu_seconds = cpu_seconds
+            self.rss = rss
+            self.child_processes = []
+
+        def exe(self):
+            return "/tmp/vireo-server"
+
+        def cmdline(self):
+            return ["vireo-server"]
+
+        def create_time(self):
+            return self.created_at
+
+        def children(self, recursive=False):
+            return list(self.child_processes)
+
+        def cpu_times(self):
+            return type("CpuTimes", (), {
+                "user": self.cpu_seconds,
+                "system": 0.0,
+            })()
+
+        def memory_info(self):
+            return type("MemoryInfo", (), {"rss": self.rss})()
+
+        def num_threads(self):
+            return 1
+
+    class _CpuPsutil:
+        Error = RuntimeError
+
+        def __init__(self, root):
+            self.root = root
+
+        def Process(self, pid):
+            assert pid == self.root.pid
+            return self.root
+
+    root = _CpuProcess(100, 1.0, 1.0, 100)
+    sampler = ProcessTreeSampler(
+        root.pid,
+        psutil_module=_CpuPsutil(root),
+        monotonic=clock.monotonic,
+    )
+    sampler.prime()
+
+    # During the one-second window the root consumes 0.2 CPU seconds and a
+    # newly spawned worker consumes 0.5. Its first sample must contribute its
+    # lifetime CPU instead of psutil's first-call cpu_percent() zero.
+    root.cpu_seconds = 1.2
+    root.child_processes = [_CpuProcess(101, 2.0, 0.5, 200)]
+    clock.sleep(1.0)
+    sample = sampler.sample()
+
+    assert sample["cpu_percent"] == 70.0
+    assert sample["rss_bytes"] == 300
+    assert sample["process_count"] == 2
 
 
 class _FakeConn:

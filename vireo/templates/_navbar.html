@@ -653,8 +653,26 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .lightbox-adjust-panel.lb-photo-transition-pending {
   opacity: 0.55;
 }
-.lifelist-lb-panel { display:flex; flex-direction:column; gap:6px; align-items:stretch; padding:4px 8px; border-radius:4px; background:rgba(12,14,16,0.88); border:1px solid rgba(255,255,255,0.42); color:#f4f7f8; font-size:12px; font-weight:650; text-shadow:0 1px 1px rgba(0,0,0,0.75); }
-.lifelist-lb-row { display:flex; align-items:center; gap:8px; justify-content:space-between; }
+.lifelist-lb-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: stretch;
+  width: 260px;
+  min-width: 260px;
+  height: 44px;
+  box-sizing: border-box;
+  overflow-y: auto;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: rgba(12,14,16,0.88);
+  border: 1px solid rgba(255,255,255,0.42);
+  color: #f4f7f8;
+  font-size: 12px;
+  font-weight: 650;
+  text-shadow: 0 1px 1px rgba(0,0,0,0.75);
+}
+.lifelist-lb-row { display:flex; flex:0 0 auto; align-items:center; gap:8px; justify-content:space-between; }
 .lifelist-lb-row .lifelist-lb-species { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:180px; }
 .lifelist-lb-panel button { min-height:24px; border:1px solid rgba(255,255,255,0.42); background:rgba(255,255,255,0.12); color:#fff; border-radius:4px; padding:4px 9px; cursor:pointer; font-size:12px; font-weight:650; }
 .lifelist-lb-panel button:hover { background:rgba(255,255,255,0.2); border-color:rgba(255,255,255,0.72); }
@@ -1162,7 +1180,8 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .lightbox-keywords {
   display: flex;
   max-width: 100%;
-  max-height: 72px;
+  height: 72px;
+  box-sizing: border-box;
   overflow-y: auto;
   align-items: center;
   gap: 5px;
@@ -4234,11 +4253,17 @@ function _lbRenderLifeListPanel(photoId) {
   var data = _lbPhotoDataByPhoto[String(photoId)];
   var entries = (data && data.life_list) || [];
   if (!entries.length) {
-    panel.style.display = 'none';
     panel.innerHTML = '';
+    // Keep an invisible, fixed-size placeholder in the wrapping action row.
+    // Otherwise navigating to an ineligible photo (or rejecting the current
+    // one) changes the bottom bar's height and makes a fit-to-window image
+    // visibly resize after its pixels have already loaded.
+    panel.style.visibility = 'hidden';
+    panel.setAttribute('aria-hidden', 'true');
     return;
   }
-  panel.style.display = '';
+  panel.style.visibility = 'visible';
+  panel.setAttribute('aria-hidden', 'false');
   panel.innerHTML = '';
   entries.forEach(function(entry) {
     var row = document.createElement('div');

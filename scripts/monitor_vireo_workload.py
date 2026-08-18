@@ -990,7 +990,11 @@ def _listener_reachable_via(
         except ValueError:
             continue
         if addr.is_loopback:
-            if all_bind or (listener_addr is not None and listener_addr.is_loopback):
+            if (
+                listener_addr is not None
+                and addr.version == listener_addr.version
+                and (all_bind or listener_addr.is_loopback)
+            ):
                 return True
             continue
         if all_bind and addr_str in (local_addresses or ()):

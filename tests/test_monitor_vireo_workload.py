@@ -1331,6 +1331,35 @@ def test_explicit_server_accepted_when_listener_binds_all_interfaces():
     assert server == {"pid": 4242, "url": "http://127.0.0.1:50222"}
 
 
+def test_listener_rejects_loopback_url_from_different_address_family():
+    proc = _FakeProc(4242, port=50222, listener_ip="127.0.0.1")
+    fake = _FakePsutil([proc])
+    resolver = _fake_resolver({"::1": ["::1"]})
+
+    with pytest.raises(RuntimeError, match="does not own"):
+        discover_server(
+            requested_pid=4242,
+            requested_url="http://[::1]:50222",
+            psutil_module=fake,
+            resolver=resolver,
+        )
+
+
+def test_ipv6_wildcard_listener_accepts_ipv6_loopback_url():
+    proc = _FakeProc(4242, port=50222, listener_ip="::")
+    fake = _FakePsutil([proc])
+    resolver = _fake_resolver({"::1": ["::1"]})
+
+    server = discover_server(
+        requested_pid=4242,
+        requested_url="http://[::1]:50222",
+        psutil_module=fake,
+        resolver=resolver,
+    )
+
+    assert server == {"pid": 4242, "url": "http://[::1]:50222"}
+
+
 def test_wildcard_listener_accepts_verified_local_lan_address():
     proc = _FakeProc(4242, port=50222, listener_ip="0.0.0.0")
     fake = _FakePsutil([proc])

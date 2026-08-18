@@ -78,6 +78,11 @@ SHADOW_DEEPEN = 0.85
 BLACK_PIVOT = 0.30
 BLACK_LIFT = 0.40
 BLACK_DEEPEN = 0.90
+# Preserve chromaticity normally, but fade chroma smoothly below four sRGB
+# luminance code values when a range control raises luminance.  That prevents
+# sensor or quantization noise from becoming a saturated speck beside neutral
+# black while retaining color once the source has meaningful luminance.
+BLACK_CHROMA_FADE = 4.0 / 255.0
 
 
 def srgb_to_linear(c):
@@ -225,6 +230,7 @@ def _apply_range_adjustments_linear(
     """Linear-RGB implementation shared by the main pipeline and wrapper."""
     luminance = _luma(linear)
     level = linear_to_srgb(luminance)
+    source_level = level
 
     if np.any(shadows):
         level = _shadow_level_curve(level, shadows)
@@ -248,6 +254,14 @@ def _apply_range_adjustments_linear(
     # it the requested neutral lifted endpoint; every non-black pixel follows
     # the chromaticity-preserving scale above.
     mapped = np.where(luminance > 1e-7, mapped, target_luminance)
+    chroma_retention = smoothstep(0.0, BLACK_CHROMA_FADE, source_level)
+    chroma_retention = chroma_retention * chroma_retention
+    chroma_retention = np.where(
+        target_luminance > luminance, chroma_retention, 1.0
+    )
+    mapped = target_luminance + (
+        mapped - target_luminance
+    ) * chroma_retention
     return _compress_linear_gamut(mapped, target_luminance)
 
 

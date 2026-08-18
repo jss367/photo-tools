@@ -196,6 +196,17 @@ def test_shadow_lift_preserves_linear_rgb_ratios_when_in_gamut():
     assert np.all(out > rgb)
 
 
+def test_lifted_black_neutralizes_one_code_chroma_noise():
+    rgb = np.array(
+        [[[0.0, 0.0, 0.0], [0.0, 0.0, 1.0 / 255.0]]],
+        dtype=np.float32,
+    )
+    out = apply_adjustments(rgb, blacks=100)
+    exact_black, blue_noise = out[0]
+    assert float(np.ptp(blue_noise)) < 0.01
+    assert np.max(np.abs(blue_noise - exact_black)) < 0.01
+
+
 def test_positive_vibrance_prefers_less_saturated_colors():
     low = np.array([[[0.55, 0.50, 0.48]]], dtype=np.float32)
     high = np.array([[[0.95, 0.20, 0.10]]], dtype=np.float32)

@@ -58,6 +58,7 @@ def test_shader_range_curve_constants_match_tone():
         f"x / {tone.BLACK_PIVOT:.2f}",
         f"{tone.BLACK_PIVOT:.2f} * {tone.BLACK_LIFT:.2f} * positive",
         f"{tone.BLACK_PIVOT:.2f} * {tone.BLACK_DEEPEN:.2f} * negative",
+        f"smoothstep(0.0, {tone.BLACK_CHROMA_FADE:.10f}, sourceLevel)",
     )
     for fragment in expected_fragments:
         assert fragment in src, f"shader is missing tone.py constant: {fragment}"
@@ -113,6 +114,7 @@ def _shader_mirror(
     def apply_range_curves(range_lin):
         luminance = range_lin @ np.array([0.2126, 0.7152, 0.0722])
         level = linear_to_srgb(luminance)
+        source_level = level
         level = shadow_level_curve(level, shadows)
         level = 1.0 - shadow_level_curve(1.0 - level, -highlights)
         level = black_level_curve(level, blacks)
@@ -123,6 +125,13 @@ def _shader_mirror(
             range_lin * (target / np.maximum(luminance, 1e-7))[..., None],
             target[..., None],
         )
+        fade_t = np.clip(source_level / (4.0 / 255.0), 0.0, 1.0)
+        chroma_retention = fade_t * fade_t * (3.0 - 2.0 * fade_t)
+        chroma_retention *= chroma_retention
+        chroma_retention = np.where(target > luminance, chroma_retention, 1.0)
+        mapped = target[..., None] + (
+            mapped - target[..., None]
+        ) * chroma_retention[..., None]
         max_channel = np.max(mapped, axis=-1)
         denominator = np.maximum(max_channel - target, 1e-7)
         chroma_scale = np.clip((1.0 - target) / denominator, 0.0, 1.0)

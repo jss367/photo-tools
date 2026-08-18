@@ -1316,6 +1316,16 @@ def test_explicit_server_rejected_when_pid_does_not_own_url_port():
         )
 
 
+@pytest.mark.parametrize("url", [
+    "http://127.0.0.1:not-a-port",
+    "http://127.0.0.1:99999",
+    "http://[::1",
+])
+def test_discovery_rejects_invalid_url_ports_without_value_error(url):
+    with pytest.raises(RuntimeError, match="valid port"):
+        discover_server(requested_url=url, psutil_module=_FakePsutil([]))
+
+
 def test_url_only_discovery_rejects_host_that_local_listener_does_not_serve():
     """`--url http://remote-host:50222` with no `--pid`: even though a
     local vireo-server also listens on port 50222, the URL points to a

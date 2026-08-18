@@ -996,6 +996,22 @@ def _process_owns_url(process, port, host, *, psutil_module, resolver=socket.get
     return None
 
 
+def _parse_server_url(url):
+    try:
+        parsed = urllib.parse.urlparse(url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError(
+            "--url must include http(s), a host, and a valid port"
+        ) from exc
+    if parsed.scheme not in {"http", "https"} or not hostname or not port:
+        raise RuntimeError(
+            "--url must include http(s), a host, and a valid port"
+        )
+    return parsed, hostname, port
+
+
 def discover_server(
     *,
     requested_pid=None,
@@ -1008,9 +1024,9 @@ def discover_server(
             "psutil is required; install the Vireo development dependencies"
         )
     if requested_pid is not None and requested_url:
-        parsed = urllib.parse.urlparse(requested_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname or not parsed.port:
-            raise RuntimeError("--url must include http(s), a host, and a port")
+        _parsed, requested_hostname, requested_port = _parse_server_url(
+            requested_url
+        )
         try:
             process = psutil_module.Process(requested_pid)
         except psutil_module.Error as exc:
@@ -1021,20 +1037,20 @@ def discover_server(
         # silently corrupt the workload comparison.
         owner = _process_owns_url(
             process,
-            parsed.port,
-            parsed.hostname,
+            requested_port,
+            requested_hostname,
             psutil_module=psutil_module,
             resolver=resolver,
         )
         if owner is None:
             raise RuntimeError(
                 f"PID {requested_pid} does not own {requested_url}: no process "
-                f"in its tree is listening on port {parsed.port} at an address "
-                f"reachable via {parsed.hostname!r}"
+                f"in its tree is listening on port {requested_port} at an address "
+                f"reachable via {requested_hostname!r}"
             )
         if not _is_vireo_process(owner, psutil_module=psutil_module):
             raise RuntimeError(
-                f"PID {requested_pid} owns port {parsed.port} but the listening "
+                f"PID {requested_pid} owns port {requested_port} but the listening "
                 f"process is not a vireo-server"
             )
         # Attribute CPU/RSS and executable-presence samples to the process
@@ -1044,11 +1060,9 @@ def discover_server(
     requested_port = None
     requested_hostname = None
     if requested_url:
-        parsed = urllib.parse.urlparse(requested_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname or not parsed.port:
-            raise RuntimeError("--url must include http(s), a host, and a port")
-        requested_port = parsed.port
-        requested_hostname = parsed.hostname
+        _parsed, requested_hostname, requested_port = _parse_server_url(
+            requested_url
+        )
     candidates = []
     for process in psutil_module.process_iter(["pid", "name", "cmdline", "create_time"]):
         try:

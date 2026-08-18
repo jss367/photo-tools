@@ -51,16 +51,24 @@ def test_browse_lightbox_arrows_navigate(live_server, page):
     expect(counter).to_contain_text("1 /")
     expect(counter).to_contain_text(first_filename)
 
+    keywords = page.locator("#lightboxKeywords")
+    expect(keywords).to_be_visible()
+    expect(keywords).to_contain_text("Keywords")
+    expect(keywords.locator(".lightbox-keyword")).to_have_text("Red-tailed Hawk")
+
     page.locator("[title='Next (→)']").click()
 
     expect(filename_display).not_to_have_text(first_filename)
     expect(counter).to_contain_text("2 /")
     expect(counter).to_contain_text(filename_display.text_content())
+    expect(keywords).to_contain_text("None")
+    expect(keywords.locator(".lightbox-keyword")).to_have_count(0)
 
     page.locator("[title='Previous (←)']").click()
     expect(filename_display).to_have_text(first_filename)
     expect(counter).to_contain_text("1 /")
     expect(counter).to_contain_text(first_filename)
+    expect(keywords.locator(".lightbox-keyword")).to_have_text("Red-tailed Hawk")
 
 
 def test_browse_lightbox_close_selects_current_photo(live_server, page):

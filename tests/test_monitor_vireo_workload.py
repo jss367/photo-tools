@@ -1389,6 +1389,21 @@ def test_specific_loopback_listener_requires_exact_address():
         )
 
 
+def test_multi_address_hostname_is_pinned_to_verified_listener():
+    proc = _FakeProc(4242, port=50222, listener_ip="127.0.0.1")
+    fake = _FakePsutil([proc])
+    resolver = _fake_resolver({"localhost": ["::1", "127.0.0.1"]})
+
+    server = discover_server(
+        requested_pid=4242,
+        requested_url="http://localhost:50222",
+        psutil_module=fake,
+        resolver=resolver,
+    )
+
+    assert server == {"pid": 4242, "url": "http://127.0.0.1:50222"}
+
+
 def test_ipv6_wildcard_listener_accepts_ipv6_loopback_url():
     proc = _FakeProc(4242, port=50222, listener_ip="::")
     fake = _FakePsutil([proc])

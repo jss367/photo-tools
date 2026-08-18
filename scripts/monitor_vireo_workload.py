@@ -980,14 +980,14 @@ def _resolve_hostname(hostname, *, resolver=socket.getaddrinfo):
     return frozenset(info[4][0] for info in infos if info and info[4])
 
 
-def _listener_reachable_via(
+def _listener_reachable_address(
     host,
     listener_ip,
     *,
     resolver=socket.getaddrinfo,
     local_addresses=None,
 ):
-    """Return True if a connection to ``host`` would reach ``listener_ip``.
+    """Return the resolved address that would reach ``listener_ip``.
 
     A listener bound to ``0.0.0.0``/``::`` accepts any local address, so
     loopback URLs are considered reachable; a listener bound to a specific
@@ -996,7 +996,7 @@ def _listener_reachable_via(
     """
     resolved = _resolve_hostname(host, resolver=resolver)
     if not resolved:
-        return False
+        return None
     all_bind = listener_ip in {"0.0.0.0", "::"}
     if all_bind and local_addresses is None:
         local_addresses = _resolve_hostname(
@@ -1017,7 +1017,7 @@ def _listener_reachable_via(
                 and addr.version == listener_addr.version
                 and (all_bind or addr == listener_addr)
             ):
-                return True
+                return addr_str
             continue
         if (
             all_bind
@@ -1025,10 +1025,25 @@ def _listener_reachable_via(
             and addr.version == listener_addr.version
             and addr_str in (local_addresses or ())
         ):
-            return True
+            return addr_str
         if not all_bind and addr_str == listener_ip:
-            return True
-    return False
+            return addr_str
+    return None
+
+
+def _listener_reachable_via(
+    host,
+    listener_ip,
+    *,
+    resolver=socket.getaddrinfo,
+    local_addresses=None,
+):
+    return _listener_reachable_address(
+        host,
+        listener_ip,
+        resolver=resolver,
+        local_addresses=local_addresses,
+    ) is not None
 
 
 def _process_owns_url(
@@ -1053,13 +1068,14 @@ def _process_owns_url(
                 continue
             if connection.laddr.port != port:
                 continue
-            if _listener_reachable_via(
+            reachable_address = _listener_reachable_address(
                 host,
                 connection.laddr.ip,
                 resolver=resolver,
                 local_addresses=local_addresses,
-            ):
-                return candidate
+            )
+            if reachable_address is not None:
+                return candidate, reachable_address
     return None
 
 
@@ -1092,7 +1108,7 @@ def discover_server(
             "psutil is required; install the Vireo development dependencies"
         )
     if requested_pid is not None and requested_url:
-        _parsed, requested_hostname, requested_port = _parse_server_url(
+        parsed, requested_hostname, requested_port = _parse_server_url(
             requested_url
         )
         try:
@@ -1103,7 +1119,7 @@ def discover_server(
         # port *and* is reachable via the URL's host; otherwise samples could
         # be mixed from two processes (or two hosts on the same port) and
         # silently corrupt the workload comparison.
-        owner = _process_owns_url(
+        owner_result = _process_owns_url(
             process,
             requested_port,
             requested_hostname,
@@ -1111,12 +1127,13 @@ def discover_server(
             resolver=resolver,
             local_addresses=local_addresses,
         )
-        if owner is None:
+        if owner_result is None:
             raise RuntimeError(
                 f"PID {requested_pid} does not own {requested_url}: no process "
                 f"in its tree is listening on port {requested_port} at an address "
                 f"reachable via {requested_hostname!r}"
             )
+        owner, reachable_address = owner_result
         if not _is_vireo_process(owner, psutil_module=psutil_module):
             raise RuntimeError(
                 f"PID {requested_pid} owns port {requested_port} but the listening "
@@ -1125,7 +1142,23 @@ def discover_server(
         # Attribute CPU/RSS and executable-presence samples to the process
         # that owns the listener.  ``requested_pid`` may be a shell or
         # supervisor whose child is the actual vireo-server.
-        return {"pid": owner.pid, "url": requested_url.rstrip("/")}
+        verified_url = requested_url.rstrip("/")
+        if len(_resolve_hostname(requested_hostname, resolver=resolver)) > 1:
+            if parsed.scheme == "https":
+                raise RuntimeError(
+                    "--url resolves to multiple addresses; use the numeric "
+                    "address of the selected HTTPS listener"
+                )
+            url_host = (
+                f"[{reachable_address}]"
+                if ":" in reachable_address
+                else reachable_address
+            )
+            verified_url = (
+                f"{parsed.scheme}://{url_host}:{requested_port}"
+                f"{parsed.path.rstrip('/')}"
+            )
+        return {"pid": owner.pid, "url": verified_url}
     requested_port = None
     requested_hostname = None
     if requested_url:

@@ -416,15 +416,8 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
                 progress_cb(i + 1, len(photo_ids), photo["filename"])
             continue
 
-        # Handle collisions
-        out_path = _deduplicate_path(out_path)
-
-        # Ensure subdirectory exists
-        out_dir = os.path.dirname(out_path)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-
         # Load, resize, and save
+        claimed_out_path = None
         try:
             load_max_size = (
                 None if recipe and recipe.get("crop") else (max_size or None)
@@ -510,8 +503,17 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
                         vireo_dir, pid, recipe,
                     ),
                 )
-            _save_export_image(img, out_path, format_info, quality)
-            img.close()
+            try:
+                out_path, output_stream = _claim_export_path(out_path)
+                claimed_out_path = out_path
+                try:
+                    _save_export_image(
+                        img, output_stream, format_info, quality,
+                    )
+                finally:
+                    output_stream.close()
+            finally:
+                img.close()
             if metadata_fields:
                 try:
                     metadata_args = _export_metadata_args(
@@ -539,6 +541,9 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
                 if exported_files is not None:
                     exported_files.append(out_path)
         except Exception as exc:
+            if claimed_out_path:
+                with contextlib.suppress(OSError):
+                    os.unlink(claimed_out_path)
             log.warning("Export failed for %s: %s", photo["filename"], exc)
             errors.append(f"{photo['filename']}: {exc}")
 
@@ -581,7 +586,7 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
     return result
 
 
-def _save_export_image(img, out_path, format_info, quality):
+def _save_export_image(img, output, format_info, quality):
     """Save a rendered export image in the requested output format."""
     pil_format = format_info["pil_format"]
     save_img = img
@@ -593,7 +598,7 @@ def _save_export_image(img, out_path, format_info, quality):
     elif pil_format == "TIFF":
         save_kwargs["compression"] = "tiff_lzw"
     try:
-        save_img.save(out_path, pil_format, **save_kwargs)
+        save_img.save(output, pil_format, **save_kwargs)
     finally:
         if save_img is not img:
             save_img.close()
@@ -1573,6 +1578,21 @@ def _deduplicate_path(
     ):
         counter += 1
     return f"{stem}_{counter}{ext}"
+
+
+def _claim_export_path(path):
+    """Atomically claim a non-overwriting output path and open stream."""
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    stem, ext = os.path.splitext(path)
+    counter = 1
+    while True:
+        candidate = path if counter == 1 else f"{stem}_{counter}{ext}"
+        try:
+            return candidate, open(candidate, "xb")
+        except FileExistsError:
+            counter += 1
 
 
 def _nearest_existing_directory(path):

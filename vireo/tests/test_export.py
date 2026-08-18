@@ -5,7 +5,9 @@ import errno
 import json
 import os
 import sys
+import threading
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -1344,6 +1346,44 @@ def test_export_photos_collision_renames(export_env):
     assert result["exported"] == 2
     assert os.path.isfile(os.path.join(env["dest"], "photo.jpg"))
     assert os.path.isfile(os.path.join(env["dest"], "photo_2.jpg"))
+
+
+def test_concurrent_exports_claim_distinct_output_paths(export_env, monkeypatch):
+    """Concurrent jobs must never select and overwrite the same filename."""
+    env = export_env
+    save_barrier = threading.Barrier(2)
+    real_save_export_image = export_mod._save_export_image
+
+    def synchronized_save(img, output, format_info, quality):
+        save_barrier.wait(timeout=10)
+        return real_save_export_image(img, output, format_info, quality)
+
+    monkeypatch.setattr(
+        export_mod, "_save_export_image", synchronized_save,
+    )
+    db_path = str(env["tmp_path"] / "test.db")
+    workspace_id = env["db"]._active_workspace_id
+
+    def run_export(photo_id):
+        thread_db = Database(db_path)
+        thread_db.set_active_workspace(workspace_id)
+        try:
+            return export_photos(
+                db=thread_db,
+                vireo_dir=env["vireo_dir"],
+                photo_ids=[photo_id],
+                destination=env["dest"],
+                options={"naming_template": "photo"},
+            )
+        finally:
+            thread_db.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(run_export, [env["p1"], env["p2"]]))
+
+    assert all(result["exported"] == 1 for result in results)
+    assert all(result["errors"] == [] for result in results)
+    assert sorted(os.listdir(env["dest"])) == ["photo.jpg", "photo_2.jpg"]
 
 
 def test_preview_export_renames_reports_existing_file(export_env):

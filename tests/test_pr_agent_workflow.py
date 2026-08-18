@@ -2,8 +2,8 @@
 
 These checks are intentionally structural. The workflow runs on GitHub, but
 the failure modes they guard are local policy regressions: self-triggering
-routine comments, stale post-merge fires, bot-authorized merges, and merges
-with unresolved current review threads.
+routine comments, stale post-merge fires, unbound bot authorization, and
+merges with unresolved current review threads.
 """
 
 from pathlib import Path
@@ -78,6 +78,9 @@ def test_concurrency_is_scoped_per_task_and_never_workflow_wide():
     ) in workflow
     assert ("group: pr-agent-merge-command-${{ github.event.issue.number }}-${{ github.event.comment.id }}") in workflow
     assert "group: pr-agent-merge-tests-${{ github.event.workflow_run.id }}" in workflow
+    assert (
+        "group: pr-agent-merge-codex-${{ matrix.target.pr }}-${{ matrix.target.reaction_id }}"
+    ) in workflow
     assert "needs: authorize_approval" in workflow
     assert "if: needs.authorize_approval.outputs.authorized == 'true'" in workflow
     assert "needs: authorize_merge_command" in workflow
@@ -167,19 +170,36 @@ def test_routine_fire_rechecks_live_pr_state_and_expected_head():
     assert "expected-head: ${{ github.event.review.commit_id }}" not in _read(WORKFLOW)
 
 
-def test_only_humans_can_authorize_a_head_bound_merge():
+def test_human_and_codex_merge_authorizations_are_head_bound():
     workflow = _read(WORKFLOW)
 
     human_actor_line = next(line for line in workflow.splitlines() if "HUMAN_MERGE_ACTORS:" in line)
     assert "jss367" in human_actor_line
     assert "bot" not in human_actor_line
+    assert 'CODEX_MERGE_ACTOR: "chatgpt-codex-connector[bot]"' in workflow
     assert "merge-on-thumbsup:" not in workflow
-    assert "merge-on-reaction:" not in workflow
     assert "startsWith(github.event.comment.body, '/merge ')" in workflow
     assert "approved-head: ${{ github.event.review.commit_id }}" in workflow
     assert "approved-head: ${{ needs.authorize_merge_command.outputs.approved_head }}" in workflow
     assert 'live_head" != "$REVIEW_HEAD' in workflow
     assert 'live_head" != "$approved_head"*' in workflow
+
+    # Reactions have no webhook, so discovery runs on the paired Codex comment,
+    # successful Tests, and a polling fallback. A generic +1 comment is never
+    # considered authorization.
+    assert 'cron: "*/15 * * * *"' in workflow
+    assert "workflow_dispatch:" in workflow
+    assert "discover-codex-merge-authorizations:" in workflow
+    assert "github.actor == 'chatgpt-codex-connector[bot]'" in workflow
+    assert "github.event.workflow_run.conclusion == 'success'" in workflow
+    assert 'select(.content == "+1")' in workflow
+    assert 'select(.created_at == $comment.created_at)' in workflow
+    assert 'select(.created_at == .updated_at)' in workflow
+    assert "Codex Review: Didn\\u0027t find any major issues." in workflow
+    assert "Reviewed commit:" in workflow
+    assert 'select($reviewed_head != "" and ($head | startswith($reviewed_head)))' in workflow
+    assert "codex-reaction-id: ${{ matrix.target.reaction_id }}" in workflow
+    assert "codex-review-comment-id: ${{ matrix.target.review_comment_id }}" in workflow
 
 
 def test_merge_gate_requires_live_head_and_resolved_current_threads():
@@ -192,7 +212,20 @@ def test_merge_gate_requires_live_head_and_resolved_current_threads():
     assert 'approval_time" != "$AUTHORIZED_AT"' in action
     assert "repos/${REPO}/issues/comments/${MERGE_COMMENT_ID}" in action
     assert 'merge_time" != "$AUTHORIZED_AT"' in action
-    assert "has no live approval or merge-command authorization" in action
+    assert "has no live approval, merge-command, or Codex-review authorization" in action
+    assert '"$authorization_count" -gt 1' in action
+    assert '"$authorization_count" -eq 0' in action
+    assert "repos/${REPO}/issues/${PR}/reactions" in action
+    assert 'reaction_actor" != "chatgpt-codex-connector[bot]"' in action
+    assert 'reaction_content" != "+1"' in action
+    assert 'reaction_time" != "$AUTHORIZED_AT"' in action
+    assert "repos/${REPO}/issues/comments/${CODEX_REVIEW_COMMENT_ID}" in action
+    assert 'codex_actor" != "chatgpt-codex-connector[bot]"' in action
+    assert 'codex_body" != "Codex Review: Didn\'t find any major issues."*' in action
+    assert 'head_sha" != "$codex_reviewed_head"*' in action
+    assert 'codex_created_at" != "$AUTHORIZED_AT"' in action
+    assert 'codex_updated_at" != "$AUTHORIZED_AT"' in action
+    assert 'select(.id != $codex_review_comment_id)' in action
     assert "reviewThreads(first:100" in action
     assert ".isResolved == false and .isOutdated == false" in action
     assert 'if [[ "$unresolved" -gt 0 ]]' in action
@@ -255,9 +288,9 @@ def test_routine_contract_is_state_based_quiet_and_resolves_addressed_threads():
 def test_merge_is_synchronous_and_retried_only_for_the_authorized_tested_head():
     workflow = _read(WORKFLOW)
 
-    # Never leave an auto-merge request armed across head changes. Immediate
-    # approval/command paths merge synchronously, and a successful Tests event
-    # retries only after recovering authorization bound to that exact head.
+    # Never leave an auto-merge request armed across head changes. Human and
+    # Codex paths merge synchronously, and a successful Tests event retries
+    # only after recovering authorization bound to that exact head.
     assert " --auto" not in workflow
     assert "--disable-auto" not in workflow
     assert "merge-after-tests:" in workflow
@@ -275,9 +308,11 @@ def test_merge_is_synchronous_and_retried_only_for_the_authorized_tested_head():
     assert "authorized-at: ${{ steps.authorization.outputs.authorized_at }}" in workflow
     assert "approval-id: ${{ steps.authorization.outputs.approval_id }}" in workflow
     assert "merge-comment-id: ${{ steps.authorization.outputs.merge_comment_id }}" in workflow
-    assert workflow.count('--match-head-commit "$HEAD_SHA"') == 3
-    assert workflow.count('if [[ "$state" == "MERGED" ]]') == 3
-    assert workflow.count("was merged by another valid authorization") == 3
+    assert "approved-head: ${{ matrix.target.head }}" in workflow
+    assert "authorized-at: ${{ matrix.target.authorized_at }}" in workflow
+    assert workflow.count('--match-head-commit "$HEAD_SHA"') == 4
+    assert workflow.count('if [[ "$state" == "MERGED" ]]') == 4
+    assert workflow.count("was merged by another valid authorization") == 4
 
 
 def test_merge_jobs_can_read_the_exact_heads_tests_run():
@@ -286,7 +321,7 @@ def test_merge_jobs_can_read_the_exact_heads_tests_run():
     merge_permissions = (
         "permissions:\n      actions: read\n      contents: write\n      issues: read\n      pull-requests: write"
     )
-    assert workflow.count(merge_permissions) == 3
+    assert workflow.count(merge_permissions) == 4
 
 
 def test_human_claude_fix_uses_a_distinct_unforgeable_reconcile_task():

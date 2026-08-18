@@ -469,7 +469,10 @@ class ProcessTreeSampler:
             for identity, value in self._cpu_times.items():
                 current_cpu_times.setdefault(identity, value)
             for identity, value in self._reaped_children_cpu_times.items():
-                current_reaped_children_cpu_times.setdefault(identity, value)
+                # Do not consume a parent's reaped-child delta until a
+                # complete recovery poll can confirm which cached descendants
+                # actually departed and reconcile their observed lifetimes.
+                current_reaped_children_cpu_times[identity] = value
             for identity, value in self._known_child_cpu_lifetimes.items():
                 current_child_cpu_lifetimes.setdefault(identity, value)
         departed = (
@@ -997,7 +1000,12 @@ def _listener_reachable_via(
             ):
                 return True
             continue
-        if all_bind and addr_str in (local_addresses or ()):
+        if (
+            all_bind
+            and listener_addr is not None
+            and addr.version == listener_addr.version
+            and addr_str in (local_addresses or ())
+        ):
             return True
         if not all_bind and addr_str == listener_ip:
             return True

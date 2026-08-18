@@ -1127,6 +1127,34 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
     clock.sleep(1.0)
     assert sampler.sample()["cpu_percent"] == 10.0
 
+    # If that child exits and is reaped while enumeration fails, preserve the
+    # parent's prior reaped baseline. The recovery poll can then reconcile the
+    # confirmed departure instead of leaving stale unreconciled CPU that would
+    # hide work from a later unrelated helper.
+    reap_root = _CpuProcess(300, 1.0, 1.0, 100)
+    reap_child = _CpuProcess(301, 2.0, 0.4, 100)
+    reap_root.child_processes = [reap_child]
+    reap_sampler = ProcessTreeSampler(
+        reap_root.pid,
+        psutil_module=_CpuPsutil(reap_root),
+        monotonic=clock.monotonic,
+        platform_system=lambda: "Linux",
+    )
+    reap_sampler.prime()
+    reap_root.child_processes = []
+    reap_root.children_error = True
+    reap_root.reaped_cpu_seconds = 0.4
+    reap_child.cpu_error = True
+    clock.sleep(1.0)
+    assert reap_sampler.sample()["process_tree_complete"] is False
+    reap_root.children_error = False
+    clock.sleep(1.0)
+    assert reap_sampler.sample()["process_tree_complete"] is False
+    assert reap_sampler._unreconciled_departed_child_cpu == 0.0
+    reap_root.reaped_cpu_seconds = 0.6
+    clock.sleep(1.0)
+    assert reap_sampler.sample()["cpu_percent"] == 20.0
+
     bad_root = _CpuProcess(200, 1.0, 1.0, 100)
     bad_child = _CpuProcess(201, 1.5, 0.2, 100)
     bad_child.cpu_error = True
@@ -1388,6 +1416,21 @@ def test_wildcard_listener_rejects_remote_address():
             psutil_module=fake,
             resolver=resolver,
             local_addresses={"192.168.1.20"},
+        )
+
+
+def test_wildcard_listener_rejects_local_address_from_other_family():
+    proc = _FakeProc(4242, port=50222, listener_ip="0.0.0.0")
+    fake = _FakePsutil([proc])
+    resolver = _fake_resolver({"vireo-v6.local": ["2001:db8::20"]})
+
+    with pytest.raises(RuntimeError, match="does not own"):
+        discover_server(
+            requested_pid=4242,
+            requested_url="http://vireo-v6.local:50222",
+            psutil_module=fake,
+            resolver=resolver,
+            local_addresses={"2001:db8::20"},
         )
 
 

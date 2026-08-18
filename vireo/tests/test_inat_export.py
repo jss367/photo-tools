@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 from db import Database
 from inat_export import (
+    _destination_name_limit,
     _exif_datetime,
     _metadata_args,
     _reserve_destination,
@@ -229,8 +230,9 @@ def test_export_inat_photo_uses_bounded_staging_filename(tmp_path):
     second_name = os.path.basename(second_output)
     assert first_name.endswith("-iNaturalist.jpg")
     assert second_name.endswith("-iNaturalist_2.jpg")
-    assert len(first_name.encode("utf-8")) <= os.pathconf(destination, "PC_NAME_MAX")
-    assert len(second_name.encode("utf-8")) <= os.pathconf(destination, "PC_NAME_MAX")
+    name_limit = _destination_name_limit(str(destination))
+    assert len(first_name.encode("utf-8")) <= name_limit
+    assert len(second_name.encode("utf-8")) <= name_limit
     assert os.path.isfile(first_output)
     assert os.path.isfile(second_output)
 

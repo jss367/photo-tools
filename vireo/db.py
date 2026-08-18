@@ -17655,7 +17655,8 @@ class Database:
                       d.photo_id, d.box_x, d.box_y, d.box_w, d.box_h,
                       d.detector_confidence, p.filename, p.timestamp, p.sharpness,
                       p.quality_score, p.subject_sharpness, p.subject_size,
-                      p.rating, p.flag, p.width, p.height
+                      p.rating, p.flag, p.width, p.height,
+                      p.eye_x, p.eye_y, p.eye_conf
                FROM predictions pr
                JOIN prediction_review pr_rev
                  ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?

@@ -6,6 +6,7 @@
 <link rel="icon" type="image/png" href="/favicon.ico">
 <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
 <link rel="stylesheet" href="/static/vireo-base.css">
+<link rel="stylesheet" href="/static/vireo-folder-browser.css">
 <title>Vireo - Browse</title>
 <style>
 body {
@@ -1780,8 +1781,21 @@ body.sidebar-resizing {
       <div class="modal" style="width:540px;">
         <h3>Export Photos</h3>
 
-        <label style="font-size:12px;color:var(--text-secondary);display:block;margin-bottom:4px;">Destination folder</label>
-        <input id="exportDest" class="modal-input" type="text" placeholder="/path/to/export/folder">
+        <label style="font-size:12px;color:var(--text-secondary);display:block;margin-bottom:4px;">Custom destination folder <span style="font-weight:400;color:var(--text-faint);">(optional)</span></label>
+        <div style="display:flex;gap:8px;align-items:stretch;margin-bottom:4px;">
+          <input id="exportDest" class="modal-input" type="text"
+                 placeholder="Same folder as each original"
+                 style="flex:1;min-width:0;margin-bottom:0;">
+          <button class="modal-btn modal-btn-cancel" type="button"
+                  onclick="browseForExportDestination()">Browse…</button>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">
+          Leave blank to export each photo beside its original.
+        </div>
+        <label style="display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text-secondary);margin-bottom:12px;cursor:pointer;">
+          <input id="exportSubfolder" type="checkbox">
+          Put exports in an “exported” subfolder
+        </label>
 
         <label style="font-size:12px;color:var(--text-secondary);display:block;margin-bottom:4px;">Preset</label>
         <select id="exportPreset" class="modal-input" style="cursor:pointer;">
@@ -1836,6 +1850,8 @@ body.sidebar-resizing {
         </div>
       </div>
     </div>
+
+    {% include '_folder_browser.html' %}
 
     <!-- Grid -->
     <div class="grid-container" id="gridContainer">
@@ -2170,6 +2186,7 @@ body.sidebar-resizing {
 
 
 <script src="/static/vireo-work-locally.js"></script>
+<script src="/static/vireo-folder-browser.js"></script>
 <script>
 /* Google Maps API key — populated from /api/config below (window._cfgPromise).
    Empty string when no key is configured; the Location section then
@@ -11206,12 +11223,52 @@ function openExportModal() {
   document.getElementById('exportPreset').value = 'original-jpg';
   applyExportPreset('original-jpg');
   document.getElementById('exportTemplate').value = '{original}';
+  document.getElementById('exportDest').value = '';
+  document.getElementById('exportSubfolder').checked = false;
   document.getElementById('exportOverlay').classList.add('open');
   updateExportPreview();
 }
 
 function closeExportModal() {
   document.getElementById('exportOverlay').classList.remove('open');
+}
+
+const exportFolderBrowser = new VireoFolderBrowser({
+  overlayId: 'folderBrowser',
+  defaultMode: 'destination',
+  modes: {
+    destination: {
+      title: 'Select Export Folder',
+      multiple: false,
+      showCounts: false,
+      startPath: function() {
+        return document.getElementById('exportDest').value.trim();
+      },
+      onSelect: function(path) {
+        document.getElementById('exportDest').value = path;
+      },
+    },
+  },
+});
+
+async function browseForExportDestination() {
+  var destination = document.getElementById('exportDest');
+  if (typeof pickDirectory === 'function') {
+    var seqBeforePicker = exportFolderBrowser.sequence;
+    var result = await pickDirectory('Select export folder', {
+      defaultPath: destination.value.trim() || undefined,
+    });
+    if (result) {
+      destination.value = Array.isArray(result) ? result[0] : result;
+      return;
+    }
+    if (typeof isTauri === 'function' && isTauri()) return;
+    if (exportFolderBrowser.sequence !== seqBeforePicker) {
+      exportFolderBrowser.open('destination', {skipInitialBrowse: true});
+      return;
+    }
+  }
+  exportFolderBrowser.open('destination');
 }
 
 function insertTemplateVar(v) {
@@ -11319,7 +11376,7 @@ document.getElementById('exportQuality').addEventListener('input', function() {
 
 async function startExport() {
   var dest = document.getElementById('exportDest').value.trim();
-  if (!dest) { alert('Please enter a destination folder.'); return; }
+  var exportToSubfolder = document.getElementById('exportSubfolder').checked;
 
   var resizeSelect = document.getElementById('exportResize').value;
   var maxSize = null;
@@ -11344,6 +11401,7 @@ async function startExport() {
       body: JSON.stringify({
         photo_ids: activeIds,
         destination: dest,
+        export_to_subfolder: exportToSubfolder,
         naming_template: template,
         max_size: maxSize,
         quality: quality,

@@ -26319,6 +26319,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         body = request.get_json(silent=True) or {}
         raw_ids = body.get("photo_ids", [])
         destination = body.get("destination", "")
+        export_to_subfolder = body.get("export_to_subfolder", False)
         naming_template = body.get("naming_template", "{original}")
         max_size = body.get("max_size")
         quality = body.get("quality", 92)
@@ -26330,10 +26331,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             photo_ids = [int(pid) for pid in raw_ids]
         except (ValueError, TypeError):
             return json_error("photo_ids must be integers")
-        if not destination:
-            return json_error("destination required")
-        if not os.path.isabs(destination):
+        if not isinstance(destination, str):
+            return json_error("destination must be a string")
+        destination = destination.strip()
+        if destination and not os.path.isabs(destination):
             return json_error("destination must be an absolute path")
+        if not isinstance(export_to_subfolder, bool):
+            return json_error("export_to_subfolder must be a boolean")
         if max_size in ("", 0):
             max_size = None
         if max_size is not None:
@@ -26415,6 +26419,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "format": output_format,
                     "working_copy_max_size": wc_max_size,
                     "developed_dir": developed_dir,
+                    "export_to_subfolder": export_to_subfolder,
                 },
                 progress_cb=progress_cb,
             )
@@ -26424,6 +26429,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             config={
                 "photo_ids": photo_ids,
                 "destination": destination,
+                "destination_mode": "custom" if destination else "original",
+                "export_to_subfolder": export_to_subfolder,
                 "naming_template": naming_template,
                 "format": output_format,
             },

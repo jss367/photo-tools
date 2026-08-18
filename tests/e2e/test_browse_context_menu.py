@@ -146,6 +146,15 @@ def test_browse_selection_review_marks_the_active_photos_eye(live_server, page):
     after_drag = marker.evaluate("el => parseFloat(el.style.left)")
     assert after_drag > before_drag + 20
 
+    page.evaluate(
+        """() => {
+          const active = grmState.items.find(item => item.id === grmState.selected);
+          active.edit_recipe = {rotation: 90};
+          grmUpdateSelectedEyeCrosshair();
+        }"""
+    )
+    expect(marker).to_be_hidden()
+
 
 def test_right_click_rating_applies(live_server, page):
     """Clicking a rating chip applies the rating to the right-clicked photo."""

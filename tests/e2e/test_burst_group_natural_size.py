@@ -222,6 +222,17 @@ def test_burst_loupe_marks_the_newly_selected_photos_eye(
         "el => getComputedStyle(el, '::before').backgroundColor"
     ) == "rgb(77, 184, 255)"
 
+    page.evaluate(
+        """() => {
+          const active = grmState.items.find(
+            item => item.photo_id === grmState.selected
+          );
+          active.edit_recipe = {crop: {x: 0.1, y: 0.1, w: 0.8, h: 0.8}};
+          grmUpdateSelectedEyeCrosshair();
+        }"""
+    )
+    expect(marker).to_be_hidden()
+
 
 def test_burst_card_box_is_180x120(live_server, page, tmp_path):
     """The 180x120 viewport stays the visible card box; the natural-size

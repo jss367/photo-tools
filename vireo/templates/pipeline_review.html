@@ -7017,6 +7017,10 @@ function grmUpdateSelectedEyeCrosshair() {
   var photo = grmState.items.find(function(item) {
     return item.id === grmState.selected;
   });
+  if (photo && _lbRecipeHasGeometricEdit(photo.edit_recipe)) {
+    grmHideSelectedEyeCrosshair();
+    return;
+  }
   var eyeX = photo && Number(photo.eye_x);
   var eyeY = photo && Number(photo.eye_y);
   if (!photo || photo.eye_x == null || photo.eye_y == null ||

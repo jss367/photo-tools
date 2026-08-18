@@ -2860,6 +2860,10 @@ function grmUpdateSelectedEyeCrosshair() {
   var item = grmState.items.find(function(entry) {
     return entry.photo_id === grmState.selected;
   });
+  if (item && _lbRecipeHasGeometricEdit(item.edit_recipe)) {
+    grmHideSelectedEyeCrosshair();
+    return;
+  }
   var eyeX = item && Number(item.eye_x);
   var eyeY = item && Number(item.eye_y);
   if (!item || item.eye_x == null || item.eye_y == null ||

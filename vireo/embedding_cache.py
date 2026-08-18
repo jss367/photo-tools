@@ -27,6 +27,7 @@ EMBEDDING_SCHEMA_VERSION = 2
 _identity_lock = threading.Lock()
 _manifest_lock = threading.Lock()
 _flights_lock = threading.Lock()
+_producer_execution_lock = threading.Lock()
 
 _diagnostics = {
     "cache_hits": 0,
@@ -35,11 +36,6 @@ _diagnostics = {
     "producer_publications": 0,
     "producer_failures": 0,
     "waiter_joins": 0,
-    # This is an invariant counter rather than an expected operating metric.
-    # It remains visible so a workload replay can prove that equal-key callers
-    # joined instead of doing duplicate text inference.
-    "single_flight_violations": 0,
-    "max_concurrent_producers_per_key": 0,
 }
 
 
@@ -51,7 +47,37 @@ class _Flight:
 
 
 _flights: dict[tuple[str, str], _Flight] = {}
-_active_producers: dict[tuple[str, str], int] = {}
+_active_producer_executions: dict[tuple[str, str], int] = {}
+_single_flight_violations = 0
+_max_concurrent_producers_per_key = 0
+
+
+def _begin_producer_execution(flight_key):
+    """Record entry into the actual embedding computation.
+
+    This uses a lock and state independent of the flight registry. Measuring
+    overlap while holding ``_flights_lock`` would only restate that registry's
+    own invariant and could never observe a duplicate computation.
+    """
+    global _max_concurrent_producers_per_key, _single_flight_violations
+    with _producer_execution_lock:
+        producer_count = _active_producer_executions.get(flight_key, 0) + 1
+        _active_producer_executions[flight_key] = producer_count
+        _max_concurrent_producers_per_key = max(
+            _max_concurrent_producers_per_key,
+            producer_count,
+        )
+        if producer_count > 1:
+            _single_flight_violations += 1
+
+
+def _end_producer_execution(flight_key):
+    with _producer_execution_lock:
+        producer_count = _active_producer_executions.get(flight_key, 0) - 1
+        if producer_count > 0:
+            _active_producer_executions[flight_key] = producer_count
+        else:
+            _active_producer_executions.pop(flight_key, None)
 
 
 def get_embedding_cache_diagnostics():
@@ -63,9 +89,15 @@ def get_embedding_cache_diagnostics():
     them.
     """
     with _flights_lock:
+        diagnostics = dict(_diagnostics)
+    with _producer_execution_lock:
         return {
-            **_diagnostics,
-            "active_producers": sum(_active_producers.values()),
+            **diagnostics,
+            "active_producers": sum(_active_producer_executions.values()),
+            "single_flight_violations": _single_flight_violations,
+            "max_concurrent_producers_per_key": (
+                _max_concurrent_producers_per_key
+            ),
         }
 
 
@@ -322,14 +354,6 @@ class EmbeddingCache:
                 flight = _Flight()
                 _flights[flight_key] = flight
                 _diagnostics["producer_starts"] += 1
-                producer_count = _active_producers.get(flight_key, 0) + 1
-                _active_producers[flight_key] = producer_count
-                _diagnostics["max_concurrent_producers_per_key"] = max(
-                    _diagnostics["max_concurrent_producers_per_key"],
-                    producer_count,
-                )
-                if producer_count > 1:
-                    _diagnostics["single_flight_violations"] += 1
                 producer = True
             else:
                 _diagnostics["waiter_joins"] += 1
@@ -395,9 +419,13 @@ class EmbeddingCache:
             if cancel_check and cancel_check():
                 raise EmbeddingWaitCancelled("classification cancelled")
             log.info("EmbeddingCache: producing key=%s", initial_digest[:12])
-            value = _validate_payload(
-                compute(), label_count, embedding_dim=embedding_dim,
-            )
+            _begin_producer_execution(flight_key)
+            try:
+                value = _validate_payload(
+                    compute(), label_count, embedding_dim=embedding_dim,
+                )
+            finally:
+                _end_producer_execution(flight_key)
             if cancel_check and cancel_check():
                 raise EmbeddingWaitCancelled("classification cancelled")
             actual_identity = identity_after() if identity_after else identity
@@ -429,11 +457,6 @@ class EmbeddingCache:
             with _flights_lock:
                 if _flights.get(flight_key) is flight:
                     del _flights[flight_key]
-                producer_count = _active_producers.get(flight_key, 0) - 1
-                if producer_count > 0:
-                    _active_producers[flight_key] = producer_count
-                else:
-                    _active_producers.pop(flight_key, None)
             flight.event.set()
 
     def _load(self, digest, label_count, embedding_dim=None):

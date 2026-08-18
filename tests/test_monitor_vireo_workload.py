@@ -225,6 +225,51 @@ def test_slow_poll_skips_missed_slots_instead_of_firing_back_to_back():
     assert elapsed == [2.0, 8.0, 10.0]
 
 
+def test_slow_poll_finishing_on_cadence_boundary_skips_that_slot():
+    """A poll ending exactly on a later cadence boundary must not cause an
+    immediate second sample at that same timestamp.
+    """
+    clock = _FakeClock()
+
+    class _BoundaryApi:
+        def __init__(self):
+            self.calls = 0
+
+        def authenticate(self):
+            pass
+
+        def sample(self):
+            self.calls += 1
+            if self.calls == 2:
+                clock.sleep(4.0)
+            return _api_sample(
+                latency=0.001, wait_count=0, wait_seconds=0.0,
+                producer_starts=0, waiter_joins=0,
+            )
+
+    n = 8
+    report = collect_workload(
+        duration=10.0,
+        interval=2.0,
+        api_client=_BoundaryApi(),
+        process_sampler=_SequenceSampler(
+            [{"cpu_percent": 100.0, "rss_bytes": 100,
+              "executable_exists": True} for _ in range(n)],
+            {"pid": 123, "executable_exists": True},
+        ),
+        system_sampler=_SequenceSampler(
+            [{"cpu_idle_percent": 50.0} for _ in range(n)],
+            {"logical_cpu_count": 16},
+        ),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert [sample["elapsed_seconds"] for sample in report["samples"]] == [
+        2.0, 8.0, 10.0,
+    ]
+
+
 def test_executable_target_is_none_when_presence_is_unknown():
     """When psutil can't read `Process.exe()` (e.g. `AccessDenied`),
     every sample reports `executable_exists=None`.  The old predicate
@@ -711,7 +756,7 @@ def test_explicit_server_accepted_when_child_process_owns_port():
         resolver=_LOOPBACK_RESOLVER,
     )
 
-    assert server == {"pid": 4242, "url": "http://127.0.0.1:50222"}
+    assert server == {"pid": 4243, "url": "http://127.0.0.1:50222"}
 
 
 def test_explicit_server_accepted_when_listener_binds_all_interfaces():

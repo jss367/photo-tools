@@ -573,8 +573,12 @@ def collect_workload(
             # tool is meant to compare — skip the missed slots so the
             # sampling schedule stays aligned to the original cadence.
             now = monotonic()
-            if next_sample < now:
-                slots_missed = math.ceil((now - next_sample) / interval)
+            if next_sample <= now:
+                # Advance strictly beyond ``now``.  ``ceil`` alone leaves
+                # the deadline equal to ``now`` when a poll finishes exactly
+                # on a later cadence boundary, triggering an immediate
+                # zero-sleep sample.
+                slots_missed = math.floor((now - next_sample) / interval) + 1
                 next_sample += slots_missed * interval
             next_sample = min(next_sample, deadline)
     except KeyboardInterrupt:
@@ -710,7 +714,10 @@ def discover_server(
                 f"PID {requested_pid} owns port {parsed.port} but the listening "
                 f"process is not a vireo-server"
             )
-        return {"pid": requested_pid, "url": requested_url.rstrip("/")}
+        # Attribute CPU/RSS and executable-presence samples to the process
+        # that owns the listener.  ``requested_pid`` may be a shell or
+        # supervisor whose child is the actual vireo-server.
+        return {"pid": owner.pid, "url": requested_url.rstrip("/")}
     requested_port = None
     requested_hostname = None
     if requested_url:

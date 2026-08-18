@@ -126,6 +126,16 @@ def test_photo_editor_export_opens_standard_export_for_current_photo(
     expect(page.locator("#exportSubmitBtn")).to_have_text("Export 1 photo")
 
 
+def test_export_handoff_does_not_open_for_failed_photo_deep_link(
+    live_server, page
+):
+    page.goto(f"{live_server['url']}/browse?photo_id=999999999&action=export")
+    page.wait_for_function("() => !loading")
+
+    expect(page.locator("#exportOverlay")).not_to_have_class("modal-overlay open")
+    assert page.evaluate("() => getActiveSelection()") == []
+
+
 def test_photo_editor_context_sends_current_photo_to_inaturalist(
     live_server, page
 ):

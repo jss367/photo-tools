@@ -11146,7 +11146,7 @@ document.addEventListener('contextmenu', function(e) {
 // interruptions, fall through to whatever refreshBrowseAfterFolderHealthChange
 // last rendered rather than deep-link forever (Codex review r3686778061).
 var _DEEP_LINK_MAX_RETRIES = 5;
-async function _runPhotoDeepLink(photoId) {
+async function _runPhotoDeepLink(photoId, onLoaded) {
   // Snapshot the health-refresh generation BEFORE any await. If a
   // vireo:folder-health-changed event fires while this loader is awaiting
   // /api/photos/<id> or its folder-scoped /api/browse/init,
@@ -11355,6 +11355,10 @@ async function _runPhotoDeepLink(photoId) {
         if (VireoFilter.hasFilters()) VireoFilter.clearAll(true);
       }).catch(function() {});
     }
+    // Run handoffs only after the target card was found and every dataset
+    // freshness check above passed. Failed or invalidated deep links return
+    // without calling this hook, so they cannot act on a stale selection.
+    if (el && typeof onLoaded === 'function') onLoaded(photoId);
   } catch(e) { /* ignore deep-link errors silently */ }
   // A concurrent refreshBrowseAfterFolderHealthChange() owns ``loading``
   // and rearms the observer itself when its loadPhotos settles; releasing
@@ -11386,24 +11390,24 @@ async function _runPhotoDeepLink(photoId) {
   // workspace grid, with the target photo never scrolled into view and
   // VireoFilter uninitialized) (Codex review r3686778061).
   for (var attempt = 0; attempt < _DEEP_LINK_MAX_RETRIES; attempt++) {
-    var wasSuperseded = await _runPhotoDeepLink(photoId);
-    if (!wasSuperseded) {
-      if (deepLinkAction === 'export') {
-        selectedPhotos.clear();
-        selectedPhotoId = photoId;
-        selectedIndex = photos.findIndex(function(photo) { return photo.id === photoId; });
-        refreshCardSelectionVisuals();
-        updateBatchBar();
-        openExportModal();
+    var wasSuperseded = await _runPhotoDeepLink(photoId, function(loadedPhotoId) {
+      if (deepLinkAction !== 'export') return;
+      selectedPhotos.clear();
+      selectedPhotoId = loadedPhotoId;
+      selectedIndex = photos.findIndex(function(photo) { return photo.id === loadedPhotoId; });
+      refreshCardSelectionVisuals();
+      updateBatchBar();
+      openExportModal();
 
-        // Treat action=export as a one-shot handoff. Refreshing or returning
-        // to this history entry should show Browse without reopening a modal.
-        params.delete('action');
-        var query = params.toString();
-        try {
-          window.history.replaceState({}, '', window.location.pathname + (query ? '?' + query : ''));
-        } catch (_) {}
-      }
+      // Treat action=export as a one-shot handoff. Refreshing or returning
+      // to this history entry should show Browse without reopening a modal.
+      params.delete('action');
+      var query = params.toString();
+      try {
+        window.history.replaceState({}, '', window.location.pathname + (query ? '?' + query : ''));
+      } catch (_) {}
+    });
+    if (!wasSuperseded) {
       return;
     }
     // Await the refresh that stole the load so the next attempt starts

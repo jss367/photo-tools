@@ -198,8 +198,7 @@ def test_export_checkboxes_remember_the_previous_choices(live_server, page):
     remembered = {
         "exportSubfolder": True,
         "exportMetadataSpecies": True,
-        "exportMetadataCaptureDate": False,
-        "exportMetadataCaptureTime": True,
+        "exportMetadataCaptureDateTime": True,
         "exportMetadataRating": False,
         "exportMetadataLocation": True,
         "exportMetadataCamera": False,
@@ -219,6 +218,27 @@ def test_export_checkboxes_remember_the_previous_choices(live_server, page):
     page.get_by_role("button", name="Export", exact=True).click()
     for control_id, checked in remembered.items():
         expect(page.locator(f"#{control_id}")).to_be_checked(checked=checked)
+
+
+def test_export_capture_preference_migrates_to_combined_checkbox(live_server, page):
+    """Either legacy capture choice keeps capture metadata enabled on upgrade."""
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        """() => {
+          localStorage.removeItem('vireo.browse.export.metadata.captureDateTime');
+          localStorage.setItem('vireo.browse.export.metadata.captureDate', '0');
+          localStorage.setItem('vireo.browse.export.metadata.captureTime', '1');
+        }"""
+    )
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+
+    expect(page.locator("#exportMetadataCaptureDateTime")).to_be_checked()
+    assert page.evaluate(
+        "localStorage.getItem('vireo.browse.export.metadata.captureDateTime')"
+    ) == "1"
 
 
 def test_more_menu_scrolls_within_short_viewport(live_server, page):

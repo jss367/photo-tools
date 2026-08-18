@@ -26319,6 +26319,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         body = request.get_json(silent=True) or {}
         raw_ids = body.get("photo_ids", [])
         destination = body.get("destination", "")
+        export_to_subfolder = body.get("export_to_subfolder", False)
         naming_template = body.get("naming_template", "{original}")
         max_size = body.get("max_size")
         quality = body.get("quality", 92)
@@ -26331,10 +26332,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             photo_ids = [int(pid) for pid in raw_ids]
         except (ValueError, TypeError):
             return json_error("photo_ids must be integers")
-        if not destination:
-            return json_error("destination required")
-        if not os.path.isabs(destination):
+        if not isinstance(destination, str):
+            return json_error("destination must be a string")
+        destination = destination.strip()
+        if destination and not os.path.isabs(destination):
             return json_error("destination must be an absolute path")
+        if not isinstance(export_to_subfolder, bool):
+            return json_error("export_to_subfolder must be a boolean")
         if max_size in ("", 0):
             max_size = None
         if max_size is not None:
@@ -26422,6 +26426,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "working_copy_max_size": wc_max_size,
                     "developed_dir": developed_dir,
                     "metadata_fields": metadata_fields,
+                    "export_to_subfolder": export_to_subfolder,
                 },
                 progress_cb=progress_cb,
             )
@@ -26431,6 +26436,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             config={
                 "photo_ids": photo_ids,
                 "destination": destination,
+                "destination_mode": "custom" if destination else "original",
+                "export_to_subfolder": export_to_subfolder,
                 "naming_template": naming_template,
                 "format": output_format,
                 "metadata_fields": metadata_fields,
@@ -36483,7 +36490,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/photos/<int:photo_id>/edit-mask-preview")
     def serve_edit_mask_preview(photo_id):
         """Serve a recipe's transformed, feathered local-weight map as a
-        tinted RGBA PNG aligned with the (uncropped) editor preview.
+        tinted RGBA PNG aligned with the editor preview.
 
         The existing lightbox mask endpoint serves the live photo_masks file
         untouched; this one shows the pixels the renderer actually weights —
@@ -36533,23 +36540,38 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return str(e), 400
         if not normalized.get("local"):
             return "Recipe has no local adjustments", 404
-        # The editor preview is uncropped; the overlay must align with it.
+        apply_crop = request.args.get("apply_crop") == "1"
+        # Crop editing uses the whole source; after the crop is committed the
+        # editor displays the real cropped render and the overlay must follow.
         display_recipe = dict(normalized)
-        display_recipe.pop("crop", None)
+        if not apply_crop:
+            display_recipe.pop("crop", None)
 
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
         snapshot = local_masks.load_snapshot(vireo_dir, photo_id, normalized)
         if snapshot is None:
             return "No usable edit-mask snapshot", 404
-        source_dims = _scaled_recipe_source_dimensions(photo, size)
+        native_dims = _recipe_source_dimensions(photo)
+        source_size = size
+        if apply_crop and normalized.get("crop") and all(native_dims):
+            from render_source import rendered_recipe_long_edge
+
+            native_source_long = max(native_dims)
+            rendered_long = rendered_recipe_long_edge(
+                native_dims[0], native_dims[1], normalized,
+            )
+            if rendered_long > 0:
+                source_size = min(
+                    native_source_long,
+                    int(math.ceil(size * native_source_long / rendered_long)),
+                )
+        source_dims = _scaled_recipe_source_dimensions(photo, source_size)
         if not source_dims[0] or not source_dims[1]:
             source_dims = snapshot.size
-        # Feather scale must reflect the SAVED (cropped) render even though
-        # the overlay is aligned with the uncropped preview — mirrors what
-        # /edit-preview passes to apply_recipe_to_loaded_image. Otherwise
-        # a cropped recipe's overlay halo drifts from the pixels the saved
-        # render actually weights.
-        native_dims = _recipe_source_dimensions(photo)
+        # Feather scale must reflect the saved cropped render in both modes.
+        # In crop-edit mode the overlay itself is aligned with the uncropped
+        # preview, but its feather still needs to match the pixels the saved
+        # render will actually weight.
         preview_detail_scale = None
         if native_dims and native_dims[0] and native_dims[1]:
             saved_native_long = float(rendered_recipe_long_edge(
@@ -36583,7 +36605,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     @app.route("/photos/<int:photo_id>/edit-preview")
     def serve_photo_edit_preview(photo_id):
-        """Serve an uncropped preview for an in-progress edit recipe."""
+        """Serve a preview for an in-progress or committed edit recipe.
+
+        Crop editing intentionally uses the whole transformed source. Once a
+        crop is committed, ``apply_crop=1`` returns the actual cropped pixels
+        so the editor can fit the finished frame in the stage.
+        """
         import io
 
         import config as cfg
@@ -36626,8 +36653,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
             from render_source import rendered_recipe_long_edge
             recipe = normalize_recipe(recipe) or {}
+            apply_crop = request.args.get("apply_crop") == "1"
             display_recipe = dict(recipe)
-            display_recipe.pop("crop", None)
+            if not apply_crop:
+                display_recipe.pop("crop", None)
             recipe_json = display_recipe
             vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
             folder_row = db.conn.execute(
@@ -36689,7 +36718,43 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 else None
             )
             load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
-            img = load_image(canonical, max_size=size, **load_kwargs)
+            # A cropped output needs more source pixels than its requested
+            # long edge. Scale the source request by the crop ratio, then let
+            # the recipe renderer crop and cap the result to ``size``. At
+            # 100% this naturally reaches the full source and stays truly 1:1
+            # without forcing a native decode for every fitted slider update.
+            native_dims = _recipe_source_dimensions(photo)
+            load_max_size = size
+            if apply_crop and recipe.get("crop"):
+                selected_dims = native_dims
+                try:
+                    from PIL import Image as _PILImage
+
+                    with _PILImage.open(canonical) as selected_image:
+                        candidate_dims = _image_size_after_exif_orientation(
+                            selected_image,
+                        )
+                    if all(candidate_dims):
+                        selected_dims = candidate_dims
+                except Exception:
+                    # Some RAW formats cannot be opened by Pillow. Their stored
+                    # native dimensions remain the best available decode bound.
+                    pass
+                if all(selected_dims):
+                    selected_source_long = max(selected_dims)
+                    rendered_long = rendered_recipe_long_edge(
+                        selected_dims[0], selected_dims[1], recipe,
+                    )
+                    if rendered_long > 0:
+                        load_max_size = min(
+                            selected_source_long,
+                            int(math.ceil(
+                                size * selected_source_long / rendered_long
+                            )),
+                        )
+                else:
+                    load_max_size = None
+            img = load_image(canonical, max_size=load_max_size, **load_kwargs)
             if (
                 img is not None
                 and selected_ext in RAW_EXTENSIONS
@@ -36704,7 +36769,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # downscaled preview when a full-size companion JPEG is
                 # sitting next to the RAW.
                 expected_w, expected_h = _scaled_recipe_source_dimensions(
-                    photo, size,
+                    photo, load_max_size,
                 )
                 if _image_is_smaller_than_expected(img, expected_w, expected_h):
                     companion_rel = photo["companion_path"]
@@ -36717,7 +36782,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             and companion_abs != canonical
                         ):
                             companion_img = load_image(
-                                companion_abs, max_size=size,
+                                companion_abs, max_size=load_max_size,
                             )
                             if _companion_image_can_replace_raw_result(
                                 companion_img, img, expected_w, expected_h,
@@ -36751,20 +36816,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             "falling back to companion JPEG", photo_id,
                         )
                         _record_working_copy_failure(db, photo, canonical)
-                        img = load_image(companion_abs, max_size=size)
+                        img = load_image(companion_abs, max_size=load_max_size)
                         if img is not None:
                             canonical = companion_abs
             if img is None:
                 _record_working_copy_failure(db, photo, canonical)
                 return "Could not load image", 500
-            native_dims = _recipe_source_dimensions(photo)
-            # Detail scale must reflect the SAVED (cropped) render even though
-            # we render the preview uncropped — otherwise a tighter crop makes
-            # the saved output's sharpen/NR visibly stronger than the preview
-            # showed, and cropped detail edits look wrong. Simulate what the
-            # saved render's max long edge would be (bounded by the endpoint
-            # size, like /full's crop-aware preview), then compute the scale
-            # from the original recipe (with crop).
+            # Detail scale must reflect the saved cropped render. This matters
+            # especially in crop-edit mode, where the preview itself is still
+            # uncropped: a tighter crop must not make the saved output's
+            # sharpen/NR stronger than the preview showed.
             preview_detail_scale = None
             if native_dims and native_dims[0] and native_dims[1]:
                 saved_native_long = float(rendered_recipe_long_edge(

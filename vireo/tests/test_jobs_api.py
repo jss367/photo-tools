@@ -1060,12 +1060,34 @@ def test_job_export_missing_photo_ids(app_and_db):
     assert resp.status_code == 400
 
 
-def test_job_export_missing_destination(app_and_db):
-    """POST /api/jobs/export without destination returns 400."""
-    app, _ = app_and_db
+def test_job_export_without_destination_uses_original_folder(app_and_db):
+    """POST /api/jobs/export accepts the beside-originals default."""
+    app, db = app_and_db
     client = app.test_client()
-    resp = client.post("/api/jobs/export", json={"photo_ids": [1]})
+    photo = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()
+
+    resp = client.post("/api/jobs/export", json={"photo_ids": [photo["id"]]})
+
+    assert resp.status_code == 200
+    job = app._job_runner.get(resp.get_json()["job_id"])
+    assert job["config"]["destination"] == ""
+    assert job["config"]["destination_mode"] == "original"
+    assert job["config"]["export_to_subfolder"] is False
+
+
+def test_job_export_subfolder_option_must_be_boolean(app_and_db):
+    """POST /api/jobs/export rejects ambiguous subfolder values."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()
+
+    resp = client.post("/api/jobs/export", json={
+        "photo_ids": [photo["id"]],
+        "export_to_subfolder": "yes",
+    })
+
     assert resp.status_code == 400
+    assert "must be a boolean" in resp.get_json()["error"]
 
 
 def test_job_export_relative_destination(app_and_db):

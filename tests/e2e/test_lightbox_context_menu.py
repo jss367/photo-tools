@@ -54,6 +54,10 @@ def test_lightbox_right_click_opens_menu(live_server, page):
     url = live_server["url"]
     _open_lightbox(page, url)
 
+    # Keep the uncommon workflow out of the always-visible action bar. It
+    # remains available from the contextual menu below.
+    expect(page.locator("#lightboxNotWildlife")).to_have_count(0)
+
     _fire_contextmenu_on_lightbox(page)
     menu = page.locator(".vireo-ctx-menu")
     expect(menu).to_be_visible()
@@ -66,6 +70,9 @@ def test_lightbox_right_click_opens_menu(live_server, page):
     ).to_be_visible()
     expect(
         menu.locator(".vireo-ctx-item", has_text="Close Lightbox")
+    ).to_be_visible()
+    expect(
+        menu.locator(".vireo-ctx-item", has_text="Wildlife classification")
     ).to_be_visible()
     # Rating / color / flag chip rows are present (14 chips total).
     assert menu.locator(".vireo-ctx-chip").count() > 5

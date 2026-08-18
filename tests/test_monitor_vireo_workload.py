@@ -175,6 +175,7 @@ def test_collect_workload_builds_deltas_targets_and_job_summary():
         "vireo_executable_present_throughout": True,
     }
     assert summary["scenario"] == {
+        "job_observation_complete": True,
         "observed_job_count": 1,
         "terminal_job_count": 1,
         "all_observed_jobs_terminal": True,
@@ -943,6 +944,51 @@ def test_compact_jobs_payload_retains_terminal_ephemeral_jobs_once():
         ("walk-1", "active"),
         ("pipeline-1", "history"),
     ]
+
+
+def test_saturated_history_window_marks_job_observation_incomplete():
+    history = [
+        {
+            "id": f"completed-{index}",
+            "type": "pipeline",
+            "status": "completed",
+            "started_at": f"2026-08-17T12:00:{index:02d}+00:00",
+            "finished_at": f"2026-08-17T12:00:{index + 1:02d}+00:00",
+        }
+        for index in range(10)
+    ]
+    compact = compact_jobs_payload({"active": [], "history": history})
+
+    assert compact["history_window_saturated"] is True
+
+    baseline = {
+        "status": 200,
+        "latency_seconds": 0.001,
+        "jobs": [],
+        "history_window_saturated": False,
+    }
+    poll = {"status": 200, "latency_seconds": 0.001, **compact}
+    clock = _FakeClock()
+    report = collect_workload(
+        duration=1.0,
+        interval=1.0,
+        api_client=_SequenceApi([baseline, poll]),
+        process_sampler=_SequenceSampler(
+            [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True}],
+            {"pid": 123, "executable_exists": True},
+        ),
+        system_sampler=_SequenceSampler(
+            [{"cpu_idle_percent": 50.0}],
+            {"logical_cpu_count": 16},
+        ),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    scenario = report["summary"]["scenario"]
+    assert scenario["job_observation_complete"] is False
+    assert scenario["observed_job_count"] == 10
+    assert scenario["workload_makespan_seconds"] is None
 
 
 def test_compact_jobs_payload_omits_user_derived_step_labels():

@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - exercised by the CLI environment
 
 
 SCHEMA_VERSION = 1
+JOBS_HISTORY_LIMIT = 10
 TERMINAL_STATUSES = {"cancelled", "completed", "failed"}
 DIAGNOSTIC_COUNTERS = {
     "cache_hits",
@@ -152,6 +153,10 @@ def compact_jobs_payload(payload):
     ]
     return {
         "jobs": active + history,
+        # GET /api/jobs requests exactly this many persisted rows. Reaching
+        # the bound is therefore ambiguous: more completed jobs may have
+        # fallen out of the window since the previous poll.
+        "history_window_saturated": len(history_jobs) >= JOBS_HISTORY_LIMIT,
         "resource_budget": payload.get("resource_budget"),
         "workload_metrics": payload.get("workload_metrics", {}),
         "keeping_awake": payload.get("keeping_awake"),
@@ -669,7 +674,7 @@ def _job_summary(observations):
     return sorted(jobs.values(), key=lambda job: (job["first_observed_seconds"], job["id"]))
 
 
-def _scenario_summary(jobs):
+def _scenario_summary(jobs, *, job_observation_complete):
     terminal = [job for job in jobs if job.get("last_status") in TERMINAL_STATUSES]
     starts = []
     finishes = []
@@ -680,9 +685,16 @@ def _scenario_summary(jobs):
         except (KeyError, TypeError, ValueError):
             continue
     makespan = None
-    if jobs and len(terminal) == len(jobs) and len(starts) == len(jobs) and len(finishes) == len(jobs):
+    if (
+        job_observation_complete
+        and jobs
+        and len(terminal) == len(jobs)
+        and len(starts) == len(jobs)
+        and len(finishes) == len(jobs)
+    ):
         makespan = round((max(finishes) - min(starts)).total_seconds(), 3)
     return {
+        "job_observation_complete": job_observation_complete,
         "observed_job_count": len(jobs),
         "terminal_job_count": len(terminal),
         "all_observed_jobs_terminal": bool(jobs) and len(terminal) == len(jobs),
@@ -729,6 +741,10 @@ def build_summary(
         for sample in successful
     ]
     final_api = successful[-1]["api"] if successful else baseline
+    job_observation_complete = not any(
+        sample["api"].get("history_window_saturated") is True
+        for sample in samples
+    )
     queued_counts = [
         sum(job.get("status") == "queued" for job in sample["api"].get("jobs", []))
         for sample in successful
@@ -839,7 +855,10 @@ def build_summary(
             ),
             "vireo_executable_present_throughout": executable_present,
         },
-        "scenario": _scenario_summary(jobs),
+        "scenario": _scenario_summary(
+            jobs,
+            job_observation_complete=job_observation_complete,
+        ),
         "jobs": jobs,
     }
 

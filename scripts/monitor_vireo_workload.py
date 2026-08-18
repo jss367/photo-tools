@@ -1163,8 +1163,9 @@ def discover_server(
         return {"pid": owner.pid, "url": verified_url}
     requested_port = None
     requested_hostname = None
+    parsed_requested_url = None
     if requested_url:
-        _parsed, requested_hostname, requested_port = _parse_server_url(
+        parsed_requested_url, requested_hostname, requested_port = _parse_server_url(
             requested_url
         )
     candidates = []
@@ -1189,22 +1190,26 @@ def discover_server(
                 # local vireo sharing the port with a *remote* vireo would
                 # be selected while the URL fetches from the remote one,
                 # pairing local CPU/RSS with remote Jobs data.
-                if requested_hostname is not None and not _listener_reachable_via(
-                    requested_hostname,
-                    connection.laddr.ip,
-                    resolver=resolver,
-                    local_addresses=local_addresses,
-                ):
-                    continue
-                host = connection.laddr.ip
-                if host == "0.0.0.0":
-                    host = "127.0.0.1"
-                elif host == "::":
-                    host = "::1"
+                if requested_hostname is not None:
+                    host = _listener_reachable_address(
+                        requested_hostname,
+                        connection.laddr.ip,
+                        resolver=resolver,
+                        local_addresses=local_addresses,
+                    )
+                    if host is None:
+                        continue
+                else:
+                    host = connection.laddr.ip
+                    if host == "0.0.0.0":
+                        host = "127.0.0.1"
+                    elif host == "::":
+                        host = "::1"
                 url_host = f"[{host}]" if ":" in host else host
                 candidates.append({
                     "pid": process.pid,
                     "url": f"http://{url_host}:{port}",
+                    "address": host,
                     "started": process.info.get("create_time") or 0,
                 })
         except (OSError, psutil_module.Error):
@@ -1227,15 +1232,43 @@ def discover_server(
             f"multiple Vireo servers are listening ({choices}); pass --pid or --url"
         )
     discovered = candidates[0]
+    verified_url = discovered["url"]
+    if requested_url:
+        verified_url = requested_url.rstrip("/")
+        if len(_resolve_hostname(requested_hostname, resolver=resolver)) > 1:
+            if parsed_requested_url.scheme == "https":
+                raise RuntimeError(
+                    "--url resolves to multiple addresses; use the numeric "
+                    "address of the selected HTTPS listener"
+                )
+            url_host = (
+                f"[{discovered['address']}]"
+                if ":" in discovered["address"]
+                else discovered["address"]
+            )
+            verified_url = (
+                f"{parsed_requested_url.scheme}://{url_host}:{requested_port}"
+                f"{parsed_requested_url.path.rstrip('/')}"
+            )
     return {
         "pid": discovered["pid"],
-        "url": requested_url.rstrip("/") if requested_url else discovered["url"],
+        "url": verified_url,
     }
 
 
 def _default_output_path():
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return Path(".context") / "benchmarks" / f"vireo-workload-{timestamp}.json"
+
+
+def _prepare_output_path(output):
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists() and not output.is_file():
+        raise RuntimeError(f"output path is not a file: {output}")
+    if output.exists() and not os.access(output, os.W_OK):
+        raise RuntimeError(f"output file is not writable: {output}")
+    if not os.access(output.parent, os.W_OK):
+        raise RuntimeError(f"output directory is not writable: {output.parent}")
 
 
 def parse_args(argv=None):
@@ -1259,6 +1292,8 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     try:
+        output = args.output or _default_output_path()
+        _prepare_output_path(output)
         server = discover_server(requested_pid=args.pid, requested_url=args.url)
         api_client = VireoApiClient(server["url"], timeout=args.timeout)
         process_sampler = ProcessTreeSampler(server["pid"])
@@ -1275,12 +1310,13 @@ def main(argv=None):
                 file=sys.stderr,
             ),
         )
+        report["vireo_url"] = server["url"]
+        output.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     except (OSError, RuntimeError) as exc:
         raise SystemExit(f"error: {exc}") from exc
-    report["vireo_url"] = server["url"]
-    output = args.output or _default_output_path()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     summary = report["summary"]
     api = summary["jobs_api_latency_seconds"] or {}
     idle = summary["system_cpu_idle_percent"] or {}

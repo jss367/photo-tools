@@ -7,6 +7,7 @@ import pytest
 from scripts.monitor_vireo_workload import (
     ProcessTreeSampler,
     VireoApiClient,
+    _prepare_output_path,
     collect_workload,
     compact_jobs_payload,
     discover_server,
@@ -187,6 +188,11 @@ def test_collect_workload_builds_deltas_targets_and_job_summary():
 def test_sampling_cli_rejects_non_finite_values(argument):
     with pytest.raises(SystemExit):
         parse_args([argument, "nan"])
+
+
+def test_output_path_validation_rejects_directory(tmp_path):
+    with pytest.raises(RuntimeError, match="not a file"):
+        _prepare_output_path(tmp_path)
 
 
 def test_slow_poll_skips_missed_slots_instead_of_firing_back_to_back():
@@ -1457,6 +1463,28 @@ def test_multi_address_hostname_is_pinned_to_verified_listener():
     server = discover_server(
         requested_pid=4242,
         requested_url="http://localhost:50222",
+        psutil_module=fake,
+        resolver=resolver,
+    )
+
+    assert server == {"pid": 4242, "url": "http://127.0.0.1:50222"}
+
+
+def test_url_only_multi_address_hostname_is_pinned_to_verified_listener():
+    proc = _FakeProc(4242, port=50222, listener_ip="127.0.0.1")
+    proc.info = {
+        "pid": 4242, "name": "vireo-server",
+        "cmdline": ["vireo-server"], "create_time": 0,
+    }
+    proc.parents = lambda: []
+    fake = _FakePsutil([proc])
+    fake.process_iter = lambda attrs=None: iter([proc])
+    resolver = _fake_resolver({
+        "vireo.local": ["192.168.1.50", "127.0.0.1"],
+    })
+
+    server = discover_server(
+        requested_url="http://vireo.local:50222",
         psutil_module=fake,
         resolver=resolver,
     )

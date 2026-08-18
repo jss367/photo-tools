@@ -26,6 +26,32 @@
     justify-content: flex-end;
     padding-left: 28px;
   }
+  .workspace-folder-job {
+    display: flex;
+    flex: 1;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 7px;
+    min-width: 0;
+    color: var(--text-secondary);
+    font-size: 11px;
+  }
+  .workspace-folder-job-phase {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+  .workspace-folder-job-progress {
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+  .workspace-folder-job a {
+    color: var(--accent);
+    white-space: nowrap;
+  }
   .workspace-folder-path {
     flex: 1;
     min-width: 0;
@@ -205,6 +231,7 @@ async function loadWsFolders() {
         var local = window.vireoLocalFolders ? window.vireoLocalFolders.statusFor(f.id) : null;
         var localBlocked = window.vireoLocalFolders && window.vireoLocalFolders.blockingJobFor(f.id);
         var localBlockedMessage = localBlocked ? window.vireoLocalFolders.blockingMessage(localBlocked) : '';
+        var localJob = window.vireoLocalFolders && window.vireoLocalFolders.jobFor(f.id);
         var displayPath = local && local.display_path ? local.display_path : f.path;
         var hasLocalActions = local && local.state !== 'remote' && local.state !== 'staging' &&
           !(local.state === 'recovery' && local.recovery_kind !== 'sync');
@@ -238,12 +265,33 @@ async function loadWsFolders() {
           html += '<span style="font-size:10px;color:var(--accent);background:rgba(36,229,202,0.1);padding:2px 7px;border-radius:3px;" title="' +
             (sharedCount > 1 ? 'Shared by ' + sharedCount + ' workspaces' : 'Using managed local storage') + '">Local' +
             (sharedCount > 1 ? ' · ' + sharedCount + ' workspaces' : '') + '</span>';
-          html += '<button onclick="vireoLocalFolders.sync(' + f.id + ')" class="btn btn-secondary"' +
-            (localBlocked ? ' disabled title="' + escapeAttr(localBlockedMessage) + '"' : '') +
-            ' style="padding:4px 9px;font-size:11px;' + (localBlocked ? 'opacity:.5;' : '') + '">Sync Back</button>';
-          html += '<button onclick="vireoLocalFolders.discard(' + f.id + ')" class="btn btn-secondary"' +
-            (localBlocked ? ' disabled title="' + escapeAttr(localBlockedMessage) + '"' : '') +
-            ' style="padding:4px 9px;font-size:11px;color:var(--danger);' + (localBlocked ? 'opacity:.5;' : '') + '">Discard</button>';
+          if (localJob) {
+            var jobProgress = localJob.progress || {};
+            var jobPhase = jobProgress.phase || (
+              localJob.type === 'work-locally-folder-sync' ? 'Preparing to sync to source…' :
+              localJob.type === 'work-locally-folder-discard' ? 'Removing local copy…' :
+              'Updating local folder…'
+            );
+            var jobCount = jobProgress.total
+              ? Number(jobProgress.current || 0).toLocaleString() + ' / ' +
+                Number(jobProgress.total).toLocaleString() + ' files'
+              : '';
+            html += '<div class="workspace-folder-job" role="status" aria-live="polite" data-local-folder-job-id="' +
+              escapeAttr(localJob.id) + '" data-local-folder-root-id="' +
+              escapeAttr(local.root_folder_id) + '">';
+            html += '<span class="btn-spinner" aria-hidden="true"></span>';
+            html += '<span class="workspace-folder-job-phase">' + escapeHtml(jobPhase) + '</span>';
+            html += '<span class="workspace-folder-job-progress">' + escapeHtml(jobCount) + '</span>';
+            html += '<a href="/jobs">View Jobs</a>';
+            html += '</div>';
+          } else {
+            html += '<button onclick="vireoLocalFolders.sync(' + f.id + ')" class="btn btn-secondary"' +
+              (localBlocked ? ' disabled title="' + escapeAttr(localBlockedMessage) + '"' : '') +
+              ' style="padding:4px 9px;font-size:11px;' + (localBlocked ? 'opacity:.5;' : '') + '">Sync Back</button>';
+            html += '<button onclick="vireoLocalFolders.discard(' + f.id + ')" class="btn btn-secondary"' +
+              (localBlocked ? ' disabled title="' + escapeAttr(localBlockedMessage) + '"' : '') +
+              ' style="padding:4px 9px;font-size:11px;color:var(--danger);' + (localBlocked ? 'opacity:.5;' : '') + '">Discard</button>';
+          }
           html += '</div>';
         }
         html += '</div>';
@@ -255,6 +303,30 @@ async function loadWsFolders() {
     }
   } catch(e) {}
 }
+
+window.addEventListener('vireo:local-folder-job-progress', function(event) {
+  var detail = event.detail || {};
+  var jobId = String(detail.jobId || '');
+  var progress = detail.progress || {};
+  var progressRootId = progress.root_folder_id == null
+    ? null
+    : String(Number(progress.root_folder_id));
+  Array.from(document.querySelectorAll('[data-local-folder-job-id]')).forEach(
+    function(status) {
+      if (status.dataset.localFolderJobId !== jobId) return;
+      if (progressRootId !== null && status.dataset.localFolderRootId !== progressRootId) return;
+      var phase = status.querySelector('.workspace-folder-job-phase');
+      var count = status.querySelector('.workspace-folder-job-progress');
+      if (phase && progress.phase) phase.textContent = progress.phase;
+      if (count) {
+        count.textContent = progress.total
+          ? Number(progress.current || 0).toLocaleString() + ' / ' +
+            Number(progress.total).toLocaleString() + ' files'
+          : '';
+      }
+    }
+  );
+});
 
 async function removeFolderFromWs(wsId, folderId) {
   var f = _wsFoldersById[folderId];

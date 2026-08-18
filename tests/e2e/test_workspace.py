@@ -48,6 +48,189 @@ def test_work_locally_full_cycle(live_server, page, tmp_path):
     assert restored == str(source)
 
 
+def test_sync_back_replaces_folder_actions_with_live_progress(
+    live_server, page, tmp_path, monkeypatch
+):
+    """The folder row acknowledges a sync immediately and tracks its job."""
+    import threading
+
+    import web.local_folder as local_folder_web
+
+    db = live_server["db"]
+    source = tmp_path / "inline-progress-source"
+    source.mkdir()
+    (source / "bird.jpg").write_bytes(b"original")
+    workspace_id = db.create_workspace("Inline Sync Progress")
+    db.set_active_workspace(workspace_id)
+    folder_id = db.add_folder(str(source), name="inline-progress-source")
+    assert page.request.post(
+        f"{live_server['url']}/api/workspaces/{workspace_id}/activate"
+    ).ok
+
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.goto(f"{live_server['url']}/workspace", timeout=5000)
+    page.get_by_role("button", name="Work Locally", exact=True).click()
+    modal = page.locator("#stageLocalFoldersModal")
+    destination = tmp_path / "inline-progress-local"
+    modal.locator("[data-local-destination-base]").fill(str(destination))
+    modal.get_by_role("button", name="Copy Locally", exact=True).click()
+    expect(page.get_by_text("Local", exact=True)).to_be_visible(timeout=15000)
+
+    local_path = db.conn.execute(
+        "SELECT path FROM folders WHERE id=?", (folder_id,)
+    ).fetchone()["path"]
+    Path(local_path, "bird.jpg").write_bytes(b"edited")
+
+    real_sync_folder = local_folder_web.sync_folder
+    progress_sent = threading.Event()
+    release_sync = threading.Event()
+
+    def paused_sync_folder(*args, **kwargs):
+        kwargs["progress"](3, 10, "bird.jpg")
+        progress_sent.set()
+        assert release_sync.wait(timeout=10)
+        return real_sync_folder(*args, **kwargs)
+
+    monkeypatch.setattr(local_folder_web, "sync_folder", paused_sync_folder)
+
+    try:
+        page.get_by_role("button", name="Sync Back", exact=True).click()
+
+        row = page.locator(".workspace-folder-row-stacked")
+        status = row.locator(".workspace-folder-job").first
+        expect(status).to_be_visible(timeout=5000)
+        expect(status).to_have_attribute("data-local-folder-root-id", str(folder_id))
+        expect(status).to_contain_text("Syncing inline-progress-source to source")
+        expect(status).to_contain_text("3 / 10 files")
+        panel = page.locator("#localWorkspaceContent")
+        expect(panel).to_contain_text("Syncing inline-progress-source to source")
+        expect(panel).to_contain_text("3 / 10 files")
+        assert progress_sent.is_set()
+        expect(status.get_by_role("link", name="View Jobs")).to_have_attribute(
+            "href", "/jobs"
+        )
+        expect(row.get_by_role("button", name="Sync Back", exact=True)).to_have_count(0)
+        expect(row.get_by_role("button", name="Discard", exact=True)).to_have_count(0)
+
+        # A bulk job gives several rows the same job ID. Progress for one root
+        # must not overwrite another root's status.
+        page.evaluate(
+            """([jobId, rootId]) => {
+                const current = document.querySelector('.workspace-folder-job');
+                const other = current.cloneNode(true);
+                other.id = 'other-folder-job';
+                other.dataset.localFolderRootId = String(Number(rootId) + 1);
+                other.querySelector('.workspace-folder-job-phase').textContent = 'Waiting for its turn';
+                current.parentElement.appendChild(other);
+                window.dispatchEvent(new CustomEvent('vireo:local-folder-job-progress', {
+                    detail: {
+                        jobId,
+                        progress: {
+                            root_folder_id: rootId,
+                            phase: 'Publishing this folder',
+                            current: 4,
+                            total: 10
+                        }
+                    }
+                }));
+            }""",
+            [status.get_attribute("data-local-folder-job-id"), folder_id],
+        )
+        expect(status).to_contain_text("Publishing this folder")
+        expect(page.locator("#other-folder-job")).to_contain_text("Waiting for its turn")
+    finally:
+        release_sync.set()
+
+    expect(
+        page.get_by_role("button", name="Work Locally", exact=True)
+    ).to_be_visible(timeout=15000)
+
+
+def test_bulk_sync_snapshot_marks_an_already_completed_folder(
+    live_server, page, tmp_path
+):
+    """A late subscriber reconstructs completed per-folder progress from steps."""
+    import os
+    import threading
+
+    from services.local_folder import stage_folder
+
+    db = live_server["db"]
+    workspace_id = db.create_workspace("Bulk Sync Progress")
+    db.set_active_workspace(workspace_id)
+    folder_ids = []
+    for name in ("first-source", "second-source"):
+        source = tmp_path / name
+        source.mkdir()
+        (source / "bird.jpg").write_bytes(b"original")
+        folder_ids.append(db.add_folder(str(source), name=name))
+
+    vireo_dir = os.path.dirname(live_server["app"].config["THUMB_CACHE_DIR"])
+    local_base = str(tmp_path / "bulk-local")
+    for folder_id in folder_ids:
+        stage_folder(db, folder_id, vireo_dir, local_base=local_base)
+
+    assert page.request.post(
+        f"{live_server['url']}/api/workspaces/{workspace_id}/activate"
+    ).ok
+
+    started = threading.Event()
+    release = threading.Event()
+    runner = live_server["app"]._job_runner
+
+    def paused_bulk_sync(job):
+        runner.set_steps(
+            job["id"],
+            [
+                {"id": f"folder-{folder_ids[0]}", "label": "Sync first-source to source"},
+                {"id": f"folder-{folder_ids[1]}", "label": "Sync second-source to source"},
+            ],
+        )
+        runner.update_step(job["id"], f"folder-{folder_ids[0]}", status="running")
+        runner.update_step(
+            job["id"],
+            f"folder-{folder_ids[0]}",
+            status="completed",
+            progress={"current": 1, "total": 1},
+        )
+        runner.update_step(job["id"], f"folder-{folder_ids[1]}", status="running")
+        job["progress"].update(
+            {
+                "root_folder_id": folder_ids[1],
+                "phase": "Checking second-source for conflicts",
+            }
+        )
+        # Publish before the page subscribes. The browser must reconstruct the
+        # first folder from the job snapshot's completed step.
+        runner.push_event(job["id"], "progress", dict(job["progress"]))
+        started.set()
+        assert release.wait(timeout=10)
+        return {"ok": True}
+
+    job_id = runner.start(
+        "work-locally-folder-sync",
+        paused_bulk_sync,
+        workspace_id=workspace_id,
+        config={"root_folder_ids": folder_ids},
+    )
+    try:
+        assert started.wait(timeout=2)
+        page.goto(f"{live_server['url']}/workspace", timeout=5000)
+        first = page.locator(
+            f'.workspace-folder-job[data-local-folder-job-id="{job_id}"]'
+            f'[data-local-folder-root-id="{folder_ids[0]}"]'
+        )
+        second = page.locator(
+            f'.workspace-folder-job[data-local-folder-job-id="{job_id}"]'
+            f'[data-local-folder-root-id="{folder_ids[1]}"]'
+        )
+        expect(first).to_contain_text("Sync first-source to source complete", timeout=5000)
+        expect(first).to_contain_text("1 / 1 files")
+        expect(second).to_contain_text("Checking second-source for conflicts")
+    finally:
+        release.set()
+
+
 def test_work_locally_explains_processing_blocker(live_server, page, tmp_path):
     """A running pipeline disables local-copy controls with a visible reason."""
     import threading

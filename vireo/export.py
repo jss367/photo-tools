@@ -176,10 +176,12 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
         progress_cb: optional callback(current, total, current_file)
 
     Returns:
-        dict with keys: exported (int), errors (list of str), destination
-        (str), plus files (list of output paths) when collect_files is true.
-        The files list contains only successful outputs and is not guaranteed
-        to remain positionally aligned with photo_ids.
+        dict with the export count, errors, destination mode, and resolved
+        output directories. ``destination`` remains a string for compatibility;
+        when beside-original exports span multiple folders, the complete list
+        is available in ``destinations``. When collect_files is true, ``files``
+        contains only successful output paths and is not guaranteed to remain
+        positionally aligned with photo_ids.
     """
     options = options or {}
     template = options.get("naming_template", "{original}")
@@ -224,6 +226,19 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
     exported_files = [] if collect_files else None
     errors = []
     metadata_jobs = []
+    resolved_destinations = []
+    resolved_destination_set = set()
+
+    # A custom destination is known even if every individual photo later
+    # fails. Beside-original destinations are collected as each catalog folder
+    # is resolved below because a single export can span several folders.
+    if destination:
+        custom_destination = (
+            os.path.join(destination, subfolder) if subfolder else destination
+        )
+        custom_destination = os.path.normpath(custom_destination)
+        resolved_destinations.append(custom_destination)
+        resolved_destination_set.add(custom_destination)
 
     # Per-export cache of developed-directory scans. Keyed by directory
     # path; each value is the (stem, ext_lower) → absolute-path map that
@@ -331,6 +346,10 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
             os.path.join(destination_base, subfolder)
             if subfolder else destination_base
         )
+        photo_destination = os.path.normpath(photo_destination)
+        if photo_destination not in resolved_destination_set:
+            resolved_destinations.append(photo_destination)
+            resolved_destination_set.add(photo_destination)
 
         # Determine subdirectory for sequence counter
         # Render template once to extract the directory part
@@ -506,10 +525,22 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
                 if os.path.isfile(out_path)
             )
 
+    # For the common one-directory case, make the long-standing singular field
+    # useful even when the caller selected "beside originals" (whose request
+    # value is intentionally empty). Multiple beside-original roots cannot be
+    # represented honestly by one path, so retain the empty sentinel there and
+    # expose every resolved root through ``destinations``.
+    result_destination = (
+        resolved_destinations[0]
+        if len(resolved_destinations) == 1
+        else destination
+    )
     result = {
         "exported": exported,
         "errors": errors,
-        "destination": destination,
+        "destination": result_destination,
+        "destinations": resolved_destinations,
+        "destination_mode": "custom" if destination else "original",
         "subfolder": subfolder,
     }
     if exported_files is not None:

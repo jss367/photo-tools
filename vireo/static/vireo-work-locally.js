@@ -225,6 +225,20 @@
     }) || null;
   }
 
+  function jobFor(folderId) {
+    var item = statusFor(folderId);
+    var rootId = Number(item && item.root_folder_id != null
+      ? item.root_folder_id
+      : folderId);
+    var job = ((data && data.jobs) || []).find(function(candidate) {
+      return (candidate.folder_ids || []).map(Number).indexOf(rootId) >= 0;
+    }) || null;
+    if (!job || !activeJob || activeJob.id !== job.id) return job;
+    return Object.assign({}, job, {
+      progress: activeJob.progressByRoot[String(rootId)] || null
+    });
+  }
+
   function folderName(path) {
     var parts = String(path || '').replace(/[\\/]+$/, '').split(/[\\/]/);
     return parts[parts.length - 1] || 'Folder';
@@ -639,18 +653,74 @@
     });
     data.jobs = jobs;
     publishFolderStatus();
+    // Workspace folder rows are rendered independently from the Work Locally
+    // panel. Refresh them as soon as the server accepts a transition so the
+    // button the user clicked cannot continue to look idle.
+    if (typeof loadWsFolders === 'function') loadWsFolders();
+  }
+
+  function publishJobProgress(jobId, progress) {
+    try {
+      window.dispatchEvent(new CustomEvent('vireo:local-folder-job-progress', {
+        detail: {jobId: jobId, progress: progress}
+      }));
+    } catch (_error) {}
+  }
+
+  function rememberCompletedSteps(watch, steps) {
+    var completed = [];
+    (steps || []).forEach(function(step) {
+      if (!step || step.status !== 'completed') return;
+      var match = /^folder-(\d+)$/.exec(String(step.id || ''));
+      if (!match) return;
+      var rootId = Number(match[1]);
+      var key = String(rootId);
+      if (watch.completedRoots[key]) return;
+      var previous = watch.progressByRoot[key] || {};
+      var progress = Object.assign({}, previous, step.progress || {}, {
+        root_folder_id: rootId,
+        current_file: step.current_file || previous.current_file || '',
+        phase: (step.label || 'Folder') + ' complete'
+      });
+      watch.progressByRoot[key] = progress;
+      watch.completedRoots[key] = true;
+      completed.push(progress);
+    });
+    return completed;
+  }
+
+  function applyJobProgress(watch, progress) {
+    if (!progress || activeJob !== watch) return;
+    watch.progress = progress;
+    var completed = rememberCompletedSteps(watch, progress.steps);
+    var rootId = Number(progress.root_folder_id);
+    if (Number.isFinite(rootId)) {
+      watch.progressByRoot[String(rootId)] = progress;
+    }
+    render();
+    completed.forEach(function(item) {
+      publishJobProgress(watch.id, item);
+    });
+    publishJobProgress(watch.id, progress);
   }
 
   function watchJob(jobId) {
     if (activeJob && activeJob.id === jobId) return;
     if (activeJob && activeJob.source) activeJob.source.close();
-    var watch = {id: jobId, progress: null, source: null};
+    var watch = {
+      id: jobId,
+      progress: null,
+      progressByRoot: {},
+      completedRoots: {},
+      source: null,
+      eventCount: 0
+    };
     activeJob = watch;
     watch.source = safeEventSource('/api/jobs/' + encodeURIComponent(jobId) + '/stream', {
       onProgress: function(progress) {
         if (activeJob !== watch) return;
-        watch.progress = progress;
-        render();
+        watch.eventCount += 1;
+        applyJobProgress(watch, progress);
       },
       onComplete: async function(event) {
         if (activeJob !== watch) return;
@@ -669,6 +739,23 @@
       }
     });
     render();
+    // A worker can publish its first update before the POST response gives us
+    // the job ID. Wait until Flask has accepted the live subscription before
+    // reading the snapshot, closing the gap where an update could otherwise
+    // fall between the GET response and the EventSource connection.
+    watch.source.addEventListener('open', function() {
+      Vireo.api.json(
+        '/api/jobs/' + encodeURIComponent(jobId), {}, {toast: false}
+      ).then(function(snapshot) {
+        if (activeJob !== watch || watch.eventCount || !snapshot) return;
+        var progress = Object.assign({}, snapshot.progress || {}, {
+          steps: snapshot.steps || []
+        });
+        if (progress.phase || progress.root_folder_id != null || progress.steps.length) {
+          applyJobProgress(watch, progress);
+        }
+      }).catch(function() {});
+    }, {once: true});
   }
 
   async function load() {
@@ -806,6 +893,7 @@
       });
       watchJob(result.job_id);
       trackStartedJob(result, 'work-locally-folder-sync');
+      showToast('Sync started. Progress is shown here and in Jobs.', 'info');
     } catch (_error) {
       await load();
     } finally {
@@ -1017,6 +1105,7 @@
   window.vireoLocalFolders = {
     load: load,
     statusFor: statusFor,
+    jobFor: jobFor,
     blockingJob: function() { return data && data.blocking_job; },
     blockingJobFor: blockingJobForFolder,
     blockingMessage: blockingJobMessage,

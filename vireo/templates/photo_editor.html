@@ -1185,7 +1185,7 @@ function setEditorZoom(percent) {
   applyEditorZoom();
   updateEditorZoomControl();
   var changed = wasMode !== editorState.zoomMode ||
-    Math.abs(wasPercent - editorState.zoomPercent) > 0.05;
+    wasPercent !== editorState.zoomPercent;
   if (changed && editorState.photoId && !editorState.loading) schedulePreview();
 }
 
@@ -1713,6 +1713,7 @@ function updatePreview() {
     editorState.previewSeq++;
     document.getElementById('previewStatus').textContent = previewStatusText(img);
     applyEditorZoom();
+    updateEditorZoomControl();
     renderCropBox();
     updateHistogramFeedback();
     refreshMaskOverlay();
@@ -1724,6 +1725,7 @@ function updatePreview() {
     if (seq !== editorState.previewSeq) return;
     document.getElementById('previewStatus').textContent = previewStatusText(img);
     applyEditorZoom();
+    updateEditorZoomControl();
     renderCropBox();
     updateHistogramFeedback();
     refreshMaskOverlay();

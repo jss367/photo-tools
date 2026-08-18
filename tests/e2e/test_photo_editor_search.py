@@ -302,6 +302,30 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
         }"""
     )
 
+    incremental_slider = page.evaluate(
+        """() => {
+            const originalSchedule = window.schedulePreview;
+            let calls = 0;
+            window.schedulePreview = () => { calls += 1; };
+            editorState.photo.width = 20000;
+            editorState.photo.height = 15000;
+            editorState.zoomMode = 'fit';
+            setEditorZoomFromSlider(1);
+            const first = editorState.zoomPercent;
+            setEditorZoomFromSlider(2);
+            const second = editorState.zoomPercent;
+            window.schedulePreview = originalSchedule;
+            editorState.photo.width = 4000;
+            editorState.photo.height = 3000;
+            editorState.zoomMode = 'fit';
+            applyEditorZoom();
+            updateEditorZoomControl();
+            return {calls, delta: second - first};
+        }"""
+    )
+    assert 0 < incremental_slider["delta"] < 0.05
+    assert incremental_slider["calls"] == 2
+
     stale_ratio = page.evaluate(
         """() => {
             const originalRecipe = cloneRecipe(editorState.recipe);
@@ -464,6 +488,29 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
     assert fit["mode"] == "fit"
     assert fit["width"] > 0
     assert fit["zoomed"] is False
+
+    loaded_geometry_refresh = page.evaluate(
+        """() => new Promise((resolve) => {
+            const img = document.getElementById('editorImg');
+            const originalControl = window.updateEditorZoomControl;
+            let calls = 0;
+            window.updateEditorZoomControl = function() {
+                calls += 1;
+                return originalControl();
+            };
+            editorState.recipe.exposure += 0.013;
+            updatePreview();
+            const beforeLoad = calls;
+            const originalLoad = img.onload;
+            img.onload = function() {
+                originalLoad.call(this);
+                const afterLoad = calls;
+                window.updateEditorZoomControl = originalControl;
+                resolve({beforeLoad, afterLoad});
+            };
+        })"""
+    )
+    assert loaded_geometry_refresh["afterLoad"] > loaded_geometry_refresh["beforeLoad"]
 
 
 def test_photo_editor_enter_saves_crop_after_drag_from_focused_input(

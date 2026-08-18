@@ -11,8 +11,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import pytest
 from db import Database
 from export import (
+    _export_timestamp_parts,
     developed_folder_key,
     export_photos,
+    normalize_metadata_fields,
     relocate_developed_dir,
     relocate_developed_file,
     resolve_template,
@@ -72,6 +74,29 @@ def test_sanitize_filename_slashes():
 
 def test_sanitize_filename_special_chars():
     assert sanitize_filename('bird: "best"') == "bird_ _best_"
+
+
+def test_normalize_metadata_fields_validates_and_deduplicates():
+    assert normalize_metadata_fields(
+        ["species", "capture_date", "species", "location"]
+    ) == ["species", "capture_date", "location"]
+    assert normalize_metadata_fields(None) == []
+
+    with pytest.raises(ValueError, match="metadata_fields must be a list"):
+        normalize_metadata_fields("species")
+    with pytest.raises(ValueError, match="entries must be one of"):
+        normalize_metadata_fields(["copyright"])
+
+
+def test_export_timestamp_parts_normalizes_utc_suffix():
+    assert _export_timestamp_parts("2024-06-15T14:30:22.5Z") == (
+        "2024:06:15",
+        "14:30:22+00:00",
+        "2024:06:15 14:30:22",
+        "2024-06-15T14:30:22.5+00:00",
+        "5",
+        "+00:00",
+    )
 
 
 @pytest.fixture
@@ -207,6 +232,235 @@ def test_export_photos_can_use_subfolder_under_custom_destination(export_env):
     assert result["exported"] == 1
     assert result["errors"] == []
     assert os.path.isfile(os.path.join(env["dest"], "exported", "bird1.jpg"))
+
+
+def test_export_photos_embeds_only_selected_metadata(export_env, monkeypatch):
+    """Checkbox selections become standard EXIF, IPTC, and XMP fields."""
+    from metadata import exiftool_available, extract_metadata
+
+    if not exiftool_available():
+        pytest.skip("ExifTool is not available")
+
+    env = export_env
+    env["db"].conn.execute(
+        "UPDATE photos SET timestamp=? WHERE id=?",
+        ("2024-06-15T14:30:22.001000-07:00", env["p1"]),
+    )
+    env["db"].conn.execute(
+        """UPDATE photos
+           SET latitude=?, longitude=?, camera_make=?, camera_model=?, lens=?,
+               focal_length=?, aperture=?, shutter_speed=?, iso=?
+           WHERE id=?""",
+        (
+            32.88, -117.25, "Nikon", "Z 8", "NIKKOR Z 400mm f/4.5 VR S",
+            400.0, 5.6, 0.002, 800, env["p1"],
+        ),
+    )
+    second_species = env["db"].add_keyword("Northern Flicker", is_species=True)
+    env["db"].tag_photo(env["p1"], second_species)
+    env["db"].conn.commit()
+
+    import export as export_module
+
+    real_run = export_module.subprocess.run
+    metadata_write_calls = []
+
+    def tracking_run(command, *args, **kwargs):
+        if "-@" in command:
+            metadata_write_calls.append(command)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(export_module.subprocess, "run", tracking_run)
+
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={
+            "metadata_fields": [
+                "species", "capture_date", "capture_time", "rating", "camera",
+            ],
+        },
+    )
+
+    assert result["exported"] == 2
+    assert result["errors"] == []
+    assert len(metadata_write_calls) == 1
+    output = os.path.join(env["dest"], "bird1.jpg")
+    metadata = extract_metadata([output])[output]
+    assert metadata["XMP"]["Subject"] == [
+        "Northern Flicker", "Red-tailed Hawk",
+    ]
+    assert metadata["XMP"]["Rating"] == 5
+    assert metadata["EXIF"]["DateTimeOriginal"] == "2024:06:15 14:30:22"
+    assert metadata["EXIF"]["SubSecTimeOriginal"] == "001000"
+    assert metadata["EXIF"]["OffsetTimeOriginal"] == "-07:00"
+    assert metadata["EXIF"]["OffsetTimeDigitized"] == "-07:00"
+    from scanner import _extract_timestamp
+    assert _extract_timestamp(metadata["EXIF"]) == "2024-06-15T14:30:22.001000"
+    assert metadata["IPTC"]["DateCreated"] == "2024:06:15"
+    assert metadata["IPTC"]["TimeCreated"] == "14:30:22-07:00"
+    assert metadata["EXIF"]["Make"] == "Nikon"
+    assert metadata["EXIF"]["Model"] == "Z 8"
+    assert metadata["EXIF"]["LensModel"] == "NIKKOR Z 400mm f/4.5 VR S"
+    assert metadata["EXIF"]["FocalLength"] == 400
+    assert metadata["EXIF"]["FNumber"] == 5.6
+    assert metadata["EXIF"]["ExposureTime"] == 0.002
+    assert metadata["EXIF"]["ISO"] == 800
+    assert "GPSLatitude" not in metadata["EXIF"]
+
+
+def test_export_photos_location_metadata_is_opt_in(export_env):
+    from metadata import exiftool_available, extract_metadata
+
+    if not exiftool_available():
+        pytest.skip("ExifTool is not available")
+
+    env = export_env
+    env["db"].conn.execute(
+        "UPDATE photos SET latitude=?, longitude=? WHERE id=?",
+        (-33.86, -117.25, env["p1"]),
+    )
+    env["db"].conn.commit()
+
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={"metadata_fields": ["location"]},
+    )
+
+    assert result["exported"] == 1
+    output = os.path.join(env["dest"], "bird1.jpg")
+    metadata = extract_metadata([output])[output]
+    assert metadata["EXIF"]["GPSLatitude"] == pytest.approx(33.86)
+    assert metadata["EXIF"]["GPSLongitude"] == pytest.approx(117.25)
+    assert metadata["Composite"]["GPSPosition"] == "-33.86 -117.25"
+
+
+def test_export_photos_uses_assigned_keyword_location(export_env):
+    from metadata import exiftool_available, extract_metadata
+
+    if not exiftool_available():
+        pytest.skip("ExifTool is not available")
+
+    env = export_env
+    location_id = env["db"].add_keyword("Torrey Pines", kw_type="location")
+    env["db"].conn.execute(
+        "UPDATE keywords SET latitude=?, longitude=? WHERE id=?",
+        (32.92, -117.25, location_id),
+    )
+    env["db"].tag_photo(env["p1"], location_id)
+    env["db"].conn.commit()
+
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={"metadata_fields": ["location"]},
+    )
+
+    assert result["exported"] == 1
+    output = os.path.join(env["dest"], "bird1.jpg")
+    metadata = extract_metadata([output])[output]
+    assert metadata["EXIF"]["GPSLatitude"] == pytest.approx(32.92)
+    assert metadata["EXIF"]["GPSLongitude"] == pytest.approx(117.25)
+    assert metadata["Composite"]["GPSPosition"] == "32.92 -117.25"
+
+
+def test_export_photos_uses_bulk_location_lookup(export_env, monkeypatch):
+    """Location metadata is prefetched without one query per photo."""
+    env = export_env
+
+    def fail_single_lookup(*_args, **_kwargs):
+        raise AssertionError("export should use the bulk location lookup")
+
+    monkeypatch.setattr(
+        env["db"], "get_effective_photo_location", fail_single_lookup
+    )
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={"metadata_fields": ["location"]},
+    )
+
+    # Neither photo has a location, so no ExifTool process is needed, but both
+    # rendered derivatives still count as successful exports.
+    assert result["exported"] == 2
+    assert result["errors"] == []
+
+
+def test_export_metadata_batch_uses_utf8_input(tmp_path, monkeypatch):
+    import export as export_module
+    import metadata
+
+    out_path = tmp_path / "Mésange.jpg"
+    out_path.write_bytes(b"rendered")
+    monkeypatch.setattr(metadata, "find_exiftool", lambda: "exiftool")
+    monkeypatch.setattr(
+        metadata, "_exiftool_command", lambda _path: ["exiftool"]
+    )
+
+    def fake_run(command, **kwargs):
+        assert command == ["exiftool", "-@", "-"]
+        assert kwargs["encoding"] == "utf-8"
+        assert "Mésange.jpg" in kwargs["input"]
+        return export_module.subprocess.CompletedProcess(
+            command, 0, "VIREO_METADATA_STATUS_1_0\n", ""
+        )
+
+    monkeypatch.setattr(export_module.subprocess, "run", fake_run)
+
+    exported, errors = export_module._write_export_metadata_batch([
+        (str(out_path), out_path.name, ["-XMP-dc:Subject=Mésange bleue"]),
+    ])
+
+    assert exported == 1
+    assert errors == []
+    assert out_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("process_error", "expected_detail"),
+    [
+        (OSError("executable missing"), "ExifTool could not start"),
+        (
+            UnicodeEncodeError("ascii", "é", 0, 1, "ordinal not in range"),
+            "ExifTool metadata could not be encoded",
+        ),
+    ],
+)
+def test_export_metadata_batch_cleans_up_process_failures(
+    tmp_path, monkeypatch, process_error, expected_detail,
+):
+    import export as export_module
+    import metadata
+
+    out_path = tmp_path / "bird.jpg"
+    out_path.write_bytes(b"rendered")
+    monkeypatch.setattr(metadata, "find_exiftool", lambda: "exiftool")
+    monkeypatch.setattr(
+        metadata, "_exiftool_command", lambda _path: ["exiftool"]
+    )
+
+    def fail_run(*_args, **_kwargs):
+        raise process_error
+
+    monkeypatch.setattr(export_module.subprocess, "run", fail_run)
+
+    exported, errors = export_module._write_export_metadata_batch([
+        (str(out_path), out_path.name, ["-XMP-dc:Subject=Bird"]),
+    ])
+
+    assert exported == 0
+    assert len(errors) == 1
+    assert expected_detail in errors[0]
+    assert not out_path.exists()
 
 
 def test_export_photos_resize(export_env):

@@ -23819,6 +23819,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         with _settings_write_lock:
             _inat_token_request_generation += 1
             request_generation = _inat_token_request_generation
+            token_at_validation_start = _read_raw_config_file().get(
+                "inat_token", "",
+            )
         try:
             user = inat.validate_token(token)
         except inat.InatApiError as exc:
@@ -23838,6 +23841,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "A newer token validation superseded this request", 409,
                 )
             raw = _read_raw_config_file()
+            if raw.get("inat_token", "") != token_at_validation_start:
+                return json_error(
+                    "The iNaturalist token changed while this request was "
+                    "being validated", 409,
+                )
             raw["inat_token"] = token
             cfg.save(raw)
         return jsonify({"ok": True, "login": user.get("login")})
@@ -23974,6 +23982,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         [item["path"] for item in exported], destination,
                     )
                 return {
+                    "ok": bool(exported),
                     "exported": exported,
                     "errors": errors,
                     "destination": destination,
@@ -26535,6 +26544,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         max_size = body.get("max_size")
         quality = body.get("quality", 92)
         output_format = body.get("format", body.get("output_format", "jpg"))
+        metadata_fields = body.get("metadata_fields", [])
 
         if not raw_ids:
             return json_error("photo_ids required")
@@ -26561,10 +26571,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if max_size < 1 or max_size > 50000:
                 return json_error("max_size must be between 1 and 50000")
         try:
-            from export import normalize_output_format, normalize_quality
+            from export import (
+                normalize_metadata_fields,
+                normalize_output_format,
+                normalize_quality,
+            )
             output_format_info = normalize_output_format(output_format)
             output_format = output_format_info["extension"]
             quality = normalize_quality(quality)
+            metadata_fields = normalize_metadata_fields(metadata_fields)
         except ValueError as exc:
             return json_error(str(exc))
 
@@ -26630,6 +26645,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "format": output_format,
                     "working_copy_max_size": wc_max_size,
                     "developed_dir": developed_dir,
+                    "metadata_fields": metadata_fields,
                     "export_to_subfolder": export_to_subfolder,
                 },
                 progress_cb=progress_cb,
@@ -26644,6 +26660,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "export_to_subfolder": export_to_subfolder,
                 "naming_template": naming_template,
                 "format": output_format,
+                "metadata_fields": metadata_fields,
             },
             workspace_id=active_ws,
         )

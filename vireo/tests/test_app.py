@@ -86,6 +86,24 @@ def test_browse_slim_batch_bar_and_unified_menu(app_and_db):
         assert kept in html
 
 
+def test_browse_export_offers_embedded_metadata_checkboxes(app_and_db):
+    app, _ = app_and_db
+    html = app.test_client().get('/browse').get_data(as_text=True)
+
+    assert "Include metadata in exported files" in html
+    for control in (
+        'id="exportMetadataSpecies"',
+        'id="exportMetadataCaptureDate"',
+        'id="exportMetadataCaptureTime"',
+        'id="exportMetadataRating"',
+        'id="exportMetadataLocation"',
+        'id="exportMetadataCamera"',
+    ):
+        assert control in html
+    assert "metadata_fields: selectedExportMetadataFields()" in html
+    assert "Location stays off unless you explicitly select it." in html
+
+
 def test_shared_context_menu_scrolls_within_viewport(app_and_db):
     """The unified action menu can exceed the viewport height at Tauri's
     supported 600px minimum. Without a max-height + overflow-y fallback,

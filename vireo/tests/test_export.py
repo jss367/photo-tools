@@ -166,7 +166,7 @@ def test_export_photos_embeds_only_selected_metadata(export_env):
     env = export_env
     env["db"].conn.execute(
         "UPDATE photos SET timestamp=? WHERE id=?",
-        ("2024-06-15T14:30:22.123456-07:00", env["p1"]),
+        ("2024-06-15T14:30:22.001000-07:00", env["p1"]),
     )
     env["db"].conn.execute(
         """UPDATE photos
@@ -203,11 +203,11 @@ def test_export_photos_embeds_only_selected_metadata(export_env):
     ]
     assert metadata["XMP"]["Rating"] == 5
     assert metadata["EXIF"]["DateTimeOriginal"] == "2024:06:15 14:30:22"
-    assert metadata["EXIF"]["SubSecTimeOriginal"] == 123456
+    assert metadata["EXIF"]["SubSecTimeOriginal"] == "001000"
     assert metadata["EXIF"]["OffsetTimeOriginal"] == "-07:00"
     assert metadata["EXIF"]["OffsetTimeDigitized"] == "-07:00"
     from scanner import _extract_timestamp
-    assert _extract_timestamp(metadata["EXIF"]) == "2024-06-15T14:30:22.123456"
+    assert _extract_timestamp(metadata["EXIF"]) == "2024-06-15T14:30:22.001000"
     assert metadata["IPTC"]["DateCreated"] == "2024:06:15"
     assert metadata["IPTC"]["TimeCreated"] == "14:30:22-07:00"
     assert metadata["EXIF"]["Make"] == "Nikon"

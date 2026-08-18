@@ -1,3 +1,4 @@
+import pytest
 from playwright.sync_api import expect
 
 PREVIEW_SVG = (
@@ -27,17 +28,22 @@ def _open_large_editor_preview(live_server, page):
     )
 
 
-def test_photo_editor_mouse_drag_pans_at_actual_size(live_server, page):
-    """A primary drag at 100% pans the viewport without moving the crop."""
+@pytest.mark.parametrize("zoom_percent", [75, 100])
+def test_photo_editor_mouse_drag_pans_at_custom_zoom(
+    live_server, page, zoom_percent
+):
+    """A primary drag at any zoom above Fit pans without moving the crop."""
     _open_large_editor_preview(live_server, page)
-    page.locator("#actualBtn").click()
+    page.evaluate("zoom => setEditorZoom(zoom)", zoom_percent)
     page.wait_for_function(
-        """() => {
+        """zoom => {
             const wrap = document.getElementById('editorCanvasWrap');
             const img = document.getElementById('editorImg');
-            return wrap.classList.contains('zoom-actual') &&
+            return wrap.classList.contains('zoom-custom') &&
+                Math.abs(editorState.zoomPercent - zoom) < 0.5 &&
                 img.naturalWidth === 1600;
-        }"""
+        }""",
+        arg=zoom_percent,
     )
     dimensions = page.evaluate(
         """() => {

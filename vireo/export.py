@@ -170,13 +170,18 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
             export_to_subfolder: bool -- create an ``exported`` directory
                 beneath the shared destination or each original photo's
                 folder.
+            collect_files: bool -- include every exported path in the result.
+                Defaults to false so large background exports keep a compact
+                job result.
         progress_cb: optional callback(current, total, current_file)
 
     Returns:
         dict with the export count, errors, destination mode, and resolved
         output directories. ``destination`` remains a string for compatibility;
         when beside-original exports span multiple folders, the complete list
-        is available in ``destinations``.
+        is available in ``destinations``. When collect_files is true, ``files``
+        contains only successful output paths and is not guaranteed to remain
+        positionally aligned with photo_ids.
     """
     options = options or {}
     template = options.get("naming_template", "{original}")
@@ -195,6 +200,7 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
     developed_dir = options.get("developed_dir") or ""
     metadata_fields = normalize_metadata_fields(options.get("metadata_fields"))
     subfolder = "exported" if options.get("export_to_subfolder") else ""
+    collect_files = bool(options.get("collect_files", False))
 
     if destination:
         os.makedirs(destination, exist_ok=True)
@@ -217,6 +223,7 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
     # Track sequence numbers per subdirectory
     seq_counters = {}
     exported = 0
+    exported_files = [] if collect_files else None
     errors = []
     metadata_jobs = []
     resolved_destinations = []
@@ -492,8 +499,12 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
                     metadata_jobs.append((out_path, photo["filename"], metadata_args))
                 else:
                     exported += 1
+                    if exported_files is not None:
+                        exported_files.append(out_path)
             else:
                 exported += 1
+                if exported_files is not None:
+                    exported_files.append(out_path)
         except Exception as exc:
             log.warning("Export failed for %s: %s", photo["filename"], exc)
             errors.append(f"{photo['filename']}: {exc}")
@@ -507,6 +518,12 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
         )
         exported += metadata_exported
         errors.extend(metadata_errors)
+        if exported_files is not None:
+            exported_files.extend(
+                out_path
+                for out_path, _filename, _args in metadata_jobs
+                if os.path.isfile(out_path)
+            )
 
     # For the common one-directory case, make the long-standing singular field
     # useful even when the caller selected "beside originals" (whose request
@@ -518,7 +535,7 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
         if len(resolved_destinations) == 1
         else destination
     )
-    return {
+    result = {
         "exported": exported,
         "errors": errors,
         "destination": result_destination,
@@ -526,6 +543,9 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
         "destination_mode": "custom" if destination else "original",
         "subfolder": subfolder,
     }
+    if exported_files is not None:
+        result["files"] = exported_files
+    return result
 
 
 def _save_export_image(img, out_path, format_info, quality):

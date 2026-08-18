@@ -59,6 +59,35 @@ def _open_commands(page):
     )
 
 
+def _defer_token_validation(page):
+    page.evaluate(
+        """
+        () => {
+          const originalSafeFetch = window.safeFetch;
+          window.__tokenValidation = {};
+          window.safeFetch = (url, ...args) => {
+            if (url !== '/api/inat/token') return originalSafeFetch(url, ...args);
+            return new Promise((resolve, reject) => {
+              window.__tokenValidation.resolve = resolve;
+              window.__tokenValidation.reject = reject;
+            });
+          };
+        }
+        """
+    )
+
+
+def _resolve_token_validation(page):
+    page.evaluate(
+        """
+        async () => {
+          window.__tokenValidation.resolve({ok: true, login: 'birder42'});
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        """
+    )
+
+
 def test_native_quick_open_reviews_checked_metadata_before_opening(live_server, page):
     page.goto(f"{live_server['url']}/browse")
     original_url = page.url
@@ -86,6 +115,282 @@ def test_native_quick_open_reviews_checked_metadata_before_opening(live_server, 
         "Opened iNaturalist in your browser."
     )
     expect(page.locator("#inatModal")).to_have_class("modal-overlay open")
+
+
+def test_missing_token_disables_direct_send_and_offers_inline_setup_and_export(
+    live_server, page,
+):
+    page.goto(f"{live_server['url']}/browse")
+    _mock_tauri(page)
+
+    page.evaluate("item => openInatQuickModal([item], [])", _item())
+
+    expect(page.locator("#inatTokenSetup")).to_contain_text(
+        "Direct submission needs an iNaturalist token"
+    )
+    expect(page.locator("#inatQuickToken")).to_be_visible()
+    expect(page.locator("#inatQuickTokenBtn")).to_have_text("Validate & Save")
+    expect(page.locator("#inatSubmitBtn")).to_be_disabled()
+    expect(page.locator("#inatQuickExportBtn")).to_be_enabled()
+
+
+def test_valid_inline_token_switches_modal_to_direct_submission(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+    _mock_tauri(page)
+    page.route(
+        "**/api/inat/token",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ok":true,"login":"birder42"}',
+        ),
+    )
+    page.evaluate("item => openInatQuickModal([item], [])", _item())
+
+    page.locator("#inatIncludeTaxon0").uncheck()
+    page.locator("#inatIncludeDate0").uncheck()
+    page.locator("#inatIncludeLocation0").uncheck()
+    page.locator("#inatIncludeDescription0").check()
+    page.locator("#inatQuickDescription0").fill("Seen beside the trail")
+    page.locator("#inatQuickToken").fill("valid-token")
+    page.locator("#inatQuickTokenBtn").click()
+
+    expect(page.locator("#inatTaxon0")).to_have_value("")
+    expect(page.locator("#inatDate0")).to_have_value("")
+    expect(page.locator("#inatLat0")).to_have_value("")
+    expect(page.locator("#inatLng0")).to_have_value("")
+    expect(page.locator("#inatDesc0")).to_have_value("Seen beside the trail")
+    expect(page.locator("#inatSubmitBtn")).to_be_enabled()
+    expect(page.locator("#inatSubmitBtn")).to_have_text("Send to iNaturalist")
+
+
+def test_stale_token_validation_does_not_reopen_closed_modal(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+    _mock_tauri(page)
+    _defer_token_validation(page)
+    page.evaluate("item => openInatQuickModal([item], [])", _item())
+
+    page.locator("#inatQuickToken").fill("valid-token")
+    page.locator("#inatQuickTokenBtn").click()
+    expect(page.locator("#inatQuickTokenBtn")).to_have_text("Validating…")
+    page.evaluate("closeInatModal()")
+    _resolve_token_validation(page)
+
+    expect(page.locator("#inatModal")).to_have_class("modal-overlay")
+    assert page.evaluate("inatQueue.length") == 0
+
+
+def test_stale_token_validation_does_not_replace_new_quick_modal(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+    _mock_tauri(page)
+    _defer_token_validation(page)
+    page.evaluate("item => openInatQuickModal([item], [])", _item())
+
+    page.locator("#inatQuickToken").fill("valid-token")
+    page.locator("#inatQuickTokenBtn").click()
+    expect(page.locator("#inatQuickTokenBtn")).to_have_text("Validating…")
+    page.evaluate("item => openInatQuickModal([item], [])", _item(2))
+    _resolve_token_validation(page)
+
+    expect(page.locator("#inatQuickToken")).to_be_visible()
+    expect(page.locator("#inatCards")).to_contain_text("photo-2.jpg")
+    expect(page.locator("#inatSubmitBtn")).to_be_disabled()
+    assert page.evaluate("inatQueue.map(item => item.photo_id)") == [2]
+
+
+def test_token_free_export_uses_checked_metadata(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+    _mock_tauri(page)
+    page.evaluate(
+        """
+        () => {
+          window.__TAURI_INTERNALS__.invoke = (command, args) => {
+            window.__externalTest.invokes.push({ command, args });
+            if (command === 'plugin:dialog|open') {
+              return Promise.resolve('/tmp/inaturalist-exports');
+            }
+            return Promise.resolve(null);
+          };
+          window.safeEventSource = (url, callbacks) => {
+            window.__externalTest.exportStreamUrl = url;
+            Promise.resolve().then(() => callbacks.onComplete({
+              status: 'completed',
+              result: {
+                exported: [{photo_id: 1, filename: 'photo-1-iNaturalist.jpg'}],
+                errors: [],
+                revealed: true
+              }
+            }));
+            return {close: () => {}};
+          };
+        }
+        """
+    )
+    captured = {}
+
+    def handle_export(route):
+        captured.update(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"job_id":"inat-export-1"}',
+        )
+
+    page.route("**/api/inat/export", handle_export)
+    page.evaluate("item => openInatQuickModal([item], [])", _item())
+    page.locator("#inatIncludeLocation0").uncheck()
+    page.locator("#inatIncludeDescription0").check()
+    page.locator("#inatQuickDescription0").fill("Seen beside the trail")
+
+    page.locator("#inatQuickExportBtn").click()
+    expect(page.locator("#inatQuickExportStatus")).to_contain_text("Exported 1 JPEG")
+
+    assert captured["destination"] == "/tmp/inaturalist-exports"
+    assert captured["reveal"] is True
+    assert page.evaluate("window.__externalTest.exportStreamUrl") == (
+        "/api/jobs/inat-export-1/stream"
+    )
+    assert captured["submissions"] == [{
+        "photo_id": 1,
+        "taxon_name": "Corvus corax",
+        "observed_on": "2026-07-12",
+        "latitude": 47.61,
+        "longitude": -122.33,
+        "include_taxon": True,
+        "include_date": True,
+        "include_location": False,
+        "include_description": True,
+        "description": "Seen beside the trail",
+    }]
+
+
+def test_folder_picker_result_does_not_export_replacement_modal(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+    _mock_tauri(page)
+    page.evaluate(
+        """
+        () => {
+          window.__TAURI_INTERNALS__.invoke = (command, args) => {
+            window.__externalTest.invokes.push({ command, args });
+            if (command === 'plugin:dialog|open') {
+              return new Promise(resolve => {
+                window.__externalTest.resolveExportDirectory = resolve;
+              });
+            }
+            return Promise.resolve(null);
+          };
+        }
+        """
+    )
+    captured = []
+
+    def handle_export(route):
+        captured.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"job_id":"unexpected-export"}',
+        )
+
+    page.route("**/api/inat/export", handle_export)
+    page.evaluate("item => openInatQuickModal([item], [])", _item())
+    page.locator("#inatQuickExportBtn").click()
+    page.wait_for_function(
+        "typeof window.__externalTest.resolveExportDirectory === 'function'"
+    )
+
+    page.evaluate("item => openInatQuickModal([item], [])", _item(2))
+    page.evaluate(
+        """
+        async () => {
+          window.__externalTest.resolveExportDirectory('/tmp/old-export');
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        """
+    )
+
+    assert captured == []
+    expect(page.locator("#inatCards")).to_contain_text("photo-2.jpg")
+    expect(page.locator("#inatQuickExportBtn")).to_be_enabled()
+
+
+def test_export_button_guards_pending_folder_picker(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+    _mock_tauri(page)
+    page.evaluate(
+        """
+        () => {
+          window.__TAURI_INTERNALS__.invoke = (command, args) => {
+            window.__externalTest.invokes.push({ command, args });
+            if (command === 'plugin:dialog|open') {
+              return new Promise(resolve => {
+                window.__externalTest.resolveExportDirectory = resolve;
+              });
+            }
+            return Promise.resolve(null);
+          };
+        }
+        """
+    )
+    page.evaluate("item => openInatQuickModal([item], [])", _item())
+
+    page.evaluate("() => { exportInatQuickPhotos(); exportInatQuickPhotos(); }")
+    page.wait_for_function(
+        "typeof window.__externalTest.resolveExportDirectory === 'function'"
+    )
+
+    assert len([
+        call for call in page.evaluate("window.__externalTest.invokes")
+        if call["command"] == "plugin:dialog|open"
+    ]) == 1
+    expect(page.locator("#inatQuickExportBtn")).to_be_disabled()
+    expect(page.locator("#inatQuickExportBtn")).to_have_text("Choosing folder…")
+
+    page.evaluate("window.__externalTest.resolveExportDirectory(null)")
+    expect(page.locator("#inatQuickExportBtn")).to_be_enabled()
+    expect(page.locator("#inatQuickExportBtn")).to_have_text("Export JPEG…")
+
+
+def test_closing_quick_modal_closes_export_stream(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+    _mock_tauri(page)
+    page.evaluate(
+        """
+        () => {
+          window.__TAURI_INTERNALS__.invoke = (command, args) => {
+            window.__externalTest.invokes.push({ command, args });
+            if (command === 'plugin:dialog|open') {
+              return Promise.resolve('/tmp/inaturalist-exports');
+            }
+            return Promise.resolve(null);
+          };
+          window.safeEventSource = (url, callbacks) => {
+            window.__externalTest.exportCallbacks = callbacks;
+            window.__externalTest.exportCloseCount = 0;
+            return {
+              close: () => { window.__externalTest.exportCloseCount += 1; }
+            };
+          };
+        }
+        """
+    )
+    page.route(
+        "**/api/inat/export",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"job_id":"inat-export-open"}',
+        ),
+    )
+    page.evaluate("item => openInatQuickModal([item], [])", _item())
+
+    page.locator("#inatQuickExportBtn").click()
+    page.wait_for_function("window._inatExportStream !== null")
+    page.evaluate("closeInatModal()")
+
+    assert page.evaluate("window.__externalTest.exportCloseCount") == 1
+    assert page.evaluate("window._inatExportStream") is None
+    expect(page.locator("#inatModal")).to_have_class("modal-overlay")
 
 
 def test_quick_open_can_omit_all_metadata_for_generic_upload(live_server, page):

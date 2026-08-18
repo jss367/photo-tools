@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 
 import pytest
 
@@ -72,6 +73,39 @@ def test_validate_token_invalid():
     with patch("inat.requests.get", return_value=mock_resp):
         result = validate_token("bad-token")
         assert result is None
+
+
+@pytest.mark.parametrize("status_code", [429, 500])
+def test_validate_token_surfaces_non_auth_api_errors(status_code):
+    from inat import InatApiError, validate_token
+    mock_resp = MagicMock(status_code=status_code, text="try again later")
+
+    with patch(
+        "inat.requests.get", return_value=mock_resp,
+    ), pytest.raises(InatApiError, match=rf"API error \({status_code}\)"):
+        validate_token("valid-token")
+
+
+def test_validate_token_rejects_invalid_success_response():
+    from inat import InatApiError, validate_token
+    mock_resp = MagicMock(status_code=200)
+    mock_resp.json.return_value = []
+
+    with patch(
+        "inat.requests.get", return_value=mock_resp,
+    ), pytest.raises(InatApiError, match="invalid token-validation response"):
+        validate_token("valid-token")
+
+
+def test_validate_token_wraps_connection_errors():
+    import requests
+    from inat import InatApiError, validate_token
+
+    with patch(
+        "inat.requests.get",
+        side_effect=requests.ConnectionError("network unavailable"),
+    ), pytest.raises(InatApiError, match="Could not contact iNaturalist"):
+        validate_token("token")
 
 
 def test_create_observation_success():
@@ -370,6 +404,322 @@ def test_api_inat_prepare_marks_direct_mode_with_token(app_and_db):
     assert data["photo_upload_requires_token"] is False
 
 
+def test_api_inat_token_validates_before_saving(app_and_db):
+    app, _db, _pid = app_and_db
+    import config as cfg
+
+    with patch("inat.validate_token", return_value={"login": "birder42"}):
+        resp = app.test_client().post(
+            "/api/inat/token", json={"token": "valid-token"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "login": "birder42"}
+    assert cfg.load()["inat_token"] == "valid-token"
+
+
+def test_api_inat_token_does_not_save_invalid_value(app_and_db):
+    app, _db, _pid = app_and_db
+    import config as cfg
+    cfg.save({"inat_token": "previous-token"})
+
+    with patch("inat.validate_token", return_value=None):
+        resp = app.test_client().post(
+            "/api/inat/token", json={"token": "invalid-token"},
+        )
+
+    assert resp.status_code == 401
+    assert cfg.load()["inat_token"] == "previous-token"
+
+
+def test_api_inat_token_only_saves_latest_overlapping_request(app_and_db):
+    app, _db, _pid = app_and_db
+    import config as cfg
+
+    old_started = threading.Event()
+    release_old = threading.Event()
+    responses = {}
+
+    def validate(token):
+        if token == "older-token":
+            old_started.set()
+            assert release_old.wait(timeout=5)
+            return {"login": "older-user"}
+        return {"login": "newer-user"}
+
+    def send_old_request():
+        responses["old"] = app.test_client().post(
+            "/api/inat/token", json={"token": "older-token"},
+        )
+
+    with patch("inat.validate_token", side_effect=validate):
+        old_thread = threading.Thread(target=send_old_request)
+        old_thread.start()
+        assert old_started.wait(timeout=5)
+        newer = app.test_client().post(
+            "/api/inat/token", json={"token": "newer-token"},
+        )
+        release_old.set()
+        old_thread.join(timeout=5)
+
+    assert not old_thread.is_alive()
+    assert newer.status_code == 200
+    assert responses["old"].status_code == 409
+    assert cfg.load()["inat_token"] == "newer-token"
+
+
+def test_api_inat_token_does_not_overwrite_settings_write(app_and_db):
+    app, _db, _pid = app_and_db
+    import config as cfg
+
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    responses = {}
+
+    def validate(_token):
+        validation_started.set()
+        assert release_validation.wait(timeout=5)
+        return {"login": "modal-user"}
+
+    def send_modal_request():
+        responses["modal"] = app.test_client().post(
+            "/api/inat/token", json={"token": "modal-token"},
+        )
+
+    with patch("inat.validate_token", side_effect=validate):
+        modal_thread = threading.Thread(target=send_modal_request)
+        modal_thread.start()
+        assert validation_started.wait(timeout=5)
+        settings = app.test_client().post(
+            "/api/config", json={"inat_token": "settings-token"},
+        )
+        release_validation.set()
+        modal_thread.join(timeout=5)
+
+    assert not modal_thread.is_alive()
+    assert settings.status_code == 200
+    assert responses["modal"].status_code == 409
+    assert cfg.load()["inat_token"] == "settings-token"
+
+
+def test_api_inat_token_rejects_aba_settings_writes(app_and_db):
+    app, _db, _pid = app_and_db
+    import config as cfg
+    cfg.save({"inat_token": "original-token"})
+
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    responses = {}
+
+    def validate(_token):
+        validation_started.set()
+        assert release_validation.wait(timeout=5)
+        return {"login": "modal-user"}
+
+    def send_modal_request():
+        responses["modal"] = app.test_client().post(
+            "/api/inat/token", json={"token": "modal-token"},
+        )
+
+    with patch("inat.validate_token", side_effect=validate):
+        modal_thread = threading.Thread(target=send_modal_request)
+        modal_thread.start()
+        assert validation_started.wait(timeout=5)
+        first_write = app.test_client().post(
+            "/api/config", json={"inat_token": "temporary-token"},
+        )
+        second_write = app.test_client().post(
+            "/api/config", json={"inat_token": "original-token"},
+        )
+        release_validation.set()
+        modal_thread.join(timeout=5)
+
+    assert not modal_thread.is_alive()
+    assert first_write.status_code == 200
+    assert second_write.status_code == 200
+    assert responses["modal"].status_code == 409
+    assert cfg.load()["inat_token"] == "original-token"
+
+
+def test_api_inat_export_uses_only_checked_metadata(app_and_db, tmp_path):
+    app, db, pid = app_and_db
+    destination = str(tmp_path / "exports")
+    kid = db.conn.execute(
+        "INSERT INTO keywords (name, type, latitude, longitude) "
+        "VALUES (?, 'location', ?, ?)",
+        ("Backyard", 38.9, -77.0),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        (pid, kid),
+    )
+    db.conn.commit()
+    expected_path = os.path.join(destination, "bird-iNaturalist.jpg")
+
+    with patch(
+        "inat_export.export_inat_photo", return_value=expected_path,
+    ) as export_photo:
+        resp = app.test_client().post("/api/inat/export", json={
+            "destination": destination,
+            "submissions": [{
+                "photo_id": pid,
+                "taxon_name": "Corvus corax",
+                "observed_on": "2024-06-01",
+                "include_taxon": True,
+                "include_date": True,
+                "include_location": False,
+                "include_description": True,
+                "description": "At the feeder",
+            }],
+            "reveal": False,
+        })
+        from wait import wait_for_job_via_client
+        job = wait_for_job_via_client(
+            app.test_client(), resp.get_json()["job_id"],
+        )
+
+    assert resp.status_code == 200
+    assert job["status"] == "completed"
+    data = job["result"]
+    assert data["exported"][0]["filename"] == "bird-iNaturalist.jpg"
+    metadata = export_photo.call_args.args[4]
+    assert metadata == {
+        "taxon_name": "Corvus corax",
+        "timestamp": "2024-06-01",
+        "description": "At the feeder",
+    }
+
+
+def test_api_inat_export_marks_wholly_unsuccessful_job_failed(
+    app_and_db, tmp_path,
+):
+    app, _db, pid = app_and_db
+    from inat_export import InatExportError
+    from wait import wait_for_job_via_client
+
+    with patch(
+        "inat_export.export_inat_photo",
+        side_effect=InatExportError("render failed"),
+    ):
+        response = app.test_client().post("/api/inat/export", json={
+            "destination": str(tmp_path),
+            "submissions": [{"photo_id": pid}],
+        })
+        job = wait_for_job_via_client(
+            app.test_client(), response.get_json()["job_id"],
+        )
+
+    assert response.status_code == 200
+    assert job["status"] == "failed"
+    assert len(job["errors"]) == 1
+    assert str(pid) in job["errors"][0]
+    assert "render failed" in job["errors"][0]
+    assert job["result"]["ok"] is False
+    assert job["result"]["exported"] == []
+    assert job["result"]["errors"] == [{
+        "photo_id": pid,
+        "error": "render failed",
+    }]
+
+
+@pytest.mark.parametrize("photo_id", [True, 1.9])
+def test_api_inat_export_rejects_non_integer_numeric_photo_ids(
+    app_and_db, tmp_path, photo_id,
+):
+    app, _db, _pid = app_and_db
+
+    response = app.test_client().post("/api/inat/export", json={
+        "destination": str(tmp_path),
+        "submissions": [{"photo_id": photo_id}],
+    })
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "photo_id must be an integer"
+
+
+def test_api_inat_export_includes_zero_coordinates(app_and_db, tmp_path):
+    app, db, pid = app_and_db
+    db.conn.execute(
+        "UPDATE photos SET latitude = 12.0, longitude = 34.0 WHERE id = ?",
+        (pid,),
+    )
+    db.conn.commit()
+
+    with patch(
+        "inat_export.export_inat_photo",
+        return_value=str(tmp_path / "bird-iNaturalist.jpg"),
+    ) as export_photo:
+        resp = app.test_client().post("/api/inat/export", json={
+            "destination": str(tmp_path),
+            "submissions": [{
+                "photo_id": pid,
+                "latitude": 0.0,
+                "longitude": 0.0,
+                "include_location": True,
+            }],
+        })
+        from wait import wait_for_job_via_client
+        job = wait_for_job_via_client(
+            app.test_client(), resp.get_json()["job_id"],
+        )
+
+    assert resp.status_code == 200
+    assert job["status"] == "completed"
+    metadata = export_photo.call_args.args[4]
+    assert metadata["latitude"] == 0.0
+    assert metadata["longitude"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("latitude", "longitude"),
+    [([], 1), (1, {}), ("nan", 1), (1, "inf"), (None, 1), (True, 1)],
+)
+def test_api_inat_export_rejects_invalid_coordinate_snapshots(
+    app_and_db, tmp_path, latitude, longitude,
+):
+    app, _db, pid = app_and_db
+
+    response = app.test_client().post("/api/inat/export", json={
+        "destination": str(tmp_path),
+        "submissions": [{
+            "photo_id": pid,
+            "latitude": latitude,
+            "longitude": longitude,
+            "include_location": True,
+        }],
+    })
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == (
+        "latitude and longitude must be finite numbers"
+    )
+
+
+@pytest.mark.parametrize(
+    ("latitude", "longitude"),
+    [(90.01, 1), (-90.01, 1), (1, 180.01), (1, -180.01)],
+)
+def test_api_inat_export_rejects_out_of_range_coordinate_snapshots(
+    app_and_db, tmp_path, latitude, longitude,
+):
+    app, _db, pid = app_and_db
+
+    response = app.test_client().post("/api/inat/export", json={
+        "destination": str(tmp_path),
+        "submissions": [{
+            "photo_id": pid,
+            "latitude": latitude,
+            "longitude": longitude,
+            "include_location": True,
+        }],
+    })
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == (
+        "latitude or longitude is out of range"
+    )
+
+
 def _add_out_of_workspace_photo(db):
     active_ws = db._active_workspace_id
     base_dir = db.conn.execute("SELECT path FROM folders LIMIT 1").fetchone()["path"]
@@ -426,6 +776,52 @@ def test_api_inat_submit_success(app_and_db):
     # Verify recorded in DB
     subs = db.get_inat_submissions([pid])
     assert pid in subs
+
+
+def test_api_inat_submit_preserves_explicit_metadata_omissions(app_and_db):
+    app, _db, pid = app_and_db
+    import config as cfg
+    cfg.save({"inat_token": "fake-token"})
+
+    with patch(
+        "inat.submit_observation",
+        return_value=(12345, "https://www.inaturalist.org/observations/12345"),
+    ) as mock_submit:
+        resp = app.test_client().post("/api/inat/submit", json={
+            "photo_id": pid,
+            "taxon_name": "",
+            "observed_on": "",
+            "latitude": None,
+            "longitude": None,
+            "description": "At the feeder",
+        })
+
+    assert resp.status_code == 200
+    kwargs = mock_submit.call_args.kwargs
+    assert kwargs["taxon_name"] == ""
+    assert kwargs["observed_on"] == ""
+    assert kwargs["latitude"] is None
+    assert kwargs["longitude"] is None
+    assert kwargs["description"] == "At the feeder"
+
+
+@pytest.mark.parametrize("coordinate", ["latitude", "longitude"])
+def test_api_inat_submit_rejects_partial_coordinates(app_and_db, coordinate):
+    app, _db, pid = app_and_db
+    import config as cfg
+    cfg.save({"inat_token": "fake-token"})
+
+    with patch("inat.submit_observation") as mock_submit:
+        response = app.test_client().post("/api/inat/submit", json={
+            "photo_id": pid,
+            coordinate: 12.5,
+        })
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == (
+        "latitude and longitude must be provided together"
+    )
+    mock_submit.assert_not_called()
 
 
 def test_api_inat_submit_reports_partial_upload(app_and_db):
@@ -684,6 +1080,24 @@ def test_api_inat_submit_batch(app_and_db):
     data = resp.get_json()
     assert len(data['results']) == 1
     assert data['results'][0]['observation_id'] == 11111
+
+
+def test_api_inat_submit_batch_rejects_partial_coordinates(app_and_db):
+    app, _db, pid = app_and_db
+    import config as cfg
+    cfg.save({"inat_token": "fake-token"})
+
+    with patch("inat.submit_observation") as mock_submit:
+        response = app.test_client().post("/api/inat/submit-batch", json={
+            "submissions": [{"photo_id": pid, "latitude": 12.5}],
+        })
+
+    assert response.status_code == 200
+    assert response.get_json()["results"] == [{
+        "photo_id": pid,
+        "error": "latitude and longitude must be provided together",
+    }]
+    mock_submit.assert_not_called()
 
 
 def test_api_inat_submit_batch_reports_partial_upload(app_and_db):

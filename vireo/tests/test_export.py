@@ -152,11 +152,29 @@ def test_export_photos_basic(export_env):
     )
     assert result["exported"] == 2
     assert result["errors"] == []
+    assert "files" not in result
     assert result["destination"] == env["dest"]
     assert result["destinations"] == [env["dest"]]
     assert result["destination_mode"] == "custom"
     assert os.path.isfile(os.path.join(env["dest"], "bird1.jpg"))
     assert os.path.isfile(os.path.join(env["dest"], "bird2.jpg"))
+
+
+def test_export_photos_collects_paths_only_when_requested(export_env):
+    env = export_env
+
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "collect_files": True},
+    )
+
+    assert result["files"] == [
+        os.path.join(env["dest"], "bird1.jpg"),
+        os.path.join(env["dest"], "bird2.jpg"),
+    ]
 
 
 def test_export_photos_defaults_to_original_folder(export_env):
@@ -309,11 +327,16 @@ def test_export_photos_embeds_only_selected_metadata(export_env, monkeypatch):
             "metadata_fields": [
                 "species", "capture_date", "capture_time", "rating", "camera",
             ],
+            "collect_files": True,
         },
     )
 
     assert result["exported"] == 2
     assert result["errors"] == []
+    assert result["files"] == [
+        os.path.join(env["dest"], "bird1.jpg"),
+        os.path.join(env["dest"], "bird2.jpg"),
+    ]
     assert len(metadata_write_calls) == 1
     output = os.path.join(env["dest"], "bird1.jpg")
     metadata = extract_metadata([output])[output]

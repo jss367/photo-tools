@@ -19413,6 +19413,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             elif "HF_TOKEN" in os.environ:
                 del os.environ["HF_TOKEN"]
             cfg.save(current)
+            if "inat_token" in body:
+                _advance_inat_token_generation()
             # If the user shrunk the preview cache quota, evict immediately to the
             # new size rather than waiting for the next cache write. No-op when
             # already under quota, so always safe to call.
@@ -19579,6 +19581,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     # and `app.run(threaded=True)` two concurrent requests can read the same
     # snapshot and the later writer drops the earlier change.
     _settings_write_lock = threading.Lock()
+    _inat_token_request_generation = 0
+
+    def _advance_inat_token_generation():
+        """Invalidate in-flight modal validations after any token write."""
+        nonlocal _inat_token_request_generation
+        _inat_token_request_generation += 1
 
     @app.route("/api/settings/global", methods=["PATCH"])
     def api_settings_global_patch():
@@ -19611,6 +19619,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             raw = _read_raw_config_file()
             schema.set_dotted(raw, key, value)
             cfg.save(raw)
+            if key == "inat_token":
+                _advance_inat_token_generation()
             _settings_post_save_side_effects(cfg.load())
         return jsonify({"ok": True, "key": key, "value": value})
 
@@ -19627,6 +19637,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             raw = _read_raw_config_file()
             schema.delete_dotted(raw, key)
             cfg.save(raw)
+            if key == "inat_token":
+                _advance_inat_token_generation()
             _settings_post_save_side_effects(cfg.load())
         return jsonify({"ok": True, "key": key})
 
@@ -19980,6 +19992,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 if existing is not _MISSING:
                     schema.set_dotted(payload, secret_key, existing)
             cfg.save(payload)
+            if "inat_token" in payload:
+                _advance_inat_token_generation()
             _settings_post_save_side_effects(cfg.load())
         return jsonify({"ok": True})
 
@@ -23795,10 +23809,247 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         token = body.get("token", "")
         if not token:
             return json_error("Token is required")
-        result = inat.validate_token(token)
+        try:
+            result = inat.validate_token(token)
+        except inat.InatApiError as exc:
+            return json_error(str(exc), 502)
         if result is None:
             return json_error("Invalid or expired token", 401)
         return jsonify(result)
+
+    @app.route("/api/inat/token", methods=["POST"])
+    def api_inat_save_token():
+        """Validate and save an iNaturalist token from the submission modal."""
+        nonlocal _inat_token_request_generation
+
+        import config as cfg
+        import inat
+
+        body = request.get_json(silent=True) or {}
+        token = str(body.get("token") or "").strip()
+        if not token:
+            return json_error("Token is required")
+        with _settings_write_lock:
+            _advance_inat_token_generation()
+            request_generation = _inat_token_request_generation
+            token_at_validation_start = _read_raw_config_file().get(
+                "inat_token", "",
+            )
+        try:
+            user = inat.validate_token(token)
+        except inat.InatApiError as exc:
+            return json_error(str(exc), 502)
+        if user is None:
+            return json_error("Invalid or expired token", 401)
+
+        # Preserve the raw config shape instead of writing cfg.load(), which
+        # would pin every default into config.json.  Invalid tokens never reach
+        # disk; validation and persistence are one user action in this flow.
+        # Only the newest validation request may persist: remote validation can
+        # finish out of order when a modal is closed and reopened, and an older
+        # response must not overwrite the token chosen by the newer flow.
+        with _settings_write_lock:
+            if request_generation != _inat_token_request_generation:
+                return json_error(
+                    "A newer token validation superseded this request", 409,
+                )
+            raw = _read_raw_config_file()
+            if raw.get("inat_token", "") != token_at_validation_start:
+                return json_error(
+                    "The iNaturalist token changed while this request was "
+                    "being validated", 409,
+                )
+            raw["inat_token"] = token
+            cfg.save(raw)
+        return jsonify({"ok": True, "login": user.get("login")})
+
+    @app.route("/api/inat/export", methods=["POST"])
+    def api_inat_export():
+        """Export edited JPEGs with only the selected iNaturalist metadata."""
+        import config as cfg
+        from inat_export import (
+            InatExportError,
+            export_inat_photo,
+            reveal_inat_exports,
+        )
+
+        body = request.get_json(silent=True) or {}
+        destination = str(body.get("destination") or "").strip()
+        submissions = body.get("submissions")
+        if not destination:
+            return json_error("destination is required")
+        if not os.path.isabs(destination):
+            return json_error("destination must be an absolute path")
+        if not isinstance(submissions, list) or not submissions:
+            return json_error("submissions array is required")
+        if len(submissions) > _MAX_SELECTION_PHOTOS:
+            return json_error("too many photos in selection", 400)
+        normalized_submissions = []
+        for item in submissions:
+            if not isinstance(item, dict):
+                return json_error("each submission must be an object")
+            raw_photo_id = item.get("photo_id")
+            if isinstance(raw_photo_id, (bool, float)):
+                return json_error("photo_id must be an integer")
+            try:
+                photo_id = int(raw_photo_id)
+            except (TypeError, ValueError):
+                return json_error("photo_id must be an integer")
+            normalized = dict(item)
+            normalized["photo_id"] = photo_id
+            if normalized.get("include_location", False):
+                latitude = normalized.get("latitude")
+                longitude = normalized.get("longitude")
+                if isinstance(latitude, bool) or isinstance(longitude, bool):
+                    return json_error(
+                        "latitude and longitude must be finite numbers",
+                    )
+                try:
+                    latitude = float(latitude)
+                    longitude = float(longitude)
+                except (TypeError, ValueError):
+                    return json_error(
+                        "latitude and longitude must be finite numbers",
+                    )
+                if not math.isfinite(latitude) or not math.isfinite(longitude):
+                    return json_error(
+                        "latitude and longitude must be finite numbers",
+                    )
+                if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+                    return json_error(
+                        "latitude or longitude is out of range",
+                    )
+                normalized["latitude"] = latitude
+                normalized["longitude"] = longitude
+            normalized_submissions.append(normalized)
+        submissions = normalized_submissions
+
+        db = _get_db()
+        effective_cfg = db.get_effective_config(cfg.load())
+        quality = effective_cfg.get("working_copy_quality", 92)
+        wc_max_size = effective_cfg.get("working_copy_max_size", 4096)
+        developed_dir = effective_cfg.get("darktable_output_dir", "") or ""
+        vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+        reveal = bool(body.get("reveal", False))
+        active_ws = db._active_workspace_id
+        runner = app._job_runner
+
+        def work(job):
+            thread_db = Database(db_path)
+            thread_db.set_active_workspace(active_ws)
+            exported = []
+            errors = []
+            total = len(submissions)
+            job["progress"]["total"] = total
+            try:
+                for index, item in enumerate(submissions, start=1):
+                    if runner.is_cancelled(job["id"]):
+                        break
+                    photo_id = item["photo_id"]
+                    photo = thread_db.get_photo(
+                        photo_id, verify_workspace=True,
+                    )
+                    if not photo:
+                        errors.append({
+                            "photo_id": photo_id,
+                            "error": "Photo not found",
+                        })
+                        job["progress"]["current"] = index
+                        runner.push_event(job["id"], "progress", {
+                            "current": index,
+                            "total": total,
+                            "current_file": "",
+                            "phase": "Exporting for iNaturalist",
+                        })
+                        continue
+
+                    metadata = {}
+                    if item.get("include_taxon", False):
+                        taxon_name = str(
+                            item.get("taxon_name") or ""
+                        ).strip()
+                        if taxon_name:
+                            metadata["taxon_name"] = taxon_name
+                    if item.get("include_date", False):
+                        observed_on = str(
+                            item.get("observed_on") or ""
+                        ).strip()
+                        if observed_on:
+                            # The modal discloses a calendar date, not capture
+                            # time or timezone, so export only that snapshot.
+                            metadata["timestamp"] = observed_on[:10]
+                    if item.get("include_location", False):
+                        latitude = item.get("latitude")
+                        longitude = item.get("longitude")
+                        if (
+                            latitude not in (None, "")
+                            and longitude not in (None, "")
+                        ):
+                            metadata["latitude"] = latitude
+                            metadata["longitude"] = longitude
+                    if item.get("include_description", False):
+                        description = str(
+                            item.get("description") or ""
+                        ).strip()
+                        if description:
+                            metadata["description"] = description[:10000]
+
+                    try:
+                        path = export_inat_photo(
+                            thread_db,
+                            vireo_dir,
+                            photo_id,
+                            destination,
+                            metadata,
+                            quality=quality,
+                            working_copy_max_size=wc_max_size,
+                            developed_dir=developed_dir,
+                        )
+                        exported.append({
+                            "photo_id": photo_id,
+                            "path": path,
+                            "filename": os.path.basename(path),
+                        })
+                    except (InatExportError, OSError, ValueError) as exc:
+                        errors.append({
+                            "photo_id": photo_id,
+                            "error": str(exc),
+                        })
+                    finally:
+                        job["progress"]["current"] = index
+                        job["progress"]["current_file"] = photo["filename"]
+                        runner.push_event(job["id"], "progress", {
+                            "current": index,
+                            "total": total,
+                            "current_file": photo["filename"],
+                            "phase": "Exporting for iNaturalist",
+                        })
+
+                revealed = False
+                if exported and reveal and not runner.is_cancelled(job["id"]):
+                    revealed = reveal_inat_exports(
+                        [item["path"] for item in exported], destination,
+                    )
+                return {
+                    "ok": bool(exported),
+                    "exported": exported,
+                    "errors": errors,
+                    "destination": destination,
+                    "revealed": revealed,
+                }
+            finally:
+                thread_db.close()
+
+        job_id = runner.start(
+            "inat-export",
+            work,
+            config={
+                "photo_ids": [item["photo_id"] for item in submissions],
+                "destination": destination,
+            },
+            workspace_id=active_ws,
+        )
+        return jsonify({"job_id": job_id})
 
     def _inat_edit_recipe_source(photo, recipe, fallback_path):
         from image_loader import RAW_EXTENSIONS
@@ -24069,13 +24320,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             photo_id, min_detector_confidence=min_conf,
         )
 
-        taxon = data.get("taxon_name") or (pred["scientific_name"] if pred else None) or (pred["species"] if pred else None)
-        observed_on = data.get("observed_on") or (photo["timestamp"][:10] if photo["timestamp"] else None)
+        default_taxon = (
+            (pred["scientific_name"] or pred["species"]) if pred else None
+        )
+        taxon = data.get("taxon_name", default_taxon)
+        observed_on = (
+            data["observed_on"]
+            if "observed_on" in data
+            else (photo["timestamp"][:10] if photo["timestamp"] else None)
+        )
         loc = db.get_effective_photo_location(photo_id)
         photo_lat = loc["latitude"] if loc else None
         photo_lng = loc["longitude"] if loc else None
-        lat = data.get("latitude") if data.get("latitude") is not None else photo_lat
-        lng = data.get("longitude") if data.get("longitude") is not None else photo_lng
+        has_latitude = "latitude" in data
+        has_longitude = "longitude" in data
+        if has_latitude != has_longitude:
+            return json_error(
+                "latitude and longitude must be provided together", 400,
+            )
+        if has_latitude:
+            lat = data["latitude"]
+            lng = data["longitude"]
+        else:
+            lat = photo_lat
+            lng = photo_lng
 
         try:
             obs_id, obs_url = inat.submit_observation(
@@ -24128,6 +24396,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         results = []
         for sub in submissions:
             photo_id = sub.get("photo_id")
+            has_latitude = "latitude" in sub
+            has_longitude = "longitude" in sub
+            if has_latitude != has_longitude:
+                results.append({
+                    "photo_id": photo_id,
+                    "error": "latitude and longitude must be provided together",
+                })
+                continue
             photo = db.conn.execute(
                 """SELECT p.*, f.path as folder_path FROM photos p
                    JOIN folders f ON f.id = p.folder_id WHERE p.id = ?""",
@@ -24164,13 +24440,28 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 photo_id, min_detector_confidence=min_conf,
             )
 
-            taxon = sub.get("taxon_name") or (pred["scientific_name"] if pred else None) or (pred["species"] if pred else None)
-            observed_on = sub.get("observed_on") or (photo["timestamp"][:10] if photo["timestamp"] else None)
+            default_taxon = (
+                (pred["scientific_name"] or pred["species"])
+                if pred else None
+            )
+            taxon = sub.get("taxon_name", default_taxon)
+            observed_on = (
+                sub["observed_on"]
+                if "observed_on" in sub
+                else (
+                    photo["timestamp"][:10]
+                    if photo["timestamp"] else None
+                )
+            )
             loc = db.get_effective_photo_location(photo_id)
             photo_lat = loc["latitude"] if loc else None
             photo_lng = loc["longitude"] if loc else None
-            lat = sub.get("latitude") if sub.get("latitude") is not None else photo_lat
-            lng = sub.get("longitude") if sub.get("longitude") is not None else photo_lng
+            if has_latitude:
+                lat = sub["latitude"]
+                lng = sub["longitude"]
+            else:
+                lat = photo_lat
+                lng = photo_lng
 
             try:
                 obs_id, obs_url = inat.submit_observation(

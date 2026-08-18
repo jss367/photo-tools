@@ -187,6 +187,41 @@ def test_export_defaults_beside_original_and_offers_folder_browser(
     assert request["export_to_subfolder"] is True
 
 
+def test_export_checkboxes_remember_the_previous_choices(live_server, page):
+    """Export checkbox choices survive closing the dialog and reloading Browse."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+
+    remembered = {
+        "exportSubfolder": True,
+        "exportRevealAfter": True,
+        "exportMetadataSpecies": True,
+        "exportMetadataCaptureDate": False,
+        "exportMetadataCaptureTime": True,
+        "exportMetadataRating": False,
+        "exportMetadataLocation": True,
+        "exportMetadataCamera": False,
+    }
+    for control_id, checked in remembered.items():
+        page.locator(f"#{control_id}").set_checked(checked)
+
+    page.get_by_role("button", name="Cancel", exact=True).click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    for control_id, checked in remembered.items():
+        expect(page.locator(f"#{control_id}")).to_be_checked(checked=checked)
+
+    page.reload()
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    for control_id, checked in remembered.items():
+        expect(page.locator(f"#{control_id}")).to_be_checked(checked=checked)
+
+
 def test_more_menu_scrolls_within_short_viewport(live_server, page):
     """The unified action menu is tall; at Tauri's 600px minimum window
     height it must scroll within the viewport instead of rendering lower

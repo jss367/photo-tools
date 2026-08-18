@@ -98,8 +98,13 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
     page.evaluate(
         """() => {
           window.__editorExportRequest = null;
+          window.__editorPreflightRequest = null;
           const originalSafeFetch = window.safeFetch;
           window.safeFetch = async function(url, options, config) {
+            if (url === '/api/jobs/export/preflight') {
+              window.__editorPreflightRequest = JSON.parse(options.body);
+              return {rename_count: 0, renames: []};
+            }
             if (url === '/api/jobs/export') {
               window.__editorExportRequest = JSON.parse(options.body);
               return {job_id: 'editor-export-test'};
@@ -124,6 +129,7 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
     assert request["format"] == "jpg"
     assert request["max_size"] == 1600
     assert request["metadata_fields"] == ["rating"]
+    assert page.evaluate("window.__editorPreflightRequest") == request
     expect(page.locator("#exportOverlay")).not_to_have_class("modal-overlay open")
 
 

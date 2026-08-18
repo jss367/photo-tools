@@ -1352,11 +1352,13 @@ def _mock_destination_reservations(monkeypatch, key):
             self.destination = destination
             self.paths = set()
 
-        def contains(self, candidate):
-            return key(os.path.relpath(candidate, self.destination)) in self.paths
+        def contains(self, candidate, destination=None):
+            destination = destination or self.destination
+            return key(os.path.relpath(candidate, destination)) in self.paths
 
-        def add(self, candidate):
-            self.paths.add(key(os.path.relpath(candidate, self.destination)))
+        def add(self, candidate, destination=None):
+            destination = destination or self.destination
+            self.paths.add(key(os.path.relpath(candidate, destination)))
 
         def close(self):
             pass
@@ -1487,14 +1489,44 @@ def test_destination_reservations_resolve_directory_symlinks(tmp_path):
     assert set(destination.iterdir()) == {real_directory, alias_directory}
 
 
+def test_destination_identity_matches_volume_equivalent_root_spellings(tmp_path):
+    """Case/normalization aliases share identity when the volume equates them."""
+    destination = tmp_path / "VireoÉRoot"
+    destination.mkdir()
+    aliases = {
+        tmp_path / destination.name.lower(),
+        tmp_path / unicodedata.normalize("NFD", destination.name),
+    }
+    equivalent_aliases = [
+        alias for alias in aliases
+        if alias != destination
+        and alias.exists()
+        and os.path.samefile(alias, destination)
+    ]
+    if not equivalent_aliases:
+        pytest.skip("test volume preserves case and Unicode normalization")
+
+    expected = export_mod._destination_path_identity(destination)
+    assert all(
+        export_mod._destination_path_identity(alias) == expected
+        for alias in equivalent_aliases
+    )
+
+
 def test_preview_export_renames_shares_aliased_destination_roots(export_env):
     """Beside-original aliases share one set of planned export paths."""
     env = export_env
-    alias_directory = env["tmp_path"] / "src-alias"
-    try:
-        alias_directory.symlink_to(env["src"], target_is_directory=True)
-    except OSError as exc:
-        pytest.skip(f"directory symlinks are unavailable: {exc}")
+    alias_directory = env["tmp_path"] / env["src"].name.upper()
+    if not (
+        alias_directory != env["src"]
+        and alias_directory.exists()
+        and os.path.samefile(alias_directory, env["src"])
+    ):
+        alias_directory = env["tmp_path"] / "src-alias"
+        try:
+            alias_directory.symlink_to(env["src"], target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory aliases are unavailable: {exc}")
     alias_folder_id = env["db"].add_folder(
         str(alias_directory), name="Safari alias",
     )

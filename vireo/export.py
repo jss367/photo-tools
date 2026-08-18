@@ -1513,6 +1513,28 @@ def _deduplicate_path(
     return f"{stem}_{counter}{ext}"
 
 
+def _destination_path_identity(path):
+    """Return a stable identity for a destination and missing descendants."""
+    existing_path = os.path.realpath(path)
+    missing_parts = []
+    while not os.path.isdir(existing_path):
+        parent, name = os.path.split(existing_path)
+        if parent == existing_path:
+            break
+        missing_parts.append(name)
+        existing_path = parent
+    try:
+        destination_stat = os.stat(existing_path)
+    except OSError:
+        return ("path", os.path.realpath(path))
+    return (
+        "filesystem",
+        destination_stat.st_dev,
+        destination_stat.st_ino,
+        tuple(reversed(missing_parts)),
+    )
+
+
 class _DestinationPathReservations:
     """Mirror planned paths on the destination volume to detect aliases."""
 
@@ -1551,22 +1573,23 @@ class _DestinationPathReservations:
             self._temporary_directory = None
             self.root = None
 
-    def _relative_path(self, candidate):
-        relative = os.path.relpath(os.path.realpath(candidate), self.destination)
+    def _relative_path(self, candidate, destination=None):
+        destination = os.path.realpath(destination or self.destination)
+        relative = os.path.relpath(os.path.realpath(candidate), destination)
         if relative == os.pardir or relative.startswith(os.pardir + os.sep):
             return None
         return relative
 
-    def contains(self, candidate):
-        relative = self._relative_path(candidate)
+    def contains(self, candidate, destination=None):
+        relative = self._relative_path(candidate, destination)
         if relative is None:
             return False
         if self.root is None:
             return relative in self._fallback
         return os.path.exists(os.path.join(self.root, relative))
 
-    def add(self, candidate):
-        relative = self._relative_path(candidate)
+    def add(self, candidate, destination=None):
+        relative = self._relative_path(candidate, destination)
         if relative is None:
             return
         if self.root is None:
@@ -1685,18 +1708,25 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
         ):
             continue
 
-        reservation_key = os.path.realpath(photo_destination)
+        reservation_key = _destination_path_identity(photo_destination)
         if reservation_key not in destination_reservations:
             destination_reservations[reservation_key] = (
                 _DestinationPathReservations(photo_destination)
             )
         reservations = destination_reservations[reservation_key]
 
+        def is_reserved(
+            candidate,
+            current_destination=photo_destination,
+            current_reservations=reservations,
+        ):
+            return current_reservations.contains(candidate, current_destination)
+
         export_path = _deduplicate_path(
             requested_path,
-            is_reserved=reservations.contains,
+            is_reserved=is_reserved,
         )
-        reservations.add(export_path)
+        reservations.add(export_path, photo_destination)
         if export_path != requested_path:
             renames.append({
                 "photo_id": pid,

@@ -3414,35 +3414,53 @@ async function startExport() {
   button.disabled = true;
   button.textContent = 'Checking filename…';
   setExportControlsBusy(true);
+  var preflight;
   try {
-    var preflight = await safeFetch('/api/jobs/export/preflight', {
+    preflight = await safeFetch('/api/jobs/export/preflight', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(exportRequest),
+    }, {toast: false});
+  } catch (error) {
+    if (requestGeneration !== editorExportRequestGeneration) return;
+    if (typeof showToast === 'function') showToast('Export check failed: ' + error.message, 'error');
+    else setStatus('Export check failed: ' + error.message, true);
+    setExportControlsBusy(false);
+    button.disabled = false;
+    button.textContent = buttonLabel;
+    return;
+  }
+  if (requestGeneration !== editorExportRequestGeneration ||
+      !document.getElementById('exportOverlay').classList.contains('open')) return;
+  if (preflight.error) {
+    if (typeof showToast === 'function') showToast('Export check failed: ' + preflight.error, 'error');
+    else setStatus('Export check failed: ' + preflight.error, true);
+    setExportControlsBusy(false);
+    button.disabled = false;
+    button.textContent = buttonLabel;
+    return;
+  }
+  if (preflight.rename_count > 0) {
+    var renameLines = (preflight.renames || []).slice(0, 5).map(function(rename) {
+      return rename.requested_name + ' → ' + rename.export_name;
     });
-    if (requestGeneration !== editorExportRequestGeneration ||
-        !document.getElementById('exportOverlay').classList.contains('open')) return;
-    if (preflight.error) throw new Error('Export check failed: ' + preflight.error);
-    if (preflight.rename_count > 0) {
-      var renameLines = (preflight.renames || []).slice(0, 5).map(function(rename) {
-        return rename.requested_name + ' → ' + rename.export_name;
-      });
-      if (preflight.rename_count > renameLines.length) {
-        renameLines.push('…and ' + (preflight.rename_count - renameLines.length) + ' more');
-      }
-      var renameMessage = preflight.rename_count + ' export filename' +
-        (preflight.rename_count === 1 ? ' is' : 's are') +
-        ' already in use. Existing files will be kept, and Vireo will save the new export' +
-        (preflight.rename_count === 1 ? '' : 's') + ' with numbered names:\n\n' +
-        renameLines.join('\n') + '\n\nContinue with export?';
-      if (!window.confirm(renameMessage)) {
-        setExportControlsBusy(false);
-        button.disabled = false;
-        button.textContent = buttonLabel;
-        return;
-      }
+    if (preflight.rename_count > renameLines.length) {
+      renameLines.push('…and ' + (preflight.rename_count - renameLines.length) + ' more');
     }
+    var renameMessage = preflight.rename_count + ' export filename' +
+      (preflight.rename_count === 1 ? ' is' : 's are') +
+      ' already in use. Existing files will be kept, and Vireo will save the new export' +
+      (preflight.rename_count === 1 ? '' : 's') + ' with numbered names:\n\n' +
+      renameLines.join('\n') + '\n\nContinue with export?';
+    if (!window.confirm(renameMessage)) {
+      setExportControlsBusy(false);
+      button.disabled = false;
+      button.textContent = buttonLabel;
+      return;
+    }
+  }
 
+  try {
     button.textContent = 'Starting export…';
     setExportDismissible(false);
     var data = await safeFetch('/api/jobs/export', {

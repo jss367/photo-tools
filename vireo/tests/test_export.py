@@ -1634,6 +1634,53 @@ def test_destination_identity_matches_volume_equivalent_root_spellings(tmp_path)
     )
 
 
+def test_preview_export_renames_verifies_colliding_directory_identities(
+    tmp_path, monkeypatch,
+):
+    """Non-unique directory inodes must not merge unrelated export folders."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    Image.new("RGB", (20, 20), color="red").save(first / "bird.jpg", "JPEG")
+    Image.new("RGB", (20, 20), color="blue").save(second / "bird.jpg", "JPEG")
+    db = Database(str(tmp_path / "identity.db"))
+    workspace_id = db.ensure_default_workspace()
+    db.set_active_workspace(workspace_id)
+    first_folder = db.add_folder(str(first), name="First")
+    second_folder = db.add_folder(str(second), name="Second")
+    first_photo = db.add_photo(
+        folder_id=first_folder,
+        filename="bird.jpg",
+        extension=".jpg",
+        file_size=1,
+        file_mtime=1,
+        timestamp="2024-01-01T00:00:00",
+    )
+    second_photo = db.add_photo(
+        folder_id=second_folder,
+        filename="bird.jpg",
+        extension=".jpg",
+        file_size=1,
+        file_mtime=1,
+        timestamp="2024-01-01T00:00:00",
+    )
+    monkeypatch.setattr(
+        export_mod,
+        "_destination_path_identity",
+        lambda _path: ("filesystem", 1, 0),
+    )
+
+    renames = preview_export_renames(
+        db=db,
+        photo_ids=[first_photo, second_photo],
+        destination=None,
+        options={"naming_template": "photo", "format": "jpg"},
+    )
+
+    assert renames == []
+
+
 def test_preview_export_renames_shares_aliased_destination_roots(export_env):
     """Beside-original aliases share one set of planned export paths."""
     env = export_env

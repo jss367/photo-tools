@@ -153,6 +153,38 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
     expect(page.locator("#exportOverlay")).not_to_have_class("modal-overlay open")
 
 
+def test_photo_editor_export_reports_preflight_failure_before_job_start(
+    live_server, page,
+):
+    url = live_server["url"]
+    photo_id = live_server["data"]["photos"][0]
+    page.goto(f"{url}/edit/{photo_id}")
+    page.locator("#exportBtn").click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    page.evaluate(
+        """() => {
+          window.__editorExportJobCalls = 0;
+          window.safeFetch = async function(url) {
+            if (url === '/api/jobs/export/preflight') {
+              throw new Error('probe denied');
+            }
+            if (url === '/api/jobs/export') window.__editorExportJobCalls++;
+            return {};
+          };
+        }"""
+    )
+
+    page.locator("#exportSubmitBtn").click()
+
+    expect(page.locator("#toastContainer")).to_contain_text(
+        "Export check failed: probe denied"
+    )
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    expect(page.get_by_role("button", name="Cancel", exact=True)).to_be_enabled()
+    expect(page.locator("#exportSubmitBtn")).to_be_enabled()
+    assert page.evaluate("window.__editorExportJobCalls") == 0
+
+
 def test_reset_adjustments_preserves_advanced_color(live_server, page):
     url = live_server["url"]
     photo_id = live_server["data"]["photos"][0]

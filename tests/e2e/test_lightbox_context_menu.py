@@ -93,7 +93,15 @@ def test_lightbox_export_resolves_photo_when_action_is_invoked(live_server, page
             selectedPhotoId = _lightboxCurrentId;
             window.__exportRequest = null;
             window.__resolveExport = null;
+            window.__rejectPreflight = true;
             window.safeFetch = async function(url, options) {
+                if (url === '/api/jobs/export/preflight') {
+                    if (window.__rejectPreflight) {
+                        window.__rejectPreflight = false;
+                        throw new Error('probe denied');
+                    }
+                    return {rename_count: 0, renames: []};
+                }
                 if (url === '/api/jobs/export') {
                     window.__exportRequest = JSON.parse(options.body);
                     return new Promise(function(resolve) {
@@ -132,6 +140,20 @@ def test_lightbox_export_resolves_photo_when_action_is_invoked(live_server, page
     )
     assert export_photo["id"] != current_id
     assert page.evaluate("_exportPhotoIds") == [export_photo["id"]]
+
+    dialog_messages = []
+
+    def accept_preflight_error(dialog):
+        dialog_messages.append(dialog.message)
+        dialog.accept()
+
+    page.once("dialog", accept_preflight_error)
+    page.locator("#exportSubmitBtn").click()
+    assert dialog_messages == ["Export check failed: probe denied"]
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    expect(page.get_by_role("button", name="Cancel", exact=True)).to_be_enabled()
+    expect(page.locator("#exportSubmitBtn")).to_be_enabled()
+    assert page.evaluate("window.__exportRequest") is None
 
     page.locator("#exportSubmitBtn").click()
     page.wait_for_function("window.__exportRequest !== null")

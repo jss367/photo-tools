@@ -1575,28 +1575,6 @@ def _deduplicate_path(
     return f"{stem}_{counter}{ext}"
 
 
-def _destination_path_identity(path):
-    """Return a stable identity for a destination and missing descendants."""
-    existing_path = os.path.realpath(path)
-    missing_parts = []
-    while not os.path.isdir(existing_path):
-        parent, name = os.path.split(existing_path)
-        if parent == existing_path:
-            break
-        missing_parts.append(name)
-        existing_path = parent
-    try:
-        destination_stat = os.stat(existing_path)
-    except OSError:
-        return ("path", os.path.realpath(path))
-    return (
-        "filesystem",
-        destination_stat.st_dev,
-        destination_stat.st_ino,
-        tuple(reversed(missing_parts)),
-    )
-
-
 def _nearest_existing_directory(path):
     """Return the directory whose filesystem will contain a planned path."""
     existing_path = os.path.realpath(path)
@@ -1606,6 +1584,20 @@ def _nearest_existing_directory(path):
             break
         existing_path = parent
     return existing_path
+
+
+def _destination_path_identity(path):
+    """Return a stable identity for an existing destination directory."""
+    existing_path = _nearest_existing_directory(path)
+    try:
+        destination_stat = os.stat(existing_path)
+    except OSError:
+        return ("path", os.path.normcase(os.path.realpath(existing_path)))
+    return (
+        "filesystem",
+        destination_stat.st_dev,
+        destination_stat.st_ino,
+    )
 
 
 class _DestinationPathReservations:
@@ -1639,6 +1631,11 @@ class _DestinationPathReservations:
     def close(self):
         self._temporary_directory.cleanup()
         self.root = None
+
+    def matches_destination(self, destination):
+        """Check whether destination can see this reservation's probe marker."""
+        marker_name = os.path.basename(self.root)
+        return os.path.isdir(os.path.join(os.path.realpath(destination), marker_name))
 
     def _relative_path(self, candidate, destination=None):
         destination = os.path.realpath(destination or self.destination)
@@ -1774,11 +1771,23 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
             os.path.dirname(requested_path)
         )
         reservation_key = _destination_path_identity(reservation_destination)
-        if reservation_key not in destination_reservations:
-            destination_reservations[reservation_key] = (
-                _DestinationPathReservations(reservation_destination)
+        reservation_group = destination_reservations.setdefault(
+            reservation_key, []
+        )
+        reservations = next((
+            candidate for candidate in reservation_group
+            if (
+                candidate.matches_destination(reservation_destination)
+                if hasattr(candidate, "matches_destination")
+                else os.path.realpath(candidate.destination)
+                == os.path.realpath(reservation_destination)
             )
-        reservations = destination_reservations[reservation_key]
+        ), None)
+        if reservations is None:
+            reservations = _DestinationPathReservations(
+                reservation_destination
+            )
+            reservation_group.append(reservations)
 
         def is_reserved(
             candidate,
@@ -1800,6 +1809,7 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
                 "destination": os.path.dirname(export_path),
             })
 
-    for reservations in destination_reservations.values():
-        reservations.close()
+    for reservation_group in destination_reservations.values():
+        for reservations in reservation_group:
+            reservations.close()
     return renames

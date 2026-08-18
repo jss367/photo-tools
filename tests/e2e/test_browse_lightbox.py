@@ -1257,6 +1257,67 @@ def test_browse_photo_id_deep_link_loads_target_after_first_folder_page(live_ser
         0, page.evaluate("totalPhotos") - offset - len(initial_ids)
     )
 
+    # Reaching the upper boundary extends the focused window backward without
+    # moving the cards the user was looking at, even when they keep scrolling
+    # while a slow preceding-page request is in flight.
+    page.evaluate(
+        """() => new Promise(resolve => {
+          const container = document.getElementById('gridContainer');
+          container.scrollTo({top: 600, behavior: 'instant'});
+          requestAnimationFrame(() => requestAnimationFrame(resolve));
+        })"""
+    )
+    page.evaluate(
+        """expectedPage => {
+          const originalSafeFetch = window.safeFetch;
+          let release;
+          window.__releasePreviousPage = () => release && release();
+          window.safeFetch = async function(url, options, behavior) {
+            const body = options && options.body ? JSON.parse(options.body) : null;
+            if (url === '/api/photos/query' && body && body.page === expectedPage) {
+              const response = originalSafeFetch.call(this, url, options, behavior);
+              await new Promise(resolve => { release = resolve; });
+              return response;
+            }
+            return originalSafeFetch.call(this, url, options, behavior);
+          };
+        }""",
+        initial_page - 1,
+    )
+    old_first_id = initial_ids[0]
+    page.evaluate(
+        """() => {
+          const container = document.getElementById('gridContainer');
+          container.scrollTop = 500;
+          container.dispatchEvent(new Event('scroll'));
+        }"""
+    )
+    page.wait_for_function("loading === true && !!window.__releasePreviousPage")
+    page.evaluate(
+        """() => {
+          const container = document.getElementById('gridContainer');
+          container.scrollTop = 250;
+          container.dispatchEvent(new Event('scroll'));
+        }"""
+    )
+    response_time_top = page.locator(f'.grid-card[data-id="{old_first_id}"]').evaluate(
+        "el => el.getBoundingClientRect().top"
+    )
+    page.evaluate("window.__releasePreviousPage()")
+    page.wait_for_function(
+        "expected => earliestPage === expected && loading === false",
+        arg=initial_page - 1,
+        timeout=5000,
+    )
+    prepended_ids = page.evaluate("photos.map(function(p) { return p.id; })")
+    assert prepended_ids[-len(initial_ids) :] == initial_ids
+    assert len(prepended_ids) == len(set(prepended_ids))
+    assert target_queries[-1]["page"] == initial_page - 1
+    new_first_top = page.locator(f'.grid-card[data-id="{old_first_id}"]').evaluate(
+        "el => el.getBoundingClientRect().top"
+    )
+    assert abs(new_first_top - response_time_top) < 2
+
     page.locator("#loadPreviousPhotosButton").click()
     page.wait_for_function("earliestPage === 1 && browseDatasetReady", timeout=5000)
     restarted_ids = page.evaluate("photos.map(function(p) { return p.id; })")

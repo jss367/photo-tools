@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 
 from image_edits import apply_recipe_to_loaded_image
 from image_loader import RAW_DECODE_PRESERVE_HIGHLIGHTS, RAW_EXTENSIONS, load_image
@@ -1505,8 +1506,8 @@ def _deduplicate_path(path, reserved_paths=None, path_key=None):
     return f"{stem}_{counter}{ext}"
 
 
-def _destination_case_insensitive(path):
-    """Return whether the existing volume containing ``path`` folds case."""
+def _destination_filename_behavior(path):
+    """Return the destination volume's case and Unicode equivalence rules."""
     probe_path = os.path.realpath(path)
     while not os.path.isdir(probe_path):
         parent = os.path.dirname(probe_path)
@@ -1515,30 +1516,41 @@ def _destination_case_insensitive(path):
         probe_path = parent
     try:
         descriptor, probe_file = tempfile.mkstemp(
-            prefix=".VireoCaseProbe-", dir=probe_path,
+            prefix=".VireoÉCaseProbe-", dir=probe_path,
         )
     except OSError:
-        # Export will report a permission/storage error separately. If the
-        # volume cannot be probed, retain the host's path-comparison behavior.
-        return os.path.normcase("Vireo") == os.path.normcase("vireo")
+        # Export will report a permission/storage error separately. Avoid
+        # inventing filename equivalences when the selected volume cannot be
+        # probed directly.
+        return False, False
     os.close(descriptor)
     try:
         probe_dir, probe_name = os.path.split(probe_file)
         case_variant = os.path.join(probe_dir, probe_name.swapcase())
-        if case_variant == probe_file or not os.path.exists(case_variant):
-            return False
-        try:
-            return os.path.samefile(probe_file, case_variant)
-        except OSError:
-            return False
+        normalized_name = unicodedata.normalize("NFD", probe_name)
+        if normalized_name == probe_name:
+            normalized_name = unicodedata.normalize("NFC", probe_name)
+        normalization_variant = os.path.join(probe_dir, normalized_name)
+
+        def aliases_probe(candidate):
+            if candidate == probe_file or not os.path.exists(candidate):
+                return False
+            try:
+                return os.path.samefile(probe_file, candidate)
+            except OSError:
+                return False
+
+        return aliases_probe(case_variant), aliases_probe(normalization_variant)
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(probe_file)
 
 
-def _export_path_key(path, case_insensitive):
+def _export_path_key(path, case_insensitive, normalization_insensitive=False):
     """Return a reservation identity matching the destination filesystem."""
     resolved = os.path.realpath(path)
+    if normalization_insensitive:
+        resolved = unicodedata.normalize("NFC", resolved)
     return resolved.casefold() if case_insensitive else resolved
 
 
@@ -1574,7 +1586,7 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
     developed_index = _DevelopedDirIndex()
     seq_counters = {}
     reserved_path_keys = set()
-    destination_case_map = {}
+    destination_behavior_map = {}
     renames = []
 
     for pid in photo_ids:
@@ -1645,14 +1657,22 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
         ):
             continue
 
-        if photo_destination not in destination_case_map:
-            destination_case_map[photo_destination] = (
-                _destination_case_insensitive(photo_destination)
+        if photo_destination not in destination_behavior_map:
+            destination_behavior_map[photo_destination] = (
+                _destination_filename_behavior(photo_destination)
             )
-        case_insensitive = destination_case_map[photo_destination]
+        case_insensitive, normalization_insensitive = (
+            destination_behavior_map[photo_destination]
+        )
 
-        def path_key(candidate, folds_case=case_insensitive):
-            return _export_path_key(candidate, folds_case)
+        def path_key(
+            candidate,
+            folds_case=case_insensitive,
+            folds_normalization=normalization_insensitive,
+        ):
+            return _export_path_key(
+                candidate, folds_case, folds_normalization,
+            )
 
         export_path = _deduplicate_path(
             requested_path,

@@ -5,6 +5,7 @@ import errno
 import json
 import os
 import sys
+import unicodedata
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -1358,7 +1359,7 @@ def test_preview_export_renames_respects_case_insensitive_destination(
     )
     env["db"].conn.commit()
     monkeypatch.setattr(
-        export_mod, "_destination_case_insensitive", lambda _path: True,
+        export_mod, "_destination_filename_behavior", lambda _path: (True, False),
     )
     monkeypatch.setattr(
         export_mod,
@@ -1395,7 +1396,7 @@ def test_preview_export_renames_keeps_case_twins_on_empty_linux_target(
     )
     env["db"].conn.commit()
     monkeypatch.setattr(
-        export_mod, "_destination_case_insensitive", lambda _path: False,
+        export_mod, "_destination_filename_behavior", lambda _path: (False, False),
     )
     monkeypatch.setattr(
         export_mod,
@@ -1413,21 +1414,64 @@ def test_preview_export_renames_keeps_case_twins_on_empty_linux_target(
     assert renames == []
 
 
-def test_destination_case_probe_matches_empty_volume(tmp_path):
-    """Case behavior comes from the selected volume, not the host platform."""
+def test_destination_filename_probe_matches_empty_volume(tmp_path):
+    """Filename behavior comes from the selected volume, not the platform."""
     destination = tmp_path / "empty-destination"
     destination.mkdir()
 
-    detected = export_mod._destination_case_insensitive(str(destination))
+    detected_case, detected_normalization = (
+        export_mod._destination_filename_behavior(str(destination))
+    )
 
-    probe = destination / "VireoCaseCheck"
+    probe = destination / "VireoÉCaseCheck"
     probe.write_text("probe")
     try:
-        observed = (destination / "vIREOcASEcHECK").exists()
+        observed_case = (destination / "vIREOécASEcHECK").exists()
+        observed_normalization = (
+            destination / unicodedata.normalize("NFD", probe.name)
+        ).exists()
     finally:
         probe.unlink()
-    assert detected is observed
+    assert detected_case is observed_case
+    assert detected_normalization is observed_normalization
     assert list(destination.iterdir()) == []
+
+
+def test_preview_export_renames_respects_unicode_equivalent_destination(
+    export_env, monkeypatch,
+):
+    """NFC/NFD batch twins collide when the target treats them as aliases."""
+    env = export_env
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = ? WHERE id = ?",
+        ("é.jpg", env["p1"]),
+    )
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = ? WHERE id = ?",
+        ("e\u0301.jpg", env["p2"]),
+    )
+    env["db"].conn.commit()
+    monkeypatch.setattr(
+        export_mod,
+        "_destination_filename_behavior",
+        lambda _path: (False, True),
+    )
+    monkeypatch.setattr(
+        export_mod,
+        "_select_export_source",
+        lambda **_kwargs: str(env["src"] / "bird1.jpg"),
+    )
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "format": "jpg"},
+    )
+
+    assert [(item["requested_name"], item["export_name"]) for item in renames] == [
+        ("e\u0301.jpg", "e\u0301_2.jpg"),
+    ]
 
 
 def test_preview_export_renames_skips_missing_source_before_sequence(

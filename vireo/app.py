@@ -6270,6 +6270,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         prune_missing_photos(cache_dir, db._active_workspace_id, db)
         results = load_results(cache_dir, db._active_workspace_id)
         if results and results.get("photos"):
+            # Cached pipeline rows predate edit recipes, which live in their
+            # own table. Enrich them before Process Review positions overlays
+            # against rendered previews so geometric edits can disable stale
+            # source-coordinate markers.
+            _attach_nested_edit_recipes(db, results)
             photo_ids = [p["id"] for p in results["photos"]]
             # Chunked: cached pipeline results can span the whole workspace,
             # exceeding SQLite's bound-parameter cap in one IN clause.

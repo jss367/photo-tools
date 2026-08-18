@@ -280,7 +280,8 @@ def test_reject_prediction_missing_id_returns_404(app_and_db):
 def test_get_prediction_group(app_and_db):
     """GET /api/predictions/group/1 returns both group members."""
     app, db = app_and_db
-    _seed_predictions(db)
+    photos = _seed_predictions(db)
+    db.set_photo_edit_recipe(photos[0]["id"], {"rotation": 90})
     client = app.test_client()
 
     resp = client.get('/api/predictions/group/g1')
@@ -297,6 +298,12 @@ def test_get_prediction_group(app_and_db):
     for member in data:
         assert 'filename' in member
         assert 'photo_id' in member
+    by_photo = {member["photo_id"]: member for member in data}
+    assert by_photo[photos[0]["id"]]["edit_recipe"] == {
+        "version": 1,
+        "rotation": 90,
+    }
+    assert by_photo[photos[1]["id"]]["edit_recipe"] is None
 
 
 def test_prediction_group_apply(app_and_db):

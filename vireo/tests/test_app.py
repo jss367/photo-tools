@@ -3865,6 +3865,32 @@ def test_pipeline_page_init_api(app_and_db):
     assert data['total_photos'] == 3
 
 
+def test_pipeline_page_init_attaches_photo_edit_recipes(app_and_db, monkeypatch):
+    """Cached review photos include live recipes from the separate edit table."""
+    import pipeline
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    db.set_photo_edit_recipe(photo["id"], {"rotation": 90})
+    cached = {
+        "photos": [{"id": photo["id"], "filename": photo["filename"]}],
+        "encounters": [],
+        "summary": {},
+    }
+    monkeypatch.setattr(pipeline, "load_results", lambda *_args, **_kwargs: cached)
+    monkeypatch.setattr(
+        pipeline, "prune_missing_photos", lambda *_args, **_kwargs: None,
+    )
+
+    response = app.test_client().get("/api/pipeline/page-init")
+
+    assert response.status_code == 200
+    assert response.get_json()["results"]["photos"][0]["edit_recipe"] == {
+        "version": 1,
+        "rotation": 90,
+    }
+
+
 def test_pipeline_page_init_omits_recent_destinations(app_and_db):
     """recent_destinations left page-init with the Destination card: the
     process page no longer copies files anywhere, so leaking the import

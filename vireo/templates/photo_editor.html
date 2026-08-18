@@ -1079,6 +1079,11 @@ function editorZoomText() {
     : Math.round(editorState.zoomPercent) + '%';
 }
 
+function editorIsActualZoom() {
+  return editorState.zoomMode !== 'fit' &&
+    Math.abs(editorState.zoomPercent - 100) < 0.5;
+}
+
 function editorClampCustomZoomToFit() {
   if (editorState.zoomMode === 'fit') return false;
   var fit = editorFitZoomPercent();
@@ -1125,8 +1130,7 @@ function updateEditorZoomControl() {
   if (actualStop) {
     actualStop.style.display = combinedFitActual ? 'none' : '';
     actualStop.style.left = Math.max(9, editorZoomSliderPosition(100) / 10) + '%';
-    actualStop.classList.toggle('active', editorState.zoomMode !== 'fit' &&
-      Math.abs(editorState.zoomPercent - 100) < 0.5);
+    actualStop.classList.toggle('active', editorIsActualZoom());
     actualStop.disabled = disabled;
   }
   if (zoomOut) {
@@ -1159,6 +1163,10 @@ function applyEditorZoom() {
     focusY = Math.max(0, Math.min(1, focusY));
   }
   wrap.classList.toggle('zoom-custom', custom);
+  // Keep the semantic 1:1 state separate from the broader custom-zoom
+  // layout. Panning and existing integrations use this marker to distinguish
+  // the exact 100% stop from intermediate slider values.
+  wrap.classList.toggle('zoom-actual', editorIsActualZoom());
   if (!custom) {
     var fitDims = editorNativeDisplayDimensions();
     var fitPercent = editorFitZoomPercent();
@@ -3014,7 +3022,7 @@ function initCropDrag() {
   };
 
   wrap.addEventListener('pointerdown', function(e) {
-    if (editorState.zoomMode === 'actual' || editorState.spacePan) startPan(e);
+    if (editorIsActualZoom() || editorState.spacePan) startPan(e);
   });
   wrap.addEventListener('pointermove', movePan);
   wrap.addEventListener('pointerup', finishPan);
@@ -3036,7 +3044,7 @@ function initCropDrag() {
     var handle = e.target && e.target.dataset ? e.target.dataset.handle : '';
     // At 100%, dragging the photo pans it. Corner handles keep resizing the
     // crop, unless Space is held as an explicit pan override.
-    if (editorState.spacePan || (editorState.zoomMode === 'actual' && !handle)) return;
+    if (editorState.spacePan || (editorIsActualZoom() && !handle)) return;
     editorState.drag = {
       handle: handle || 'move',
       startX: e.clientX,

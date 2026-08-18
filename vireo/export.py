@@ -104,14 +104,16 @@ def resolve_template(template, photo, species=None, seq=1):
     return result
 
 
-def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_cb=None):
-    """Export photos to a destination directory with optional resize and renaming.
+def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
+                  progress_cb=None):
+    """Export photos with optional resize and renaming.
 
     Args:
         db: Database instance
         vireo_dir: path to ~/.vireo/
         photo_ids: list of photo IDs to export
-        destination: absolute path to output directory
+        destination: absolute path to a shared output directory. When empty,
+            each photo is exported beside its original.
         options: dict with keys:
             naming_template: str (default "{original}")
             max_size: int or None -- max long-edge pixels
@@ -134,6 +136,9 @@ def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_
                 <developed_dir>/<stem>.<ext> is also probed so libraries
                 developed before the per-folder nesting convention was
                 introduced still pick up their developed outputs.
+            export_to_subfolder: bool -- create an ``exported`` directory
+                beneath the shared destination or each original photo's
+                folder.
         progress_cb: optional callback(current, total, current_file)
 
     Returns:
@@ -155,8 +160,10 @@ def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_
     except (ValueError, TypeError):
         wc_max = 4096
     developed_dir = options.get("developed_dir") or ""
+    subfolder = "exported" if options.get("export_to_subfolder") else ""
 
-    os.makedirs(destination, exist_ok=True)
+    if destination:
+        os.makedirs(destination, exist_ok=True)
 
     photos_map = db.get_photos_by_ids(photo_ids)
     folders = {f["id"]: f["path"] for f in db.get_folder_tree()}
@@ -258,10 +265,34 @@ def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_
             "folder_name": os.path.basename(folder_path),
         }
 
+        # Resolve this photo's destination. An empty shared destination means
+        # "beside the original", so selections spanning folders stay beside
+        # their respective originals instead of being collapsed together.
+        destination_base = destination or folder_path
+        if not destination_base:
+            errors.append(f"{photo['filename']}: original folder unavailable")
+            if progress_cb:
+                progress_cb(i + 1, len(photo_ids), photo["filename"])
+            continue
+        if not destination and not os.path.isdir(destination_base):
+            # Do not recreate an offline volume's catalog path on the local
+            # filesystem merely because a working copy can still be read.
+            errors.append(f"{photo['filename']}: original folder unavailable")
+            if progress_cb:
+                progress_cb(i + 1, len(photo_ids), photo["filename"])
+            continue
+        photo_destination = (
+            os.path.join(destination_base, subfolder)
+            if subfolder else destination_base
+        )
+
         # Determine subdirectory for sequence counter
         # Render template once to extract the directory part
-        subdir_key = os.path.dirname(
-            resolve_template(template, photo_info, species=species, seq=0)
+        subdir_key = (
+            photo_destination,
+            os.path.dirname(
+                resolve_template(template, photo_info, species=species, seq=0)
+            ),
         )
         seq_counters.setdefault(subdir_key, 0)
         seq_counters[subdir_key] += 1
@@ -272,11 +303,13 @@ def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_
         # Guard against path traversal: strip leading slashes/dots so that
         # absolute paths and ".." segments cannot escape the destination dir.
         rel_path_safe = os.path.normpath(rel_path).lstrip(os.sep + ".")
-        out_path = os.path.join(destination, rel_path_safe + f".{output_ext}")
+        out_path = os.path.join(
+            photo_destination, rel_path_safe + f".{output_ext}"
+        )
         # Final containment check: resolved path must start with destination.
         # dest_real may already end with os.sep when destination is a root dir
         # (e.g. "/" on POSIX), so avoid doubling the separator.
-        dest_real = os.path.realpath(destination)
+        dest_real = os.path.realpath(photo_destination)
         out_real = os.path.realpath(out_path)
         dest_prefix = dest_real if dest_real.endswith(os.sep) else dest_real + os.sep
         if not out_real.startswith(dest_prefix) and out_real != dest_real:
@@ -395,6 +428,7 @@ def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_
         "files": exported_files,
         "errors": errors,
         "destination": destination,
+        "subfolder": subfolder,
     }
 
 

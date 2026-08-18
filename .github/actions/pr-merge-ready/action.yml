@@ -29,8 +29,8 @@ inputs:
   codex-reaction-id:
     description: Issue-reaction ID when authorization came from Codex review.
     required: false
-  codex-review-comment-id:
-    description: Codex summary-comment ID paired with the approving reaction.
+  codex-tests-run-id:
+    description: Tests run ID anchoring a Codex reaction after the approved head.
     required: false
 
 outputs:
@@ -58,7 +58,7 @@ runs:
         APPROVAL_ID: ${{ inputs.approval-id }}
         MERGE_COMMENT_ID: ${{ inputs.merge-comment-id }}
         CODEX_REACTION_ID: ${{ inputs.codex-reaction-id }}
-        CODEX_REVIEW_COMMENT_ID: ${{ inputs.codex-review-comment-id }}
+        CODEX_TESTS_RUN_ID: ${{ inputs.codex-tests-run-id }}
       run: |
         set -euo pipefail
 
@@ -96,8 +96,8 @@ runs:
         authorization_count=0
         [[ -n "$APPROVAL_ID" ]] && authorization_count=$((authorization_count + 1))
         [[ -n "$MERGE_COMMENT_ID" ]] && authorization_count=$((authorization_count + 1))
-        if [[ -n "$CODEX_REACTION_ID" || -n "$CODEX_REVIEW_COMMENT_ID" ]]; then
-          if [[ -z "$CODEX_REACTION_ID" || -z "$CODEX_REVIEW_COMMENT_ID" ]]; then
+        if [[ -n "$CODEX_REACTION_ID" || -n "$CODEX_TESTS_RUN_ID" ]]; then
+          if [[ -z "$CODEX_REACTION_ID" || -z "$CODEX_TESTS_RUN_ID" ]]; then
             echo "PR #${PR} has an incomplete Codex merge authorization."
             exit 0
           fi
@@ -160,27 +160,21 @@ runs:
             exit 0
           fi
 
-          if ! codex_comment=$(gh api "repos/${REPO}/issues/comments/${CODEX_REVIEW_COMMENT_ID}"); then
-            echo "Codex review summary ${CODEX_REVIEW_COMMENT_ID} no longer exists."
+          if ! codex_tests_run=$(gh run view "$CODEX_TESTS_RUN_ID" --repo "$REPO" \
+            --json headSha,event,workflowName,createdAt); then
+            echo "Tests run ${CODEX_TESTS_RUN_ID} no longer exists."
             exit 0
           fi
-          codex_actor=$(jq -r '.user.login' <<< "$codex_comment")
-          codex_body=$(jq -r '.body' <<< "$codex_comment")
-          codex_created_at=$(jq -r '.created_at' <<< "$codex_comment")
-          codex_updated_at=$(jq -r '.updated_at' <<< "$codex_comment")
-          codex_reviewed_head=$(jq -r '
-            try (.body
-              | capture("\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-fA-F]{7,40})`")
-              | .sha
-              | ascii_downcase)
-            catch ""' <<< "$codex_comment")
-          if [[ "$codex_actor" != "chatgpt-codex-connector[bot]" \
-            || "$codex_body" != "Codex Review: Didn't find any major issues."* \
-            || -z "$codex_reviewed_head" \
-            || "$head_sha" != "$codex_reviewed_head"* \
-            || "$codex_created_at" != "$AUTHORIZED_AT" \
-            || "$codex_updated_at" != "$AUTHORIZED_AT" ]]; then
-            echo "Codex summary ${CODEX_REVIEW_COMMENT_ID} no longer approves PR #${PR} head ${head_sha}."
+          codex_tests_head=$(jq -r '.headSha' <<< "$codex_tests_run")
+          codex_tests_event=$(jq -r '.event' <<< "$codex_tests_run")
+          codex_tests_workflow=$(jq -r '.workflowName' <<< "$codex_tests_run")
+          codex_tests_started_at=$(jq -r '.createdAt' <<< "$codex_tests_run")
+          if [[ "$codex_tests_head" != "$head_sha" \
+            || "$codex_tests_event" != "pull_request" \
+            || "$codex_tests_workflow" != "Tests" \
+            || "$reaction_time" < "$codex_tests_started_at" \
+            || "$reaction_time" == "$codex_tests_started_at" ]]; then
+            echo "Reaction ${CODEX_REACTION_ID} is not bound to Tests run ${CODEX_TESTS_RUN_ID} for PR #${PR} head ${head_sha}."
             exit 0
           fi
         fi
@@ -203,15 +197,28 @@ runs:
         newer_comment_feedback=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
           --slurp | jq \
             --arg authorized_at "$AUTHORIZED_AT" \
-            --argjson codex_review_comment_id "${CODEX_REVIEW_COMMENT_ID:-0}" '
+            --arg codex_actor "chatgpt-codex-connector[bot]" \
+            --arg head "$head_sha" '
             (add // [])
             | [ .[]
-                | select(.id != $codex_review_comment_id)
                 | select(.updated_at >= $authorized_at)
+                | select(
+                    (.user.login == $codex_actor
+                      and .created_at == .updated_at
+                      and (.body | startswith("Codex Review: Didn\u0027t find any major issues."))
+                      and ((try (.body
+                        | capture("\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-fA-F]{7,40})`")
+                        | .sha
+                        | ascii_downcase)
+                      catch "") as $reviewed_head
+                        | $reviewed_head != ""
+                        and ($head | startswith($reviewed_head))))
+                    | not
+                  )
                 | select(
                     .author_association == "OWNER"
                     or .author_association == "COLLABORATOR"
-                    or .user.login == "chatgpt-codex-connector[bot]"
+                    or .user.login == $codex_actor
                   )
                 | select(.body != "+1" and .body != "👍")
                 | select(.body | endswith("<!-- pr-agent-generated -->") | not)

@@ -281,3 +281,25 @@ def test_working_copy_satisfies_recipe_render_scales_wc_before_compare(tmp_path)
         full, recipe=None, max_size=1024, vireo_dir=str(tmp_path),
         rel_slack=0.01,
     ) is True
+
+
+def test_path_satisfies_recipe_render_checks_both_cropped_axes(tmp_path):
+    photo = {
+        "width": 6000,
+        "height": 4000,
+        "exif_data": None,
+    }
+    recipe = {"crop": {"x": 0, "y": 0, "w": 0.5, "h": 1}}
+    truncated = tmp_path / "truncated.jpg"
+    sufficient = tmp_path / "sufficient.jpg"
+    _img(1000, 1000).save(truncated, "JPEG")
+    _img(1500, 1000).save(sufficient, "JPEG")
+
+    # Both candidates have a 1000px cropped long edge, but the square source
+    # yields only 500px on the short edge instead of the required 750px.
+    assert rs.path_satisfies_recipe_render(
+        str(truncated), photo, recipe, max_size=1000,
+    ) is False
+    assert rs.path_satisfies_recipe_render(
+        str(sufficient), photo, recipe, max_size=1000,
+    ) is True

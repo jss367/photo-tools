@@ -338,7 +338,7 @@ def working_copy_path_if_satisfies(
 
 
 def path_satisfies_recipe_render(path, photo, recipe, max_size):
-    """Return True when the file at ``path`` is large enough for this render."""
+    """Return True when ``path`` covers both axes required by this render."""
     original_w, original_h = recipe_source_dimensions(photo)
     if original_w <= 0 or original_h <= 0:
         return False
@@ -348,11 +348,25 @@ def path_satisfies_recipe_render(path, photo, recipe, max_size):
             width, height = image_size_after_exif_orientation(img)
     except Exception:
         return False
-    original_render_long = rendered_recipe_long_edge(original_w, original_h, recipe)
-    required_long = (
-        min(max_size, original_render_long) if max_size else original_render_long
+    required_w, required_h = rendered_recipe_dimensions(
+        original_w, original_h, recipe,
     )
-    return rendered_recipe_long_edge(width, height, recipe) >= required_long
+    required_long = max(required_w, required_h)
+    if max_size and required_long > max_size:
+        required_scale = max_size / required_long
+        required_w *= required_scale
+        required_h *= required_scale
+
+    rendered_w, rendered_h = rendered_recipe_dimensions(width, height, recipe)
+    rendered_long = max(rendered_w, rendered_h)
+    if max_size and rendered_long > max_size:
+        rendered_scale = max_size / rendered_long
+        rendered_w *= rendered_scale
+        rendered_h *= rendered_scale
+
+    return not is_undersized(
+        rendered_w, rendered_h, required_w, required_h, abs_slack=0,
+    )
 
 
 def recipe_render_source(photo, recipe, max_size, vireo_dir, folders):

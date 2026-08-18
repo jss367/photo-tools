@@ -137,6 +137,56 @@ def test_single_click_reveals_batch_bar(live_server, page):
     page.keyboard.press("Escape")
 
 
+def test_export_defaults_beside_original_and_offers_folder_browser(
+    live_server, page,
+):
+    """Export starts beside originals and keeps a browsable custom path."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    expect(page.locator("#exportDest")).to_have_value("")
+    expect(page.locator("#exportDest")).to_have_attribute(
+        "placeholder", "Same folder as each original"
+    )
+    expect(page.locator("#exportSubfolder")).not_to_be_checked()
+
+    page.get_by_role("button", name="Browse…", exact=True).click()
+    expect(page.locator("#folderBrowser")).to_have_class(
+        "folder-browser-overlay open"
+    )
+    expect(page.locator("#folderBrowserTitle")).to_have_text(
+        "Select Export Folder"
+    )
+    page.keyboard.press("Escape")
+    expect(page.locator("#folderBrowser")).not_to_have_class(
+        "folder-browser-overlay open"
+    )
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    page.locator("#exportSubfolder").check()
+
+    page.evaluate(
+        """() => {
+          window.__exportRequest = null;
+          window.safeFetch = async function(url, options) {
+            if (url === '/api/jobs/export') {
+              window.__exportRequest = JSON.parse(options.body);
+              return {job_id: 'export-test'};
+            }
+            return {};
+          };
+        }"""
+    )
+    page.locator("#exportSubmitBtn").click()
+    page.wait_for_function("() => window.__exportRequest !== null")
+    request = page.evaluate("window.__exportRequest")
+    assert request["destination"] == ""
+    assert request["export_to_subfolder"] is True
+
+
 def test_more_menu_scrolls_within_short_viewport(live_server, page):
     """The unified action menu is tall; at Tauri's 600px minimum window
     height it must scroll within the viewport instead of rendering lower

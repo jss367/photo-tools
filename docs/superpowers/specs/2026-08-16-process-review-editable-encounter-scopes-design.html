@@ -978,9 +978,9 @@ merging, or separating a group.</li>
 <p>A review view is a query over the canonical result. It contains:</p>
 <ul>
 <li>an optional collection;</li>
-<li>a photo-status filter: All, Keep, Review, Reject, or Species
-conflicts;</li>
-<li>species-review state filtering;</li>
+<li>a photo-status filter: All, Keep, Review, or Reject;</li>
+<li>species-review state filtering: All, Needs review, Resolved, or
+Conflicts;</li>
 <li>species or filename search;</li>
 <li>encounter match mode: Any photo or Every photo;</li>
 <li>encounter sort; and</li>
@@ -1446,10 +1446,16 @@ from an encounter that is shown.
 example, Collection “August shorebirds” plus Status “Review” means
 photos that are both in the collection and currently marked Review. The
 encounter match rule is then applied once to that combined set.</p>
-<p>Species and filename search includes a complete encounter when the
-query matches any visible encounter label, burst label, qualifying
-prediction, or filename. Search does not trim the encounter. Search
-options such as case matching and whole-word matching retain their
+<p>Search contributes photo-based criteria to <code>S</code> before the
+encounter match rule is applied. A filename or photo ID matches only that
+photo; a subject or prediction field matches the photo carrying that
+evidence; a burst label is projected onto every photo in that burst; and
+an encounter label is projected onto every photo in that encounter.
+Consequently, a query that matches one filename includes the complete
+encounter under <strong>Any photo</strong> but excludes it under
+<strong>Every photo</strong>, while a query that matches an encounter-level
+label can qualify every member under either mode. Search never trims an
+encounter that qualifies. Match-case and whole-word options retain their
 current meaning.</p>
 <p>Species-review filtering operates at the encounter level:</p>
 <ul>

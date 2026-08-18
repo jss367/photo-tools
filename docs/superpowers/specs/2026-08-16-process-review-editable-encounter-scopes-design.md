@@ -268,8 +268,8 @@ Changing a view never changes canonical grouping.
 A review view is a query over the canonical result. It contains:
 
 - an optional collection;
-- a photo-status filter: All, Keep, Review, Reject, or Species conflicts;
-- species-review state filtering;
+- a photo-status filter: All, Keep, Review, or Reject;
+- species-review state filtering: All, Needs review, Resolved, or Conflicts;
 - species or filename search;
 - encounter match mode: Any photo or Every photo;
 - encounter sort; and
@@ -697,10 +697,15 @@ Photo-based criteria are combined first to form `S`. For example, Collection
 collection and currently marked Review. The encounter match rule is then
 applied once to that combined set.
 
-Species and filename search includes a complete encounter when the query
-matches any visible encounter label, burst label, qualifying prediction, or
-filename. Search does not trim the encounter. Search options such as case
-matching and whole-word matching retain their current meaning.
+Search contributes photo-based criteria to `S` before the encounter match rule
+is applied. A filename or photo ID matches only that photo; a subject or
+prediction field matches the photo carrying that evidence; a burst label is
+projected onto every photo in that burst; and an encounter label is projected
+onto every photo in that encounter. Consequently, a query that matches one
+filename includes the complete encounter under **Any photo** but excludes it
+under **Every photo**, while a query that matches an encounter-level label can
+qualify every member under either mode. Search never trims an encounter that
+qualifies. Match-case and whole-word options retain their current meaning.
 
 Species-review filtering operates at the encounter level:
 

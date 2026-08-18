@@ -100,6 +100,7 @@ def _walk_folder(folder, root_name, multi_source, file_types, recursive,
     files = []
     type_breakdown = {}
     total_size = 0
+    last_metadata_emit = 0.0
     for index, f in enumerate(discovered, start=1):
         if cancel.is_set():
             return None
@@ -132,7 +133,10 @@ def _walk_folder(folder, root_name, multi_source, file_types, recursive,
             "thumb_url": "/api/import/folder-preview/thumbnail?path="
             + quote(str(f)),
         })
-        if index % 500 == 0:
+        now = time.monotonic()
+        if (index % 500 == 0
+                or now - last_metadata_emit >= PROGRESS_MIN_INTERVAL_SECONDS):
+            last_metadata_emit = now
             emit({
                 "type": "folder_progress",
                 "path": folder,

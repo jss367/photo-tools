@@ -3,6 +3,7 @@
 import json
 import threading
 import time
+from pathlib import Path
 
 import source_discovery
 from image_loader import ScanCancelled
@@ -89,3 +90,35 @@ def test_stream_survives_a_crashing_walker(monkeypatch):
     assert frames[-1]["type"] == "done"
     assert frames[-1]["total_count"] == 0
     assert frames[-1]["source_counts"] == {"/photos/a": 0}
+
+
+def test_metadata_progress_is_throttled_by_time_not_file_count(
+        tmp_path, monkeypatch):
+    root = tmp_path / "card"
+    root.mkdir()
+    files = []
+    for index in range(3):
+        photo = root / f"photo-{index}.jpg"
+        photo.write_bytes(b"x")
+        files.append(photo)
+
+    monkeypatch.setattr(
+        source_discovery, "discover_source_files", lambda *_args, **_kwargs: files,
+    )
+    ticks = iter([0.0, 0.1, 0.4])
+    monkeypatch.setattr(source_discovery.time, "monotonic", ticks.__next__)
+    events = []
+
+    result = source_discovery._walk_folder(
+        str(root), Path(root).name, False, "both", True,
+        threading.Event(), events.append,
+    )
+
+    assert result["count"] == 3
+    assert [event for event in events if event.get("stage") == "metadata"] == [{
+        "type": "folder_progress",
+        "path": str(root),
+        "stage": "metadata",
+        "checked": 3,
+        "found": 3,
+    }]

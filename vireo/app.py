@@ -9579,6 +9579,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
         return jsonify({"ok": True, "wildlife_excluded": excluded})
 
+    def _local_mask_stale(db, photo_id, recipe):
+        if not recipe or not recipe.get("local"):
+            return False
+        import local_masks
+        variant_row = db.conn.execute(
+            "SELECT active_mask_variant FROM photos WHERE id=?",
+            (photo_id,),
+        ).fetchone()
+        variant = variant_row["active_mask_variant"] if variant_row else None
+        mask_row = db.get_photo_mask(photo_id, variant) if variant else None
+        return local_masks.is_stale(recipe, mask_row)
+
     @app.route("/api/photos/<int:photo_id>/edit-recipe", methods=["GET"])
     def api_get_photo_edit_recipe(photo_id):
         db = _get_db()
@@ -9586,21 +9598,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not photo:
             return _photo_not_found_error(legacy_error="not found")
         recipe = db.get_photo_edit_recipe(photo_id)
-        payload = {"photo_id": photo_id, "recipe": recipe}
-        if recipe and recipe.get("local"):
-            import local_masks
-            variant_row = db.conn.execute(
-                "SELECT active_mask_variant FROM photos WHERE id=?",
-                (photo_id,),
-            ).fetchone()
-            variant = variant_row["active_mask_variant"] if variant_row else None
-            mask_row = (
-                db.get_photo_mask(photo_id, variant) if variant else None
-            )
-            payload["local_mask_stale"] = local_masks.is_stale(
-                recipe, mask_row
-            )
-        return jsonify(payload)
+        return jsonify({
+            "photo_id": photo_id,
+            "recipe": recipe,
+            "local_mask_stale": _local_mask_stale(db, photo_id, recipe),
+        })
 
     @app.route(
         "/api/photos/<int:photo_id>/local-mask/snapshot", methods=["POST"]
@@ -9677,7 +9679,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 new_value,
                 [{"photo_id": photo_id, "old_value": old_value, "new_value": new_value}],
             )
-        return jsonify({"ok": True, "recipe": new_recipe})
+        return jsonify({
+            "ok": True,
+            "recipe": new_recipe,
+            "local_mask_stale": _local_mask_stale(db, photo_id, new_recipe),
+        })
 
     @app.route("/api/photos/<int:photo_id>/edit-recipe", methods=["DELETE"])
     def api_clear_photo_edit_recipe(photo_id):

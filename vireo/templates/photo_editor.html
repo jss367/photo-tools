@@ -3138,7 +3138,6 @@ async function saveRecipe(description) {
   // write the previous photo's returned recipe back into the editor state for
   // a different photo (or refresh the cache under the wrong photoId).
   var savedPhotoId = editorState.photoId;
-  var savedLocalStale = editorState.localStale;
   editorState.savingPhotoIds[String(savedPhotoId)] = true;
   var acceptingCropEdit = editorState.cropEditing &&
     !!recipeForSave(editorState.recipe).crop;
@@ -3168,8 +3167,8 @@ async function saveRecipe(description) {
     if (editorState.photoId !== savedPhotoId) return false;
     editorState.savedRecipe = cloneRecipe(data.recipe || {});
     editorState.recipe = cloneRecipe(data.recipe || {});
-    editorState.savedLocalStale = savedLocalStale;
-    editorState.localStale = savedLocalStale;
+    editorState.savedLocalStale = !!data.local_mask_stale;
+    editorState.localStale = editorState.savedLocalStale;
     ensureCrop(editorState.recipe);
     editorState.cropEditing = !recipeForSave(editorState.recipe).crop;
     if (acceptingCropEdit && !editorState.cropEditing) {

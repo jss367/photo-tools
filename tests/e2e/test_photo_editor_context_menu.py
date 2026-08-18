@@ -114,7 +114,9 @@ def test_photo_editor_context_disables_save_while_request_is_pending(
     page.wait_for_function("() => !isEditorDirty()")
 
 
-def test_photo_editor_save_keeps_staleness_of_submitted_mask(live_server, page):
+def test_photo_editor_save_uses_authoritative_staleness_from_response(
+    live_server, page
+):
     _open_editor(live_server, page)
     page.evaluate(
         """() => {
@@ -135,8 +137,12 @@ def test_photo_editor_save_keeps_staleness_of_submitted_mask(live_server, page):
     page.evaluate(
         """() => {
           // Simulate Update Mask completing while the old-mask PUT is pending.
+          // The response describes the recipe that actually won persistence.
           editorState.localStale = false;
-          window.__resolveStaleMaskSave({recipe: {rotation: 90}});
+          window.__resolveStaleMaskSave({
+            recipe: {rotation: 90},
+            local_mask_stale: true,
+          });
         }"""
     )
     page.evaluate("() => window.__staleMaskSave")

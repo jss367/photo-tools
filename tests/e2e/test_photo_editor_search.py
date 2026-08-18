@@ -355,6 +355,8 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
             loadedSize = 16384;
             editorState.zoomPercent = 55;
             const after = editorNativeDisplayDimensions().width * 0.55;
+            editorState.zoomPercent = 90;
+            const later = editorNativeDisplayDimensions().width * 0.90;
             for (const [name, descriptor] of [
                 ['currentSrc', originalCurrentSrc],
                 ['naturalWidth', originalNaturalWidth],
@@ -368,10 +370,11 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
             editorState.zoomMode = 'fit';
             applyEditorZoom();
             updateEditorZoomControl();
-            return {before, after};
+            return {before, after, later};
         }"""
     )
     assert capped_zoom["after"] >= capped_zoom["before"]
+    assert capped_zoom["later"] > capped_zoom["after"]
 
     stale_ratio = page.evaluate(
         """() => {

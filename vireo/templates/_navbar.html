@@ -8665,7 +8665,15 @@ function buildLightboxContextMenu(pid) {
   }
   if (has('openPhotoExportModal')) {
     items.push({ label: 'Export\u2026',
-      onClick: function() { window.openPhotoExportModal([pid]); } });
+      onClick: function() {
+        // The lightbox can navigate while its context menu remains open.
+        // Resolve the visible identity now instead of exporting the photo
+        // that happened to be current when the menu was built.
+        var exportPid = _lightboxCommittedId != null
+          ? _lightboxCommittedId
+          : _lightboxCurrentId;
+        if (exportPid != null) window.openPhotoExportModal([exportPid]);
+      } });
   }
   items.push({ label: window.VIREO_REVEAL_LABEL,
     onClick: function() { revealLightboxPhoto(pid); } });

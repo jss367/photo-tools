@@ -81,8 +81,8 @@ def test_lightbox_right_click_opens_menu(live_server, page):
     assert menu.locator(".vireo-ctx-chip").count() > 5
 
 
-def test_lightbox_export_targets_current_photo(live_server, page):
-    """Lightbox Export opens photo export for only the displayed photo."""
+def test_lightbox_export_resolves_photo_when_action_is_invoked(live_server, page):
+    """Lightbox Export targets the displayed photo even after menu-open nav."""
     url = live_server["url"]
     _open_lightbox(page, url)
 
@@ -90,7 +90,7 @@ def test_lightbox_export_targets_current_photo(live_server, page):
     page.evaluate(
         """() => {
             selectedPhotos.clear();
-            selectedPhotoId = photos.find(photo => photo.id !== _lightboxCurrentId).id;
+            selectedPhotoId = _lightboxCurrentId;
             window.__exportRequest = null;
             window.safeFetch = async function(url, options) {
                 if (url === '/api/jobs/export') {
@@ -103,6 +103,14 @@ def test_lightbox_export_targets_current_photo(live_server, page):
     )
 
     _fire_contextmenu_on_lightbox(page)
+    export_id = page.evaluate(
+        """() => {
+            const next = photos.find(photo => photo.id !== _lightboxCurrentId);
+            _lightboxCurrentId = next.id;
+            _lightboxCommittedId = next.id;
+            return next.id;
+        }"""
+    )
     menu = page.locator(".vireo-ctx-menu")
     menu.locator(".vireo-ctx-item", has_text="Export…").click()
 
@@ -110,11 +118,12 @@ def test_lightbox_export_targets_current_photo(live_server, page):
     expect(page.locator("#exportOverlay")).to_be_visible()
     expect(page.locator("#lightboxOverlay")).to_have_class("lightbox-overlay")
     expect(page.locator("#exportSubmitBtn")).to_have_text("Export 1 photo")
-    assert page.evaluate("_exportPhotoIds") == [current_id]
+    assert export_id != current_id
+    assert page.evaluate("_exportPhotoIds") == [export_id]
 
     page.locator("#exportSubmitBtn").click()
     page.wait_for_function("window.__exportRequest !== null")
-    assert page.evaluate("window.__exportRequest.photo_ids") == [current_id]
+    assert page.evaluate("window.__exportRequest.photo_ids") == [export_id]
 
 
 def test_lightbox_color_description_opens_editor(live_server, page):

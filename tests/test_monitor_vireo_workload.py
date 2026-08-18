@@ -593,6 +593,7 @@ def test_single_flight_target_is_unknown_when_any_api_sample_fails():
 
     targets = report["summary"]["targets"]
     assert report["summary"]["api_failure_count"] == 1
+    assert report["summary"]["scenario"]["job_observation_complete"] is False
     assert targets["no_embedding_single_flight_violations"] is None
 
 
@@ -660,6 +661,7 @@ def test_interrupt_before_poll_marks_api_targets_unknown():
 
     assert report["interrupted"] is True
     assert report["samples"] == []
+    assert report["summary"]["scenario"]["job_observation_complete"] is False
     assert report["summary"]["targets"]["jobs_api_p95_below_500ms"] is None
     assert report["summary"]["targets"][
         "no_embedding_single_flight_violations"
@@ -782,6 +784,7 @@ def test_interrupted_api_poll_retains_resource_sample_and_marks_failure():
     assert report["samples"][0]["process"]["cpu_percent"] == 100.0
     assert report["samples"][0]["api"]["error"].startswith("interrupted")
     assert report["summary"]["api_failure_count"] == 1
+    assert report["summary"]["scenario"]["job_observation_complete"] is False
     assert report["summary"]["targets"]["jobs_api_p95_below_500ms"] is None
 
 

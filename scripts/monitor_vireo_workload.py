@@ -741,9 +741,13 @@ def build_summary(
         for sample in successful
     ]
     final_api = successful[-1]["api"] if successful else baseline
-    job_observation_complete = not any(
-        sample["api"].get("history_window_saturated") is True
-        for sample in samples
+    job_observation_complete = (
+        not interrupted
+        and api_failure_count == 0
+        and not any(
+            sample["api"].get("history_window_saturated") is True
+            for sample in samples
+        )
     )
     queued_counts = [
         sum(job.get("status") == "queued" for job in sample["api"].get("jobs", []))

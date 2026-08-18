@@ -353,6 +353,98 @@ def test_export_photos_uses_assigned_keyword_location(export_env):
     assert metadata["Composite"]["GPSPosition"] == "32.92 -117.25"
 
 
+def test_export_photos_uses_bulk_location_lookup(export_env, monkeypatch):
+    """Location metadata is prefetched without one query per photo."""
+    env = export_env
+
+    def fail_single_lookup(*_args, **_kwargs):
+        raise AssertionError("export should use the bulk location lookup")
+
+    monkeypatch.setattr(
+        env["db"], "get_effective_photo_location", fail_single_lookup
+    )
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={"metadata_fields": ["location"]},
+    )
+
+    # Neither photo has a location, so no ExifTool process is needed, but both
+    # rendered derivatives still count as successful exports.
+    assert result["exported"] == 2
+    assert result["errors"] == []
+
+
+def test_export_metadata_batch_uses_utf8_input(tmp_path, monkeypatch):
+    import export as export_module
+    import metadata
+
+    out_path = tmp_path / "Mésange.jpg"
+    out_path.write_bytes(b"rendered")
+    monkeypatch.setattr(metadata, "find_exiftool", lambda: "exiftool")
+    monkeypatch.setattr(
+        metadata, "_exiftool_command", lambda _path: ["exiftool"]
+    )
+
+    def fake_run(command, **kwargs):
+        assert command == ["exiftool", "-@", "-"]
+        assert kwargs["encoding"] == "utf-8"
+        assert "Mésange.jpg" in kwargs["input"]
+        return export_module.subprocess.CompletedProcess(
+            command, 0, "VIREO_METADATA_STATUS_1_0\n", ""
+        )
+
+    monkeypatch.setattr(export_module.subprocess, "run", fake_run)
+
+    exported, errors = export_module._write_export_metadata_batch([
+        (str(out_path), out_path.name, ["-XMP-dc:Subject=Mésange bleue"]),
+    ])
+
+    assert exported == 1
+    assert errors == []
+    assert out_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("process_error", "expected_detail"),
+    [
+        (OSError("executable missing"), "ExifTool could not start"),
+        (
+            UnicodeEncodeError("ascii", "é", 0, 1, "ordinal not in range"),
+            "ExifTool metadata could not be encoded",
+        ),
+    ],
+)
+def test_export_metadata_batch_cleans_up_process_failures(
+    tmp_path, monkeypatch, process_error, expected_detail,
+):
+    import export as export_module
+    import metadata
+
+    out_path = tmp_path / "bird.jpg"
+    out_path.write_bytes(b"rendered")
+    monkeypatch.setattr(metadata, "find_exiftool", lambda: "exiftool")
+    monkeypatch.setattr(
+        metadata, "_exiftool_command", lambda _path: ["exiftool"]
+    )
+
+    def fail_run(*_args, **_kwargs):
+        raise process_error
+
+    monkeypatch.setattr(export_module.subprocess, "run", fail_run)
+
+    exported, errors = export_module._write_export_metadata_batch([
+        (str(out_path), out_path.name, ["-XMP-dc:Subject=Bird"]),
+    ])
+
+    assert exported == 0
+    assert len(errors) == 1
+    assert expected_detail in errors[0]
+    assert not out_path.exists()
+
+
 def test_export_photos_resize(export_env):
     """export_photos resizes photos to max_size."""
     env = export_env

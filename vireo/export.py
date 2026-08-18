@@ -203,10 +203,7 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
         _get_photo_camera_data(db, photo_ids) if "camera" in metadata_fields else {}
     )
     location_map = (
-        {
-            pid: db.get_effective_photo_location(pid, verify_workspace=False)
-            for pid in photo_ids
-        }
+        db.get_effective_photo_locations(photo_ids, verify_workspace=False)
         if "location" in metadata_fields else {}
     )
 
@@ -729,11 +726,20 @@ def _write_export_metadata_batch(jobs):
             input="\n".join(argfile_lines) + "\n",
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=timeout,
             **no_window_kwargs(),
         )
     except subprocess.TimeoutExpired:
         return _fail_export_metadata_jobs(jobs, "ExifTool metadata write timed out")
+    except OSError as exc:
+        return _fail_export_metadata_jobs(
+            jobs, f"ExifTool could not start: {exc}"
+        )
+    except UnicodeError as exc:
+        return _fail_export_metadata_jobs(
+            jobs, f"ExifTool metadata could not be encoded: {exc}"
+        )
 
     statuses = {
         int(index): int(status)

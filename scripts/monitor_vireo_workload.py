@@ -249,6 +249,10 @@ class ProcessTreeSampler:
         self.processes = {}
         self._cpu_times = {}
         self._last_cpu_sample_at = None
+        self._last_reaped_children_cpu = 0.0
+        self._known_child_cpu_lifetimes = {}
+        self._unreconciled_departed_child_cpu = 0.0
+        self._initial_rss_bytes = None
         try:
             self.executable = self.root.exe()
         except (OSError, self.psutil.Error):
@@ -275,6 +279,7 @@ class ProcessTreeSampler:
     def metadata(self):
         return {
             **self._metadata,
+            "initial_rss_bytes": self._initial_rss_bytes,
             "executable_exists": (
                 os.path.exists(self.executable) if self.executable else None
             ),
@@ -292,13 +297,28 @@ class ProcessTreeSampler:
 
     def prime(self):
         self._cpu_times = {}
+        self._known_child_cpu_lifetimes = {}
+        initial_rss_bytes = 0
+        process_count = 0
         for process in self._current_processes():
             try:
                 identity = (process.pid, process.create_time())
                 cpu = process.cpu_times()
-                self._cpu_times[identity] = cpu.user + cpu.system
+                total_cpu_seconds = cpu.user + cpu.system
+                self._cpu_times[identity] = total_cpu_seconds
+                if process.pid == self.root.pid:
+                    self._last_reaped_children_cpu = (
+                        getattr(cpu, "children_user", 0.0)
+                        + getattr(cpu, "children_system", 0.0)
+                    )
+                else:
+                    self._known_child_cpu_lifetimes[identity] = total_cpu_seconds
+                initial_rss_bytes += process.memory_info().rss
+                process_count += 1
             except (OSError, self.psutil.Error):
                 continue
+        self._unreconciled_departed_child_cpu = 0.0
+        self._initial_rss_bytes = initial_rss_bytes if process_count else None
         self._last_cpu_sample_at = self.monotonic()
 
     def sample(self):
@@ -310,6 +330,8 @@ class ProcessTreeSampler:
         )
         cpu_seconds = 0.0
         current_cpu_times = {}
+        current_child_cpu_lifetimes = {}
+        reaped_children_cpu = self._last_reaped_children_cpu
         rss_bytes = 0
         thread_count = 0
         process_count = 0
@@ -319,6 +341,13 @@ class ProcessTreeSampler:
                 cpu = process.cpu_times()
                 total_cpu_seconds = cpu.user + cpu.system
                 current_cpu_times[identity] = total_cpu_seconds
+                if process.pid == self.root.pid:
+                    reaped_children_cpu = (
+                        getattr(cpu, "children_user", 0.0)
+                        + getattr(cpu, "children_system", 0.0)
+                    )
+                else:
+                    current_child_cpu_lifetimes[identity] = total_cpu_seconds
                 # A child first discovered after prime() was spawned during
                 # this sampling window. Its cumulative process CPU time is
                 # therefore the correct delta from zero; psutil.cpu_percent
@@ -333,7 +362,32 @@ class ProcessTreeSampler:
                 process_count += 1
             except (OSError, self.psutil.Error):
                 continue
+        departed = (
+            self._known_child_cpu_lifetimes.keys()
+            - current_child_cpu_lifetimes.keys()
+        )
+        self._unreconciled_departed_child_cpu += sum(
+            self._known_child_cpu_lifetimes[identity]
+            for identity in departed
+        )
+        # On platforms that expose cumulative CPU for reaped children, this
+        # closes two gaps in live process enumeration: CPU accrued after a
+        # child's last observation, and helpers created and reaped entirely
+        # between polls. Subtract full lifetimes of departed children already
+        # observed live so their work is not double-counted.
+        reaped_delta = max(
+            reaped_children_cpu - self._last_reaped_children_cpu,
+            0.0,
+        )
+        reconciled = min(
+            reaped_delta,
+            self._unreconciled_departed_child_cpu,
+        )
+        cpu_seconds += reaped_delta - reconciled
+        self._unreconciled_departed_child_cpu -= reconciled
         self._cpu_times = current_cpu_times
+        self._known_child_cpu_lifetimes = current_child_cpu_lifetimes
+        self._last_reaped_children_cpu = reaped_children_cpu
         self._last_cpu_sample_at = sampled_at
         cpu_percent = cpu_seconds / elapsed * 100.0 if elapsed > 0 else 0.0
         metadata = self.metadata()
@@ -496,7 +550,7 @@ def _scenario_summary(jobs):
     }
 
 
-def build_summary(baseline, samples):
+def build_summary(baseline, samples, *, process_metadata=None):
     successful = [
         sample for sample in samples
         if _is_successful_jobs_sample(sample["api"])
@@ -505,6 +559,7 @@ def build_summary(baseline, samples):
     api_latencies = [sample["api"]["latency_seconds"] for sample in successful]
     process_cpu = [sample["process"]["cpu_percent"] for sample in samples]
     process_rss = [sample["process"]["rss_bytes"] for sample in samples]
+    initial_rss = (process_metadata or {}).get("initial_rss_bytes")
     system_idle = [sample["system"]["cpu_idle_percent"] for sample in samples]
     observations = [(0.0, baseline)] + [
         (sample["elapsed_seconds"], sample["api"])
@@ -555,7 +610,11 @@ def build_summary(baseline, samples):
         "vireo_process_tree_cpu_percent": _number_summary(process_cpu),
         "vireo_process_tree_rss_bytes": {
             **(_number_summary(process_rss) or {}),
-            "growth": process_rss[-1] - process_rss[0] if process_rss else None,
+            "growth": (
+                process_rss[-1]
+                - (initial_rss if isinstance(initial_rss, (int, float)) else process_rss[0])
+                if process_rss else None
+            ),
         },
         "system_cpu_idle_percent": idle_summary,
         "jobs_api_latency_seconds": latency_summary,
@@ -661,6 +720,7 @@ def collect_workload(
             "system": system_sampler.sample(),
             "api": api_client.sample(),
         })
+    process_metadata = process_sampler.metadata()
     return {
         "schema_version": SCHEMA_VERSION,
         "started_at": started_at,
@@ -668,10 +728,14 @@ def collect_workload(
         "interrupted": interrupted,
         "requested_duration_seconds": duration,
         "interval_seconds": interval,
-        "process": process_sampler.metadata(),
+        "process": process_metadata,
         "host": system_sampler.metadata(),
         "baseline": baseline,
-        "summary": build_summary(baseline, samples),
+        "summary": build_summary(
+            baseline,
+            samples,
+            process_metadata=process_metadata,
+        ),
         "samples": samples,
     }
 

@@ -117,7 +117,7 @@ def test_collect_workload_builds_deltas_targets_and_job_summary():
             {"cpu_percent": 800.0, "rss_bytes": 100, "executable_exists": True},
             {"cpu_percent": 900.0, "rss_bytes": 120, "executable_exists": True},
         ],
-        {"pid": 123, "executable_exists": True},
+        {"pid": 123, "initial_rss_bytes": 80, "executable_exists": True},
     )
     system = _SequenceSampler(
         [
@@ -143,7 +143,7 @@ def test_collect_workload_builds_deltas_targets_and_job_summary():
     summary = report["summary"]
     assert summary["jobs_api_latency_seconds"]["p95"] == 0.02
     assert summary["system_cpu_idle_percent"]["p05"] == 20.0
-    assert summary["vireo_process_tree_rss_bytes"]["growth"] == 20
+    assert summary["vireo_process_tree_rss_bytes"]["growth"] == 40
     assert summary["resource_wait_delta"] == {
         "wait_count": 2,
         "wait_seconds": 2.5,
@@ -759,11 +759,14 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
     clock = _FakeClock()
 
     class _CpuProcess:
-        def __init__(self, pid, created_at, cpu_seconds, rss):
+        def __init__(
+            self, pid, created_at, cpu_seconds, rss, reaped_cpu_seconds=0.0,
+        ):
             self.pid = pid
             self.created_at = created_at
             self.cpu_seconds = cpu_seconds
             self.rss = rss
+            self.reaped_cpu_seconds = reaped_cpu_seconds
             self.child_processes = []
 
         def exe(self):
@@ -782,6 +785,8 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
             return type("CpuTimes", (), {
                 "user": self.cpu_seconds,
                 "system": 0.0,
+                "children_user": self.reaped_cpu_seconds,
+                "children_system": 0.0,
             })()
 
         def memory_info(self):
@@ -819,6 +824,68 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
     assert sample["cpu_percent"] == 70.0
     assert sample["rss_bytes"] == 300
     assert sample["process_count"] == 2
+    assert sampler.metadata()["initial_rss_bytes"] == 100
+
+
+def test_process_sampler_counts_children_reaped_between_polls():
+    clock = _FakeClock()
+
+    class _RootProcess:
+        pid = 100
+        own_cpu = 1.0
+        reaped_cpu = 0.0
+
+        def exe(self):
+            return "/tmp/vireo-server"
+
+        def cmdline(self):
+            return ["vireo-server"]
+
+        def create_time(self):
+            return 1.0
+
+        def children(self, recursive=False):
+            return []
+
+        def cpu_times(self):
+            return type("CpuTimes", (), {
+                "user": self.own_cpu,
+                "system": 0.0,
+                "children_user": self.reaped_cpu,
+                "children_system": 0.0,
+            })()
+
+        def memory_info(self):
+            return type("MemoryInfo", (), {"rss": 100})()
+
+        def num_threads(self):
+            return 1
+
+    class _CpuPsutil:
+        Error = RuntimeError
+
+        def __init__(self, root):
+            self.root = root
+
+        def Process(self, pid):
+            assert pid == self.root.pid
+            return self.root
+
+    root = _RootProcess()
+    sampler = ProcessTreeSampler(
+        root.pid,
+        psutil_module=_CpuPsutil(root),
+        monotonic=clock.monotonic,
+    )
+    sampler.prime()
+
+    # A helper consumes 0.4 CPU seconds and is reaped before the next poll,
+    # so it never appears in children(). The parent's cumulative child time
+    # is the only process-tree accounting record that survives.
+    root.reaped_cpu = 0.4
+    clock.sleep(1.0)
+
+    assert sampler.sample()["cpu_percent"] == 40.0
 
 
 class _FakeConn:

@@ -457,6 +457,12 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
     assert one_axis["overflowX"] != one_axis["overflowY"]
     assert one_axis["fittedAxisError"] < 1
 
+    page.evaluate(
+        """() => {
+            editorState.zoomMode = 'custom';
+            editorState.zoomPercent = editorFitZoomPercent();
+        }"""
+    )
     page.set_viewport_size({"width": 3000, "height": 2000})
     page.wait_for_function(
         """() => editorState.zoomMode === 'fit' &&
@@ -543,11 +549,20 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
         """() => new Promise((resolve) => {
             const img = document.getElementById('editorImg');
             const originalControl = window.updateEditorZoomControl;
+            const originalRenderSize = window.previewRenderSize;
+            const originalSchedule = window.schedulePreview;
             let calls = 0;
+            let renderSizeCalls = 0;
+            let scheduled = 0;
             window.updateEditorZoomControl = function() {
                 calls += 1;
                 return originalControl();
             };
+            window.previewRenderSize = function() {
+                renderSizeCalls += 1;
+                return renderSizeCalls === 1 ? 2048 : 4096;
+            };
+            window.schedulePreview = function() { scheduled += 1; };
             editorState.recipe.exposure += 0.013;
             updatePreview();
             const beforeLoad = calls;
@@ -556,11 +571,14 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
                 originalLoad.call(this);
                 const afterLoad = calls;
                 window.updateEditorZoomControl = originalControl;
-                resolve({beforeLoad, afterLoad});
+                window.previewRenderSize = originalRenderSize;
+                window.schedulePreview = originalSchedule;
+                resolve({beforeLoad, afterLoad, scheduled});
             };
         })"""
     )
     assert loaded_geometry_refresh["afterLoad"] > loaded_geometry_refresh["beforeLoad"]
+    assert loaded_geometry_refresh["scheduled"] == 1
 
 
 def test_photo_editor_enter_saves_crop_after_drag_from_focused_input(

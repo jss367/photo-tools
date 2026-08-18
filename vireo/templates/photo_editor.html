@@ -1730,6 +1730,18 @@ function updatePreview() {
     renderCropBox();
     updateHistogramFeedback();
     refreshMaskOverlay();
+    var loadedRenderSize = 0;
+    try {
+      loadedRenderSize = Number(new URL(img.currentSrc || img.src,
+        window.location.href).searchParams.get('size')) || 0;
+    } catch (_) {}
+    // The decoded image can reveal authoritative orientation/aspect geometry
+    // that moves Fit into another source-render bucket. Re-request that tier
+    // instead of indefinitely stretching the just-loaded preview.
+    if (editorState.zoomMode === 'fit' && loadedRenderSize &&
+        previewRenderSize() !== loadedRenderSize) {
+      schedulePreview();
+    }
   };
   img.onerror = function() {
     if (seq !== editorState.previewSeq) return;

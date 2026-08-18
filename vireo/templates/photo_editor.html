@@ -1033,7 +1033,7 @@ body {
 
     <div class="modal-actions">
       <button id="exportSubmitBtn" class="modal-btn modal-btn-primary" type="button" onclick="startExport()">Export Photo</button>
-      <button class="modal-btn modal-btn-cancel" type="button" onclick="closeExportModal()">Cancel</button>
+      <button class="modal-btn modal-btn-cancel" type="button" data-export-cancel onclick="closeExportModal()">Cancel</button>
     </div>
   </div>
 </div>
@@ -3189,6 +3189,19 @@ async function saveRecipe(description) {
 
 var editorExportRequestGeneration = 0;
 
+function setExportControlsBusy(busy) {
+  document.querySelectorAll('#exportOverlay input, #exportOverlay select, #exportOverlay button').forEach(function(control) {
+    if (control.id === 'exportSubmitBtn' || control.hasAttribute('data-export-cancel')) return;
+    if (busy) {
+      control.setAttribute('data-export-was-disabled', control.disabled ? '1' : '0');
+      control.disabled = true;
+    } else if (control.hasAttribute('data-export-was-disabled')) {
+      control.disabled = control.getAttribute('data-export-was-disabled') === '1';
+      control.removeAttribute('data-export-was-disabled');
+    }
+  });
+}
+
 const exportFolderBrowser = new VireoFolderBrowser({
   overlayId: 'folderBrowser',
   defaultMode: 'destination',
@@ -3233,6 +3246,7 @@ async function openExportModal() {
   document.getElementById('exportDest').value = '';
   document.getElementById('exportSubfolder').checked = false;
   editorExportRequestGeneration++;
+  setExportControlsBusy(false);
   document.getElementById('exportSubmitBtn').disabled = false;
   document.getElementById('exportSubmitBtn').textContent = 'Export Photo';
   document.getElementById('exportOverlay').classList.add('open');
@@ -3241,6 +3255,7 @@ async function openExportModal() {
 
 function closeExportModal() {
   editorExportRequestGeneration++;
+  setExportControlsBusy(false);
   document.getElementById('exportOverlay').classList.remove('open');
 }
 
@@ -3388,6 +3403,7 @@ async function startExport() {
   };
   button.disabled = true;
   button.textContent = 'Checking filename…';
+  setExportControlsBusy(true);
   try {
     var preflight = await safeFetch('/api/jobs/export/preflight', {
       method: 'POST',
@@ -3410,6 +3426,7 @@ async function startExport() {
         (preflight.rename_count === 1 ? '' : 's') + ' with numbered names:\n\n' +
         renameLines.join('\n') + '\n\nContinue with export?';
       if (!window.confirm(renameMessage)) {
+        setExportControlsBusy(false);
         button.disabled = false;
         button.textContent = buttonLabel;
         return;
@@ -3431,6 +3448,7 @@ async function startExport() {
     if (requestGeneration !== editorExportRequestGeneration) return;
     if (typeof showToast === 'function') showToast('Export failed: ' + error.message, 'error');
     else setStatus('Export failed: ' + error.message, true);
+    setExportControlsBusy(false);
     button.disabled = false;
     button.textContent = buttonLabel;
   }

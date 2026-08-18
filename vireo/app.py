@@ -6270,28 +6270,40 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         prune_missing_photos(cache_dir, db._active_workspace_id, db)
         results = load_results(cache_dir, db._active_workspace_id)
         if results and results.get("photos"):
+            # Cached pipeline rows predate edit recipes, which live in their
+            # own table. Enrich them before Process Review positions overlays
+            # against rendered previews so geometric edits can disable stale
+            # source-coordinate markers.
+            _attach_nested_edit_recipes(db, results)
             photo_ids = [p["id"] for p in results["photos"]]
             # Chunked: cached pipeline results can span the whole workspace,
             # exceeding SQLite's bound-parameter cap in one IN clause.
-            flag_map = {}
+            live_photo_map = {}
             for chunk in _chunked(photo_ids):
                 placeholders = ",".join("?" for _ in chunk)
                 rows = db.conn.execute(
-                    f"SELECT id, flag, rating FROM photos WHERE id IN ({placeholders})",
+                    f"""SELECT id, flag, rating,
+                               eye_x, eye_y, eye_conf, eye_tenengrad
+                          FROM photos WHERE id IN ({placeholders})""",
                     chunk,
                 ).fetchall()
-                flag_map.update({r["id"]: (r["flag"], r["rating"]) for r in rows})
+                live_photo_map.update({r["id"]: r for r in rows})
             for p in results["photos"]:
-                f, r = flag_map.get(p["id"], ("none", 0))
-                p["flag"] = f
-                p["rating"] = r
+                live = live_photo_map.get(p["id"])
+                p["flag"] = live["flag"] if live else "none"
+                p["rating"] = live["rating"] if live else 0
+                if live:
+                    p["eye_x"] = live["eye_x"]
+                    p["eye_y"] = live["eye_y"]
+                    p["eye_conf"] = live["eye_conf"]
+                    p["eye_tenengrad"] = live["eye_tenengrad"]
             # Overlay representative state onto the cached results so
             # pipeline cards render the badge after a page reload. The
             # cache is written before eligibility runs (and by pipeline
             # runs that predate the badge), so is_species_representative
             # is otherwise absent and every card renders unbadged even
             # when the DB says the photo is the species rep. The flag
-            # overlay above is what makes this call correct — the shared
+            # live overlay above is what makes this call correct — the shared
             # attacher short-circuits rejected photos, and the overlay
             # ensures p["flag"] reflects the live DB, not a stale cache.
             _attach_species_representatives(db, results["photos"])
@@ -26712,6 +26724,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         quality = body.get("quality", 92)
         output_format = body.get("format", body.get("output_format", "jpg"))
         metadata_fields = body.get("metadata_fields", [])
+        reveal_after_export = body.get("reveal_after_export", False)
 
         if not raw_ids:
             return json_error("photo_ids required")
@@ -26726,6 +26739,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error("destination must be an absolute path")
         if not isinstance(export_to_subfolder, bool):
             return json_error("export_to_subfolder must be a boolean")
+        if not isinstance(reveal_after_export, bool):
+            return json_error("reveal_after_export must be a boolean")
         if max_size in ("", 0):
             max_size = None
         if max_size is not None:
@@ -26778,7 +26793,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         developed_dir = effective_cfg.get("darktable_output_dir", "") or ""
 
         def work(job):
-            from export import export_photos
+            from export import export_photos, reveal_exported_files
 
             thread_db = Database(db_path)
             thread_db.set_active_workspace(active_ws)
@@ -26800,7 +26815,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "phase": "Exporting photos",
                 })
 
-            return export_photos(
+            result = export_photos(
                 db=thread_db,
                 vireo_dir=vireo_dir,
                 photo_ids=photo_ids,
@@ -26814,9 +26829,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "developed_dir": developed_dir,
                     "metadata_fields": metadata_fields,
                     "export_to_subfolder": export_to_subfolder,
+                    "collect_files": reveal_after_export,
                 },
                 progress_cb=progress_cb,
             )
+            exported_files = result.pop("files", [])
+            result["revealed"] = bool(
+                reveal_after_export
+                and exported_files
+                and not runner.is_cancelled(job["id"])
+                and reveal_exported_files(exported_files)
+            )
+            return result
 
         job_id = runner.start(
             "export", work,
@@ -26828,6 +26852,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "naming_template": naming_template,
                 "format": output_format,
                 "metadata_fields": metadata_fields,
+                "reveal_after_export": reveal_after_export,
             },
             workspace_id=active_ws,
         )

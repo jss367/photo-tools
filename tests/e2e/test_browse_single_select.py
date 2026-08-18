@@ -197,6 +197,7 @@ def test_export_checkboxes_remember_the_previous_choices(live_server, page):
 
     remembered = {
         "exportSubfolder": True,
+        "exportRevealAfter": True,
         "exportMetadataSpecies": True,
         "exportMetadataCaptureDateTime": True,
         "exportMetadataRating": False,

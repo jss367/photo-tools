@@ -4073,6 +4073,9 @@ def test_photo_editor_page_renders(client_with_photo):
     assert "rename.requested_name + ' → ' + rename.export_name" in html
     assert "var editorExportRequestGeneration = 0;" in html
     assert "requestGeneration !== editorExportRequestGeneration" in html
+    assert "function setExportControlsBusy(busy)" in html
+    assert "setExportControlsBusy(true);" in html
+    assert "data-export-cancel" in html
     assert "Feedback" in html
     assert "histogramCanvas" in html
     assert "shadowClipValue" in html

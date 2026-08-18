@@ -152,6 +152,88 @@ def test_burst_card_img_laid_out_at_natural_size(live_server, page, tmp_path):
     )
 
 
+def test_burst_loupe_marks_the_newly_selected_photos_eye(
+    live_server, page, tmp_path,
+):
+    """A blue eye marker follows the active photo within a selected subset."""
+    db = live_server["db"]
+    n = _seed_burst_with_real_photos(db, tmp_path)
+    if n < 2:
+        pytest.skip("need at least two burst photos")
+
+    photo_ids = [
+        row["id"]
+        for row in db.conn.execute(
+            """SELECT p.id
+                 FROM photos p
+                 JOIN detections d ON d.photo_id = p.id
+                 JOIN predictions pr ON pr.detection_id = d.id
+                WHERE pr.species = 'Red-tailed Hawk'
+                  AND pr.classifier_model = 'BioCLIP-2'
+                ORDER BY p.id"""
+        ).fetchall()
+    ]
+    db.conn.execute(
+        "UPDATE photos SET eye_x = 0.2, eye_y = 0.4, eye_conf = 0.98 WHERE id = ?",
+        (photo_ids[0],),
+    )
+    db.conn.execute(
+        "UPDATE photos SET eye_x = 0.8, eye_y = 0.4, eye_conf = 0.98 WHERE id = ?",
+        (photo_ids[1],),
+    )
+    db.conn.commit()
+    _ensure_photo_files_on_disk(db, tmp_path)
+
+    page.goto(f"{live_server['url']}/review")
+    page.wait_for_load_state("networkidle")
+    _open_burst_modal(page)
+    page.evaluate(
+        """() => {
+          grmState.selected = null;
+          grmState.selectedIds.clear();
+          grmState.selectionAnchor = null;
+          renderGroupModal();
+          grmRefreshSelectedLoupe();
+        }"""
+    )
+
+    first = page.locator(
+        f'#grmOverlay .grm-card[data-photo-id="{photo_ids[0]}"]'
+    )
+    second = page.locator(
+        f'#grmOverlay .grm-card[data-photo-id="{photo_ids[1]}"]'
+    )
+    first.click()
+    marker = page.locator("#grmSelectedEyeCrosshair")
+    expect(marker).to_be_visible()
+    first_left = marker.evaluate("el => parseFloat(el.style.left)")
+
+    second.click(modifiers=["Meta"])
+    expect(marker).to_be_visible()
+    page.wait_for_function(
+        "left => parseFloat(document.getElementById('grmSelectedEyeCrosshair').style.left) !== left",
+        arg=first_left,
+    )
+    second_left = marker.evaluate("el => parseFloat(el.style.left)")
+
+    assert page.evaluate("grmState.selectedIds.size") == 2
+    assert second_left > first_left
+    assert marker.evaluate(
+        "el => getComputedStyle(el, '::before').backgroundColor"
+    ) == "rgb(77, 184, 255)"
+
+    page.evaluate(
+        """() => {
+          const active = grmState.items.find(
+            item => item.photo_id === grmState.selected
+          );
+          active.edit_recipe = {crop: {x: 0.1, y: 0.1, w: 0.8, h: 0.8}};
+          grmUpdateSelectedEyeCrosshair();
+        }"""
+    )
+    expect(marker).to_be_hidden()
+
+
 def test_burst_card_box_is_180x120(live_server, page, tmp_path):
     """The 180x120 viewport stays the visible card box; the natural-size
     <img> inside is clipped via overflow:hidden on .grm-card-img-box.

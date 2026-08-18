@@ -99,11 +99,16 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
         """() => {
           window.__editorExportRequest = null;
           window.__editorPreflightRequest = null;
+          window.__resolveEditorPreflight = null;
           const originalSafeFetch = window.safeFetch;
           window.safeFetch = async function(url, options, config) {
             if (url === '/api/jobs/export/preflight') {
               window.__editorPreflightRequest = JSON.parse(options.body);
-              return {rename_count: 0, renames: []};
+              return new Promise(function(resolve) {
+                window.__resolveEditorPreflight = function() {
+                  resolve({rename_count: 0, renames: []});
+                };
+              });
             }
             if (url === '/api/jobs/export') {
               window.__editorExportRequest = JSON.parse(options.body);
@@ -122,6 +127,10 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
     page.locator("#exportResizeCustom").fill("1600")
     page.locator("#exportMetadataRating").check()
     page.locator("#exportSubmitBtn").click()
+    page.wait_for_function("() => window.__resolveEditorPreflight !== null")
+    expect(page.locator("#exportDest")).to_be_disabled()
+    expect(page.get_by_role("button", name="Cancel", exact=True)).to_be_enabled()
+    page.evaluate("window.__resolveEditorPreflight()")
     page.wait_for_function("() => window.__editorExportRequest !== null")
     request = page.evaluate("window.__editorExportRequest")
     assert request["photo_ids"] == [photo_id]

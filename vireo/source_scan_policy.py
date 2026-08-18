@@ -11,6 +11,8 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import ntpath
+import os
+import plistlib
 import posixpath
 import subprocess
 import sys
@@ -102,6 +104,35 @@ def _policy_for_filesystem(path, volume_key, fs_type):
     return _policy(path, volume_key, "unknown", 1)
 
 
+def _darwin_device_is_external(source, run):
+    """Read local disk metadata without touching the selected mount path."""
+    if not (source or "").startswith("/dev/"):
+        return None
+    try:
+        result = run(
+            ["diskutil", "info", "-plist", source],
+            capture_output=True, timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    payload = result.stdout or b""
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    try:
+        info = plistlib.loads(payload)
+    except (plistlib.InvalidFileException, TypeError, ValueError):
+        return None
+    location = str(info.get("DeviceLocation") or "").strip().lower()
+    return bool(
+        info.get("RemovableMedia")
+        or info.get("Ejectable")
+        or info.get("Internal") is False
+        or location == "external"
+    )
+
+
 def _darwin_policies(paths, run):
     try:
         result = run(
@@ -115,6 +146,7 @@ def _darwin_policies(paths, run):
     if not mounts:
         return _unknown(paths)
     policies = []
+    external_by_source = {}
     for path in paths:
         mount = _best_mount(path, mounts, case_insensitive=True)
         if mount is None:
@@ -129,13 +161,45 @@ def _darwin_policies(paths, run):
         if remote_setup.mount_type_is_network_or_unknown(fs_type):
             policies.append(_policy(path, "darwin:" + identity, "network", 1))
         else:
-            policies.append(_policy_for_filesystem(
-                path, "darwin:" + identity, fs_type,
-            ))
+            if mount["source"] not in external_by_source:
+                external_by_source[mount["source"]] = (
+                    _darwin_device_is_external(mount["source"], run)
+                )
+            if external_by_source[mount["source"]] is True:
+                policies.append(_policy(
+                    path, "darwin:" + identity, "removable", 1,
+                ))
+            else:
+                policies.append(_policy_for_filesystem(
+                    path, "darwin:" + identity, fs_type,
+                ))
     return policies
 
 
-def _linux_mounts(mountinfo_path):
+def _linux_device_is_removable(device_number, sys_dev_block):
+    """Read the block device's sysfs flag, including a partition's parent."""
+    try:
+        current = os.path.realpath(os.path.join(sys_dev_block, device_number))
+    except (OSError, TypeError, ValueError):
+        return None
+    # A partition (for example sdb1) usually carries the flag on its parent
+    # disk (sdb), so walk a bounded number of metadata-only sysfs ancestors.
+    for _ in range(12):
+        try:
+            with open(os.path.join(current, "removable"), encoding="ascii") as flag:
+                value = flag.read().strip()
+        except OSError:
+            value = ""
+        if value in {"0", "1"}:
+            return value == "1"
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
+def _linux_mounts(mountinfo_path, sys_dev_block):
     mounts = []
     try:
         with open(mountinfo_path, encoding="utf-8") as mountinfo:
@@ -152,14 +216,17 @@ def _linux_mounts(mountinfo_path):
                     "volume_key": "linux:" + left_fields[2],
                     "mount_point": _unescape_mount_path(left_fields[4]),
                     "fs_type": right_fields[0],
+                    "removable": _linux_device_is_removable(
+                        left_fields[2], sys_dev_block,
+                    ),
                 })
     except OSError:
         return []
     return mounts
 
 
-def _linux_policies(paths, mountinfo_path):
-    mounts = _linux_mounts(mountinfo_path)
+def _linux_policies(paths, mountinfo_path, sys_dev_block):
+    mounts = _linux_mounts(mountinfo_path, sys_dev_block)
     if not mounts:
         return _unknown(paths)
     policies = []
@@ -167,6 +234,10 @@ def _linux_policies(paths, mountinfo_path):
         mount = _best_mount(path, mounts)
         if mount is None:
             policies.append(_policy(path, "unknown-volume", "unknown", 1))
+        elif mount["removable"] is True:
+            policies.append(_policy(
+                path, mount["volume_key"], "removable", 1,
+            ))
         else:
             policies.append(_policy_for_filesystem(
                 path, mount["volume_key"], mount["fs_type"],
@@ -263,7 +334,7 @@ def _windows_policies(paths, get_drive_type=None, get_remote_share=None):
 def classify_sources(
     paths, *, platform=None, run=subprocess.run,
     mountinfo_path="/proc/self/mountinfo", get_drive_type=None,
-    get_remote_share=None,
+    get_remote_share=None, sys_dev_block="/sys/dev/block",
 ):
     """Return a conservative per-volume concurrency policy for ``paths``."""
     clean_paths = [path for path in paths if isinstance(path, str) and path]
@@ -271,7 +342,7 @@ def classify_sources(
     if platform == "darwin":
         return _darwin_policies(clean_paths, run)
     if platform.startswith("linux"):
-        return _linux_policies(clean_paths, mountinfo_path)
+        return _linux_policies(clean_paths, mountinfo_path, sys_dev_block)
     if platform == "win32":
         return _windows_policies(
             clean_paths, get_drive_type=get_drive_type,

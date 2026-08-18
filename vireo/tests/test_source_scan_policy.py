@@ -1,4 +1,5 @@
 import os
+import plistlib
 import subprocess
 from types import SimpleNamespace
 
@@ -44,6 +45,29 @@ def test_darwin_mount_failure_falls_back_to_one_shared_serial_lane():
     assert {policy["max_parallel"] for policy in policies} == {1}
 
 
+def test_darwin_apfs_external_disk_is_serialized_as_removable():
+    mount_output = "\n".join([
+        "/dev/disk3s1s1 on / (apfs, local, read-only)",
+        "/dev/disk4s1 on /Volumes/EXTERNAL (apfs, local)",
+    ])
+
+    def run(args, **_kwargs):
+        if args == ["mount"]:
+            return SimpleNamespace(returncode=0, stdout=mount_output)
+        assert args == ["diskutil", "info", "-plist", "/dev/disk4s1"]
+        return SimpleNamespace(
+            returncode=0,
+            stdout=plistlib.dumps({"Internal": False, "Ejectable": True}),
+        )
+
+    policy = source_scan_policy.classify_sources(
+        ["/Volumes/EXTERNAL/Photos"], platform="darwin", run=run,
+    )[0]
+
+    assert policy["storage"] == "removable"
+    assert policy["max_parallel"] == 1
+
+
 def test_linux_uses_mount_identity_and_unescapes_mount_points(tmp_path):
     mountinfo = tmp_path / "mountinfo"
     mountinfo.write_text("\n".join([
@@ -63,6 +87,26 @@ def test_linux_uses_mount_identity_and_unescapes_mount_points(tmp_path):
     ]
     assert [policy["max_parallel"] for policy in policies] == [2, 1, 1, 1]
     assert policies[1]["volume_key"] == policies[2]["volume_key"] == "linux:0:44"
+
+
+def test_linux_ext4_removable_disk_is_serialized(tmp_path):
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        "22 20 8:17 / /media/me/SSD rw - ext4 /dev/sdb1 rw\n")
+    sys_dev_block = tmp_path / "sys" / "dev" / "block"
+    partition = tmp_path / "sys" / "devices" / "block" / "sdb" / "sdb1"
+    partition.mkdir(parents=True)
+    (partition.parent / "removable").write_text("1\n")
+    sys_dev_block.mkdir(parents=True)
+    (sys_dev_block / "8:17").symlink_to(partition)
+
+    policy = source_scan_policy.classify_sources(
+        ["/media/me/SSD/Photos"], platform="linux",
+        mountinfo_path=str(mountinfo), sys_dev_block=str(sys_dev_block),
+    )[0]
+
+    assert policy["storage"] == "removable"
+    assert policy["max_parallel"] == 1
 
 
 def test_windows_distinguishes_fixed_remote_and_removable_drives():

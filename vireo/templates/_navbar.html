@@ -613,6 +613,7 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .lightbox-overlay.lb-hide-chrome .lightbox-nav,
 .lightbox-overlay.lb-hide-chrome .lightbox-actions,
 .lightbox-overlay.lb-hide-chrome .lightbox-adjust-panel,
+.lightbox-overlay.lb-hide-chrome .lightbox-view-panel,
 .lightbox-overlay.lb-hide-chrome .lightbox-zoom-control {
   display: none !important;
 }
@@ -756,7 +757,8 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   cursor: default;
   text-shadow: none;
 }
-.lb-action-btn[aria-pressed="true"] {
+.lb-action-btn[aria-pressed="true"],
+.lb-action-btn[aria-expanded="true"] {
   color: #ffe066;
   border-color: rgba(255, 224, 102, 0.84);
   background: rgba(92, 76, 12, 0.82);
@@ -765,17 +767,14 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   color: #ffe066;
   border-color: rgba(255, 224, 102, 0.84);
 }
-.lb-action-info {
-  color: #9ee7ff;
-  border-color: rgba(158, 231, 255, 0.78);
+.lb-action-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 1px;
+  background: rgba(255, 255, 255, 0.24);
 }
-.lb-action-inat {
-  color: #b9ee5a;
-  border-color: rgba(185, 238, 90, 0.82);
-}
-.lb-action-warning {
-  color: #ffca6a;
-  border-color: rgba(255, 202, 106, 0.82);
+.lb-action-gap {
+  width: 10px;
 }
 .lb-action-danger {
   color: #fff;
@@ -823,22 +822,72 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   display: none;
 }
 .lb-tone-canvas.show { display: block; }
+.lightbox-view-panel {
+  display: none;
+  position: absolute;
+  box-sizing: border-box;
+  width: min(282px, calc(100vw - 16px));
+  max-height: calc(100vh - 112px);
+  overflow-y: auto;
+  padding: 8px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.76);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  cursor: default;
+  z-index: 10001;
+  color: #f4f7f8;
+  font-size: 12px;
+  font-weight: 650;
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.75);
+}
+.lightbox-view-panel.open { display: block; }
+.lb-view-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.lb-view-row:hover { background: rgba(255, 255, 255, 0.09); }
+.lb-view-row input[type="checkbox"] {
+  margin: 0;
+  accent-color: #ffe066;
+}
+.lb-view-row:has(input:disabled) {
+  color: rgba(244, 247, 248, 0.48);
+  cursor: default;
+  text-shadow: none;
+}
+.lb-view-row:has(input:disabled):hover { background: none; }
+.lb-view-label { flex: 1 1 auto; }
+.lb-view-note {
+  font-weight: 500;
+  font-size: 11px;
+  color: rgba(244, 247, 248, 0.62);
+  white-space: nowrap;
+}
+.lb-view-divider {
+  height: 1px;
+  margin: 6px 4px;
+  background: rgba(255, 255, 255, 0.18);
+}
 .lb-mask-controls {
   display: none;
   align-items: center;
-  gap: 6px;
-  min-height: 32px;
-  background: rgba(12, 14, 16, 0.88);
-  border: 1px solid rgba(255, 255, 255, 0.42);
-  border-radius: 4px;
-  padding: 4px 8px;
+  gap: 8px;
+  padding: 2px 8px 6px 30px;
   font-size: 12px;
-  font-weight: 650;
-  color: #f4f7f8;
-  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.75);
+  font-weight: 500;
+  color: rgba(244, 247, 248, 0.85);
 }
-.lb-mask-controls.has-variants { display: inline-flex; }
+.lb-mask-controls.has-variants { display: flex; }
 .lb-mask-controls select {
+  flex: 1 1 auto;
+  min-width: 0;
   background: #f6f2e8;
   color: #222;
   border: 1px solid rgba(255, 255, 255, 0.65);
@@ -3764,51 +3813,78 @@ async function createWorkspace() {
          onclick="event.stopPropagation();"
          title="Select and copy filename"></div>
     <div id="lightboxActions" class="lightbox-actions">
-    <button class="lb-action-btn lb-action-accent" id="lightboxSourceControl" style="display:none;" onclick="event.stopPropagation(); vireoTogglePairSource(_lightboxCurrentId);" title="Switch between the developed JPEG and RAW source">
+    <button class="lb-action-btn" id="lightboxSourceControl" style="display:none;" onclick="event.stopPropagation(); vireoTogglePairSource(_lightboxCurrentId);" title="Switch between the developed JPEG and RAW source">
       Viewing JPEG · Show RAW
     </button>
-    <button class="lb-action-btn" id="lightboxToggleBoxes" onclick="event.stopPropagation(); toggleLightboxBoxes();" title="Toggle detection boxes (b)">
-      Hide Boxes
+    <button class="lb-action-btn" id="lightboxViewBtn" aria-haspopup="true" aria-expanded="false" onclick="event.stopPropagation(); toggleLightboxViewMenu();" title="Overlay and interface visibility options">
+      View &#9662;
     </button>
-    <button class="lb-action-btn" id="lightboxToggleMasks" onclick="event.stopPropagation(); toggleLightboxMasks();" title="Toggle mask overlay">
-      Hide Masks
+    <span class="lb-action-sep" aria-hidden="true"></span>
+    <button class="lb-action-btn" id="lightboxFlagBtn" aria-pressed="false" onclick="event.stopPropagation(); lightboxSetFlagAction('flagged');" title="Flag photo (p)">
+      Flag
     </button>
-    <button class="lb-action-btn" id="lightboxToggleEye" onclick="event.stopPropagation(); toggleLightboxEye();" title="Toggle eye marker">
-      Hide Eye
+    <button class="lb-action-btn" id="lightboxRejectBtn" aria-pressed="false" onclick="event.stopPropagation(); lightboxSetFlagAction('rejected');" title="Reject photo (x)">
+      Reject
     </button>
-    <button class="lb-action-btn" id="lightboxTrackEye" aria-pressed="false" onclick="event.stopPropagation(); toggleLightboxTrackEye();" title="Keep the detected eye in the same screen position while navigating">
-      Track Eye
-    </button>
-    <button class="lb-action-btn" id="lightboxToggleInfo" onclick="event.stopPropagation(); toggleLightboxInfo();" title="Toggle filename, counter, and zoom badge">
-      Hide Info
-    </button>
-    <button class="lb-action-btn" id="lightboxToggleChrome" onclick="event.stopPropagation(); toggleLightboxChrome();" title="Toggle lightbox controls">
-      Hide UI
-    </button>
-    <span class="lb-mask-controls" id="lightboxMaskControls" onclick="event.stopPropagation();" title="SAM mask overlay">
-      <span>Mask:</span>
-      <select id="lightboxMaskSelect" onchange="event.stopPropagation(); _lbOnMaskVariantChange();"></select>
-    </span>
-    <button class="lb-action-btn lb-action-warning" id="lightboxNotWildlife" onclick="event.stopPropagation(); lightboxToggleWildlifeExcluded();" title="Exclude from wildlife detection and classification">
+    <button class="lb-action-btn" id="lightboxNotWildlife" onclick="event.stopPropagation(); lightboxToggleWildlifeExcluded();" title="Exclude from wildlife detection and classification">
       Not Wildlife
     </button>
-    <button class="lb-action-btn lb-action-inat" id="lightboxInat" onclick="">
+    <span class="lb-action-sep" aria-hidden="true"></span>
+    <button class="lb-action-btn" id="lightboxInat" onclick="">
       iNaturalist
     </button>
-    <button class="lb-action-btn lb-action-info" id="lightboxSimilar" onclick="">
+    <button class="lb-action-btn" id="lightboxSimilar" onclick="">
       Find Similar
     </button>
-    <button class="lb-action-btn lb-action-accent" id="lightboxInspect" onclick="">
+    <button class="lb-action-btn" id="lightboxInspect" onclick="">
       Inspect Pipeline
     </button>
-    <button class="lb-action-btn lb-action-accent" id="lightboxAdjustBtn" onclick="event.stopPropagation(); toggleLightboxAdjustPanel();" title="Quick non-destructive adjustments">
+    <span class="lb-action-sep" aria-hidden="true"></span>
+    <button class="lb-action-btn" id="lightboxAdjustBtn" aria-expanded="false" onclick="event.stopPropagation(); toggleLightboxAdjustPanel();" title="Quick non-destructive adjustments">
       Adjust
     </button>
     <button class="lb-action-btn lb-action-accent" id="lightboxEditPhoto" onclick="">
       Edit Photo
     </button>
+    <span class="lb-action-gap" aria-hidden="true"></span>
     <button class="lb-action-btn lb-action-danger" id="lightboxDeleteBtn" onclick="lightboxDelete()" title="Delete photo">Delete</button>
     </div>
+  </div>
+  <div class="lightbox-view-panel" id="lightboxViewPanel" onclick="event.stopPropagation();">
+    <label class="lb-view-row" title="Toggle detection boxes (b)">
+      <input type="checkbox" id="lightboxToggleBoxes" onchange="toggleLightboxBoxes();">
+      <span class="lb-view-label">Detection boxes</span>
+      <span class="lb-view-note" id="lightboxBoxesNote"></span>
+    </label>
+    <label class="lb-view-row" title="Toggle mask overlay">
+      <input type="checkbox" id="lightboxToggleMasks" onchange="toggleLightboxMasks();">
+      <span class="lb-view-label">Mask overlay</span>
+      <span class="lb-view-note" id="lightboxMasksNote"></span>
+    </label>
+    <span class="lb-mask-controls" id="lightboxMaskControls" title="SAM mask overlay variant">
+      <span>Variant</span>
+      <select id="lightboxMaskSelect" onchange="event.stopPropagation(); _lbOnMaskVariantChange();"></select>
+    </span>
+    <label class="lb-view-row" title="Toggle eye marker">
+      <input type="checkbox" id="lightboxToggleEye" onchange="toggleLightboxEye();">
+      <span class="lb-view-label">Eye marker</span>
+      <span class="lb-view-note" id="lightboxEyeNote"></span>
+    </label>
+    <label class="lb-view-row" title="Keep the detected eye in the same screen position while navigating">
+      <input type="checkbox" id="lightboxTrackEye" onchange="toggleLightboxTrackEye();">
+      <span class="lb-view-label">Track eye between photos</span>
+      <span class="lb-view-note" id="lightboxTrackEyeNote"></span>
+    </label>
+    <div class="lb-view-divider"></div>
+    <label class="lb-view-row" title="Toggle filename, counter, and zoom badge">
+      <input type="checkbox" id="lightboxToggleInfo" onchange="toggleLightboxInfo();">
+      <span class="lb-view-label">Filename &amp; counter</span>
+    </label>
+    <label class="lb-view-row" title="Toggle lightbox controls (h)">
+      <input type="checkbox" id="lightboxToggleChrome" onchange="toggleLightboxChrome();">
+      <span class="lb-view-label">Lightbox controls</span>
+      <span class="lb-view-note">h restores</span>
+    </label>
   </div>
   <div class="lightbox-adjust-panel" id="lightboxAdjustPanel" onclick="event.stopPropagation();">
     <div class="lb-adjust-header">
@@ -4006,6 +4082,8 @@ function _lbGuardReadOnly() {
 
 function _lbApplyReadOnlyState() {
   var controls = [
+    ['lightboxFlagBtn', 'Flag photo (p)'],
+    ['lightboxRejectBtn', 'Reject photo (x)'],
     ['lightboxNotWildlife', 'Exclude from wildlife detection and classification'],
     ['lightboxInat', 'Submit to iNaturalist'],
     ['lightboxAdjustBtn', 'Quick non-destructive adjustments'],
@@ -5940,7 +6018,7 @@ function toggleLightboxAdjustPanel() {
   if (!panel) return;
   var open = !panel.classList.contains('open');
   panel.classList.toggle('open', open);
-  if (btn) btn.textContent = open ? 'Hide Adjust' : 'Adjust';
+  if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
   if (open) {
     _lbRenderAdjustmentControls();
     _lbSetAdjustmentControlsDisabled(!_lbEditRecipeLoaded);
@@ -6272,14 +6350,13 @@ function _lbNormalizeFlag(flag) {
 }
 
 function _lbSetFlagStatus(flag) {
+  var normalized = typeof flag === 'undefined' ? null : _lbNormalizeFlag(flag);
+  var flagBtn = document.getElementById('lightboxFlagBtn');
+  var rejectBtn = document.getElementById('lightboxRejectBtn');
+  if (flagBtn) flagBtn.setAttribute('aria-pressed', normalized === 'flagged' ? 'true' : 'false');
+  if (rejectBtn) rejectBtn.setAttribute('aria-pressed', normalized === 'rejected' ? 'true' : 'false');
   var el = document.getElementById('lightboxFlagStatus');
   if (!el) return;
-  if (typeof flag === 'undefined') {
-    el.className = 'lightbox-flag-status';
-    el.textContent = '';
-    return;
-  }
-  var normalized = _lbNormalizeFlag(flag);
   el.className = 'lightbox-flag-status';
   if (!normalized) {
     el.textContent = '';
@@ -6562,14 +6639,13 @@ function _lbApplyBoxesVisibility() {
   var container = document.getElementById('lightboxDetections');
   var available = _lbSourceOverlaysAvailable();
   if (container) container.style.display = (_lbBoxesVisible && available) ? '' : 'none';
-  var btn = document.getElementById('lightboxToggleBoxes');
-  if (btn) {
-    btn.disabled = !available;
-    btn.textContent = !available ? 'Boxes Edited' : (_lbBoxesVisible ? 'Hide Boxes' : 'Show Boxes');
-    btn.title = !available
-      ? 'Detection boxes are hidden for geometrically edited photos'
-      : 'Toggle detection boxes (b)';
+  var input = document.getElementById('lightboxToggleBoxes');
+  if (input) {
+    input.disabled = !available;
+    input.checked = _lbBoxesVisible;
   }
+  var note = document.getElementById('lightboxBoxesNote');
+  if (note) note.textContent = available ? '' : 'unavailable for edited photos';
 }
 
 function toggleLightboxBoxes() {
@@ -6581,8 +6657,8 @@ function toggleLightboxBoxes() {
 function _lbApplyInfoVisibility() {
   var overlay = document.getElementById('lightboxOverlay');
   if (overlay) overlay.classList.toggle('lb-hide-info', !_lbInfoVisible);
-  var btn = document.getElementById('lightboxToggleInfo');
-  if (btn) btn.textContent = _lbInfoVisible ? 'Hide Info' : 'Show Info';
+  var input = document.getElementById('lightboxToggleInfo');
+  if (input) input.checked = _lbInfoVisible;
 }
 
 function toggleLightboxInfo() {
@@ -6595,8 +6671,8 @@ function toggleLightboxInfo() {
 function _lbApplyChromeVisibility() {
   var overlay = document.getElementById('lightboxOverlay');
   if (overlay) overlay.classList.toggle('lb-hide-chrome', !_lbChromeVisible);
-  var btn = document.getElementById('lightboxToggleChrome');
-  if (btn) btn.textContent = _lbChromeVisible ? 'Hide UI' : 'Show UI';
+  var input = document.getElementById('lightboxToggleChrome');
+  if (input) input.checked = _lbChromeVisible;
 }
 
 function toggleLightboxChrome() {
@@ -6606,6 +6682,90 @@ function toggleLightboxChrome() {
   _lbApplyChromeVisibility();
 }
 
+function _lbPositionViewPanel() {
+  var panel = document.getElementById('lightboxViewPanel');
+  var btn = document.getElementById('lightboxViewBtn');
+  if (!panel || !btn || !panel.classList.contains('open')) return;
+  // The actions wrap and conditionally gain controls as photos change. Keep
+  // the panel attached to its button even when that happens while it is open.
+  var gutter = 8;
+  var btnRect = btn.getBoundingClientRect();
+  var maxLeft = Math.max(gutter, window.innerWidth - panel.offsetWidth - gutter);
+  var desiredBottom = window.innerHeight - btnRect.top + gutter;
+  var maxBottom = Math.max(gutter, window.innerHeight - panel.offsetHeight - gutter);
+  panel.style.left = Math.max(gutter, Math.min(btnRect.left, maxLeft)) + 'px';
+  panel.style.bottom = Math.max(gutter, Math.min(desiredBottom, maxBottom)) + 'px';
+}
+
+var _lbViewPanelPositionFrame = null;
+function _lbScheduleViewPanelPosition() {
+  if (_lbViewPanelPositionFrame !== null) return;
+  _lbViewPanelPositionFrame = requestAnimationFrame(function() {
+    _lbViewPanelPositionFrame = null;
+    _lbPositionViewPanel();
+  });
+}
+
+function toggleLightboxViewMenu(force) {
+  var panel = document.getElementById('lightboxViewPanel');
+  var btn = document.getElementById('lightboxViewBtn');
+  if (!panel || !btn) return;
+  var open = typeof force === 'boolean' ? force : !panel.classList.contains('open');
+  panel.classList.toggle('open', open);
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (!open) return;
+  // Refresh every row so the menu reflects the current photo's state.
+  _lbApplyBoxesVisibility();
+  _lbApplyMaskToggleButton();
+  _lbApplyEyeVisibility();
+  _lbApplyTrackEyeState();
+  _lbApplyInfoVisibility();
+  _lbApplyChromeVisibility();
+  // The overlay is position:fixed inset:0, so viewport coords map directly.
+  _lbPositionViewPanel();
+}
+
+(function() {
+  var actions = document.getElementById('lightboxActions');
+  var viewBtn = document.getElementById('lightboxViewBtn');
+  window.addEventListener('resize', _lbScheduleViewPanelPosition);
+  document.addEventListener('fullscreenchange', _lbScheduleViewPanelPosition);
+  document.addEventListener('webkitfullscreenchange', _lbScheduleViewPanelPosition);
+  if (window.ResizeObserver) {
+    var viewLayoutObserver = new ResizeObserver(_lbScheduleViewPanelPosition);
+    if (actions) viewLayoutObserver.observe(actions);
+    if (viewBtn) viewLayoutObserver.observe(viewBtn);
+  }
+  if (window.MutationObserver && actions) {
+    var viewLayoutMutationObserver = new MutationObserver(_lbScheduleViewPanelPosition);
+    viewLayoutMutationObserver.observe(actions, {
+      attributes: true,
+      childList: true,
+      characterData: true,
+      subtree: true
+    });
+  }
+})();
+
+function lightboxSetFlagAction(flag) {
+  if (_lightboxCurrentId == null) return;
+  var pid = _lightboxCurrentId;
+  // Clicking the button for the photo's current state clears it, so the pair
+  // covers flag/reject/unflag without a third button. Match against the
+  // *displayed* flag (which includes provisional edits, e.g. Group Review
+  // stages picks/rejects before Apply) so a second click on an already-lit
+  // button clears the shown state instead of re-applying the same edit.
+  var current = _lbNormalizeFlag(_lbDisplayedFlagFor(pid)) || 'none';
+  var target = (current === flag) ? 'none' : flag;
+  // Same dispatch order as the keyboard shortcuts: the misses page intercepts
+  // flag writes to keep its local model in sync.
+  if (
+    typeof window.handleMissesLightboxFlagShortcut === 'function' &&
+    window.handleMissesLightboxFlagShortcut(pid, target) === true
+  ) return;
+  _lbApplyFlag(pid, target);
+}
+
 function _lbApplyEyeVisibility() {
   var container = document.getElementById('lightboxEye');
   var available = _lbSourceOverlaysAvailable();
@@ -6613,14 +6773,13 @@ function _lbApplyEyeVisibility() {
     container.style.display =
       (_lbEyeVisible && available && container.childElementCount > 0) ? 'block' : 'none';
   }
-  var btn = document.getElementById('lightboxToggleEye');
-  if (btn) {
-    btn.disabled = !available;
-    btn.textContent = !available ? 'Eye Edited' : (_lbEyeVisible ? 'Hide Eye' : 'Show Eye');
-    btn.title = !available
-      ? 'Eye marker is hidden for geometrically edited photos'
-      : 'Toggle eye marker';
+  var input = document.getElementById('lightboxToggleEye');
+  if (input) {
+    input.disabled = !available;
+    input.checked = _lbEyeVisible;
   }
+  var note = document.getElementById('lightboxEyeNote');
+  if (note) note.textContent = available ? '' : 'unavailable for edited photos';
 }
 
 function toggleLightboxEye() {
@@ -6652,36 +6811,34 @@ function _lbPhotoEyePoint(photoId, photo) {
 }
 
 function _lbApplyTrackEyeState() {
-  var btn = document.getElementById('lightboxTrackEye');
-  if (!btn) return;
+  var input = document.getElementById('lightboxTrackEye');
+  if (!input) return;
   var photo = _lbPhotoData(_lightboxCurrentId);
   var eyeKnown = !!(
     photo && Object.prototype.hasOwnProperty.call(photo, 'eye_x')
   );
   var hasEye = !!_lbPhotoEyePoint(_lightboxCurrentId, photo);
   var available = hasEye && _lbSourceOverlaysAvailable();
-  btn.setAttribute('aria-pressed', _lbTrackEyeEnabled ? 'true' : 'false');
-  if (_lbTrackEyeEnabled) {
-    if (available) {
-      btn.textContent = 'Tracking Eye';
-    } else if (eyeKnown) {
-      btn.textContent = 'Eye Tracking Paused';
+  input.checked = _lbTrackEyeEnabled;
+  var note = document.getElementById('lightboxTrackEyeNote');
+  if (note) {
+    if (_lbTrackEyeEnabled && !available) {
+      note.textContent = eyeKnown ? 'paused for this photo' : 'waiting for eye';
     } else {
-      btn.textContent = 'Waiting for Eye';
+      note.textContent = '';
     }
-  } else {
-    btn.textContent = 'Track Eye';
   }
-  if (_lbTrackEyeEnabled && !available) {
-    btn.title = eyeKnown
-      ? 'Eye tracking is on but unavailable for this photo'
-      : 'Eye tracking is on; waiting for this photo\'s eye metadata';
-  } else if (!_lbTrackEyeEnabled && !available) {
-    btn.title = 'Turn on eye tracking; it will start when a usable eye keypoint is available';
-  } else {
-    btn.title = _lbTrackEyeEnabled
-      ? 'Keep the detected eye in the same screen position while navigating'
-      : 'Track the detected eye while navigating';
+  var row = input.closest('.lb-view-row');
+  if (row) {
+    if (_lbTrackEyeEnabled && !available) {
+      row.title = eyeKnown
+        ? 'Eye tracking is on but unavailable for this photo'
+        : 'Eye tracking is on; waiting for this photo\'s eye metadata';
+    } else if (!_lbTrackEyeEnabled && !available) {
+      row.title = 'Turn on eye tracking; it will start when a usable eye keypoint is available';
+    } else {
+      row.title = 'Keep the detected eye in the same screen position while navigating';
+    }
   }
 }
 
@@ -6900,20 +7057,13 @@ function _lbApplyMaskUrl(url) {
 }
 
 function _lbApplyMaskToggleButton() {
-  var btn = document.getElementById('lightboxToggleMasks');
-  if (!btn) return;
+  var input = document.getElementById('lightboxToggleMasks');
+  if (!input) return;
   var available = _lbSourceOverlaysAvailable();
-  if (!available) {
-    btn.disabled = true;
-    btn.textContent = 'Masks Hidden';
-    btn.title = 'Mask overlay is hidden for geometrically edited photos';
-    btn.setAttribute('aria-label', btn.title);
-    return;
-  }
-  btn.disabled = false;
-  btn.textContent = _lbMasksVisible ? 'Hide Masks' : 'Show Masks';
-  btn.title = 'Toggle mask overlay';
-  btn.setAttribute('aria-label', btn.title);
+  input.disabled = !available;
+  input.checked = _lbMasksVisible;
+  var note = document.getElementById('lightboxMasksNote');
+  if (note) note.textContent = available ? '' : 'unavailable for edited photos';
 }
 
 function _lbApplyWildlifeExcludedButton() {
@@ -8293,7 +8443,8 @@ function closeLightbox(e) {
   var adjustPanel = document.getElementById('lightboxAdjustPanel');
   if (adjustPanel) adjustPanel.classList.remove('open');
   var adjustBtn = document.getElementById('lightboxAdjustBtn');
-  if (adjustBtn) adjustBtn.textContent = 'Adjust';
+  if (adjustBtn) adjustBtn.setAttribute('aria-expanded', 'false');
+  toggleLightboxViewMenu(false);
   _lbSetZoomPopoverOpen(false);
   _lbApplyTransform();
   document.getElementById('lightboxOverlay').classList.remove('active');
@@ -9331,6 +9482,17 @@ async function inatDoSubmit() {
 // See src-tauri/src/menu.rs for the menu definition.
 // If adding JS-based navigation shortcuts, guard with:
 //   if (window.__TAURI_INTERNALS__) return;
+// True when the key event's target is a field where typing/arrows must edit
+// the field instead of driving lightbox shortcuts. Checkboxes and radios are
+// deliberately NOT editable: the View menu's toggles keep focus after a
+// click, and they consume no text or arrow keys, so hotkeys (b, h, arrows)
+// must keep working while one is focused. Text inputs, selects, and range
+// sliders (the Adjust panel) genuinely consume keys, so they stay guarded.
+function _lbKeyTargetEditable(t) {
+  if (!t) return false;
+  if (t.tagName === 'INPUT') return !(t.type === 'checkbox' || t.type === 'radio');
+  return t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || !!t.isContentEditable;
+}
 document.addEventListener('keydown', function(e) {
   // Esc handling for the lightbox + overlay cascade is owned by the Keymap.pushEsc
   // stack now: each open*() pushes its close*() and each close*() pops it. The
@@ -9342,9 +9504,7 @@ document.addEventListener('keydown', function(e) {
   // so the lightbox keeps keyboard precedence; the burst modal's own keydown
   // handler bails while the lightbox is open.
   if (document.querySelector('.pipeline-overlay.active, .similar-overlay.active, .modal-overlay.open, .inspect-overlay.open, .shortcuts-overlay.open, .help-overlay.active, .report-overlay.active')) return;
-  var tag0 = e.target && e.target.tagName;
-  var editable0 = tag0 === 'INPUT' || tag0 === 'TEXTAREA' || tag0 === 'SELECT' ||
-    (e.target && e.target.isContentEditable);
+  var editable0 = _lbKeyTargetEditable(e.target);
   // Editable check must come before arrow handling so arrows inside form
   // fields (e.g. the mask-variant <select>) change the value, not the photo.
   if (!editable0 && e.key === 'ArrowRight') {
@@ -9384,10 +9544,7 @@ document.addEventListener('keydown', function(e) {
   }
   var boxesKey = (window._vireoShortcuts && window._vireoShortcuts.browse && window._vireoShortcuts.browse.toggle_boxes) || 'b';
   if (matchesShortcut(e, boxesKey)) {
-    var tag2 = e.target && e.target.tagName;
-    var editable2 = tag2 === 'INPUT' || tag2 === 'TEXTAREA' || tag2 === 'SELECT' ||
-      (e.target && e.target.isContentEditable);
-    if (!editable2) {
+    if (!_lbKeyTargetEditable(e.target)) {
       toggleLightboxBoxes();
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -9400,10 +9557,7 @@ document.addEventListener('keydown', function(e) {
   var browseSc = window._vireoShortcuts && window._vireoShortcuts.browse;
   var uiKey = browseSc && 'toggle_ui' in browseSc ? browseSc.toggle_ui : 'h';
   if (matchesShortcut(e, uiKey)) {
-    var tagUi = e.target && e.target.tagName;
-    var editableUi = tagUi === 'INPUT' || tagUi === 'TEXTAREA' || tagUi === 'SELECT' ||
-      (e.target && e.target.isContentEditable);
-    if (!editableUi) {
+    if (!_lbKeyTargetEditable(e.target)) {
       toggleLightboxChrome();
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -9422,9 +9576,7 @@ document.addEventListener('keydown', function(e) {
   }
   // Skip when focus is in a form field — modals opened from the lightbox (e.g. iNaturalist)
   // need '-' / '0' as literal input in lat/lon fields.
-  var tag = e.target && e.target.tagName;
-  var editable = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' ||
-    (e.target && e.target.isContentEditable);
+  var editable = _lbKeyTargetEditable(e.target);
   // Flag / Reject / Unflag — operate on the photo currently displayed in the
   // lightbox. The lightbox is shared across pages; setFlagFor (browse) and
   // setReviewFlag (review) update their page's local model, so prefer them

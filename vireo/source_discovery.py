@@ -42,7 +42,10 @@ def unique_root_names(folders):
     root_names = {}
     parts = [Path(f).parts for f in folders]
     for depth in range(1, max(len(p) for p in parts) + 1):
-        suffixes = [str(Path(*p[-depth:])) for p in parts]
+        # These names are browser-facing labels, not paths passed back to the
+        # filesystem. Keep their separator stable across server platforms so
+        # POSIX-shaped inputs do not render with backslashes on Windows.
+        suffixes = ["/".join(p[-depth:]) for p in parts]
         if len(set(suffixes)) == len(suffixes):
             for folder_path, suffix in zip(folders, suffixes, strict=True):
                 root_names[folder_path] = suffix

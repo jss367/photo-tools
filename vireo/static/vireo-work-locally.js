@@ -713,17 +713,20 @@
     });
     render();
     // A worker can publish its first update before the POST response gives us
-    // the job ID. The event stream is intentionally live-only, so seed this
-    // watcher from the job snapshot unless a newer SSE update wins the race.
-    Vireo.api.json(
-      '/api/jobs/' + encodeURIComponent(jobId), {}, {toast: false}
-    ).then(function(snapshot) {
-      if (activeJob !== watch || watch.eventCount || !snapshot) return;
-      var progress = snapshot.progress || {};
-      if (progress.phase || progress.root_folder_id != null) {
-        applyJobProgress(watch, progress);
-      }
-    }).catch(function() {});
+    // the job ID. Wait until Flask has accepted the live subscription before
+    // reading the snapshot, closing the gap where an update could otherwise
+    // fall between the GET response and the EventSource connection.
+    watch.source.addEventListener('open', function() {
+      Vireo.api.json(
+        '/api/jobs/' + encodeURIComponent(jobId), {}, {toast: false}
+      ).then(function(snapshot) {
+        if (activeJob !== watch || watch.eventCount || !snapshot) return;
+        var progress = snapshot.progress || {};
+        if (progress.phase || progress.root_folder_id != null) {
+          applyJobProgress(watch, progress);
+        }
+      }).catch(function() {});
+    }, {once: true});
   }
 
   async function load() {

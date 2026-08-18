@@ -33,6 +33,30 @@ def test_navbar_links_navigate_to_browse(live_server, page):
     expect(page).to_have_url(f"{url}/browse")
 
 
+def test_editor_browse_nav_focuses_current_photo(live_server, page):
+    """Browse navigation from Edit carries the photo being edited."""
+    url = live_server["url"]
+    photo_id = live_server["data"]["photos"][0]
+    next_photo_id = live_server["data"]["photos"][1]
+
+    page.goto(f"{url}/edit/{photo_id}")
+    expect(page.locator("#editorFilename")).to_have_text("hawk1.jpg")
+
+    # The editor changes photos in place, so verify the Browse target follows
+    # the current photo instead of retaining the route used on first render.
+    page.evaluate("photoId => loadPhoto(photoId)", next_photo_id)
+    expect(page).to_have_url(f"{url}/edit/{next_photo_id}")
+
+    browse_link = page.locator("[data-testid='nav-browse']")
+    expect(browse_link).to_have_attribute(
+        "href", f"/browse?photo_id={next_photo_id}"
+    )
+    browse_link.click()
+
+    expect(page).to_have_url(f"{url}/browse?photo_id={next_photo_id}")
+    expect(page.locator(f'.grid-card[data-id="{next_photo_id}"]')).to_be_visible()
+
+
 def test_workspace_dropdown_shows_current(live_server, page):
     """Workspace dropdown displays the current workspace name."""
     url = live_server["url"]

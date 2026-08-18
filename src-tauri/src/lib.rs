@@ -382,7 +382,13 @@ pub fn run() {
                     let url = format!("http://127.0.0.1:{}{}", port, route);
                     open_in_browser(app, &url);
                 } else if let Some(window) = app.get_webview_window("main") {
-                    let js = format!("window.location.href = '{}'", route);
+                    // Let the web UI preserve page-specific context. In
+                    // particular, Edit resolves /browse to the current
+                    // photo's Browse deep link so View -> Browse focuses it.
+                    let js = format!(
+                        "window.location.href = (typeof window.vireoResolveNavigationHref === 'function' ? window.vireoResolveNavigationHref('{}') : '{}')",
+                        route, route
+                    );
                     if let Err(e) = window.eval(&js) {
                         log::error!("Failed to navigate to {}: {}", route, e);
                     }

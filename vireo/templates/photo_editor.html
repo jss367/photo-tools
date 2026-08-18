@@ -1044,13 +1044,16 @@ var editorState = {
   photoId: null,
   photo: null,
   savedRecipe: {},
+  savedRecipeSeq: 0,
   recipe: {},
   presets: [],
   localDraft: {subject: {}, background: {}, feather: 0},
   localMask: null,
   localMaskPromise: null,
+  localMaskUpdateSeq: 0,
   localAvailable: false,
   localStale: false,
+  savedLocalStale: false,
   maskOverlay: false,
   maskOverlaySeq: 0,
   maskOverlayTimer: null,
@@ -1081,6 +1084,7 @@ var editorState = {
   // `searchSeq`, this mismatch tells us the in-flight response was already
   // invalidated so a replacement fetch is required.
   searchQuerySeq: 0,
+  savingPhotoIds: {},
   suppressUnloadPrompt: false,
 };
 
@@ -2800,12 +2804,14 @@ function resetLocal() {
 
 async function updateLocalMask() {
   var photoId = editorState.photoId;
+  var updateSeq = ++editorState.localMaskUpdateSeq;
   try {
     var data = await safeFetch(
       '/api/photos/' + photoId + '/local-mask/snapshot',
       {method: 'POST'}, {toast: false}
     );
-    if (editorState.photoId !== photoId) return;
+    if (editorState.photoId !== photoId ||
+        editorState.localMaskUpdateSeq !== updateSeq) return;
     editorState.localMask = data.mask;
     editorState.localStale = false;
     rebuildLocalSection();
@@ -2815,6 +2821,8 @@ async function updateLocalMask() {
       showToast('Subject mask updated — save to keep it', 'success');
     }
   } catch (e) {
+    if (editorState.photoId !== photoId ||
+        editorState.localMaskUpdateSeq !== updateSeq) return;
     if (typeof showToast === 'function') {
       showToast(e.message || 'Could not update the subject mask', 'error');
     }
@@ -3131,10 +3139,12 @@ function resetAllEdits() {
 
 async function saveRecipe(description) {
   if (!editorState.photoId) return false;
+  if (editorState.savingPhotoIds[String(editorState.photoId)]) return false;
   // Capture the photo being saved so a Prev/Next during the PUT can't make us
   // write the previous photo's returned recipe back into the editor state for
   // a different photo (or refresh the cache under the wrong photoId).
   var savedPhotoId = editorState.photoId;
+  editorState.savingPhotoIds[String(savedPhotoId)] = true;
   var acceptingCropEdit = editorState.cropEditing &&
     !!recipeForSave(editorState.recipe).crop;
   var btn = document.getElementById('saveBtn');
@@ -3162,7 +3172,10 @@ async function saveRecipe(description) {
     // button — don't overwrite it with the previous photo's saved data.
     if (editorState.photoId !== savedPhotoId) return false;
     editorState.savedRecipe = cloneRecipe(data.recipe || {});
+    editorState.savedRecipeSeq++;
     editorState.recipe = cloneRecipe(data.recipe || {});
+    editorState.savedLocalStale = !!data.local_mask_stale;
+    editorState.localStale = editorState.savedLocalStale;
     ensureCrop(editorState.recipe);
     editorState.cropEditing = !recipeForSave(editorState.recipe).crop;
     if (acceptingCropEdit && !editorState.cropEditing) {
@@ -3181,6 +3194,8 @@ async function saveRecipe(description) {
       setStatus(e.message || 'Save failed', true);
     }
     return false;
+  } finally {
+    delete editorState.savingPhotoIds[String(savedPhotoId)];
   }
 }
 
@@ -3860,6 +3875,199 @@ function copyEditSettings() {
   else setStatus('Settings copied');
 }
 
+function revertUnsavedEdits() {
+  if (editorState.loading || editorState.savingPhotoIds[String(editorState.photoId)] ||
+      !isEditorDirty()) return;
+  if (!window.confirm('Discard unsaved edits and return to the last saved version?')) return;
+  // A mask update may still be awaiting its snapshot POST. Its result belongs
+  // to the discarded working state and must not make the restored recipe dirty.
+  editorState.localMaskUpdateSeq++;
+  editorState.recipe = cloneRecipe(editorState.savedRecipe);
+  editorState.localStale = editorState.savedLocalStale;
+  ensureCrop(editorState.recipe);
+  editorState.showBefore = false;
+  editorState.cropEditing = !recipeForSave(editorState.recipe).crop;
+  editorState.cropAspect = null;
+  editorState.zoomMode = 'fit';
+  updateAspectButtons();
+  syncControls();
+  updatePreview();
+  if (typeof showToast === 'function') showToast('Unsaved edits discarded', 'success');
+  else setStatus('Unsaved edits discarded');
+}
+
+function exportCurrentEditedPhoto() {
+  if (!editorState.photoId || editorState.loading ||
+      editorState.savingPhotoIds[String(editorState.photoId)]) return;
+  return openExportModal();
+}
+
+function sendCurrentEditedPhotoToInat() {
+  if (!editorState.photoId || editorState.loading ||
+      editorState.savingPhotoIds[String(editorState.photoId)] || isEditorDirty()) return;
+  if (typeof window.submitToInat === 'function') {
+    window.submitToInat(editorState.photoId);
+  }
+}
+
+function buildPhotoEditorContextMenu() {
+  var unavailable = !editorState.photoId || editorState.loading;
+  var dirty = !unavailable && isEditorDirty();
+  var savePending = !unavailable &&
+    !!editorState.savingPhotoIds[String(editorState.photoId)];
+  var recipe = unavailable ? {} : recipeForSave(editorState.recipe);
+  var hasEdits = Object.keys(recipe || {}).length > 0;
+  var beforeLabel = editorState.showBefore ? 'Show Current Edits' : 'Show Saved Version';
+
+  return [
+    {
+      label: 'Save Changes',
+      disabled: !dirty || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : 'No unsaved changes'),
+      onClick: function() { saveRecipe(); },
+    },
+    {
+      label: 'Revert to Saved',
+      disabled: !dirty || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : 'No unsaved changes'),
+      onClick: revertUnsavedEdits,
+    },
+    { separator: true },
+    {
+      label: beforeLabel,
+      disabled: !dirty && !editorState.showBefore,
+      disabledHint: unavailable ? 'No photo is ready to edit' : 'Make an edit to compare it with the saved version',
+      onClick: toggleBeforePreview,
+    },
+    {
+      label: 'Fit to Window',
+      disabled: unavailable || editorState.zoomMode === 'fit',
+      disabledHint: unavailable ? 'No photo is ready to edit' : 'Already fit to the window',
+      onClick: setEditorZoomToFit,
+    },
+    {
+      label: 'View at 100%',
+      disabled: unavailable || editorIsActualZoom(),
+      disabledHint: unavailable ? 'No photo is ready to edit' : 'Already viewing at 100%',
+      onClick: setEditorZoomToActual,
+    },
+    { separator: true },
+    {
+      label: 'Auto Tone',
+      disabled: unavailable || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : undefined),
+      onClick: autoTone,
+    },
+    {
+      label: 'Edit Crop',
+      disabled: unavailable || savePending || editorState.cropEditing || editorState.showBefore,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending
+          ? 'Saving changes'
+          : (editorState.showBefore ? 'Return to the current edit first' : 'Crop editing is already active')),
+      onClick: beginCropEdit,
+    },
+    {
+      label: 'Full Frame',
+      disabled: unavailable || savePending || !recipe.crop,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : 'The full frame is already selected'),
+      onClick: resetCrop,
+    },
+    {
+      label: 'Rotate Left',
+      disabled: unavailable || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : undefined),
+      onClick: function() { rotateRecipe(-90); },
+    },
+    {
+      label: 'Rotate Right',
+      disabled: unavailable || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : undefined),
+      onClick: function() { rotateRecipe(90); },
+    },
+    {
+      label: 'Flip Horizontal',
+      disabled: unavailable || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : undefined),
+      onClick: function() { flipRecipe('horizontal'); },
+    },
+    {
+      label: 'Flip Vertical',
+      disabled: unavailable || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : undefined),
+      onClick: function() { flipRecipe('vertical'); },
+    },
+    { separator: true },
+    {
+      label: 'Copy Edit Settings',
+      disabled: unavailable || !hasEdits,
+      disabledHint: unavailable ? 'No photo is ready to edit' : 'There are no edit settings to copy',
+      onClick: copyEditSettings,
+    },
+    {
+      label: 'Reset All Edits',
+      disabled: unavailable || savePending || !hasEdits,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : 'There are no edits to reset'),
+      onClick: resetAllEdits,
+    },
+    { separator: true },
+    {
+      label: 'Export\u2026',
+      disabled: unavailable || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to export'
+        : (savePending ? 'Saving changes' : undefined),
+      onClick: exportCurrentEditedPhoto,
+    },
+    {
+      label: 'Send to iNaturalist',
+      disabled: unavailable || dirty || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to send'
+        : (savePending ? 'Saving changes' :
+          (dirty ? 'Save changes before sending to iNaturalist' : undefined)),
+      onClick: sendCurrentEditedPhotoToInat,
+    },
+  ];
+}
+
+function initEditorContextMenu() {
+  var shell = document.querySelector('.editor-shell');
+  if (!shell || typeof window.openContextMenu !== 'function') return;
+  shell.addEventListener('contextmenu', function(e) {
+    // Keep the browser's native spelling/copy/paste menu anywhere text can be
+    // entered or selected. The Vireo menu owns the rest of the editor surface.
+    var target = e.target;
+    if (target && target.closest &&
+        target.closest('input, textarea, select, [contenteditable]')) return;
+    var selection = window.getSelection ? window.getSelection() : null;
+    if (selection && !selection.isCollapsed && String(selection).trim()) return;
+    if (target && target.closest && target.closest('.vireo-ctx-menu')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    openContextMenu(e, buildPhotoEditorContextMenu());
+  });
+}
+
 function editorEmptyState() {
   document.getElementById('editorFilename').textContent = 'No photo to edit';
   document.getElementById('editorSubhead').textContent = 'Open a photo from Browse, then choose Edit.';
@@ -3875,6 +4083,15 @@ function editorEmptyState() {
   });
 }
 
+function applyLoadedLocalStaleness(photoId, loadSeq, savedRecipeSeq, data) {
+  if (editorState.photoId !== photoId || editorState.loadSeq !== loadSeq ||
+      editorState.savedRecipeSeq !== savedRecipeSeq) return false;
+  editorState.localStale = !!data.local_mask_stale;
+  editorState.savedLocalStale = editorState.localStale;
+  updateLocalBandVisibility();
+  return true;
+}
+
 async function loadPhoto(photoId, opts) {
   opts = opts || {};
   photoId = Number(photoId);
@@ -3882,12 +4099,14 @@ async function loadPhoto(photoId, opts) {
   // Rapid Next/Prev can leave multiple /api/photos/:id requests in flight; the
   // seq lets a stale resolution bail out instead of overwriting newer state.
   var seq = ++editorState.loadSeq;
+  editorState.localMaskUpdateSeq++;
   editorState.photoId = photoId;
   editorState.photo = null;
   // Reset recipe state so a Save click during the load window can't write the
   // previous (possibly dirty) photo's recipe onto the new photoId. syncControls
   // re-runs updateDirtyState after the new photo loads, restoring Save state.
   editorState.savedRecipe = {};
+  editorState.savedRecipeSeq++;
   editorState.recipe = {};
   var saveBtn = document.getElementById('saveBtn');
   if (saveBtn) saveBtn.disabled = true;
@@ -3917,6 +4136,7 @@ async function loadPhoto(photoId, opts) {
     if (seq !== editorState.loadSeq) return;
     editorState.photo = photo;
     editorState.savedRecipe = cloneRecipe(photo.edit_recipe || {});
+    editorState.savedRecipeSeq++;
     editorState.recipe = cloneRecipe(photo.edit_recipe || {});
     ensureCrop(editorState.recipe);
     editorState.cropEditing = !recipeForSave(editorState.recipe).crop;
@@ -3924,6 +4144,7 @@ async function loadPhoto(photoId, opts) {
     editorState.localMaskPromise = null;
     editorState.localAvailable = false;
     editorState.localStale = false;
+    editorState.savedLocalStale = false;
     editorState.maskOverlay = false;
     setButtonActive('maskOverlayBtn', false);
     refreshMaskOverlay();
@@ -3934,11 +4155,12 @@ async function loadPhoto(photoId, opts) {
         updateLocalBandVisibility();
       }).catch(function() {});
     if (photo.edit_recipe && photo.edit_recipe.local) {
+      var localStaleSavedRecipeSeq = editorState.savedRecipeSeq;
       safeFetch('/api/photos/' + photoId + '/edit-recipe', {}, {toast: false})
         .then(function(d) {
-          if (editorState.photoId !== photoId) return;
-          editorState.localStale = !!d.local_mask_stale;
-          updateLocalBandVisibility();
+          applyLoadedLocalStaleness(
+            photoId, seq, localStaleSavedRecipeSeq, d
+          );
         }).catch(function() {});
     }
     document.getElementById('editorFilename').textContent = photo.filename || ('Photo ' + photoId);
@@ -4033,6 +4255,7 @@ function initEditorKeyboard() {
 async function initEditor() {
   initCropDrag();
   initEditorKeyboard();
+  initEditorContextMenu();
   initUnloadGuard();
   buildLocalControls();
   clearHistogramFeedback();

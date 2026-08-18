@@ -9939,8 +9939,10 @@ def test_local_mask_snapshot_and_recipe_roundtrip(client_with_photo):
         json=_local_recipe_payload(mask),
     )
     assert resp.status_code == 200
-    saved = resp.get_json()["recipe"]
+    saved_response = resp.get_json()
+    saved = saved_response["recipe"]
     assert saved["local"]["mask"]["ref"] == mask["ref"]
+    assert saved_response["local_mask_stale"] is False
 
     got = client.get(f"/api/photos/{photo_id}/edit-recipe").get_json()
     assert got["recipe"]["local"]["mask"]["ref"] == mask["ref"]
@@ -10005,10 +10007,11 @@ def test_local_recipe_stale_flag_tracks_live_mask(client_with_photo):
     mask = client.post(
         f"/api/photos/{photo_id}/local-mask/snapshot"
     ).get_json()["mask"]
-    client.put(
+    saved = client.put(
         f"/api/photos/{photo_id}/edit-recipe",
         json=_local_recipe_payload(mask),
     )
+    assert saved.get_json()["local_mask_stale"] is False
 
     # Rewrite the live mask (as a detector/SAM re-run would).
     arr = np.zeros((600, 800), dtype=np.uint8)
@@ -10017,6 +10020,12 @@ def test_local_recipe_stale_flag_tracks_live_mask(client_with_photo):
 
     got = client.get(f"/api/photos/{photo_id}/edit-recipe").get_json()
     assert got["local_mask_stale"] is True
+
+    resaved = client.put(
+        f"/api/photos/{photo_id}/edit-recipe",
+        json=_local_recipe_payload(mask),
+    )
+    assert resaved.get_json()["local_mask_stale"] is True
 
 
 def test_local_recipe_rejects_unknown_snapshot_ref(client_with_photo):

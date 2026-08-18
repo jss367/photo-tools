@@ -617,7 +617,7 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .lightbox-overlay.lb-hide-chrome .lightbox-zoom-control {
   display: none !important;
 }
-.lightbox-overlay.lb-hide-info .lightbox-filename,
+.lightbox-overlay.lb-hide-info .lightbox-info,
 .lightbox-overlay.lb-hide-info #lightboxCounter,
 .lightbox-overlay.lb-hide-info .lightbox-zoom-control {
   display: none !important;
@@ -1144,6 +1144,60 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   user-select: text;
   -webkit-user-select: text;
   pointer-events: auto;
+}
+.lightbox-info {
+  flex: 0 1 min(35vw, 420px);
+  min-width: 0;
+  max-width: min(35vw, 420px);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+}
+.lightbox-info .lightbox-filename {
+  flex: none;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.lightbox-keywords {
+  display: flex;
+  max-width: 100%;
+  max-height: 72px;
+  overflow-y: auto;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  padding: 5px 7px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.6);
+  color: rgba(244, 247, 248, 0.58);
+  font-size: 11px;
+  line-height: 1.2;
+  cursor: default;
+  pointer-events: auto;
+}
+.lightbox-keywords-label {
+  padding: 2px 1px;
+  color: rgba(244, 247, 248, 0.55);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.lightbox-keyword {
+  max-width: 220px;
+  overflow: hidden;
+  padding: 2px 6px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(244, 247, 248, 0.88);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lightbox-keywords-empty {
+  padding: 2px 1px;
+  font-style: italic;
 }
 
 /* ---------- Pipeline Inspector ---------- */
@@ -3808,10 +3862,15 @@ async function createWorkspace() {
   <div class="lightbox-flag-status" id="lightboxFlagStatus" aria-live="polite"></div>
   <div id="lightboxCounter" style="display:none;position:absolute;top:16px;left:50%;transform:translateX(-50%);max-width:calc(100vw - 160px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(255,255,255,0.6);font-size:13px;background:rgba(0,0,0,0.5);padding:3px 10px;border-radius:4px;"></div>
   <div class="lightbox-bottom-bar">
-    <div class="lightbox-filename" id="lightboxFilename"
-         onmousedown="event.stopPropagation();"
-         onclick="event.stopPropagation();"
-         title="Select and copy filename"></div>
+    <div class="lightbox-info">
+      <div class="lightbox-filename" id="lightboxFilename"
+           onmousedown="event.stopPropagation();"
+           onclick="event.stopPropagation();"
+           title="Select and copy filename"></div>
+      <div class="lightbox-keywords" id="lightboxKeywords"
+           aria-label="Keywords"
+           onclick="event.stopPropagation();"></div>
+    </div>
     <div id="lightboxActions" class="lightbox-actions">
     <button class="lb-action-btn" id="lightboxSourceControl" style="display:none;" onclick="event.stopPropagation(); vireoTogglePairSource(_lightboxCurrentId);" title="Switch between the developed JPEG and RAW source">
       Viewing JPEG · Show RAW
@@ -7570,6 +7629,37 @@ function _lbRefreshEditRecipeCache(updates) {
 
 window.vireoRefreshEditRecipeCache = _lbRefreshEditRecipeCache;
 
+function _lbRenderKeywords(keywords) {
+  var container = document.getElementById('lightboxKeywords');
+  if (!container) return;
+  container.innerHTML = '';
+
+  var label = document.createElement('span');
+  label.className = 'lightbox-keywords-label';
+  label.textContent = 'Keywords';
+  label.setAttribute('aria-hidden', 'true');
+  container.appendChild(label);
+
+  var entries = Array.isArray(keywords) ? keywords.filter(function(keyword) {
+    return keyword && keyword.name;
+  }) : [];
+  if (!entries.length) {
+    var empty = document.createElement('span');
+    empty.className = 'lightbox-keywords-empty';
+    empty.textContent = 'None';
+    container.appendChild(empty);
+    return;
+  }
+
+  entries.forEach(function(keyword) {
+    var pill = document.createElement('span');
+    pill.className = 'lightbox-keyword';
+    pill.textContent = keyword.name;
+    pill.title = keyword.name;
+    container.appendChild(pill);
+  });
+}
+
 function openLightbox(photoId, filename, photoList, options) {
   var alreadyOpen = !!window._lbEscToken;
   var transitionAlreadyPending = _lbVisualTransitionPending;
@@ -7683,6 +7773,7 @@ function openLightbox(photoId, filename, photoList, options) {
   var similarBtn = document.getElementById('lightboxSimilar');
   var inatBtn = document.getElementById('lightboxInat');
   var wrap = document.getElementById('lightboxWrap');
+  var detailData = null;
 
   // The browser keeps painting the outgoing bitmap while a newly assigned
   // image source loads. Keep the visible filename and position paired with
@@ -7692,6 +7783,9 @@ function openLightbox(photoId, filename, photoList, options) {
   var visibleIdentityCommitted = false;
   function commitVisiblePhotoIdentity() {
     label.textContent = filename || '';
+    _lbRenderKeywords(
+      detailData && detailData.keywords || currentFromList && currentFromList.keywords || []
+    );
     _lbSetFlagStatus(_lbDisplayedFlagFor(photoId));
     _lbApplyWildlifeExcludedButton();
     var counter = document.getElementById('lightboxCounter');
@@ -7821,6 +7915,8 @@ function openLightbox(photoId, filename, photoList, options) {
         data.edit_recipe = _lbRecipeHasEdits(currentRecipe) ? _lbCloneEditRecipe(currentRecipe) : null;
       }
       _lbPhotoDataByPhoto[String(photoId)] = data;
+      detailData = data;
+      if (visibleIdentityCommitted) _lbRenderKeywords(data.keywords);
       _lbRenderLifeListPanel(photoId);
       if (editRecipeFresh) {
         _lbRememberEditRecipe(photoId, data.edit_recipe);

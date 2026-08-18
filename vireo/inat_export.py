@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 from export import export_photos, sanitize_filename
@@ -127,14 +128,23 @@ def write_inat_metadata(path: str, metadata: dict) -> None:
         raise InatExportError(f"Could not write photo metadata: {detail}")
 
 
-def _deduplicate_destination(path: str) -> str:
-    if not os.path.exists(path):
-        return path
+def _reserve_destination(path: str) -> str:
+    """Atomically reserve a deduplicated destination with an empty file."""
     stem, extension = os.path.splitext(path)
-    index = 2
-    while os.path.exists(f"{stem}_{index}{extension}"):
-        index += 1
-    return f"{stem}_{index}{extension}"
+    index = 1
+    while True:
+        candidate = path if index == 1 else f"{stem}_{index}{extension}"
+        try:
+            fd = os.open(
+                candidate,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError:
+            index += 1
+            continue
+        os.close(fd)
+        return candidate
 
 
 def export_inat_photo(
@@ -180,10 +190,24 @@ def export_inat_photo(
 
         original_stem = Path(photo["filename"]).stem
         filename = sanitize_filename(f"{original_stem}-iNaturalist.jpg")
-        final_path = _deduplicate_destination(os.path.join(destination, filename))
+        final_path = None
+        staged_path = None
         try:
-            shutil.move(rendered_path, final_path)
+            final_path = _reserve_destination(
+                os.path.join(destination, filename),
+            )
+            stage_fd, staged_path = tempfile.mkstemp(
+                prefix=f".{filename}.", suffix=".tmp", dir=destination,
+            )
+            os.close(stage_fd)
+            shutil.copy2(rendered_path, staged_path)
+            os.replace(staged_path, final_path)
+            staged_path = None
         except OSError as exc:
+            for cleanup_path in (staged_path, final_path):
+                if cleanup_path:
+                    with suppress(FileNotFoundError):
+                        os.unlink(cleanup_path)
             raise InatExportError(f"Could not save exported photo: {exc}") from exc
     return final_path
 

@@ -9429,6 +9429,10 @@ function _inatApplyQuickChoicesToQueue() {
 async function exportInatQuickPhotos() {
   var status = document.getElementById('inatQuickExportStatus');
   var button = document.getElementById('inatQuickExportBtn');
+  var generation = _inatModalGeneration;
+  var queue = inatQueue;
+  var itemCount = queue.length;
+  var submissions = _inatQuickExportSubmissions();
   var destination = null;
   try {
     if (typeof pickDirectory === 'function' && typeof isTauri === 'function' && isTauri()) {
@@ -9437,30 +9441,36 @@ async function exportInatQuickPhotos() {
       destination = window.prompt('Export folder path:');
     }
   } catch(e) {
+    if (generation !== _inatModalGeneration) return;
     status.className = 'inat-card-status error';
     status.textContent = '\u2717 Could not open the folder picker: ' + e.message;
     return;
   }
   if (!destination) return;
+  if (
+    generation !== _inatModalGeneration ||
+    inatQueue !== queue ||
+    !document.getElementById('inatModal').classList.contains('open')
+  ) return;
 
   button.disabled = true;
   button.textContent = 'Exporting\u2026';
   status.className = 'inat-card-status';
-  status.textContent = 'Rendering edited JPEG' + (inatQueue.length === 1 ? '' : 's') + ' and writing metadata\u2026';
+  status.textContent = 'Rendering edited JPEG' + (itemCount === 1 ? '' : 's') + ' and writing metadata\u2026';
   try {
     var started = await safeFetch('/api/inat/export', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         destination: destination,
-        submissions: _inatQuickExportSubmissions(),
+        submissions: submissions,
         reveal: typeof isTauri === 'function' && isTauri(),
       }),
     }, { toast: false });
     safeEventSource('/api/jobs/' + started.job_id + '/stream', {
       onProgress: function(progress) {
         var current = progress.current || 0;
-        var total = progress.total || inatQueue.length;
+        var total = progress.total || itemCount;
         status.textContent = 'Exporting ' + current + ' of ' + total + '\u2026';
       },
       onComplete: function(done) {
@@ -9482,20 +9492,20 @@ async function exportInatQuickPhotos() {
             (result.revealed ? ' Revealed in the file manager.' : '');
         }
         button.disabled = false;
-        button.textContent = inatQueue.length === 1 ? 'Export JPEG\u2026' : 'Export ' + inatQueue.length + ' JPEGs\u2026';
+        button.textContent = itemCount === 1 ? 'Export JPEG\u2026' : 'Export ' + itemCount + ' JPEGs\u2026';
       },
       onError: function() {
         status.className = 'inat-card-status error';
         status.textContent = '\u2717 Lost the export progress connection.';
         button.disabled = false;
-        button.textContent = inatQueue.length === 1 ? 'Export JPEG\u2026' : 'Export ' + inatQueue.length + ' JPEGs\u2026';
+        button.textContent = itemCount === 1 ? 'Export JPEG\u2026' : 'Export ' + itemCount + ' JPEGs\u2026';
       },
     });
   } catch(e) {
     status.className = 'inat-card-status error';
     status.textContent = '\u2717 ' + e.message;
     button.disabled = false;
-    button.textContent = inatQueue.length === 1 ? 'Export JPEG\u2026' : 'Export ' + inatQueue.length + ' JPEGs\u2026';
+    button.textContent = itemCount === 1 ? 'Export JPEG\u2026' : 'Export ' + itemCount + ' JPEGs\u2026';
   }
 }
 

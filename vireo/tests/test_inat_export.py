@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -11,6 +12,7 @@ from db import Database
 from inat_export import (
     _exif_datetime,
     _metadata_args,
+    _reserve_destination,
     export_inat_photo,
     write_inat_metadata,
 )
@@ -58,6 +60,20 @@ def test_metadata_args_strip_unselected_location_and_date():
     assert args[0] == "-all="
     assert not any("GPS" in arg for arg in args)
     assert not any("DateTimeOriginal" in arg for arg in args)
+
+
+def test_reserve_destination_is_atomic_across_concurrent_exports(tmp_path):
+    requested = str(tmp_path / "bird-iNaturalist.jpg")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        reserved = list(pool.map(lambda _index: _reserve_destination(requested), range(8)))
+
+    assert len(set(reserved)) == 8
+    assert {os.path.basename(path) for path in reserved} == {
+        "bird-iNaturalist.jpg",
+        *(f"bird-iNaturalist_{index}.jpg" for index in range(2, 9)),
+    }
+    assert all(os.path.isfile(path) for path in reserved)
 
 
 def test_write_inat_metadata_replaces_existing_metadata(tmp_path):

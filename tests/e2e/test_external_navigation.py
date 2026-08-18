@@ -260,6 +260,56 @@ def test_token_free_export_uses_checked_metadata(live_server, page):
     }]
 
 
+def test_folder_picker_result_does_not_export_replacement_modal(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+    _mock_tauri(page)
+    page.evaluate(
+        """
+        () => {
+          window.__TAURI_INTERNALS__.invoke = (command, args) => {
+            window.__externalTest.invokes.push({ command, args });
+            if (command === 'plugin:dialog|open') {
+              return new Promise(resolve => {
+                window.__externalTest.resolveExportDirectory = resolve;
+              });
+            }
+            return Promise.resolve(null);
+          };
+        }
+        """
+    )
+    captured = []
+
+    def handle_export(route):
+        captured.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"job_id":"unexpected-export"}',
+        )
+
+    page.route("**/api/inat/export", handle_export)
+    page.evaluate("item => openInatQuickModal([item], [])", _item())
+    page.locator("#inatQuickExportBtn").click()
+    page.wait_for_function(
+        "typeof window.__externalTest.resolveExportDirectory === 'function'"
+    )
+
+    page.evaluate("item => openInatQuickModal([item], [])", _item(2))
+    page.evaluate(
+        """
+        async () => {
+          window.__externalTest.resolveExportDirectory('/tmp/old-export');
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        """
+    )
+
+    assert captured == []
+    expect(page.locator("#inatCards")).to_contain_text("photo-2.jpg")
+    expect(page.locator("#inatQuickExportBtn")).to_be_enabled()
+
+
 def test_quick_open_can_omit_all_metadata_for_generic_upload(live_server, page):
     page.goto(f"{live_server['url']}/browse")
     _mock_tauri(page)

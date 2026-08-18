@@ -439,9 +439,14 @@ def test_api_inat_export_uses_only_checked_metadata(app_and_db, tmp_path):
             }],
             "reveal": False,
         })
+        from wait import wait_for_job_via_client
+        job = wait_for_job_via_client(
+            app.test_client(), resp.get_json()["job_id"],
+        )
 
     assert resp.status_code == 200
-    data = resp.get_json()
+    assert job["status"] == "completed"
+    data = job["result"]
     assert data["exported"][0]["filename"] == "bird-iNaturalist.jpg"
     metadata = export_photo.call_args.args[4]
     assert metadata == {
@@ -470,8 +475,13 @@ def test_api_inat_export_includes_zero_coordinates(app_and_db, tmp_path):
                 "include_location": True,
             }],
         })
+        from wait import wait_for_job_via_client
+        job = wait_for_job_via_client(
+            app.test_client(), resp.get_json()["job_id"],
+        )
 
     assert resp.status_code == 200
+    assert job["status"] == "completed"
     metadata = export_photo.call_args.args[4]
     assert metadata["latitude"] == 0.0
     assert metadata["longitude"] == 0.0
@@ -533,6 +543,33 @@ def test_api_inat_submit_success(app_and_db):
     # Verify recorded in DB
     subs = db.get_inat_submissions([pid])
     assert pid in subs
+
+
+def test_api_inat_submit_preserves_explicit_metadata_omissions(app_and_db):
+    app, _db, pid = app_and_db
+    import config as cfg
+    cfg.save({"inat_token": "fake-token"})
+
+    with patch(
+        "inat.submit_observation",
+        return_value=(12345, "https://www.inaturalist.org/observations/12345"),
+    ) as mock_submit:
+        resp = app.test_client().post("/api/inat/submit", json={
+            "photo_id": pid,
+            "taxon_name": "",
+            "observed_on": "",
+            "latitude": None,
+            "longitude": None,
+            "description": "At the feeder",
+        })
+
+    assert resp.status_code == 200
+    kwargs = mock_submit.call_args.kwargs
+    assert kwargs["taxon_name"] == ""
+    assert kwargs["observed_on"] == ""
+    assert kwargs["latitude"] is None
+    assert kwargs["longitude"] is None
+    assert kwargs["description"] == "At the feeder"
 
 
 def test_api_inat_submit_reports_partial_upload(app_and_db):

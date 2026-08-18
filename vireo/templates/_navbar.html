@@ -9378,6 +9378,7 @@ async function validateAndSaveInatToken() {
     }, { toast: false });
     status.className = 'inat-card-status success';
     status.textContent = '\u2713 Valid token' + (data.login ? ' for ' + data.login : '') + '. Opening direct submission\u2026';
+    _inatApplyQuickChoicesToQueue();
     openInatModal(_inatQuickFailures);
   } catch(e) {
     status.className = 'inat-card-status error';
@@ -9398,6 +9399,21 @@ function _inatQuickExportSubmissions() {
       include_description: !!(document.getElementById('inatIncludeDescription' + idx) || {}).checked,
       description: description ? description.value.trim() : '',
     };
+  });
+}
+
+function _inatApplyQuickChoicesToQueue() {
+  var choices = _inatQuickExportSubmissions();
+  choices.forEach(function(choice, idx) {
+    var item = inatQueue[idx];
+    if (!item) return;
+    if (!choice.include_taxon) item.taxon_name = '';
+    if (!choice.include_date) item.observed_on = '';
+    if (!choice.include_location) {
+      item.latitude = '';
+      item.longitude = '';
+    }
+    item.description = choice.include_description ? choice.description : '';
   });
 }
 
@@ -9423,7 +9439,7 @@ async function exportInatQuickPhotos() {
   status.className = 'inat-card-status';
   status.textContent = 'Rendering edited JPEG' + (inatQueue.length === 1 ? '' : 's') + ' and writing metadata\u2026';
   try {
-    var result = await safeFetch('/api/inat/export', {
+    var started = await safeFetch('/api/inat/export', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
@@ -9432,20 +9448,43 @@ async function exportInatQuickPhotos() {
         reveal: typeof isTauri === 'function' && isTauri(),
       }),
     }, { toast: false });
-    var count = (result.exported || []).length;
-    var failed = (result.errors || []).length;
-    if (!count) {
-      var firstError = failed ? result.errors[0].error : 'No photos were exported.';
-      throw new Error(firstError);
-    }
-    status.className = failed ? 'inat-card-status warning' : 'inat-card-status success';
-    status.textContent = '\u2713 Exported ' + count + ' JPEG' + (count === 1 ? '' : 's') +
-      (failed ? '; ' + failed + ' failed.' : '.') +
-      (result.revealed ? ' Revealed in the file manager.' : '');
+    safeEventSource('/api/jobs/' + started.job_id + '/stream', {
+      onProgress: function(progress) {
+        var current = progress.current || 0;
+        var total = progress.total || inatQueue.length;
+        status.textContent = 'Exporting ' + current + ' of ' + total + '\u2026';
+      },
+      onComplete: function(done) {
+        var result = done.result || {};
+        var count = (result.exported || []).length;
+        var failed = (result.errors || []).length;
+        if (done.status === 'cancelled') {
+          status.className = 'inat-card-status warning';
+          status.textContent = 'Export cancelled after ' + count + ' JPEG' + (count === 1 ? '' : 's') + '.';
+        } else if (!count) {
+          status.className = 'inat-card-status error';
+          status.textContent = '\u2717 ' + (
+            failed ? result.errors[0].error : 'No photos were exported.'
+          );
+        } else {
+          status.className = failed ? 'inat-card-status warning' : 'inat-card-status success';
+          status.textContent = '\u2713 Exported ' + count + ' JPEG' + (count === 1 ? '' : 's') +
+            (failed ? '; ' + failed + ' failed.' : '.') +
+            (result.revealed ? ' Revealed in the file manager.' : '');
+        }
+        button.disabled = false;
+        button.textContent = inatQueue.length === 1 ? 'Export JPEG\u2026' : 'Export ' + inatQueue.length + ' JPEGs\u2026';
+      },
+      onError: function() {
+        status.className = 'inat-card-status error';
+        status.textContent = '\u2717 Lost the export progress connection.';
+        button.disabled = false;
+        button.textContent = inatQueue.length === 1 ? 'Export JPEG\u2026' : 'Export ' + inatQueue.length + ' JPEGs\u2026';
+      },
+    });
   } catch(e) {
     status.className = 'inat-card-status error';
     status.textContent = '\u2717 ' + e.message;
-  } finally {
     button.disabled = false;
     button.textContent = inatQueue.length === 1 ? 'Export JPEG\u2026' : 'Export ' + inatQueue.length + ' JPEGs\u2026';
   }
@@ -9487,7 +9526,7 @@ function openInatModal(failures) {
         '<div><label>Longitude</label><input id="inatLng' + idx + '" value="' + escapeAttr(String(item.longitude)) + '"></div>' +
         '<div><label>Geoprivacy</label><select id="inatGeo' + idx + '"><option value="open">Open</option><option value="obscured">Obscured</option><option value="private">Private</option></select></div>' +
         '<div></div>' +
-        '<textarea id="inatDesc' + idx + '" placeholder="Notes (optional)"></textarea>' +
+        '<textarea id="inatDesc' + idx + '" placeholder="Notes (optional)">' + escapeHtml(item.description || '') + '</textarea>' +
       '</div>' +
       '<div class="inat-card-status" id="inatStatus' + idx + '"></div>' +
     '</div>';

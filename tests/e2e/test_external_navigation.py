@@ -118,10 +118,19 @@ def test_valid_inline_token_switches_modal_to_direct_submission(live_server, pag
     )
     page.evaluate("item => openInatQuickModal([item], [])", _item())
 
+    page.locator("#inatIncludeTaxon0").uncheck()
+    page.locator("#inatIncludeDate0").uncheck()
+    page.locator("#inatIncludeLocation0").uncheck()
+    page.locator("#inatIncludeDescription0").check()
+    page.locator("#inatQuickDescription0").fill("Seen beside the trail")
     page.locator("#inatQuickToken").fill("valid-token")
     page.locator("#inatQuickTokenBtn").click()
 
-    expect(page.locator("#inatTaxon0")).to_have_value("Corvus corax")
+    expect(page.locator("#inatTaxon0")).to_have_value("")
+    expect(page.locator("#inatDate0")).to_have_value("")
+    expect(page.locator("#inatLat0")).to_have_value("")
+    expect(page.locator("#inatLng0")).to_have_value("")
+    expect(page.locator("#inatDesc0")).to_have_value("Seen beside the trail")
     expect(page.locator("#inatSubmitBtn")).to_be_enabled()
     expect(page.locator("#inatSubmitBtn")).to_have_text("Send to iNaturalist")
 
@@ -139,6 +148,18 @@ def test_token_free_export_uses_checked_metadata(live_server, page):
             }
             return Promise.resolve(null);
           };
+          window.safeEventSource = (url, callbacks) => {
+            window.__externalTest.exportStreamUrl = url;
+            Promise.resolve().then(() => callbacks.onComplete({
+              status: 'completed',
+              result: {
+                exported: [{photo_id: 1, filename: 'photo-1-iNaturalist.jpg'}],
+                errors: [],
+                revealed: true
+              }
+            }));
+            return {close: () => {}};
+          };
         }
         """
     )
@@ -149,10 +170,7 @@ def test_token_free_export_uses_checked_metadata(live_server, page):
         route.fulfill(
             status=200,
             content_type="application/json",
-            body=(
-                '{"exported":[{"photo_id":1,"filename":"photo-1-iNaturalist.jpg"}],'
-                '"errors":[],"revealed":true}'
-            ),
+            body='{"job_id":"inat-export-1"}',
         )
 
     page.route("**/api/inat/export", handle_export)
@@ -166,6 +184,9 @@ def test_token_free_export_uses_checked_metadata(live_server, page):
 
     assert captured["destination"] == "/tmp/inaturalist-exports"
     assert captured["reveal"] is True
+    assert page.evaluate("window.__externalTest.exportStreamUrl") == (
+        "/api/jobs/inat-export-1/stream"
+    )
     assert captured["submissions"] == [{
         "photo_id": 1,
         "include_taxon": True,

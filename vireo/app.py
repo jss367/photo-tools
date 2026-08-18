@@ -23850,6 +23850,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error("submissions array is required")
         if len(submissions) > _MAX_SELECTION_PHOTOS:
             return json_error("too many photos in selection", 400)
+        normalized_submissions = []
+        for item in submissions:
+            if not isinstance(item, dict):
+                return json_error("each submission must be an object")
+            try:
+                photo_id = int(item.get("photo_id"))
+            except (TypeError, ValueError):
+                return json_error("photo_id must be an integer")
+            normalized = dict(item)
+            normalized["photo_id"] = photo_id
+            normalized_submissions.append(normalized)
+        submissions = normalized_submissions
 
         db = _get_db()
         effective_cfg = db.get_effective_config(cfg.load())
@@ -23858,72 +23870,115 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         wc_max_size = effective_cfg.get("working_copy_max_size", 4096)
         developed_dir = effective_cfg.get("darktable_output_dir", "") or ""
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+        reveal = bool(body.get("reveal", False))
+        active_ws = db._active_workspace_id
+        runner = app._job_runner
 
-        exported = []
-        errors = []
-        for item in submissions:
-            if not isinstance(item, dict):
-                errors.append({"photo_id": None, "error": "Invalid submission"})
-                continue
+        def work(job):
+            thread_db = Database(db_path)
+            thread_db.set_active_workspace(active_ws)
+            exported = []
+            errors = []
+            total = len(submissions)
+            job["progress"]["total"] = total
             try:
-                photo_id = int(item.get("photo_id"))
-            except (TypeError, ValueError):
-                errors.append({"photo_id": item.get("photo_id"), "error": "Invalid photo id"})
-                continue
-            photo = db.get_photo(photo_id, verify_workspace=True)
-            if not photo:
-                errors.append({"photo_id": photo_id, "error": "Photo not found"})
-                continue
+                for index, item in enumerate(submissions, start=1):
+                    if runner.is_cancelled(job["id"]):
+                        break
+                    photo_id = item["photo_id"]
+                    photo = thread_db.get_photo(
+                        photo_id, verify_workspace=True,
+                    )
+                    if not photo:
+                        errors.append({
+                            "photo_id": photo_id,
+                            "error": "Photo not found",
+                        })
+                        job["progress"]["current"] = index
+                        runner.push_event(job["id"], "progress", {
+                            "current": index,
+                            "total": total,
+                            "current_file": "",
+                            "phase": "Exporting for iNaturalist",
+                        })
+                        continue
 
-            pred = db.get_top_prediction_for_photo(
-                photo_id, min_detector_confidence=min_conf,
-            )
-            location = db.get_effective_photo_location(photo_id)
-            metadata = {}
-            if item.get("include_taxon", False) and pred:
-                metadata["taxon_name"] = (
-                    pred["scientific_name"] or pred["species"]
-                )
-            if item.get("include_date", False):
-                metadata["timestamp"] = photo["timestamp"]
-            if item.get("include_location", False) and location:
-                metadata["latitude"] = location["latitude"]
-                metadata["longitude"] = location["longitude"]
-            if item.get("include_description", False):
-                description = str(item.get("description") or "").strip()
-                if description:
-                    metadata["description"] = description[:10000]
+                    pred = thread_db.get_top_prediction_for_photo(
+                        photo_id, min_detector_confidence=min_conf,
+                    )
+                    location = thread_db.get_effective_photo_location(photo_id)
+                    metadata = {}
+                    if item.get("include_taxon", False) and pred:
+                        metadata["taxon_name"] = (
+                            pred["scientific_name"] or pred["species"]
+                        )
+                    if item.get("include_date", False):
+                        metadata["timestamp"] = photo["timestamp"]
+                    if item.get("include_location", False) and location:
+                        metadata["latitude"] = location["latitude"]
+                        metadata["longitude"] = location["longitude"]
+                    if item.get("include_description", False):
+                        description = str(
+                            item.get("description") or ""
+                        ).strip()
+                        if description:
+                            metadata["description"] = description[:10000]
 
-            try:
-                path = export_inat_photo(
-                    db,
-                    vireo_dir,
-                    photo_id,
-                    destination,
-                    metadata,
-                    quality=quality,
-                    working_copy_max_size=wc_max_size,
-                    developed_dir=developed_dir,
-                )
-                exported.append({
-                    "photo_id": photo_id,
-                    "path": path,
-                    "filename": os.path.basename(path),
-                })
-            except (InatExportError, OSError, ValueError) as exc:
-                errors.append({"photo_id": photo_id, "error": str(exc)})
+                    try:
+                        path = export_inat_photo(
+                            thread_db,
+                            vireo_dir,
+                            photo_id,
+                            destination,
+                            metadata,
+                            quality=quality,
+                            working_copy_max_size=wc_max_size,
+                            developed_dir=developed_dir,
+                        )
+                        exported.append({
+                            "photo_id": photo_id,
+                            "path": path,
+                            "filename": os.path.basename(path),
+                        })
+                    except (InatExportError, OSError, ValueError) as exc:
+                        errors.append({
+                            "photo_id": photo_id,
+                            "error": str(exc),
+                        })
+                    finally:
+                        job["progress"]["current"] = index
+                        job["progress"]["current_file"] = photo["filename"]
+                        runner.push_event(job["id"], "progress", {
+                            "current": index,
+                            "total": total,
+                            "current_file": photo["filename"],
+                            "phase": "Exporting for iNaturalist",
+                        })
 
-        revealed = False
-        if exported and body.get("reveal", False):
-            revealed = reveal_inat_exports(
-                [item["path"] for item in exported], destination,
-            )
-        return jsonify({
-            "exported": exported,
-            "errors": errors,
-            "destination": destination,
-            "revealed": revealed,
-        })
+                revealed = False
+                if exported and reveal and not runner.is_cancelled(job["id"]):
+                    revealed = reveal_inat_exports(
+                        [item["path"] for item in exported], destination,
+                    )
+                return {
+                    "exported": exported,
+                    "errors": errors,
+                    "destination": destination,
+                    "revealed": revealed,
+                }
+            finally:
+                thread_db.close()
+
+        job_id = runner.start(
+            "inat-export",
+            work,
+            config={
+                "photo_ids": [item["photo_id"] for item in submissions],
+                "destination": destination,
+            },
+            workspace_id=active_ws,
+        )
+        return jsonify({"job_id": job_id})
 
     def _inat_edit_recipe_source(photo, recipe, fallback_path):
         from image_loader import RAW_EXTENSIONS
@@ -24194,13 +24249,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             photo_id, min_detector_confidence=min_conf,
         )
 
-        taxon = data.get("taxon_name") or (pred["scientific_name"] if pred else None) or (pred["species"] if pred else None)
-        observed_on = data.get("observed_on") or (photo["timestamp"][:10] if photo["timestamp"] else None)
+        default_taxon = (
+            (pred["scientific_name"] or pred["species"]) if pred else None
+        )
+        taxon = data.get("taxon_name", default_taxon)
+        observed_on = (
+            data["observed_on"]
+            if "observed_on" in data
+            else (photo["timestamp"][:10] if photo["timestamp"] else None)
+        )
         loc = db.get_effective_photo_location(photo_id)
         photo_lat = loc["latitude"] if loc else None
         photo_lng = loc["longitude"] if loc else None
-        lat = data.get("latitude") if data.get("latitude") is not None else photo_lat
-        lng = data.get("longitude") if data.get("longitude") is not None else photo_lng
+        lat = data.get("latitude", photo_lat)
+        lng = data.get("longitude", photo_lng)
 
         try:
             obs_id, obs_url = inat.submit_observation(
@@ -24289,13 +24351,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 photo_id, min_detector_confidence=min_conf,
             )
 
-            taxon = sub.get("taxon_name") or (pred["scientific_name"] if pred else None) or (pred["species"] if pred else None)
-            observed_on = sub.get("observed_on") or (photo["timestamp"][:10] if photo["timestamp"] else None)
+            default_taxon = (
+                (pred["scientific_name"] or pred["species"])
+                if pred else None
+            )
+            taxon = sub.get("taxon_name", default_taxon)
+            observed_on = (
+                sub["observed_on"]
+                if "observed_on" in sub
+                else (
+                    photo["timestamp"][:10]
+                    if photo["timestamp"] else None
+                )
+            )
             loc = db.get_effective_photo_location(photo_id)
             photo_lat = loc["latitude"] if loc else None
             photo_lng = loc["longitude"] if loc else None
-            lat = sub.get("latitude") if sub.get("latitude") is not None else photo_lat
-            lng = sub.get("longitude") if sub.get("longitude") is not None else photo_lng
+            lat = sub.get("latitude", photo_lat)
+            lng = sub.get("longitude", photo_lng)
 
             try:
                 obs_id, obs_url = inat.submit_observation(

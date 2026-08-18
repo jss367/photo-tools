@@ -1044,6 +1044,7 @@ var editorState = {
   photoId: null,
   photo: null,
   savedRecipe: {},
+  savedRecipeSeq: 0,
   recipe: {},
   presets: [],
   localDraft: {subject: {}, background: {}, feather: 0},
@@ -3166,6 +3167,7 @@ async function saveRecipe(description) {
     // button — don't overwrite it with the previous photo's saved data.
     if (editorState.photoId !== savedPhotoId) return false;
     editorState.savedRecipe = cloneRecipe(data.recipe || {});
+    editorState.savedRecipeSeq++;
     editorState.recipe = cloneRecipe(data.recipe || {});
     editorState.savedLocalStale = !!data.local_mask_stale;
     editorState.localStale = editorState.savedLocalStale;
@@ -4057,6 +4059,15 @@ function editorEmptyState() {
   });
 }
 
+function applyLoadedLocalStaleness(photoId, loadSeq, savedRecipeSeq, data) {
+  if (editorState.photoId !== photoId || editorState.loadSeq !== loadSeq ||
+      editorState.savedRecipeSeq !== savedRecipeSeq) return false;
+  editorState.localStale = !!data.local_mask_stale;
+  editorState.savedLocalStale = editorState.localStale;
+  updateLocalBandVisibility();
+  return true;
+}
+
 async function loadPhoto(photoId, opts) {
   opts = opts || {};
   photoId = Number(photoId);
@@ -4070,6 +4081,7 @@ async function loadPhoto(photoId, opts) {
   // previous (possibly dirty) photo's recipe onto the new photoId. syncControls
   // re-runs updateDirtyState after the new photo loads, restoring Save state.
   editorState.savedRecipe = {};
+  editorState.savedRecipeSeq++;
   editorState.recipe = {};
   var saveBtn = document.getElementById('saveBtn');
   if (saveBtn) saveBtn.disabled = true;
@@ -4099,6 +4111,7 @@ async function loadPhoto(photoId, opts) {
     if (seq !== editorState.loadSeq) return;
     editorState.photo = photo;
     editorState.savedRecipe = cloneRecipe(photo.edit_recipe || {});
+    editorState.savedRecipeSeq++;
     editorState.recipe = cloneRecipe(photo.edit_recipe || {});
     ensureCrop(editorState.recipe);
     editorState.cropEditing = !recipeForSave(editorState.recipe).crop;
@@ -4117,12 +4130,12 @@ async function loadPhoto(photoId, opts) {
         updateLocalBandVisibility();
       }).catch(function() {});
     if (photo.edit_recipe && photo.edit_recipe.local) {
+      var localStaleSavedRecipeSeq = editorState.savedRecipeSeq;
       safeFetch('/api/photos/' + photoId + '/edit-recipe', {}, {toast: false})
         .then(function(d) {
-          if (editorState.photoId !== photoId) return;
-          editorState.localStale = !!d.local_mask_stale;
-          editorState.savedLocalStale = editorState.localStale;
-          updateLocalBandVisibility();
+          applyLoadedLocalStaleness(
+            photoId, seq, localStaleSavedRecipeSeq, d
+          );
         }).catch(function() {});
     }
     document.getElementById('editorFilename').textContent = photo.filename || ('Photo ' + photoId);

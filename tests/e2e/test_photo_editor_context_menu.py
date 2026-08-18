@@ -151,6 +151,32 @@ def test_photo_editor_save_uses_authoritative_staleness_from_response(
     assert page.evaluate("() => editorState.savedLocalStale") is True
 
 
+def test_photo_editor_ignores_staleness_for_an_older_saved_recipe(
+    live_server, page
+):
+    _open_editor(live_server, page)
+
+    applied = page.evaluate(
+        """() => {
+          const requestedSavedRecipeSeq = editorState.savedRecipeSeq;
+          editorState.savedRecipe = {version: 1, rotation: 90};
+          editorState.savedRecipeSeq += 1;
+          editorState.localStale = false;
+          editorState.savedLocalStale = false;
+          return applyLoadedLocalStaleness(
+            editorState.photoId,
+            editorState.loadSeq,
+            requestedSavedRecipeSeq,
+            {local_mask_stale: true}
+          );
+        }"""
+    )
+
+    assert applied is False
+    assert page.evaluate("() => editorState.localStale") is False
+    assert page.evaluate("() => editorState.savedLocalStale") is False
+
+
 def test_photo_editor_context_revert_restores_saved_recipe(live_server, page):
     _open_editor(live_server, page)
     page.evaluate("() => rotateRecipe(90)")

@@ -1517,7 +1517,7 @@ class _DestinationPathReservations:
     """Mirror planned paths on the destination volume to detect aliases."""
 
     def __init__(self, destination):
-        self.destination = os.path.abspath(destination)
+        self.destination = os.path.realpath(destination)
         probe_path = os.path.realpath(destination)
         while not os.path.isdir(probe_path):
             parent = os.path.dirname(probe_path)
@@ -1552,7 +1552,7 @@ class _DestinationPathReservations:
             self.root = None
 
     def _relative_path(self, candidate):
-        relative = os.path.relpath(os.path.abspath(candidate), self.destination)
+        relative = os.path.relpath(os.path.realpath(candidate), self.destination)
         if relative == os.pardir or relative.startswith(os.pardir + os.sep):
             return None
         return relative

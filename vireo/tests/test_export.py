@@ -1469,6 +1469,24 @@ def test_destination_reservations_match_empty_volume(tmp_path):
     assert list(destination.iterdir()) == []
 
 
+def test_destination_reservations_resolve_directory_symlinks(tmp_path):
+    """A real directory and its symlink reserve the same export path."""
+    destination = tmp_path / "destination"
+    real_directory = destination / "real"
+    alias_directory = destination / "alias"
+    real_directory.mkdir(parents=True)
+    try:
+        alias_directory.symlink_to(real_directory, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    with export_mod._DestinationPathReservations(str(destination)) as reservations:
+        reservations.add(real_directory / "photo.jpg")
+        assert reservations.contains(alias_directory / "photo.jpg")
+
+    assert set(destination.iterdir()) == {real_directory, alias_directory}
+
+
 def test_preview_export_renames_respects_unicode_equivalent_destination(
     export_env, monkeypatch,
 ):

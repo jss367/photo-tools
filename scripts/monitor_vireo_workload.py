@@ -164,20 +164,36 @@ def compact_jobs_payload(payload):
 
 
 class VireoApiClient:
-    def __init__(self, base_url, timeout=5.0, *, opener=None, clock=time.perf_counter):
+    def __init__(
+        self,
+        base_url,
+        timeout=5.0,
+        *,
+        opener=None,
+        clock=time.perf_counter,
+        host_header=None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.clock = clock
+        self.host_header = host_header
         self.opener = opener or urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(CookieJar())
         )
 
     def _request(self, path):
         url = urllib.parse.urljoin(self.base_url + "/", path.lstrip("/"))
+        request = urllib.request.Request(url)
+        if self.host_header:
+            # Vireo intentionally trusts only loopback Host values. Discovery
+            # has already proven that the non-loopback destination belongs to
+            # this local process, so connect to that interface while presenting
+            # the trusted application-level host.
+            request.add_unredirected_header("Host", self.host_header)
         started = self.clock()
         error = None
         try:
-            with self.opener.open(url, timeout=self.timeout) as response:
+            with self.opener.open(request, timeout=self.timeout) as response:
                 body = response.read()
                 status = response.status
         except urllib.error.HTTPError as exc:
@@ -1195,6 +1211,13 @@ def _parse_server_url(url):
     return parsed, hostname, port
 
 
+def _trusted_host_override(address):
+    try:
+        return None if ipaddress.ip_address(address).is_loopback else "localhost"
+    except ValueError:
+        return None
+
+
 def discover_server(
     *,
     requested_pid=None,
@@ -1263,7 +1286,11 @@ def discover_server(
                 f"{parsed.scheme}://{url_host}:{requested_port}"
                 f"{parsed.path.rstrip('/')}"
             )
-        return {"pid": owner.pid, "url": verified_url}
+        server = {"pid": owner.pid, "url": verified_url}
+        host_header = _trusted_host_override(reachable_address)
+        if host_header:
+            server["host_header"] = host_header
+        return server
     requested_port = None
     requested_hostname = None
     parsed_requested_url = None
@@ -1353,10 +1380,14 @@ def discover_server(
                 f"{parsed_requested_url.scheme}://{url_host}:{requested_port}"
                 f"{parsed_requested_url.path.rstrip('/')}"
             )
-    return {
+    server = {
         "pid": discovered["pid"],
         "url": verified_url,
     }
+    host_header = _trusted_host_override(discovered["address"])
+    if host_header:
+        server["host_header"] = host_header
+    return server
 
 
 def _default_output_path():
@@ -1398,7 +1429,11 @@ def main(argv=None):
         output = args.output or _default_output_path()
         _prepare_output_path(output)
         server = discover_server(requested_pid=args.pid, requested_url=args.url)
-        api_client = VireoApiClient(server["url"], timeout=args.timeout)
+        api_client = VireoApiClient(
+            server["url"],
+            timeout=args.timeout,
+            host_header=server.get("host_header"),
+        )
         process_sampler = ProcessTreeSampler(server["pid"])
         system_sampler = SystemSampler()
         report = collect_workload(

@@ -1259,8 +1259,11 @@ def test_compact_progress_drops_free_form_phase_entirely():
 
 
 def test_api_client_establishes_browser_cookie_before_reading_jobs():
+    host_headers = []
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            host_headers.append(self.headers.get("Host"))
             if self.path == "/":
                 self.send_response(200)
                 self.send_header("Set-Cookie", "vireo_session=test; Path=/; HttpOnly")
@@ -1289,7 +1292,10 @@ def test_api_client_establishes_browser_cookie_before_reading_jobs():
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
     try:
-        client = VireoApiClient(f"http://127.0.0.1:{server.server_port}")
+        client = VireoApiClient(
+            f"http://127.0.0.1:{server.server_port}",
+            host_header="localhost",
+        )
         client.authenticate()
         sample = client.sample()
     finally:
@@ -1299,6 +1305,7 @@ def test_api_client_establishes_browser_cookie_before_reading_jobs():
 
     assert sample["status"] == 200
     assert sample["resource_budget"] == {"waiters": 0}
+    assert host_headers == ["localhost", "localhost"]
 
 
 def test_api_client_returns_failure_for_truncated_http_body():
@@ -1792,7 +1799,11 @@ def test_wildcard_listener_accepts_verified_local_lan_address():
         local_addresses={"192.168.1.20"},
     )
 
-    assert server == {"pid": 4242, "url": "http://vireo.local:50222"}
+    assert server == {
+        "pid": 4242,
+        "url": "http://vireo.local:50222",
+        "host_header": "localhost",
+    }
 
 
 def test_wildcard_listener_uses_interface_address_not_hostname_only():
@@ -1817,7 +1828,11 @@ def test_wildcard_listener_uses_interface_address_not_hostname_only():
         resolver=resolver,
     )
 
-    assert server == {"pid": 4242, "url": "http://vireo.local:50222"}
+    assert server == {
+        "pid": 4242,
+        "url": "http://vireo.local:50222",
+        "host_header": "localhost",
+    }
 
 
 def test_wildcard_listener_rejects_remote_address():
@@ -1916,7 +1931,11 @@ def test_discovery_brackets_specific_ipv6_listener_address():
 
     server = discover_server(psutil_module=fake)
 
-    assert server == {"pid": 4242, "url": "http://[2001:db8::1]:50222"}
+    assert server == {
+        "pid": 4242,
+        "url": "http://[2001:db8::1]:50222",
+        "host_header": "localhost",
+    }
 
 
 @pytest.mark.parametrize("listener_ip", ["::1", "::"])

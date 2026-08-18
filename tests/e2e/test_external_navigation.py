@@ -59,6 +59,35 @@ def _open_commands(page):
     )
 
 
+def _defer_token_validation(page):
+    page.evaluate(
+        """
+        () => {
+          const originalSafeFetch = window.safeFetch;
+          window.__tokenValidation = {};
+          window.safeFetch = (url, ...args) => {
+            if (url !== '/api/inat/token') return originalSafeFetch(url, ...args);
+            return new Promise((resolve, reject) => {
+              window.__tokenValidation.resolve = resolve;
+              window.__tokenValidation.reject = reject;
+            });
+          };
+        }
+        """
+    )
+
+
+def _resolve_token_validation(page):
+    page.evaluate(
+        """
+        async () => {
+          window.__tokenValidation.resolve({ok: true, login: 'birder42'});
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        """
+    )
+
+
 def test_native_quick_open_reviews_checked_metadata_before_opening(live_server, page):
     page.goto(f"{live_server['url']}/browse")
     original_url = page.url
@@ -133,6 +162,40 @@ def test_valid_inline_token_switches_modal_to_direct_submission(live_server, pag
     expect(page.locator("#inatDesc0")).to_have_value("Seen beside the trail")
     expect(page.locator("#inatSubmitBtn")).to_be_enabled()
     expect(page.locator("#inatSubmitBtn")).to_have_text("Send to iNaturalist")
+
+
+def test_stale_token_validation_does_not_reopen_closed_modal(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+    _mock_tauri(page)
+    _defer_token_validation(page)
+    page.evaluate("item => openInatQuickModal([item], [])", _item())
+
+    page.locator("#inatQuickToken").fill("valid-token")
+    page.locator("#inatQuickTokenBtn").click()
+    expect(page.locator("#inatQuickTokenBtn")).to_have_text("Validating…")
+    page.evaluate("closeInatModal()")
+    _resolve_token_validation(page)
+
+    expect(page.locator("#inatModal")).to_have_class("modal-overlay")
+    assert page.evaluate("inatQueue.length") == 0
+
+
+def test_stale_token_validation_does_not_replace_new_quick_modal(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+    _mock_tauri(page)
+    _defer_token_validation(page)
+    page.evaluate("item => openInatQuickModal([item], [])", _item())
+
+    page.locator("#inatQuickToken").fill("valid-token")
+    page.locator("#inatQuickTokenBtn").click()
+    expect(page.locator("#inatQuickTokenBtn")).to_have_text("Validating…")
+    page.evaluate("item => openInatQuickModal([item], [])", _item(2))
+    _resolve_token_validation(page)
+
+    expect(page.locator("#inatQuickToken")).to_be_visible()
+    expect(page.locator("#inatCards")).to_contain_text("photo-2.jpg")
+    expect(page.locator("#inatSubmitBtn")).to_be_disabled()
+    assert page.evaluate("inatQueue.map(item => item.photo_id)") == [2]
 
 
 def test_token_free_export_uses_checked_metadata(live_server, page):

@@ -9094,6 +9094,7 @@ var inatQueue = [];  // [{photo_id, taxon_name, observed_on, latitude, longitude
 var _inatSubmitting = false;  // true while inatDoSubmit's loop is running
 var _inatCancelled = false;   // set by closeInatModal to stop the loop gracefully
 var _inatQuickFailures = [];
+var _inatModalGeneration = 0;
 
 function _inatQueueItem(photoId, data) {
   return {
@@ -9233,6 +9234,7 @@ async function submitToInatBatch(photoIds) {
 }
 
 async function openInatQuickModal(items, failures) {
+  _inatModalGeneration++;
   if (window._inatEscToken) Keymap.popEsc(window._inatEscToken);
   window._inatEscToken = Keymap.pushEsc(function() { closeInatModal(); });
 
@@ -9360,6 +9362,7 @@ async function validateAndSaveInatToken() {
   var input = document.getElementById('inatQuickToken');
   var status = document.getElementById('inatQuickTokenStatus');
   var button = document.getElementById('inatQuickTokenBtn');
+  var generation = _inatModalGeneration;
   var token = input ? input.value.trim() : '';
   if (!token) {
     status.className = 'inat-card-status error';
@@ -9376,11 +9379,17 @@ async function validateAndSaveInatToken() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({token: token}),
     }, { toast: false });
+    if (
+      generation !== _inatModalGeneration ||
+      !document.getElementById('inatModal').classList.contains('open') ||
+      document.getElementById('inatQuickToken') !== input
+    ) return;
     status.className = 'inat-card-status success';
     status.textContent = '\u2713 Valid token' + (data.login ? ' for ' + data.login : '') + '. Opening direct submission\u2026';
     _inatApplyQuickChoicesToQueue();
     openInatModal(_inatQuickFailures);
   } catch(e) {
+    if (generation !== _inatModalGeneration) return;
     status.className = 'inat-card-status error';
     status.textContent = '\u2717 ' + e.message;
     button.disabled = false;
@@ -9491,6 +9500,7 @@ async function exportInatQuickPhotos() {
 }
 
 function openInatModal(failures) {
+  _inatModalGeneration++;
   if (window._inatEscToken) Keymap.popEsc(window._inatEscToken);
   window._inatEscToken = Keymap.pushEsc(function() { closeInatModal(); });
 
@@ -9541,6 +9551,7 @@ function openInatModal(failures) {
 }
 
 function closeInatModal() {
+  _inatModalGeneration++;
   if (window._inatEscToken) { Keymap.popEsc(window._inatEscToken); window._inatEscToken = null; }
   document.getElementById('inatModal').classList.remove('open');
   if (_inatSubmitting) {

@@ -21,6 +21,9 @@ on:
   workflow_run:
     workflows: ["Tests"]
     types: [completed]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
 
 # Concurrency is scoped per job (see the `concurrency:` block on each job
 # below) rather than workflow-wide. A workflow-wide `pr-agent-<PR>` group
@@ -42,6 +45,7 @@ permissions:
 
 env:
   HUMAN_MERGE_ACTORS: "jss367"
+  CODEX_MERGE_ACTOR: "chatgpt-codex-connector[bot]"
   TRUSTED_PR_AUTHORS: "jss367"
   AGENT_LABEL: claude-agent
 
@@ -611,6 +615,172 @@ jobs:
           gh label create "$AGENT_LABEL" --repo "$REPO" --color 5319e7 \
             --description "PRs handled by the Claude PR agent" || true
           gh pr edit "$PR" --repo "$REPO" --add-label "$AGENT_LABEL"
+
+  # GitHub does not emit a workflow event for issue reactions. Discover a
+  # Codex approval when its summary comment arrives, when Tests succeeds, and
+  # on a short polling fallback. The reaction authorizes only the commit named
+  # in the paired, unedited "no major issues" summary at the same timestamp.
+  discover-codex-merge-authorizations:
+    if: >-
+      github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'issue_comment'
+          && github.event.issue.pull_request
+          && github.actor == 'chatgpt-codex-connector[bot]')
+      || (github.event_name == 'workflow_run'
+          && github.event.workflow_run.event == 'pull_request'
+          && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.authorizations.outputs.targets }}
+    steps:
+      - name: Find reviewed heads approved by Codex
+        id: authorizations
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PR: ${{ github.event.issue.number }}
+          TESTED_HEAD: ${{ github.event.workflow_run.head_sha }}
+          TESTED_PRS: ${{ toJson(github.event.workflow_run.pull_requests) }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            candidates=$(jq -r '.[0].number // empty' <<< "$TESTED_PRS")
+          elif [[ "$EVENT_NAME" == "issue_comment" ]]; then
+            candidates="$EVENT_PR"
+          else
+            candidates=$(gh pr list --repo "$REPO" --state open --limit 1000 \
+              --json number --jq '.[].number')
+          fi
+
+          targets='[]'
+          for pr in $candidates; do
+            pr_json=$(gh pr view "$pr" --repo "$REPO" \
+              --json state,isDraft,headRefOid,baseRefName,headRepositoryOwner,headRepository)
+            state=$(jq -r '.state' <<< "$pr_json")
+            draft=$(jq -r '.isDraft' <<< "$pr_json")
+            head_sha=$(jq -r '.headRefOid | ascii_downcase' <<< "$pr_json")
+            base_ref=$(jq -r '.baseRefName' <<< "$pr_json")
+            head_repo=$(jq -r '.headRepositoryOwner.login + "/" + .headRepository.name' <<< "$pr_json")
+
+            if [[ "$state" != "OPEN" || "$draft" == "true" \
+              || "$base_ref" != "main" || "$head_repo" != "$REPO" ]]; then
+              continue
+            fi
+            if [[ "$EVENT_NAME" == "workflow_run" && "$head_sha" != "$TESTED_HEAD" ]]; then
+              echo "PR #${pr} advanced beyond tested head ${TESTED_HEAD}; skipping stale Tests event."
+              continue
+            fi
+
+            comments=$(gh api --paginate "repos/${REPO}/issues/${pr}/comments" \
+              --slurp | jq 'add // []')
+            reactions=$(gh api --paginate "repos/${REPO}/issues/${pr}/reactions" \
+              --slurp | jq 'add // []')
+            authorization=$(jq -cn \
+              --argjson comments "$comments" \
+              --argjson reactions "$reactions" \
+              --arg bot "$CODEX_MERGE_ACTOR" \
+              --arg head "$head_sha" '
+                [ $comments[]
+                  | select(.user.login == $bot)
+                  | select(.created_at == .updated_at)
+                  | select(.body | startswith("Codex Review: Didn\u0027t find any major issues."))
+                  | . as $comment
+                  | (try ($comment.body
+                      | capture("\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-fA-F]{7,40})`")
+                      | .sha
+                      | ascii_downcase)
+                    catch "") as $reviewed_head
+                  | select($reviewed_head != "" and ($head | startswith($reviewed_head)))
+                  | $reactions[]
+                  | select(.user.login == $bot)
+                  | select(.content == "+1")
+                  | select(.created_at == $comment.created_at)
+                  | {
+                      authorized_at: .created_at,
+                      reaction_id: .id,
+                      review_comment_id: $comment.id
+                    }
+                ]
+                | sort_by(.authorized_at)
+                | last // empty')
+
+            if [[ -z "$authorization" ]]; then
+              continue
+            fi
+            echo "Codex approved PR #${pr} at ${head_sha}."
+            targets=$(jq -c \
+              --argjson pr "$pr" \
+              --arg head "$head_sha" \
+              --argjson authorization "$authorization" \
+              '. + [{
+                pr: $pr,
+                head: $head,
+                authorized_at: $authorization.authorized_at,
+                reaction_id: $authorization.reaction_id,
+                review_comment_id: $authorization.review_comment_id
+              }]' <<< "$targets")
+          done
+
+          echo "targets=${targets}" >> "$GITHUB_OUTPUT"
+
+  merge-on-codex-reaction:
+    needs: discover-codex-merge-authorizations
+    if: needs.discover-codex-merge-authorizations.outputs.targets != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.discover-codex-merge-authorizations.outputs.targets) }}
+    concurrency:
+      group: pr-agent-merge-codex-${{ matrix.target.pr }}-${{ matrix.target.reaction_id }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      issues: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Check live merge readiness
+        id: ready
+        uses: ./.github/actions/pr-merge-ready
+        with:
+          repo: ${{ github.repository }}
+          pr: ${{ matrix.target.pr }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          approved-head: ${{ matrix.target.head }}
+          authorized-at: ${{ matrix.target.authorized_at }}
+          codex-reaction-id: ${{ matrix.target.reaction_id }}
+          codex-review-comment-id: ${{ matrix.target.review_comment_id }}
+
+      - name: Squash-merge Codex-approved head
+        if: steps.ready.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ matrix.target.pr }}
+          HEAD_SHA: ${{ steps.ready.outputs.head-sha }}
+          TITLE: ${{ steps.ready.outputs.title }}
+        run: |
+          if ! merge_output=$(gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
+            --match-head-commit "$HEAD_SHA" \
+            --subject "${TITLE} (#${PR})" 2>&1); then
+            state=$(gh pr view "$PR" --repo "$REPO" --json state --jq .state)
+            if [[ "$state" == "MERGED" ]]; then
+              echo "PR #${PR} was merged by another valid authorization."
+              exit 0
+            fi
+            echo "$merge_output"
+            exit 1
+          fi
+          echo "Merged PR #${PR} after Codex approved head ${HEAD_SHA}."
 
   # A human approval authorizes only the reviewed head. Current unresolved
   # threads, stale heads, forks, stacked children, non-main bases, and a Tests

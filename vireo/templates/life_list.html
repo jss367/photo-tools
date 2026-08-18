@@ -42,7 +42,10 @@
   .species-card:hover { border-color:var(--accent); }
   .species-card img { width:100%; aspect-ratio:3/2; object-fit:cover; display:block; background:var(--bg-tertiary); }
   .lifer-number { position:absolute; top:8px; left:8px; padding:2px 8px; border-radius:999px; background:rgba(0,0,0,0.65); color:#fff; font-size:11px; font-weight:700; letter-spacing:0.5px; }
-  .lifelist-ribbon { position:absolute; top:8px; right:8px; padding:2px 7px; border-radius:999px; background:var(--accent); color:var(--accent-text); font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.5px; }
+  .lifelist-badges { position:absolute; top:8px; right:8px; display:flex; flex-direction:column; align-items:flex-end; gap:4px; z-index:2; pointer-events:none; }
+  .lifelist-ribbon, .lifelist-pick-badge { padding:2px 7px; border-radius:999px; font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.5px; box-shadow:0 1px 5px rgba(0,0,0,.4); }
+  .lifelist-ribbon { background:var(--accent); color:var(--accent-text); }
+  .lifelist-pick-badge { background:rgba(0,0,0,.72); color:#fff; border:1px solid rgba(255,255,255,.65); }
   .species-info { padding:10px 12px 12px; }
   .species-name { font-size:15px; font-weight:600; color:var(--text-primary); }
   .species-sci { font-size:12px; font-style:italic; color:var(--text-secondary); margin-top:1px; }
@@ -321,6 +324,7 @@ var lifeListExportColumnSelections = {species: null, photos: null};
 var LIFE_LIST_PAGE_SIZE = 100;
 var lifeListLightboxSpecies = null;
 var lifeListLoadPromises = {};
+var lifeListLoadSeq = 0;
 
 function restoreLifeListViewPreferences() {
   VireoViewPreferences.restoreAll(document.getElementById('controlsBar'));
@@ -342,13 +346,18 @@ function formatDate(iso) {
 
 async function loadLifeList() {
   var meta = document.getElementById('meta');
+  var loadSeq = ++lifeListLoadSeq;
   meta.textContent = 'Loading life list…';
+  var data;
   try {
-    currentData = await safeFetch('/api/life-list');
+    data = await safeFetch('/api/life-list');
   } catch (e) {
+    if (loadSeq !== lifeListLoadSeq) return;
     meta.textContent = 'Failed to load life list.';
     return;
   }
+  if (loadSeq !== lifeListLoadSeq) return;
+  currentData = data;
   populateLifeListTaxonomyFilters();
   render();
 }
@@ -482,10 +491,17 @@ function renderCard(entry, displayNumber) {
           + (Math.min(LIFE_LIST_PAGE_SIZE, remaining) === 1 ? '' : 's'))
       + '</button>'
     : '';
+  var badges = '';
+  if (best && (best.is_species_representative || best.flag === 'flagged')) {
+    badges = '<div class="lifelist-badges">'
+      + (best.is_species_representative ? '<div class="lifelist-ribbon">Representative</div>' : '')
+      + (best.flag === 'flagged' ? '<div class="lifelist-pick-badge" title="Flagged as Pick">Pick</div>' : '')
+      + '</div>';
+  }
   return '<div class="species-card" data-species="' + escapeAttr(entry.species) + '" title="'
     + escapeAttr((entry.locations || []).join(', ')) + '">'
     + '<div class="lifer-number">#' + displayNumber + '</div>'
-    + (best && best.is_species_representative ? '<div class="lifelist-ribbon">Representative</div>' : '')
+    + badges
     + (best ? '<img src="' + escapeAttr(thumb) + '" data-photo-id="' + escapeAttr(best.id) + '" alt="' + escapeAttr(best.filename) + '" loading="lazy">' : '')
     + '<div class="species-info">'
     + '<div class="species-name">' + escapeAttr(entry.species) + '</div>'
@@ -642,6 +658,19 @@ document.addEventListener('lightbox:navigationboundary', function(event) {
       openLightbox(next.id, next.filename, entry.photos);
     }
   });
+});
+
+// Picks change the server-authoritative Life List order. Refetch instead of
+// duplicating the Representative → Pick → ranked ordering in the browser;
+// the open lightbox keeps its stable navigation array, while the card is ready
+// in the new order (and with its Pick badge) when the viewer closes.
+document.addEventListener('lightbox:flagchanged', function(event) {
+  var detail = event && event.detail || {};
+  var previous = detail.previousFlag || 'none';
+  var next = detail.flag || 'none';
+  if (previous === next) return;
+  if (previous !== 'flagged' && next !== 'flagged') return;
+  loadLifeList();
 });
 
 document.addEventListener('lightbox:closed', function() {

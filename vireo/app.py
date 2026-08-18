@@ -868,8 +868,9 @@ def _highlight_score_bucket(photos, picked_first=False):
     """Attach highlight scores and compact reason labels to one species bucket.
 
     picked_first promotes flagged photos above unflagged ones regardless of
-    score — desired on the Highlights page, but off by default so callers
-    like the Life List keep selecting the highest-scored photo.
+    score — desired on the Highlights page. It is off by default so callers
+    such as Life List can calculate the ranked baseline before applying their
+    own Representative / Pick curation tiers.
     """
     subject_values = [p.get("subject_tenengrad") for p in photos]
     eye_values = [p.get("eye_tenengrad") for p in photos if p.get("eye_tenengrad") is not None]
@@ -14434,6 +14435,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "id": photo["id"],
                 "filename": photo["filename"],
                 "timestamp": photo.get("timestamp"),
+                "flag": photo.get("flag") or "none",
                 "quality_score": photo.get("quality_score"),
                 "highlight_score": photo.get("highlight_score"),
                 "reasons": photo.get("reasons") or [],
@@ -14470,11 +14472,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             preferred_applied = any(
                 photo.get("is_species_representative") for photo in photos
             )
-            if preferred_applied:
-                _sort_photos_with_representatives_first(
-                    photos, representative_order
-                )
-            best_source = "representative" if preferred_applied else "algorithm"
             if not preferred_applied and highlight_ranks:
                 valid_highlights = [
                     (highlight_ranks[p["id"]], p["id"])
@@ -14487,8 +14484,31 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         if photo["id"] == highlight_id:
                             if idx:
                                 photos.insert(0, photos.pop(idx))
-                            best_source = "highlight"
                             break
+            # Life List curation order is explicit representative selection,
+            # then Picks (the P flag), then the existing highlight/algorithmic
+            # ranking. Keep ranked positions as the final tie-breaker so
+            # multiple Picks retain their quality order and non-Picks behave
+            # exactly as before.
+            ranked_position = {
+                photo["id"]: idx for idx, photo in enumerate(photos)
+            }
+            photos.sort(key=lambda photo: (
+                0 if photo["id"] in representative_order else (
+                    1 if photo.get("flag") == "flagged" else 2
+                ),
+                representative_order.get(photo["id"], 0),
+                ranked_position.get(photo["id"], 0),
+            ))
+            best_photo = photos[0] if photos else {}
+            if best_photo.get("is_species_representative"):
+                best_source = "representative"
+            elif best_photo.get("flag") == "flagged":
+                best_source = "pick"
+            elif best_photo.get("is_highlighted"):
+                best_source = "highlight"
+            else:
+                best_source = "algorithm"
             if photo_limit is None:
                 top = photos[photo_offset:]
             else:

@@ -669,6 +669,7 @@
 
   function applyJobProgress(watch, progress) {
     if (!progress || activeJob !== watch) return;
+    watch.progress = progress;
     var rootId = Number(progress.root_folder_id);
     if (Number.isFinite(rootId)) {
       watch.progressByRoot[String(rootId)] = progress;
@@ -680,7 +681,13 @@
   function watchJob(jobId) {
     if (activeJob && activeJob.id === jobId) return;
     if (activeJob && activeJob.source) activeJob.source.close();
-    var watch = {id: jobId, progressByRoot: {}, source: null, eventCount: 0};
+    var watch = {
+      id: jobId,
+      progress: null,
+      progressByRoot: {},
+      source: null,
+      eventCount: 0
+    };
     activeJob = watch;
     watch.source = safeEventSource('/api/jobs/' + encodeURIComponent(jobId) + '/stream', {
       onProgress: function(progress) {

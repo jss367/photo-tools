@@ -102,6 +102,9 @@ def test_sync_back_replaces_folder_actions_with_live_progress(
         expect(status).to_have_attribute("data-local-folder-root-id", str(folder_id))
         expect(status).to_contain_text("Syncing inline-progress-source to source")
         expect(status).to_contain_text("3 / 10 files")
+        panel = page.locator("#localWorkspaceContent")
+        expect(panel).to_contain_text("Syncing inline-progress-source to source")
+        expect(panel).to_contain_text("3 / 10 files")
         assert progress_sent.is_set()
         expect(status.get_by_role("link", name="View Jobs")).to_have_attribute(
             "href", "/jobs"

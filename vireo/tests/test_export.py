@@ -15,6 +15,7 @@ from export import (
     developed_folder_key,
     export_photos,
     normalize_metadata_fields,
+    preview_export_renames,
     relocate_developed_dir,
     relocate_developed_file,
     resolve_template,
@@ -1301,6 +1302,44 @@ def test_export_photos_collision_renames(export_env):
     assert result["exported"] == 2
     assert os.path.isfile(os.path.join(env["dest"], "photo.jpg"))
     assert os.path.isfile(os.path.join(env["dest"], "photo_2.jpg"))
+
+
+def test_preview_export_renames_reports_existing_file(export_env):
+    """The export preflight exposes the numbered name before rendering."""
+    env = export_env
+    os.makedirs(env["dest"])
+    existing = os.path.join(env["dest"], "bird1.jpg")
+    Image.new("RGB", (20, 20), color="green").save(existing, "JPEG")
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "format": "jpg"},
+    )
+
+    assert renames == [{
+        "photo_id": env["p1"],
+        "requested_name": "bird1.jpg",
+        "export_name": "bird1_2.jpg",
+        "destination": env["dest"],
+    }]
+
+
+def test_preview_export_renames_reports_same_batch_collision(export_env):
+    """Preflight also predicts collisions created by earlier batch entries."""
+    env = export_env
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={"naming_template": "photo", "format": "jpg"},
+    )
+
+    assert [(item["requested_name"], item["export_name"]) for item in renames] == [
+        ("photo.jpg", "photo_2.jpg"),
+    ]
 
 
 def test_export_photos_convert_png_batch_deduplicates_extension(export_env):

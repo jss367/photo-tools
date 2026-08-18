@@ -1864,6 +1864,9 @@ body.sidebar-resizing {
           <button class="export-var-pill" onclick="insertTemplateVar('{folder}')">{folder}</button>
         </div>
         <div id="exportPreview" style="font-size:11px;color:var(--text-muted);margin-bottom:12px;font-family:monospace;"></div>
+        <div id="exportCollisionPolicy" style="font-size:11px;color:var(--text-secondary);margin-bottom:12px;padding:8px 10px;border:1px solid var(--border-secondary);border-radius:4px;background:var(--bg-tertiary);line-height:1.45;">
+          Existing files are never overwritten. If an export name is already in use, Vireo adds a number such as <code>_2</code>. You’ll be shown the filename changes before export starts.
+        </div>
 
         <label style="font-size:12px;color:var(--text-secondary);display:block;margin-bottom:7px;">Include metadata in exported files</label>
         <div class="export-metadata-options">
@@ -11581,29 +11584,70 @@ async function startExport() {
   var btn = document.getElementById('exportSubmitBtn');
   var activeIds = getActiveSelection();
   var count = activeIds.length;
+  var buttonLabel = 'Export ' + count + ' photo' + (count === 1 ? '' : 's');
   btn.disabled = true;
+  btn.textContent = 'Checking filenames…';
+
+  var exportRequest = {
+    photo_ids: activeIds,
+    destination: dest,
+    export_to_subfolder: exportToSubfolder,
+    naming_template: template,
+    max_size: maxSize,
+    quality: quality,
+    format: format,
+    metadata_fields: selectedExportMetadataFields(),
+  };
 
   try {
+    var preflight = await safeFetch('/api/jobs/export/preflight', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(exportRequest),
+    });
+    if (preflight.error) {
+      alert('Export check failed: ' + preflight.error);
+      btn.disabled = false;
+      btn.textContent = buttonLabel;
+      return;
+    }
+    if (preflight.rename_count > 0) {
+      var renameLines = (preflight.renames || []).slice(0, 5).map(function(rename) {
+        return rename.requested_name + ' → ' + rename.export_name;
+      });
+      if (preflight.rename_count > renameLines.length) {
+        renameLines.push('…and ' + (preflight.rename_count - renameLines.length) + ' more');
+      }
+      var renameMessage = preflight.rename_count + ' export filename' +
+        (preflight.rename_count === 1 ? ' is' : 's are') +
+        ' already in use. Existing files will be kept, and Vireo will save the new export' +
+        (preflight.rename_count === 1 ? '' : 's') + ' with numbered names:\n\n' +
+        renameLines.join('\n') + '\n\nContinue with export?';
+      if (!window.confirm(renameMessage)) {
+        btn.disabled = false;
+        btn.textContent = buttonLabel;
+        return;
+      }
+    }
+
+    btn.textContent = 'Starting export…';
     var data = await safeFetch('/api/jobs/export', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        photo_ids: activeIds,
-        destination: dest,
-        export_to_subfolder: exportToSubfolder,
-        naming_template: template,
-        max_size: maxSize,
-        quality: quality,
-        format: format,
-        metadata_fields: selectedExportMetadataFields(),
-      }),
+      body: JSON.stringify(exportRequest),
     });
-    if (data.error) { alert('Export error: ' + data.error); btn.disabled = false; return; }
+    if (data.error) {
+      alert('Export error: ' + data.error);
+      btn.disabled = false;
+      btn.textContent = buttonLabel;
+      return;
+    }
     closeExportModal();
     showToast('Export started (' + count + ' photos)', 'info');
   } catch(err) {
     alert('Export failed: ' + err.message);
     btn.disabled = false;
+    btn.textContent = buttonLabel;
   }
 }
 

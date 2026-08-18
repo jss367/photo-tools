@@ -26604,6 +26604,70 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     # -- Export job route --
 
+    @app.route("/api/jobs/export/preflight", methods=["POST"])
+    def api_job_export_preflight():
+        """Preview collision renames before starting a photo export."""
+        body = request.get_json(silent=True) or {}
+        raw_ids = body.get("photo_ids", [])
+        destination = body.get("destination", "")
+        export_to_subfolder = body.get("export_to_subfolder", False)
+        naming_template = body.get("naming_template", "{original}")
+        output_format = body.get("format", body.get("output_format", "jpg"))
+
+        if not raw_ids:
+            return json_error("photo_ids required")
+        try:
+            photo_ids = [int(pid) for pid in raw_ids]
+        except (ValueError, TypeError):
+            return json_error("photo_ids must be integers")
+        if not isinstance(destination, str):
+            return json_error("destination must be a string")
+        destination = destination.strip()
+        if destination and not os.path.isabs(destination):
+            return json_error("destination must be an absolute path")
+        if not isinstance(export_to_subfolder, bool):
+            return json_error("export_to_subfolder must be a boolean")
+        if not isinstance(naming_template, str):
+            return json_error("naming_template must be a string")
+
+        try:
+            from export import normalize_output_format, preview_export_renames
+            output_format = normalize_output_format(output_format)["extension"]
+        except ValueError as exc:
+            return json_error(str(exc))
+
+        db = _get_db()
+        active_ws = db._active_workspace_id
+        visible_set = set()
+        for chunk in _chunked(photo_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            visible = db.conn.execute(
+                f"""SELECT p.id FROM photos p
+                    JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+                    WHERE wf.workspace_id = ? AND p.id IN ({placeholders})""",
+                [active_ws] + list(chunk),
+            ).fetchall()
+            visible_set.update(row["id"] for row in visible)
+        photo_ids = [pid for pid in photo_ids if pid in visible_set]
+        if not photo_ids:
+            return json_error("no exportable photos in current workspace")
+
+        renames = preview_export_renames(
+            db=db,
+            photo_ids=photo_ids,
+            destination=destination,
+            options={
+                "naming_template": naming_template,
+                "format": output_format,
+                "export_to_subfolder": export_to_subfolder,
+            },
+        )
+        return jsonify({
+            "rename_count": len(renames),
+            "renames": renames[:20],
+            "truncated": len(renames) > 20,
+        })
+
     @app.route("/api/jobs/export", methods=["POST"])
     def api_job_export():
         """Export selected photos to a destination directory."""

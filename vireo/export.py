@@ -1472,12 +1472,101 @@ def _resolve_source(photo, vireo_dir, folders, use_working_copy=False):
     return os.path.join(folder_path, photo["filename"])
 
 
-def _deduplicate_path(path):
-    """Append _2, _3, etc. if path already exists."""
-    if not os.path.exists(path):
+def _deduplicate_path(path, reserved_paths=None):
+    """Append _2, _3, etc. if a path exists or is reserved by this batch."""
+    reserved_paths = reserved_paths or set()
+    if not os.path.exists(path) and path not in reserved_paths:
         return path
     stem, ext = os.path.splitext(path)
     counter = 2
-    while os.path.exists(f"{stem}_{counter}{ext}"):
+    while (
+        os.path.exists(f"{stem}_{counter}{ext}")
+        or f"{stem}_{counter}{ext}" in reserved_paths
+    ):
         counter += 1
     return f"{stem}_{counter}{ext}"
+
+
+def preview_export_renames(db, photo_ids, destination=None, options=None):
+    """Return filename changes that export collision handling would make.
+
+    This is a read-only preflight for the export dialog. It mirrors export's
+    destination, template, sequence, and deduplication rules without loading or
+    rendering image bytes. A later filesystem change can still introduce a new
+    collision, so the dialog also states the non-overwrite policy permanently.
+    """
+    options = options or {}
+    template = options.get("naming_template", "{original}")
+    output_ext = normalize_output_format(
+        options.get("format", options.get("output_format", "jpg"))
+    )["extension"]
+    subfolder = "exported" if options.get("export_to_subfolder") else ""
+
+    photos_map = db.get_photos_by_ids(photo_ids)
+    folders = {folder["id"]: folder["path"] for folder in db.get_folder_tree()}
+    species_map = db.get_species_keywords_for_photos(photo_ids)
+    seq_counters = {}
+    reserved_paths = set()
+    renames = []
+
+    for pid in photo_ids:
+        photo = photos_map.get(pid)
+        if not photo:
+            continue
+
+        folder_path = folders.get(photo["folder_id"], "")
+        destination_base = destination or folder_path
+        if not destination_base:
+            continue
+        photo_destination = os.path.normpath(
+            os.path.join(destination_base, subfolder)
+            if subfolder else destination_base
+        )
+
+        species_list = species_map.get(pid, [])
+        species = species_list[0] if species_list else None
+        photo_info = {
+            "filename": photo["filename"],
+            "timestamp": photo["timestamp"],
+            "rating": photo["rating"],
+            "folder_name": os.path.basename(folder_path),
+        }
+        subdir_key = (
+            photo_destination,
+            os.path.dirname(
+                resolve_template(template, photo_info, species=species, seq=0)
+            ),
+        )
+        seq_counters.setdefault(subdir_key, 0)
+        seq_counters[subdir_key] += 1
+        rel_path = resolve_template(
+            template,
+            photo_info,
+            species=species,
+            seq=seq_counters[subdir_key],
+        )
+        rel_path_safe = os.path.normpath(rel_path).lstrip(os.sep + ".")
+        requested_path = os.path.join(
+            photo_destination, rel_path_safe + f".{output_ext}"
+        )
+
+        dest_real = os.path.realpath(photo_destination)
+        requested_real = os.path.realpath(requested_path)
+        dest_prefix = dest_real if dest_real.endswith(os.sep) else dest_real + os.sep
+        if (
+            not requested_real.startswith(dest_prefix)
+            and requested_real != dest_real
+        ):
+            continue
+
+        export_path = _deduplicate_path(requested_path, reserved_paths)
+        reserved_paths.add(export_path)
+        if export_path != requested_path:
+            renames.append({
+                "photo_id": pid,
+                "requested_name": os.path.basename(requested_path),
+                "export_name": os.path.basename(export_path),
+                "destination": os.path.dirname(export_path),
+            })
+
+    return renames

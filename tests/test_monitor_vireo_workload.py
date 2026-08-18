@@ -741,6 +741,99 @@ def test_process_identity_is_rechecked_after_terminal_api_poll():
     ] is False
 
 
+def test_process_exit_before_resource_sample_preserves_prior_samples():
+    clock = _FakeClock()
+
+    class _ExitBeforeSecondSample(_SequenceSampler):
+        def sample(self):
+            if clock.monotonic() >= 2.0:
+                raise RuntimeError("monitored Vireo PID 123 exited")
+            return super().sample()
+
+        def metadata_unverified(self):
+            return {"pid": 123, "identity_verified": False}
+
+    report = collect_workload(
+        duration=2.0,
+        interval=1.0,
+        api_client=_SequenceApi([
+            _api_sample(
+                latency=0.001, wait_count=0, wait_seconds=0.0,
+                producer_starts=0, waiter_joins=0,
+            ),
+            _api_sample(
+                latency=0.001, wait_count=0, wait_seconds=0.0,
+                producer_starts=0, waiter_joins=0,
+            ),
+        ]),
+        process_sampler=_ExitBeforeSecondSample(
+            [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True}],
+            {"pid": 123, "executable_exists": True},
+        ),
+        system_sampler=_SequenceSampler(
+            [{"cpu_idle_percent": 50.0}],
+            {"logical_cpu_count": 16},
+        ),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert report["process_exit_error"] == "monitored Vireo PID 123 exited"
+    assert len(report["samples"]) == 1
+    assert report["summary"]["scenario"]["job_observation_complete"] is False
+
+
+def test_terminal_api_overrun_marks_resource_interval_incomplete():
+    clock = _FakeClock()
+
+    class _OverrunApi:
+        def __init__(self):
+            self.calls = 0
+
+        def authenticate(self):
+            pass
+
+        def sample(self):
+            self.calls += 1
+            if self.calls == 2:
+                clock.sleep(2.0)
+            return _api_sample(
+                latency=2.0, wait_count=0, wait_seconds=0.0,
+                producer_starts=0, waiter_joins=0,
+            )
+
+    report = collect_workload(
+        duration=2.0,
+        interval=1.0,
+        api_client=_OverrunApi(),
+        process_sampler=_SequenceSampler(
+            [{
+                "cpu_percent": 100.0,
+                "rss_bytes": 100,
+                "executable_exists": True,
+                "cpu_accounting_complete": True,
+            }],
+            {
+                "pid": 123,
+                "executable_exists": True,
+                "cpu_accounting_complete": True,
+            },
+        ),
+        system_sampler=_SequenceSampler(
+            [{"cpu_idle_percent": 50.0}],
+            {"logical_cpu_count": 16},
+        ),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert report["samples"][0]["resource_interval_complete"] is False
+    assert report["summary"]["incomplete_resource_interval_count"] == 1
+    assert report["summary"]["vireo_process_tree_cpu_percent"][
+        "accounting_complete"
+    ] is False
+
+
 def test_interrupted_api_poll_retains_resource_sample_and_marks_failure():
     clock = _FakeClock()
 
@@ -833,6 +926,7 @@ def test_late_process_exit_preserves_report_and_fails_trust_gate():
 
     assert report["process_exit_error"] == "monitored Vireo PID 123 exited"
     assert len(report["samples"]) == 1
+    assert report["summary"]["scenario"]["job_observation_complete"] is False
     assert report["summary"]["targets"]["vireo_executable_present_throughout"] is False
 
 

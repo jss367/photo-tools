@@ -730,6 +730,10 @@ def build_summary(
                 sample["process"].get("cpu_accounting_complete") is not False
                 for sample in samples
             )
+            and all(
+                sample.get("resource_interval_complete") is not False
+                for sample in samples
+            )
         )
     process_rss = [
         sample["process"]["rss_bytes"] for sample in complete_process_samples
@@ -744,6 +748,7 @@ def build_summary(
     job_observation_complete = (
         not interrupted
         and api_failure_count == 0
+        and (process_metadata or {}).get("identity_verified") is not False
         and not any(
             sample["api"].get("history_window_saturated") is True
             for sample in samples
@@ -810,6 +815,10 @@ def build_summary(
         executable_present = None
     return {
         "sample_count": len(samples),
+        "incomplete_resource_interval_count": sum(
+            sample.get("resource_interval_complete") is False
+            for sample in samples
+        ),
         "incomplete_process_sample_count": (
             len(samples) - len(complete_process_samples)
         ),
@@ -902,7 +911,13 @@ def collect_workload(
             if sleep_for > 0:
                 sleep(sleep_for)
             elapsed = monotonic() - started
-            process_sample = process_sampler.sample()
+            try:
+                process_sample = process_sampler.sample()
+            except RuntimeError as exc:
+                # Preserve all earlier identity-verified samples if Vireo
+                # exits during the sleep or before resource sampling.
+                process_exit_error = str(exc)
+                break
             system_sample = system_sampler.sample()
             try:
                 api_sample = api_client.sample()
@@ -916,6 +931,7 @@ def collect_workload(
                 samples.append({
                     "captured_at": _utc_now(),
                     "elapsed_seconds": round(elapsed, 3),
+                    "resource_interval_complete": False,
                     "process": process_sample,
                     "system": system_sample,
                     "api": api_sample,
@@ -937,6 +953,13 @@ def collect_workload(
             samples.append({
                 "captured_at": _utc_now(),
                 "elapsed_seconds": round(elapsed, 3),
+                # A request that crosses the run deadline prevents the next
+                # resource boundary from capturing the remainder of the
+                # requested window. A resource sample already taken at the
+                # deadline itself has captured the complete requested window.
+                "resource_interval_complete": (
+                    next_sample >= deadline or monotonic() <= deadline
+                ),
                 "process": process_sample,
                 "system": system_sample,
                 "api": api_sample,

@@ -667,14 +667,40 @@
     } catch (_error) {}
   }
 
+  function rememberCompletedSteps(watch, steps) {
+    var completed = [];
+    (steps || []).forEach(function(step) {
+      if (!step || step.status !== 'completed') return;
+      var match = /^folder-(\d+)$/.exec(String(step.id || ''));
+      if (!match) return;
+      var rootId = Number(match[1]);
+      var key = String(rootId);
+      if (watch.completedRoots[key]) return;
+      var previous = watch.progressByRoot[key] || {};
+      var progress = Object.assign({}, previous, step.progress || {}, {
+        root_folder_id: rootId,
+        current_file: step.current_file || previous.current_file || '',
+        phase: (step.label || 'Folder') + ' complete'
+      });
+      watch.progressByRoot[key] = progress;
+      watch.completedRoots[key] = true;
+      completed.push(progress);
+    });
+    return completed;
+  }
+
   function applyJobProgress(watch, progress) {
     if (!progress || activeJob !== watch) return;
     watch.progress = progress;
+    var completed = rememberCompletedSteps(watch, progress.steps);
     var rootId = Number(progress.root_folder_id);
     if (Number.isFinite(rootId)) {
       watch.progressByRoot[String(rootId)] = progress;
     }
     render();
+    completed.forEach(function(item) {
+      publishJobProgress(watch.id, item);
+    });
     publishJobProgress(watch.id, progress);
   }
 
@@ -685,6 +711,7 @@
       id: jobId,
       progress: null,
       progressByRoot: {},
+      completedRoots: {},
       source: null,
       eventCount: 0
     };
@@ -721,8 +748,10 @@
         '/api/jobs/' + encodeURIComponent(jobId), {}, {toast: false}
       ).then(function(snapshot) {
         if (activeJob !== watch || watch.eventCount || !snapshot) return;
-        var progress = snapshot.progress || {};
-        if (progress.phase || progress.root_folder_id != null) {
+        var progress = Object.assign({}, snapshot.progress || {}, {
+          steps: snapshot.steps || []
+        });
+        if (progress.phase || progress.root_folder_id != null || progress.steps.length) {
           applyJobProgress(watch, progress);
         }
       }).catch(function() {});

@@ -1997,9 +1997,15 @@ function cropBoxForAspect(crop, normalizedRatio) {
   var w = current.w;
   var h = current.h;
   // Fit the requested ratio inside the crop the user most recently shaped.
-  // This keeps its center and never brings discarded pixels back into view.
+  // This keeps its center and avoids restoring discarded pixels except when
+  // the crop must grow to satisfy the editor's minimum selectable size.
   if (w / h > normalizedRatio) w = h * normalizedRatio;
   else h = w / normalizedRatio;
+  // clampCrop enforces a 2% floor on each axis independently. Scale both
+  // dimensions together first so that floor cannot break the selected ratio.
+  var minScale = Math.max(1, 0.02 / w, 0.02 / h);
+  w *= minScale;
+  h *= minScale;
   return clampCrop({
     x: centerX - w / 2,
     y: centerY - h / 2,

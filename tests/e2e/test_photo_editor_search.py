@@ -361,6 +361,21 @@ def test_photo_editor_aspect_uses_current_crop(live_server, page):
     assert crop["h"] == pytest.approx(0.4)
     assert (crop["w"] / crop["h"]) == pytest.approx(1.5)
 
+    minimum_crops = page.evaluate(
+        """() => ({
+            editor: cropBoxForAspect(
+                {x: 0.1, y: 0.2, w: 0.02, h: 0.5}, 1.5
+            ),
+            shared: _cropBoxForAspect(
+                {x: 0.1, y: 0.2, w: 0.02, h: 0.5}, 1.5
+            ),
+        })"""
+    )
+    for minimum_crop in minimum_crops.values():
+        assert minimum_crop["w"] >= 0.02
+        assert minimum_crop["h"] >= 0.02
+        assert (minimum_crop["w"] / minimum_crop["h"]) == pytest.approx(1.5)
+
 
 def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page):
     """The editor zoom slider scales continuously and keeps exact Fit/100% actions."""

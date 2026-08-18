@@ -825,7 +825,8 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .lightbox-view-panel {
   display: none;
   position: absolute;
-  width: 264px;
+  box-sizing: border-box;
+  width: min(282px, calc(100vw - 16px));
   max-height: calc(100vh - 112px);
   overflow-y: auto;
   padding: 8px;
@@ -6639,6 +6640,30 @@ function toggleLightboxChrome() {
   _lbApplyChromeVisibility();
 }
 
+function _lbPositionViewPanel() {
+  var panel = document.getElementById('lightboxViewPanel');
+  var btn = document.getElementById('lightboxViewBtn');
+  if (!panel || !btn || !panel.classList.contains('open')) return;
+  // The actions wrap and conditionally gain controls as photos change. Keep
+  // the panel attached to its button even when that happens while it is open.
+  var gutter = 8;
+  var btnRect = btn.getBoundingClientRect();
+  var maxLeft = Math.max(gutter, window.innerWidth - panel.offsetWidth - gutter);
+  var desiredBottom = window.innerHeight - btnRect.top + gutter;
+  var maxBottom = Math.max(gutter, window.innerHeight - panel.offsetHeight - gutter);
+  panel.style.left = Math.max(gutter, Math.min(btnRect.left, maxLeft)) + 'px';
+  panel.style.bottom = Math.max(gutter, Math.min(desiredBottom, maxBottom)) + 'px';
+}
+
+var _lbViewPanelPositionFrame = null;
+function _lbScheduleViewPanelPosition() {
+  if (_lbViewPanelPositionFrame !== null) return;
+  _lbViewPanelPositionFrame = requestAnimationFrame(function() {
+    _lbViewPanelPositionFrame = null;
+    _lbPositionViewPanel();
+  });
+}
+
 function toggleLightboxViewMenu(force) {
   var panel = document.getElementById('lightboxViewPanel');
   var btn = document.getElementById('lightboxViewBtn');
@@ -6654,14 +6679,31 @@ function toggleLightboxViewMenu(force) {
   _lbApplyTrackEyeState();
   _lbApplyInfoVisibility();
   _lbApplyChromeVisibility();
-  // Anchor above the View button. The button's on-screen position shifts as
-  // conditional controls appear and the bar wraps, so recompute on each open.
   // The overlay is position:fixed inset:0, so viewport coords map directly.
-  var btnRect = btn.getBoundingClientRect();
-  var maxLeft = window.innerWidth - panel.offsetWidth - 8;
-  panel.style.left = Math.max(8, Math.min(btnRect.left, maxLeft)) + 'px';
-  panel.style.bottom = (window.innerHeight - btnRect.top + 8) + 'px';
+  _lbPositionViewPanel();
 }
+
+(function() {
+  var actions = document.getElementById('lightboxActions');
+  var viewBtn = document.getElementById('lightboxViewBtn');
+  window.addEventListener('resize', _lbScheduleViewPanelPosition);
+  document.addEventListener('fullscreenchange', _lbScheduleViewPanelPosition);
+  document.addEventListener('webkitfullscreenchange', _lbScheduleViewPanelPosition);
+  if (window.ResizeObserver) {
+    var viewLayoutObserver = new ResizeObserver(_lbScheduleViewPanelPosition);
+    if (actions) viewLayoutObserver.observe(actions);
+    if (viewBtn) viewLayoutObserver.observe(viewBtn);
+  }
+  if (window.MutationObserver && actions) {
+    var viewLayoutMutationObserver = new MutationObserver(_lbScheduleViewPanelPosition);
+    viewLayoutMutationObserver.observe(actions, {
+      attributes: true,
+      childList: true,
+      characterData: true,
+      subtree: true
+    });
+  }
+})();
 
 function lightboxSetFlagAction(flag) {
   if (_lightboxCurrentId == null) return;

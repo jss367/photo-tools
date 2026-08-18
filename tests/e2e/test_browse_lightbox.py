@@ -1130,6 +1130,48 @@ def test_browse_lightbox_reserves_space_for_bottom_controls(live_server, page):
     )
 
 
+def test_browse_lightbox_view_menu_tracks_wrapping_action_bar(live_server, page):
+    """An open View menu stays anchored through viewport and control changes."""
+    page.set_viewport_size({"width": 1000, "height": 700})
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+    expect(page.locator("#lightboxOverlay")).to_have_class("lightbox-overlay active")
+    page.locator("#lightboxViewBtn").click()
+
+    panel_tracks_button = """() => {
+        const panel = document.getElementById('lightboxViewPanel');
+        const button = document.getElementById('lightboxViewBtn');
+        const p = panel.getBoundingClientRect();
+        const b = button.getBoundingClientRect();
+        const gutter = 8;
+        const expectedLeft = Math.max(
+            gutter,
+            Math.min(b.left, Math.max(gutter, innerWidth - p.width - gutter)),
+        );
+        const expectedTop = Math.max(gutter, b.top - p.height - gutter);
+        return panel.classList.contains('open')
+            && Math.abs(p.left - expectedLeft) < 2
+            && Math.abs(p.top - expectedTop) < 2
+            && p.right <= innerWidth - gutter + 1;
+    }"""
+    page.wait_for_function(panel_tracks_button)
+
+    # Narrowing the viewport wraps the action bar and moves the View button.
+    page.set_viewport_size({"width": 640, "height": 700})
+    page.wait_for_function(panel_tracks_button)
+
+    # Conditional controls and their labels can also move the anchor without
+    # a window resize (for example, paired sources or Life List actions).
+    page.evaluate(
+        """() => {
+            const source = document.getElementById('lightboxSourceControl');
+            source.style.display = '';
+            source.textContent = 'Viewing developed JPEG · Show original RAW';
+        }"""
+    )
+    page.wait_for_function(panel_tracks_button)
+
+
 def test_browse_photo_id_deep_link_loads_target_folder_first_page(live_server, page):
     """Open in Browse must find a target that is not on global Browse page 1."""
     db = live_server["db"]

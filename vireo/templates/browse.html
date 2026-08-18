@@ -1814,7 +1814,8 @@ body.sidebar-resizing {
           Leave blank to export each photo beside its original.
         </div>
         <label style="display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text-secondary);margin-bottom:12px;cursor:pointer;">
-          <input id="exportSubfolder" type="checkbox">
+          <input id="exportSubfolder" type="checkbox"
+                 data-view-preference="vireo.browse.export.subfolder">
           Put exports in an “exported” subfolder
         </label>
 
@@ -1867,11 +1868,11 @@ body.sidebar-resizing {
 
         <label style="font-size:12px;color:var(--text-secondary);display:block;margin-bottom:7px;">Include metadata in exported files</label>
         <div class="export-metadata-options">
-          <label class="export-metadata-option"><input id="exportMetadataSpecies" type="checkbox" value="species"> Species</label>
-          <label class="export-metadata-option"><input id="exportMetadataCaptureDateTime" type="checkbox" value="capture_date_time"> Capture date &amp; time</label>
-          <label class="export-metadata-option"><input id="exportMetadataRating" type="checkbox" value="rating"> Rating</label>
-          <label class="export-metadata-option"><input id="exportMetadataLocation" type="checkbox" value="location"> Location</label>
-          <label class="export-metadata-option"><input id="exportMetadataCamera" type="checkbox" value="camera"> Camera &amp; exposure</label>
+          <label class="export-metadata-option"><input id="exportMetadataSpecies" type="checkbox" value="species" data-view-preference="vireo.browse.export.metadata.species"> Species</label>
+          <label class="export-metadata-option"><input id="exportMetadataCaptureDateTime" type="checkbox" value="capture_date_time" data-view-preference="vireo.browse.export.metadata.captureDateTime"> Capture date &amp; time</label>
+          <label class="export-metadata-option"><input id="exportMetadataRating" type="checkbox" value="rating" data-view-preference="vireo.browse.export.metadata.rating"> Rating</label>
+          <label class="export-metadata-option"><input id="exportMetadataLocation" type="checkbox" value="location" data-view-preference="vireo.browse.export.metadata.location"> Location</label>
+          <label class="export-metadata-option"><input id="exportMetadataCamera" type="checkbox" value="camera" data-view-preference="vireo.browse.export.metadata.camera"> Camera &amp; exposure</label>
         </div>
         <p class="export-metadata-help">Unchecked details are left out.</p>
 
@@ -11408,6 +11409,7 @@ function openExportModal() {
   });
   document.getElementById('exportDest').value = '';
   document.getElementById('exportSubfolder').checked = false;
+  VireoViewPreferences.restoreAll(document.getElementById('exportOverlay'));
   document.getElementById('exportOverlay').classList.add('open');
   updateExportPreview();
 }

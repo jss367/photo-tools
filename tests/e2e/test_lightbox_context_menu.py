@@ -69,6 +69,9 @@ def test_lightbox_right_click_opens_menu(live_server, page):
         menu.locator(".vireo-ctx-item", has_text="Copy Path")
     ).to_be_visible()
     expect(
+        menu.locator(".vireo-ctx-item", has_text="Export…")
+    ).to_be_visible()
+    expect(
         menu.locator(".vireo-ctx-item", has_text="Close Lightbox")
     ).to_be_visible()
     expect(
@@ -76,6 +79,42 @@ def test_lightbox_right_click_opens_menu(live_server, page):
     ).to_be_visible()
     # Rating / color / flag chip rows are present (14 chips total).
     assert menu.locator(".vireo-ctx-chip").count() > 5
+
+
+def test_lightbox_export_targets_current_photo(live_server, page):
+    """Lightbox Export opens photo export for only the displayed photo."""
+    url = live_server["url"]
+    _open_lightbox(page, url)
+
+    current_id = page.evaluate("_lightboxCurrentId")
+    page.evaluate(
+        """() => {
+            selectedPhotos.clear();
+            selectedPhotoId = photos.find(photo => photo.id !== _lightboxCurrentId).id;
+            window.__exportRequest = null;
+            window.safeFetch = async function(url, options) {
+                if (url === '/api/jobs/export') {
+                    window.__exportRequest = JSON.parse(options.body);
+                    return {job_id: 'lightbox-export-test'};
+                }
+                return {};
+            };
+        }"""
+    )
+
+    _fire_contextmenu_on_lightbox(page)
+    menu = page.locator(".vireo-ctx-menu")
+    menu.locator(".vireo-ctx-item", has_text="Export…").click()
+
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    expect(page.locator("#exportOverlay")).to_be_visible()
+    expect(page.locator("#lightboxOverlay")).to_have_class("lightbox-overlay")
+    expect(page.locator("#exportSubmitBtn")).to_have_text("Export 1 photo")
+    assert page.evaluate("_exportPhotoIds") == [current_id]
+
+    page.locator("#exportSubmitBtn").click()
+    page.wait_for_function("window.__exportRequest !== null")
+    assert page.evaluate("window.__exportRequest.photo_ids") == [current_id]
 
 
 def test_lightbox_color_description_opens_editor(live_server, page):

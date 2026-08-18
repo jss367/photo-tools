@@ -1,7 +1,46 @@
 import json
 import re
 
+import pytest
 from playwright.sync_api import expect
+
+# The preview endpoint streams SSE frames and ends with a `done` frame that
+# carries the old synchronous folder-preview payload. These helpers let
+# stubs speak that protocol: __previewDoneResponse wraps a payload in a
+# single done frame; __sseStream hands tests a push()/close() handle for
+# driving scan-progress frames one at a time.
+SSE_PREVIEW_HELPERS = """
+window.__previewDoneResponse = (payload) => new Response(
+  'data: ' + JSON.stringify(Object.assign({type: 'done'}, payload)) + '\\n\\n',
+  {status: 200, headers: {'Content-Type': 'text/event-stream'}});
+window.__sseStream = () => {
+  let controller;
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({start(c) { controller = c; }});
+  return {
+    response: new Response(stream,
+      {status: 200, headers: {'Content-Type': 'text/event-stream'}}),
+    push: (frame) => controller.enqueue(encoder.encode(
+      'data: ' + JSON.stringify(frame) + '\\n\\n')),
+    close: () => { try { controller.close(); } catch (e) {} },
+  };
+};
+"""
+
+
+@pytest.fixture(autouse=True)
+def _sse_preview_helpers(page):
+    page.add_init_script(SSE_PREVIEW_HELPERS)
+    yield
+
+
+def _fulfill_preview_stream(route, payload):
+    route.fulfill(
+        status=200,
+        content_type="text/event-stream",
+        body="data: " + json.dumps({"type": "done", **payload}) + "\n\n",
+    )
+
 
 
 def _suppress_auto_preview(page):
@@ -46,14 +85,15 @@ def test_import_source_browse_button_shows_quick_photo_count(live_server, page):
           const originalFetch = window.fetch.bind(window);
           window.fetch = (input, init) => {
             const target = typeof input === 'string' ? input : input.url;
-            if (target && target.indexOf('/api/import/folder-preview') === 0) {
-              return Promise.resolve(new Response(JSON.stringify({
+            if (target && target.indexOf('/api/import/folder-preview-stream') === 0) {
+              return Promise.resolve(window.__previewDoneResponse({
                 total_count: 42,
                 total_size: 0,
                 type_breakdown: {'.jpg': 42},
                 duplicate_count: 0,
                 files: [],
-              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+                source_counts: {'/tmp/card-a': 42},
+              }));
             }
             return originalFetch(input, init);
           };
@@ -69,6 +109,304 @@ def test_import_source_browse_button_shows_quick_photo_count(live_server, page):
     expect(source_list.locator(".source-meta")).to_have_text("42 photos")
 
 
+# Stubs the preview stream with a hand-driven SSE stream. Tests push
+# policy/folder frames via window.__streams[N].push(...) to walk the UI
+# through scan states; a final done frame completes the preview. Aborting a
+# superseded request closes its stream (mirroring a real disconnected
+# response body) and counts it in __streamAborts.
+CONTROLLED_STREAM_STUB = """
+    () => {
+      window.__streams = [];
+      window.__streamAborts = 0;
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const target = typeof input === 'string' ? input : input.url;
+        if (target && target.indexOf('/api/import/folder-preview-stream') === 0) {
+          const stream = window.__sseStream();
+          stream.folders = JSON.parse(init.body).folders;
+          if (init.signal) {
+            init.signal.addEventListener('abort', () => {
+              window.__streamAborts += 1;
+              stream.close();
+            }, {once: true});
+          }
+          window.__streams.push(stream);
+          return Promise.resolve(stream.response);
+        }
+        return originalFetch(input, init);
+      };
+      window.pickDirectory = async () => ['/tmp/card-a', '/tmp/card-b'];
+    }
+"""
+
+
+def _push_frame(page, stream_index, frame_js):
+    page.evaluate(
+        "() => window.__streams[" + str(stream_index) + "].push(" +
+        frame_js + ")")
+
+
+def test_import_source_counts_explain_queue_progress(live_server, page):
+    """Multiple folders show which scan is active and which are waiting."""
+    url = live_server["url"]
+    page.goto(f"{url}/import")
+    page.evaluate(CONTROLLED_STREAM_STUB)
+
+    page.locator("[data-testid='import-source-browse-btn']").click()
+    page.wait_for_function("() => window.__streams.length === 1")
+
+    _push_frame(page, 0, """{type: 'policy', sources: [
+      {path: '/tmp/card-a', storage: 'network', position: 1, total: 2},
+      {path: '/tmp/card-b', storage: 'network', position: 2, total: 2},
+    ]}""")
+    metas = page.locator("#sourceList .source-meta")
+    expect(metas.nth(0)).to_have_text("Waiting · 1 of 2")
+    expect(metas.nth(1)).to_have_text("Waiting · 2 of 2")
+
+    _push_frame(
+        page, 0,
+        "{type: 'folder_started', path: '/tmp/card-a', storage: 'network'}")
+    expect(metas.nth(0)).to_contain_text("Scanning")
+    expect(metas.nth(1)).to_have_text("Waiting · 2 of 2")
+    progress = page.locator("#sourceCountProgress")
+    expect(progress).to_contain_text("Scanning folder 1 of 2")
+    expect(progress).to_contain_text("network storage")
+
+    _push_frame(page, 0, """{type: 'folder_progress', path: '/tmp/card-a',
+      stage: 'walk', checked: 1200, found: 3}""")
+    expect(metas.nth(0)).to_contain_text("1,200 checked")
+    expect(metas.nth(0)).to_contain_text("(3 photos)")
+
+    _push_frame(
+        page, 0,
+        "{type: 'folder_done', path: '/tmp/card-a', count: 3, error: false}")
+    expect(metas.nth(0)).to_have_text("3 photos")
+    _push_frame(
+        page, 0,
+        "{type: 'folder_started', path: '/tmp/card-b', storage: 'network'}")
+    expect(metas.nth(1)).to_contain_text("Scanning")
+    expect(progress).to_contain_text("1 folder counted (3 photos)")
+
+    _push_frame(
+        page, 0,
+        "{type: 'folder_done', path: '/tmp/card-b', count: 4, error: false}")
+    _push_frame(page, 0, """{type: 'done', total_count: 7, total_size: 0,
+      type_breakdown: {'.jpg': 7}, duplicate_count: 0, files: [],
+      source_counts: {'/tmp/card-a': 3, '/tmp/card-b': 4}}""")
+    page.evaluate("() => window.__streams[0].close()")
+    expect(metas.nth(1)).to_have_text("4 photos")
+    expect(progress).to_have_text("2 folders counted · 7 photos found")
+
+
+def test_import_source_counts_overlap_on_known_local_storage(live_server, page):
+    """A fast local volume scans several folders at once."""
+    url = live_server["url"]
+    page.goto(f"{url}/import")
+    page.evaluate(CONTROLLED_STREAM_STUB)
+
+    page.locator("[data-testid='import-source-browse-btn']").click()
+    page.wait_for_function("() => window.__streams.length === 1")
+
+    _push_frame(page, 0, """{type: 'policy', sources: [
+      {path: '/tmp/card-a', storage: 'local', position: 1, total: 2},
+      {path: '/tmp/card-b', storage: 'local', position: 2, total: 2},
+    ]}""")
+    _push_frame(
+        page, 0,
+        "{type: 'folder_started', path: '/tmp/card-a', storage: 'local'}")
+    _push_frame(
+        page, 0,
+        "{type: 'folder_started', path: '/tmp/card-b', storage: 'local'}")
+
+    metas = page.locator("#sourceList .source-meta")
+    expect(metas.nth(0)).to_contain_text("Scanning")
+    expect(metas.nth(1)).to_contain_text("Scanning")
+    progress = page.locator("#sourceCountProgress")
+    expect(progress).to_contain_text("Scanning folders 1 and 2 of 2")
+    expect(progress).to_contain_text("local storage")
+
+    _push_frame(
+        page, 0,
+        "{type: 'folder_done', path: '/tmp/card-a', count: 3, error: false}")
+    _push_frame(
+        page, 0,
+        "{type: 'folder_done', path: '/tmp/card-b', count: 4, error: false}")
+    _push_frame(page, 0, """{type: 'done', total_count: 7, total_size: 0,
+      type_breakdown: {'.jpg': 7}, duplicate_count: 0, files: [],
+      source_counts: {'/tmp/card-a': 3, '/tmp/card-b': 4}}""")
+    page.evaluate("() => window.__streams[0].close()")
+    expect(progress).to_have_text("2 folders counted · 7 photos found")
+
+
+def test_preview_done_payload_settles_source_rows(live_server, page):
+    """A stream delivering only the final payload still fills every row."""
+    url = live_server["url"]
+    page.goto(f"{url}/import")
+    page.evaluate(
+        """
+        () => {
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const target = typeof input === 'string' ? input : input.url;
+            if (target && target.indexOf('/api/import/folder-preview-stream') === 0) {
+              return Promise.resolve(window.__previewDoneResponse({
+                total_count: 2,
+                total_size: 2,
+                type_breakdown: {'.jpg': 2},
+                duplicate_count: 0,
+                files: [],
+                source_counts: {'/tmp/card-a': 1, '/tmp/card-b': 1},
+              }));
+            }
+            return originalFetch(input, init);
+          };
+          window.pickDirectory = async () => ['/tmp/card-a', '/tmp/card-b'];
+        }
+        """
+    )
+
+    page.locator("[data-testid='import-source-browse-btn']").click()
+
+    expect(page.locator("#sourceList .source-meta")).to_have_text([
+        "1 photo", "1 photo",
+    ])
+    expect(page.locator("#sourceCountProgress")).to_have_text(
+        "2 folders counted · 2 photos found")
+
+
+def test_superseded_preview_stream_is_aborted(live_server, page):
+    """Changing the source list cancels the previous walk outright.
+
+    The client holds one stream per preview; aborting it is what lets the
+    server stop walking (test_source_discovery covers the server half).
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/import")
+    page.evaluate(CONTROLLED_STREAM_STUB)
+
+    page.evaluate("() => addSourcePath('/tmp/card-a')")
+    page.wait_for_function("() => window.__streams.length === 1")
+    _push_frame(page, 0, """{type: 'policy', sources: [
+      {path: '/tmp/card-a', storage: 'network', position: 1, total: 1},
+    ]}""")
+    _push_frame(
+        page, 0,
+        "{type: 'folder_started', path: '/tmp/card-a', storage: 'network'}")
+    metas = page.locator("#sourceList .source-meta")
+    expect(metas.nth(0)).to_contain_text("Scanning")
+
+    page.evaluate("() => addSourcePath('/tmp/card-b')")
+    page.wait_for_function("() => window.__streams.length === 2")
+    assert page.evaluate("() => window.__streamAborts") == 1
+    # The successor walks the full selection in one traversal.
+    assert page.evaluate("() => window.__streams[1].folders") == [
+        "/tmp/card-a", "/tmp/card-b",
+    ]
+
+
+def test_no_file_types_settles_rows_from_aborted_preview(live_server, page):
+    """Validation after abort must not leave the old scan appearing active."""
+    page.goto(f"{live_server['url']}/import")
+    page.wait_for_load_state("networkidle")
+    _suppress_auto_preview(page)
+    page.evaluate(
+        """() => {
+          sources = ['/tmp/card-a'];
+          document.getElementById('modeCopy').checked = true;
+          sourceCounts['/tmp/card-a'] = {
+            status: 'loading', position: 1, total: 1,
+            storage: 'network', startedAt: Date.now(),
+            lastEventAt: Date.now(),
+          };
+          ensureSourceCountClock();
+          renderSources();
+          window.__previewAborted = false;
+          importPreviewAbort = new AbortController();
+          importPreviewAbort.signal.addEventListener(
+            'abort', () => { window.__previewAborted = true; }, {once: true});
+        }"""
+    )
+    meta = page.locator("#sourceList .source-meta")
+    expect(meta).to_contain_text("Scanning")
+
+    page.evaluate(
+        """async () => {
+          document.getElementById('fileTypePreset').value = 'custom';
+          document.querySelectorAll('.file-ext').forEach(
+            (el) => { el.checked = false; });
+          await previewImport();
+        }"""
+    )
+
+    assert page.evaluate("() => window.__previewAborted") is True
+    expect(meta).to_have_text("Waiting to scan")
+    expect(page.locator("#sourceCountProgress")).not_to_have_class(
+        re.compile(r"\bvisible\b"))
+    assert page.evaluate("() => sourceCountTickTimer") is None
+
+
+def test_no_file_types_clears_completed_counts_from_old_filter(
+        live_server, page):
+    """A validation abort must not retain a count from the old file filter."""
+    page.goto(f"{live_server['url']}/import")
+    page.wait_for_load_state("networkidle")
+    _suppress_auto_preview(page)
+    page.evaluate(
+        """() => {
+          sources = ['/tmp/card-a'];
+          document.getElementById('modeCopy').checked = true;
+          sourceCounts['/tmp/card-a'] = {
+            status: 'loaded', count: 42, text: '42 photos',
+          };
+          renderSources();
+        }"""
+    )
+    meta = page.locator("#sourceList .source-meta")
+    expect(meta).to_have_text("42 photos")
+
+    page.evaluate(
+        """async () => {
+          document.getElementById('fileTypePreset').value = 'custom';
+          document.querySelectorAll('.file-ext').forEach(
+            (el) => { el.checked = false; });
+          await previewImport();
+        }"""
+    )
+
+    expect(meta).to_have_text("Waiting to scan")
+    expect(page.locator("#sourceCountProgress")).not_to_have_class(
+        re.compile(r"\bvisible\b"))
+
+
+def test_stalled_network_scan_shows_no_response_hint(live_server, page):
+    """A quiet network walk surfaces a disconnected-storage hint."""
+    url = live_server["url"]
+    page.goto(f"{url}/import")
+    page.evaluate(CONTROLLED_STREAM_STUB)
+    # Shrink the stall threshold so the hint appears within one clock tick.
+    page.evaluate("() => { SOURCE_SCAN_STALL_MS = 300; }")
+
+    page.evaluate("() => addSourcePath('/tmp/card-a')")
+    page.wait_for_function("() => window.__streams.length === 1")
+    _push_frame(page, 0, """{type: 'policy', sources: [
+      {path: '/tmp/card-a', storage: 'network', position: 1, total: 1},
+    ]}""")
+    _push_frame(
+        page, 0,
+        "{type: 'folder_started', path: '/tmp/card-a', storage: 'network'}")
+
+    # No further frames arrive: the walk is blocked on the mount.
+    metas = page.locator("#sourceList .source-meta")
+    expect(metas.nth(0)).to_contain_text("no response")
+    expect(page.locator("#sourceCountProgress")).to_contain_text(
+        "not responding — the storage may be disconnected or slow")
+
+    # A late frame clears the hint: the walk was slow, not dead.
+    _push_frame(page, 0, """{type: 'folder_progress', path: '/tmp/card-a',
+      stage: 'walk', checked: 900, found: 2}""")
+    expect(metas.nth(0)).not_to_contain_text("no response")
+
+
 # Stubs a two-file copy-mode preview where IMG_0002.jpg comes back flagged as
 # a duplicate. Shared by the tests that exercise the preview grid.
 TWO_FILE_PREVIEW_STUB = """
@@ -81,29 +419,20 @@ TWO_FILE_PREVIEW_STUB = """
             const target = typeof input === 'string' ? input : input.url;
             if (target && target.indexOf('/api/import/folder-preview') === 0) {
               const body = JSON.parse(init.body || '{}');
-              if (body.summary_only) {
-                return Promise.resolve(new Response(JSON.stringify({
-                  total_count: 2,
-                  total_size: 2468,
-                  type_breakdown: {'.jpg': 2},
-                  duplicate_count: 0,
-                  files: [],
-                }), {status: 200, headers: {'Content-Type': 'application/json'}}));
-              }
               window.__fullPreviewCalls += 1;
               // Tests flip __emptyPreview to simulate a source that comes
               // back with zero importable files (e.g. an empty card or a
               // filter that excludes everything).
               if (window.__emptyPreview) {
-                return Promise.resolve(new Response(JSON.stringify({
+                return Promise.resolve(window.__previewDoneResponse({
                   total_count: 0,
                   total_size: 0,
                   type_breakdown: {},
                   duplicate_count: 0,
                   files: [],
-                }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+                }));
               }
-              return Promise.resolve(new Response(JSON.stringify({
+              return Promise.resolve(window.__previewDoneResponse({
                 total_count: 2,
                 total_size: 2468,
                 type_breakdown: {'.jpg': 2},
@@ -126,7 +455,7 @@ TWO_FILE_PREVIEW_STUB = """
                     thumb_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
                   },
                 ],
-              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }));
             }
             if (target && target.indexOf('/api/import/check-duplicates') === 0) {
               window.__dupCalls += 1;
@@ -219,23 +548,14 @@ MULTI_FOLDER_MIXED_PREVIEW_STUB = """
             const target = typeof input === 'string' ? input : input.url;
             if (target && target.indexOf('/api/import/folder-preview') === 0) {
               const body = JSON.parse(init.body || '{}');
-              if (body.summary_only) {
-                return Promise.resolve(new Response(JSON.stringify({
-                  total_count: 4,
-                  total_size: 4936,
-                  type_breakdown: {'.jpg': 4},
-                  duplicate_count: 0,
-                  files: [],
-                }), {status: 200, headers: {'Content-Type': 'application/json'}}));
-              }
               window.__fullPreviewCalls += 1;
-              return Promise.resolve(new Response(JSON.stringify({
+              return Promise.resolve(window.__previewDoneResponse({
                 total_count: 4,
                 total_size: 4936,
                 type_breakdown: {'.jpg': 4},
                 duplicate_count: 0,
                 files: FILES,
-              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }));
             }
             if (target && target.indexOf('/api/import/check-duplicates') === 0) {
               window.__dupCalls += 1;
@@ -521,20 +841,11 @@ def test_hide_duplicates_preserves_first_occurrence_from_overlapping_sources(
             const target = typeof input === 'string' ? input : input.url;
             if (target && target.indexOf('/api/import/folder-preview') === 0) {
               const body = JSON.parse(init.body || '{}');
-              if (body.summary_only) {
-                return Promise.resolve(new Response(JSON.stringify({
-                  total_count: 2,
-                  total_size: 2468,
-                  type_breakdown: {'.jpg': 2},
-                  duplicate_count: 0,
-                  files: [],
-                }), {status: 200, headers: {'Content-Type': 'application/json'}}));
-              }
               window.__fullPreviewCalls += 1;
               // Same path arrives twice — mimics scanning /card and
               // /card/DCIM together, the exact overlap that surfaces this
               // per-occurrence bug.
-              return Promise.resolve(new Response(JSON.stringify({
+              return Promise.resolve(window.__previewDoneResponse({
                 total_count: 2,
                 total_size: 2468,
                 type_breakdown: {'.jpg': 2},
@@ -557,7 +868,7 @@ def test_hide_duplicates_preserves_first_occurrence_from_overlapping_sources(
                     thumb_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
                   },
                 ],
-              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }));
             }
             if (target && target.indexOf('/api/import/check-duplicates') === 0) {
               // The real checker only flags the second occurrence as an
@@ -718,17 +1029,8 @@ def test_import_auto_preview_clears_grid_when_selection_becomes_invalid(
             const target = typeof input === 'string' ? input : input.url;
             if (target && target.indexOf('/api/import/folder-preview') === 0) {
               const body = JSON.parse(init.body || '{}');
-              if (body.summary_only) {
-                return Promise.resolve(new Response(JSON.stringify({
-                  total_count: 1,
-                  total_size: 1234,
-                  type_breakdown: {'.jpg': 1},
-                  duplicate_count: 0,
-                  files: [],
-                }), {status: 200, headers: {'Content-Type': 'application/json'}}));
-              }
               window.__fullPreviewCalls += 1;
-              return Promise.resolve(new Response(JSON.stringify({
+              return Promise.resolve(window.__previewDoneResponse({
                 total_count: 1,
                 total_size: 1234,
                 type_breakdown: {'.jpg': 1},
@@ -741,7 +1043,7 @@ def test_import_auto_preview_clears_grid_when_selection_becomes_invalid(
                   extension: '.jpg',
                   thumb_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
                 }],
-              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }));
             }
             if (target && target.indexOf('/api/import/check-duplicates') === 0) {
               const frame = 'data: ' + JSON.stringify({
@@ -838,13 +1140,13 @@ def test_import_custom_extensions_feed_preview(live_server, page):
             const target = typeof input === 'string' ? input : input.url;
             if (target && target.indexOf('/api/import/folder-preview') === 0) {
               window.__previewBody = JSON.parse(init.body);
-              return Promise.resolve(new Response(JSON.stringify({
+              return Promise.resolve(window.__previewDoneResponse({
                 total_count: 0,
                 total_size: 0,
                 type_breakdown: {},
                 duplicate_count: 0,
                 files: [],
-              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }));
             }
             return originalFetch(input, init);
           };
@@ -886,13 +1188,13 @@ def test_import_preview_passes_verify_by_hash_to_duplicate_check(live_server, pa
           window.fetch = (input, init) => {
             const target = typeof input === 'string' ? input : input.url;
             if (target && target.indexOf('/api/import/folder-preview') === 0) {
-              return Promise.resolve(new Response(JSON.stringify({
+              return Promise.resolve(window.__previewDoneResponse({
                 total_count: 1,
                 total_size: 0,
                 type_breakdown: {'.jpg': 1},
                 duplicate_count: 0,
                 files: [{path: '/tmp/card-a/IMG_0001.jpg'}],
-              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }));
             }
             if (target && target.indexOf('/api/import/check-duplicates') === 0) {
               window.__dupBody = JSON.parse(init.body);
@@ -932,16 +1234,12 @@ def test_import_preview_shows_destination_folder_structure(live_server, page):
     captured = {}
 
     def folder_preview(route):
-        route.fulfill(
-            status=200,
-            content_type="application/json",
-            body=json.dumps({
-                "files": [
-                    {"path": "/tmp/card-a/IMG_0001.jpg"},
-                    {"path": "/tmp/card-a/IMG_0002.jpg"},
-                ],
-            }),
-        )
+        _fulfill_preview_stream(route, {
+            "files": [
+                {"path": "/tmp/card-a/IMG_0001.jpg"},
+                {"path": "/tmp/card-a/IMG_0002.jpg"},
+            ],
+        })
 
     def check_duplicates(route):
         frame = (
@@ -979,7 +1277,7 @@ def test_import_preview_shows_destination_folder_structure(live_server, page):
             }),
         )
 
-    page.route("**/api/import/folder-preview", folder_preview)
+    page.route("**/api/import/folder-preview-stream", folder_preview)
     page.route("**/api/import/check-duplicates", check_duplicates)
     page.route("**/api/import/destination-preview", destination_preview)
     page.goto(f"{url}/import")
@@ -1033,9 +1331,9 @@ def test_import_destination_structure_ignores_stale_response(live_server, page):
           window.fetch = (input, init) => {
             const target = typeof input === 'string' ? input : input.url;
             if (target && target.indexOf('/api/import/folder-preview') === 0) {
-              return Promise.resolve(new Response(JSON.stringify({
+              return Promise.resolve(window.__previewDoneResponse({
                 files: [{path: '/tmp/card-a/IMG_0001.jpg'}],
-              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }));
             }
             if (target && target.indexOf('/api/import/check-duplicates') === 0) {
               const frame = 'data: ' + JSON.stringify({
@@ -1086,11 +1384,8 @@ def test_import_destination_structure_hides_on_duplicate_control_toggle(
     url = live_server["url"]
 
     def folder_preview(route):
-        route.fulfill(
-            status=200,
-            content_type="application/json",
-            body=json.dumps({"files": [{"path": "/tmp/card-a/IMG_0001.jpg"}]}),
-        )
+        _fulfill_preview_stream(
+            route, {"files": [{"path": "/tmp/card-a/IMG_0001.jpg"}]})
 
     def check_duplicates(route):
         frame = (
@@ -1119,7 +1414,7 @@ def test_import_destination_structure_hides_on_duplicate_control_toggle(
             }),
         )
 
-    page.route("**/api/import/folder-preview", folder_preview)
+    page.route("**/api/import/folder-preview-stream", folder_preview)
     page.route("**/api/import/check-duplicates", check_duplicates)
     page.route("**/api/import/destination-preview", destination_preview)
     page.goto(f"{url}/import")
@@ -1167,12 +1462,12 @@ def test_import_duplicate_stream_result_ignored_after_controls_change(
           window.fetch = (input, init) => {
             const target = typeof input === 'string' ? input : input.url;
             if (target && target.indexOf('/api/import/folder-preview') === 0) {
-              return Promise.resolve(new Response(JSON.stringify({
+              return Promise.resolve(window.__previewDoneResponse({
                 files: [
                   {path: '/tmp/card-a/IMG_0001.jpg'},
                   {path: '/tmp/card-a/IMG_0002.jpg'},
                 ],
-              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }));
             }
             if (target && target.indexOf('/api/import/check-duplicates') === 0) {
               return new Promise((resolve) => {
@@ -1251,9 +1546,9 @@ def test_new_import_preview_aborts_superseded_duplicate_stream(
           window.fetch = (input, init = {}) => {
             const target = typeof input === 'string' ? input : input.url;
             if (target && target.indexOf('/api/import/folder-preview') === 0) {
-              return Promise.resolve(new Response(JSON.stringify({
+              return Promise.resolve(window.__previewDoneResponse({
                 files: [{path: '/tmp/card-a/IMG_0001.jpg'}],
-              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }));
             }
             if (target && target.indexOf('/api/import/check-duplicates') === 0) {
               window.__duplicateFetchCount += 1;
@@ -1326,9 +1621,9 @@ def test_removing_last_source_aborts_in_flight_duplicate_stream(
           window.fetch = (input, init = {}) => {
             const target = typeof input === 'string' ? input : input.url;
             if (target && target.indexOf('/api/import/folder-preview') === 0) {
-              return Promise.resolve(new Response(JSON.stringify({
+              return Promise.resolve(window.__previewDoneResponse({
                 files: [{path: '/tmp/card-a/IMG_0001.jpg'}],
-              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }));
             }
             if (target && target.indexOf('/api/import/check-duplicates') === 0) {
               window.__duplicateStarted = true;
@@ -1398,10 +1693,10 @@ def test_re_adding_the_last_source_after_abort_does_not_reuse_stale_paths(
           window.fetch = (input, init = {}) => {
             const target = typeof input === 'string' ? input : input.url;
             if (target && target.indexOf('/api/import/folder-preview') === 0) {
-              return Promise.resolve(new Response(JSON.stringify({
+              return Promise.resolve(window.__previewDoneResponse({
                 files: [{path: '/tmp/card-a/IMG_0001.jpg'},
                         {path: '/tmp/card-a/IMG_0002.jpg'}],
-              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }));
             }
             if (target && target.indexOf('/api/import/check-duplicates') === 0) {
               window.__duplicateStarted = true;
@@ -1487,9 +1782,9 @@ def test_import_preview_older_response_does_not_clobber_newer_summary(
             const target = typeof input === 'string' ? input : input.url;
             if (target && target.indexOf('/api/import/folder-preview') === 0) {
               window.__folderPreviewCallCount += 1;
-              const payload = new Response(JSON.stringify({
+              const payload = window.__previewDoneResponse({
                 files: [{path: '/tmp/card-a/IMG_0001.jpg'}],
-              }), {status: 200, headers: {'Content-Type': 'application/json'}});
+              });
               if (window.__folderPreviewCallCount === 1) {
                 return new Promise((resolve) => {
                   window.__resolveOldPreview = () => resolve(payload);
@@ -2464,11 +2759,8 @@ def test_import_destination_structure_hides_when_folder_browser_picks_destinatio
     url = live_server["url"]
 
     def folder_preview(route):
-        route.fulfill(
-            status=200,
-            content_type="application/json",
-            body=json.dumps({"files": [{"path": "/tmp/card-a/IMG_0001.jpg"}]}),
-        )
+        _fulfill_preview_stream(
+            route, {"files": [{"path": "/tmp/card-a/IMG_0001.jpg"}]})
 
     def check_duplicates(route):
         frame = (
@@ -2507,7 +2799,7 @@ def test_import_destination_structure_hides_when_folder_browser_picks_destinatio
             }),
         )
 
-    page.route("**/api/import/folder-preview", folder_preview)
+    page.route("**/api/import/folder-preview-stream", folder_preview)
     page.route("**/api/import/check-duplicates", check_duplicates)
     page.route("**/api/import/destination-preview", destination_preview)
     page.route("**/api/browse**", browse)
@@ -2547,11 +2839,8 @@ def test_import_folder_template_examples_retire_with_their_source(
     url = live_server["url"]
 
     def folder_preview(route):
-        route.fulfill(
-            status=200,
-            content_type="application/json",
-            body=json.dumps({"files": [{"path": "/tmp/card-a/IMG_0001.jpg"}]}),
-        )
+        _fulfill_preview_stream(
+            route, {"files": [{"path": "/tmp/card-a/IMG_0001.jpg"}]})
 
     def check_duplicates(route):
         route.fulfill(
@@ -2591,7 +2880,7 @@ def test_import_folder_template_examples_retire_with_their_source(
             }),
         )
 
-    page.route("**/api/import/folder-preview", folder_preview)
+    page.route("**/api/import/folder-preview-stream", folder_preview)
     page.route("**/api/import/check-duplicates", check_duplicates)
     page.route("**/api/import/destination-preview", destination_preview)
     page.goto(f"{url}/import")
@@ -2644,11 +2933,11 @@ def _stub_preview(page, files, duplicates=None):
           window.fetch = (input, init) => {
             const t = typeof input === 'string' ? input : input.url;
             if (t && t.indexOf('/api/import/folder-preview') === 0) {
-              return Promise.resolve(new Response(JSON.stringify({
+              return Promise.resolve(window.__previewDoneResponse({
                 total_count: files.length, total_size: 0,
                 type_breakdown: {'.jpg': files.length},
                 duplicate_count: 0, files: files,
-              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }));
             }
             if (t && t.indexOf('/api/import/check-duplicates') === 0) {
               const frame = 'data: ' + JSON.stringify({
@@ -3554,11 +3843,11 @@ def test_start_is_disabled_while_the_duplicate_stream_is_draining(
           window.fetch = (input, init) => {
             const t = typeof input === 'string' ? input : input.url;
             if (t && t.indexOf('/api/import/folder-preview') === 0) {
-              return Promise.resolve(new Response(JSON.stringify({
+              return Promise.resolve(window.__previewDoneResponse({
                 total_count: files.length, total_size: 0,
                 type_breakdown: {'.jpg': files.length},
                 duplicate_count: 0, files: files,
-              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }));
             }
             if (t && t.indexOf('/api/import/check-duplicates') === 0) {
               return new Promise(() => {});   // stream never drains
@@ -4205,6 +4494,29 @@ def test_snapshot_mode_hides_selection_and_says_what_it_will_import(
     # The disabled radios are what make naming Copy to archive wrong here.
     expect(page.locator("#modeCopy")).to_be_disabled()
     expect(page.locator("#modeInPlace")).to_be_disabled()
+
+
+def test_snapshot_mode_suppresses_folder_scan_totals(live_server, page):
+    """Snapshot mode never runs folder-count scans, so the source-count
+    summary must stay silent instead of announcing "0 photos found"
+    underneath the snapshot's own file-count message. activateNewImagesImport
+    marks each source `loaded` with no `count`; a summary that would sum
+    those into 0 is a lie about work that never happened.
+    """
+    page.goto(f"{live_server['url']}/import")  # warm the app before routing
+    _stub_snapshot_import(page, _files(3))
+    page.goto(f"{live_server['url']}/import?new_images=42")
+    expect(page.locator("#importPreviewGrid")).to_be_visible()
+
+    expect(page.locator("#newImagesImportSource")).to_contain_text(
+        "3 newly detected images",
+    )
+    # The summary strip is either empty or hidden; either way it must not
+    # claim "0 photos found" or announce a scan count.
+    progress = page.locator("#sourceCountProgress")
+    expect(progress).not_to_contain_text("0 photos")
+    expect(progress).not_to_contain_text("folders counted")
+    expect(progress).not_to_contain_text("photos found")
 
 
 def test_snapshot_mode_loads_while_import_readiness_is_slow(

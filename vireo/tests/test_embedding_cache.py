@@ -17,6 +17,7 @@ from embedding_cache import (
     EmbeddingWaitCancelled,
     build_embedding_identity,
     canonicalize_labels,
+    get_embedding_cache_diagnostics,
     identity_digest,
 )
 
@@ -108,6 +109,7 @@ def test_pinned_install_does_not_rehash_large_encoder_files(
 
 
 def test_equal_key_callers_compute_once_and_waiter_rereads_disk(tmp_path):
+    diagnostics_before = get_embedding_cache_diagnostics()
     cache = EmbeddingCache(tmp_path / "cache")
     identity = _identity()
     producer_started = threading.Event()
@@ -134,6 +136,48 @@ def test_equal_key_callers_compute_once_and_waiter_rereads_disk(tmp_path):
     assert calls == 1
     assert np.array_equal(first_value, second_value)
     assert first_value is not second_value
+    diagnostics_after = get_embedding_cache_diagnostics()
+    assert diagnostics_after["producer_starts"] - diagnostics_before["producer_starts"] == 1
+    assert diagnostics_after["producer_publications"] - diagnostics_before["producer_publications"] == 1
+    assert diagnostics_after["waiter_joins"] - diagnostics_before["waiter_joins"] == 1
+    assert diagnostics_after["single_flight_violations"] == 0
+
+
+def test_single_flight_diagnostics_observe_actual_compute_overlap(monkeypatch):
+    import embedding_cache
+
+    flight_key = ("diagnostics-test", "same-key")
+    before = get_embedding_cache_diagnostics()
+    # This test deliberately injects an overlap into the independent
+    # computation instrumentation. Restore the process-lifetime counters when
+    # the test ends so later API tests still observe real application state.
+    monkeypatch.setattr(
+        embedding_cache,
+        "_single_flight_violations",
+        before["single_flight_violations"],
+    )
+    monkeypatch.setattr(
+        embedding_cache,
+        "_max_concurrent_producers_per_key",
+        before["max_concurrent_producers_per_key"],
+    )
+    embedding_cache._begin_producer_execution(flight_key)
+    try:
+        embedding_cache._begin_producer_execution(flight_key)
+        try:
+            during = get_embedding_cache_diagnostics()
+            assert during["active_producers"] == before["active_producers"] + 2
+            assert during["single_flight_violations"] == (
+                before["single_flight_violations"] + 1
+            )
+            assert during["max_concurrent_producers_per_key"] >= 2
+        finally:
+            embedding_cache._end_producer_execution(flight_key)
+    finally:
+        embedding_cache._end_producer_execution(flight_key)
+
+    after = get_embedding_cache_diagnostics()
+    assert after["active_producers"] == before["active_producers"]
 
 
 def test_producer_cancellation_wakes_waiter_and_waiter_takes_over(tmp_path):

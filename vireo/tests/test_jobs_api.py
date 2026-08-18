@@ -684,6 +684,10 @@ def test_jobs_list_includes_resource_budget_snapshot(app_and_db):
     for resource in resources.values():
         assert 0 <= resource["available"] <= resource["capacity"]
 
+    embedding_metrics = data["workload_metrics"]["embedding_cache"]
+    assert embedding_metrics["active_producers"] >= 0
+    assert embedding_metrics["single_flight_violations"] == 0
+
 
 def test_jobs_list_includes_workspace_names(app_and_db):
     """GET /api/jobs includes workspace_names mapping."""

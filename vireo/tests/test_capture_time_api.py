@@ -5,6 +5,27 @@ from types import SimpleNamespace
 from wait import wait_for_job_via_client
 
 
+def _exiftool_command(commands):
+    """Select the command under test, ignoring unrelated platform probes."""
+    return next(
+        command
+        for command in commands
+        if command
+        and any(
+            os.path.basename(argument).lower() in {"exiftool", "exiftool.exe"}
+            for argument in command[:2]
+        )
+    )
+
+
+def test_exiftool_command_accepts_supported_launchers():
+    perl_command = ["/usr/bin/perl", "/opt/vireo/exiftool", "-json"]
+    windows_command = ["exiftool.exe", "-json"]
+
+    assert _exiftool_command([["/usr/sbin/sysctl"], perl_command]) == perl_command
+    assert _exiftool_command([["wmic"], windows_command]) == windows_command
+
+
 def test_capture_time_offset_validation_rejects_invalid_extremes():
     from capture_time import parse_offset_minutes
 
@@ -141,7 +162,7 @@ def test_capture_time_job_writes_exiftool_and_refreshes_cache(client_with_photo,
     assert job["result"]["shift_minutes"] == -180
 
     assert commands
-    cmd = commands[0]
+    cmd = _exiftool_command(commands)
     assert "-overwrite_original" in cmd
     assert "-AllDates-=0:0:0 3:0:0" in cmd
     assert "-OffsetTimeOriginal=-10:00" in cmd
@@ -272,10 +293,11 @@ def test_capture_time_job_writes_missing_offset_tags(client_with_photo, monkeypa
     assert job["result"]["updated"] == 1
     assert job["result"]["skipped"] == 0
     assert commands
-    assert "-OffsetTime=-10:00" in commands[0]
-    assert "-OffsetTimeOriginal=-10:00" in commands[0]
-    assert "-OffsetTimeDigitized=-10:00" in commands[0]
-    assert not any(arg.startswith("-AllDates") for arg in commands[0])
+    cmd = _exiftool_command(commands)
+    assert "-OffsetTime=-10:00" in cmd
+    assert "-OffsetTimeOriginal=-10:00" in cmd
+    assert "-OffsetTimeDigitized=-10:00" in cmd
+    assert not any(arg.startswith("-AllDates") for arg in cmd)
 
 
 def test_capture_time_job_does_not_skip_companion_pair_from_primary_cache(
@@ -357,9 +379,10 @@ def test_capture_time_job_does_not_skip_companion_pair_from_primary_cache(
     assert job["result"]["updated"] == 1
     assert job["result"]["skipped"] == 0
     assert commands
-    assert primary_path in commands[0]
-    assert companion_path in commands[0]
-    assert not any(arg.startswith("-AllDates") for arg in commands[0])
+    cmd = _exiftool_command(commands)
+    assert primary_path in cmd
+    assert companion_path in cmd
+    assert not any(arg.startswith("-AllDates") for arg in cmd)
 
 
 def test_capture_time_preview_preserves_instant_uses_per_photo_shifts(app_and_db):
@@ -481,7 +504,7 @@ def test_capture_time_manual_mode_ignores_target_offset(client_with_photo, monke
     assert job["result"]["target_offset"] is None
 
     assert commands
-    cmd = commands[0]
+    cmd = _exiftool_command(commands)
     assert "-AllDates+=0:0:0 0:30:0" in cmd
     assert not any(arg.startswith("-OffsetTime") for arg in cmd), cmd
 

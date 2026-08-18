@@ -26729,9 +26729,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             result["revealed"] = bool(
                 reveal_after_export
                 and exported_files
-                and reveal_exported_files(
-                    exported_files, result.get("destinations", []),
-                )
+                and reveal_exported_files(exported_files)
             )
             return result
 

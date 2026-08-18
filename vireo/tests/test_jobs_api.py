@@ -1115,8 +1115,8 @@ def test_job_export_reveals_successful_output(
     destination = tmp_path / "exports"
     reveal_calls = []
 
-    def fake_reveal(paths, destinations):
-        reveal_calls.append((paths, destinations))
+    def fake_reveal(paths):
+        reveal_calls.append(paths)
         return True
 
     monkeypatch.setattr(export_module, "reveal_exported_files", fake_reveal)
@@ -1134,7 +1134,7 @@ def test_job_export_reveals_successful_output(
     assert job["status"] == "completed"
     assert job["result"]["revealed"] is True
     assert "files" not in job["result"]
-    assert reveal_calls == [([str(output)], [str(destination)])]
+    assert reveal_calls == [[str(output)]]
     assert output.is_file()
 
 

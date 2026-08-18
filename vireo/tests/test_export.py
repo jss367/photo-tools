@@ -209,7 +209,7 @@ def test_reveal_export_batch_opens_each_output_folder_on_linux(
     monkeypatch.setattr(export_module.subprocess, "run", run)
 
     assert export_module.reveal_exported_files(
-        [str(first), str(second)], [str(first_dir), str(second_dir)],
+        [str(first), str(second)],
     ) is True
     assert [call.args[0] for call in run.call_args_list] == [
         ["xdg-open", str(first_dir)],

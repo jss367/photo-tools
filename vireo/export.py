@@ -46,7 +46,7 @@ EXPORT_METADATA_FIELDS = frozenset({
 })
 
 
-def reveal_exported_files(paths, destinations=None):
+def reveal_exported_files(paths):
     """Show successful exports in the platform's file manager.
 
     A single export is selected when the platform supports it. For a batch,
@@ -65,13 +65,7 @@ def reveal_exported_files(paths, destinations=None):
     if len(existing_paths) == 1:
         targets = [(existing_paths[0], False)]
     else:
-        candidate_dirs = [
-            os.path.abspath(path)
-            for path in destinations or []
-            if path and os.path.isdir(path)
-        ]
-        if not candidate_dirs:
-            candidate_dirs = [os.path.dirname(path) for path in existing_paths]
+        candidate_dirs = [os.path.dirname(path) for path in existing_paths]
         # Preserve export order while avoiding duplicate file-manager windows.
         targets = [(path, True) for path in dict.fromkeys(candidate_dirs)]
 

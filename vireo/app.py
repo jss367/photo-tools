@@ -26684,7 +26684,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 return json_error("max_size must be between 1 and 50000")
 
         try:
-            from export import normalize_output_format, preview_export_renames
+            from export import (
+                ExportPreflightError,
+                normalize_output_format,
+                preview_export_renames,
+            )
             output_format = normalize_output_format(output_format)["extension"]
         except ValueError as exc:
             return json_error(str(exc))
@@ -26708,24 +26712,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
         effective_cfg = db.get_effective_config(cfg.load())
 
-        renames = preview_export_renames(
-            db=db,
-            photo_ids=photo_ids,
-            destination=destination,
-            options={
-                "naming_template": naming_template,
-                "format": output_format,
-                "export_to_subfolder": export_to_subfolder,
-                "max_size": max_size,
-                "working_copy_max_size": effective_cfg.get(
-                    "working_copy_max_size", 4096,
-                ),
-                "vireo_dir": vireo_dir,
-                "developed_dir": (
-                    effective_cfg.get("darktable_output_dir", "") or ""
-                ),
-            },
-        )
+        try:
+            renames = preview_export_renames(
+                db=db,
+                photo_ids=photo_ids,
+                destination=destination,
+                options={
+                    "naming_template": naming_template,
+                    "format": output_format,
+                    "export_to_subfolder": export_to_subfolder,
+                    "max_size": max_size,
+                    "working_copy_max_size": effective_cfg.get(
+                        "working_copy_max_size", 4096,
+                    ),
+                    "vireo_dir": vireo_dir,
+                    "developed_dir": (
+                        effective_cfg.get("darktable_output_dir", "") or ""
+                    ),
+                },
+            )
+        except ExportPreflightError as exc:
+            return json_error(str(exc), status=409)
         return jsonify({
             "rename_count": len(renames),
             "renames": renames[:20],

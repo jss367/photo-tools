@@ -1092,6 +1092,29 @@ def test_job_export_preflight_reports_numbered_collision_name(
     }
 
 
+def test_job_export_preflight_reports_unverifiable_destination(
+    app_and_db, monkeypatch,
+):
+    import export as export_mod
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()
+
+    def fail_preflight(**_kwargs):
+        raise export_mod.ExportPreflightError("destination cannot be verified")
+
+    monkeypatch.setattr(export_mod, "preview_export_renames", fail_preflight)
+
+    resp = client.post("/api/jobs/export/preflight", json={
+        "photo_ids": [photo["id"]],
+        "destination": "",
+    })
+
+    assert resp.status_code == 409
+    assert resp.get_json()["error"] == "destination cannot be verified"
+
+
 def test_job_export_missing_photo_ids(app_and_db):
     """POST /api/jobs/export without photo_ids returns 400."""
     app, _ = app_and_db

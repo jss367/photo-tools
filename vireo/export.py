@@ -47,6 +47,10 @@ EXPORT_METADATA_FIELDS = frozenset({
 })
 
 
+class ExportPreflightError(RuntimeError):
+    """Raised when collision behavior cannot be verified safely."""
+
+
 def reveal_exported_files(paths):
     """Show successful exports in the platform's file manager.
 
@@ -1608,16 +1612,12 @@ class _DestinationPathReservations:
             self._temporary_directory = tempfile.TemporaryDirectory(
                 prefix=".VireoExportReservation-", dir=probe_path,
             )
-        except OSError:
-            # Export will report a permission/storage error separately. Exact
-            # matching is the safest fallback when the volume cannot be used.
-            self._temporary_directory = None
-        self.root = (
-            self._temporary_directory.name
-            if self._temporary_directory is not None
-            else None
-        )
-        self._fallback = set()
+        except OSError as exc:
+            raise ExportPreflightError(
+                "Vireo could not verify filename collisions on the destination "
+                "volume. Check the folder permissions and try again."
+            ) from exc
+        self.root = self._temporary_directory.name
 
     def __enter__(self):
         return self
@@ -1626,10 +1626,8 @@ class _DestinationPathReservations:
         self.close()
 
     def close(self):
-        if self._temporary_directory is not None:
-            self._temporary_directory.cleanup()
-            self._temporary_directory = None
-            self.root = None
+        self._temporary_directory.cleanup()
+        self.root = None
 
     def _relative_path(self, candidate, destination=None):
         destination = os.path.realpath(destination or self.destination)
@@ -1642,16 +1640,11 @@ class _DestinationPathReservations:
         relative = self._relative_path(candidate, destination)
         if relative is None:
             return False
-        if self.root is None:
-            return relative in self._fallback
         return os.path.exists(os.path.join(self.root, relative))
 
     def add(self, candidate, destination=None):
         relative = self._relative_path(candidate, destination)
         if relative is None:
-            return
-        if self.root is None:
-            self._fallback.add(relative)
             return
         shadow_path = os.path.join(self.root, relative)
         os.makedirs(os.path.dirname(shadow_path), exist_ok=True)

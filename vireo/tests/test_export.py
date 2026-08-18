@@ -1511,6 +1511,29 @@ def test_destination_reservations_match_empty_volume(tmp_path):
     assert list(destination.iterdir()) == []
 
 
+def test_destination_reservations_fail_when_volume_cannot_be_probed(
+    tmp_path, monkeypatch,
+):
+    """Preflight must not claim no collision after losing volume semantics."""
+    destination = tmp_path / "destination"
+    destination.mkdir()
+
+    def deny_temporary_directory(*_args, **_kwargs):
+        raise PermissionError("directory creation denied")
+
+    monkeypatch.setattr(
+        export_mod.tempfile,
+        "TemporaryDirectory",
+        deny_temporary_directory,
+    )
+
+    with pytest.raises(
+        export_mod.ExportPreflightError,
+        match="could not verify filename collisions",
+    ):
+        export_mod._DestinationPathReservations(str(destination))
+
+
 def test_destination_reservations_resolve_directory_symlinks(tmp_path):
     """A real directory and its symlink reserve the same export path."""
     destination = tmp_path / "destination"

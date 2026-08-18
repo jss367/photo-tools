@@ -178,6 +178,7 @@ def export_inat_photo(
                 "quality": quality,
                 "working_copy_max_size": working_copy_max_size,
                 "developed_dir": developed_dir,
+                "collect_files": True,
             },
         )
         files = result.get("files") or []

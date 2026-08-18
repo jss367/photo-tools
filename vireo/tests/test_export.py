@@ -127,8 +127,26 @@ def test_export_photos_basic(export_env):
     )
     assert result["exported"] == 2
     assert result["errors"] == []
+    assert "files" not in result
     assert os.path.isfile(os.path.join(env["dest"], "bird1.jpg"))
     assert os.path.isfile(os.path.join(env["dest"], "bird2.jpg"))
+
+
+def test_export_photos_collects_paths_only_when_requested(export_env):
+    env = export_env
+
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "collect_files": True},
+    )
+
+    assert result["files"] == [
+        os.path.join(env["dest"], "bird1.jpg"),
+        os.path.join(env["dest"], "bird2.jpg"),
+    ]
 
 
 def test_export_photos_defaults_to_original_folder(export_env):

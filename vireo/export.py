@@ -139,11 +139,14 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
             export_to_subfolder: bool -- create an ``exported`` directory
                 beneath the shared destination or each original photo's
                 folder.
+            collect_files: bool -- include every exported path in the result.
+                Defaults to false so large background exports keep a compact
+                job result.
         progress_cb: optional callback(current, total, current_file)
 
     Returns:
-        dict with keys: exported (int), files (list of output paths),
-        errors (list of str), destination (str)
+        dict with keys: exported (int), errors (list of str), destination
+        (str), plus files (list of output paths) when collect_files is true.
     """
     options = options or {}
     template = options.get("naming_template", "{original}")
@@ -161,6 +164,7 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
         wc_max = 4096
     developed_dir = options.get("developed_dir") or ""
     subfolder = "exported" if options.get("export_to_subfolder") else ""
+    collect_files = bool(options.get("collect_files", False))
 
     if destination:
         os.makedirs(destination, exist_ok=True)
@@ -176,7 +180,7 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
     # Track sequence numbers per subdirectory
     seq_counters = {}
     exported = 0
-    exported_files = []
+    exported_files = [] if collect_files else None
     errors = []
 
     # Per-export cache of developed-directory scans. Keyed by directory
@@ -415,7 +419,8 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
             _save_export_image(img, out_path, format_info, quality)
             img.close()
             exported += 1
-            exported_files.append(out_path)
+            if exported_files is not None:
+                exported_files.append(out_path)
         except Exception as exc:
             log.warning("Export failed for %s: %s", photo["filename"], exc)
             errors.append(f"{photo['filename']}: {exc}")
@@ -423,13 +428,15 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
         if progress_cb:
             progress_cb(i + 1, len(photo_ids), photo["filename"])
 
-    return {
+    result = {
         "exported": exported,
-        "files": exported_files,
         "errors": errors,
         "destination": destination,
         "subfolder": subfolder,
     }
+    if exported_files is not None:
+        result["files"] = exported_files
+    return result
 
 
 def _save_export_image(img, out_path, format_info, quality):

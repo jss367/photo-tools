@@ -293,12 +293,14 @@ class ProcessTreeSampler:
         try:
             alive = self.root.is_running()
             current_create_time = self.root.create_time()
+            status = self.root.status()
         except (OSError, self.psutil.Error) as exc:
             raise RuntimeError(
                 f"monitored Vireo PID {self.root.pid} exited"
             ) from exc
         if (
             not alive
+            or status == getattr(self.psutil, "STATUS_ZOMBIE", "zombie")
             or (
                 self._root_create_time is not None
                 and current_create_time != self._root_create_time

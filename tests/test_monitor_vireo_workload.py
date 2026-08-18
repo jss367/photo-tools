@@ -807,6 +807,7 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
             self.rss = rss
             self.reaped_cpu_seconds = reaped_cpu_seconds
             self.alive = True
+            self.status_value = "running"
             self.child_processes = []
 
         def exe(self):
@@ -820,6 +821,9 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
 
         def is_running(self):
             return self.alive
+
+        def status(self):
+            return self.status_value
 
         def children(self, recursive=False):
             return list(self.child_processes)
@@ -872,6 +876,10 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
     root.alive = False
     with pytest.raises(RuntimeError, match="exited or was replaced"):
         sampler.sample()
+    root.alive = True
+    root.status_value = "zombie"
+    with pytest.raises(RuntimeError, match="exited or was replaced"):
+        sampler.sample()
 
 
 def test_process_sampler_counts_children_reaped_between_polls():
@@ -893,6 +901,9 @@ def test_process_sampler_counts_children_reaped_between_polls():
 
         def is_running(self):
             return True
+
+        def status(self):
+            return "running"
 
         def children(self, recursive=False):
             return []

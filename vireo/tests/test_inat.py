@@ -446,6 +446,40 @@ def test_api_inat_token_only_saves_latest_overlapping_request(app_and_db):
     assert cfg.load()["inat_token"] == "newer-token"
 
 
+def test_api_inat_token_does_not_overwrite_settings_write(app_and_db):
+    app, _db, _pid = app_and_db
+    import config as cfg
+
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    responses = {}
+
+    def validate(_token):
+        validation_started.set()
+        assert release_validation.wait(timeout=5)
+        return {"login": "modal-user"}
+
+    def send_modal_request():
+        responses["modal"] = app.test_client().post(
+            "/api/inat/token", json={"token": "modal-token"},
+        )
+
+    with patch("inat.validate_token", side_effect=validate):
+        modal_thread = threading.Thread(target=send_modal_request)
+        modal_thread.start()
+        assert validation_started.wait(timeout=5)
+        settings = app.test_client().post(
+            "/api/config", json={"inat_token": "settings-token"},
+        )
+        release_validation.set()
+        modal_thread.join(timeout=5)
+
+    assert not modal_thread.is_alive()
+    assert settings.status_code == 200
+    assert responses["modal"].status_code == 409
+    assert cfg.load()["inat_token"] == "settings-token"
+
+
 def test_api_inat_export_uses_only_checked_metadata(app_and_db, tmp_path):
     app, db, pid = app_and_db
     destination = str(tmp_path / "exports")
@@ -491,6 +525,38 @@ def test_api_inat_export_uses_only_checked_metadata(app_and_db, tmp_path):
         "timestamp": "2024-06-01T10:00:00",
         "description": "At the feeder",
     }
+
+
+def test_api_inat_export_marks_wholly_unsuccessful_job_failed(
+    app_and_db, tmp_path,
+):
+    app, _db, pid = app_and_db
+    from inat_export import InatExportError
+    from wait import wait_for_job_via_client
+
+    with patch(
+        "inat_export.export_inat_photo",
+        side_effect=InatExportError("render failed"),
+    ):
+        response = app.test_client().post("/api/inat/export", json={
+            "destination": str(tmp_path),
+            "submissions": [{"photo_id": pid}],
+        })
+        job = wait_for_job_via_client(
+            app.test_client(), response.get_json()["job_id"],
+        )
+
+    assert response.status_code == 200
+    assert job["status"] == "failed"
+    assert job["errors"] == [
+        f"{{'photo_id': {pid}, 'error': 'render failed'}}",
+    ]
+    assert job["result"]["ok"] is False
+    assert job["result"]["exported"] == []
+    assert job["result"]["errors"] == [{
+        "photo_id": pid,
+        "error": "render failed",
+    }]
 
 
 def test_api_inat_export_includes_zero_coordinates(app_and_db, tmp_path):

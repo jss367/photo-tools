@@ -198,7 +198,7 @@ def export_inat_photo(
                 os.path.join(destination, filename),
             )
             stage_fd, staged_path = tempfile.mkstemp(
-                prefix=f".{filename}.", suffix=".tmp", dir=destination,
+                prefix=".inat-", suffix=".tmp", dir=destination,
             )
             os.close(stage_fd)
             shutil.copy2(rendered_path, staged_path)

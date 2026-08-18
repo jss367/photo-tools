@@ -281,11 +281,16 @@ def test_export_photos_embeds_only_selected_metadata(export_env, monkeypatch):
             "metadata_fields": [
                 "species", "capture_date", "capture_time", "rating", "camera",
             ],
+            "collect_files": True,
         },
     )
 
     assert result["exported"] == 2
     assert result["errors"] == []
+    assert result["files"] == [
+        os.path.join(env["dest"], "bird1.jpg"),
+        os.path.join(env["dest"], "bird2.jpg"),
+    ]
     assert len(metadata_write_calls) == 1
     output = os.path.join(env["dest"], "bird1.jpg")
     metadata = extract_metadata([output])[output]

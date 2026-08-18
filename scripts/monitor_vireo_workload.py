@@ -253,6 +253,7 @@ class ProcessTreeSampler:
         self._known_child_cpu_lifetimes = {}
         self._unreconciled_departed_child_cpu = 0.0
         self._initial_rss_bytes = None
+        self._initial_executable_exists = None
         try:
             self.executable = self.root.exe()
         except (OSError, self.psutil.Error):
@@ -262,10 +263,12 @@ class ProcessTreeSampler:
         except (OSError, self.psutil.Error):
             command = []
         try:
+            self._root_create_time = self.root.create_time()
             started_at = datetime.fromtimestamp(
-                self.root.create_time(), UTC
+                self._root_create_time, UTC
             ).isoformat(timespec="seconds")
         except (OSError, self.psutil.Error):
+            self._root_create_time = None
             started_at = None
         self._metadata = {
             "pid": self.root.pid,
@@ -280,10 +283,30 @@ class ProcessTreeSampler:
         return {
             **self._metadata,
             "initial_rss_bytes": self._initial_rss_bytes,
+            "initial_executable_exists": self._initial_executable_exists,
             "executable_exists": (
                 os.path.exists(self.executable) if self.executable else None
             ),
         }
+
+    def _assert_root_alive(self):
+        try:
+            alive = self.root.is_running()
+            current_create_time = self.root.create_time()
+        except (OSError, self.psutil.Error) as exc:
+            raise RuntimeError(
+                f"monitored Vireo PID {self.root.pid} exited"
+            ) from exc
+        if (
+            not alive
+            or (
+                self._root_create_time is not None
+                and current_create_time != self._root_create_time
+            )
+        ):
+            raise RuntimeError(
+                f"monitored Vireo PID {self.root.pid} exited or was replaced"
+            )
 
     def _current_processes(self):
         discovered = [self.root]
@@ -296,6 +319,10 @@ class ProcessTreeSampler:
         return list(live.values())
 
     def prime(self):
+        self._assert_root_alive()
+        self._initial_executable_exists = (
+            os.path.exists(self.executable) if self.executable else None
+        )
         self._cpu_times = {}
         self._known_child_cpu_lifetimes = {}
         initial_rss_bytes = 0
@@ -322,6 +349,7 @@ class ProcessTreeSampler:
         self._last_cpu_sample_at = self.monotonic()
 
     def sample(self):
+        self._assert_root_alive()
         sampled_at = self.monotonic()
         elapsed = (
             sampled_at - self._last_cpu_sample_at
@@ -597,7 +625,14 @@ def build_summary(baseline, samples, *, process_metadata=None):
     # let the trustworthiness gate falsely pass in restricted environments,
     # so require an explicit True to pass, an explicit False to fail, and
     # otherwise surface the gate as None.
-    executable_states = [sample["process"].get("executable_exists") for sample in samples]
+    executable_states = []
+    if process_metadata and "initial_executable_exists" in process_metadata:
+        executable_states.append(process_metadata["initial_executable_exists"])
+    executable_states.extend(
+        sample["process"].get("executable_exists") for sample in samples
+    )
+    if process_metadata and "executable_exists" in process_metadata:
+        executable_states.append(process_metadata["executable_exists"])
     if not executable_states or any(state is False for state in executable_states):
         executable_present = False
     elif all(state is True for state in executable_states):

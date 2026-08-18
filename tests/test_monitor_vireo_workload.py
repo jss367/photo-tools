@@ -344,6 +344,45 @@ def test_executable_target_is_false_when_presence_verified_missing():
     assert report["summary"]["targets"]["vireo_executable_present_throughout"] is False
 
 
+def test_executable_target_includes_final_metadata_check():
+    clock = _FakeClock()
+    api = _SequenceApi([
+        _api_sample(
+            latency=0.001, wait_count=0, wait_seconds=0.0,
+            producer_starts=0, waiter_joins=0,
+        ),
+        _api_sample(
+            latency=0.001, wait_count=0, wait_seconds=0.0,
+            producer_starts=0, waiter_joins=0,
+        ),
+    ])
+    process = _SequenceSampler(
+        [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True}],
+        {
+            "pid": 123,
+            "initial_executable_exists": True,
+            "executable_exists": False,
+        },
+    )
+    system = _SequenceSampler(
+        [{"cpu_idle_percent": 50.0}],
+        {"logical_cpu_count": 16},
+    )
+
+    report = collect_workload(
+        duration=1.0,
+        interval=1.0,
+        api_client=api,
+        process_sampler=process,
+        system_sampler=system,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert report["process"]["executable_exists"] is False
+    assert report["summary"]["targets"]["vireo_executable_present_throughout"] is False
+
+
 def test_job_summary_tracks_history_only_jobs_and_ignores_baseline_history():
     """A short job (e.g. a cached embedding request) may start and finish
     between two polling intervals, appearing only in `history`.  Such jobs
@@ -767,6 +806,7 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
             self.cpu_seconds = cpu_seconds
             self.rss = rss
             self.reaped_cpu_seconds = reaped_cpu_seconds
+            self.alive = True
             self.child_processes = []
 
         def exe(self):
@@ -777,6 +817,9 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
 
         def create_time(self):
             return self.created_at
+
+        def is_running(self):
+            return self.alive
 
         def children(self, recursive=False):
             return list(self.child_processes)
@@ -826,6 +869,10 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
     assert sample["process_count"] == 2
     assert sampler.metadata()["initial_rss_bytes"] == 100
 
+    root.alive = False
+    with pytest.raises(RuntimeError, match="exited or was replaced"):
+        sampler.sample()
+
 
 def test_process_sampler_counts_children_reaped_between_polls():
     clock = _FakeClock()
@@ -843,6 +890,9 @@ def test_process_sampler_counts_children_reaped_between_polls():
 
         def create_time(self):
             return 1.0
+
+        def is_running(self):
+            return True
 
         def children(self, recursive=False):
             return []

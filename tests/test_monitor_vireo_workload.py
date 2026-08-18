@@ -540,7 +540,7 @@ def test_malformed_200_jobs_response_counts_as_api_failure():
         },
     ])
     process = _SequenceSampler(
-        [{"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True}],
+        [{"cpu_percent": 1500.0, "rss_bytes": 100, "executable_exists": True}],
         {"pid": 123, "executable_exists": True},
     )
     system = _SequenceSampler(
@@ -559,6 +559,7 @@ def test_malformed_200_jobs_response_counts_as_api_failure():
     )
 
     assert report["summary"]["api_failure_count"] == 1
+    assert report["summary"]["cpu_capacity_burst_samples"] == 1
     assert report["summary"]["jobs_api_latency_seconds"] is None
     assert report["summary"]["targets"]["jobs_api_p95_below_500ms"] is False
 
@@ -1501,6 +1502,22 @@ def test_discovery_brackets_specific_ipv6_listener_address():
     server = discover_server(psutil_module=fake)
 
     assert server == {"pid": 4242, "url": "http://[2001:db8::1]:50222"}
+
+
+@pytest.mark.parametrize("listener_ip", ["::1", "::"])
+def test_discovery_preserves_ipv6_family_for_loopback_listeners(listener_ip):
+    proc = _FakeProc(4242, port=50222, listener_ip=listener_ip)
+    proc.info = {
+        "pid": 4242, "name": "vireo-server",
+        "cmdline": ["vireo-server"], "create_time": 0,
+    }
+    proc.parents = lambda: []
+    fake = _FakePsutil([proc])
+    fake.process_iter = lambda attrs=None: iter([proc])
+
+    server = discover_server(psutil_module=fake)
+
+    assert server == {"pid": 4242, "url": "http://[::1]:50222"}
 
 
 def test_url_only_discovery_accepts_loopback_hostname_for_local_listener():

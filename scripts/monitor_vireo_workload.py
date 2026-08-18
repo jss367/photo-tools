@@ -724,7 +724,10 @@ def build_summary(
         for sample in successful
     ]
     cpu_cap_violations = 0
-    for sample in successful:
+    last_cpu_capacity = (
+        (baseline.get("resource_budget") or {}).get("cpu", {}).get("capacity")
+    )
+    for sample in samples:
         if sample["process"].get("process_tree_complete") is False:
             continue
         capacity = (
@@ -732,7 +735,12 @@ def build_summary(
             .get("cpu", {})
             .get("capacity")
         )
-        if capacity and sample["process"]["cpu_percent"] > capacity * 110:
+        if capacity:
+            last_cpu_capacity = capacity
+        if (
+            last_cpu_capacity
+            and sample["process"]["cpu_percent"] > last_cpu_capacity * 110
+        ):
             cpu_cap_violations += 1
     latency_summary = _number_summary(api_latencies)
     idle_summary = _number_summary(system_idle)
@@ -1143,8 +1151,10 @@ def discover_server(
                 ):
                     continue
                 host = connection.laddr.ip
-                if host in {"0.0.0.0", "::", "::1"}:
+                if host == "0.0.0.0":
                     host = "127.0.0.1"
+                elif host == "::":
+                    host = "::1"
                 url_host = f"[{host}]" if ":" in host else host
                 candidates.append({
                     "pid": process.pid,

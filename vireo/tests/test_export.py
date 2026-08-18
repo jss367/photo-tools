@@ -8,6 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+import export as export_mod
 import pytest
 from db import Database
 from export import (
@@ -1335,6 +1336,36 @@ def test_preview_export_renames_reports_same_batch_collision(export_env):
         photo_ids=[env["p1"], env["p2"]],
         destination=env["dest"],
         options={"naming_template": "photo", "format": "jpg"},
+    )
+
+    assert [(item["requested_name"], item["export_name"]) for item in renames] == [
+        ("photo.jpg", "photo_2.jpg"),
+    ]
+
+
+def test_preview_export_renames_respects_case_insensitive_destination(
+    export_env, monkeypatch,
+):
+    """Case-only batch twins are collisions when the target folds case."""
+    env = export_env
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = 'Photo.jpg' WHERE id = ?",
+        (env["p1"],),
+    )
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = 'photo.jpg' WHERE id = ?",
+        (env["p2"],),
+    )
+    env["db"].conn.commit()
+    monkeypatch.setattr(
+        export_mod, "_destination_case_insensitive", lambda _path: True,
+    )
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "format": "jpg"},
     )
 
     assert [(item["requested_name"], item["export_name"]) for item in renames] == [

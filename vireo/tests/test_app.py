@@ -113,6 +113,8 @@ def test_browse_export_warns_before_numbering_collision_names(app_and_db):
     assert "'/api/jobs/export/preflight'" in html
     assert "Continue with export?" in html
     assert "requested_name + ' → ' + rename.export_name" in html
+    assert "var exportRequestGeneration = 0;" in html
+    assert "requestGeneration !== exportRequestGeneration" in html
 
 
 def test_shared_context_menu_scrolls_within_viewport(app_and_db):

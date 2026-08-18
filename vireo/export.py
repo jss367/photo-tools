@@ -10,6 +10,7 @@ import subprocess
 
 from image_edits import apply_recipe_to_loaded_image
 from image_loader import RAW_DECODE_PRESERVE_HIGHLIGHTS, RAW_EXTENSIONS, load_image
+from path_guard import fs_is_case_insensitive, is_case_insensitive_platform
 from proc import no_window_kwargs
 from render_source import (
     companion_image_can_replace_raw_result,
@@ -1472,19 +1473,39 @@ def _resolve_source(photo, vireo_dir, folders, use_working_copy=False):
     return os.path.join(folder_path, photo["filename"])
 
 
-def _deduplicate_path(path, reserved_paths=None):
+def _deduplicate_path(path, reserved_paths=None, path_key=None):
     """Append _2, _3, etc. if a path exists or is reserved by this batch."""
     reserved_paths = reserved_paths or set()
-    if not os.path.exists(path) and path not in reserved_paths:
+    path_key = path_key or (lambda candidate: candidate)
+    if not os.path.exists(path) and path_key(path) not in reserved_paths:
         return path
     stem, ext = os.path.splitext(path)
     counter = 2
     while (
         os.path.exists(f"{stem}_{counter}{ext}")
-        or f"{stem}_{counter}{ext}" in reserved_paths
+        or path_key(f"{stem}_{counter}{ext}") in reserved_paths
     ):
         counter += 1
     return f"{stem}_{counter}{ext}"
+
+
+def _destination_case_insensitive(path):
+    """Return whether the existing volume containing ``path`` folds case."""
+    if is_case_insensitive_platform():
+        return True
+    probe_path = os.path.realpath(path)
+    while not os.path.isdir(probe_path):
+        parent = os.path.dirname(probe_path)
+        if parent == probe_path:
+            break
+        probe_path = parent
+    return fs_is_case_insensitive(probe_path)
+
+
+def _export_path_key(path, case_insensitive):
+    """Return a reservation identity matching the destination filesystem."""
+    resolved = os.path.realpath(path)
+    return resolved.casefold() if case_insensitive else resolved
 
 
 def preview_export_renames(db, photo_ids, destination=None, options=None):
@@ -1506,7 +1527,8 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
     folders = {folder["id"]: folder["path"] for folder in db.get_folder_tree()}
     species_map = db.get_species_keywords_for_photos(photo_ids)
     seq_counters = {}
-    reserved_paths = set()
+    reserved_path_keys = set()
+    destination_case_map = {}
     renames = []
 
     for pid in photo_ids:
@@ -1559,8 +1581,21 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
         ):
             continue
 
-        export_path = _deduplicate_path(requested_path, reserved_paths)
-        reserved_paths.add(export_path)
+        if photo_destination not in destination_case_map:
+            destination_case_map[photo_destination] = (
+                _destination_case_insensitive(photo_destination)
+            )
+        case_insensitive = destination_case_map[photo_destination]
+
+        def path_key(candidate, folds_case=case_insensitive):
+            return _export_path_key(candidate, folds_case)
+
+        export_path = _deduplicate_path(
+            requested_path,
+            reserved_path_keys,
+            path_key=path_key,
+        )
+        reserved_path_keys.add(path_key(export_path))
         if export_path != requested_path:
             renames.append({
                 "photo_id": pid,

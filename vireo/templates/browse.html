@@ -11399,9 +11399,12 @@ async function _runPhotoDeepLink(photoId) {
 })();
 
 /* ---------- Export Modal ---------- */
+var exportRequestGeneration = 0;
+
 function openExportModal() {
   var activeIds = getActiveSelection();
   if (activeIds.length === 0) return;
+  exportRequestGeneration++;
   document.getElementById('exportSubmitBtn').textContent = 'Export ' + activeIds.length + ' photo' + (activeIds.length === 1 ? '' : 's');
   document.getElementById('exportSubmitBtn').disabled = false;
   document.getElementById('exportPreset').value = 'original-jpg';
@@ -11422,6 +11425,7 @@ function selectedExportMetadataFields() {
 }
 
 function closeExportModal() {
+  exportRequestGeneration++;
   document.getElementById('exportOverlay').classList.remove('open');
 }
 
@@ -11567,6 +11571,7 @@ document.getElementById('exportQuality').addEventListener('input', function() {
 });
 
 async function startExport() {
+  var requestGeneration = ++exportRequestGeneration;
   var dest = document.getElementById('exportDest').value.trim();
   var exportToSubfolder = document.getElementById('exportSubfolder').checked;
 
@@ -11605,6 +11610,8 @@ async function startExport() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(exportRequest),
     });
+    if (requestGeneration !== exportRequestGeneration ||
+        !document.getElementById('exportOverlay').classList.contains('open')) return;
     if (preflight.error) {
       alert('Export check failed: ' + preflight.error);
       btn.disabled = false;
@@ -11636,6 +11643,8 @@ async function startExport() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(exportRequest),
     });
+    if (requestGeneration !== exportRequestGeneration ||
+        !document.getElementById('exportOverlay').classList.contains('open')) return;
     if (data.error) {
       alert('Export error: ' + data.error);
       btn.disabled = false;
@@ -11645,6 +11654,7 @@ async function startExport() {
     closeExportModal();
     showToast('Export started (' + count + ' photos)', 'info');
   } catch(err) {
+    if (requestGeneration !== exportRequestGeneration) return;
     alert('Export failed: ' + err.message);
     btn.disabled = false;
     btn.textContent = buttonLabel;

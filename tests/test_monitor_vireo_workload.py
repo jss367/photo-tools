@@ -1068,6 +1068,28 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
     root.children_error = False
     replacement.cpu_seconds = 0.4
     clock.sleep(1.0)
+    recovery_sample = sampler.sample()
+    assert recovery_sample["cpu_percent"] == 10.0
+    assert recovery_sample["process_tree_complete"] is False
+    replacement.cpu_seconds = 0.5
+    clock.sleep(1.0)
+    assert sampler.sample()["process_tree_complete"] is True
+
+    # If a brand-new child cannot be read during the incomplete interval, its
+    # first successful read establishes a baseline in the excluded recovery
+    # interval instead of charging its lifetime CPU over one second.
+    unreadable_child = _CpuProcess(102, 4.0, 0.3, 100)
+    unreadable_child.cpu_error = True
+    root.child_processes = [unreadable_child]
+    clock.sleep(1.0)
+    assert sampler.sample()["process_tree_complete"] is False
+    unreadable_child.cpu_error = False
+    clock.sleep(1.0)
+    recovered_child = sampler.sample()
+    assert recovered_child["cpu_percent"] == 0.0
+    assert recovered_child["process_tree_complete"] is False
+    unreadable_child.cpu_seconds = 0.4
+    clock.sleep(1.0)
     assert sampler.sample()["cpu_percent"] == 10.0
 
     bad_root = _CpuProcess(200, 1.0, 1.0, 100)

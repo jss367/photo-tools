@@ -262,6 +262,7 @@ class ProcessTreeSampler:
         self._reaped_children_cpu_times = {}
         self._known_child_cpu_lifetimes = {}
         self._unreconciled_departed_child_cpu = 0.0
+        self._needs_rebaseline_after_incomplete = False
         self._initial_rss_bytes = None
         self._initial_executable_exists = None
         try:
@@ -407,11 +408,13 @@ class ProcessTreeSampler:
                 "could not capture a complete Vireo process-tree baseline"
             )
         self._unreconciled_departed_child_cpu = 0.0
+        self._needs_rebaseline_after_incomplete = False
         self._initial_rss_bytes = initial_rss_bytes if process_count else None
         self._last_cpu_sample_at = self.monotonic()
 
     def sample(self):
         self._assert_root_alive()
+        recovering_from_incomplete = self._needs_rebaseline_after_incomplete
         sampled_at = self.monotonic()
         elapsed = (
             sampled_at - self._last_cpu_sample_at
@@ -442,7 +445,11 @@ class ProcessTreeSampler:
                 # this sampling window. Its cumulative process CPU time is
                 # therefore the correct delta from zero; psutil.cpu_percent
                 # would instead return a synthetic zero on this first call.
-                previous_cpu_seconds = self._cpu_times.get(identity, 0.0)
+                previous_cpu_seconds = self._cpu_times.get(identity)
+                if previous_cpu_seconds is None:
+                    previous_cpu_seconds = (
+                        total_cpu_seconds if recovering_from_incomplete else 0.0
+                    )
                 cpu_seconds += max(
                     total_cpu_seconds - previous_cpu_seconds,
                     0.0,
@@ -453,7 +460,8 @@ class ProcessTreeSampler:
             except (OSError, self.psutil.Error):
                 process_tree_complete = False
                 continue
-        if not process_tree_complete:
+        measurement_complete = process_tree_complete
+        if not measurement_complete:
             # An enumeration/read failure is not evidence that a cached child
             # departed. Keep its cumulative baselines so a later successful
             # poll does not charge its entire lifetime again from zero.
@@ -495,6 +503,10 @@ class ProcessTreeSampler:
         self._reaped_children_cpu_times = current_reaped_children_cpu_times
         self._known_child_cpu_lifetimes = current_child_cpu_lifetimes
         self._last_cpu_sample_at = sampled_at
+        self._needs_rebaseline_after_incomplete = not measurement_complete
+        process_tree_complete = (
+            measurement_complete and not recovering_from_incomplete
+        )
         cpu_percent = cpu_seconds / elapsed * 100.0 if elapsed > 0 else 0.0
         metadata = self.metadata()
         return {

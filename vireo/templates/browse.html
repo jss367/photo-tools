@@ -1868,8 +1868,7 @@ body.sidebar-resizing {
         <label style="font-size:12px;color:var(--text-secondary);display:block;margin-bottom:7px;">Include metadata in exported files</label>
         <div class="export-metadata-options">
           <label class="export-metadata-option"><input id="exportMetadataSpecies" type="checkbox" value="species"> Species</label>
-          <label class="export-metadata-option"><input id="exportMetadataCaptureDate" type="checkbox" value="capture_date"> Capture date</label>
-          <label class="export-metadata-option"><input id="exportMetadataCaptureTime" type="checkbox" value="capture_time"> Capture time</label>
+          <label class="export-metadata-option"><input id="exportMetadataCaptureDateTime" type="checkbox" value="capture_date_time"> Capture date &amp; time</label>
           <label class="export-metadata-option"><input id="exportMetadataRating" type="checkbox" value="rating"> Rating</label>
           <label class="export-metadata-option"><input id="exportMetadataLocation" type="checkbox" value="location"> Location</label>
           <label class="export-metadata-option"><input id="exportMetadataCamera" type="checkbox" value="camera"> Camera &amp; exposure</label>
@@ -11415,7 +11414,14 @@ function openExportModal() {
 
 function selectedExportMetadataFields() {
   return Array.from(document.querySelectorAll('.export-metadata-option input:checked'))
-    .map(function(input) { return input.value; });
+    .reduce(function(fields, input) {
+      if (input.value === 'capture_date_time') {
+        fields.push('capture_date', 'capture_time');
+      } else {
+        fields.push(input.value);
+      }
+      return fields;
+    }, []);
 }
 
 function closeExportModal() {

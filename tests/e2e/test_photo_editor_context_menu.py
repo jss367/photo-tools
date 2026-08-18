@@ -114,6 +114,37 @@ def test_photo_editor_context_disables_save_while_request_is_pending(
     page.wait_for_function("() => !isEditorDirty()")
 
 
+def test_photo_editor_save_keeps_staleness_of_submitted_mask(live_server, page):
+    _open_editor(live_server, page)
+    page.evaluate(
+        """() => {
+          editorState.localStale = true;
+          editorState.savedLocalStale = true;
+          rotateRecipe(90);
+          const originalSafeFetch = window.safeFetch;
+          window.safeFetch = function(url, options, config) {
+            if (url.includes('/edit-recipe') && options && options.method === 'PUT') {
+              return new Promise(resolve => { window.__resolveStaleMaskSave = resolve; });
+            }
+            return originalSafeFetch(url, options, config);
+          };
+          window.__staleMaskSave = saveRecipe();
+        }"""
+    )
+
+    page.evaluate(
+        """() => {
+          // Simulate Update Mask completing while the old-mask PUT is pending.
+          editorState.localStale = false;
+          window.__resolveStaleMaskSave({recipe: {rotation: 90}});
+        }"""
+    )
+    page.evaluate("() => window.__staleMaskSave")
+
+    assert page.evaluate("() => editorState.localStale") is True
+    assert page.evaluate("() => editorState.savedLocalStale") is True
+
+
 def test_photo_editor_context_revert_restores_saved_recipe(live_server, page):
     _open_editor(live_server, page)
     page.evaluate("() => rotateRecipe(90)")

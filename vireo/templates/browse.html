@@ -5446,9 +5446,6 @@ async function prependPreviousPhotos(options) {
   var loadSucceeded = false;
   var requestedPage = earliestPage - 1;
   var request = buildBrowsePageRequest(requestedPage, perPage);
-  var oldFirstPhoto = photos.length ? photos[0] : null;
-  var oldFirstCard = oldFirstPhoto ? getGridCard(oldFirstPhoto.id) : null;
-  var oldFirstTop = oldFirstCard ? oldFirstCard.getBoundingClientRect().top : null;
 
   try {
     var data = await safeFetch(request.url, request.options, {
@@ -5475,6 +5472,13 @@ async function prependPreviousPhotos(options) {
       loadedIds.add(key);
       return true;
     });
+
+    // Capture at response time, not request time: the user can continue
+    // scrolling while the network request is in flight, and the prepend must
+    // preserve the position they reached rather than undoing that movement.
+    var oldFirstPhoto = photos.length ? photos[0] : null;
+    var oldFirstCard = oldFirstPhoto ? getGridCard(oldFirstPhoto.id) : null;
+    var oldFirstTop = oldFirstCard ? oldFirstCard.getBoundingClientRect().top : null;
 
     photos = preceding.concat(photos);
     earliestPage = requestedPage;

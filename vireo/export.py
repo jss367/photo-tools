@@ -8,7 +8,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import unicodedata
 
 from image_edits import apply_recipe_to_loaded_image
 from image_loader import RAW_DECODE_PRESERVE_HIGHLIGHTS, RAW_EXTENSIONS, load_image
@@ -1490,72 +1489,98 @@ def _select_export_source(
     )
 
 
-def _deduplicate_path(path, reserved_paths=None, path_key=None):
+def _deduplicate_path(
+    path, reserved_paths=None, path_key=None, is_reserved=None,
+):
     """Append _2, _3, etc. if a path exists or is reserved by this batch."""
     reserved_paths = reserved_paths or set()
     path_key = path_key or (lambda candidate: candidate)
-    if not os.path.exists(path) and path_key(path) not in reserved_paths:
+
+    def reserved(candidate):
+        if is_reserved is not None:
+            return is_reserved(candidate)
+        return path_key(candidate) in reserved_paths
+
+    if not os.path.exists(path) and not reserved(path):
         return path
     stem, ext = os.path.splitext(path)
     counter = 2
     while (
         os.path.exists(f"{stem}_{counter}{ext}")
-        or path_key(f"{stem}_{counter}{ext}") in reserved_paths
+        or reserved(f"{stem}_{counter}{ext}")
     ):
         counter += 1
     return f"{stem}_{counter}{ext}"
 
 
-def _destination_filename_behavior(path):
-    """Return the destination volume's case and Unicode equivalence rules."""
-    probe_path = os.path.realpath(path)
-    while not os.path.isdir(probe_path):
-        parent = os.path.dirname(probe_path)
-        if parent == probe_path:
-            break
-        probe_path = parent
-    try:
-        descriptor, probe_file = tempfile.mkstemp(
-            prefix=".VireoÉCaseProbe-", dir=probe_path,
+class _DestinationPathReservations:
+    """Mirror planned paths on the destination volume to detect aliases."""
+
+    def __init__(self, destination):
+        self.destination = os.path.abspath(destination)
+        probe_path = os.path.realpath(destination)
+        while not os.path.isdir(probe_path):
+            parent = os.path.dirname(probe_path)
+            if parent == probe_path:
+                break
+            probe_path = parent
+        try:
+            self._temporary_directory = tempfile.TemporaryDirectory(
+                prefix=".VireoExportReservation-", dir=probe_path,
+            )
+        except OSError:
+            # Export will report a permission/storage error separately. Exact
+            # matching is the safest fallback when the volume cannot be used.
+            self._temporary_directory = None
+        self.root = (
+            self._temporary_directory.name
+            if self._temporary_directory is not None
+            else None
         )
-    except OSError:
-        # Export will report a permission/storage error separately. Avoid
-        # inventing filename equivalences when the selected volume cannot be
-        # probed directly.
-        return False, False
-    os.close(descriptor)
-    try:
-        probe_dir, probe_name = os.path.split(probe_file)
-        case_variant = os.path.join(probe_dir, probe_name.swapcase())
-        normalized_name = unicodedata.normalize("NFD", probe_name)
-        if normalized_name == probe_name:
-            normalized_name = unicodedata.normalize("NFC", probe_name)
-        normalization_variant = os.path.join(probe_dir, normalized_name)
+        self._fallback = set()
 
-        def aliases_probe(candidate):
-            if candidate == probe_file or not os.path.exists(candidate):
-                return False
-            try:
-                return os.path.samefile(probe_file, candidate)
-            except OSError:
-                return False
+    def __enter__(self):
+        return self
 
-        return aliases_probe(case_variant), aliases_probe(normalization_variant)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(probe_file)
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        self.close()
 
+    def close(self):
+        if self._temporary_directory is not None:
+            self._temporary_directory.cleanup()
+            self._temporary_directory = None
+            self.root = None
 
-def _export_path_key(path, case_insensitive, normalization_insensitive=False):
-    """Return a reservation identity matching the destination filesystem."""
-    resolved = os.path.realpath(path)
-    if normalization_insensitive:
-        resolved = unicodedata.normalize("NFC", resolved)
-    # ``casefold`` performs linguistic expansions (for example ß -> ss) that
-    # filesystems such as NTFS do not, which would invent batch collisions.
-    # ``lower`` preserves those distinct spellings while matching ordinary
-    # case aliases observed by the destination probe.
-    return resolved.lower() if case_insensitive else resolved
+    def _relative_path(self, candidate):
+        relative = os.path.relpath(os.path.abspath(candidate), self.destination)
+        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+            return None
+        return relative
+
+    def contains(self, candidate):
+        relative = self._relative_path(candidate)
+        if relative is None:
+            return False
+        if self.root is None:
+            return relative in self._fallback
+        return os.path.exists(os.path.join(self.root, relative))
+
+    def add(self, candidate):
+        relative = self._relative_path(candidate)
+        if relative is None:
+            return
+        if self.root is None:
+            self._fallback.add(relative)
+            return
+        shadow_path = os.path.join(self.root, relative)
+        os.makedirs(os.path.dirname(shadow_path), exist_ok=True)
+        try:
+            with open(shadow_path, "xb"):
+                pass
+        except FileExistsError:
+            # A filesystem alias can race between contains() and add(); either
+            # spelling represents the same reserved destination.
+            pass
 
 
 def preview_export_renames(db, photo_ids, destination=None, options=None):
@@ -1589,8 +1614,7 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
     edit_recipes = db.get_photo_edit_recipes(photo_ids)
     developed_index = _DevelopedDirIndex()
     seq_counters = {}
-    reserved_path_keys = set()
-    destination_behavior_map = {}
+    destination_reservations = {}
     renames = []
 
     for pid in photo_ids:
@@ -1661,29 +1685,17 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
         ):
             continue
 
-        if photo_destination not in destination_behavior_map:
-            destination_behavior_map[photo_destination] = (
-                _destination_filename_behavior(photo_destination)
+        if photo_destination not in destination_reservations:
+            destination_reservations[photo_destination] = (
+                _DestinationPathReservations(photo_destination)
             )
-        case_insensitive, normalization_insensitive = (
-            destination_behavior_map[photo_destination]
-        )
-
-        def path_key(
-            candidate,
-            folds_case=case_insensitive,
-            folds_normalization=normalization_insensitive,
-        ):
-            return _export_path_key(
-                candidate, folds_case, folds_normalization,
-            )
+        reservations = destination_reservations[photo_destination]
 
         export_path = _deduplicate_path(
             requested_path,
-            reserved_path_keys,
-            path_key=path_key,
+            is_reserved=reservations.contains,
         )
-        reserved_path_keys.add(path_key(export_path))
+        reservations.add(export_path)
         if export_path != requested_path:
             renames.append({
                 "photo_id": pid,
@@ -1692,4 +1704,6 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
                 "destination": os.path.dirname(export_path),
             })
 
+    for reservations in destination_reservations.values():
+        reservations.close()
     return renames

@@ -1344,6 +1344,36 @@ def test_preview_export_renames_reports_same_batch_collision(export_env):
     ]
 
 
+def _mock_destination_reservations(monkeypatch, key):
+    """Install an in-memory destination with a chosen filename comparison."""
+
+    class FakeReservations:
+        def __init__(self, destination):
+            self.destination = destination
+            self.paths = set()
+
+        def contains(self, candidate):
+            return key(os.path.relpath(candidate, self.destination)) in self.paths
+
+        def add(self, candidate):
+            self.paths.add(key(os.path.relpath(candidate, self.destination)))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        export_mod, "_DestinationPathReservations", FakeReservations,
+    )
+
+
+def _ntfs_test_key(path):
+    """Model the NTFS distinctions exercised by these regression tests."""
+    return "".join(
+        "σ" if character in {"Σ", "σ", "ς"} else character.lower()
+        for character in path
+    )
+
+
 def test_preview_export_renames_respects_case_insensitive_destination(
     export_env, monkeypatch,
 ):
@@ -1358,9 +1388,7 @@ def test_preview_export_renames_respects_case_insensitive_destination(
         (env["p2"],),
     )
     env["db"].conn.commit()
-    monkeypatch.setattr(
-        export_mod, "_destination_filename_behavior", lambda _path: (True, False),
-    )
+    _mock_destination_reservations(monkeypatch, _ntfs_test_key)
     monkeypatch.setattr(
         export_mod,
         "_select_export_source",
@@ -1395,9 +1423,7 @@ def test_preview_export_renames_keeps_case_twins_on_empty_linux_target(
         (env["p2"],),
     )
     env["db"].conn.commit()
-    monkeypatch.setattr(
-        export_mod, "_destination_filename_behavior", lambda _path: (False, False),
-    )
+    _mock_destination_reservations(monkeypatch, lambda path: path)
     monkeypatch.setattr(
         export_mod,
         "_select_export_source",
@@ -1414,14 +1440,10 @@ def test_preview_export_renames_keeps_case_twins_on_empty_linux_target(
     assert renames == []
 
 
-def test_destination_filename_probe_matches_empty_volume(tmp_path):
-    """Filename behavior comes from the selected volume, not the platform."""
+def test_destination_reservations_match_empty_volume(tmp_path):
+    """Batch reservations use the selected volume's filename behavior."""
     destination = tmp_path / "empty-destination"
     destination.mkdir()
-
-    detected_case, detected_normalization = (
-        export_mod._destination_filename_behavior(str(destination))
-    )
 
     probe = destination / "VireoÉCaseCheck"
     probe.write_text("probe")
@@ -1432,6 +1454,16 @@ def test_destination_filename_probe_matches_empty_volume(tmp_path):
         ).exists()
     finally:
         probe.unlink()
+
+    with export_mod._DestinationPathReservations(str(destination)) as reservations:
+        reservations.add(probe)
+        detected_case = reservations.contains(
+            destination / "vIREOécASEcHECK"
+        )
+        detected_normalization = reservations.contains(
+            destination / unicodedata.normalize("NFD", probe.name)
+        )
+
     assert detected_case is observed_case
     assert detected_normalization is observed_normalization
     assert list(destination.iterdir()) == []
@@ -1451,10 +1483,9 @@ def test_preview_export_renames_respects_unicode_equivalent_destination(
         ("e\u0301.jpg", env["p2"]),
     )
     env["db"].conn.commit()
-    monkeypatch.setattr(
-        export_mod,
-        "_destination_filename_behavior",
-        lambda _path: (False, True),
+    _mock_destination_reservations(
+        monkeypatch,
+        lambda path: unicodedata.normalize("NFC", path),
     )
     monkeypatch.setattr(
         export_mod,
@@ -1488,11 +1519,7 @@ def test_preview_export_renames_preserves_non_equivalent_casefold_names(
         ("strasse.jpg", env["p2"]),
     )
     env["db"].conn.commit()
-    monkeypatch.setattr(
-        export_mod,
-        "_destination_filename_behavior",
-        lambda _path: (True, False),
-    )
+    _mock_destination_reservations(monkeypatch, _ntfs_test_key)
     monkeypatch.setattr(
         export_mod,
         "_select_export_source",
@@ -1507,6 +1534,39 @@ def test_preview_export_renames_preserves_non_equivalent_casefold_names(
     )
 
     assert renames == []
+
+
+def test_preview_export_renames_detects_ntfs_sigma_aliases(
+    export_env, monkeypatch,
+):
+    """NTFS-equivalent sigma spellings are reserved as one destination."""
+    env = export_env
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = ? WHERE id = ?",
+        ("Σ.jpg", env["p1"]),
+    )
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = ? WHERE id = ?",
+        ("ς.jpg", env["p2"]),
+    )
+    env["db"].conn.commit()
+    _mock_destination_reservations(monkeypatch, _ntfs_test_key)
+    monkeypatch.setattr(
+        export_mod,
+        "_select_export_source",
+        lambda **_kwargs: str(env["src"] / "bird1.jpg"),
+    )
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "format": "jpg"},
+    )
+
+    assert [(item["requested_name"], item["export_name"]) for item in renames] == [
+        ("ς.jpg", "ς_2.jpg"),
+    ]
 
 
 def test_preview_export_renames_skips_missing_source_before_sequence(

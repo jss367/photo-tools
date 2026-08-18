@@ -3475,6 +3475,8 @@ function sendCurrentEditedPhotoToInat() {
 function buildPhotoEditorContextMenu() {
   var unavailable = !editorState.photoId || editorState.loading;
   var dirty = !unavailable && isEditorDirty();
+  var saveButton = document.getElementById('saveBtn');
+  var savePending = dirty && saveButton && saveButton.disabled;
   var recipe = unavailable ? {} : recipeForSave(editorState.recipe);
   var hasEdits = Object.keys(recipe || {}).length > 0;
   var beforeLabel = editorState.showBefore ? 'Show Current Edits' : 'Show Saved Version';
@@ -3482,8 +3484,10 @@ function buildPhotoEditorContextMenu() {
   return [
     {
       label: 'Save Changes',
-      disabled: !dirty,
-      disabledHint: unavailable ? 'No photo is ready to edit' : 'No unsaved changes',
+      disabled: !dirty || savePending,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (savePending ? 'Saving changes' : 'No unsaved changes'),
       onClick: function() { saveRecipe(); },
     },
     {

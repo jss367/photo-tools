@@ -57,6 +57,38 @@ def test_photo_editor_context_transform_updates_recipe(live_server, page):
     expect(save_item).not_to_have_class(re.compile(r"vireo-ctx-disabled"))
 
 
+def test_photo_editor_context_disables_save_while_request_is_pending(
+    live_server, page
+):
+    _open_editor(live_server, page)
+    page.evaluate(
+        """() => {
+          rotateRecipe(90);
+          const originalSafeFetch = window.safeFetch;
+          window.safeFetch = function(url, options, config) {
+            if (url.includes('/edit-recipe') && options && options.method === 'PUT') {
+              return new Promise(resolve => { window.__resolveEditorSave = resolve; });
+            }
+            return originalSafeFetch(url, options, config);
+          };
+          saveRecipe();
+        }"""
+    )
+
+    save_item = page.evaluate(
+        """() => {
+          const item = buildPhotoEditorContextMenu().find(
+            entry => entry.label === 'Save Changes'
+          );
+          return {disabled: item.disabled, hint: item.disabledHint};
+        }"""
+    )
+    assert save_item == {"disabled": True, "hint": "Saving changes"}
+
+    page.evaluate("() => window.__resolveEditorSave({recipe: {rotation: 90}})")
+    page.wait_for_function("() => !isEditorDirty()")
+
+
 def test_photo_editor_context_revert_restores_saved_recipe(live_server, page):
     _open_editor(live_server, page)
     page.evaluate("() => rotateRecipe(90)")

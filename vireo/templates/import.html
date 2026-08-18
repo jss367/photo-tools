@@ -1462,6 +1462,23 @@ function failActiveSourceScans() {
   if (changed) renderSources();
 }
 
+// A validation failure can supersede and abort a real traversal before the
+// replacement run reaches discovery. Those old loading/queued states no
+// longer have a walker behind them, but they are not scan failures either.
+// Return them to the neutral pre-scan state until the options are valid.
+function resetActiveSourceScans() {
+  let changed = false;
+  sources.forEach(path => {
+    const state = sourceCounts[path];
+    if (state && (state.status === 'loading' || state.status === 'queued')) {
+      delete sourceCounts[path];
+      changed = true;
+    }
+  });
+  stopSourceCountClock();
+  if (changed) renderSources();
+}
+
 // Belt-and-suspenders against a stream whose per-folder frames were missed
 // (e.g. a stub or proxy that only delivers the final frame): the done
 // payload's per-source totals settle any row still waiting or scanning.
@@ -3200,6 +3217,10 @@ async function previewImport(opts) {
   const copyMode = newImagesSnapshotId === null && selectedImportMode() === 'copy';
   const fileTypes = copyMode ? selectedFileTypes() : 'both';
   if (copyMode && Array.isArray(fileTypes) && !fileTypes.length) {
+    // This run already aborted its predecessor at the top of the function.
+    // No replacement traversal will start, so do not leave the predecessor's
+    // rows and elapsed clock claiming that a scan is still active.
+    resetActiveSourceScans();
     retireHideDuplicatesOptIn();
     summary.textContent = '';
     showError('Choose at least one file extension.');

@@ -1004,7 +1004,7 @@ def _listener_reachable_via(
             if (
                 listener_addr is not None
                 and addr.version == listener_addr.version
-                and (all_bind or listener_addr.is_loopback)
+                and (all_bind or addr == listener_addr)
             ):
                 return True
             continue

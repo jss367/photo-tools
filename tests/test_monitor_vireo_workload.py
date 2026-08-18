@@ -1374,6 +1374,20 @@ def test_listener_rejects_loopback_url_from_different_address_family():
         )
 
 
+def test_specific_loopback_listener_requires_exact_address():
+    proc = _FakeProc(4242, port=50222, listener_ip="127.0.0.1")
+    fake = _FakePsutil([proc])
+    resolver = _fake_resolver({"other-loopback": ["127.0.0.2"]})
+
+    with pytest.raises(RuntimeError, match="does not own"):
+        discover_server(
+            requested_pid=4242,
+            requested_url="http://other-loopback:50222",
+            psutil_module=fake,
+            resolver=resolver,
+        )
+
+
 def test_ipv6_wildcard_listener_accepts_ipv6_loopback_url():
     proc = _FakeProc(4242, port=50222, listener_ip="::")
     fake = _FakePsutil([proc])

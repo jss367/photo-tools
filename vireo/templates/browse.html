@@ -10052,6 +10052,11 @@ document.addEventListener('click', function(e) {
 
 /* ---------- Keyboard Shortcuts ---------- */
 document.addEventListener('keydown', function(e) {
+  // The shared folder browser installs its Escape handler when it opens.
+  // Leave the underlying export modal alone so that handler can dismiss only
+  // the topmost picker and preserve the user's export settings.
+  if (document.querySelector('.folder-browser-overlay.open')) return;
+
   if (isBrowseCompareOpen()) {
     if (e.key === 'Escape') {
       e.preventDefault();

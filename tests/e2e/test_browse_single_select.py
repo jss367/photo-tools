@@ -161,7 +161,11 @@ def test_export_defaults_beside_original_and_offers_folder_browser(
     expect(page.locator("#folderBrowserTitle")).to_have_text(
         "Select Export Folder"
     )
-    page.locator("#folderBrowser .folder-browser-close").click()
+    page.keyboard.press("Escape")
+    expect(page.locator("#folderBrowser")).not_to_have_class(
+        "folder-browser-overlay open"
+    )
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
     page.locator("#exportSubfolder").check()
 
     page.evaluate(

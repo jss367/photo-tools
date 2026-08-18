@@ -1011,7 +1011,21 @@ function editorNativeDisplayDimensions() {
     // This avoids upscaling if a RAW fallback or the endpoint's safety cap
     // yields fewer pixels than the database dimensions advertise.
     if (loadedSize >= Math.min(16384, nativeLong)) {
-      return {width: img.naturalWidth, height: img.naturalHeight};
+      if (nativeLong <= 16384 ||
+          (editorState.zoomMode !== 'fit' && editorState.zoomPercent >= 100)) {
+        return {width: img.naturalWidth, height: img.naturalHeight};
+      }
+      if (editorState.zoomMode !== 'fit') {
+        // Below 100%, reaching the server's safety cap must not redefine the
+        // image's base size and then apply the percentage a second time. Use
+        // an equivalent base that keeps the capped render at its delivered
+        // display size as the slider approaches 100%.
+        var zoomScale = Math.max(0.001, editorState.zoomPercent / 100);
+        return {
+          width: img.naturalWidth / zoomScale,
+          height: img.naturalHeight / zoomScale
+        };
+      }
     }
     var longEdge = Math.max(width, height);
     var ratio = img.naturalWidth / img.naturalHeight;

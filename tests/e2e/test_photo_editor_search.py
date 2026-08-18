@@ -326,6 +326,53 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
     assert 0 < incremental_slider["delta"] < 0.05
     assert incremental_slider["calls"] == 2
 
+    capped_zoom = page.evaluate(
+        """() => {
+            const img = document.getElementById('editorImg');
+            const originalCurrentSrc = Object.getOwnPropertyDescriptor(img, 'currentSrc');
+            const originalNaturalWidth = Object.getOwnPropertyDescriptor(img, 'naturalWidth');
+            const originalNaturalHeight = Object.getOwnPropertyDescriptor(img, 'naturalHeight');
+            let loadedSize = 16128;
+            Object.defineProperty(img, 'currentSrc', {
+                configurable: true,
+                get: () => '/photos/' + editorState.photoId +
+                    '/edit-preview?size=' + loadedSize + '&recipe=' +
+                    encodeURIComponent(JSON.stringify(previewRecipeFor(editorState.recipe)))
+            });
+            Object.defineProperty(img, 'naturalWidth', {
+                configurable: true,
+                get: () => loadedSize
+            });
+            Object.defineProperty(img, 'naturalHeight', {
+                configurable: true,
+                get: () => loadedSize * 2 / 3
+            });
+            editorState.photo.width = 30000;
+            editorState.photo.height = 20000;
+            editorState.zoomMode = 'custom';
+            editorState.zoomPercent = 54;
+            const before = editorNativeDisplayDimensions().width * 0.54;
+            loadedSize = 16384;
+            editorState.zoomPercent = 55;
+            const after = editorNativeDisplayDimensions().width * 0.55;
+            for (const [name, descriptor] of [
+                ['currentSrc', originalCurrentSrc],
+                ['naturalWidth', originalNaturalWidth],
+                ['naturalHeight', originalNaturalHeight]
+            ]) {
+                if (descriptor) Object.defineProperty(img, name, descriptor);
+                else delete img[name];
+            }
+            editorState.photo.width = 4000;
+            editorState.photo.height = 3000;
+            editorState.zoomMode = 'fit';
+            applyEditorZoom();
+            updateEditorZoomControl();
+            return {before, after};
+        }"""
+    )
+    assert capped_zoom["after"] >= capped_zoom["before"]
+
     stale_ratio = page.evaluate(
         """() => {
             const originalRecipe = cloneRecipe(editorState.recipe);

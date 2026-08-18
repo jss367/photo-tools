@@ -1465,12 +1465,14 @@ function failActiveSourceScans() {
 // A validation failure can supersede and abort a real traversal before the
 // replacement run reaches discovery. Those old loading/queued states no
 // longer have a walker behind them, but they are not scan failures either.
-// Return them to the neutral pre-scan state until the options are valid.
+// Return every row to the neutral pre-scan state until the options are valid.
+// Completed/error rows describe the old filter just as much as active rows
+// do, so retaining them would show stale counts after validation aborts.
 function resetActiveSourceScans() {
   let changed = false;
   sources.forEach(path => {
     const state = sourceCounts[path];
-    if (state && (state.status === 'loading' || state.status === 'queued')) {
+    if (state) {
       delete sourceCounts[path];
       changed = true;
     }

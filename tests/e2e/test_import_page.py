@@ -345,6 +345,39 @@ def test_no_file_types_settles_rows_from_aborted_preview(live_server, page):
     assert page.evaluate("() => sourceCountTickTimer") is None
 
 
+def test_no_file_types_clears_completed_counts_from_old_filter(
+        live_server, page):
+    """A validation abort must not retain a count from the old file filter."""
+    page.goto(f"{live_server['url']}/import")
+    page.wait_for_load_state("networkidle")
+    _suppress_auto_preview(page)
+    page.evaluate(
+        """() => {
+          sources = ['/tmp/card-a'];
+          document.getElementById('modeCopy').checked = true;
+          sourceCounts['/tmp/card-a'] = {
+            status: 'loaded', count: 42, text: '42 photos',
+          };
+          renderSources();
+        }"""
+    )
+    meta = page.locator("#sourceList .source-meta")
+    expect(meta).to_have_text("42 photos")
+
+    page.evaluate(
+        """async () => {
+          document.getElementById('fileTypePreset').value = 'custom';
+          document.querySelectorAll('.file-ext').forEach(
+            (el) => { el.checked = false; });
+          await previewImport();
+        }"""
+    )
+
+    expect(meta).to_have_text("Waiting to scan")
+    expect(page.locator("#sourceCountProgress")).not_to_have_class(
+        re.compile(r"\bvisible\b"))
+
+
 def test_stalled_network_scan_shows_no_response_hint(live_server, page):
     """A quiet network walk surfaces a disconnected-storage hint."""
     url = live_server["url"]

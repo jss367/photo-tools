@@ -3506,6 +3506,9 @@ async function loadPhoto(photoId, opts) {
   if (!opts.skipUrl) {
     try { window.history.replaceState({photoId: photoId}, '', '/edit/' + photoId); } catch (_) {}
   }
+  if (typeof window.vireoRefreshNavigationHrefs === 'function') {
+    window.vireoRefreshNavigationHrefs();
+  }
   setStatus('Loading...');
   document.getElementById('editorFilename').textContent = 'Loading photo...';
   updateNavControls();

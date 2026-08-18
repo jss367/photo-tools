@@ -2120,7 +2120,9 @@ document.addEventListener('keydown', function(e) {
     if (idx < tabs.length) {
       e.preventDefault();
       const target = all.find(p => p.id === tabs[idx]);
-      if (target) window.location.href = target.href;
+      if (target) {
+        window.location.href = window.vireoResolveNavigationHref(target.href);
+      }
     }
   }
   // cmd+W → close current tab (pinned or ephemeral)
@@ -2652,6 +2654,16 @@ function sendReport() {
 
 <script>
 /* ---------- Unified tab strip + ephemeral slot + overflow ---------- */
+// Preserve the photo context when leaving the editor for Browse. Browse's
+// existing photo_id deep link owns the folder switch, bounded page load,
+// centering, and highlight; navigation surfaces only need to hand it the
+// editor photo currently shown in the URL.
+window.vireoResolveNavigationHref = function(path) {
+  if (path !== '/browse') return path;
+  var match = window.location.pathname.match(/^\/edit\/(\d+)\/?$/);
+  return match ? '/browse?photo_id=' + encodeURIComponent(match[1]) : path;
+};
+
 // Hardcoded fallbacks so the strip has something to render even when
 // /api/workspace/tabs fails (network error, 5xx, invalid JSON). Without
 // these, a transient fetch failure on first load leaves the navbar
@@ -2734,7 +2746,13 @@ window.NAV_ALL_PAGES = [
 
   function buildTabAnchor(page, opts) {
     const a = document.createElement('a');
-    a.href = page.href;
+    a.href = window.vireoResolveNavigationHref(page.href);
+    // The editor swaps photos with history.replaceState(), without rebuilding
+    // the tab strip. Resolve again at activation time so Prev/Next and search
+    // navigation cannot leave Browse pointing at the previous photo.
+    a.addEventListener('click', () => {
+      a.href = window.vireoResolveNavigationHref(page.href);
+    });
     a.draggable = false;
     a.className = 'nav-tab';
     if (opts && opts.ephemeral) a.classList.add('is-ephemeral');
@@ -2850,7 +2868,7 @@ window.NAV_ALL_PAGES = [
       item.dataset.navId = page.id;
       item.appendChild(document.createTextNode(page.label));
       item.addEventListener('click', () => {
-        window.location.href = page.href;
+        window.location.href = window.vireoResolveNavigationHref(page.href);
       });
       menu.appendChild(item);
     });
@@ -2896,7 +2914,9 @@ window.NAV_ALL_PAGES = [
     const nextId = isOnTab ? adjacentTabId(navId) : null;
     postJSON('/api/workspace/tabs/unpin', {nav_id: navId}).then(() => {
       if (isOnTab) {
-        window.location.href = nextId ? pageById[nextId].href : '/browse';
+        window.location.href = window.vireoResolveNavigationHref(
+          nextId ? pageById[nextId].href : '/browse'
+        );
       } else {
         return fetchAndRender();
       }
@@ -2923,7 +2943,9 @@ window.NAV_ALL_PAGES = [
     }
     if (!adjId && TABS.length) adjId = TABS[TABS.length - 1];
     const next = adjId ? pageById[adjId] : null;
-    window.location.href = next ? next.href : '/browse';
+    window.location.href = window.vireoResolveNavigationHref(
+      next ? next.href : '/browse'
+    );
   }
 
   window.pinTab = function(navId) {
@@ -2988,6 +3010,14 @@ window.NAV_ALL_PAGES = [
       return postJSON('/api/workspace/tabs/reorder', {tabs: newOrder})
         .then(() => fetchAndRender());
     },
+  };
+
+  window.vireoRefreshNavigationHrefs = function() {
+    const browse = pageById.browse;
+    if (!browse) return;
+    document.querySelectorAll('.nav-tab[data-nav-id="browse"]').forEach(a => {
+      a.href = window.vireoResolveNavigationHref(browse.href);
+    });
   };
 
   // The tab strip only needs the navbar DOM above, not the full page. Start it
@@ -3325,7 +3355,7 @@ window.NAV_ALL_PAGES = [
           }
           // Don't navigate if we're already on this page.
           if (window.location.pathname === route) return false;
-          window.location.href = route;
+          window.location.href = window.vireoResolveNavigationHref(route);
         }
       });
     });
@@ -10900,7 +10930,7 @@ function showRevealFeedback(data) {
 }
 
 function nativeMenuRoute(path) {
-  window.location.href = path;
+  window.location.href = window.vireoResolveNavigationHref(path);
 }
 
 function nativeMenuLightboxOpen() {
@@ -13972,7 +14002,7 @@ async function _deleteMissingPhotoIds(ids, deleteSidecars) {
 
   function navigateTo(page) {
     window.closeCommandPalette();
-    window.location.href = page.href;
+    window.location.href = window.vireoResolveNavigationHref(page.href);
   }
 
   // Wire input handlers

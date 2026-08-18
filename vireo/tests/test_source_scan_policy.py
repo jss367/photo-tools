@@ -69,12 +69,54 @@ def test_windows_distinguishes_fixed_remote_and_removable_drives():
     drive_types = {"C:\\": 3, "Z:\\": 4, "E:\\": 2}
     policies = source_scan_policy.classify_sources([
         "C:\\Photos\\A", "Z:\\Photos\\B", "E:\\DCIM",
-    ], platform="win32", get_drive_type=lambda root: drive_types[root])
+    ], platform="win32", get_drive_type=lambda root: drive_types[root],
+        get_remote_share=lambda _local: None)
 
     assert [policy["storage"] for policy in policies] == [
         "local", "network", "removable",
     ]
     assert [policy["max_parallel"] for policy in policies] == [2, 1, 1]
+
+
+def test_windows_groups_a_mapped_drive_with_its_unc_share():
+    """Z:\\ and \\\\nas\\share are one share: selecting both spellings must
+    share a lane, or the per-share serialization is defeated."""
+    drive_types = {"Z:\\": 4, "\\\\NAS\\Share\\": 4}
+    policies = source_scan_policy.classify_sources([
+        "Z:\\Photos\\2026",
+        "\\\\NAS\\Share\\Photos\\2027",
+    ], platform="win32",
+        get_drive_type=lambda root: drive_types[root],
+        get_remote_share=lambda local: (
+            "\\\\nas\\share" if local == "Z:" else None))
+
+    assert [policy["storage"] for policy in policies] == ["network", "network"]
+    assert policies[0]["volume_key"] == policies[1]["volume_key"]
+    assert policies[0]["volume_key"] == "windows:unc:nas/share"
+
+
+def test_windows_mapped_drive_keeps_its_own_lane_when_lookup_fails():
+    policies = source_scan_policy.classify_sources([
+        "Z:\\Photos",
+    ], platform="win32", get_drive_type=lambda _root: 4,
+        get_remote_share=lambda _local: None)
+
+    assert policies[0]["storage"] == "network"
+    assert policies[0]["volume_key"] == "windows:drive:z:"
+
+
+def test_windows_only_consults_the_mapping_table_for_remote_drives():
+    def refuse(_local):
+        raise AssertionError(
+            "local drives must not trigger a remote-share lookup")
+
+    policies = source_scan_policy.classify_sources([
+        "C:\\Photos\\A",
+    ], platform="win32", get_drive_type=lambda _root: 3,
+        get_remote_share=refuse)
+
+    assert policies[0]["storage"] == "local"
+    assert policies[0]["volume_key"] == "windows:drive:c:"
 
 
 def test_classify_sources_does_not_stat_the_selected_paths(monkeypatch):

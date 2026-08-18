@@ -363,6 +363,7 @@ class ProcessTreeSampler:
             try:
                 identity = (process.pid, process.create_time())
             except (OSError, self.psutil.Error):
+                enumeration_complete = False
                 continue
             # A descendant PID can be reused between polls. Reuse a cached
             # psutil object only when its creation time still identifies the

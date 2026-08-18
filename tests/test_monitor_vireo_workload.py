@@ -973,6 +973,7 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
             self.child_processes = []
             self.children_error = False
             self.cpu_error = False
+            self.create_time_error = False
 
         def exe(self):
             return "/tmp/vireo-server"
@@ -981,6 +982,8 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
             return ["vireo-server"]
 
         def create_time(self):
+            if self.create_time_error:
+                raise RuntimeError("transient identity read failure")
             return self.created_at
 
         def is_running(self):
@@ -1079,11 +1082,11 @@ def test_process_sampler_counts_cpu_for_newly_discovered_child():
     # first successful read establishes a baseline in the excluded recovery
     # interval instead of charging its lifetime CPU over one second.
     unreadable_child = _CpuProcess(102, 4.0, 0.3, 100)
-    unreadable_child.cpu_error = True
+    unreadable_child.create_time_error = True
     root.child_processes = [unreadable_child]
     clock.sleep(1.0)
     assert sampler.sample()["process_tree_complete"] is False
-    unreadable_child.cpu_error = False
+    unreadable_child.create_time_error = False
     clock.sleep(1.0)
     recovered_child = sampler.sample()
     assert recovered_child["cpu_percent"] == 0.0

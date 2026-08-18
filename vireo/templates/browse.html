@@ -11375,6 +11375,7 @@ async function _runPhotoDeepLink(photoId) {
 (async function() {
   var params = new URLSearchParams(window.location.search);
   var photoId = params.get('photo_id');
+  var deepLinkAction = params.get('action');
   if (!photoId) return;
   photoId = parseInt(photoId, 10);
   if (isNaN(photoId)) return;
@@ -11386,7 +11387,25 @@ async function _runPhotoDeepLink(photoId) {
   // VireoFilter uninitialized) (Codex review r3686778061).
   for (var attempt = 0; attempt < _DEEP_LINK_MAX_RETRIES; attempt++) {
     var wasSuperseded = await _runPhotoDeepLink(photoId);
-    if (!wasSuperseded) return;
+    if (!wasSuperseded) {
+      if (deepLinkAction === 'export') {
+        selectedPhotos.clear();
+        selectedPhotoId = photoId;
+        selectedIndex = photos.findIndex(function(photo) { return photo.id === photoId; });
+        refreshCardSelectionVisuals();
+        updateBatchBar();
+        openExportModal();
+
+        // Treat action=export as a one-shot handoff. Refreshing or returning
+        // to this history entry should show Browse without reopening a modal.
+        params.delete('action');
+        var query = params.toString();
+        try {
+          window.history.replaceState({}, '', window.location.pathname + (query ? '?' + query : ''));
+        } catch (_) {}
+      }
+      return;
+    }
     // Await the refresh that stole the load so the next attempt starts
     // from a settled state and its pre-await snapshot is guaranteed to
     // match the current generation (unless yet another refresh fires

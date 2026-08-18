@@ -3440,6 +3440,173 @@ function copyEditSettings() {
   else setStatus('Settings copied');
 }
 
+function revertUnsavedEdits() {
+  if (editorState.loading || !isEditorDirty()) return;
+  if (!window.confirm('Discard unsaved edits and return to the last saved version?')) return;
+  editorState.recipe = cloneRecipe(editorState.savedRecipe);
+  ensureCrop(editorState.recipe);
+  editorState.showBefore = false;
+  editorState.cropEditing = !recipeForSave(editorState.recipe).crop;
+  editorState.cropAspect = null;
+  editorState.zoomMode = 'fit';
+  updateAspectButtons();
+  syncControls();
+  updatePreview();
+  if (typeof showToast === 'function') showToast('Unsaved edits discarded', 'success');
+  else setStatus('Unsaved edits discarded');
+}
+
+function exportCurrentEditedPhoto() {
+  if (!editorState.photoId || editorState.loading || isEditorDirty()) return;
+  // Browse owns the full export dialog (format, resize, naming, metadata, and
+  // destination). Hand it the current photo explicitly, then have its
+  // deep-link loader select the photo and open that same dialog.
+  window.location.href = '/browse?photo_id=' + encodeURIComponent(editorState.photoId) +
+    '&action=export';
+}
+
+function sendCurrentEditedPhotoToInat() {
+  if (!editorState.photoId || editorState.loading || isEditorDirty()) return;
+  if (typeof window.submitToInat === 'function') {
+    window.submitToInat(editorState.photoId);
+  }
+}
+
+function buildPhotoEditorContextMenu() {
+  var unavailable = !editorState.photoId || editorState.loading;
+  var dirty = !unavailable && isEditorDirty();
+  var recipe = unavailable ? {} : recipeForSave(editorState.recipe);
+  var hasEdits = Object.keys(recipe || {}).length > 0;
+  var beforeLabel = editorState.showBefore ? 'Show Current Edits' : 'Show Saved Version';
+
+  return [
+    {
+      label: 'Save Changes',
+      disabled: !dirty,
+      disabledHint: unavailable ? 'No photo is ready to edit' : 'No unsaved changes',
+      onClick: function() { saveRecipe(); },
+    },
+    {
+      label: 'Revert to Saved',
+      disabled: !dirty,
+      disabledHint: unavailable ? 'No photo is ready to edit' : 'No unsaved changes',
+      onClick: revertUnsavedEdits,
+    },
+    { separator: true },
+    {
+      label: beforeLabel,
+      disabled: !dirty && !editorState.showBefore,
+      disabledHint: unavailable ? 'No photo is ready to edit' : 'Make an edit to compare it with the saved version',
+      onClick: toggleBeforePreview,
+    },
+    {
+      label: 'Fit to Window',
+      disabled: unavailable || editorState.zoomMode === 'fit',
+      disabledHint: unavailable ? 'No photo is ready to edit' : 'Already fit to the window',
+      onClick: setEditorZoomToFit,
+    },
+    {
+      label: 'View at 100%',
+      disabled: unavailable || editorIsActualZoom(),
+      disabledHint: unavailable ? 'No photo is ready to edit' : 'Already viewing at 100%',
+      onClick: setEditorZoomToActual,
+    },
+    { separator: true },
+    {
+      label: 'Auto Tone',
+      disabled: unavailable,
+      disabledHint: unavailable ? 'No photo is ready to edit' : undefined,
+      onClick: autoTone,
+    },
+    {
+      label: 'Edit Crop',
+      disabled: unavailable || editorState.cropEditing || editorState.showBefore,
+      disabledHint: unavailable
+        ? 'No photo is ready to edit'
+        : (editorState.showBefore ? 'Return to the current edit first' : 'Crop editing is already active'),
+      onClick: beginCropEdit,
+    },
+    {
+      label: 'Full Frame',
+      disabled: unavailable || !recipe.crop,
+      disabledHint: unavailable ? 'No photo is ready to edit' : 'The full frame is already selected',
+      onClick: resetCrop,
+    },
+    {
+      label: 'Rotate Left',
+      disabled: unavailable,
+      disabledHint: unavailable ? 'No photo is ready to edit' : undefined,
+      onClick: function() { rotateRecipe(-90); },
+    },
+    {
+      label: 'Rotate Right',
+      disabled: unavailable,
+      disabledHint: unavailable ? 'No photo is ready to edit' : undefined,
+      onClick: function() { rotateRecipe(90); },
+    },
+    {
+      label: 'Flip Horizontal',
+      disabled: unavailable,
+      disabledHint: unavailable ? 'No photo is ready to edit' : undefined,
+      onClick: function() { flipRecipe('horizontal'); },
+    },
+    {
+      label: 'Flip Vertical',
+      disabled: unavailable,
+      disabledHint: unavailable ? 'No photo is ready to edit' : undefined,
+      onClick: function() { flipRecipe('vertical'); },
+    },
+    { separator: true },
+    {
+      label: 'Copy Edit Settings',
+      disabled: unavailable || !hasEdits,
+      disabledHint: unavailable ? 'No photo is ready to edit' : 'There are no edit settings to copy',
+      onClick: copyEditSettings,
+    },
+    {
+      label: 'Reset All Edits',
+      disabled: unavailable || !hasEdits,
+      disabledHint: unavailable ? 'No photo is ready to edit' : 'There are no edits to reset',
+      onClick: resetAllEdits,
+    },
+    { separator: true },
+    {
+      label: 'Export\u2026',
+      disabled: unavailable || dirty,
+      disabledHint: unavailable
+        ? 'No photo is ready to export'
+        : (dirty ? 'Save changes before exporting' : undefined),
+      onClick: exportCurrentEditedPhoto,
+    },
+    {
+      label: 'Send to iNaturalist',
+      disabled: unavailable || dirty,
+      disabledHint: unavailable
+        ? 'No photo is ready to send'
+        : (dirty ? 'Save changes before sending to iNaturalist' : undefined),
+      onClick: sendCurrentEditedPhotoToInat,
+    },
+  ];
+}
+
+function initEditorContextMenu() {
+  var shell = document.querySelector('.editor-shell');
+  if (!shell || typeof window.openContextMenu !== 'function') return;
+  shell.addEventListener('contextmenu', function(e) {
+    // Keep the browser's native spelling/copy/paste menu anywhere text can be
+    // entered or selected. The Vireo menu owns the rest of the editor surface.
+    var target = e.target;
+    if (target && target.closest &&
+        target.closest('input, textarea, select, [contenteditable]')) return;
+    var selection = window.getSelection ? window.getSelection() : null;
+    if (selection && !selection.isCollapsed && String(selection).trim()) return;
+    if (target && target.closest && target.closest('.vireo-ctx-menu')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    openContextMenu(e, buildPhotoEditorContextMenu());
+  });
+}
+
 function editorEmptyState() {
   document.getElementById('editorFilename').textContent = 'No photo to edit';
   document.getElementById('editorSubhead').textContent = 'Open a photo from Browse, then choose Edit.';
@@ -3602,6 +3769,7 @@ function initEditorKeyboard() {
 async function initEditor() {
   initCropDrag();
   initEditorKeyboard();
+  initEditorContextMenu();
   initUnloadGuard();
   buildLocalControls();
   clearHistogramFeedback();

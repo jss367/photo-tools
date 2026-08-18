@@ -2326,6 +2326,14 @@ var collectionLoadGen = 0;
 var collectionLoadStates = {};
 var collectionRenderDecisionGen = 0;
 var browseFolderRows = [];
+// The workspace ID whose folder tree is currently reflected in the DOM.
+// Captured atomically with the tree from /api/browse/init and refreshed
+// from the same server snapshot on every /api/folders?with_workspace=1
+// response, so ``removeWorkspaceRootFromBrowse`` can bind its DELETE to
+// the workspace the user actually saw. Trusting ``/api/workspaces/active``
+// at click time would let a cross-tab workspace switch redirect the
+// destructive call to the wrong workspace (Codex review r3798912101).
+var browseWorkspaceId = null;
 var collectionsById = {};
 var browseCompareIds = [];
 var browseCompareOffset = 0;
@@ -3298,6 +3306,9 @@ async function bootstrapBrowse() {
       // The sidebar trees are scope-independent, so render them even if a
       // newer load owns the grid — otherwise a sort change during init would
       // leave Browse with no folder/keyword/collection lists at all.
+      if (data.active_workspace_id != null) {
+        browseWorkspaceId = Number(data.active_workspace_id);
+      }
       renderFolderTree(data.folders || []);
       renderKeywordTree(data.keywords || []);
       renderCollectionList(data.collections || []);
@@ -3575,7 +3586,13 @@ function reconcileFolderLoadRenders() {
     if (state.status === 'success') {
       var shouldRender = !state.shouldRender || state.shouldRender();
       folderRenderDecisionGen = gen;
-      if (shouldRender) renderFolderTree(state.data);
+      if (shouldRender) {
+        // Update browseWorkspaceId in lockstep with the rendered rows so
+        // the destructive Remove action always targets the workspace the
+        // user actually sees.
+        if (state.workspaceId != null) browseWorkspaceId = state.workspaceId;
+        renderFolderTree(state.data);
+      }
       Object.keys(folderLoadStates).forEach(function(key) {
         if (Number(key) <= folderLoadGen) delete folderLoadStates[key];
       });
@@ -3592,11 +3609,24 @@ async function loadFolders(opts) {
     shouldRender: opts && opts.shouldRender
   };
   try {
-    var data = await safeFetch('/api/folders', {}, { toast: false });
+    // One request returns both the tree and the workspace it was scoped
+    // to, so ``browseWorkspaceId`` moves in lockstep with
+    // ``browseFolderRows`` no matter what another tab does in between.
+    // A parallel ``/api/workspaces/active`` call would leave a window
+    // where /api/folders and /api/workspaces/active can disagree (Codex
+    // review r3799038685); it would also drag the expensive per-root
+    // workspace_photo_count query into every sidebar refresh (Codex
+    // review r3799038688).
+    var payload = await safeFetch(
+      '/api/folders?with_workspace=1', {}, { toast: false }
+    );
+    var data = (payload && payload.folders) || [];
     var state = folderLoadStates[myGen];
     if (!state) return data;
     state.status = 'success';
     state.data = data;
+    state.workspaceId = (payload && payload.active_workspace_id != null)
+      ? Number(payload.active_workspace_id) : null;
     reconcileFolderLoadRenders();
     return data;
   } catch(e) {
@@ -3663,7 +3693,7 @@ function renderFolderTree(folders) {
       var partialBadge = f.status === 'partial'
         ? '<span class="folder-status-partial" title="Scan did not complete — re-scan to finish">partial</span>'
         : '';
-      html += '<div class="tree-item' + activeClass + '" onclick="filterByFolder(' + f.id + ')" data-folder-id="' + f.id + '">' +
+      html += '<div class="tree-item' + activeClass + '" onclick="filterByFolder(' + f.id + ')" data-folder-id="' + f.id + '" data-workspace-root="' + (f.is_workspace_root ? '1' : '0') + '">' +
         indent + toggle +
         '<span class="folder-name">' + escapeHtml(f.name) + '</span>' +
         '<span class="folder-local-status-slot">' + folderLocalStatusMarkup(localStatuses[f.id]) + '</span>' +
@@ -10617,6 +10647,163 @@ async function rescanFolder(fid) {
   }
 }
 
+async function removeWorkspaceRootFromBrowse(fid) {
+  var folder = browseFolderRows.find(function(row) {
+    return Number(row.id) === Number(fid);
+  });
+  if (!folder || !folder.is_workspace_root) return;
+
+  // Bind the DELETE to the workspace this tree was rendered against, not
+  // whatever ``/api/workspaces/active`` returns at click time. Workspace
+  // activation is persisted globally, so another tab switching workspaces
+  // after render would otherwise redirect the destructive call at the
+  // wrong workspace (Codex review r3798912101).
+  var wsId = browseWorkspaceId;
+  if (wsId == null) {
+    showToast(
+      'Cannot remove the folder yet — the workspace context is still loading. Try again in a moment.',
+      'error'
+    );
+    return;
+  }
+
+  var path = folder.path || folder.name || 'this folder';
+  var msg = 'Remove "' + path + '" from this workspace?\n\n' +
+    'Photos in this folder and its subfolders will no longer appear in this workspace, ' +
+    'and predictions, collections, and pending changes referencing them will be hidden here too.\n\n' +
+    'Photos and folders are not deleted. You can re-add the folder later to restore visibility.';
+  if (!confirm(msg)) return;
+
+  // Snapshot every folder ID within the removed root's subtree BEFORE the
+  // DELETE mutates state. The URL cleanup below needs this so that a
+  // descendant scope (opened via ``?folder_id=<descendant>``) is stripped
+  // as well; without it, a subsequent reload restores the detached
+  // descendant and loads an empty Browse view because the refreshed tree
+  // no longer contains it (Codex review r3799361364).
+  var removedSubtreeIds = (function collectSubtreeIds() {
+    var childrenByParent = {};
+    browseFolderRows.forEach(function(row) {
+      var pid = row.parent_id;
+      if (pid == null) return;
+      var key = Number(pid);
+      if (!childrenByParent[key]) childrenByParent[key] = [];
+      childrenByParent[key].push(Number(row.id));
+    });
+    var ids = {};
+    ids[Number(fid)] = true;
+    var queue = [Number(fid)];
+    while (queue.length) {
+      var current = queue.shift();
+      (childrenByParent[current] || []).forEach(function(childId) {
+        if (!ids[childId]) {
+          ids[childId] = true;
+          queue.push(childId);
+        }
+      });
+    }
+    return ids;
+  })();
+
+  try {
+    // Verify the workspace the tree was rendered against is still the
+    // globally-active one. If another tab has switched workspaces since
+    // render, refuse the DELETE and reload — running it silently against
+    // the render-time workspace would then leave this tab holding a mixed
+    // view (deleted folder gone from workspace A but the rest of the page
+    // still showing A's data while the app is globally on B).
+    var active = await safeFetch(
+      '/api/workspaces/active', {}, { toast: false }
+    );
+    if (active && Number(active.id) !== Number(wsId)) {
+      showToast(
+        'The active workspace changed in another window. Reloading to sync.',
+        'info'
+      );
+      window.location.reload();
+      return;
+    }
+
+    await safeFetch('/api/workspaces/' + wsId + '/folders/' + fid, {
+      method: 'DELETE',
+    });
+
+    // The DELETE succeeded, so strip any ``?folder_id=<id>`` from the
+    // current URL when it points at a folder that will not survive the
+    // removal. That includes the removed root, its visible descendants,
+    // and any descendant already flagged ``missing`` before the DELETE —
+    // ``browseFolderRows`` excludes missing rows, so a health refresh
+    // that removed the descendant before the click would leave it out of
+    // ``removedSubtreeIds`` and the URL would still restore an empty
+    // scope on any subsequent reload (Codex reviews r3799300182,
+    // r3799361364, and r3799431533). Treating "not currently visible in
+    // ``browseFolderRows``" as also-strip covers the missing-descendant
+    // case without pulling in catalog ancestry.
+    try {
+      var urlParams = new URLSearchParams(window.location.search);
+      var urlFolderId = parseInt(urlParams.get('folder_id'), 10);
+      if (!isNaN(urlFolderId)) {
+        var stillVisible = !removedSubtreeIds[Number(urlFolderId)] &&
+          browseFolderRows.some(function(row) {
+            return Number(row.id) === Number(urlFolderId);
+          });
+        if (!stillVisible) {
+          urlParams.delete('folder_id');
+          var newSearch = urlParams.toString();
+          var newUrl = window.location.pathname +
+            (newSearch ? '?' + newSearch : '') +
+            window.location.hash;
+          window.history.replaceState({}, '', newUrl);
+        }
+      }
+    } catch (urlErr) {
+      console.warn('Could not strip folder_id from URL after removal', urlErr);
+    }
+
+    // Refresh the authoritative local-folder payload before rebuilding
+    // the tree. Without this, ``window.vireoLocalFolderData`` still
+    // carries the removed root when ``renderFolderTree`` runs, so
+    // ``folderLocalStatuses`` synthesizes a phantom top-level row for it
+    // and leaves the removed folder visible until the next blocker poll
+    // (Codex review r3798912105). ``load()`` swallows fetch failures and
+    // returns ``null``; rendering against the pre-DELETE
+    // ``window.vireoLocalFolderData`` in that case would resurrect the
+    // removed root as a phantom, so reload instead of rebuilding from
+    // stale local state (Codex review r3799142116).
+    if (window.vireoLocalFolders &&
+        typeof window.vireoLocalFolders.load === 'function') {
+      var localRefreshed = await window.vireoLocalFolders.load();
+      if (localRefreshed === null) {
+        window.location.reload();
+        return;
+      }
+    }
+
+    var loaded = await Promise.all([
+      loadFolders(),
+      loadKeywords(),
+      loadCollections(),
+    ]);
+    // A transient folder-list failure leaves the old tree in place. Reloading
+    // is safer than showing a removed root until the next health transition.
+    if (loaded[0] === null) {
+      window.location.reload();
+      return;
+    }
+    if (activeFolderId && !loaded[0].some(function(row) {
+      return Number(row.id) === Number(activeFolderId);
+    })) {
+      activeFolderId = null;
+    }
+    await resetAndLoad({ preserveCollection: !!activeCollectionId });
+    loadCollectionCounts();
+    loadSummary();
+    if (timelineMode) loadCalendarData();
+    showToast('Folder removed from this workspace.', 'success');
+  } catch (err) {
+    console.error('removeWorkspaceRootFromBrowse failed', err);
+  }
+}
+
 document.addEventListener('contextmenu', function(e) {
   var ti = e.target.closest('.tree-item[data-folder-id]');
   if (!ti) return;
@@ -10625,7 +10812,7 @@ document.addEventListener('contextmenu', function(e) {
   e.preventDefault();
   var fid = parseInt(ti.dataset.folderId, 10);
   if (isNaN(fid)) return;
-  openContextMenu(e, [
+  var items = [
     { label: 'Filter by this folder', onClick: function() { filterByFolder(fid); } },
     { separator: true },
     { label: window.VIREO_REVEAL_LABEL, onClick: function() { revealFolder(fid); } },
@@ -10635,7 +10822,15 @@ document.addEventListener('contextmenu', function(e) {
     { label: 'Work Locally\u2026', onClick: function() { workLocallyFolder(fid); } },
     { label: 'Move\u2026', onClick: function() { moveFolder(fid); } },
     { label: 'Rescan this Folder', onClick: function() { rescanFolder(fid); } },
-  ]);
+  ];
+  if (ti.dataset.workspaceRoot === '1') {
+    items.push({ separator: true });
+    items.push({
+      label: 'Remove from This Workspace\u2026',
+      onClick: function() { removeWorkspaceRootFromBrowse(fid); },
+    });
+  }
+  openContextMenu(e, items);
 });
 
 /* ---------- Collection sidebar context menu ---------- */
@@ -10873,6 +11068,11 @@ async function _runPhotoDeepLink(photoId) {
           initData.folder_health_version);
         if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
         if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
+      }
+      // Pin the workspace this tree came from so a later Remove action
+      // targets the same workspace even on the deep-link entry point.
+      if (initData.active_workspace_id != null) {
+        browseWorkspaceId = Number(initData.active_workspace_id);
       }
       renderFolderTree(initData.folders || []);
       renderKeywordTree(initData.keywords || []);

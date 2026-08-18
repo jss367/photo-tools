@@ -6211,6 +6211,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "folder_health_version": folder_health_version,
                 "focus_index": focus_index,
                 "focus_page": focus_page,
+                # The workspace this tree was scoped to. Browse pins it to
+                # the destructive folder-removal call so a cross-tab
+                # workspace switch between render and click cannot redirect
+                # the DELETE at another workspace.
+                "active_workspace_id": db._ws_id(),
             }
         )
         # End the read transaction after every value in the response has been
@@ -6618,6 +6623,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/folders")
     def api_folders():
         db = _get_db()
+        # Browse pins its destructive Remove action to the workspace the
+        # tree was rendered against. Fetching the tree and the active
+        # workspace ID in two independent requests would let a cross-tab
+        # workspace switch pair A's rows with B's id, so opt-in callers
+        # get both from a single read snapshot instead of following up
+        # with /api/workspaces/active (Codex review r3799038685). The
+        # legacy array response is preserved for every other caller.
+        include_workspace = request.args.get("with_workspace") in ("1", "true")
+        if include_workspace:
+            db.conn.execute("BEGIN")
+            try:
+                folders = [dict(f) for f in db.get_folder_tree()]
+                active_workspace_id = db._ws_id()
+            finally:
+                db.conn.rollback()
+            return jsonify(
+                {"folders": folders, "active_workspace_id": active_workspace_id}
+            )
         folders = db.get_folder_tree()
         return jsonify([dict(f) for f in folders])
 

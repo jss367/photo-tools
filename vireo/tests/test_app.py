@@ -202,6 +202,27 @@ def test_api_folders(app_and_db):
     assert '/photos/2024' in paths
 
 
+def test_api_folders_with_workspace_returns_paired_snapshot(app_and_db):
+    """GET /api/folders?with_workspace=1 returns the tree and the
+    workspace it was scoped to from a single read snapshot. Browse
+    binds the destructive Remove action to that id, so pairing the
+    two here — instead of following the tree fetch with a separate
+    /api/workspaces/active call — prevents a cross-tab workspace
+    switch from redirecting the DELETE at the wrong workspace and
+    keeps the expensive workspace-folder-roots query off every
+    sidebar refresh (Codex reviews r3799038685, r3799038688).
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    resp = client.get('/api/folders?with_workspace=1')
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload['active_workspace_id'] == db._active_workspace_id
+    assert isinstance(payload['folders'], list)
+    paths = {f['path'] for f in payload['folders']}
+    assert '/photos/2024' in paths
+
+
 def test_api_photos_extensions_returns_distinct_lowercased(app_and_db):
     """GET /api/photos/extensions returns sorted, lowercased, workspace-scoped extensions."""
     app, db = app_and_db
@@ -15468,6 +15489,22 @@ def test_browse_init_flags_degraded_without_counting(app_and_db, monkeypatch):
     # The broken one is still flagged so the sidebar renders it disabled
     # before loadCollectionCounts() has a chance to run.
     assert by_id[bad]["count_error"] is True
+
+
+def test_browse_init_returns_active_workspace_id(app_and_db):
+    """/api/browse/init must include the workspace this response was
+    scoped to. Browse pins the destructive workspace-folder removal to
+    this id so a cross-tab workspace switch between render and click
+    cannot redirect the DELETE at another workspace (Codex review
+    r3798912101).
+    """
+    app, db = app_and_db
+    client = app.test_client()
+
+    resp = client.get("/api/browse/init")
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["active_workspace_id"] == db._active_workspace_id
 
 
 def test_collections_list_surfaces_non_rule_failures(app_and_db, monkeypatch):

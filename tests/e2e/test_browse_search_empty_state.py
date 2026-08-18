@@ -1172,7 +1172,10 @@ def test_load_folders_generation_guard_prevents_stale_render(
         else:
             route.continue_()
 
-    page.route("**/api/folders", _hold_first_folders)
+    # ``loadFolders()`` now fires ``/api/folders?with_workspace=1`` so the
+    # tree and its workspace id come from one snapshot; a bare
+    # ``**/api/folders`` glob no longer matches (Codex review r3799207269).
+    page.route("**/api/folders?*", _hold_first_folders)
 
     # Kick off the older ("stale") call. Do NOT await the returned promise —
     # ``page.evaluate`` would otherwise block until the held response returns.
@@ -1243,7 +1246,7 @@ def test_load_folders_renders_older_success_after_newer_failure(
         else:
             route.continue_()
 
-    page.route("**/api/folders", _hold_success_then_fail)
+    page.route("**/api/folders?*", _hold_success_then_fail)
     page.evaluate(
         "() => { window._olderSuccessfulFolderLoad = "
         "loadFolders({ shouldRender: () => true }); }"
@@ -1571,7 +1574,7 @@ def test_health_refresh_uses_its_folder_response_when_render_is_superseded(
     def _hold_folder_loads(route):
         held.append(route)
 
-    page.route("**/api/folders", _hold_folder_loads)
+    page.route("**/api/folders?*", _hold_folder_loads)
     park.rmdir()
 
     with page.expect_response(
@@ -1719,7 +1722,7 @@ def test_health_refresh_skips_stale_reset_when_load_folders_fails(
         else:
             route.continue_()
 
-    page.route("**/api/folders", _fail_first_folders)
+    page.route("**/api/folders?*", _fail_first_folders)
 
     # Trigger the health refresh directly. Using the event bypasses the
     # navbar poll timing so the test is deterministic; the fix under test
@@ -1786,7 +1789,7 @@ def test_health_refresh_retry_preserves_unrelated_transition_ids(
         else:
             route.continue_()
 
-    page.route("**/api/folders", _fail_first_folders)
+    page.route("**/api/folders?*", _fail_first_folders)
     db.conn.execute(
         "UPDATE folders SET status = 'missing' WHERE id = ?",
         (folder_ids[1],),
@@ -1830,7 +1833,7 @@ def test_bounded_folder_retries_reconcile_on_next_normal_poll(live_server, page)
         else:
             route.continue_()
 
-    page.route("**/api/folders", _fail_folders)
+    page.route("**/api/folders?*", _fail_folders)
     page.evaluate(
         "document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {"
         "detail: {restored: [], wentMissing: [], source: 'test', "

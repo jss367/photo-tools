@@ -73,6 +73,11 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
     expect(page.locator("#saveBtn")).to_be_disabled()
     expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
     expect(page.locator("#exportPreview")).to_have_text("Preview: hawk1.jpg")
+    page.locator("#exportTemplate").fill("{species}")
+    expect(page.locator("#exportPreview")).to_have_text(
+        "Preview: Red-tailed Hawk.jpg"
+    )
+    page.locator("#exportTemplate").fill("{original}")
 
     page.get_by_role("button", name="Browse…", exact=True).click()
     expect(page.locator("#folderBrowser")).to_have_class(
@@ -97,6 +102,13 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
           };
         }"""
     )
+    page.locator("#exportResize").select_option("custom")
+    page.locator("#exportSubmitBtn").click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    assert page.evaluate("window.__editorExportRequest") is None
+    expect(page.locator("#exportResizeCustom")).to_be_focused()
+
+    page.locator("#exportResizeCustom").fill("1600")
     page.locator("#exportMetadataRating").check()
     page.locator("#exportSubmitBtn").click()
     page.wait_for_function("() => window.__editorExportRequest !== null")
@@ -104,6 +116,7 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
     assert request["photo_ids"] == [photo_id]
     assert request["destination"] == ""
     assert request["format"] == "jpg"
+    assert request["max_size"] == 1600
     assert request["metadata_fields"] == ["rating"]
     expect(page.locator("#exportOverlay")).not_to_have_class("modal-overlay open")
 

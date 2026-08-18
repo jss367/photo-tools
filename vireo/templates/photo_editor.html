@@ -3318,9 +3318,20 @@ async function startExport() {
   var exportPhotoId = editorState.photoId;
   var button = document.getElementById('exportSubmitBtn');
   var resizeValue = document.getElementById('exportResize').value;
-  var maxSize = resizeValue === 'custom'
-    ? (parseInt(document.getElementById('exportResizeCustom').value, 10) || null)
-    : (resizeValue ? parseInt(resizeValue, 10) : null);
+  var maxSize = resizeValue ? parseInt(resizeValue, 10) : null;
+  if (resizeValue === 'custom') {
+    var customResizeInput = document.getElementById('exportResizeCustom');
+    maxSize = Number(customResizeInput.value);
+    if (!Number.isInteger(maxSize) || maxSize < 100 || maxSize > 20000) {
+      if (typeof showToast === 'function') {
+        showToast('Enter a custom size from 100 to 20000 pixels.', 'error');
+      } else {
+        setStatus('Enter a custom size from 100 to 20000 pixels.', true);
+      }
+      customResizeInput.focus();
+      return;
+    }
+  }
   button.disabled = true;
   try {
     var data = await safeFetch('/api/jobs/export', {

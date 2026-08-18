@@ -1010,6 +1010,7 @@ def test_photo_detail_life_list_lists_eligible_species(app_and_db):
     db.tag_photo(pid, kid)
 
     data = client.get(f"/api/photos/{pid}").get_json()
+    assert data["species"] == ["American Robin"]
     assert data["life_list"] == [
         {
             "species": "American Robin",

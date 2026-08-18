@@ -1,5 +1,6 @@
 import re
 
+import pytest
 from playwright.sync_api import expect
 
 
@@ -318,6 +319,47 @@ def test_photo_editor_crop_lock_keeps_current_aspect(live_server, page):
 
     after = crop_aspect()
     assert abs(after - before) < 0.001
+
+
+def test_photo_editor_aspect_uses_current_crop(live_server, page):
+    """A ratio preset should refine the latest crop instead of resetting it."""
+    url = live_server["url"]
+    photo_id = live_server["data"]["photos"][0]
+    preview_svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' width='400' height='400'>"
+        "<rect width='400' height='400' fill='green'/>"
+        "</svg>"
+    )
+
+    page.route(
+        "**/photos/*/edit-preview**",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="image/svg+xml",
+            body=preview_svg,
+        ),
+    )
+    page.goto(f"{url}/edit/{photo_id}")
+    page.wait_for_function(
+        "() => document.getElementById('editorImg').naturalWidth > 0"
+    )
+
+    # Model the crop left by the user's most recent corner drag.
+    page.evaluate(
+        """() => {
+            editorState.recipe.crop = {x: 0.1, y: 0.2, w: 0.6, h: 0.5};
+            editorState.cropEditing = true;
+            renderCropBox();
+        }"""
+    )
+    page.locator("#aspect32Btn").click()
+
+    crop = page.evaluate("() => editorState.recipe.crop")
+    assert crop["x"] == pytest.approx(0.1)
+    assert crop["y"] == pytest.approx(0.25)
+    assert crop["w"] == pytest.approx(0.6)
+    assert crop["h"] == pytest.approx(0.4)
+    assert (crop["w"] / crop["h"]) == pytest.approx(1.5)
 
 
 def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page):

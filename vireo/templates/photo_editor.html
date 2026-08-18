@@ -1989,6 +1989,25 @@ function currentCropAspect() {
   return Number.isFinite(aspect) && aspect > 0 ? aspect : null;
 }
 
+function cropBoxForAspect(crop, normalizedRatio) {
+  var current = clampCrop(crop);
+  if (!Number.isFinite(normalizedRatio) || normalizedRatio <= 0) return current;
+  var centerX = current.x + current.w / 2;
+  var centerY = current.y + current.h / 2;
+  var w = current.w;
+  var h = current.h;
+  // Fit the requested ratio inside the crop the user most recently shaped.
+  // This keeps its center and never brings discarded pixels back into view.
+  if (w / h > normalizedRatio) w = h * normalizedRatio;
+  else h = w / normalizedRatio;
+  return clampCrop({
+    x: centerX - w / 2,
+    y: centerY - h / 2,
+    w: w,
+    h: h,
+  });
+}
+
 function markChanged(render) {
   if (editorState.loading) return;
   var wasShowingBefore = editorState.showBefore;
@@ -2080,13 +2099,9 @@ function setAspect(aspect) {
   updateAspectButtons();
   var imageAspect = imageWidth / imageHeight;
   var normalizedRatio = aspect / imageAspect;
-  var w = 0.9;
-  var h = w / normalizedRatio;
-  if (h > 0.9) {
-    h = 0.9;
-    w = h * normalizedRatio;
-  }
-  editorState.recipe.crop = { x: (1 - w) / 2, y: (1 - h) / 2, w: w, h: h };
+  editorState.recipe.crop = cropBoxForAspect(
+    ensureCrop(editorState.recipe), normalizedRatio
+  );
   markChanged(reopenedCrop);
 }
 

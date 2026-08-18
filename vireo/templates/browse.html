@@ -11352,7 +11352,7 @@ async function startExport() {
     });
     if (data.error) { alert('Export error: ' + data.error); btn.disabled = false; return; }
     closeExportModal();
-    showToast('Export started (' + count + ' photos)');
+    showToast('Export started (' + count + ' photos)', 'info');
   } catch(err) {
     alert('Export failed: ' + err.message);
     btn.disabled = false;

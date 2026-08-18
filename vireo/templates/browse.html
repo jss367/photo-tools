@@ -11542,6 +11542,10 @@ function updateExportPreview() {
   // Use first selected photo for preview
   var firstId = (_exportPhotoIds || getActiveSelection())[0];
   var photo = photos.find(function(p) { return p.id === firstId; });
+  // Find Similar and other shared-lightbox entry points can display photos
+  // outside Browse's currently loaded page. Their metadata remains available
+  // through the lightbox cache/list after the viewer closes for this modal.
+  if (!photo && typeof _lbPhotoData === 'function') photo = _lbPhotoData(firstId);
   if (!photo) { document.getElementById('exportPreview').textContent = ''; return; }
   var stem = photo.filename.replace(/\.[^.]+$/, '');
   var ts = photo.timestamp || '';

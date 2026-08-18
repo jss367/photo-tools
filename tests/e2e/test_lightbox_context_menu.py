@@ -103,12 +103,16 @@ def test_lightbox_export_resolves_photo_when_action_is_invoked(live_server, page
     )
 
     _fire_contextmenu_on_lightbox(page)
-    export_id = page.evaluate(
+    export_photo = page.evaluate(
         """() => {
             const next = photos.find(photo => photo.id !== _lightboxCurrentId);
             _lightboxCurrentId = next.id;
             _lightboxCommittedId = next.id;
-            return next.id;
+            // Simulate opening a Find Similar result that is not present in
+            // Browse's currently loaded page. The lightbox retains its own
+            // photo list for metadata-backed export previews.
+            photos = photos.filter(photo => photo.id !== next.id);
+            return {id: next.id, filename: next.filename};
         }"""
     )
     menu = page.locator(".vireo-ctx-menu")
@@ -118,12 +122,15 @@ def test_lightbox_export_resolves_photo_when_action_is_invoked(live_server, page
     expect(page.locator("#exportOverlay")).to_be_visible()
     expect(page.locator("#lightboxOverlay")).to_have_class("lightbox-overlay")
     expect(page.locator("#exportSubmitBtn")).to_have_text("Export 1 photo")
-    assert export_id != current_id
-    assert page.evaluate("_exportPhotoIds") == [export_id]
+    expect(page.locator("#exportPreview")).to_contain_text(
+        export_photo["filename"].rsplit(".", 1)[0]
+    )
+    assert export_photo["id"] != current_id
+    assert page.evaluate("_exportPhotoIds") == [export_photo["id"]]
 
     page.locator("#exportSubmitBtn").click()
     page.wait_for_function("window.__exportRequest !== null")
-    assert page.evaluate("window.__exportRequest.photo_ids") == [export_id]
+    assert page.evaluate("window.__exportRequest.photo_ids") == [export_photo["id"]]
 
 
 def test_lightbox_color_description_opens_editor(live_server, page):

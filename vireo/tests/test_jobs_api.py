@@ -1127,6 +1127,21 @@ def test_job_export_invalid_max_size(app_and_db, tmp_path):
     assert "max_size must be a positive integer" in resp.get_json()["error"]
 
 
+def test_job_export_rejects_unknown_metadata_field(app_and_db, tmp_path):
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()
+
+    resp = client.post("/api/jobs/export", json={
+        "photo_ids": [photo["id"]],
+        "destination": str(tmp_path / "out"),
+        "metadata_fields": ["private_notes"],
+    })
+
+    assert resp.status_code == 400
+    assert "metadata_fields entries must be one of" in resp.get_json()["error"]
+
+
 @pytest.mark.skip(reason="retired pipeline import/archive destination path")
 def test_pipeline_ingest_saves_recent_destination(app_and_db, tmp_path, monkeypatch):
     """Starting a pipeline with a destination saves it to recent_destinations in config."""

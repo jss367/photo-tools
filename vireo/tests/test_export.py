@@ -13,6 +13,7 @@ from db import Database
 from export import (
     developed_folder_key,
     export_photos,
+    normalize_metadata_fields,
     relocate_developed_dir,
     relocate_developed_file,
     resolve_template,
@@ -74,6 +75,18 @@ def test_sanitize_filename_special_chars():
     assert sanitize_filename('bird: "best"') == "bird_ _best_"
 
 
+def test_normalize_metadata_fields_validates_and_deduplicates():
+    assert normalize_metadata_fields(
+        ["species", "capture_date", "species", "location"]
+    ) == ["species", "capture_date", "location"]
+    assert normalize_metadata_fields(None) == []
+
+    with pytest.raises(ValueError, match="metadata_fields must be a list"):
+        normalize_metadata_fields("species")
+    with pytest.raises(ValueError, match="entries must be one of"):
+        normalize_metadata_fields(["copyright"])
+
+
 @pytest.fixture
 def export_env(tmp_path):
     """Set up a DB with photos and real image files for export testing."""
@@ -129,6 +142,87 @@ def test_export_photos_basic(export_env):
     assert result["errors"] == []
     assert os.path.isfile(os.path.join(env["dest"], "bird1.jpg"))
     assert os.path.isfile(os.path.join(env["dest"], "bird2.jpg"))
+
+
+def test_export_photos_embeds_only_selected_metadata(export_env):
+    """Checkbox selections become standard EXIF, IPTC, and XMP fields."""
+    from metadata import exiftool_available, extract_metadata
+
+    if not exiftool_available():
+        pytest.skip("ExifTool is not available")
+
+    env = export_env
+    env["db"].conn.execute(
+        """UPDATE photos
+           SET latitude=?, longitude=?, camera_make=?, camera_model=?, lens=?,
+               focal_length=?, aperture=?, shutter_speed=?, iso=?
+           WHERE id=?""",
+        (
+            32.88, -117.25, "Nikon", "Z 8", "NIKKOR Z 400mm f/4.5 VR S",
+            400.0, 5.6, 0.002, 800, env["p1"],
+        ),
+    )
+    second_species = env["db"].add_keyword("Northern Flicker", is_species=True)
+    env["db"].tag_photo(env["p1"], second_species)
+    env["db"].conn.commit()
+
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={
+            "metadata_fields": [
+                "species", "capture_date", "capture_time", "rating", "camera",
+            ],
+        },
+    )
+
+    assert result["exported"] == 1
+    assert result["errors"] == []
+    output = os.path.join(env["dest"], "bird1.jpg")
+    metadata = extract_metadata([output])[output]
+    assert metadata["XMP"]["Subject"] == [
+        "Northern Flicker", "Red-tailed Hawk",
+    ]
+    assert metadata["XMP"]["Rating"] == 5
+    assert metadata["EXIF"]["DateTimeOriginal"] == "2024:06:15 14:30:22"
+    assert metadata["IPTC"]["DateCreated"] == "2024:06:15"
+    assert metadata["IPTC"]["TimeCreated"].startswith("14:30:22")
+    assert metadata["EXIF"]["Make"] == "Nikon"
+    assert metadata["EXIF"]["Model"] == "Z 8"
+    assert metadata["EXIF"]["FocalLength"] == 400
+    assert metadata["EXIF"]["ISO"] == 800
+    assert "GPSLatitude" not in metadata["EXIF"]
+
+
+def test_export_photos_location_metadata_is_opt_in(export_env):
+    from metadata import exiftool_available, extract_metadata
+
+    if not exiftool_available():
+        pytest.skip("ExifTool is not available")
+
+    env = export_env
+    env["db"].conn.execute(
+        "UPDATE photos SET latitude=?, longitude=? WHERE id=?",
+        (-33.86, -117.25, env["p1"]),
+    )
+    env["db"].conn.commit()
+
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={"metadata_fields": ["location"]},
+    )
+
+    assert result["exported"] == 1
+    output = os.path.join(env["dest"], "bird1.jpg")
+    metadata = extract_metadata([output])[output]
+    assert metadata["EXIF"]["GPSLatitude"] == pytest.approx(33.86)
+    assert metadata["EXIF"]["GPSLongitude"] == pytest.approx(117.25)
+    assert metadata["Composite"]["GPSPosition"] == "-33.86 -117.25"
 
 
 def test_export_photos_resize(export_env):

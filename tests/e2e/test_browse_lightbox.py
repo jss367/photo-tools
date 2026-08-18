@@ -1257,6 +1257,35 @@ def test_browse_photo_id_deep_link_loads_target_after_first_folder_page(live_ser
         0, page.evaluate("totalPhotos") - offset - len(initial_ids)
     )
 
+    # Reaching the upper boundary extends the focused window backward without
+    # moving the cards the user was looking at. A wheel-up event matters here:
+    # at scrollTop=0 there is no lower scrollTop to produce a scroll event.
+    page.evaluate(
+        """() => new Promise(resolve => {
+          const container = document.getElementById('gridContainer');
+          container.scrollTo({top: 0, behavior: 'instant'});
+          requestAnimationFrame(() => requestAnimationFrame(resolve));
+        })"""
+    )
+    old_first_id = initial_ids[0]
+    old_first_top = page.locator(f'.grid-card[data-id="{old_first_id}"]').evaluate(
+        "el => el.getBoundingClientRect().top"
+    )
+    page.locator("#gridContainer").dispatch_event("wheel", {"deltaY": -100})
+    page.wait_for_function(
+        "expected => earliestPage === expected && loading === false",
+        arg=initial_page - 1,
+        timeout=5000,
+    )
+    prepended_ids = page.evaluate("photos.map(function(p) { return p.id; })")
+    assert prepended_ids[-len(initial_ids) :] == initial_ids
+    assert len(prepended_ids) == len(set(prepended_ids))
+    assert target_queries[-1]["page"] == initial_page - 1
+    new_first_top = page.locator(f'.grid-card[data-id="{old_first_id}"]').evaluate(
+        "el => el.getBoundingClientRect().top"
+    )
+    assert abs(new_first_top - old_first_top) < 2
+
     page.locator("#loadPreviousPhotosButton").click()
     page.wait_for_function("earliestPage === 1 && browseDatasetReady", timeout=5000)
     restarted_ids = page.evaluate("photos.map(function(p) { return p.id; })")

@@ -3018,6 +3018,29 @@ function appendGridPhotos(newPhotos, startIdx) {
   refreshColorLabelControlsIn(grid);
 }
 
+function prependGridPhotos(newPhotos) {
+  if (!newPhotos.length) return;
+  var grid = document.getElementById('grid');
+  var html = '';
+  newPhotos.forEach(function(p, idx) {
+    html += renderPhotoCard(p, idx);
+  });
+
+  // Existing cards keep their DOM nodes (and therefore their already-decoded
+  // thumbnails), but their array indices move when a preceding page arrives.
+  // Keep the inline selection handlers in lockstep with the new indices.
+  Array.from(grid.getElementsByClassName('grid-card')).forEach(function(card) {
+    var idx = parseInt(card.dataset.idx, 10) + newPhotos.length;
+    var id = parseInt(card.dataset.id, 10);
+    card.dataset.idx = idx;
+    card.setAttribute('onclick', 'selectPhoto(event,' + id + ',' + idx + ')');
+  });
+  grid.insertAdjacentHTML('afterbegin', html);
+  if (selectedIndex >= 0) selectedIndex += newPhotos.length;
+  updateGridTail();
+  refreshColorLabelControlsIn(grid);
+}
+
 /* The grid tail reserves a bounded amount of scroll space for the next photos
    that haven't loaded yet. It must not reserve the entire dataset: Browse
    loads a contiguous prefix, so an absolute-bottom jump in a large library
@@ -5381,6 +5404,121 @@ async function loadPreviousPhotos() {
   return resetAndLoad();
 }
 
+function buildBrowsePageRequest(page, requestPerPage) {
+  if (activeCollectionId && !dashboardCollectionScope) {
+    var cparams = new URLSearchParams();
+    cparams.set('page', page);
+    cparams.set('per_page', requestPerPage);
+    return {
+      url: '/api/collections/' + activeCollectionId + '/photos?' + cparams.toString(),
+      options: {},
+    };
+  }
+
+  var body = {
+    rules: getBrowseRules() || [],
+    sort: document.getElementById('sortSelect').value,
+    page: page,
+    per_page: requestPerPage,
+  };
+  var visual = window.VireoFilter && VireoFilter.getVisual ? VireoFilter.getVisual() : null;
+  if (visual) body.visual = visual;
+  if (activeFolderId) body.folder_id = activeFolderId;
+  if (activeCollectionId && dashboardCollectionScope) body.collection_id = activeCollectionId;
+  return {
+    url: '/api/photos/query',
+    options: {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
+/* Extend a focused deep-link window upward by one page. Unlike the explicit
+   "Browse from beginning" action, this preserves the user's viewport: the
+   first previously-loaded card remains at the same screen position while the
+   new cards are inserted above it. */
+async function prependPreviousPhotos(options) {
+  if (loading || earliestPage <= 1) return false;
+  loading = true;
+  var windowIsCurrent = observeBrowseWindow();
+  var loadSucceeded = false;
+  var requestedPage = earliestPage - 1;
+  var request = buildBrowsePageRequest(requestedPage, perPage);
+  var oldFirstPhoto = photos.length ? photos[0] : null;
+  var oldFirstCard = oldFirstPhoto ? getGridCard(oldFirstPhoto.id) : null;
+  var oldFirstTop = oldFirstCard ? oldFirstCard.getBoundingClientRect().top : null;
+
+  try {
+    var data = await safeFetch(request.url, request.options, {
+      toast: !(options && options.silent),
+    });
+    if (!windowIsCurrent()) return null;
+
+    totalPhotos = data.total;
+    if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalPhotos);
+    if (window.VireoFilter && VireoFilter.setVisualInfo) {
+      VireoFilter.setVisualInfo(data.visual || null);
+    }
+    (data.photos || []).forEach(function(p) {
+      if (p.similarity != null) p._similarity = p.similarity;
+    });
+
+    // Offset paging can overlap by a row if an ingestion/deletion lands
+    // between the focused init snapshot and this request. Never duplicate a
+    // card in the live window; the next dataset reset will reconcile ordering.
+    var loadedIds = new Set(photos.map(function(p) { return String(p.id); }));
+    var preceding = (data.photos || []).filter(function(p) {
+      var key = String(p.id);
+      if (loadedIds.has(key)) return false;
+      loadedIds.add(key);
+      return true;
+    });
+
+    photos = preceding.concat(photos);
+    earliestPage = requestedPage;
+    prependGridPhotos(preceding);
+    updatePreviousPhotosButton();
+    allLoaded = loadedWindowOffset() + photos.length >= totalPhotos;
+    updateGridTail();
+    updateFilterSummary();
+
+    // Adding rows changes scrollHeight. Compensate by the anchor's exact
+    // layout delta so there is no visual jump, even with a responsive number
+    // of grid columns.
+    if (oldFirstPhoto && oldFirstTop != null) {
+      var movedFirstCard = getGridCard(oldFirstPhoto.id);
+      if (movedFirstCard) {
+        document.getElementById('gridContainer').scrollTop +=
+          movedFirstCard.getBoundingClientRect().top - oldFirstTop;
+      }
+    }
+
+    if (preceding.length > 0) {
+      var refreshIds = preceding.map(function(p) { return p.id; });
+      loadInatStatus(refreshIds).then(function() {
+        if (windowIsCurrent()) refreshGridCards(refreshIds);
+      });
+      fetchColorLabels(refreshIds).then(function() {
+        if (windowIsCurrent()) refreshGridCards(refreshIds);
+      });
+    }
+    loadSucceeded = true;
+  } catch(e) {
+    if (!windowIsCurrent()) return null;
+  } finally {
+    if (windowIsCurrent()) {
+      loading = false;
+      if (loadSucceeded && anchorScanDepth === 0) {
+        rearmInfiniteScrollObserver();
+        requestAnimationFrame(ensureViewportHydrated);
+      }
+    }
+  }
+  return loadSucceeded;
+}
+
 async function loadPhotos(options) {
   if (loading) return null;
   if (allLoaded) return true;
@@ -5413,34 +5551,10 @@ async function loadPhotos(options) {
   var reqPage = (currentPage - 1) / chunk + 1;
   var reqPerPage = perPage * chunk;
 
-  var url;
-  var fetchOptions = {};
-  if (activeCollectionId && !dashboardCollectionScope) {
-    var cparams = new URLSearchParams();
-    cparams.set('page', reqPage);
-    cparams.set('per_page', reqPerPage);
-    url = '/api/collections/' + activeCollectionId + '/photos?' + cparams.toString();
-  } else {
-    url = '/api/photos/query';
-    var body = {
-      rules: getBrowseRules() || [],
-      sort: document.getElementById('sortSelect').value,
-      page: reqPage,
-      per_page: reqPerPage,
-    };
-    var loadVisual = window.VireoFilter && VireoFilter.getVisual ? VireoFilter.getVisual() : null;
-    if (loadVisual) body.visual = loadVisual;
-    if (activeFolderId) body.folder_id = activeFolderId;
-    if (activeCollectionId && dashboardCollectionScope) body.collection_id = activeCollectionId;
-    fetchOptions = {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    };
-  }
+  var request = buildBrowsePageRequest(reqPage, reqPerPage);
 
   try {
-    var data = await safeFetch(url, fetchOptions);
+    var data = await safeFetch(request.url, request.options);
     if (!windowIsCurrent()) return null;  // grid was reset mid-flight; drop stale response
     totalPhotos = data.total;
     if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalPhotos);
@@ -6006,6 +6120,22 @@ function ensureViewportHydrated() {
   if (skelRect.top - contRect.bottom <= 3200) loadPhotos({ silent: true });
 }
 
+/* A photo deep link begins with the page containing the target. When the user
+   travels back toward the top edge of that window, fetch its preceding page
+   just as the lower edge fetches the following page. The grid's top is used
+   instead of the sticky explanation banner, whose sticky geometry remains in
+   the viewport even when the actual loading boundary is far above it. */
+function ensurePreviousViewportHydrated() {
+  if (loading || earliestPage <= 1 || anchorScanDepth > 0) return;
+  if (photos.length === 0) return;
+  var grid = document.getElementById('grid');
+  var contRect = gridContainer.getBoundingClientRect();
+  var gridRect = grid.getBoundingClientRect();
+  if (gridRect.top >= contRect.top - 800) {
+    prependPreviousPhotos({ silent: true });
+  }
+}
+
 window.addEventListener('resize', function() {
   var sidebar = document.getElementById('browseSidebar');
   if (sidebar) setBrowseSidebarWidth(sidebar.getBoundingClientRect().width, false);
@@ -6017,11 +6147,21 @@ window.addEventListener('resize', function() {
 
 /* ---------- Scroll Position Tracking ---------- */
 var scrollTimer = null;
+var lastGridScrollTop = gridContainer.scrollTop;
 gridContainer.addEventListener('scroll', function() {
+  var nextScrollTop = gridContainer.scrollTop;
+  if (nextScrollTop < lastGridScrollTop) ensurePreviousViewportHydrated();
+  lastGridScrollTop = nextScrollTop;
   ensureViewportHydrated();
   if (scrollTimer) clearTimeout(scrollTimer);
   scrollTimer = setTimeout(updateScrollPosition, 50);
 });
+
+// At scrollTop=0 an upward wheel gesture cannot produce a scroll event. It is
+// still an unambiguous request to continue into the earlier photos.
+gridContainer.addEventListener('wheel', function(e) {
+  if (e.deltaY < 0) requestAnimationFrame(ensurePreviousViewportHydrated);
+}, { passive: true });
 
 /* ---------- Photo Selection & Detail ---------- */
 function selectPhoto(e, id, idx) {

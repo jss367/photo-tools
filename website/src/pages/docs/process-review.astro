@@ -1,0 +1,925 @@
+---
+import Base from '../../layouts/Base.astro';
+
+const base = import.meta.env.BASE_URL;
+
+const sections = [
+  ['overview', 'What Process Review does'],
+  ['mental-model', 'Photos, bursts, and encounters'],
+  ['page-map', 'Page map'],
+  ['narrow-review', 'Narrow a large review'],
+  ['triage', 'Keep, review, and reject'],
+  ['species', 'Species evidence'],
+  ['disagreements', 'Resolve disagreements'],
+  ['multiple-species', 'Multiple species in one photo'],
+  ['multiple-models', 'Multiple models and label lists'],
+  ['group-review', 'Group Review'],
+  ['structure', 'Correct grouping'],
+  ['saving', 'Saving, syncing, and undo'],
+  ['workflows', 'Common workflows'],
+  ['troubleshooting', 'Troubleshooting'],
+  ['glossary', 'Glossary'],
+];
+---
+
+<Base title="Process Review guide — Vireo" description="A detailed visual guide to reviewing encounters, species predictions, and photo grouping in Vireo.">
+  <header class="guide-hero">
+    <div class="guide-shell guide-hero__inner">
+      <nav class="breadcrumbs" aria-label="Breadcrumb">
+        <a href={`${base}docs/`}>Documentation</a>
+        <span aria-hidden="true">/</span>
+        <span>Process Review</span>
+      </nav>
+      <div class="guide-hero__grid">
+        <div>
+          <div class="guide-status"><span></span> Design preview</div>
+          <h1>Process Review</h1>
+          <p class="guide-hero__lede">Review a complete photographic encounter at a time, understand how species suggestions were produced, and correct decisions without losing the surrounding context.</p>
+          <div class="hero-actions">
+            <a href="#overview" class="btn btn--primary">Start the guide</a>
+            <a href="#page-map" class="hero-link">See the page map <span aria-hidden="true">&darr;</span></a>
+          </div>
+        </div>
+        <div class="hero-illustration" aria-label="An encounter containing two bursts and five photographs">
+          <div class="hero-window">
+            <div class="hero-window__bar"><i></i><i></i><i></i><span>Encounter 18</span></div>
+            <div class="hero-window__summary">
+              <span class="bird-dot"></span>
+              <strong>Varied Thrush</strong>
+              <small>2 bursts · 5 photos</small>
+            </div>
+            <div class="hero-burst">
+              <span class="hero-burst__label">Burst 1</span>
+              <div class="hero-photo keep"></div>
+              <div class="hero-photo review"></div>
+              <div class="hero-photo"></div>
+            </div>
+            <div class="hero-burst">
+              <span class="hero-burst__label">Burst 2</span>
+              <div class="hero-photo"></div>
+              <div class="hero-photo keep"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="preview-note">
+        <strong>About this guide</strong>
+        <p>This is a preview of the planned encounter-preserving Process Review redesign. It deliberately documents the intended experience, including editable scopes and expanded species evidence. Current Vireo releases may not have every control shown here; this status will be updated as the redesign becomes available.</p>
+      </div>
+    </div>
+  </header>
+
+  <div class="guide-shell guide-layout">
+    <aside class="guide-nav" aria-label="On this page">
+      <div class="guide-nav__inner">
+        <strong>On this page</strong>
+        <ol>
+          {sections.map(([id, label]) => <li><a href={`#${id}`}>{label}</a></li>)}
+        </ol>
+      </div>
+    </aside>
+
+    <div class="guide-content" id="start">
+      <section id="overview" class="guide-section intro-section">
+        <p class="section-label">Overview</p>
+        <h2>One place to make the final review decisions</h2>
+        <p>Process Review turns the output of a completed Process run into an editable review workspace. It keeps related photos together so that you can compare poses, verify species, correct grouping, and choose what to keep with the evidence still visible.</p>
+
+        <div class="outcome-grid">
+          <article>
+            <span class="outcome-icon outcome-icon--green" aria-hidden="true">✓</span>
+            <h3>Decide</h3>
+            <p>Accept or change automated keep, review, and reject recommendations.</p>
+          </article>
+          <article>
+            <span class="outcome-icon outcome-icon--blue" aria-hidden="true">◎</span>
+            <h3>Identify</h3>
+            <p>Confirm one or more species while preserving the predictions that informed you.</p>
+          </article>
+          <article>
+            <span class="outcome-icon outcome-icon--violet" aria-hidden="true">↔</span>
+            <h3>Organize</h3>
+            <p>Fix burst and encounter boundaries when the automatic grouping is not right.</p>
+          </article>
+        </div>
+
+        <div class="principle-card">
+          <div class="principle-card__mark" aria-hidden="true">Context</div>
+          <div>
+            <h3>The central rule: filters choose encounters, not loose photos</h3>
+            <p>When one photo matches a filter, Vireo can show its complete encounter. This protects the sequence you need for comparison and prevents a narrower view from silently changing the grouping.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="mental-model" class="guide-section">
+        <p class="section-label">The mental model</p>
+        <h2>Photos live inside bursts, and bursts live inside encounters</h2>
+        <p>Understanding these three levels makes every Process Review action predictable.</p>
+
+        <figure class="concept-diagram" aria-labelledby="hierarchy-caption">
+          <div class="hierarchy-row">
+            <div class="hierarchy-node hierarchy-node--encounter">
+              <span class="node-number">1</span>
+              <div><strong>Encounter</strong><small>A continuous sighting or photographic situation</small></div>
+            </div>
+            <span class="hierarchy-arrow" aria-hidden="true">contains</span>
+            <div class="hierarchy-node hierarchy-node--burst">
+              <span class="node-number">2</span>
+              <div><strong>Bursts</strong><small>Short, rapid sequences inside the encounter</small></div>
+            </div>
+            <span class="hierarchy-arrow" aria-hidden="true">contain</span>
+            <div class="hierarchy-node hierarchy-node--photo">
+              <span class="node-number">3</span>
+              <div><strong>Photos</strong><small>The individual files you inspect and triage</small></div>
+            </div>
+          </div>
+          <figcaption id="hierarchy-caption">Vireo preserves this hierarchy while you filter and edit.</figcaption>
+        </figure>
+
+        <div class="definition-grid">
+          <article><h3>Photo</h3><p>One image file. A photo can contain several visible subjects and therefore several species observations.</p></article>
+          <article><h3>Burst</h3><p>Photos taken close together, usually with little change in subject or composition. Burst-level review is useful for choosing the strongest frames.</p></article>
+          <article><h3>Encounter</h3><p>One or more related bursts that belong to the same sighting. It is the primary unit shown, filtered, paged, and counted.</p></article>
+          <article><h3>Subject</h3><p>A distinct detected animal or region in a photo. Species evidence belongs to a subject before it is summarized for the photo, burst, or encounter.</p></article>
+        </div>
+      </section>
+
+      <section id="page-map" class="guide-section">
+        <p class="section-label">Orientation</p>
+        <h2>Page map</h2>
+        <p>The page keeps high-frequency review tools close to the photographs and moves detailed evidence or tuning into panels that can be opened when needed.</p>
+
+        <figure class="page-map" aria-labelledby="page-map-caption">
+          <div class="page-map__header"><span>Process Review</span><small>Coverage · progress · destinations</small></div>
+          <div class="page-map__toolbar"><strong>Review toolbar</strong><span>Search</span><span>Status</span><span>Scope</span><span>Match rule</span><span>Sort</span></div>
+          <div class="page-map__body">
+            <div class="page-map__sidebar"><strong>Controls</strong><span>Grouping</span><span>Scoring</span><span>Display</span><span>Trace</span></div>
+            <div class="page-map__list">
+              <div class="map-encounter"><strong>Encounter card</strong><span>species · progress · summary</span><i></i><i></i><i></i><i></i></div>
+              <div class="map-encounter map-encounter--faded"><strong>Next encounter</strong><i></i><i></i><i></i></div>
+              <div class="map-pagination"><span>34 encounters loaded</span><strong>Loading more as you scroll…</strong></div>
+            </div>
+            <div class="page-map__panel"><strong>Evidence</strong><span>Subjects</span><span>Models</span><span>Alternatives</span><span>History</span></div>
+          </div>
+          <figcaption id="page-map-caption">
+            <span><b>A</b> Coverage and summary</span>
+            <span><b>B</b> Filters and view controls</span>
+            <span><b>C</b> Encounter list</span>
+            <span><b>D</b> Optional evidence panel</span>
+          </figcaption>
+        </figure>
+
+        <div class="feature-list">
+          <div><strong>Page header</strong><p>States which Process result is being reviewed, how much of the workspace it covers, and whether changes still need sidecar synchronization.</p></div>
+          <div><strong>Summary strip</strong><p>Keeps Process-result inventory, triage, and species-review totals canonical while showing matching photos, complete encounters, and context photos separately for the current view.</p></div>
+          <div><strong>Review toolbar</strong><p>Searches and narrows the encounter list without modifying the saved Process result.</p></div>
+          <div><strong>Encounter list</strong><p>Loads complete encounters progressively in bounded pages as you approach the end of the list. Loading more never changes grouping.</p></div>
+          <div><strong>Advanced controls</strong><p>Adjust grouping and scoring, inspect why an encounter was formed, and control optional overlays.</p></div>
+          <div><strong>Evidence panel</strong><p>Explains species suggestions by subject, model, and label list while leaving the encounter visible.</p></div>
+        </div>
+      </section>
+
+      <section id="narrow-review" class="guide-section">
+        <p class="section-label">Working with large reviews</p>
+        <h2>Narrow the list without breaking encounters apart</h2>
+        <p>A review view is a lens over one saved Process result. Changing the view decides which complete encounters appear; it does not rerun grouping and does not create a second, read-only result.</p>
+
+        <div class="steps">
+          <article><span>1</span><div><h3>Start from the latest Process result</h3><p>Every view is a lens over the same canonical result. Begin with <strong>All processed photos</strong>, and optionally narrow to one collection.</p></div></article>
+          <article><span>2</span><div><h3>Add conditions</h3><p>Narrow by triage, species-review state, encounter match rule, or a search across species, scientific name, filename, model name, label-list name, or photo ID.</p></div></article>
+          <article><span>3</span><div><h3>Choose how encounters qualify</h3><p>Use <strong>Any photo</strong> for inclusive discovery or <strong>Every photo</strong> for strict containment.</p></div></article>
+          <article><span>4</span><div><h3>Review complete encounters</h3><p>Once an encounter qualifies, all of its photos remain together and every edit uses the same stable identities.</p></div></article>
+        </div>
+
+        <figure class="matching-diagram" aria-labelledby="matching-caption">
+          <div class="match-example">
+            <div class="match-example__heading"><strong>Encounter A</strong><span>3 of 4 photos match</span></div>
+            <div class="photo-row">
+              <span class="mini-photo match">✓</span><span class="mini-photo match">✓</span><span class="mini-photo miss">—</span><span class="mini-photo match">✓</span>
+            </div>
+          </div>
+          <div class="match-branches">
+            <div class="match-result match-result--yes"><strong>Any photo</strong><span>Show the complete encounter</span><small>At least one photo matches</small></div>
+            <div class="match-result match-result--no"><strong>Every photo</strong><span>Do not show the encounter</span><small>One photo does not match</small></div>
+          </div>
+          <figcaption id="matching-caption">The matching rule changes which encounters qualify, never which photos are removed from a qualifying encounter.</figcaption>
+        </figure>
+
+        <div class="comparison-table-wrap">
+          <table class="comparison-table">
+            <thead><tr><th>Setting</th><th>Use it when</th><th>An encounter appears when</th><th>What is displayed</th></tr></thead>
+            <tbody>
+              <tr><th>Any photo</th><td>You want to find every encounter touched by a condition.</td><td>One or more photos match.</td><td>The complete encounter, including nonmatching photos.</td></tr>
+              <tr><th>Every photo</th><td>You want encounters wholly contained in a condition.</td><td>Every photo matches.</td><td>The complete encounter.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <aside class="callout callout--info">
+          <strong>Why there is no “matching photos only” option</strong>
+          <p>Removing individual nonmatching photos would make a burst look incomplete, hide comparison frames, and make structural edits ambiguous. For photo-only browsing, use Browse; Process Review is intentionally encounter-centered.</p>
+        </aside>
+      </section>
+
+      <section id="triage" class="guide-section">
+        <p class="section-label">Photo decisions</p>
+        <h2>Keep, review, and reject are recommendations you control</h2>
+        <p>Automated triage gives each photo a starting state. Your manual decision always takes precedence and remains distinct from the automated recommendation.</p>
+
+        <div class="status-grid">
+          <article class="status-card status-card--keep"><span>Keep</span><p>A strong frame you intend to retain or carry forward.</p></article>
+          <article class="status-card status-card--review"><span>Review</span><p>An uncertain frame that deserves another look before the review is complete.</p></article>
+          <article class="status-card status-card--reject"><span>Reject</span><p>A frame you do not intend to keep. This marks the photo; it does not delete the file.</p></article>
+        </div>
+
+        <h3>Where a decision can apply</h3>
+        <ul class="check-list">
+          <li><strong>One photo:</strong> change only the selected frame.</li>
+          <li><strong>Selected photos:</strong> apply the same decision to a deliberate selection.</li>
+          <li><strong>One burst:</strong> update all photos in that rapid sequence.</li>
+          <li><strong>One encounter:</strong> update all photos in the sighting.</li>
+        </ul>
+        <p>Vireo names the target in the command and confirmation text. A control never silently widens from photo to burst or from burst to encounter.</p>
+      </section>
+
+      <section id="species" class="guide-section">
+        <p class="section-label">Identification</p>
+        <h2>Suggestions are evidence; confirmations are your conclusion</h2>
+        <p>Vireo keeps three ideas separate: what a model predicted, how those predictions were summarized, and what you confirmed. Confirming a species does not erase a model disagreement or rewrite its confidence.</p>
+
+        <div class="evidence-stack">
+          <div class="evidence-layer evidence-layer--human"><span>4</span><div><strong>Human confirmation</strong><small>Your accepted identification, including multiple species when needed</small></div></div>
+          <div class="evidence-connector" aria-hidden="true"></div>
+          <div class="evidence-layer evidence-layer--summary"><span>3</span><div><strong>Review-unit suggestion</strong><small>A summary for the photo, burst, or encounter—not a new prediction</small></div></div>
+          <div class="evidence-connector" aria-hidden="true"></div>
+          <div class="evidence-layer evidence-layer--source"><span>2</span><div><strong>Prediction source</strong><small>The exact model and label-list pairing that produced the alternatives</small></div></div>
+          <div class="evidence-connector" aria-hidden="true"></div>
+          <div class="evidence-layer evidence-layer--subject"><span>1</span><div><strong>Subject evidence</strong><small>Predictions attached to a particular animal or image region</small></div></div>
+        </div>
+
+        <aside class="callout callout--tip">
+          <strong>Confidence is not agreement</strong>
+          <p>A model can be highly confident while another model strongly disagrees. Vireo shows both confidence within a source and agreement across independent sources.</p>
+        </aside>
+      </section>
+
+      <section id="disagreements" class="guide-section">
+        <p class="section-label">Species decisions</p>
+        <h2>What happens when species predictions disagree</h2>
+        <p>Disagreement is a review signal, not an error to hide. Vireo distinguishes compatible differences—such as genus versus species—from true alternatives that cannot all describe the same subject.</p>
+
+        <figure class="disagreement-flow" aria-labelledby="disagreement-caption">
+          <div class="flow-sources">
+            <div><span class="source-chip">Model A · Birds v4</span><strong>Song Sparrow</strong><small>82%</small></div>
+            <div><span class="source-chip">Model B · Regional birds</span><strong>Lincoln's Sparrow</strong><small>74%</small></div>
+            <div><span class="source-chip">Model A · Genus list</span><strong>Melospiza</strong><small>91%</small></div>
+          </div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-analysis">
+            <span class="analysis-compatible">Compatible: Melospiza</span>
+            <strong>Independent models disagree at species level</strong>
+            <small>Needs confirmation</small>
+          </div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-decision">
+            <span>Human decision</span>
+            <strong>Song Sparrow</strong>
+            <small>All original evidence retained</small>
+          </div>
+          <figcaption id="disagreement-caption">A broader taxon may be compatible with both alternatives; it does not cast an extra independent vote.</figcaption>
+        </figure>
+
+        <h3>Recommended review sequence</h3>
+        <ol class="number-list">
+          <li><span>1</span><div><strong>Open Species evidence.</strong><p>Start with the subjects that have a disagreement badge or low agreement.</p></div></li>
+          <li><span>2</span><div><strong>Check whether the predictions describe the same subject.</strong><p>Two correct labels on two different birds are not a disagreement.</p></div></li>
+          <li><span>3</span><div><strong>Compare independent sources.</strong><p>Model–label-list pairs are shown separately, while related lists from one model are consolidated before cross-model agreement is calculated.</p></div></li>
+          <li><span>4</span><div><strong>Consider taxonomic compatibility.</strong><p>A genus-level label can support a species-level label without pretending to be equally specific.</p></div></li>
+          <li><span>5</span><div><strong>Confirm, add another species, or leave unresolved.</strong><p>Uncertainty remains visible until you have enough evidence to decide.</p></div></li>
+        </ol>
+
+        <div class="rule-grid">
+          <article><strong>Compatible</strong><p>“Sparrow” and “Song Sparrow” can both be true at different levels. Vireo presents the more specific supported result and retains the broader evidence.</p></article>
+          <article><strong>Competing</strong><p>“Song Sparrow” and “Lincoln's Sparrow” are exclusive alternatives for the same subject and require adjudication.</p></article>
+          <article><strong>Independent subjects</strong><p>“Song Sparrow” on subject 1 and “Dark-eyed Junco” on subject 2 can both be confirmed for the same photo.</p></article>
+          <article><strong>Insufficient evidence</strong><p>If no alternative is reliable, leave the unit unconfirmed or record the broadest defensible taxon.</p></article>
+        </div>
+      </section>
+
+      <section id="multiple-species" class="guide-section">
+        <p class="section-label">Complex photographs</p>
+        <h2>One image can contain several subjects and several species</h2>
+        <p>Species review is not limited to one label per file. Evidence is attached to subjects first, allowing a mixed flock or predator-and-prey image to be represented honestly.</p>
+
+        <figure class="subjects-diagram" aria-labelledby="subjects-caption">
+          <div class="subject-photo">
+            <span class="subject-shape subject-shape--one">1</span>
+            <span class="subject-shape subject-shape--two">2</span>
+            <span class="subject-shape subject-shape--three">3</span>
+            <small>One photograph</small>
+          </div>
+          <div class="subject-lines" aria-hidden="true"><i></i><i></i><i></i></div>
+          <div class="subject-results">
+            <div><span>Subject 1</span><strong>Snow Goose</strong><small>confirmed</small></div>
+            <div><span>Subject 2</span><strong>Snow Goose</strong><small>confirmed</small></div>
+            <div><span>Subject 3</span><strong>Ross's Goose</strong><small>confirmed</small></div>
+          </div>
+          <figcaption id="subjects-caption">The photo summary contains two species, while each subject retains its own evidence and confirmation.</figcaption>
+        </figure>
+
+        <ul class="check-list">
+          <li>Confirm each visible subject separately when detections can be distinguished.</li>
+          <li>Add a species manually if it is visible but was not detected.</li>
+          <li>Mark duplicate subject detections so they do not inflate support.</li>
+          <li>Use an image-level observation when subjects overlap and cannot be separated reliably.</li>
+          <li>At burst and encounter level, show the union of confirmed species with photo-level provenance.</li>
+        </ul>
+      </section>
+
+      <section id="multiple-models" class="guide-section">
+        <p class="section-label">Prediction provenance</p>
+        <h2>How Vireo combines multiple models and label lists</h2>
+        <p>Every prediction source has an identity: a model version paired with the exact label list it used. This matters because two lists run through the same model are related views of one system, while two independently trained models provide stronger evidence of agreement.</p>
+
+        <div class="source-formula" aria-label="Prediction source equals model version plus label-list version">
+          <span>Model version</span><b>+</b><span>Label-list version</span><b>=</b><strong>Prediction source</strong>
+        </div>
+
+        <div class="comparison-table-wrap">
+          <table class="comparison-table">
+            <thead><tr><th>Situation</th><th>How Vireo handles it</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><th>One model, one exclusive list</th><td>Shows ranked alternatives for one subject.</td><td>The labels compete with one another.</td></tr>
+              <tr><th>One model, several related lists</th><td>Normalizes compatible taxa and consolidates them as one model family before agreement is measured.</td><td>Related outputs must not become duplicate votes.</td></tr>
+              <tr><th>Several independent models</th><td>Shows each source and calculates agreement from calibrated, independently weighted evidence.</td><td>Agreement is useful only when provenance remains visible.</td></tr>
+              <tr><th>Multi-label presence model</th><td>Allows several labels to be present simultaneously.</td><td>These outputs are not mutually exclusive alternatives.</td></tr>
+              <tr><th>Different taxonomies</th><td>Maps labels to stable taxon identifiers and reports incompatible or unmapped versions.</td><td>Matching text alone is not enough to establish biological equivalence.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The evidence panel always shows</h3>
+        <div class="feature-list feature-list--compact">
+          <div><strong>Model and version</strong><p>Which trained model produced the output.</p></div>
+          <div><strong>Label list and version</strong><p>Which possible labels the model was choosing among.</p></div>
+          <div><strong>Output mode</strong><p>Exclusive alternatives or independent multi-label presence.</p></div>
+          <div><strong>Confidence and rank</strong><p>The source's score and the candidate's position within that source.</p></div>
+          <div><strong>Subject</strong><p>Which animal or image region the prediction describes.</p></div>
+          <div><strong>Compatibility notes</strong><p>How broader, narrower, synonymous, or unmapped taxa were interpreted.</p></div>
+        </div>
+      </section>
+
+      <section id="group-review" class="guide-section">
+        <p class="section-label">Focused comparison</p>
+        <h2>Use Group Review to compare a burst without distractions</h2>
+        <p>Group Review opens one burst in a larger comparison workspace. It is the fastest place to choose the strongest photos, inspect close calls, and optionally confirm species before moving on.</p>
+
+        <div class="group-review-mock" role="img" aria-label="Group Review workspace with a candidate strip, keep zone, reject zone, and decision controls">
+          <div class="gr-title"><strong>Group Review · Burst 2</strong><span>8 photos</span></div>
+          <div class="gr-strip"><i></i><i></i><i class="selected"></i><i></i><i></i></div>
+          <div class="gr-zones">
+            <div class="gr-zone gr-zone--keep"><span>Keep</span><i></i><i></i></div>
+            <div class="gr-loupe"><small>Selected photo</small><div></div></div>
+            <div class="gr-zone gr-zone--reject"><span>Reject</span><i></i></div>
+          </div>
+          <div class="gr-actions"><span>Species: Varied Thrush</span><span>□ Confirm species</span><strong>Apply and close</strong></div>
+        </div>
+
+        <ol class="number-list">
+          <li><span>1</span><div><strong>Compare at a useful size.</strong><p>Select a frame to inspect focus, pose, occlusion, and other available quality evidence.</p></div></li>
+          <li><span>2</span><div><strong>Move photos between decisions.</strong><p>Arrange the burst into Keep, Review, and Reject without leaving the comparison.</p></div></li>
+          <li><span>3</span><div><strong>Handle outliers structurally.</strong><p>If selected frames do not belong in the burst, extract them to a new burst rather than merely changing their triage status.</p></div></li>
+          <li><span>4</span><div><strong>Commit deliberately.</strong><p>Apply only the checked changes. Closing without applying leaves the underlying decisions unchanged.</p></div></li>
+        </ol>
+      </section>
+
+      <section id="structure" class="guide-section">
+        <p class="section-label">Grouping corrections</p>
+        <h2>Splitting and detaching solve different problems</h2>
+        <p>Structural commands use precise verbs because they change different boundaries. A split cuts an ordered sequence at a boundary; an extraction removes selected items and makes a new sibling group.</p>
+
+        <figure class="structure-diagram" aria-labelledby="structure-caption">
+          <div class="structure-column">
+            <div class="structure-title"><span class="verb verb--split">Split</span><strong>Cut at a boundary</strong></div>
+            <div class="structure-before"><b>A</b><b>B</b><span class="cut"></span><b>C</b><b>D</b></div>
+            <span class="down-arrow" aria-hidden="true">↓</span>
+            <div class="structure-after"><span><b>A</b><b>B</b></span><span><b>C</b><b>D</b></span></div>
+            <p>Use when everything after a chosen point belongs in a second burst or encounter.</p>
+          </div>
+          <div class="structure-column">
+            <div class="structure-title"><span class="verb verb--extract">Extract</span><strong>Remove selected items</strong></div>
+            <div class="structure-before"><b>A</b><b class="picked">B</b><b>C</b><b class="picked">D</b></div>
+            <span class="down-arrow" aria-hidden="true">↓</span>
+            <div class="structure-after"><span><b>A</b></span><span class="extracted"><b>B</b></span><span><b>C</b></span><span class="extracted"><b>D</b></span></div>
+            <p>Use when a proper subset of a burst—contiguous or noncontiguous—should become separate sibling groups. Vireo partitions the source into maximal selected and unselected chronological runs, and every run becomes its own burst so no group spans an intervening run. To move a complete burst out of its encounter, use Separate burst as encounter.</p>
+          </div>
+          <figcaption id="structure-caption">“Detach” is represented in the interface by a specific extraction command: Extract photos to new burst or Separate burst as encounter.</figcaption>
+        </figure>
+
+        <div class="operation-list">
+          <article><div><span>Burst</span><h3>Split burst here</h3></div><p>Cuts one burst between two adjacent photos. Photos before the boundary stay in the first burst; photos at and after it form the second.</p></article>
+          <article><div><span>Burst</span><h3>Extract photos to new burst</h3></div><p>Removes a selected proper subset from its current burst and places the photos into new sibling burst membership in the same encounter. When the selection is not contiguous, the source burst is partitioned into maximal selected and unselected chronological runs and each run becomes its own burst. Selecting every photo is invalid; use Separate burst as encounter for a complete burst.</p></article>
+          <article><div><span>Burst</span><h3>Merge adjacent bursts</h3></div><p>Combines neighboring bursts inside the same encounter while preserving chronological photo order.</p></article>
+          <article><div><span>Encounter</span><h3>Split encounter here</h3></div><p>Cuts an encounter between adjacent bursts. Bursts before the boundary stay together; the remainder becomes a new encounter.</p></article>
+          <article><div><span>Encounter</span><h3>Separate burst as encounter</h3></div><p>Removes one complete burst and turns it into its own encounter. Other bursts remain in their existing encounter.</p></article>
+          <article><div><span>Encounter</span><h3>Merge encounters</h3></div><p>Combines selected compatible encounters and then orders their bursts chronologically.</p></article>
+        </div>
+
+        <aside class="callout callout--warning">
+          <strong>Structural edits do not change the image files</strong>
+          <p>They change Vireo's review organization and the stable relationships among photos. Triage decisions and confirmed species travel with the photos or review units to which they belong.</p>
+        </aside>
+      </section>
+
+      <section id="saving" class="guide-section">
+        <p class="section-label">Persistence</p>
+        <h2>View changes are temporary; review decisions are saved</h2>
+        <div class="comparison-table-wrap">
+          <table class="comparison-table">
+            <thead><tr><th>Action</th><th>Saved?</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><th>Search, filter, sort, or change page</th><td>Saved as a view preference</td><td>Changes only what you see.</td></tr>
+              <tr><th>Change triage or confirm species</th><td>Saved immediately</td><td>Updates the canonical review result and marks metadata as pending synchronization when applicable.</td></tr>
+              <tr><th>Split, extract, or merge</th><td>Saved immediately</td><td>Creates a new structural revision while preserving stable photo identities.</td></tr>
+              <tr><th>Adjust grouping controls</th><td>Preview first</td><td>Shows the proposed result; applying it creates a new revision.</td></tr>
+              <tr><th>Synchronize sidecars</th><td>Written externally</td><td>Writes supported decisions to metadata that other applications can read.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="save-flow" aria-label="Decision saving flow">
+          <span>Make a decision</span><b aria-hidden="true">→</b><span>Vireo saves a revision</span><b aria-hidden="true">→</b><span>Undo remains available</span><b aria-hidden="true">→</b><span>Synchronize sidecars when ready</span>
+        </div>
+
+        <p>Undo and redo describe the exact target and result, such as “Moved 2 photos to a new burst.” If another session changes the same review unit, Vireo pauses the conflicting action, refreshes that unit, and asks you to try again rather than overwriting newer work.</p>
+      </section>
+
+      <section id="workflows" class="guide-section">
+        <p class="section-label">Task recipes</p>
+        <h2>Common workflows</h2>
+        <div class="workflow-list">
+          <details open>
+            <summary><span>01</span><strong>Review a new Process result</strong></summary>
+            <ol><li>Open Process Review from the completed run.</li><li>Read the coverage summary and note any photos outside the result.</li><li>Start with Review or Conflicts to address uncertain units.</li><li>Open Group Review for close comparisons.</li><li>Confirm species and finish triage.</li><li>Synchronize sidecars when the pending count is ready.</li></ol>
+          </details>
+          <details>
+            <summary><span>02</span><strong>Review one species without losing context</strong></summary>
+            <ol><li>Add a species condition in the toolbar.</li><li>Choose Any photo.</li><li>Vireo selects every encounter containing at least one matching photo.</li><li>Review the complete encounters, including nearby frames with different or uncertain suggestions.</li></ol>
+          </details>
+          <details>
+            <summary><span>03</span><strong>Resolve a disagreement between models</strong></summary>
+            <ol><li>Set Species review to Conflicts.</li><li>Open the evidence panel for the flagged subject.</li><li>Compare independent models, related label lists, confidence, and taxonomy notes.</li><li>Inspect adjacent frames in the burst for a clearer view.</li><li>Confirm the supported species, add multiple species, or leave the unit unresolved.</li></ol>
+          </details>
+          <details>
+            <summary><span>04</span><strong>Correct an incorrectly grouped sequence</strong></summary>
+            <ol><li>Decide whether the mistake is a boundary or an outlier.</li><li>For a boundary, use Split burst here or Split encounter here.</li><li>For outliers, use Extract photos to new burst or Separate burst as encounter.</li><li>Use Merge only for adjacent or explicitly selected compatible groups.</li><li>Check the resulting cards and undo if the new structure is not what you intended.</li></ol>
+          </details>
+          <details>
+            <summary><span>05</span><strong>Make a large review faster</strong></summary>
+            <ol><li>Use a collection, triage, or species-review condition to reduce the qualifying encounters.</li><li>Keep Any photo selected when context matters most; use Every photo for strict containment.</li><li>Sort disagreements and unresolved review units first.</li><li>Keep the evidence panel closed until a decision needs explanation.</li><li>Let the encounter list load progressively in bounded pages rather than loading the complete workspace at once.</li></ol>
+          </details>
+        </div>
+      </section>
+
+      <section id="troubleshooting" class="guide-section">
+        <p class="section-label">When something looks wrong</p>
+        <h2>Troubleshooting</h2>
+        <div class="troubleshooting-list">
+          <details><summary>Why am I seeing photos that do not match my filter?</summary><p>You selected Any photo. One or more photos qualified, so Vireo included the complete encounter for context. Change to Every photo if the whole encounter must satisfy the condition.</p></details>
+          <details><summary>Why did an encounter disappear with Every photo selected?</summary><p>At least one photo in that encounter did not satisfy all active conditions. The encounter is omitted rather than shown partially.</p></details>
+          <details><summary>Why do two label lists not count as two model votes?</summary><p>If both lists came from the same underlying model family, their errors may be correlated. Vireo consolidates those related outputs before measuring agreement across independent models.</p></details>
+          <details><summary>Why does a photo show more than one confirmed species?</summary><p>The photo contains multiple subjects or an image-level observation with multiple taxa. Species confirmation is intentionally not restricted to one label per file.</p></details>
+          <details><summary>What does “Needs confirmation” mean?</summary><p>There is usable automated evidence, but no human confirmation for the review unit—or a disagreement, ambiguity, or missing mapping still needs attention.</p></details>
+          <details><summary>Does Reject delete my photo?</summary><p>No. Reject is a review decision used by later workflows. Process Review does not delete the underlying file.</p></details>
+          <details><summary>Why did a click take a long time?</summary><p>Changing view conditions should update a bounded encounter query and feel immediate. Evidence and thumbnails load progressively. If an action waits several seconds without visible progress, that is a performance problem rather than expected behavior.</p></details>
+          <details><summary>Why does my current version say a collection is view-only?</summary><p>The released page currently protects its saved review cache by making Workspace and Collection scopes read-only. The redesign documented here replaces those alternate results with editable encounter-preserving views. Until that change ships, switch to Latest review before editing.</p></details>
+        </div>
+      </section>
+
+      <section id="glossary" class="guide-section">
+        <p class="section-label">Reference</p>
+        <h2>Glossary</h2>
+        <dl class="glossary">
+          <div><dt>Complete encounter</dt><dd>Every photo and burst belonging to an encounter at the selected structural revision.</dd></div>
+          <div><dt>Confirmation</dt><dd>A human identification accepted for a subject, photo, burst, or encounter.</dd></div>
+          <div><dt>Encounter matching</dt><dd>The rule that determines whether an entire encounter qualifies for the current review view.</dd></div>
+          <div><dt>Exclusive alternatives</dt><dd>Labels where only one is expected to be correct for a subject, such as the ranked species from a classifier.</dd></div>
+          <div><dt>Label list</dt><dd>The versioned set of labels a model was configured to predict.</dd></div>
+          <div><dt>Model family</dt><dd>Outputs treated as related because they share the same underlying model or training lineage.</dd></div>
+          <div><dt>Multi-label prediction</dt><dd>An output where several labels may be present at the same time.</dd></div>
+          <div><dt>Prediction source</dt><dd>A model version paired with a label-list version and output mode.</dd></div>
+          <div><dt>Process result</dt><dd>The canonical grouping, scoring, and model evidence produced by a completed Process run.</dd></div>
+          <div><dt>Review unit</dt><dd>The level at which a decision is being made: subject, photo, burst, or encounter.</dd></div>
+          <div><dt>Review view</dt><dd>A saved or temporary set of conditions that chooses which complete encounters appear.</dd></div>
+          <div><dt>Structural revision</dt><dd>A saved version of burst and encounter membership after a split, extraction, merge, or regrouping change.</dd></div>
+        </dl>
+      </section>
+
+      <footer class="guide-end">
+        <p class="section-label">Continue learning</p>
+        <h2>Process Review connects decisions to the rest of Vireo</h2>
+        <p>Use Process to create or refresh analysis, Browse for photo-first exploration, Cull for fast triage, and sidecar synchronization to share supported decisions with other photo applications.</p>
+        <a href={`${base}docs/`} class="btn btn--primary">Back to all documentation</a>
+      </footer>
+    </div>
+  </div>
+</Base>
+
+<style>
+  :global(html) { scroll-padding-top: calc(var(--nav-height) + 24px); }
+
+  .guide-shell {
+    width: min(1380px, calc(100% - 48px));
+    margin: 0 auto;
+  }
+
+  .guide-hero {
+    color: #26382f;
+    background:
+      radial-gradient(circle at 82% 12%, rgba(168, 209, 194, 0.42), transparent 31%),
+      radial-gradient(circle at 9% 82%, rgba(246, 220, 151, 0.38), transparent 28%),
+      #f7faf5;
+    border-bottom: 1px solid #dce7dd;
+    padding: 46px 0 36px;
+  }
+
+  .breadcrumbs {
+    display: flex;
+    gap: 9px;
+    color: #748179;
+    font-size: var(--text-sm);
+    margin-bottom: 44px;
+  }
+
+  .breadcrumbs a { color: #557160; }
+
+  .guide-hero__grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(420px, 0.82fr);
+    align-items: center;
+    gap: clamp(48px, 8vw, 120px);
+  }
+
+  .guide-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 10px;
+    color: #426476;
+    background: #e6f3f7;
+    border: 1px solid #c8e0e8;
+    border-radius: 999px;
+    font-size: var(--text-xs);
+    font-weight: 800;
+    letter-spacing: .04em;
+    margin-bottom: 18px;
+    text-transform: uppercase;
+  }
+
+  .guide-status span { width: 7px; height: 7px; border-radius: 50%; background: #5c98ae; }
+
+  .guide-hero h1 {
+    font-size: clamp(3.2rem, 7vw, 6.4rem);
+    letter-spacing: -.055em;
+    line-height: .95;
+    margin-bottom: 24px;
+  }
+
+  .guide-hero__lede {
+    color: #607168;
+    font-size: clamp(1.15rem, 2vw, 1.4rem);
+    line-height: 1.55;
+    max-width: 710px;
+  }
+
+  .hero-actions { display: flex; align-items: center; gap: 24px; margin-top: 30px; }
+  .hero-link { color: #456453; font-weight: 700; }
+
+  .hero-illustration { min-width: 0; }
+  .hero-window { background: rgba(255,255,255,.88); border: 1px solid #cddbd0; border-radius: 17px; box-shadow: 0 28px 70px rgba(55, 82, 64, .16); overflow: hidden; transform: rotate(1deg); }
+  .hero-window__bar { height: 38px; display: flex; align-items: center; gap: 6px; padding: 0 14px; background: #eef4ef; border-bottom: 1px solid #d8e2d9; }
+  .hero-window__bar i { width: 8px; height: 8px; border-radius: 50%; background: #b5c7b9; }
+  .hero-window__bar span { margin-left: auto; color: #6f7d73; font-size: 11px; font-weight: 700; }
+  .hero-window__summary { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; padding: 16px 18px; }
+  .hero-window__summary small { color: #839087; }
+  .bird-dot { width: 11px; height: 11px; background: #5d8870; border-radius: 50%; box-shadow: 0 0 0 5px #e6f0e8; }
+  .hero-burst { display: grid; grid-template-columns: 68px repeat(3, 1fr); gap: 7px; align-items: center; padding: 9px 14px; border-top: 1px solid #edf1ed; }
+  .hero-burst__label { color: #718078; font-size: 11px; font-weight: 700; }
+  .hero-photo { aspect-ratio: 4/3; min-width: 0; position: relative; background: linear-gradient(150deg,#879f8d,#d2dece); border-radius: 6px; }
+  .hero-photo::after { content: ''; position: absolute; left: 7px; bottom: 7px; width: 8px; height: 8px; background: #f1ca6d; border: 2px solid #fff; border-radius: 50%; }
+  .hero-photo.keep::after { background: #5dab79; }
+  .hero-photo.review::after { background: #e9b94e; }
+
+  .preview-note { display: grid; grid-template-columns: 170px 1fr; gap: 28px; margin-top: 48px; padding: 19px 22px; color: #53675c; background: rgba(255,255,255,.62); border: 1px solid #d7e2d9; border-radius: 12px; font-size: var(--text-sm); }
+  .preview-note strong { color: #344a3e; }
+
+  .guide-layout { display: grid; grid-template-columns: 250px minmax(0, 860px); justify-content: center; align-items: start; gap: 64px; padding-top: 68px; padding-bottom: 100px; }
+
+  .guide-nav { position: sticky; top: calc(var(--nav-height) + 24px); }
+  .guide-nav__inner { padding: 18px 0 18px 18px; border-left: 1px solid #dfe5df; }
+  .guide-nav strong { display: block; color: #2f4438; font-size: var(--text-sm); margin-bottom: 12px; }
+  .guide-nav ol { list-style: none; }
+  .guide-nav li { margin: 0; }
+  .guide-nav a { display: block; padding: 4px 0; color: #76827b; font-size: 13px; line-height: 1.35; }
+  .guide-nav a:hover { color: #446953; }
+
+  .guide-content { min-width: 0; color: #34443b; }
+  .guide-section { padding: 74px 0 18px; border-top: 1px solid #e4e8e4; }
+  .guide-section:first-child { padding-top: 0; border-top: 0; }
+  .guide-section h2, .guide-end h2 { color: #26382f; font-size: clamp(2rem, 4vw, 2.8rem); line-height: 1.12; letter-spacing: -.03em; margin-bottom: 18px; }
+  .guide-section > p:not(.section-label), .guide-end > p:not(.section-label) { color: #68756e; font-size: 1.06rem; max-width: 760px; margin-bottom: 26px; }
+  .guide-section h3 { color: #30463a; font-size: 1.2rem; margin: 34px 0 14px; }
+  .section-label { color: #65836f; font-size: 11px; font-weight: 800; letter-spacing: .12em; margin-bottom: 12px; text-transform: uppercase; }
+
+  .outcome-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 34px 0; }
+  .outcome-grid article { padding: 20px; background: #f8faf7; border: 1px solid #e0e7e1; border-radius: 12px; }
+  .outcome-grid h3 { font-size: 1rem; margin: 15px 0 6px; }
+  .outcome-grid p { color: #718078; font-size: 14px; }
+  .outcome-icon { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 10px; font-weight: 900; }
+  .outcome-icon--green { color: #3d7653; background: #e4f2e7; }
+  .outcome-icon--blue { color: #3f7180; background: #e4f1f4; }
+  .outcome-icon--violet { color: #665a82; background: #eeeaf5; }
+
+  .principle-card { display: grid; grid-template-columns: 90px 1fr; gap: 22px; padding: 22px; background: #eff7f0; border: 1px solid #d8e8da; border-radius: 12px; }
+  .principle-card__mark { width: 78px; height: 78px; display: grid; place-items: center; color: #52705d; background: #fff; border: 1px solid #d8e6da; border-radius: 50%; font-size: 11px; font-weight: 800; text-transform: uppercase; }
+  .principle-card h3 { margin: 3px 0 7px; font-size: 1.05rem; }
+  .principle-card p { color: #637369; font-size: 14px; }
+
+  figure { margin: 34px 0; }
+  figcaption { color: #78847d; font-size: 12px; line-height: 1.5; margin-top: 13px; text-align: center; }
+  .concept-diagram { padding: 28px; background: #fafbf9; border: 1px solid #e2e7e2; border-radius: 14px; }
+  .hierarchy-row { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: center; gap: 12px; }
+  .hierarchy-node { min-height: 126px; display: flex; flex-direction: column; justify-content: space-between; padding: 17px; border-radius: 11px; }
+  .hierarchy-node strong, .hierarchy-node small { display: block; }
+  .hierarchy-node small { opacity: .72; font-size: 11px; margin-top: 5px; }
+  .hierarchy-node--encounter { background: #e7f3ea; border: 1px solid #cfe3d4; }
+  .hierarchy-node--burst { background: #e8f2f5; border: 1px solid #cfe0e5; }
+  .hierarchy-node--photo { background: #f7f0df; border: 1px solid #e9dcb9; }
+  .node-number { width: 27px; height: 27px; display: grid; place-items: center; background: rgba(255,255,255,.8); border-radius: 50%; font-size: 11px; font-weight: 900; }
+  .hierarchy-arrow { color: #89958e; font-size: 10px; text-transform: uppercase; }
+
+  .definition-grid, .rule-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; overflow: hidden; background: #dfe5df; border: 1px solid #dfe5df; border-radius: 12px; }
+  .definition-grid article, .rule-grid article { padding: 22px; background: #fff; }
+  .definition-grid h3 { margin: 0 0 7px; font-size: 1rem; }
+  .definition-grid p, .rule-grid p { color: #728078; font-size: 14px; }
+  .rule-grid strong { display: block; color: #31463a; margin-bottom: 8px; }
+
+  .page-map { overflow: hidden; padding: 14px; background: #edf3ee; border: 1px solid #d6e0d7; border-radius: 14px; box-shadow: 0 16px 40px rgba(50,75,58,.08); }
+  .page-map__header { display: flex; align-items: center; justify-content: space-between; padding: 13px 15px; background: #fff; border-radius: 9px 9px 0 0; }
+  .page-map__header span { font-size: 13px; font-weight: 800; }
+  .page-map__header small { color: #839087; }
+  .page-map__toolbar { display: flex; gap: 7px; align-items: center; padding: 9px; background: #f8faf8; border-top: 1px solid #edf0ed; }
+  .page-map__toolbar strong { margin-right: auto; font-size: 10px; }
+  .page-map__toolbar span { padding: 4px 7px; color: #66766d; background: #fff; border: 1px solid #dfe5df; border-radius: 4px; font-size: 9px; }
+  .page-map__body { display: grid; grid-template-columns: 110px 1fr 120px; gap: 8px; min-height: 280px; padding-top: 8px; }
+  .page-map__sidebar, .page-map__panel { display: flex; flex-direction: column; gap: 8px; padding: 12px; background: #f8faf8; border-radius: 8px; }
+  .page-map__sidebar strong, .page-map__panel strong { font-size: 10px; }
+  .page-map__sidebar span, .page-map__panel span { padding-bottom: 7px; color: #849087; border-bottom: 1px solid #e6ebe7; font-size: 9px; }
+  .page-map__list { display: flex; flex-direction: column; gap: 8px; }
+  .map-encounter { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; padding: 12px; background: #fff; border: 1px solid #d9e2da; border-radius: 8px; }
+  .map-encounter strong { grid-column: 1/3; font-size: 10px; }
+  .map-encounter span { grid-column: 3/5; color: #7e8a82; font-size: 8px; text-align: right; }
+  .map-encounter i { height: 52px; background: linear-gradient(145deg, #8ea695, #d4ddd1); border-radius: 4px; }
+  .map-encounter i:nth-of-type(2) { background: linear-gradient(145deg, #a6b987, #dae0bb); }
+  .map-encounter--faded { opacity: .7; }
+  .map-pagination { display: flex; justify-content: center; gap: 18px; padding: 7px; color: #7d8981; font-size: 8px; }
+  .page-map figcaption { display: flex; flex-wrap: wrap; justify-content: center; gap: 16px; }
+  .page-map figcaption b { display: inline-grid; width: 18px; height: 18px; place-items: center; color: #42634e; background: #e0eee3; border-radius: 50%; }
+
+  .feature-list { display: grid; grid-template-columns: 1fr 1fr; gap: 0 28px; }
+  .feature-list div { padding: 18px 0; border-top: 1px solid #e4e8e4; }
+  .feature-list strong { display: block; color: #34483c; margin-bottom: 5px; }
+  .feature-list p { color: #738078; font-size: 14px; }
+  .feature-list--compact { margin-top: 24px; }
+
+  .steps { margin: 30px 0; }
+  .steps article { display: grid; grid-template-columns: 38px 1fr; gap: 16px; padding: 14px 0; }
+  .steps article > span { width: 34px; height: 34px; display: grid; place-items: center; color: #456653; background: #e9f3eb; border-radius: 50%; font-size: 12px; font-weight: 900; }
+  .steps h3 { margin: 1px 0 4px; font-size: 1rem; }
+  .steps p { color: #6f7c74; font-size: 14px; }
+
+  .matching-diagram { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: 18px; padding: 24px; background: #f7faf7; border: 1px solid #dde5de; border-radius: 14px; }
+  .match-example { display: flex; flex-direction: column; justify-content: center; padding: 20px; background: #fff; border: 1px solid #dce4dd; border-radius: 10px; }
+  .match-example__heading { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 14px; }
+  .match-example__heading span { color: #7d8981; font-size: 10px; }
+  .photo-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .mini-photo { aspect-ratio: 4/3; display: grid; place-items: center; border-radius: 5px; font-size: 12px; font-weight: 900; }
+  .mini-photo.match { color: #3f7553; background: #dfefe3; border: 1px solid #c5dfcc; }
+  .mini-photo.miss { color: #8b7560; background: #f2ede6; border: 1px solid #e5dbce; }
+  .match-branches { display: grid; gap: 9px; }
+  .match-result { display: grid; grid-template-columns: 84px 1fr; align-items: center; padding: 14px; border-radius: 9px; }
+  .match-result strong { grid-row: 1/3; }
+  .match-result span { font-size: 12px; font-weight: 700; }
+  .match-result small { opacity: .72; }
+  .match-result--yes { color: #365e44; background: #e6f3e9; border: 1px solid #cde4d3; }
+  .match-result--no { color: #775f4b; background: #f5eee7; border: 1px solid #e5d8ca; }
+  .matching-diagram figcaption { grid-column: 1/-1; }
+
+  .comparison-table-wrap { overflow-x: auto; margin: 28px 0; border: 1px solid #dfe5df; border-radius: 12px; }
+  .comparison-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  .comparison-table th, .comparison-table td { padding: 15px 16px; border-bottom: 1px solid #e4e9e4; text-align: left; vertical-align: top; }
+  .comparison-table thead th { color: #5a6d61; background: #f4f7f4; font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+  .comparison-table tbody th { min-width: 128px; color: #34483c; }
+  .comparison-table tbody td { color: #6e7b73; }
+  .comparison-table tr:last-child th, .comparison-table tr:last-child td { border-bottom: 0; }
+
+  .callout { margin: 28px 0; padding: 19px 22px; border-radius: 10px; }
+  .callout strong { display: block; margin-bottom: 5px; }
+  .callout p { font-size: 14px; }
+  .callout--info { color: #486272; background: #edf6f8; border: 1px solid #d3e7ec; }
+  .callout--tip { color: #50644f; background: #f0f7eb; border: 1px solid #dcebd2; }
+  .callout--warning { color: #705b3e; background: #fbf4e5; border: 1px solid #ecdfbe; }
+
+  .status-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 28px 0; }
+  .status-card { padding: 20px; border-radius: 11px; }
+  .status-card span { display: inline-block; padding: 4px 9px; border-radius: 999px; font-size: 11px; font-weight: 900; text-transform: uppercase; }
+  .status-card p { color: #68766e; font-size: 14px; margin-top: 13px; }
+  .status-card--keep { background: #edf7ef; border: 1px solid #d5e9d9; } .status-card--keep span { color: #376b4a; background: #d7eddc; }
+  .status-card--review { background: #fbf6e9; border: 1px solid #ece2c7; } .status-card--review span { color: #745d22; background: #f1e4b8; }
+  .status-card--reject { background: #f9eeee; border: 1px solid #ead7d7; } .status-card--reject span { color: #855050; background: #efdada; }
+
+  .check-list { list-style: none; display: grid; gap: 10px; margin: 18px 0 28px; }
+  .check-list li { position: relative; padding-left: 28px; color: #67756d; }
+  .check-list li::before { content: '✓'; position: absolute; left: 0; top: 1px; width: 18px; height: 18px; display: grid; place-items: center; color: #4d755c; background: #e5f1e8; border-radius: 50%; font-size: 10px; font-weight: 900; }
+
+  .evidence-stack { width: min(620px, 100%); display: flex; flex-direction: column; align-items: center; margin: 35px auto; }
+  .evidence-layer { width: 100%; display: grid; grid-template-columns: 36px 1fr; gap: 14px; align-items: center; padding: 14px 18px; border-radius: 10px; }
+  .evidence-layer > span { width: 30px; height: 30px; display: grid; place-items: center; background: rgba(255,255,255,.76); border-radius: 50%; font-size: 11px; font-weight: 900; }
+  .evidence-layer strong, .evidence-layer small { display: block; }
+  .evidence-layer small { opacity: .72; margin-top: 3px; }
+  .evidence-layer--human { width: 78%; background: #e7f2e9; border: 1px solid #cfdfd2; }
+  .evidence-layer--summary { width: 85%; background: #edf4e6; border: 1px solid #dbe6cf; }
+  .evidence-layer--source { width: 92%; background: #e7f1f4; border: 1px solid #cfe0e5; }
+  .evidence-layer--subject { background: #f4eee3; border: 1px solid #e4d9c7; }
+  .evidence-connector { width: 1px; height: 13px; background: #c9d3cb; }
+
+  .disagreement-flow { display: grid; grid-template-columns: minmax(0,1.2fr) auto minmax(0,.8fr) auto minmax(0,.8fr); align-items: center; gap: 10px; padding: 24px; background: #f8faf8; border: 1px solid #dfe6e0; border-radius: 14px; }
+  .flow-sources { display: grid; gap: 7px; }
+  .flow-sources > div { display: grid; grid-template-columns: 1fr auto; padding: 10px; background: #fff; border: 1px solid #e0e6e1; border-radius: 7px; }
+  .source-chip { grid-column: 1/-1; color: #708078; font-size: 8px; text-transform: uppercase; }
+  .flow-sources strong { font-size: 11px; }
+  .flow-sources small { color: #678171; }
+  .flow-arrow { color: #92a098; }
+  .flow-analysis, .flow-decision { padding: 16px; border-radius: 9px; text-align: center; }
+  .flow-analysis { background: #fbf3e5; border: 1px solid #eadbbc; }
+  .flow-analysis strong, .flow-analysis small, .flow-decision span, .flow-decision strong, .flow-decision small { display: block; }
+  .flow-analysis strong { font-size: 11px; margin: 9px 0; }
+  .flow-analysis small { color: #876b39; }
+  .analysis-compatible { display: inline-block; color: #526f5a; background: #e5f0e7; border-radius: 999px; padding: 3px 6px; font-size: 8px; }
+  .flow-decision { background: #e7f3ea; border: 1px solid #cfe2d3; }
+  .flow-decision span { color: #678170; font-size: 9px; text-transform: uppercase; }
+  .flow-decision strong { margin: 7px 0; font-size: 13px; }
+  .flow-decision small { color: #6f8075; font-size: 8px; }
+  .disagreement-flow figcaption { grid-column: 1/-1; }
+
+  .number-list { list-style: none; margin: 18px 0 32px; }
+  .number-list li { display: grid; grid-template-columns: 34px 1fr; gap: 14px; padding: 13px 0; }
+  .number-list li > span { width: 30px; height: 30px; display: grid; place-items: center; color: #52705e; background: #e9f1ea; border-radius: 50%; font-size: 11px; font-weight: 900; }
+  .number-list p { color: #718078; font-size: 14px; margin-top: 3px; }
+
+  .subjects-diagram { display: grid; grid-template-columns: minmax(220px,.85fr) 36px minmax(0,1fr); align-items: center; padding: 26px; background: #f8faf8; border: 1px solid #dfe6e0; border-radius: 14px; }
+  .subject-photo { aspect-ratio: 4/3; position: relative; overflow: hidden; background: linear-gradient(150deg,#8eaa99,#d4dfd0 72%); border: 7px solid #fff; border-radius: 10px; box-shadow: 0 8px 22px rgba(51,72,58,.12); }
+  .subject-photo small { position: absolute; left: 9px; bottom: 8px; padding: 2px 6px; color: #fff; background: rgba(38,56,47,.66); border-radius: 3px; }
+  .subject-shape { position: absolute; display: grid; place-items: center; width: 38px; height: 38px; color: #fff; background: rgba(55,105,75,.72); border: 2px solid #fff; border-radius: 50% 50% 45% 45%; font-size: 11px; font-weight: 900; }
+  .subject-shape--one { left: 18%; top: 25%; } .subject-shape--two { left: 49%; top: 39%; } .subject-shape--three { right: 12%; top: 20%; background: rgba(92,111,138,.78); }
+  .subject-lines { display: flex; flex-direction: column; gap: 39px; }
+  .subject-lines i { display: block; width: 100%; border-top: 1px dashed #a6b5aa; }
+  .subject-results { display: grid; gap: 8px; }
+  .subject-results div { display: grid; grid-template-columns: 62px 1fr auto; gap: 8px; align-items: center; padding: 11px; background: #fff; border: 1px solid #dfe6e0; border-radius: 7px; }
+  .subject-results span, .subject-results small { color: #7c8981; font-size: 9px; }
+  .subject-results strong { font-size: 12px; }
+  .subject-results small { color: #4f795c; }
+  .subjects-diagram figcaption { grid-column: 1/-1; }
+
+  .source-formula { display: grid; grid-template-columns: 1fr auto 1fr auto 1.1fr; align-items: center; gap: 12px; margin: 30px 0; padding: 22px; background: #f5f8f5; border: 1px solid #dfe6e0; border-radius: 12px; text-align: center; }
+  .source-formula span, .source-formula strong { padding: 12px; background: #fff; border: 1px solid #dbe4dc; border-radius: 7px; }
+  .source-formula strong { color: #3e684e; background: #e9f3eb; border-color: #d0e3d4; }
+  .source-formula b { color: #95a199; }
+
+  .group-review-mock { overflow: hidden; margin: 30px 0; background: #eef3ef; border: 1px solid #d7e1d8; border-radius: 14px; box-shadow: 0 16px 40px rgba(49,70,56,.09); }
+  .gr-title, .gr-actions { display: flex; justify-content: space-between; gap: 12px; padding: 12px 16px; background: #fff; font-size: 11px; }
+  .gr-title span { color: #849087; }
+  .gr-strip { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; padding: 10px 14px; border-top: 1px solid #e5eae6; }
+  .gr-strip i { height: 52px; background: linear-gradient(145deg,#91a799,#c9d5cb); border-radius: 5px; }
+  .gr-strip i.selected { outline: 3px solid #e0b94c; outline-offset: 1px; }
+  .gr-zones { display: grid; grid-template-columns: .7fr 1.4fr .7fr; gap: 10px; padding: 14px; }
+  .gr-zone { min-height: 150px; display: flex; gap: 5px; align-content: flex-start; flex-wrap: wrap; padding: 10px; border: 1px dashed; border-radius: 8px; }
+  .gr-zone span { width: 100%; font-size: 9px; font-weight: 800; text-transform: uppercase; }
+  .gr-zone i { width: 43px; height: 35px; border-radius: 4px; background: rgba(255,255,255,.7); }
+  .gr-zone--keep { color: #477157; background: #e6f1e8; border-color: #9fc2a8; }
+  .gr-zone--reject { color: #845858; background: #f4e8e8; border-color: #d3aaaa; }
+  .gr-loupe { padding: 9px; color: #76837b; background: #fff; border-radius: 8px; font-size: 9px; }
+  .gr-loupe div { height: 118px; margin-top: 6px; background: linear-gradient(145deg,#819888,#d2dccf); border-radius: 5px; }
+  .gr-actions { align-items: center; border-top: 1px solid #dfe6e0; color: #66756c; }
+  .gr-actions strong { padding: 6px 9px; color: #31473a; background: #e2be59; border-radius: 5px; }
+
+  .structure-diagram { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 14px; background: #f7f9f7; border: 1px solid #dfe5df; border-radius: 14px; }
+  .structure-column { padding: 19px; background: #fff; border: 1px solid #e0e6e1; border-radius: 10px; }
+  .structure-title { display: flex; align-items: center; gap: 9px; margin-bottom: 22px; }
+  .verb { padding: 3px 7px; border-radius: 999px; font-size: 9px; font-weight: 900; text-transform: uppercase; }
+  .verb--split { color: #4e6979; background: #e5f0f4; }
+  .verb--extract { color: #675d7d; background: #eeeaf5; }
+  .structure-title strong { font-size: 12px; }
+  .structure-before, .structure-after, .structure-after > span { display: flex; justify-content: center; align-items: center; gap: 5px; }
+  .structure-before b, .structure-after b { width: 35px; height: 35px; display: grid; place-items: center; color: #466250; background: #e5efe7; border: 1px solid #cee0d2; border-radius: 5px; font-size: 10px; }
+  .structure-before b.picked, .structure-after .extracted b { color: #655a7b; background: #eeeaf5; border-color: #dcd4e9; }
+  .cut { height: 44px; margin: 0 3px; border-left: 2px dashed #cf8b6f; }
+  .down-arrow { display: block; color: #97a29b; margin: 7px 0; text-align: center; }
+  .structure-after { gap: 15px; }
+  .structure-column p { color: #748078; font-size: 12px; margin-top: 19px; }
+  .structure-diagram figcaption { grid-column: 1/-1; }
+
+  .operation-list { display: grid; gap: 8px; margin: 26px 0; }
+  .operation-list article { display: grid; grid-template-columns: 225px 1fr; gap: 20px; padding: 17px 19px; background: #fafbfa; border: 1px solid #e2e7e2; border-radius: 9px; }
+  .operation-list h3 { margin: 3px 0 0; font-size: .98rem; }
+  .operation-list div > span { color: #708078; font-size: 9px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+  .operation-list p { color: #6c7971; font-size: 14px; }
+
+  .save-flow { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 26px 0; padding: 18px; background: #f2f7f2; border: 1px solid #dbe5dc; border-radius: 10px; }
+  .save-flow span { padding: 9px; background: #fff; border: 1px solid #dce4dd; border-radius: 6px; font-size: 11px; font-weight: 700; text-align: center; }
+  .save-flow b { color: #99a59d; }
+
+  .workflow-list, .troubleshooting-list { display: grid; gap: 9px; margin-top: 26px; }
+  .workflow-list details, .troubleshooting-list details { background: #fafbfa; border: 1px solid #e0e6e1; border-radius: 10px; }
+  .workflow-list summary, .troubleshooting-list summary { cursor: pointer; list-style: none; padding: 18px 20px; color: #34483c; }
+  .workflow-list summary::-webkit-details-marker, .troubleshooting-list summary::-webkit-details-marker { display: none; }
+  .workflow-list summary { display: flex; gap: 14px; align-items: center; }
+  .workflow-list summary span { color: #7d8d83; font-size: 10px; }
+  .workflow-list summary::after, .troubleshooting-list summary::after { content: '+'; float: right; margin-left: auto; color: #7a887f; font-size: 18px; font-weight: 400; }
+  .workflow-list details[open] summary::after, .troubleshooting-list details[open] summary::after { content: '−'; }
+  .workflow-list ol { margin: 0 28px 20px 55px; color: #6d7a72; font-size: 14px; }
+  .workflow-list li { padding: 4px 0 4px 4px; }
+  .troubleshooting-list summary { font-weight: 700; }
+  .troubleshooting-list p { padding: 0 52px 20px 20px; color: #6f7c74; font-size: 14px; }
+
+  .glossary { display: grid; grid-template-columns: 1fr 1fr; gap: 0 30px; }
+  .glossary div { padding: 16px 0; border-top: 1px solid #e2e7e2; }
+  .glossary dt { color: #33483b; font-weight: 800; margin-bottom: 5px; }
+  .glossary dd { color: #738078; font-size: 14px; }
+
+  .guide-end { margin-top: 80px; padding: 42px; background: linear-gradient(145deg,#edf5ee,#f7f4e9); border: 1px solid #dce5dc; border-radius: 16px; }
+  .guide-end .btn { margin-top: 4px; }
+
+  @media (max-width: 1050px) {
+    .guide-hero__grid { grid-template-columns: 1fr 380px; gap: 42px; }
+    .guide-layout { grid-template-columns: 205px minmax(0, 760px); gap: 38px; }
+    .disagreement-flow { grid-template-columns: 1fr; }
+    .flow-arrow { transform: rotate(90deg); text-align: center; }
+  }
+
+  @media (max-width: 820px) {
+    .guide-shell { width: min(100% - 32px, 760px); }
+    .guide-hero { padding-top: 30px; }
+    .breadcrumbs { margin-bottom: 32px; }
+    .guide-hero__grid { grid-template-columns: 1fr; }
+    .hero-illustration { max-width: 560px; }
+    .preview-note { grid-template-columns: 1fr; gap: 6px; }
+    .guide-layout { display: block; }
+    .guide-nav { display: none; }
+    .guide-section { padding-top: 58px; }
+  }
+
+  @media (max-width: 620px) {
+    .guide-shell { width: min(100% - 24px, 580px); }
+    .guide-hero h1 { font-size: 3.1rem; }
+    .hero-actions { align-items: flex-start; flex-direction: column; gap: 14px; }
+    .hero-burst { grid-template-columns: 50px repeat(3, 1fr); }
+    .outcome-grid, .status-grid, .definition-grid, .rule-grid, .structure-diagram, .glossary { grid-template-columns: 1fr; }
+    .principle-card { grid-template-columns: 1fr; }
+    .principle-card__mark { width: 58px; height: 58px; }
+    .hierarchy-row { grid-template-columns: 1fr; }
+    .hierarchy-arrow { text-align: center; }
+    .hierarchy-node { min-height: 100px; }
+    .page-map__body { grid-template-columns: 75px 1fr; }
+    .page-map__panel { display: none; }
+    .page-map__toolbar span:nth-last-child(-n+3) { display: none; }
+    .feature-list { grid-template-columns: 1fr; }
+    .matching-diagram { grid-template-columns: 1fr; }
+    .matching-diagram figcaption { grid-column: auto; }
+    .match-result { grid-template-columns: 72px 1fr; }
+    .subjects-diagram { grid-template-columns: 1fr; }
+    .subject-lines { display: none; }
+    .subject-results { margin-top: 12px; }
+    .subjects-diagram figcaption { grid-column: auto; }
+    .source-formula { grid-template-columns: 1fr; }
+    .source-formula b { transform: rotate(90deg); }
+    .gr-zones { grid-template-columns: 1fr; }
+    .gr-zone { min-height: 80px; }
+    .structure-diagram figcaption { grid-column: auto; }
+    .operation-list article { grid-template-columns: 1fr; gap: 7px; }
+    .save-flow { flex-direction: column; }
+    .save-flow b { transform: rotate(90deg); }
+    .guide-end { padding: 26px; }
+  }
+
+  @media print {
+    :global(.nav), :global(.footer), .guide-nav, .hero-actions { display: none !important; }
+    :global(main) { padding-top: 0 !important; }
+    .guide-hero { padding-top: 30px; }
+    .guide-layout { display: block; }
+    .guide-content { max-width: 100%; }
+    .guide-section, figure, article, details, table { break-inside: avoid; }
+    .guide-section { padding-top: 36px; }
+  }
+</style>

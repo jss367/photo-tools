@@ -54,8 +54,39 @@ for (const entry of helpData) {
     </div>
   </section>
 
+  <!-- Detailed guides -->
+  <section class="section section--light" id="guides">
+    <div class="container docs-section">
+      <div class="section-heading-row">
+        <div>
+          <p class="section-kicker">Detailed guides</p>
+          <h2>Understand every decision</h2>
+        </div>
+        <p class="section-intro">Visual, task-oriented references for Vireo's most powerful workflows.</p>
+      </div>
+
+      <a class="guide-card" href={`${base}docs/process-review/`}>
+        <div class="guide-card__art" aria-hidden="true">
+          <span class="guide-card__encounter">
+            <i></i><i></i><i></i><i></i>
+          </span>
+          <span class="guide-card__decision">Review</span>
+        </div>
+        <div class="guide-card__body">
+          <div class="guide-card__eyebrow">
+            <span>Process Review</span>
+            <span class="guide-card__badge">Design preview</span>
+          </div>
+          <h3>Review encounters, predictions, and grouping</h3>
+          <p>Learn how to narrow a large review without losing context, resolve species disagreements, work with multiple models, and correct burst or encounter boundaries.</p>
+          <span class="guide-card__link">Read the detailed guide <span aria-hidden="true">&rarr;</span></span>
+        </div>
+      </a>
+    </div>
+  </section>
+
   <!-- FAQ -->
-  <section class="section section--light" id="faq">
+  <section class="section" id="faq">
     <div class="container docs-section">
       <h2>FAQ</h2>
 
@@ -88,7 +119,7 @@ for (const entry of helpData) {
   <section class="section section--navy">
     <div class="container github-callout">
       <h2>Looking for more?</h2>
-      <p>For technical documentation, troubleshooting, API details, and contributing guidelines, visit the project on GitHub.</p>
+      <p>For technical documentation, troubleshooting, developer interfaces, and contributing guidelines, visit the project on GitHub.</p>
       <a href="https://github.com/jss367/vireo" class="btn btn--primary btn--large" target="_blank" rel="noopener">View on GitHub</a>
     </div>
   </section>
@@ -115,6 +146,138 @@ for (const entry of helpData) {
   .docs-section h2 {
     font-size: var(--text-3xl);
     margin-bottom: var(--space-2xl);
+  }
+
+  .section-heading-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: end;
+    gap: var(--space-xl);
+    margin-bottom: var(--space-2xl);
+  }
+
+  .section-heading-row h2 {
+    margin-bottom: 0;
+  }
+
+  .section-kicker {
+    color: var(--color-accent);
+    font-size: var(--text-xs);
+    font-weight: 800;
+    letter-spacing: 0.1em;
+    margin-bottom: var(--space-sm);
+    text-transform: uppercase;
+  }
+
+  .section-intro {
+    color: var(--color-text-muted);
+    max-width: 420px;
+  }
+
+  .guide-card {
+    display: grid;
+    grid-template-columns: minmax(240px, 0.75fr) minmax(0, 1.25fr);
+    overflow: hidden;
+    color: var(--color-text-on-light);
+    background: var(--color-bg-white);
+    border: 1px solid rgba(58, 53, 32, 0.12);
+    border-radius: 16px;
+    box-shadow: var(--shadow-sm);
+    text-decoration: none;
+    transition: transform var(--transition-fast), box-shadow var(--transition-fast), border-color var(--transition-fast);
+  }
+
+  .guide-card:hover {
+    color: var(--color-text-on-light);
+    border-color: var(--color-accent);
+    box-shadow: var(--shadow-md);
+    transform: translateY(-2px);
+  }
+
+  .guide-card__art {
+    min-height: 250px;
+    display: grid;
+    place-items: center;
+    position: relative;
+    background:
+      radial-gradient(circle at 72% 30%, rgba(255, 255, 255, 0.72), transparent 28%),
+      linear-gradient(145deg, #eef7ef, #e6f2f6);
+  }
+
+  .guide-card__encounter {
+    width: min(78%, 290px);
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    padding: 12px;
+    background: rgba(255, 255, 255, 0.82);
+    border: 1px solid rgba(44, 93, 68, 0.2);
+    border-radius: 12px;
+    box-shadow: 0 16px 36px rgba(37, 74, 55, 0.12);
+  }
+
+  .guide-card__encounter i {
+    aspect-ratio: 4 / 3;
+    border-radius: 6px;
+    background: linear-gradient(150deg, #8eb49a, #cbdcbd);
+  }
+
+  .guide-card__encounter i:nth-child(2) { background: linear-gradient(150deg, #6f9e80, #b9d2c1); }
+  .guide-card__encounter i:nth-child(3) { background: linear-gradient(150deg, #d8ba74, #f1dfad); }
+  .guide-card__encounter i:nth-child(4) { background: linear-gradient(150deg, #7ea6ac, #c1d8db); }
+
+  .guide-card__decision {
+    position: absolute;
+    right: 9%;
+    bottom: 17%;
+    padding: 5px 10px;
+    color: #694d00;
+    background: #fff4c7;
+    border: 1px solid #e6c95e;
+    border-radius: 999px;
+    font-size: var(--text-xs);
+    font-weight: 800;
+    box-shadow: var(--shadow-sm);
+  }
+
+  .guide-card__body {
+    padding: var(--space-2xl);
+    align-self: center;
+  }
+
+  .guide-card__eyebrow {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    color: var(--color-text-muted);
+    font-size: var(--text-sm);
+    font-weight: 700;
+    margin-bottom: var(--space-md);
+  }
+
+  .guide-card__badge {
+    padding: 3px 8px;
+    color: #315e70;
+    background: #e8f4f8;
+    border-radius: 999px;
+    font-size: var(--text-xs);
+  }
+
+  .guide-card h3 {
+    font-size: var(--text-2xl);
+    line-height: 1.25;
+    margin-bottom: var(--space-md);
+  }
+
+  .guide-card p {
+    color: var(--color-text-muted);
+    margin-bottom: var(--space-lg);
+    max-width: 650px;
+  }
+
+  .guide-card__link {
+    color: var(--color-accent-hover);
+    font-weight: 700;
   }
 
   /* Getting Started steps */
@@ -246,6 +409,28 @@ for (const entry of helpData) {
     max-width: 600px;
     margin-left: auto;
     margin-right: auto;
+  }
+
+  @media (max-width: 720px) {
+    .section-heading-row {
+      display: block;
+    }
+
+    .section-intro {
+      margin-top: var(--space-md);
+    }
+
+    .guide-card {
+      grid-template-columns: 1fr;
+    }
+
+    .guide-card__art {
+      min-height: 190px;
+    }
+
+    .guide-card__body {
+      padding: var(--space-xl);
+    }
   }
 </style>
 

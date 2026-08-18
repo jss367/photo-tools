@@ -650,6 +650,8 @@ def _job_summary(observations):
                 "last_resource_wait_seconds": job.get("resource_wait_seconds", 0.0),
                 "last_resource_wait_count": job.get("resource_wait_count", 0),
             })
+            if record["started_at"] is None and job.get("started_at"):
+                record["started_at"] = job["started_at"]
             progress = job.get("progress") or {}
             if progress:
                 record["last_progress"] = progress

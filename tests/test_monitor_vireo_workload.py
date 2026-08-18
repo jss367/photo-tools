@@ -482,6 +482,66 @@ def test_job_summary_tracks_history_only_jobs_and_ignores_baseline_history():
     assert report["summary"]["jobs"][0]["observed_resource_wait_seconds"] == 1.25
 
 
+def test_queued_job_refreshes_started_at_for_scenario_makespan():
+    clock = _FakeClock()
+    empty = {
+        "status": 200,
+        "latency_seconds": 0.001,
+        "resource_budget": {"waiters": 0},
+        "workload_metrics": {"embedding_cache": {}},
+        "jobs": [],
+    }
+    queued = {
+        **empty,
+        "jobs": [{
+            "id": "queued-job",
+            "type": "pipeline",
+            "status": "queued",
+            "source": "active",
+            "started_at": None,
+        }],
+    }
+    completed = {
+        **empty,
+        "jobs": [{
+            "id": "queued-job",
+            "type": "pipeline",
+            "status": "completed",
+            "source": "history",
+            "started_at": "2026-08-17T12:00:00+00:00",
+            "finished_at": "2026-08-17T12:00:10+00:00",
+            "duration": 10.0,
+        }],
+    }
+    api = _SequenceApi([empty, queued, completed])
+    process = _SequenceSampler(
+        [
+            {"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True},
+            {"cpu_percent": 100.0, "rss_bytes": 100, "executable_exists": True},
+        ],
+        {"pid": 123, "executable_exists": True},
+    )
+    system = _SequenceSampler(
+        [{"cpu_idle_percent": 50.0}, {"cpu_idle_percent": 50.0}],
+        {"logical_cpu_count": 16},
+    )
+
+    report = collect_workload(
+        duration=2.0,
+        interval=1.0,
+        api_client=api,
+        process_sampler=process,
+        system_sampler=system,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert report["summary"]["jobs"][0]["started_at"] == (
+        "2026-08-17T12:00:00+00:00"
+    )
+    assert report["summary"]["scenario"]["workload_makespan_seconds"] == 10.0
+
+
 def test_single_flight_target_is_unknown_when_any_api_sample_fails():
     """`embedding_delta` is computed from the last successful API poll,
     so any single-flight violation happening after the last success is

@@ -211,6 +211,7 @@ def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_
     seq_counters = {}
     exported = 0
     errors = []
+    metadata_jobs = []
 
     # Per-export cache of developed-directory scans. Keyed by directory
     # path; each value is the (stem, ext_lower) → absolute-path map that
@@ -423,8 +424,7 @@ def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_
             img.close()
             if metadata_fields:
                 try:
-                    _write_export_metadata(
-                        out_path,
+                    metadata_args = _export_metadata_args(
                         metadata_fields,
                         photo,
                         species_list,
@@ -438,13 +438,25 @@ def export_photos(db, vireo_dir, photo_ids, destination, options=None, progress_
                     with contextlib.suppress(OSError):
                         os.unlink(out_path)
                     raise
-            exported += 1
+                if metadata_args:
+                    metadata_jobs.append((out_path, photo["filename"], metadata_args))
+                else:
+                    exported += 1
+            else:
+                exported += 1
         except Exception as exc:
             log.warning("Export failed for %s: %s", photo["filename"], exc)
             errors.append(f"{photo['filename']}: {exc}")
 
         if progress_cb:
             progress_cb(i + 1, len(photo_ids), photo["filename"])
+
+    if metadata_jobs:
+        metadata_exported, metadata_errors = _write_export_metadata_batch(
+            metadata_jobs,
+        )
+        exported += metadata_exported
+        errors.extend(metadata_errors)
 
     return {"exported": exported, "errors": errors, "destination": destination}
 
@@ -551,12 +563,8 @@ def _metadata_assignment(tag, value):
     return f"-{tag}={text}"
 
 
-def _write_export_metadata(
-    out_path, fields, photo, species, camera_data, location_data=None,
-):
-    """Embed selected catalog metadata into one rendered export via ExifTool."""
-    from metadata import _exiftool_command, find_exiftool
-
+def _export_metadata_args(fields, photo, species, camera_data, location_data=None):
+    """Build ExifTool assignments for one rendered export."""
     args = []
     selected = set(fields)
 
@@ -644,30 +652,84 @@ def _write_export_metadata(
 
     # A selected field can legitimately be unavailable for one photo. In
     # that case there is nothing to write and the image itself still exports.
-    if not args:
-        return
+    return args
+
+
+def _exiftool_argfile_path(path):
+    """Encode a path as one ExifTool argfile C-string line."""
+    escaped = str(path).replace("\\", "\\\\")
+    escaped = escaped.replace("\r", "\\r").replace("\n", "\\n")
+    return f"#[CSTR]{escaped}"
+
+
+def _write_export_metadata_batch(jobs):
+    """Write per-file metadata commands through one ExifTool process."""
+    from metadata import _exiftool_command, find_exiftool
 
     exiftool = find_exiftool()
     if not exiftool:
-        raise RuntimeError("ExifTool is required to include export metadata")
-    command = [
-        *_exiftool_command(exiftool),
-        "-overwrite_original",
-        "-n",
-        *args,
-        "--",
-        out_path,
-    ]
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        **no_window_kwargs(),
-    )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(detail or "ExifTool could not write export metadata")
+        detail = "ExifTool is required to include export metadata"
+        return _fail_export_metadata_jobs(jobs, detail)
+
+    argfile_lines = []
+    marker_prefix = "VIREO_METADATA_STATUS_"
+    for index, (out_path, _filename, args) in enumerate(jobs, start=1):
+        argfile_lines.extend([
+            "-overwrite_original",
+            "-n",
+            *args,
+            _exiftool_argfile_path(os.path.abspath(out_path)),
+            "-echo3",
+            f"{marker_prefix}{index}_${{status}}",
+            f"-execute{index}",
+        ])
+
+    timeout = max(120, min(3600, len(jobs) * 5))
+    try:
+        result = subprocess.run(
+            [*_exiftool_command(exiftool), "-@", "-"],
+            input="\n".join(argfile_lines) + "\n",
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            **no_window_kwargs(),
+        )
+    except subprocess.TimeoutExpired:
+        return _fail_export_metadata_jobs(jobs, "ExifTool metadata write timed out")
+
+    statuses = {
+        int(index): int(status)
+        for index, status in re.findall(
+            rf"^{marker_prefix}(\d+)_(\d+)$", result.stdout, re.MULTILINE,
+        )
+    }
+    invocation_failed = result.returncode != 0 and not statuses
+    error_lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+    exported = 0
+    errors = []
+    for index, (out_path, filename, _args) in enumerate(jobs, start=1):
+        status = statuses.get(index)
+        if not invocation_failed and status == 0:
+            exported += 1
+            continue
+        detail = next(
+            (line for line in error_lines if out_path in line),
+            error_lines[0] if error_lines else "ExifTool could not write export metadata",
+        )
+        with contextlib.suppress(OSError):
+            os.unlink(out_path)
+        errors.append(f"{filename}: {detail}")
+    return exported, errors
+
+
+def _fail_export_metadata_jobs(jobs, detail):
+    """Remove derivatives for a failed metadata batch and return job errors."""
+    errors = []
+    for out_path, filename, _args in jobs:
+        with contextlib.suppress(OSError):
+            os.unlink(out_path)
+        errors.append(f"{filename}: {detail}")
+    return 0, errors
 
 
 def _recipe_result_dimensions(width, height, recipe):

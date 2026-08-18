@@ -156,7 +156,7 @@ def test_export_photos_basic(export_env):
     assert os.path.isfile(os.path.join(env["dest"], "bird2.jpg"))
 
 
-def test_export_photos_embeds_only_selected_metadata(export_env):
+def test_export_photos_embeds_only_selected_metadata(export_env, monkeypatch):
     """Checkbox selections become standard EXIF, IPTC, and XMP fields."""
     from metadata import exiftool_available, extract_metadata
 
@@ -182,10 +182,22 @@ def test_export_photos_embeds_only_selected_metadata(export_env):
     env["db"].tag_photo(env["p1"], second_species)
     env["db"].conn.commit()
 
+    import export as export_module
+
+    real_run = export_module.subprocess.run
+    metadata_write_calls = []
+
+    def tracking_run(command, *args, **kwargs):
+        if "-@" in command:
+            metadata_write_calls.append(command)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(export_module.subprocess, "run", tracking_run)
+
     result = export_photos(
         db=env["db"],
         vireo_dir=env["vireo_dir"],
-        photo_ids=[env["p1"]],
+        photo_ids=[env["p1"], env["p2"]],
         destination=env["dest"],
         options={
             "metadata_fields": [
@@ -194,8 +206,9 @@ def test_export_photos_embeds_only_selected_metadata(export_env):
         },
     )
 
-    assert result["exported"] == 1
+    assert result["exported"] == 2
     assert result["errors"] == []
+    assert len(metadata_write_calls) == 1
     output = os.path.join(env["dest"], "bird1.jpg")
     metadata = extract_metadata([output])[output]
     assert metadata["XMP"]["Subject"] == [

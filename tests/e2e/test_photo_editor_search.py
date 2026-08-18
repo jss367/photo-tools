@@ -264,3 +264,94 @@ def test_photo_editor_crop_lock_keeps_current_aspect(live_server, page):
 
     after = crop_aspect()
     assert abs(after - before) < 0.001
+
+
+def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page):
+    """The editor zoom slider scales continuously and keeps exact Fit/100% actions."""
+    url = live_server["url"]
+    photo_id = live_server["data"]["photos"][0]
+    preview_svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' width='4000' height='3000'>"
+        "<rect width='4000' height='3000' fill='green'/></svg>"
+    )
+
+    page.route(
+        "**/photos/*/edit-preview**",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="image/svg+xml",
+            body=preview_svg,
+        ),
+    )
+    page.set_viewport_size({"width": 2000, "height": 1000})
+    page.goto(f"{url}/edit/{photo_id}")
+    expect(page.locator("#editorFilename")).to_have_text("hawk1.jpg")
+    page.wait_for_function(
+        "() => document.getElementById('editorImg').naturalWidth > 0"
+    )
+
+    # Make the source dimensions deterministic independently of the fixture.
+    page.evaluate(
+        """() => {
+            editorState.photo.width = 4000;
+            editorState.photo.height = 3000;
+            applyEditorZoom();
+            updateEditorZoomControl();
+        }"""
+    )
+
+    page.locator("#actualBtn").click()
+    expect(page.locator("#editorZoomSlider")).to_have_attribute(
+        "aria-valuetext", "100%"
+    )
+    page.wait_for_function(
+        "() => document.getElementById('editorImg').src.includes('size=4000')"
+    )
+    actual = page.evaluate(
+        """() => ({
+            mode: editorState.zoomMode,
+            width: document.getElementById('editorImg').clientWidth,
+            zoomed: document.getElementById('editorCanvasWrap')
+                .classList.contains('zoom-custom'),
+            focusX: (() => {
+                const img = document.getElementById('editorImg').getBoundingClientRect();
+                const wrap = document.getElementById('editorCanvasWrap');
+                const viewport = wrap.getBoundingClientRect();
+                return (viewport.left + wrap.clientWidth / 2 - img.left) / img.width;
+            })()
+        })"""
+    )
+    assert actual["mode"] == "custom"
+    assert actual["width"] == 4000
+    assert actual["zoomed"] is True
+    assert abs(actual["focusX"] - 0.5) < 0.01
+
+    page.evaluate(
+        """() => {
+            const slider = document.getElementById('editorZoomSlider');
+            slider.value = String(Math.round(editorZoomSliderPosition(50)));
+            slider.dispatchEvent(new Event('input', {bubbles: true}));
+        }"""
+    )
+    page.wait_for_function("() => Math.abs(editorState.zoomPercent - 50) < 0.5")
+    page.wait_for_function(
+        "() => document.getElementById('editorImg').src.includes('size=2048')"
+    )
+    intermediate_width = page.evaluate(
+        "() => document.getElementById('editorImg').clientWidth"
+    )
+    assert abs(intermediate_width - 2000) <= 4
+
+    page.locator("#fitBtn").click()
+    expect(page.locator("#editorZoomSlider")).to_have_attribute(
+        "aria-valuetext", "Fit"
+    )
+    fit = page.evaluate(
+        """() => ({
+            mode: editorState.zoomMode,
+            inlineWidth: document.getElementById('editorImg').style.width,
+            zoomed: document.getElementById('editorCanvasWrap')
+                .classList.contains('zoom-custom')
+        })"""
+    )
+    assert fit == {"mode": "fit", "inlineWidth": "", "zoomed": False}

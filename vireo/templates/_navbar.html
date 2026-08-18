@@ -8624,8 +8624,9 @@ function closeLightbox(e) {
  * The lightbox is shared across pages (browse, review, etc.), so the menu
  * sits in _navbar.html alongside the overlay. Rating / color / flag / reveal
  * helpers (`setRatingFor`, `setColorLabelFor`, `setFlagFor`, `findSimilar`,
- * `openInEditor`, `revealPhoto`, `copyPhotoPaths`) are defined on pages that
- * carry a photo grid (browse.html). On /review, there is no selection model
+ * `openInEditor`, `openPhotoExportModal`, `revealPhoto`, `copyPhotoPaths`) are
+ * defined on pages that carry a photo grid (browse.html). On /review, there
+ * is no selection model
  * but per-photo `setReviewRating` / `setReviewFlag` helpers exist and the
  * rating/flag chips fall through to them. Pages without a page-local flag
  * helper use the shared photo flag endpoint. Color labels are not part of the
@@ -8734,6 +8735,18 @@ function buildLightboxContextMenu(pid) {
   }
   if (has('openInEditor')) {
     items = items.concat(window.buildOpenInEditorMenuItems([pid]));
+  }
+  if (has('openPhotoExportModal')) {
+    items.push({ label: 'Export\u2026',
+      onClick: function() {
+        // The lightbox can navigate while its context menu remains open.
+        // Resolve the visible identity now instead of exporting the photo
+        // that happened to be current when the menu was built.
+        var exportPid = _lightboxCommittedId != null
+          ? _lightboxCommittedId
+          : _lightboxCurrentId;
+        if (exportPid != null) window.openPhotoExportModal([exportPid]);
+      } });
   }
   items.push({ label: window.VIREO_REVEAL_LABEL,
     onClick: function() { revealLightboxPhoto(pid); } });

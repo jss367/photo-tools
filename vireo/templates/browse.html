@@ -10361,6 +10361,7 @@ document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') {
       if (openModal.id === 'batchKeywordModal') hideBatchKeywordModal();
       else if (openModal.id === 'batchCollectionModal') hideBatchCollectionModal();
+      else if (openModal.id === 'exportOverlay') closeExportModal();
       else openModal.classList.remove('open');
     }
     return;
@@ -11499,6 +11500,8 @@ async function _runPhotoDeepLink(photoId) {
 })();
 
 /* ---------- Export Modal ---------- */
+var _exportPhotoIds = null;
+
 function migrateExportCaptureDateTimePreference() {
   var combinedKey = 'vireo.browse.export.metadata.captureDateTime';
   if (VireoViewPreferences.read(combinedKey) !== null) return;
@@ -11513,9 +11516,13 @@ function migrateExportCaptureDateTimePreference() {
   );
 }
 
-function openExportModal() {
-  var activeIds = getActiveSelection();
+function openExportModal(photoIds) {
+  var activeIds = Array.isArray(photoIds) ? photoIds.slice() : getActiveSelection();
   if (activeIds.length === 0) return;
+  // Snapshot the requested photos for the lifetime of the modal. In
+  // particular, the lightbox menu exports the displayed photo even when the
+  // Browse grid has a different single- or multi-photo selection behind it.
+  _exportPhotoIds = activeIds;
   document.getElementById('exportSubmitBtn').textContent = 'Export ' + activeIds.length + ' photo' + (activeIds.length === 1 ? '' : 's');
   document.getElementById('exportSubmitBtn').disabled = false;
   document.getElementById('exportPreset').value = 'original-jpg';
@@ -11532,6 +11539,17 @@ function openExportModal() {
   updateExportPreview();
 }
 
+// The shared lightbox only offers photo export when its host page exposes
+// this capability. Other pages use openExportModal for unrelated exports
+// (for example Life List data), so the context menu must not key off that
+// generic function name.
+function openPhotoExportModal(photoIds) {
+  if (document.getElementById('lightboxOverlay').classList.contains('active')) {
+    closeLightbox();
+  }
+  openExportModal(photoIds);
+}
+
 function selectedExportMetadataFields() {
   return Array.from(document.querySelectorAll('.export-metadata-option input:checked'))
     .reduce(function(fields, input) {
@@ -11546,6 +11564,7 @@ function selectedExportMetadataFields() {
 
 function closeExportModal() {
   document.getElementById('exportOverlay').classList.remove('open');
+  _exportPhotoIds = null;
 }
 
 const exportFolderBrowser = new VireoFolderBrowser({
@@ -11645,8 +11664,12 @@ function updateExportPreview() {
   var template = document.getElementById('exportTemplate').value;
   if (!template) { document.getElementById('exportPreview').textContent = ''; return; }
   // Use first selected photo for preview
-  var firstId = getActiveSelection()[0];
+  var firstId = (_exportPhotoIds || getActiveSelection())[0];
   var photo = photos.find(function(p) { return p.id === firstId; });
+  // Find Similar and other shared-lightbox entry points can display photos
+  // outside Browse's currently loaded page. Their metadata remains available
+  // through the lightbox cache/list after the viewer closes for this modal.
+  if (!photo && typeof _lbPhotoData === 'function') photo = _lbPhotoData(firstId);
   if (!photo) { document.getElementById('exportPreview').textContent = ''; return; }
   var stem = photo.filename.replace(/\.[^.]+$/, '');
   var ts = photo.timestamp || '';
@@ -11706,7 +11729,7 @@ async function startExport() {
   var format = document.getElementById('exportFormat').value || 'jpg';
   var template = document.getElementById('exportTemplate').value || '{original}';
   var btn = document.getElementById('exportSubmitBtn');
-  var activeIds = getActiveSelection();
+  var activeIds = (_exportPhotoIds || getActiveSelection()).slice();
   var count = activeIds.length;
   btn.disabled = true;
 

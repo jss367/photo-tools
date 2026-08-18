@@ -300,6 +300,17 @@ def test_photo_editor_continuous_zoom_has_fit_and_native_stops(live_server, page
         }"""
     )
 
+    stale_ratio = page.evaluate(
+        """() => {
+            const originalRecipe = cloneRecipe(editorState.recipe);
+            editorState.recipe.rotation = 90;
+            const dims = editorNativeDisplayDimensions();
+            editorState.recipe = originalRecipe;
+            return dims;
+        }"""
+    )
+    assert stale_ratio == {"width": 3000, "height": 4000}
+
     page.set_viewport_size({"width": 5000, "height": 4000})
     native_stop = page.evaluate(
         """() => {

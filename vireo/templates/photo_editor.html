@@ -963,6 +963,21 @@ function editorZoomRecipe() {
   return editorState.showBefore ? editorState.savedRecipe : editorState.recipe;
 }
 
+function editorImageMatchesZoomRecipe(img) {
+  if (!img || !editorState.photoId) return false;
+  try {
+    var url = new URL(img.currentSrc || img.src, window.location.href);
+    if (url.pathname !== '/photos/' + editorState.photoId + '/edit-preview') {
+      return false;
+    }
+    var loadedRecipe = JSON.parse(url.searchParams.get('recipe') || '{}');
+    return recipeKey(loadedRecipe) ===
+      recipeKey(previewRecipeFor(editorZoomRecipe() || {}));
+  } catch (_) {
+    return false;
+  }
+}
+
 function editorNativeDisplayDimensions() {
   var photo = editorState.photo || {};
   var width = Number(photo.width) || 0;
@@ -984,7 +999,8 @@ function editorNativeDisplayDimensions() {
   // source's native long edge while following the preview's authoritative
   // post-transform aspect ratio once it is available.
   var img = document.getElementById('editorImg');
-  if (img && img.complete && img.naturalWidth && img.naturalHeight) {
+  if (img && img.complete && img.naturalWidth && img.naturalHeight &&
+      editorImageMatchesZoomRecipe(img)) {
     var nativeLong = Math.max(width, height);
     var loadedSize = 0;
     try {

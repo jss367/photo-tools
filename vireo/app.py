@@ -36755,16 +36755,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             native_dims = _recipe_source_dimensions(photo)
             load_max_size = size
             if apply_crop and recipe.get("crop"):
-                if all(native_dims):
-                    native_source_long = max(native_dims)
+                selected_dims = native_dims
+                try:
+                    from PIL import Image as _PILImage
+
+                    with _PILImage.open(canonical) as selected_image:
+                        candidate_dims = _image_size_after_exif_orientation(
+                            selected_image,
+                        )
+                    if all(candidate_dims):
+                        selected_dims = candidate_dims
+                except Exception:
+                    # Some RAW formats cannot be opened by Pillow. Their stored
+                    # native dimensions remain the best available decode bound.
+                    pass
+                if all(selected_dims):
+                    selected_source_long = max(selected_dims)
                     rendered_long = rendered_recipe_long_edge(
-                        native_dims[0], native_dims[1], recipe,
+                        selected_dims[0], selected_dims[1], recipe,
                     )
                     if rendered_long > 0:
                         load_max_size = min(
-                            native_source_long,
+                            selected_source_long,
                             int(math.ceil(
-                                size * native_source_long / rendered_long
+                                size * selected_source_long / rendered_long
                             )),
                         )
                 else:

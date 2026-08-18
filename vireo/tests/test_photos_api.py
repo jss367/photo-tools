@@ -2822,6 +2822,39 @@ def test_edit_preview_applies_committed_crop_when_requested(client_with_photo):
         assert img.size == (192, 256)
 
 
+def test_edit_preview_crop_scales_from_selected_source_dimensions(
+    client_with_photo, monkeypatch,
+):
+    """A differently shaped working source must retain the requested edge."""
+    import io
+
+    import app as app_module
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    folder = db.conn.execute("SELECT path FROM folders").fetchone()
+    selected_path = os.path.join(folder["path"], "selected-working-copy.jpg")
+    Image.new("RGB", (800, 450), (30, 80, 120)).save(selected_path, "JPEG")
+
+    monkeypatch.setattr(
+        app_module,
+        "_recipe_render_source",
+        lambda *_args, **_kwargs: (selected_path, True),
+    )
+    rendered = app.test_client().get(
+        f"/photos/{photo_id}/edit-preview",
+        query_string={
+            "size": "256",
+            "apply_crop": "1",
+            "recipe": '{"crop":{"x":0,"y":0,"w":0.25,"h":1}}',
+        },
+    )
+
+    assert rendered.status_code == 200
+    with Image.open(io.BytesIO(rendered.data)) as img:
+        assert img.size[1] == 256
+
+
 def test_edit_preview_scales_detail_to_native_resolution(client_with_photo):
     """A downscaled edit-preview of a sharpen recipe must shrink the USM
     kernel by the render scale (output px per native px): the served bytes

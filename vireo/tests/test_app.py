@@ -3066,6 +3066,53 @@ def test_compare_predictions_api_can_refresh_selected_photos(app_and_db):
     ] == [photo_ids[1]]
 
 
+def test_compare_predictions_api_limits_targeted_photo_ids(app_and_db):
+    """A targeted refresh cannot build an unbounded collection query."""
+    import app as app_module
+
+    app, db = app_and_db
+    cid = db.add_collection("Target limit", "[]")
+    query = [("collection_id", str(cid))]
+    query.extend(
+        ("photo_id", str(photo_id))
+        for photo_id in range(app_module._MAX_SELECTION_PHOTOS + 1)
+    )
+
+    response = app.test_client().get(
+        "/api/predictions/compare", query_string=query,
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "too many photo_ids"
+
+
+def test_collection_photo_narrowing_wraps_any_rules(app_and_db):
+    """A target ID applies to every branch of an any-mode collection."""
+    import json
+
+    _app, db = app_and_db
+    photo_ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY id LIMIT 3"
+        ).fetchall()
+    ]
+    cid = db.add_collection(
+        "Any-mode target",
+        json.dumps({
+            "mode": "any",
+            "rules": [
+                {"field": "photo_ids", "value": [photo_ids[0]]},
+                {"field": "photo_ids", "value": [photo_ids[1]]},
+            ],
+        }),
+    )
+
+    rows = db.get_collection_photos(cid, photo_ids=[photo_ids[1]])
+
+    assert [row["id"] for row in rows] == [photo_ids[1]]
+
+
 def test_compare_predictions_api_preserves_unclassified_subject(app_and_db):
     """A qualifying box remains visible when no classifier prediction exists."""
     app, db = app_and_db
@@ -20734,6 +20781,9 @@ async function loadComparison() {}
 """
 
 _ID_CONFLICTS_BATCH_DRIVER = """
+// This harness tests grouped decision accounting, not comparison transport.
+// The production refresh has browser dependencies and is covered by E2E tests.
+refreshDecisionPhotos = async function() {};
 batchAction('accept').then(function() {
   process.stdout.write(JSON.stringify({
     toasts: __toasts, requests: __requests, status: __status,

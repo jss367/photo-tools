@@ -1598,7 +1598,12 @@ async function predictionAction(predId, action) {
     } else {
       showToast('Could not confirm the decision (' +
         (e && e.message ? e.message : 'the request failed') +
-        ') — refreshing the photo to show the current state.', 'error');
+        ') — reloading the comparison to show the current state.', 'error');
+      // An accept/replace response can be lost after a grouped write commits.
+      // Without its photo_ids response we cannot know every burst member that
+      // changed, so only a full reload can reconcile the collection safely.
+      await loadComparison();
+      return;
     }
     await refreshDecisionPhotos(entryPhotoIds);
     return;
@@ -1634,13 +1639,19 @@ function comparePhotoIdsForPredictions(predictionIds) {
   var wanted = new Set((predictionIds || []).map(function(id) {
     return Number(id);
   }));
-  var photoIds = [];
-  (compareData && compareData.photos || []).forEach(function(photo) {
-    var found = Object.keys(photo.predictions || {}).some(function(model) {
-      return (photo.predictions[model] || []).some(function(pred) {
+  function hasWantedPrediction(predictions) {
+    return Object.keys(predictions || {}).some(function(model) {
+      return (predictions[model] || []).some(function(pred) {
         return wanted.has(Number(pred.id));
       });
     });
+  }
+  var photoIds = [];
+  (compareData && compareData.photos || []).forEach(function(photo) {
+    var found = hasWantedPrediction(photo.predictions) ||
+      (photo.subjects || []).some(function(subject) {
+        return hasWantedPrediction(subject.predictions);
+      });
     if (found) photoIds.push(photo.photo_id);
   });
   return photoIds;

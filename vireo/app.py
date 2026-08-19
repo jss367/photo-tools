@@ -16751,6 +16751,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         requested_photo_values = request.args.getlist("photo_id")
         requested_photo_ids = None
         if requested_photo_values:
+            if len(requested_photo_values) > _MAX_SELECTION_PHOTOS:
+                return json_error("too many photo_ids")
             try:
                 requested_photo_ids = [
                     int(value) for value in requested_photo_values

@@ -127,6 +127,8 @@ def test_compare_reject_updates_in_place_without_reloading_collection(
 
 def test_compare_accept_refreshes_only_the_changed_photo(live_server, page):
     """Keyword writes refresh their taxonomy comparison, not the collection."""
+    from urllib.parse import parse_qs, urlparse
+
     photo_id = live_server["data"]["photos"][1]
     compare_requests = []
     page.on(
@@ -149,7 +151,8 @@ def test_compare_accept_refreshes_only_the_changed_photo(live_server, page):
         "Red-tailed Hawk"
     )
     assert len(compare_requests) == 1
-    assert f"photo_id={photo_id}" in compare_requests[0]
+    query = parse_qs(urlparse(compare_requests[0]).query)
+    assert query["photo_id"] == [str(photo_id)]
 
 
 def test_compare_treats_second_detected_species_as_additional(live_server, page):
@@ -421,8 +424,7 @@ def test_compare_full_load_resets_filter_when_stale_cache_reports_needs_review(
     db.conn.commit()
 
     # Exercise the full-load path directly.
-    page.evaluate("() => loadComparison()")
-    page.wait_for_function("() => window.compareData !== null")
+    page.evaluate("async () => { await loadComparison(); }")
 
     # The reload must have cleared the cache before computing the summary,
     # so activeFilter reflects the fresh dataset (0 pending → 'all'), not

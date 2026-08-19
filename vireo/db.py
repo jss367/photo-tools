@@ -22815,10 +22815,11 @@ class Database:
                 return []
             placeholders = ",".join("?" for _ in narrowed_ids)
             id_condition = f"p.id IN ({placeholders})"
-            where = (
-                f"{where} AND {id_condition}"
-                if where else f"WHERE {id_condition}"
-            )
+            if where:
+                body = where[len("WHERE "):]
+                where = f"WHERE ({body}) AND {id_condition}"
+            else:
+                where = f"WHERE {id_condition}"
             params.extend(narrowed_ids)
         page = max(1, page)
         offset = (page - 1) * per_page

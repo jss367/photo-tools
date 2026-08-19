@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 from image_edits import apply_recipe_to_loaded_image
 from image_loader import RAW_DECODE_PRESERVE_HIGHLIGHTS, RAW_EXTENSIONS, load_image
@@ -44,6 +45,10 @@ EXPORT_METADATA_FIELDS = frozenset({
     "location",
     "camera",
 })
+
+
+class ExportPreflightError(RuntimeError):
+    """Raised when collision behavior cannot be verified safely."""
 
 
 def reveal_exported_files(paths):
@@ -322,49 +327,19 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
         folder_path = folders.get(photo["folder_id"], "")
         recipe = edit_recipes.get(pid)
         exif_data = exif_data_map.get(pid)
-        source_path = None
-        for dev_candidate in _iter_developed_outputs(
-            photo["filename"],
-            folder_path,
-            developed_dir,
-            developed_index,
-            preferred_exts=_developed_ext_preference(output_ext),
-        ):
-            # Guard against silent downscaling: darktable's develop job
-            # can write the output at --width=N, so a developed file may
-            # be smaller than the original. Keep trying lower-preference
-            # developed candidates before falling through to the working
-            # copy / original source.
-            if _developed_can_satisfy_size(
-                dev_candidate, photo, max_size, recipe, exif_data=exif_data
-            ):
-                source_path = dev_candidate
-                break
-        if not source_path:
-            use_wc = _working_copy_can_satisfy_export(
-                photo, recipe, max_size, wc_max, vireo_dir,
-                exif_data=exif_data, folder_path=folder_path,
-            )
-            source_path = None
-            if not use_wc:
-                primary_path = (
-                    os.path.join(folder_path, photo["filename"])
-                    if folder_path else ""
-                )
-                primary_is_raw = (
-                    os.path.splitext(photo["filename"])[1].lower()
-                    in RAW_EXTENSIONS
-                )
-                source_path = _companion_can_satisfy_export(
-                    photo, folder_path, recipe, max_size, exif_data=exif_data,
-                    skip_raw_primary=(
-                        not primary_is_raw or os.path.isfile(primary_path)
-                    ),
-                )
-            if not source_path:
-                source_path = _resolve_source(
-                    photo, vireo_dir, folders, use_working_copy=use_wc,
-                )
+        source_path = _select_export_source(
+            photo=photo,
+            folder_path=folder_path,
+            folders=folders,
+            recipe=recipe,
+            max_size=max_size,
+            wc_max=wc_max,
+            vireo_dir=vireo_dir,
+            developed_dir=developed_dir,
+            developed_index=developed_index,
+            output_ext=output_ext,
+            exif_data=exif_data,
+        )
         if not source_path or not os.path.isfile(source_path):
             errors.append(f"{photo['filename']}: source file missing")
             if progress_cb:
@@ -441,15 +416,8 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
                 progress_cb(i + 1, len(photo_ids), photo["filename"])
             continue
 
-        # Handle collisions
-        out_path = _deduplicate_path(out_path)
-
-        # Ensure subdirectory exists
-        out_dir = os.path.dirname(out_path)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-
         # Load, resize, and save
+        claimed_out_path = None
         try:
             load_max_size = (
                 None if recipe and recipe.get("crop") else (max_size or None)
@@ -535,8 +503,17 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
                         vireo_dir, pid, recipe,
                     ),
                 )
-            _save_export_image(img, out_path, format_info, quality)
-            img.close()
+            try:
+                out_path, output_stream = _claim_export_path(out_path)
+                claimed_out_path = out_path
+                try:
+                    _save_export_image(
+                        img, output_stream, format_info, quality,
+                    )
+                finally:
+                    output_stream.close()
+            finally:
+                img.close()
             if metadata_fields:
                 try:
                     metadata_args = _export_metadata_args(
@@ -564,6 +541,9 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
                 if exported_files is not None:
                     exported_files.append(out_path)
         except Exception as exc:
+            if claimed_out_path:
+                with contextlib.suppress(OSError):
+                    os.unlink(claimed_out_path)
             log.warning("Export failed for %s: %s", photo["filename"], exc)
             errors.append(f"{photo['filename']}: {exc}")
 
@@ -606,7 +586,7 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
     return result
 
 
-def _save_export_image(img, out_path, format_info, quality):
+def _save_export_image(img, output, format_info, quality):
     """Save a rendered export image in the requested output format."""
     pil_format = format_info["pil_format"]
     save_img = img
@@ -618,7 +598,7 @@ def _save_export_image(img, out_path, format_info, quality):
     elif pil_format == "TIFF":
         save_kwargs["compression"] = "tiff_lzw"
     try:
-        save_img.save(out_path, pil_format, **save_kwargs)
+        save_img.save(output, pil_format, **save_kwargs)
     finally:
         if save_img is not img:
             save_img.close()
@@ -1530,12 +1510,326 @@ def _resolve_source(photo, vireo_dir, folders, use_working_copy=False):
     return os.path.join(folder_path, photo["filename"])
 
 
-def _deduplicate_path(path):
-    """Append _2, _3, etc. if path already exists."""
-    if not os.path.exists(path):
+def _select_export_source(
+    *, photo, folder_path, folders, recipe, max_size, wc_max, vireo_dir,
+    developed_dir, developed_index, output_ext, exif_data,
+):
+    """Resolve the source candidate used before export allocates a filename."""
+    for dev_candidate in _iter_developed_outputs(
+        photo["filename"],
+        folder_path,
+        developed_dir,
+        developed_index,
+        preferred_exts=_developed_ext_preference(output_ext),
+    ):
+        if _developed_can_satisfy_size(
+            dev_candidate, photo, max_size, recipe, exif_data=exif_data,
+        ):
+            return dev_candidate
+
+    use_wc = _working_copy_can_satisfy_export(
+        photo, recipe, max_size, wc_max, vireo_dir,
+        exif_data=exif_data, folder_path=folder_path,
+    )
+    if not use_wc:
+        primary_path = (
+            os.path.join(folder_path, photo["filename"])
+            if folder_path else ""
+        )
+        primary_is_raw = (
+            os.path.splitext(photo["filename"])[1].lower() in RAW_EXTENSIONS
+        )
+        companion = _companion_can_satisfy_export(
+            photo,
+            folder_path,
+            recipe,
+            max_size,
+            exif_data=exif_data,
+            skip_raw_primary=(
+                not primary_is_raw or os.path.isfile(primary_path)
+            ),
+        )
+        if companion:
+            return companion
+    return _resolve_source(
+        photo, vireo_dir, folders, use_working_copy=use_wc,
+    )
+
+
+def _deduplicate_path(
+    path, reserved_paths=None, path_key=None, is_reserved=None,
+):
+    """Append _2, _3, etc. if a path exists or is reserved by this batch."""
+    reserved_paths = reserved_paths or set()
+    path_key = path_key or (lambda candidate: candidate)
+
+    def reserved(candidate):
+        if is_reserved is not None:
+            return is_reserved(candidate)
+        return path_key(candidate) in reserved_paths
+
+    if not os.path.lexists(path) and not reserved(path):
         return path
     stem, ext = os.path.splitext(path)
     counter = 2
-    while os.path.exists(f"{stem}_{counter}{ext}"):
+    while (
+        os.path.lexists(f"{stem}_{counter}{ext}")
+        or reserved(f"{stem}_{counter}{ext}")
+    ):
         counter += 1
     return f"{stem}_{counter}{ext}"
+
+
+def _claim_export_path(path):
+    """Atomically claim a non-overwriting output path and open stream."""
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    stem, ext = os.path.splitext(path)
+    counter = 1
+    while True:
+        candidate = path if counter == 1 else f"{stem}_{counter}{ext}"
+        try:
+            return candidate, open(candidate, "xb")
+        except FileExistsError:
+            counter += 1
+
+
+def _nearest_existing_directory(path):
+    """Return the directory whose filesystem will contain a planned path."""
+    existing_path = os.path.realpath(path)
+    while not os.path.isdir(existing_path):
+        parent = os.path.dirname(existing_path)
+        if parent == existing_path:
+            break
+        existing_path = parent
+    return existing_path
+
+
+def _destination_path_identity(path):
+    """Return a stable identity for an existing destination directory."""
+    existing_path = _nearest_existing_directory(path)
+    try:
+        destination_stat = os.stat(existing_path)
+    except OSError:
+        return ("path", os.path.normcase(os.path.realpath(existing_path)))
+    return (
+        "filesystem",
+        destination_stat.st_dev,
+        destination_stat.st_ino,
+    )
+
+
+class _DestinationPathReservations:
+    """Mirror planned paths on the destination volume to detect aliases."""
+
+    def __init__(self, destination):
+        self.destination = os.path.realpath(destination)
+        probe_path = os.path.realpath(destination)
+        while not os.path.isdir(probe_path):
+            parent = os.path.dirname(probe_path)
+            if parent == probe_path:
+                break
+            probe_path = parent
+        try:
+            self._temporary_directory = tempfile.TemporaryDirectory(
+                prefix=".VireoExportReservation-", dir=probe_path,
+            )
+        except OSError as exc:
+            raise ExportPreflightError(
+                "Vireo could not verify filename collisions on the destination "
+                "volume. Check the folder permissions and try again."
+            ) from exc
+        self.root = self._temporary_directory.name
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        self.close()
+
+    def close(self):
+        self._temporary_directory.cleanup()
+        self.root = None
+
+    def matches_destination(self, destination):
+        """Check whether destination can see this reservation's probe marker."""
+        marker_name = os.path.basename(self.root)
+        return os.path.isdir(os.path.join(os.path.realpath(destination), marker_name))
+
+    def _relative_path(self, candidate, destination=None):
+        destination = os.path.realpath(destination or self.destination)
+        relative = os.path.relpath(os.path.realpath(candidate), destination)
+        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+            return None
+        return relative
+
+    def contains(self, candidate, destination=None):
+        relative = self._relative_path(candidate, destination)
+        if relative is None:
+            return False
+        return os.path.exists(os.path.join(self.root, relative))
+
+    def add(self, candidate, destination=None):
+        relative = self._relative_path(candidate, destination)
+        if relative is None:
+            return
+        shadow_path = os.path.join(self.root, relative)
+        os.makedirs(os.path.dirname(shadow_path), exist_ok=True)
+        try:
+            with open(shadow_path, "xb"):
+                pass
+        except FileExistsError:
+            # A filesystem alias can race between contains() and add(); either
+            # spelling represents the same reserved destination.
+            pass
+
+
+def preview_export_renames(db, photo_ids, destination=None, options=None):
+    """Return filename changes that export collision handling would make.
+
+    This preflight mirrors export's source, destination, template, sequence,
+    and deduplication rules without rendering output files. A later filesystem
+    change can still introduce a new collision, so the dialog also states the
+    non-overwrite policy permanently.
+    """
+    options = options or {}
+    template = options.get("naming_template", "{original}")
+    output_ext = normalize_output_format(
+        options.get("format", options.get("output_format", "jpg"))
+    )["extension"]
+    max_size = options.get("max_size")
+    if max_size is not None:
+        max_size = int(max_size)
+    try:
+        wc_max = int(options.get("working_copy_max_size", 4096))
+    except (ValueError, TypeError):
+        wc_max = 4096
+    vireo_dir = options.get("vireo_dir") or ""
+    developed_dir = options.get("developed_dir") or ""
+    subfolder = "exported" if options.get("export_to_subfolder") else ""
+
+    photos_map = db.get_photos_by_ids(photo_ids)
+    folders = {folder["id"]: folder["path"] for folder in db.get_folder_tree()}
+    species_map = db.get_species_keywords_for_photos(photo_ids)
+    exif_data_map = _get_photo_exif_data(db, photo_ids)
+    edit_recipes = db.get_photo_edit_recipes(photo_ids)
+    developed_index = _DevelopedDirIndex()
+    seq_counters = {}
+    destination_reservations = {}
+    renames = []
+
+    for pid in photo_ids:
+        photo = photos_map.get(pid)
+        if not photo:
+            continue
+
+        folder_path = folders.get(photo["folder_id"], "")
+        source_path = _select_export_source(
+            photo=photo,
+            folder_path=folder_path,
+            folders=folders,
+            recipe=edit_recipes.get(pid),
+            max_size=max_size,
+            wc_max=wc_max,
+            vireo_dir=vireo_dir,
+            developed_dir=developed_dir,
+            developed_index=developed_index,
+            output_ext=output_ext,
+            exif_data=exif_data_map.get(pid),
+        )
+        if not source_path or not os.path.isfile(source_path):
+            continue
+
+        destination_base = destination or folder_path
+        if not destination_base:
+            continue
+        if not destination and not os.path.isdir(destination_base):
+            continue
+        photo_destination = os.path.normpath(
+            os.path.join(destination_base, subfolder)
+            if subfolder else destination_base
+        )
+
+        species_list = species_map.get(pid, [])
+        species = species_list[0] if species_list else None
+        photo_info = {
+            "filename": photo["filename"],
+            "timestamp": photo["timestamp"],
+            "rating": photo["rating"],
+            "folder_name": os.path.basename(folder_path),
+        }
+        subdir_key = (
+            photo_destination,
+            os.path.dirname(
+                resolve_template(template, photo_info, species=species, seq=0)
+            ),
+        )
+        seq_counters.setdefault(subdir_key, 0)
+        seq_counters[subdir_key] += 1
+        rel_path = resolve_template(
+            template,
+            photo_info,
+            species=species,
+            seq=seq_counters[subdir_key],
+        )
+        rel_path_safe = os.path.normpath(rel_path).lstrip(os.sep + ".")
+        requested_path = os.path.join(
+            photo_destination, rel_path_safe + f".{output_ext}"
+        )
+
+        dest_real = os.path.realpath(photo_destination)
+        requested_real = os.path.realpath(requested_path)
+        dest_prefix = dest_real if dest_real.endswith(os.sep) else dest_real + os.sep
+        if (
+            not requested_real.startswith(dest_prefix)
+            and requested_real != dest_real
+        ):
+            continue
+
+        reservation_destination = _nearest_existing_directory(
+            os.path.dirname(requested_path)
+        )
+        reservation_key = _destination_path_identity(reservation_destination)
+        reservation_group = destination_reservations.setdefault(
+            reservation_key, []
+        )
+        reservations = next((
+            candidate for candidate in reservation_group
+            if (
+                candidate.matches_destination(reservation_destination)
+                if hasattr(candidate, "matches_destination")
+                else os.path.realpath(candidate.destination)
+                == os.path.realpath(reservation_destination)
+            )
+        ), None)
+        if reservations is None:
+            reservations = _DestinationPathReservations(
+                reservation_destination
+            )
+            reservation_group.append(reservations)
+
+        def is_reserved(
+            candidate,
+            current_destination=reservation_destination,
+            current_reservations=reservations,
+        ):
+            return current_reservations.contains(candidate, current_destination)
+
+        export_path = _deduplicate_path(
+            requested_path,
+            is_reserved=is_reserved,
+        )
+        reservations.add(export_path, reservation_destination)
+        if export_path != requested_path:
+            renames.append({
+                "photo_id": pid,
+                "requested_name": os.path.basename(requested_path),
+                "export_name": os.path.basename(export_path),
+                "destination": os.path.dirname(export_path),
+            })
+
+    for reservation_group in destination_reservations.values():
+        for reservations in reservation_group:
+            reservations.close()
+    return renames

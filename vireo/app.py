@@ -26651,6 +26651,100 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     # -- Export job route --
 
+    @app.route("/api/jobs/export/preflight", methods=["POST"])
+    def api_job_export_preflight():
+        """Preview collision renames before starting a photo export."""
+        body = request.get_json(silent=True) or {}
+        raw_ids = body.get("photo_ids", [])
+        destination = body.get("destination", "")
+        export_to_subfolder = body.get("export_to_subfolder", False)
+        naming_template = body.get("naming_template", "{original}")
+        output_format = body.get("format", body.get("output_format", "jpg"))
+        max_size = body.get("max_size")
+
+        if not raw_ids:
+            return json_error("photo_ids required")
+        try:
+            photo_ids = [int(pid) for pid in raw_ids]
+        except (ValueError, TypeError):
+            return json_error("photo_ids must be integers")
+        if not isinstance(destination, str):
+            return json_error("destination must be a string")
+        destination = destination.strip()
+        if destination and not os.path.isabs(destination):
+            return json_error("destination must be an absolute path")
+        if not isinstance(export_to_subfolder, bool):
+            return json_error("export_to_subfolder must be a boolean")
+        if not isinstance(naming_template, str):
+            return json_error("naming_template must be a string")
+        if max_size in ("", 0):
+            max_size = None
+        if max_size is not None:
+            if isinstance(max_size, bool):
+                return json_error("max_size must be a positive integer")
+            try:
+                max_size = int(max_size)
+            except (TypeError, ValueError):
+                return json_error("max_size must be a positive integer")
+            if max_size < 1 or max_size > 50000:
+                return json_error("max_size must be between 1 and 50000")
+
+        try:
+            from export import (
+                ExportPreflightError,
+                normalize_output_format,
+                preview_export_renames,
+            )
+            output_format = normalize_output_format(output_format)["extension"]
+        except ValueError as exc:
+            return json_error(str(exc))
+
+        db = _get_db()
+        active_ws = db._active_workspace_id
+        visible_set = set()
+        for chunk in _chunked(photo_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            visible = db.conn.execute(
+                f"""SELECT p.id FROM photos p
+                    JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+                    WHERE wf.workspace_id = ? AND p.id IN ({placeholders})""",
+                [active_ws] + list(chunk),
+            ).fetchall()
+            visible_set.update(row["id"] for row in visible)
+        photo_ids = [pid for pid in photo_ids if pid in visible_set]
+        if not photo_ids:
+            return json_error("no exportable photos in current workspace")
+
+        vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+        effective_cfg = db.get_effective_config(cfg.load())
+
+        try:
+            renames = preview_export_renames(
+                db=db,
+                photo_ids=photo_ids,
+                destination=destination,
+                options={
+                    "naming_template": naming_template,
+                    "format": output_format,
+                    "export_to_subfolder": export_to_subfolder,
+                    "max_size": max_size,
+                    "working_copy_max_size": effective_cfg.get(
+                        "working_copy_max_size", 4096,
+                    ),
+                    "vireo_dir": vireo_dir,
+                    "developed_dir": (
+                        effective_cfg.get("darktable_output_dir", "") or ""
+                    ),
+                },
+            )
+        except ExportPreflightError as exc:
+            return json_error(str(exc), status=409)
+        return jsonify({
+            "rename_count": len(renames),
+            "renames": renames[:20],
+            "truncated": len(renames) > 20,
+        })
+
     @app.route("/api/jobs/export", methods=["POST"])
     def api_job_export():
         """Export selected photos to a destination directory."""

@@ -5,10 +5,14 @@ import errno
 import json
 import os
 import sys
+import threading
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+import export as export_mod
 import pytest
 from db import Database
 from export import (
@@ -16,6 +20,7 @@ from export import (
     developed_folder_key,
     export_photos,
     normalize_metadata_fields,
+    preview_export_renames,
     relocate_developed_dir,
     relocate_developed_file,
     resolve_template,
@@ -1341,6 +1346,571 @@ def test_export_photos_collision_renames(export_env):
     assert result["exported"] == 2
     assert os.path.isfile(os.path.join(env["dest"], "photo.jpg"))
     assert os.path.isfile(os.path.join(env["dest"], "photo_2.jpg"))
+
+
+def test_concurrent_exports_claim_distinct_output_paths(export_env, monkeypatch):
+    """Concurrent jobs must never select and overwrite the same filename."""
+    env = export_env
+    save_barrier = threading.Barrier(2)
+    real_save_export_image = export_mod._save_export_image
+
+    def synchronized_save(img, output, format_info, quality):
+        save_barrier.wait(timeout=10)
+        return real_save_export_image(img, output, format_info, quality)
+
+    monkeypatch.setattr(
+        export_mod, "_save_export_image", synchronized_save,
+    )
+    db_path = str(env["tmp_path"] / "test.db")
+    workspace_id = env["db"]._active_workspace_id
+
+    def run_export(photo_id):
+        thread_db = Database(db_path)
+        thread_db.set_active_workspace(workspace_id)
+        try:
+            return export_photos(
+                db=thread_db,
+                vireo_dir=env["vireo_dir"],
+                photo_ids=[photo_id],
+                destination=env["dest"],
+                options={"naming_template": "photo"},
+            )
+        finally:
+            thread_db.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(run_export, [env["p1"], env["p2"]]))
+
+    assert all(result["exported"] == 1 for result in results)
+    assert all(result["errors"] == [] for result in results)
+    assert sorted(os.listdir(env["dest"])) == ["photo.jpg", "photo_2.jpg"]
+
+
+def test_preview_export_renames_reports_existing_file(export_env):
+    """The export preflight exposes the numbered name before rendering."""
+    env = export_env
+    os.makedirs(env["dest"])
+    existing = os.path.join(env["dest"], "bird1.jpg")
+    Image.new("RGB", (20, 20), color="green").save(existing, "JPEG")
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "format": "jpg"},
+    )
+
+    assert renames == [{
+        "photo_id": env["p1"],
+        "requested_name": "bird1.jpg",
+        "export_name": "bird1_2.jpg",
+        "destination": env["dest"],
+    }]
+
+
+def test_preview_export_renames_treats_dangling_symlinks_as_occupied(export_env):
+    """Preflight must match exclusive creation for dangling directory entries."""
+    env = export_env
+    os.makedirs(env["dest"])
+    requested = os.path.join(env["dest"], "bird1.jpg")
+    numbered = os.path.join(env["dest"], "bird1_2.jpg")
+    try:
+        os.symlink("missing-requested-target", requested)
+        os.symlink("missing-numbered-target", numbered)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "format": "jpg"},
+    )
+
+    assert renames == [{
+        "photo_id": env["p1"],
+        "requested_name": "bird1.jpg",
+        "export_name": "bird1_3.jpg",
+        "destination": env["dest"],
+    }]
+
+
+def test_preview_export_renames_reports_same_batch_collision(export_env):
+    """Preflight also predicts collisions created by earlier batch entries."""
+    env = export_env
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={"naming_template": "photo", "format": "jpg"},
+    )
+
+    assert [(item["requested_name"], item["export_name"]) for item in renames] == [
+        ("photo.jpg", "photo_2.jpg"),
+    ]
+
+
+def _mock_destination_reservations(monkeypatch, key):
+    """Install an in-memory destination with a chosen filename comparison."""
+
+    class FakeReservations:
+        def __init__(self, destination):
+            self.destination = destination
+            self.paths = set()
+
+        def contains(self, candidate, destination=None):
+            destination = destination or self.destination
+            return key(os.path.relpath(candidate, destination)) in self.paths
+
+        def add(self, candidate, destination=None):
+            destination = destination or self.destination
+            self.paths.add(key(os.path.relpath(candidate, destination)))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        export_mod, "_DestinationPathReservations", FakeReservations,
+    )
+
+
+def _ntfs_test_key(path):
+    """Model the NTFS distinctions exercised by these regression tests."""
+    return "".join(
+        "σ" if character in {"Σ", "σ", "ς"} else character.lower()
+        for character in path
+    )
+
+
+def test_preview_export_renames_respects_case_insensitive_destination(
+    export_env, monkeypatch,
+):
+    """Case-only batch twins are collisions when the target folds case."""
+    env = export_env
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = 'Photo.jpg' WHERE id = ?",
+        (env["p1"],),
+    )
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = 'photo.jpg' WHERE id = ?",
+        (env["p2"],),
+    )
+    env["db"].conn.commit()
+    _mock_destination_reservations(monkeypatch, _ntfs_test_key)
+    monkeypatch.setattr(
+        export_mod,
+        "_select_export_source",
+        lambda **_kwargs: str(env["src"] / "bird1.jpg"),
+    )
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "format": "jpg"},
+    )
+
+    assert [(item["requested_name"], item["export_name"]) for item in renames] == [
+        ("photo.jpg", "photo_2.jpg"),
+    ]
+
+
+def test_preview_export_renames_probes_nested_output_filesystem(
+    export_env, monkeypatch,
+):
+    """A mounted template subdirectory supplies its own filename semantics."""
+    env = export_env
+    destination = env["tmp_path"] / "export_out"
+    mounted_output = destination / "mounted"
+    mounted_output.mkdir(parents=True)
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = 'Photo.jpg' WHERE id = ?",
+        (env["p1"],),
+    )
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = 'photo.jpg' WHERE id = ?",
+        (env["p2"],),
+    )
+    env["db"].conn.commit()
+    observed_destinations = []
+
+    class MountedReservations:
+        def __init__(self, reservation_destination):
+            self.destination = os.path.realpath(reservation_destination)
+            self.paths = set()
+            observed_destinations.append(self.destination)
+
+        def contains(self, candidate, destination=None):
+            relative = os.path.relpath(candidate, destination or self.destination)
+            return relative.lower() in self.paths
+
+        def add(self, candidate, destination=None):
+            relative = os.path.relpath(candidate, destination or self.destination)
+            self.paths.add(relative.lower())
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        export_mod, "_DestinationPathReservations", MountedReservations,
+    )
+    monkeypatch.setattr(
+        export_mod,
+        "_select_export_source",
+        lambda **_kwargs: str(env["src"] / "bird1.jpg"),
+    )
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=str(destination),
+        options={"naming_template": "mounted/{original}", "format": "jpg"},
+    )
+
+    assert observed_destinations == [os.path.realpath(mounted_output)]
+    assert [(item["requested_name"], item["export_name"]) for item in renames] == [
+        ("photo.jpg", "photo_2.jpg"),
+    ]
+
+
+def test_preview_export_renames_keeps_case_twins_on_empty_linux_target(
+    export_env, monkeypatch,
+):
+    """An empty case-sensitive target must not produce a phantom rename."""
+    env = export_env
+    empty_destination = env["tmp_path"] / "empty-export"
+    empty_destination.mkdir()
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = 'Photo.jpg' WHERE id = ?",
+        (env["p1"],),
+    )
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = 'photo.jpg' WHERE id = ?",
+        (env["p2"],),
+    )
+    env["db"].conn.commit()
+    _mock_destination_reservations(monkeypatch, lambda path: path)
+    monkeypatch.setattr(
+        export_mod,
+        "_select_export_source",
+        lambda **_kwargs: str(env["src"] / "bird1.jpg"),
+    )
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=str(empty_destination),
+        options={"naming_template": "{original}", "format": "jpg"},
+    )
+
+    assert renames == []
+
+
+def test_destination_reservations_match_empty_volume(tmp_path):
+    """Batch reservations use the selected volume's filename behavior."""
+    destination = tmp_path / "empty-destination"
+    destination.mkdir()
+
+    probe = destination / "VireoÉCaseCheck"
+    probe.write_text("probe")
+    try:
+        observed_case = (destination / "vIREOécASEcHECK").exists()
+        observed_normalization = (
+            destination / unicodedata.normalize("NFD", probe.name)
+        ).exists()
+    finally:
+        probe.unlink()
+
+    with export_mod._DestinationPathReservations(str(destination)) as reservations:
+        reservations.add(probe)
+        detected_case = reservations.contains(
+            destination / "vIREOécASEcHECK"
+        )
+        detected_normalization = reservations.contains(
+            destination / unicodedata.normalize("NFD", probe.name)
+        )
+
+    assert detected_case is observed_case
+    assert detected_normalization is observed_normalization
+    assert list(destination.iterdir()) == []
+
+
+def test_destination_reservations_fail_when_volume_cannot_be_probed(
+    tmp_path, monkeypatch,
+):
+    """Preflight must not claim no collision after losing volume semantics."""
+    destination = tmp_path / "destination"
+    destination.mkdir()
+
+    def deny_temporary_directory(*_args, **_kwargs):
+        raise PermissionError("directory creation denied")
+
+    monkeypatch.setattr(
+        export_mod.tempfile,
+        "TemporaryDirectory",
+        deny_temporary_directory,
+    )
+
+    with pytest.raises(
+        export_mod.ExportPreflightError,
+        match="could not verify filename collisions",
+    ):
+        export_mod._DestinationPathReservations(str(destination))
+
+
+def test_destination_reservations_resolve_directory_symlinks(tmp_path):
+    """A real directory and its symlink reserve the same export path."""
+    destination = tmp_path / "destination"
+    real_directory = destination / "real"
+    alias_directory = destination / "alias"
+    real_directory.mkdir(parents=True)
+    try:
+        alias_directory.symlink_to(real_directory, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    with export_mod._DestinationPathReservations(str(destination)) as reservations:
+        reservations.add(real_directory / "photo.jpg")
+        assert reservations.contains(alias_directory / "photo.jpg")
+
+    assert set(destination.iterdir()) == {real_directory, alias_directory}
+
+
+def test_destination_identity_matches_volume_equivalent_root_spellings(tmp_path):
+    """Case/normalization aliases share identity when the volume equates them."""
+    destination = tmp_path / "VireoÉRoot"
+    destination.mkdir()
+    aliases = {
+        tmp_path / destination.name.lower(),
+        tmp_path / unicodedata.normalize("NFD", destination.name),
+    }
+    equivalent_aliases = [
+        alias for alias in aliases
+        if alias != destination
+        and alias.exists()
+        and os.path.samefile(alias, destination)
+    ]
+    if not equivalent_aliases:
+        pytest.skip("test volume preserves case and Unicode normalization")
+
+    expected = export_mod._destination_path_identity(destination)
+    assert all(
+        export_mod._destination_path_identity(alias) == expected
+        for alias in equivalent_aliases
+    )
+
+
+def test_preview_export_renames_verifies_colliding_directory_identities(
+    tmp_path, monkeypatch,
+):
+    """Non-unique directory inodes must not merge unrelated export folders."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    Image.new("RGB", (20, 20), color="red").save(first / "bird.jpg", "JPEG")
+    Image.new("RGB", (20, 20), color="blue").save(second / "bird.jpg", "JPEG")
+    db = Database(str(tmp_path / "identity.db"))
+    workspace_id = db.ensure_default_workspace()
+    db.set_active_workspace(workspace_id)
+    first_folder = db.add_folder(str(first), name="First")
+    second_folder = db.add_folder(str(second), name="Second")
+    first_photo = db.add_photo(
+        folder_id=first_folder,
+        filename="bird.jpg",
+        extension=".jpg",
+        file_size=1,
+        file_mtime=1,
+        timestamp="2024-01-01T00:00:00",
+    )
+    second_photo = db.add_photo(
+        folder_id=second_folder,
+        filename="bird.jpg",
+        extension=".jpg",
+        file_size=1,
+        file_mtime=1,
+        timestamp="2024-01-01T00:00:00",
+    )
+    monkeypatch.setattr(
+        export_mod,
+        "_destination_path_identity",
+        lambda _path: ("filesystem", 1, 0),
+    )
+
+    renames = preview_export_renames(
+        db=db,
+        photo_ids=[first_photo, second_photo],
+        destination=None,
+        options={"naming_template": "photo", "format": "jpg"},
+    )
+
+    assert renames == []
+
+
+def test_preview_export_renames_shares_aliased_destination_roots(export_env):
+    """Beside-original aliases share one set of planned export paths."""
+    env = export_env
+    alias_directory = env["tmp_path"] / env["src"].name.upper()
+    if not (
+        alias_directory != env["src"]
+        and alias_directory.exists()
+        and os.path.samefile(alias_directory, env["src"])
+    ):
+        alias_directory = env["tmp_path"] / "src-alias"
+        try:
+            alias_directory.symlink_to(env["src"], target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory aliases are unavailable: {exc}")
+    alias_folder_id = env["db"].add_folder(
+        str(alias_directory), name="Safari alias",
+    )
+    env["db"].conn.execute(
+        "UPDATE photos SET folder_id = ?, filename = ? WHERE id = ?",
+        (alias_folder_id, "bird1.jpg", env["p2"]),
+    )
+    env["db"].conn.commit()
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=None,
+        options={"naming_template": "photo", "format": "jpg"},
+    )
+
+    assert [(item["requested_name"], item["export_name"]) for item in renames] == [
+        ("photo.jpg", "photo_2.jpg"),
+    ]
+
+
+def test_preview_export_renames_respects_unicode_equivalent_destination(
+    export_env, monkeypatch,
+):
+    """NFC/NFD batch twins collide when the target treats them as aliases."""
+    env = export_env
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = ? WHERE id = ?",
+        ("é.jpg", env["p1"]),
+    )
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = ? WHERE id = ?",
+        ("e\u0301.jpg", env["p2"]),
+    )
+    env["db"].conn.commit()
+    _mock_destination_reservations(
+        monkeypatch,
+        lambda path: unicodedata.normalize("NFC", path),
+    )
+    monkeypatch.setattr(
+        export_mod,
+        "_select_export_source",
+        lambda **_kwargs: str(env["src"] / "bird1.jpg"),
+    )
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "format": "jpg"},
+    )
+
+    assert [(item["requested_name"], item["export_name"]) for item in renames] == [
+        ("e\u0301.jpg", "e\u0301_2.jpg"),
+    ]
+
+
+def test_preview_export_renames_preserves_non_equivalent_casefold_names(
+    export_env, monkeypatch,
+):
+    """Case-insensitive targets do not equate linguistic ß/ss spellings."""
+    env = export_env
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = ? WHERE id = ?",
+        ("straße.jpg", env["p1"]),
+    )
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = ? WHERE id = ?",
+        ("strasse.jpg", env["p2"]),
+    )
+    env["db"].conn.commit()
+    _mock_destination_reservations(monkeypatch, _ntfs_test_key)
+    monkeypatch.setattr(
+        export_mod,
+        "_select_export_source",
+        lambda **_kwargs: str(env["src"] / "bird1.jpg"),
+    )
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "format": "jpg"},
+    )
+
+    assert renames == []
+
+
+def test_preview_export_renames_detects_ntfs_sigma_aliases(
+    export_env, monkeypatch,
+):
+    """NTFS-equivalent sigma spellings are reserved as one destination."""
+    env = export_env
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = ? WHERE id = ?",
+        ("Σ.jpg", env["p1"]),
+    )
+    env["db"].conn.execute(
+        "UPDATE photos SET filename = ? WHERE id = ?",
+        ("ς.jpg", env["p2"]),
+    )
+    env["db"].conn.commit()
+    _mock_destination_reservations(monkeypatch, _ntfs_test_key)
+    monkeypatch.setattr(
+        export_mod,
+        "_select_export_source",
+        lambda **_kwargs: str(env["src"] / "bird1.jpg"),
+    )
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "format": "jpg"},
+    )
+
+    assert [(item["requested_name"], item["export_name"]) for item in renames] == [
+        ("ς.jpg", "ς_2.jpg"),
+    ]
+
+
+def test_preview_export_renames_skips_missing_source_before_sequence(
+    export_env,
+):
+    """Missing photos do not shift sequence numbers used by real exports."""
+    env = export_env
+    missing_id = env["db"].add_photo(
+        folder_id=env["fid"],
+        filename="missing.jpg",
+        extension=".jpg",
+        file_size=0,
+        file_mtime=0,
+        timestamp="2024-06-14T10:00:00",
+    )
+    os.makedirs(env["dest"])
+    Image.new("RGB", (20, 20)).save(
+        os.path.join(env["dest"], "bird1_0001.jpg"), "JPEG",
+    )
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[missing_id, env["p1"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}_{seq}", "format": "jpg"},
+    )
+
+    assert [(item["requested_name"], item["export_name"]) for item in renames] == [
+        ("bird1_0001.jpg", "bird1_0001_2.jpg"),
+    ]
 
 
 def test_export_photos_convert_png_batch_deduplicates_extension(export_env):

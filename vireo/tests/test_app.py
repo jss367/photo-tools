@@ -105,6 +105,22 @@ def test_browse_export_offers_embedded_metadata_checkboxes(app_and_db):
     assert "Unchecked details are left out." in html
 
 
+def test_browse_export_warns_before_numbering_collision_names(app_and_db):
+    app, _ = app_and_db
+    html = app.test_client().get('/browse').get_data(as_text=True)
+
+    assert "Existing files are never overwritten." in html
+    assert "Vireo adds a number" in html
+    assert "'/api/jobs/export/preflight'" in html
+    assert "Continue with export?" in html
+    assert "requested_name + ' → ' + rename.export_name" in html
+    assert "var exportRequestGeneration = 0;" in html
+    assert "requestGeneration !== exportRequestGeneration" in html
+    assert "function setExportControlsBusy(busy)" in html
+    assert "setExportControlsBusy(true);" in html
+    assert "data-export-cancel" in html
+
+
 def test_browse_export_offers_reveal_after_export(app_and_db):
     app, _ = app_and_db
     html = app.test_client().get('/browse').get_data(as_text=True)

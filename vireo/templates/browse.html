@@ -1871,6 +1871,9 @@ body.sidebar-resizing {
           <button class="export-var-pill" onclick="insertTemplateVar('{folder}')">{folder}</button>
         </div>
         <div id="exportPreview" style="font-size:11px;color:var(--text-muted);margin-bottom:12px;font-family:monospace;"></div>
+        <div id="exportCollisionPolicy" style="font-size:11px;color:var(--text-secondary);margin-bottom:12px;padding:8px 10px;border:1px solid var(--border-secondary);border-radius:4px;background:var(--bg-tertiary);line-height:1.45;">
+          Existing files are never overwritten. If an export name is already in use, Vireo adds a number such as <code>_2</code>. You’ll be shown the filename changes before export starts.
+        </div>
 
         <label style="font-size:12px;color:var(--text-secondary);display:block;margin-bottom:7px;">Include metadata in exported files</label>
         <div class="export-metadata-options">
@@ -1884,7 +1887,7 @@ body.sidebar-resizing {
 
         <div class="modal-actions">
           <button id="exportSubmitBtn" class="modal-btn modal-btn-primary" onclick="startExport()">Export</button>
-          <button class="modal-btn modal-btn-cancel" onclick="closeExportModal()">Cancel</button>
+          <button class="modal-btn modal-btn-cancel" data-export-cancel onclick="closeExportModal()">Cancel</button>
         </div>
       </div>
     </div>
@@ -11500,7 +11503,29 @@ async function _runPhotoDeepLink(photoId) {
 })();
 
 /* ---------- Export Modal ---------- */
+var exportRequestGeneration = 0;
+var exportDismissible = true;
 var _exportPhotoIds = null;
+
+function setExportControlsBusy(busy) {
+  document.querySelectorAll('#exportOverlay input, #exportOverlay select, #exportOverlay button').forEach(function(control) {
+    if (control.id === 'exportSubmitBtn' || control.hasAttribute('data-export-cancel')) return;
+    if (busy) {
+      control.setAttribute('data-export-was-disabled', control.disabled ? '1' : '0');
+      control.disabled = true;
+    } else if (control.hasAttribute('data-export-was-disabled')) {
+      control.disabled = control.getAttribute('data-export-was-disabled') === '1';
+      control.removeAttribute('data-export-was-disabled');
+    }
+  });
+}
+
+function setExportDismissible(dismissible) {
+  exportDismissible = dismissible;
+  document.querySelectorAll('#exportOverlay [data-export-cancel]').forEach(function(control) {
+    control.disabled = !dismissible;
+  });
+}
 
 function migrateExportCaptureDateTimePreference() {
   var combinedKey = 'vireo.browse.export.metadata.captureDateTime';
@@ -11519,6 +11544,9 @@ function migrateExportCaptureDateTimePreference() {
 function openExportModal(photoIds) {
   var activeIds = Array.isArray(photoIds) ? photoIds.slice() : getActiveSelection();
   if (activeIds.length === 0) return;
+  exportRequestGeneration++;
+  setExportControlsBusy(false);
+  setExportDismissible(true);
   // Snapshot the requested photos for the lifetime of the modal. In
   // particular, the lightbox menu exports the displayed photo even when the
   // Browse grid has a different single- or multi-photo selection behind it.
@@ -11563,6 +11591,9 @@ function selectedExportMetadataFields() {
 }
 
 function closeExportModal() {
+  if (!exportDismissible) return;
+  exportRequestGeneration++;
+  setExportControlsBusy(false);
   document.getElementById('exportOverlay').classList.remove('open');
   _exportPhotoIds = null;
 }
@@ -11713,6 +11744,7 @@ document.getElementById('exportQuality').addEventListener('input', function() {
 });
 
 async function startExport() {
+  var requestGeneration = ++exportRequestGeneration;
   var dest = document.getElementById('exportDest').value.trim();
   var exportToSubfolder = document.getElementById('exportSubfolder').checked;
   var revealAfterExport = document.getElementById('exportRevealAfter').checked;
@@ -11731,30 +11763,95 @@ async function startExport() {
   var btn = document.getElementById('exportSubmitBtn');
   var activeIds = (_exportPhotoIds || getActiveSelection()).slice();
   var count = activeIds.length;
+  var buttonLabel = 'Export ' + count + ' photo' + (count === 1 ? '' : 's');
   btn.disabled = true;
+  btn.textContent = 'Checking filenames…';
+  setExportControlsBusy(true);
+
+  var exportRequest = {
+    photo_ids: activeIds,
+    destination: dest,
+    export_to_subfolder: exportToSubfolder,
+    naming_template: template,
+    max_size: maxSize,
+    quality: quality,
+    format: format,
+    metadata_fields: selectedExportMetadataFields(),
+    reveal_after_export: revealAfterExport,
+  };
+
+  var preflight;
+  try {
+    preflight = await safeFetch('/api/jobs/export/preflight', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(exportRequest),
+    }, {toast: false});
+  } catch (err) {
+    if (requestGeneration !== exportRequestGeneration) return;
+    alert('Export check failed: ' + err.message);
+    setExportControlsBusy(false);
+    btn.disabled = false;
+    btn.textContent = buttonLabel;
+    return;
+  }
+  if (requestGeneration !== exportRequestGeneration ||
+      !document.getElementById('exportOverlay').classList.contains('open')) return;
+  if (preflight.error) {
+    alert('Export check failed: ' + preflight.error);
+    setExportControlsBusy(false);
+    btn.disabled = false;
+    btn.textContent = buttonLabel;
+    return;
+  }
+  if (preflight.rename_count > 0) {
+    var renameLines = (preflight.renames || []).slice(0, 5).map(function(rename) {
+      return rename.requested_name + ' → ' + rename.export_name;
+    });
+    if (preflight.rename_count > renameLines.length) {
+      renameLines.push('…and ' + (preflight.rename_count - renameLines.length) + ' more');
+    }
+    var renameMessage = preflight.rename_count + ' export filename' +
+      (preflight.rename_count === 1 ? ' is' : 's are') +
+      ' already in use. Existing files will be kept, and Vireo will save the new export' +
+      (preflight.rename_count === 1 ? '' : 's') + ' with numbered names:\n\n' +
+      renameLines.join('\n') + '\n\nContinue with export?';
+    if (!window.confirm(renameMessage)) {
+      setExportControlsBusy(false);
+      btn.disabled = false;
+      btn.textContent = buttonLabel;
+      return;
+    }
+  }
 
   try {
+    btn.textContent = 'Starting export…';
+    setExportDismissible(false);
     var data = await safeFetch('/api/jobs/export', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        photo_ids: activeIds,
-        destination: dest,
-        export_to_subfolder: exportToSubfolder,
-        naming_template: template,
-        max_size: maxSize,
-        quality: quality,
-        format: format,
-        metadata_fields: selectedExportMetadataFields(),
-        reveal_after_export: revealAfterExport,
-      }),
+      body: JSON.stringify(exportRequest),
     });
-    if (data.error) { alert('Export error: ' + data.error); btn.disabled = false; return; }
+    if (requestGeneration !== exportRequestGeneration ||
+        !document.getElementById('exportOverlay').classList.contains('open')) return;
+    if (data.error) {
+      setExportDismissible(true);
+      alert('Export error: ' + data.error);
+      setExportControlsBusy(false);
+      btn.disabled = false;
+      btn.textContent = buttonLabel;
+      return;
+    }
+    setExportDismissible(true);
     closeExportModal();
     showToast('Export started (' + count + ' photos)', 'info');
   } catch(err) {
+    if (requestGeneration !== exportRequestGeneration) return;
+    setExportDismissible(true);
     alert('Export failed: ' + err.message);
+    setExportControlsBusy(false);
     btn.disabled = false;
+    btn.textContent = buttonLabel;
   }
 }
 

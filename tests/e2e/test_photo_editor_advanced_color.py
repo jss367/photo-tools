@@ -98,11 +98,26 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
     page.evaluate(
         """() => {
           window.__editorExportRequest = null;
+          window.__editorPreflightRequest = null;
+          window.__resolveEditorPreflight = null;
+          window.__resolveEditorExport = null;
           const originalSafeFetch = window.safeFetch;
           window.safeFetch = async function(url, options, config) {
+            if (url === '/api/jobs/export/preflight') {
+              window.__editorPreflightRequest = JSON.parse(options.body);
+              return new Promise(function(resolve) {
+                window.__resolveEditorPreflight = function() {
+                  resolve({rename_count: 0, renames: []});
+                };
+              });
+            }
             if (url === '/api/jobs/export') {
               window.__editorExportRequest = JSON.parse(options.body);
-              return {job_id: 'editor-export-test'};
+              return new Promise(function(resolve) {
+                window.__resolveEditorExport = function() {
+                  resolve({job_id: 'editor-export-test'});
+                };
+              });
             }
             return originalSafeFetch(url, options, config);
           };
@@ -117,6 +132,10 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
     page.locator("#exportResizeCustom").fill("1600")
     page.locator("#exportMetadataRating").check()
     page.locator("#exportSubmitBtn").click()
+    page.wait_for_function("() => window.__resolveEditorPreflight !== null")
+    expect(page.locator("#exportDest")).to_be_disabled()
+    expect(page.get_by_role("button", name="Cancel", exact=True)).to_be_enabled()
+    page.evaluate("window.__resolveEditorPreflight()")
     page.wait_for_function("() => window.__editorExportRequest !== null")
     request = page.evaluate("window.__editorExportRequest")
     assert request["photo_ids"] == [photo_id]
@@ -124,7 +143,46 @@ def test_photo_editor_export_saves_current_edits_and_exports_current_photo(
     assert request["format"] == "jpg"
     assert request["max_size"] == 1600
     assert request["metadata_fields"] == ["rating"]
+    assert page.evaluate("window.__editorPreflightRequest") == request
+    expect(page.get_by_role("button", name="Cancel", exact=True)).to_be_disabled()
+    page.keyboard.press("Escape")
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    page.evaluate("document.getElementById('exportOverlay').click()")
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    page.evaluate("window.__resolveEditorExport()")
     expect(page.locator("#exportOverlay")).not_to_have_class("modal-overlay open")
+
+
+def test_photo_editor_export_reports_preflight_failure_before_job_start(
+    live_server, page,
+):
+    url = live_server["url"]
+    photo_id = live_server["data"]["photos"][0]
+    page.goto(f"{url}/edit/{photo_id}")
+    page.locator("#exportBtn").click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    page.evaluate(
+        """() => {
+          window.__editorExportJobCalls = 0;
+          window.safeFetch = async function(url) {
+            if (url === '/api/jobs/export/preflight') {
+              throw new Error('probe denied');
+            }
+            if (url === '/api/jobs/export') window.__editorExportJobCalls++;
+            return {};
+          };
+        }"""
+    )
+
+    page.locator("#exportSubmitBtn").click()
+
+    expect(page.locator("#toastContainer")).to_contain_text(
+        "Export check failed: probe denied"
+    )
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    expect(page.get_by_role("button", name="Cancel", exact=True)).to_be_enabled()
+    expect(page.locator("#exportSubmitBtn")).to_be_enabled()
+    assert page.evaluate("window.__editorExportJobCalls") == 0
 
 
 def test_reset_adjustments_preserves_advanced_color(live_server, page):

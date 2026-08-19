@@ -1052,6 +1052,69 @@ def test_job_export_returns_job_id(app_and_db, tmp_path):
     assert data["job_id"].startswith("export-")
 
 
+def test_job_export_preflight_reports_numbered_collision_name(
+    app_and_db, tmp_path,
+):
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.conn.execute(
+        "SELECT id, folder_id FROM photos WHERE filename = 'bird1.jpg'"
+    ).fetchone()
+    source = tmp_path / "source"
+    source.mkdir()
+    Image.new("RGB", (20, 20)).save(source / "bird1.jpg", "JPEG")
+    db.conn.execute(
+        "UPDATE folders SET path = ? WHERE id = ?",
+        (str(source), photo["folder_id"]),
+    )
+    db.conn.commit()
+    destination = tmp_path / "export_out"
+    destination.mkdir()
+    Image.new("RGB", (20, 20)).save(destination / "bird1.jpg", "JPEG")
+
+    resp = client.post("/api/jobs/export/preflight", json={
+        "photo_ids": [photo["id"]],
+        "destination": str(destination),
+        "naming_template": "{original}",
+        "format": "jpg",
+    })
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {
+        "rename_count": 1,
+        "renames": [{
+            "photo_id": photo["id"],
+            "requested_name": "bird1.jpg",
+            "export_name": "bird1_2.jpg",
+            "destination": str(destination),
+        }],
+        "truncated": False,
+    }
+
+
+def test_job_export_preflight_reports_unverifiable_destination(
+    app_and_db, monkeypatch,
+):
+    import export as export_mod
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()
+
+    def fail_preflight(**_kwargs):
+        raise export_mod.ExportPreflightError("destination cannot be verified")
+
+    monkeypatch.setattr(export_mod, "preview_export_renames", fail_preflight)
+
+    resp = client.post("/api/jobs/export/preflight", json={
+        "photo_ids": [photo["id"]],
+        "destination": "",
+    })
+
+    assert resp.status_code == 409
+    assert resp.get_json()["error"] == "destination cannot be verified"
+
+
 def test_job_export_missing_photo_ids(app_and_db):
     """POST /api/jobs/export without photo_ids returns 400."""
     app, _ = app_and_db

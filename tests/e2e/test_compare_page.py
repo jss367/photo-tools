@@ -228,6 +228,48 @@ def test_compare_discards_queued_refresh_after_collection_load(live_server, page
     assert calls == [1]
 
 
+def test_compare_scoped_refresh_exits_empty_needs_review_filter(live_server, page):
+    """Resolving the final pending row reveals the remaining collection."""
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+
+    result = page.evaluate(
+        """async () => {
+          var originalFetch = jsonFetch;
+          var refreshed = JSON.parse(JSON.stringify(compareData));
+          refreshed.photos.forEach(function(photo) {
+            Object.keys(photo.predictions || {}).forEach(function(model) {
+              (photo.predictions[model] || []).forEach(function(pred) {
+                pred.status = 'reviewed';
+              });
+            });
+            (photo.subjects || []).forEach(function(subject) {
+              Object.keys(subject.predictions || {}).forEach(function(model) {
+                (subject.predictions[model] || []).forEach(function(pred) {
+                  pred.status = 'reviewed';
+                });
+              });
+            });
+          });
+          jsonFetch = async function() { return refreshed; };
+          activeFilter = 'needs_review';
+          try {
+            await refreshComparisonPhotos(refreshed.photos.map(function(photo) {
+              return photo.photo_id;
+            }));
+            return {
+              filter: activeFilter,
+              needsReview: effectiveSummary().needs_review,
+            };
+          } finally {
+            jsonFetch = originalFetch;
+          }
+        }"""
+    )
+
+    assert result == {"filter": "all", "needsReview": 0}
+
+
 def test_compare_treats_second_detected_species_as_additional(live_server, page):
     """A second subject is additional information, not a tag conflict."""
     from labels_fingerprint import TOL_SENTINEL

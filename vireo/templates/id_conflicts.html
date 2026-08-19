@@ -1733,6 +1733,14 @@ async function refreshComparisonPhotos(photoIds) {
   compareData.photos = mergedPhotos;
   compareData.models = Array.from(mergedModels).sort();
   populateModelSelects(compareData.models);
+  // Match the full-load behavior when the default queue is exhausted. Keep
+  // explicit user-selected filters intact, but do not strand them on an empty
+  // Needs review table after resolving the final pending row.
+  signalCache = new Map();
+  if (activeFilter === 'needs_review' &&
+      effectiveSummary().needs_review === 0) {
+    activeFilter = 'all';
+  }
   renderCompare();
 }
 

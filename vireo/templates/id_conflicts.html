@@ -1619,6 +1619,14 @@ async function predictionAction(predId, action) {
     return;
   }
 
+  // A collection navigation that finished while the POST was in flight may
+  // have loaded a snapshot from before this decision committed. Reconcile the
+  // current collection without ever mutating it using the old row's state.
+  if (!comparisonScopeIsCurrent(decisionScope)) {
+    await loadComparison();
+    return;
+  }
+
   // Reject and Reviewed only change this prediction's review status. Keep
   // the already-loaded comparison in place and update both copies of the
   // prediction (the model column and its subject) immediately. Keyword
@@ -1797,6 +1805,7 @@ async function batchAction(action) {
   var attempted = 0;
   var refused = [];
   var unconfirmed = 0;
+  var groupedConflict = false;
   var refreshPhotoIds = ids.slice();
   // Rows an earlier request in *this* loop already decided. Accept, replace
   // and accept-subject expand through the burst group, so one request can
@@ -1831,7 +1840,11 @@ async function batchAction(action) {
       // true when the server answered. A lost response leaves the decision
       // possibly committed, and saying otherwise is the same kind of
       // convenient fiction the rest of this flow exists to remove.
-      if (e && e.answered) refused.push(e.message || 'refused');
+      if (e && e.answered) {
+        refused.push(e.message || 'refused');
+        if (e.status === 409 && (action === 'accept' || action === 'replace' ||
+            action === 'accept_subject')) groupedConflict = true;
+      }
       else unconfirmed++;
     }
   }
@@ -1852,11 +1865,15 @@ async function batchAction(action) {
     showToast(reportParts.join('; '), 'error');
   }
   selectedRows.clear();
+  if (!comparisonScopeIsCurrent(decisionScope)) {
+    await loadComparison();
+    return;
+  }
   // A grouped keyword decision may commit for unselected burst members before
   // its response is lost. Without the response photo_ids, a targeted refresh
   // cannot discover those members, so reconcile the whole collection.
-  if (unconfirmed && (action === 'accept' || action === 'replace' ||
-      action === 'accept_subject')) {
+  if (groupedConflict || (unconfirmed && (action === 'accept' ||
+      action === 'replace' || action === 'accept_subject'))) {
     await loadComparison();
     return;
   }

@@ -20870,6 +20870,8 @@ def test_id_conflicts_batch_accept_reports_group_expanded_rows_as_applied(
     assert [t["message"] for t in stale["toasts"]] == [
         "1 of 2 not applied — prediction already rejected; cannot accept",
     ]
+    assert stale["fullReloads"] == 1
+    assert stale["targetedRefreshes"] == 0
 
 
 def test_id_conflicts_batch_unconfirmed_accept_fully_reloads(app_and_db):

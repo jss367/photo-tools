@@ -199,7 +199,7 @@ def test_compare_discards_queued_refresh_after_collection_load(live_server, page
     page.goto(f"{live_server['url']}/id-conflicts")
     page.wait_for_function("() => window.compareData !== null")
 
-    calls = page.evaluate(
+    result = page.evaluate(
         """async () => {
           var calls = [];
           var releaseFirst;
@@ -225,7 +225,7 @@ def test_compare_discards_queued_refresh_after_collection_load(live_server, page
         }"""
     )
 
-    assert calls == [1]
+    assert result == [1]
 
 
 def test_compare_scoped_refresh_exits_empty_needs_review_filter(live_server, page):
@@ -275,16 +275,18 @@ def test_compare_decision_refresh_keeps_its_origin_scope(live_server, page):
     page.goto(f"{live_server['url']}/id-conflicts")
     page.wait_for_function("() => window.compareData !== null")
 
-    calls = page.evaluate(
+    result = page.evaluate(
         """async () => {
           var predId = compareData.photos[0].predictions[
             Object.keys(compareData.photos[0].predictions)[0]
           ][0].id;
           var originalFetch = jsonFetch;
           var originalRefresh = refreshComparisonPhotos;
+          var originalLoad = loadComparison;
           var releasePost;
           var postGate = new Promise(function(resolve) { releasePost = resolve; });
           var refreshCalls = [];
+          var fullLoads = 0;
           jsonFetch = async function(url) {
             if (url.indexOf('/api/predictions/') === 0) {
               await postGate;
@@ -295,21 +297,23 @@ def test_compare_decision_refresh_keeps_its_origin_scope(live_server, page):
           refreshComparisonPhotos = async function(ids) {
             refreshCalls.push(ids);
           };
+          loadComparison = async function() { fullLoads++; };
           try {
             var decision = predictionAction(predId, 'reviewed');
             await new Promise(function(resolve) { setTimeout(resolve, 0); });
             loadingSeq++;
             releasePost();
             await decision;
-            return refreshCalls;
+            return {refreshCalls: refreshCalls, fullLoads: fullLoads};
           } finally {
             jsonFetch = originalFetch;
             refreshComparisonPhotos = originalRefresh;
+            loadComparison = originalLoad;
           }
         }"""
     )
 
-    assert calls == []
+    assert result == {"refreshCalls": [], "fullLoads": 1}
 
 
 def test_compare_grouped_409_performs_full_reload(live_server, page):

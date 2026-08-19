@@ -1577,28 +1577,49 @@ function bestPrediction(photo) {
 
 async function predictionAction(predId, action) {
   var url = '/api/predictions/' + predId + '/' + endpointForAction(action);
+  var entryPhotoIds = comparePhotoIdsForPredictions([predId]);
+  var data;
   try {
-    await jsonFetch(url, { method: 'POST' });
+    data = await jsonFetch(url, { method: 'POST' });
   } catch (e) {
     // The decision endpoints now answer 409 when the row was already settled
     // — from a second tab, or from a Browse batch decision landing while this
     // page sat open. The buttons here are disabled for non-pending rows, so
-    // reaching this means the page is stale: say so and reload, rather than
-    // swallowing the click, which would look like the action succeeded.
+    // reaching this means the page is stale: say so and refresh that photo
+    // rather than swallowing the click, which would look like the action
+    // succeeded.
     //
     // Only a server that answered lets us say the decision was not applied.
     // For a dropped connection or a 5xx the request may well have committed,
-    // so the honest report is that we cannot confirm it — the reload below
-    // shows which it was either way.
+    // so the honest report is that we cannot confirm it — the targeted
+    // refresh below shows which it was either way.
     if (e && e.answered) {
       showToast(e.message || 'Could not apply that decision', 'error');
     } else {
       showToast('Could not confirm the decision (' +
         (e && e.message ? e.message : 'the request failed') +
-        ') — reloading to show the current state.', 'error');
+        ') — refreshing the photo to show the current state.', 'error');
+    }
+    await refreshDecisionPhotos(entryPhotoIds);
+    return;
+  }
+
+  // Reject and Reviewed only change this prediction's review status. Keep
+  // the already-loaded comparison in place and update both copies of the
+  // prediction (the model column and its subject) immediately. Keyword
+  // decisions need fresh taxonomy comparisons, so those use the small
+  // photo-scoped endpoint below instead of guessing at new categories here.
+  if (action === 'reject' || action === 'reviewed') {
+    if (setComparePredictionStatus(
+      predId, action === 'reject' ? 'rejected' : 'reviewed'
+    )) {
+      renderCompare();
+      return;
     }
   }
-  await loadComparison();
+
+  var affectedPhotoIds = entryPhotoIds.concat((data && data.photo_ids) || []);
+  await refreshDecisionPhotos(affectedPhotoIds);
 }
 
 function endpointForAction(action) {
@@ -1609,6 +1630,88 @@ function endpointForAction(action) {
   return 'reviewed';
 }
 
+function comparePhotoIdsForPredictions(predictionIds) {
+  var wanted = new Set((predictionIds || []).map(function(id) {
+    return Number(id);
+  }));
+  var photoIds = [];
+  (compareData && compareData.photos || []).forEach(function(photo) {
+    var found = Object.keys(photo.predictions || {}).some(function(model) {
+      return (photo.predictions[model] || []).some(function(pred) {
+        return wanted.has(Number(pred.id));
+      });
+    });
+    if (found) photoIds.push(photo.photo_id);
+  });
+  return photoIds;
+}
+
+function setComparePredictionStatus(predId, status) {
+  var changed = false;
+  function updatePredictions(predictions) {
+    Object.keys(predictions || {}).forEach(function(model) {
+      (predictions[model] || []).forEach(function(pred) {
+        if (Number(pred.id) !== Number(predId)) return;
+        pred.status = status;
+        changed = true;
+      });
+    });
+  }
+  (compareData && compareData.photos || []).forEach(function(photo) {
+    updatePredictions(photo.predictions);
+    (photo.subjects || []).forEach(function(subject) {
+      updatePredictions(subject.predictions);
+    });
+  });
+  return changed;
+}
+
+async function refreshComparisonPhotos(photoIds) {
+  if (!compareData) return;
+  var uniqueIds = Array.from(new Set((photoIds || []).map(Number).filter(function(id) {
+    return Number.isInteger(id) && id > 0;
+  })));
+  if (!uniqueIds.length) {
+    await loadComparison();
+    return;
+  }
+
+  var collId = document.getElementById('collectionPicker').value;
+  var refreshed = new Map();
+  var refreshedModels = new Set(compareData.models || []);
+  // Keep each URL comfortably below browser/server limits for large burst
+  // groups while still issuing far less work than a whole-collection reload.
+  for (var start = 0; start < uniqueIds.length; start += 100) {
+    var params = new URLSearchParams({collection_id: collId});
+    uniqueIds.slice(start, start + 100).forEach(function(photoId) {
+      params.append('photo_id', String(photoId));
+    });
+    var data = await jsonFetch('/api/predictions/compare?' + params.toString());
+    (data.models || []).forEach(function(model) { refreshedModels.add(model); });
+    (data.photos || []).forEach(function(photo) {
+      refreshed.set(Number(photo.photo_id), photo);
+    });
+  }
+
+  var requested = new Set(uniqueIds);
+  var untouched = (compareData.photos || []).filter(function(photo) {
+    return !requested.has(Number(photo.photo_id));
+  });
+  compareData.photos = untouched.concat(Array.from(refreshed.values()));
+  compareData.models = Array.from(refreshedModels).sort();
+  populateModelSelects(compareData.models);
+  renderCompare();
+}
+
+async function refreshDecisionPhotos(photoIds) {
+  try {
+    await refreshComparisonPhotos(photoIds);
+  } catch (e) {
+    showToast('Could not refresh the changed photo — reloading the comparison.', 'error');
+    await loadComparison();
+  }
+}
+
 async function batchAction(action) {
   var ids = Array.from(selectedRows);
   var photos = (compareData.photos || []).filter(function(photo) {
@@ -1617,6 +1720,7 @@ async function batchAction(action) {
   var attempted = 0;
   var refused = [];
   var unconfirmed = 0;
+  var refreshPhotoIds = ids.slice();
   // Rows an earlier request in *this* loop already decided. Accept, replace
   // and accept-subject expand through the burst group, so one request can
   // settle several of the selected photos; the next iteration would then hit
@@ -1633,9 +1737,11 @@ async function batchAction(action) {
     // failure bucket, because the server told us it wrote this row.
     if (decidedByThisBatch.alreadyDecided(pred.id)) continue;
     try {
-      decidedByThisBatch.record(await jsonFetch(
+      var decision = await jsonFetch(
         '/api/predictions/' + pred.id + '/' + endpointForAction(action),
-        { method: 'POST' }));
+        { method: 'POST' });
+      decidedByThisBatch.record(decision);
+      refreshPhotoIds = refreshPhotoIds.concat(decision.photo_ids || []);
     } catch (e) {
       // One already-settled row must not abandon the rest of the batch, but
       // the count has to be named — a batch that quietly did less than the
@@ -1660,13 +1766,13 @@ async function batchAction(action) {
   if (unconfirmed) {
     reportParts.push(unconfirmed + ' of ' + attempted +
       ' could not be confirmed (the request failed with no answer from the ' +
-      'server) — the reload below shows whether they landed');
+      'server) — the refresh below shows whether they landed');
   }
   if (reportParts.length) {
     showToast(reportParts.join('; '), 'error');
   }
   selectedRows.clear();
-  await loadComparison();
+  await refreshDecisionPhotos(refreshPhotoIds);
 }
 
 updateConflictThresholdControl();

@@ -98,6 +98,60 @@ def test_compare_page_thumbnail_opens_lightbox(live_server, page):
     expect(page.locator("#lightboxFilename")).to_have_text(filename)
 
 
+def test_compare_reject_updates_in_place_without_reloading_collection(
+    live_server, page
+):
+    """Reject is a status-only decision and must not refetch the collection."""
+    compare_requests = []
+    page.on(
+        "request",
+        lambda request: compare_requests.append(request.url)
+        if "/api/predictions/compare?" in request.url
+        else None,
+    )
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+    compare_requests.clear()
+
+    page.locator("#filterRow button", has_text="All").click()
+    row = page.locator(".compare-table tbody tr").first
+    photo_id = row.get_attribute("data-photo-id")
+    with page.expect_response("**/reject") as response_info:
+        row.get_by_role("button", name="Reject", exact=True).first.click()
+    assert response_info.value.ok
+
+    row = page.locator(f'tr[data-photo-id="{photo_id}"]')
+    expect(row.locator(".status-pill.rejected")).to_be_visible()
+    assert compare_requests == []
+
+
+def test_compare_accept_refreshes_only_the_changed_photo(live_server, page):
+    """Keyword writes refresh their taxonomy comparison, not the collection."""
+    photo_id = live_server["data"]["photos"][1]
+    compare_requests = []
+    page.on(
+        "request",
+        lambda request: compare_requests.append(request.url)
+        if "/api/predictions/compare?" in request.url
+        else None,
+    )
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+    compare_requests.clear()
+
+    page.locator("#filterRow button", has_text="All").click()
+    row = page.locator(f'tr[data-photo-id="{photo_id}"]')
+    with page.expect_response("**/accept") as response_info:
+        row.get_by_role("button", name="Add keyword", exact=True).click()
+    assert response_info.value.ok
+
+    expect(row.locator(".keyword-pill.species")).to_contain_text(
+        "Red-tailed Hawk"
+    )
+    assert len(compare_requests) == 1
+    assert f"photo_id={photo_id}" in compare_requests[0]
+
+
 def test_compare_treats_second_detected_species_as_additional(live_server, page):
     """A second subject is additional information, not a tag conflict."""
     from labels_fingerprint import TOL_SENTINEL
@@ -169,6 +223,8 @@ def test_compare_treats_second_detected_species_as_additional(live_server, page)
     with page.expect_response("**/accept-subject") as response_info:
         row.get_by_role("button", name="Add additional species").first.click()
     assert response_info.value.ok
+    page.locator("#filterRow button", has_text="All").click()
+    row = page.locator(f'tr[data-photo-id="{photo_id}"]')
     expect(row.locator(".keyword-pill.species", has_text="Cooper's Hawk")).to_be_visible()
 
     keyword_names = {item["name"] for item in db.get_photo_keywords(photo_id)}
@@ -278,17 +334,13 @@ def test_compare_row_status_surfaces_unclassified_over_pending_match(
     assert status["rowCategory"] == "unclassified"
 
 
-def test_compare_load_reset_filter_when_stale_cache_reports_needs_review(
+def test_compare_full_load_resets_filter_when_stale_cache_reports_needs_review(
     live_server, page
 ):
-    """After ``predictionAction()`` reloads compare data, ``loadComparison()``
-    must clear ``signalCache`` before it calls ``effectiveSummary()`` — the
-    summary picks ``activeFilter`` from ``needs_review > 0``, and would
-    otherwise read stale assessments cached from before the action ran.
-    The visible symptom is an empty Needs review table after accepting or
-    rejecting the last pending subject: the summary keeps reporting
-    needs_review=1 from the pre-action cache, so ``activeFilter`` stays on
-    ``needs_review`` while the freshly rendered rows have nothing pending.
+    """A full ``loadComparison()`` must clear ``signalCache`` before it calls
+    ``effectiveSummary()``. Full loads still happen on initial navigation and
+    as a fallback when a targeted decision refresh fails; stale assessments
+    must not select a filter that disagrees with the freshly loaded rows.
 
     Regression for a bug where the cache clear only fired inside
     ``renderCompare()`` — after ``effectiveSummary()`` had already returned
@@ -368,7 +420,7 @@ def test_compare_load_reset_filter_when_stale_cache_reports_needs_review(
     )
     db.conn.commit()
 
-    # Reload compare data via the same code path predictionAction() takes.
+    # Exercise the full-load path directly.
     page.evaluate("() => loadComparison()")
     page.wait_for_function("() => window.compareData !== null")
 

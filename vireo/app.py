@@ -16748,7 +16748,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if err is not None:
             return err
 
-        photos = db.get_collection_photos(collection_id, per_page=999999)
+        requested_photo_values = request.args.getlist("photo_id")
+        requested_photo_ids = None
+        if requested_photo_values:
+            try:
+                requested_photo_ids = [
+                    int(value) for value in requested_photo_values
+                ]
+            except (TypeError, ValueError):
+                return json_error("photo_id must be an integer")
+            if any(photo_id <= 0 for photo_id in requested_photo_ids):
+                return json_error("photo_id must be a positive integer")
+
+        photos = db.get_collection_photos(
+            collection_id,
+            per_page=999999,
+            photo_ids=requested_photo_ids,
+        )
         photo_ids = [p["id"] for p in photos]
         if not photo_ids:
             return jsonify({
@@ -17097,6 +17113,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return jsonify({
                 "ok": True,
                 "prediction_ids": result["accepted_prediction_ids"],
+                "photo_ids": result["photo_ids"],
             })
         except Exception:
             db.conn.rollback()
@@ -18167,6 +18184,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "prediction_ids": (
                     result["accepted_prediction_ids"] if result else []
                 ),
+                "photo_ids": result["photo_ids"] if result else [],
             })
         except Exception:
             db.conn.rollback()
@@ -18240,6 +18258,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "ok": True,
                 "species": result["species"],
                 "prediction_ids": result["prediction_ids"],
+                "photo_ids": [result["photo_id"]],
             })
         except Exception:
             db.conn.rollback()

@@ -97,6 +97,7 @@ def test_accept_prediction(app_and_db):
     resp = client.post(f'/api/predictions/{pred["id"]}/accept')
     assert resp.status_code == 200
     assert resp.get_json()['ok'] is True
+    assert resp.get_json()['photo_ids'] == [photos[2]['id']]
 
     # Prediction status should be accepted (workspace-scoped via prediction_review)
     assert db.get_review_status(pred['id'], db._active_workspace_id) == 'accepted'
@@ -139,13 +140,14 @@ def test_grouped_accept_names_every_row_it_decided(app_and_db):
     another tab under different scope.
     """
     app, db = app_and_db
-    _, (pred_a, pred_b) = _burst_pair(db, 'gburst', 'Steller Jay')
+    photo_ids, (pred_a, pred_b) = _burst_pair(db, 'gburst', 'Steller Jay')
     ws = db._active_workspace_id
     client = app.test_client()
 
     resp = client.post(f'/api/predictions/{pred_a}/accept')
     assert resp.status_code == 200
     assert sorted(resp.get_json()['prediction_ids']) == sorted([pred_a, pred_b])
+    assert sorted(resp.get_json()['photo_ids']) == sorted(photo_ids)
     assert db.get_review_status(pred_b, ws) == 'accepted'
 
     # The request the loop would otherwise send next. It is a genuine refusal

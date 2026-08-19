@@ -18503,6 +18503,7 @@ class Database:
                     "keyword_id": existing["id"] if existing else None,
                     "affected": [],
                     "accepted_prediction_ids": [],
+                    "photo_ids": [],
                 }
 
             kid = self.add_keyword(species, is_species=True, _commit=False)
@@ -18853,6 +18854,9 @@ class Database:
                 "keyword_id": kid,
                 "affected": affected,
                 "accepted_prediction_ids": accepted_pred_ids,
+                "photo_ids": list(dict.fromkeys(
+                    photo_id for photo_id, _pred_id in targets
+                )),
             }
         except Exception:
             if _commit:
@@ -22789,13 +22793,33 @@ class Database:
 
         return folder_join, "", where, params
 
-    def get_collection_photos(self, collection_id, page=1, per_page=50):
-        """Build SQL from collection rules and return matching photos."""
+    def get_collection_photos(
+        self, collection_id, page=1, per_page=50, photo_ids=None,
+    ):
+        """Build SQL from collection rules and return matching photos.
+
+        ``photo_ids`` optionally narrows the collection query to a small set.
+        ID Conflicts uses this after a decision so it can refresh only the
+        photos the write touched instead of rebuilding the whole collection.
+        The collection rules still apply, which also lets the client detect a
+        photo that left the collection because its species keywords changed.
+        """
         parts = self._build_collection_query(collection_id)
         if parts is None:
             return []
 
         folder_join, join_clause, where, params = parts
+        if photo_ids is not None:
+            narrowed_ids = list(dict.fromkeys(int(pid) for pid in photo_ids))
+            if not narrowed_ids:
+                return []
+            placeholders = ",".join("?" for _ in narrowed_ids)
+            id_condition = f"p.id IN ({placeholders})"
+            where = (
+                f"{where} AND {id_condition}"
+                if where else f"WHERE {id_condition}"
+            )
+            params.extend(narrowed_ids)
         page = max(1, page)
         offset = (page - 1) * per_page
         params.extend([per_page, offset])

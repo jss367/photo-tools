@@ -3040,6 +3040,32 @@ def test_compare_predictions_api(app_and_db):
         assert "detection_id" in model_preds[0]
 
 
+def test_compare_predictions_api_can_refresh_selected_photos(app_and_db):
+    """Repeated photo_id params narrow the collection comparison response."""
+    import json
+
+    app, db = app_and_db
+    photo_ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY id LIMIT 2"
+        ).fetchall()
+    ]
+    cid = db.add_collection(
+        "Targeted comparison",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    response = app.test_client().get(
+        f"/api/predictions/compare?collection_id={cid}&photo_id={photo_ids[1]}"
+    )
+
+    assert response.status_code == 200
+    assert [
+        photo["photo_id"] for photo in response.get_json()["photos"]
+    ] == [photo_ids[1]]
+
+
 def test_compare_predictions_api_preserves_unclassified_subject(app_and_db):
     """A qualifying box remains visible when no classifier prediction exists."""
     app, db = app_and_db

@@ -98,6 +98,261 @@ def test_compare_page_thumbnail_opens_lightbox(live_server, page):
     expect(page.locator("#lightboxFilename")).to_have_text(filename)
 
 
+def test_compare_reject_updates_in_place_without_reloading_collection(
+    live_server, page
+):
+    """Reject refreshes one photo, never the complete collection."""
+    from urllib.parse import parse_qs, urlparse
+
+    compare_requests = []
+    page.on(
+        "request",
+        lambda request: compare_requests.append(request.url)
+        if "/api/predictions/compare?" in request.url
+        else None,
+    )
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+    compare_requests.clear()
+
+    page.locator("#filterRow button", has_text="All").click()
+    row = page.locator(".compare-table tbody tr").first
+    photo_id = row.get_attribute("data-photo-id")
+    with page.expect_response("**/reject") as response_info:
+        row.get_by_role("button", name="Reject", exact=True).first.click()
+    assert response_info.value.ok
+
+    row = page.locator(f'tr[data-photo-id="{photo_id}"]')
+    expect(row.locator(".status-pill.rejected")).to_be_visible()
+    assert len(compare_requests) == 1
+    query = parse_qs(urlparse(compare_requests[0]).query)
+    assert query["photo_id"] == [photo_id]
+
+
+def test_compare_accept_refreshes_only_the_changed_photo(live_server, page):
+    """Keyword writes refresh their taxonomy comparison, not the collection."""
+    from urllib.parse import parse_qs, urlparse
+
+    photo_id = live_server["data"]["photos"][1]
+    compare_requests = []
+    page.on(
+        "request",
+        lambda request: compare_requests.append(request.url)
+        if "/api/predictions/compare?" in request.url
+        else None,
+    )
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+    compare_requests.clear()
+
+    page.locator("#filterRow button", has_text="All").click()
+    row = page.locator(f'tr[data-photo-id="{photo_id}"]')
+    with page.expect_response("**/accept") as response_info:
+        row.get_by_role("button", name="Add keyword", exact=True).click()
+    assert response_info.value.ok
+
+    expect(row.locator(".keyword-pill.species")).to_contain_text(
+        "Red-tailed Hawk"
+    )
+    assert len(compare_requests) == 1
+    query = parse_qs(urlparse(compare_requests[0]).query)
+    assert query["photo_id"] == [str(photo_id)]
+
+
+def test_compare_serializes_scoped_decision_refreshes(live_server, page):
+    """An older scoped response cannot merge after a newer decision."""
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+
+    result = page.evaluate(
+        """async () => {
+          var calls = [];
+          var releaseFirst;
+          var firstGate = new Promise(function(resolve) {
+            releaseFirst = resolve;
+          });
+          var originalRefresh = refreshComparisonPhotos;
+          refreshComparisonPhotos = async function(ids) {
+            calls.push(ids[0]);
+            if (ids[0] === 1) await firstGate;
+          };
+          try {
+            var first = refreshDecisionPhotos([1]);
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            var second = refreshDecisionPhotos([2]);
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            var beforeRelease = calls.slice();
+            releaseFirst();
+            await Promise.all([first, second]);
+            return {beforeRelease: beforeRelease, afterRelease: calls};
+          } finally {
+            refreshComparisonPhotos = originalRefresh;
+          }
+        }"""
+    )
+
+    assert result == {"beforeRelease": [1], "afterRelease": [1, 2]}
+
+
+def test_compare_discards_queued_refresh_after_collection_load(live_server, page):
+    """Queued work stays bound to the collection that originated it."""
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+
+    result = page.evaluate(
+        """async () => {
+          var calls = [];
+          var releaseFirst;
+          var firstGate = new Promise(function(resolve) {
+            releaseFirst = resolve;
+          });
+          var originalRefresh = refreshComparisonPhotos;
+          refreshComparisonPhotos = async function(ids) {
+            calls.push(ids[0]);
+            if (ids[0] === 1) await firstGate;
+          };
+          try {
+            var first = refreshDecisionPhotos([1]);
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            var queued = refreshDecisionPhotos([2]);
+            loadingSeq++;
+            releaseFirst();
+            await Promise.all([first, queued]);
+            return calls;
+          } finally {
+            refreshComparisonPhotos = originalRefresh;
+          }
+        }"""
+    )
+
+    assert result == [1]
+
+
+def test_compare_scoped_refresh_exits_empty_needs_review_filter(live_server, page):
+    """Resolving the final pending row reveals the remaining collection."""
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+
+    result = page.evaluate(
+        """async () => {
+          var originalFetch = jsonFetch;
+          var refreshed = JSON.parse(JSON.stringify(compareData));
+          refreshed.photos.forEach(function(photo) {
+            Object.keys(photo.predictions || {}).forEach(function(model) {
+              (photo.predictions[model] || []).forEach(function(pred) {
+                pred.status = 'reviewed';
+              });
+            });
+            (photo.subjects || []).forEach(function(subject) {
+              Object.keys(subject.predictions || {}).forEach(function(model) {
+                (subject.predictions[model] || []).forEach(function(pred) {
+                  pred.status = 'reviewed';
+                });
+              });
+            });
+          });
+          jsonFetch = async function() { return refreshed; };
+          activeFilter = 'needs_review';
+          try {
+            await refreshComparisonPhotos(refreshed.photos.map(function(photo) {
+              return photo.photo_id;
+            }));
+            return {
+              filter: activeFilter,
+              needsReview: effectiveSummary().needs_review,
+            };
+          } finally {
+            jsonFetch = originalFetch;
+          }
+        }"""
+    )
+
+    assert result == {"filter": "all", "needsReview": 0}
+
+
+def test_compare_decision_refresh_keeps_its_origin_scope(live_server, page):
+    """A collection load during the POST supersedes its later refresh."""
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+
+    result = page.evaluate(
+        """async () => {
+          var predId = compareData.photos[0].predictions[
+            Object.keys(compareData.photos[0].predictions)[0]
+          ][0].id;
+          var originalFetch = jsonFetch;
+          var originalRefresh = refreshComparisonPhotos;
+          var originalLoad = loadComparison;
+          var releasePost;
+          var postGate = new Promise(function(resolve) { releasePost = resolve; });
+          var refreshCalls = [];
+          var fullLoads = 0;
+          jsonFetch = async function(url) {
+            if (url.indexOf('/api/predictions/') === 0) {
+              await postGate;
+              return {ok: true};
+            }
+            return originalFetch(url);
+          };
+          refreshComparisonPhotos = async function(ids) {
+            refreshCalls.push(ids);
+          };
+          loadComparison = async function() { fullLoads++; };
+          try {
+            var decision = predictionAction(predId, 'reviewed');
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            loadingSeq++;
+            releasePost();
+            await decision;
+            return {refreshCalls: refreshCalls, fullLoads: fullLoads};
+          } finally {
+            jsonFetch = originalFetch;
+            refreshComparisonPhotos = originalRefresh;
+            loadComparison = originalLoad;
+          }
+        }"""
+    )
+
+    assert result == {"refreshCalls": [], "fullLoads": 1}
+
+
+def test_compare_grouped_409_performs_full_reload(live_server, page):
+    """An external grouped decision cannot be reconciled from one photo."""
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+
+    result = page.evaluate(
+        """async () => {
+          var predId = compareData.photos[0].predictions[
+            Object.keys(compareData.photos[0].predictions)[0]
+          ][0].id;
+          var originalFetch = jsonFetch;
+          var originalLoad = loadComparison;
+          var originalRefresh = refreshDecisionPhotos;
+          var fullLoads = 0;
+          var targetedRefreshes = 0;
+          jsonFetch = async function() {
+            var error = new Error('prediction already accepted');
+            error.status = 409;
+            error.answered = true;
+            throw error;
+          };
+          loadComparison = async function() { fullLoads++; };
+          refreshDecisionPhotos = async function() { targetedRefreshes++; };
+          try {
+            await predictionAction(predId, 'accept');
+            return {fullLoads: fullLoads, targetedRefreshes: targetedRefreshes};
+          } finally {
+            jsonFetch = originalFetch;
+            loadComparison = originalLoad;
+            refreshDecisionPhotos = originalRefresh;
+          }
+        }"""
+    )
+
+    assert result == {"fullLoads": 1, "targetedRefreshes": 0}
+
+
 def test_compare_treats_second_detected_species_as_additional(live_server, page):
     """A second subject is additional information, not a tag conflict."""
     from labels_fingerprint import TOL_SENTINEL
@@ -169,6 +424,8 @@ def test_compare_treats_second_detected_species_as_additional(live_server, page)
     with page.expect_response("**/accept-subject") as response_info:
         row.get_by_role("button", name="Add additional species").first.click()
     assert response_info.value.ok
+    page.locator("#filterRow button", has_text="All").click()
+    row = page.locator(f'tr[data-photo-id="{photo_id}"]')
     expect(row.locator(".keyword-pill.species", has_text="Cooper's Hawk")).to_be_visible()
 
     keyword_names = {item["name"] for item in db.get_photo_keywords(photo_id)}
@@ -278,17 +535,13 @@ def test_compare_row_status_surfaces_unclassified_over_pending_match(
     assert status["rowCategory"] == "unclassified"
 
 
-def test_compare_load_reset_filter_when_stale_cache_reports_needs_review(
+def test_compare_full_load_resets_filter_when_stale_cache_reports_needs_review(
     live_server, page
 ):
-    """After ``predictionAction()`` reloads compare data, ``loadComparison()``
-    must clear ``signalCache`` before it calls ``effectiveSummary()`` — the
-    summary picks ``activeFilter`` from ``needs_review > 0``, and would
-    otherwise read stale assessments cached from before the action ran.
-    The visible symptom is an empty Needs review table after accepting or
-    rejecting the last pending subject: the summary keeps reporting
-    needs_review=1 from the pre-action cache, so ``activeFilter`` stays on
-    ``needs_review`` while the freshly rendered rows have nothing pending.
+    """A full ``loadComparison()`` must clear ``signalCache`` before it calls
+    ``effectiveSummary()``. Full loads still happen on initial navigation and
+    as a fallback when a targeted decision refresh fails; stale assessments
+    must not select a filter that disagrees with the freshly loaded rows.
 
     Regression for a bug where the cache clear only fired inside
     ``renderCompare()`` — after ``effectiveSummary()`` had already returned
@@ -368,9 +621,8 @@ def test_compare_load_reset_filter_when_stale_cache_reports_needs_review(
     )
     db.conn.commit()
 
-    # Reload compare data via the same code path predictionAction() takes.
-    page.evaluate("() => loadComparison()")
-    page.wait_for_function("() => window.compareData !== null")
+    # Exercise the full-load path directly.
+    page.evaluate("async () => { await loadComparison(); }")
 
     # The reload must have cleared the cache before computing the summary,
     # so activeFilter reflects the fresh dataset (0 pending → 'all'), not

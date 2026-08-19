@@ -435,6 +435,7 @@ var excludeState = {
 };
 var selectedRows = new Set();
 var loadingSeq = 0;
+var decisionRefreshQueue = Promise.resolve();
 var signalCache = new Map();
 var CONFLICT_THRESHOLD_KEY = 'vireo.compare.conflictThreshold';
 var conflictMinConfidence = loadConflictThreshold();
@@ -1576,29 +1577,76 @@ function bestPrediction(photo) {
 }
 
 async function predictionAction(predId, action) {
+  var decisionScope = currentComparisonScope();
   var url = '/api/predictions/' + predId + '/' + endpointForAction(action);
+  var entryPhotoIds = comparePhotoIdsForPredictions([predId]);
+  var data;
   try {
-    await jsonFetch(url, { method: 'POST' });
+    data = await jsonFetch(url, { method: 'POST' });
   } catch (e) {
     // The decision endpoints now answer 409 when the row was already settled
     // — from a second tab, or from a Browse batch decision landing while this
     // page sat open. The buttons here are disabled for non-pending rows, so
-    // reaching this means the page is stale: say so and reload, rather than
-    // swallowing the click, which would look like the action succeeded.
+    // reaching this means the page is stale: say so and refresh that photo
+    // rather than swallowing the click, which would look like the action
+    // succeeded.
     //
     // Only a server that answered lets us say the decision was not applied.
     // For a dropped connection or a 5xx the request may well have committed,
-    // so the honest report is that we cannot confirm it — the reload below
-    // shows which it was either way.
+    // so the honest report is that we cannot confirm it — the targeted
+    // refresh below shows which it was either way.
     if (e && e.answered) {
       showToast(e.message || 'Could not apply that decision', 'error');
+      // Another tab can settle an entire burst before this stale row reaches
+      // the server. The 409 does not name those grouped photos, so a scoped
+      // refresh cannot reconcile the comparison safely.
+      if (e.status === 409 && (action === 'accept' || action === 'replace' ||
+          action === 'accept_subject')) {
+        await loadComparison();
+        return;
+      }
     } else {
       showToast('Could not confirm the decision (' +
         (e && e.message ? e.message : 'the request failed') +
-        ') — reloading to show the current state.', 'error');
+        ') — reloading the comparison to show the current state.', 'error');
+      // An accept/replace response can be lost after a grouped write commits.
+      // Without its photo_ids response we cannot know every burst member that
+      // changed, so only a full reload can reconcile the collection safely.
+      await loadComparison();
+      return;
     }
+    await refreshDecisionPhotos(entryPhotoIds, decisionScope);
+    return;
   }
-  await loadComparison();
+
+  // A collection navigation that finished while the POST was in flight may
+  // have loaded a snapshot from before this decision committed. Reconcile the
+  // current collection without ever mutating it using the old row's state.
+  if (!comparisonScopeIsCurrent(decisionScope)) {
+    await loadComparison();
+    return;
+  }
+
+  // Reject and Reviewed only change this prediction's review status. Keep
+  // the already-loaded comparison in place and update both copies of the
+  // prediction (the model column and its subject) immediately. Keyword
+  // decisions need fresh taxonomy comparisons, so those use the small
+  // photo-scoped endpoint below instead of guessing at new categories here.
+  if (action === 'reject' || action === 'reviewed') {
+    if (setComparePredictionStatus(
+      predId, action === 'reject' ? 'rejected' : 'reviewed'
+    )) {
+      renderCompare();
+    }
+    // Status can itself be part of a saved collection's rules. Re-query this
+    // photo so a row that no longer belongs is removed without reloading the
+    // rest of the comparison.
+    await refreshDecisionPhotos(entryPhotoIds, decisionScope);
+    return;
+  }
+
+  var affectedPhotoIds = entryPhotoIds.concat((data && data.photo_ids) || []);
+  await refreshDecisionPhotos(affectedPhotoIds, decisionScope);
 }
 
 function endpointForAction(action) {
@@ -1609,7 +1657,147 @@ function endpointForAction(action) {
   return 'reviewed';
 }
 
+function comparePhotoIdsForPredictions(predictionIds) {
+  var wanted = new Set((predictionIds || []).map(function(id) {
+    return Number(id);
+  }));
+  function hasWantedPrediction(predictions) {
+    return Object.keys(predictions || {}).some(function(model) {
+      return (predictions[model] || []).some(function(pred) {
+        return wanted.has(Number(pred.id));
+      });
+    });
+  }
+  var photoIds = [];
+  (compareData && compareData.photos || []).forEach(function(photo) {
+    var found = hasWantedPrediction(photo.predictions) ||
+      (photo.subjects || []).some(function(subject) {
+        return hasWantedPrediction(subject.predictions);
+      });
+    if (found) photoIds.push(photo.photo_id);
+  });
+  return photoIds;
+}
+
+function setComparePredictionStatus(predId, status) {
+  var changed = false;
+  function updatePredictions(predictions) {
+    Object.keys(predictions || {}).forEach(function(model) {
+      (predictions[model] || []).forEach(function(pred) {
+        if (Number(pred.id) !== Number(predId)) return;
+        pred.status = status;
+        changed = true;
+      });
+    });
+  }
+  (compareData && compareData.photos || []).forEach(function(photo) {
+    updatePredictions(photo.predictions);
+    (photo.subjects || []).forEach(function(subject) {
+      updatePredictions(subject.predictions);
+    });
+  });
+  return changed;
+}
+
+function currentComparisonScope() {
+  return {
+    collectionId: document.getElementById('collectionPicker').value,
+    loadingSeq: loadingSeq,
+  };
+}
+
+function comparisonScopeIsCurrent(scope) {
+  return Boolean(compareData) && scope.loadingSeq === loadingSeq &&
+    document.getElementById('collectionPicker').value === scope.collectionId;
+}
+
+async function refreshComparisonPhotos(photoIds, scope) {
+  if (!compareData) return;
+  var uniqueIds = Array.from(new Set((photoIds || []).map(Number).filter(function(id) {
+    return Number.isInteger(id) && id > 0;
+  })));
+  if (!uniqueIds.length) {
+    await loadComparison();
+    return;
+  }
+
+  var refreshScope = scope || currentComparisonScope();
+  if (!comparisonScopeIsCurrent(refreshScope)) return;
+  var collId = refreshScope.collectionId;
+  var refreshSeq = refreshScope.loadingSeq;
+  var refreshed = new Map();
+  // Keep each URL comfortably below browser/server limits for large burst
+  // groups while still issuing far less work than a whole-collection reload.
+  for (var start = 0; start < uniqueIds.length; start += 100) {
+    var params = new URLSearchParams({collection_id: collId});
+    uniqueIds.slice(start, start + 100).forEach(function(photoId) {
+      params.append('photo_id', String(photoId));
+    });
+    var data = await jsonFetch('/api/predictions/compare?' + params.toString());
+    // A full load, including a collection switch, supersedes this scoped
+    // response. Never merge rows fetched for the old collection into the new
+    // comparison after its request wins the race.
+    if (refreshSeq !== loadingSeq ||
+        document.getElementById('collectionPicker').value !== collId ||
+        !compareData) return;
+    (data.photos || []).forEach(function(photo) {
+      refreshed.set(Number(photo.photo_id), photo);
+    });
+  }
+
+  var requested = new Set(uniqueIds);
+  var untouched = (compareData.photos || []).filter(function(photo) {
+    return !requested.has(Number(photo.photo_id));
+  });
+  var mergedPhotos = untouched.concat(Array.from(refreshed.values()));
+  var mergedModels = new Set();
+  mergedPhotos.forEach(function(photo) {
+    Object.keys(photo.predictions || {}).forEach(function(model) {
+      mergedModels.add(model);
+    });
+    (photo.subjects || []).forEach(function(subject) {
+      Object.keys(subject.predictions || {}).forEach(function(model) {
+        mergedModels.add(model);
+      });
+    });
+  });
+  compareData.photos = mergedPhotos;
+  compareData.models = Array.from(mergedModels).sort();
+  populateModelSelects(compareData.models);
+  // Match the full-load behavior when the default queue is exhausted. Keep
+  // explicit user-selected filters intact, but do not strand them on an empty
+  // Needs review table after resolving the final pending row.
+  signalCache = new Map();
+  if (activeFilter === 'needs_review' &&
+      effectiveSummary().needs_review === 0) {
+    activeFilter = 'all';
+  }
+  renderCompare();
+}
+
+function refreshDecisionPhotos(photoIds, scope) {
+  // Decision buttons on different rows can be used before an earlier scoped
+  // request finishes. Serialize the reads so an older server snapshot can
+  // never merge after a newer one and overwrite its state.
+  var queuedScope = scope || currentComparisonScope();
+  var refresh = decisionRefreshQueue.then(async function() {
+    // Capture scope when the decision is made, not when its queued refresh
+    // eventually starts. A collection load while it waits supersedes it.
+    if (!comparisonScopeIsCurrent(queuedScope)) return;
+    try {
+      await refreshComparisonPhotos(photoIds, queuedScope);
+    } catch (e) {
+      showToast('Could not refresh the changed photo — reloading the comparison.', 'error');
+      await loadComparison();
+    }
+  });
+  // A failed reload must not poison every later refresh in the queue.
+  decisionRefreshQueue = refresh.catch(function() {});
+  return refresh;
+}
+
 async function batchAction(action) {
+  var decisionScope = currentComparisonScope();
   var ids = Array.from(selectedRows);
   var photos = (compareData.photos || []).filter(function(photo) {
     return ids.indexOf(photo.photo_id) >= 0;
@@ -1617,6 +1805,8 @@ async function batchAction(action) {
   var attempted = 0;
   var refused = [];
   var unconfirmed = 0;
+  var groupedConflict = false;
+  var refreshPhotoIds = ids.slice();
   // Rows an earlier request in *this* loop already decided. Accept, replace
   // and accept-subject expand through the burst group, so one request can
   // settle several of the selected photos; the next iteration would then hit
@@ -1633,9 +1823,11 @@ async function batchAction(action) {
     // failure bucket, because the server told us it wrote this row.
     if (decidedByThisBatch.alreadyDecided(pred.id)) continue;
     try {
-      decidedByThisBatch.record(await jsonFetch(
+      var decision = await jsonFetch(
         '/api/predictions/' + pred.id + '/' + endpointForAction(action),
-        { method: 'POST' }));
+        { method: 'POST' });
+      decidedByThisBatch.record(decision);
+      refreshPhotoIds = refreshPhotoIds.concat(decision.photo_ids || []);
     } catch (e) {
       // One already-settled row must not abandon the rest of the batch, but
       // the count has to be named — a batch that quietly did less than the
@@ -1648,7 +1840,11 @@ async function batchAction(action) {
       // true when the server answered. A lost response leaves the decision
       // possibly committed, and saying otherwise is the same kind of
       // convenient fiction the rest of this flow exists to remove.
-      if (e && e.answered) refused.push(e.message || 'refused');
+      if (e && e.answered) {
+        refused.push(e.message || 'refused');
+        if (e.status === 409 && (action === 'accept' || action === 'replace' ||
+            action === 'accept_subject')) groupedConflict = true;
+      }
       else unconfirmed++;
     }
   }
@@ -1658,15 +1854,30 @@ async function batchAction(action) {
       refused[0]);
   }
   if (unconfirmed) {
+    var reloadsAll = action === 'accept' || action === 'replace' ||
+      action === 'accept_subject';
     reportParts.push(unconfirmed + ' of ' + attempted +
       ' could not be confirmed (the request failed with no answer from the ' +
-      'server) — the reload below shows whether they landed');
+      'server) — the ' + (reloadsAll ? 'reload' : 'refresh') +
+      ' below shows whether they landed');
   }
   if (reportParts.length) {
     showToast(reportParts.join('; '), 'error');
   }
   selectedRows.clear();
-  await loadComparison();
+  if (!comparisonScopeIsCurrent(decisionScope)) {
+    await loadComparison();
+    return;
+  }
+  // A grouped keyword decision may commit for unselected burst members before
+  // its response is lost. Without the response photo_ids, a targeted refresh
+  // cannot discover those members, so reconcile the whole collection.
+  if (groupedConflict || (unconfirmed && (action === 'accept' ||
+      action === 'replace' || action === 'accept_subject'))) {
+    await loadComparison();
+    return;
+  }
+  await refreshDecisionPhotos(refreshPhotoIds, decisionScope);
 }
 
 updateConflictThresholdControl();

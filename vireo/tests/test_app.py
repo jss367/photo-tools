@@ -3056,6 +3056,79 @@ def test_compare_predictions_api(app_and_db):
         assert "detection_id" in model_preds[0]
 
 
+def test_compare_predictions_api_can_refresh_selected_photos(app_and_db):
+    """Repeated photo_id params narrow the collection comparison response."""
+    import json
+
+    app, db = app_and_db
+    photo_ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY id LIMIT 2"
+        ).fetchall()
+    ]
+    cid = db.add_collection(
+        "Targeted comparison",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    response = app.test_client().get(
+        f"/api/predictions/compare?collection_id={cid}&photo_id={photo_ids[1]}"
+    )
+
+    assert response.status_code == 200
+    assert [
+        photo["photo_id"] for photo in response.get_json()["photos"]
+    ] == [photo_ids[1]]
+
+
+def test_compare_predictions_api_limits_targeted_photo_ids(app_and_db):
+    """A targeted refresh cannot build an unbounded collection query."""
+    import app as app_module
+
+    app, db = app_and_db
+    cid = db.add_collection("Target limit", "[]")
+    query = [("collection_id", str(cid))]
+    query.extend(
+        ("photo_id", str(photo_id))
+        for photo_id in range(app_module._MAX_SELECTION_PHOTOS + 1)
+    )
+
+    response = app.test_client().get(
+        "/api/predictions/compare", query_string=query,
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "too many photo_ids"
+
+
+def test_collection_photo_narrowing_wraps_any_rules(app_and_db):
+    """A target ID applies to every branch of an any-mode collection."""
+    import json
+
+    _app, db = app_and_db
+    photo_ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY id LIMIT 3"
+        ).fetchall()
+    ]
+    cid = db.add_collection(
+        "Any-mode target",
+        json.dumps({
+            "mode": "any",
+            "rules": [
+                {"field": "photo_ids", "value": [photo_ids[0]]},
+                {"field": "photo_ids", "value": [photo_ids[1]]},
+            ],
+        }),
+    )
+
+    rows = db.get_collection_photos(cid, photo_ids=[photo_ids[1]])
+
+    assert [row["id"] for row in rows] == [photo_ids[1]]
+
+
 def test_compare_predictions_api_preserves_unclassified_subject(app_and_db):
     """A qualifying box remains visible when no classifier prediction exists."""
     app, db = app_and_db
@@ -20699,6 +20772,9 @@ async function %s(url) {
   }
   var members = __groups[predId] || [predId];
   members.forEach(function(m) { __status[m] = 'accepted'; });
+  if ((__input.unconfirmed || []).indexOf(predId) >= 0) {
+    throw new Error('connection lost after commit');
+  }
   return {ok: true, prediction_ids: members};
 }
 var __toasts = [];
@@ -20719,14 +20795,24 @@ def _grouped_decision_module():
 _ID_CONFLICTS_BATCH_STUB = """
 var compareData = {photos: __input.photos};
 var selectedRows = new Set(__input.photos.map(function(p) { return p.photo_id; }));
+var loadingSeq = 0;
+var document = {
+  getElementById: function() { return {value: '1'}; },
+};
 function bestPrediction(photo) { return photo.prediction; }
-async function loadComparison() {}
+var __fullReloads = 0;
+var __targetedRefreshes = 0;
+async function loadComparison() { __fullReloads++; }
 """
 
 _ID_CONFLICTS_BATCH_DRIVER = """
+// This harness tests grouped decision accounting, not comparison transport.
+// The production refresh has browser dependencies and is covered by E2E tests.
+refreshDecisionPhotos = async function() { __targetedRefreshes++; };
 batchAction('accept').then(function() {
   process.stdout.write(JSON.stringify({
     toasts: __toasts, requests: __requests, status: __status,
+    fullReloads: __fullReloads, targetedRefreshes: __targetedRefreshes,
   }));
 });
 """
@@ -20800,6 +20886,30 @@ def test_id_conflicts_batch_accept_reports_group_expanded_rows_as_applied(
     assert [t["message"] for t in stale["toasts"]] == [
         "1 of 2 not applied — prediction already rejected; cannot accept",
     ]
+    assert stale["fullReloads"] == 1
+    assert stale["targetedRefreshes"] == 0
+
+
+def test_id_conflicts_batch_unconfirmed_accept_fully_reloads(app_and_db):
+    """A lost grouped-write response cannot be reconciled by selected IDs."""
+    app, _ = app_and_db
+    html = app.test_client().get("/id-conflicts").get_data(as_text=True)
+    photos = [
+        {"photo_id": 1, "prediction": {"id": 11}},
+        {"photo_id": 2, "prediction": {"id": 12}},
+    ]
+
+    result = _run_id_conflicts_batch(html, {
+        "photos": photos,
+        "status": {"11": "pending", "12": "pending", "13": "pending"},
+        "groups": {"11": [11, 13]},
+        "unconfirmed": [11],
+    })
+
+    assert result["status"]["13"] == "accepted"
+    assert result["fullReloads"] == 1
+    assert result["targetedRefreshes"] == 0
+    assert "reload below" in result["toasts"][0]["message"]
 
 
 # Review's accept handlers, driven against the same burst-expanding server.

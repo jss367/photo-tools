@@ -1740,7 +1740,14 @@ function refreshDecisionPhotos(photoIds) {
   // Decision buttons on different rows can be used before an earlier scoped
   // request finishes. Serialize the reads so an older server snapshot can
   // never merge after a newer one and overwrite its state.
+  var queuedCollectionId = document.getElementById('collectionPicker').value;
+  var queuedLoadingSeq = loadingSeq;
   var refresh = decisionRefreshQueue.then(async function() {
+    // Capture scope when the decision is made, not when its queued refresh
+    // eventually starts. A collection load while it waits supersedes it.
+    if (queuedLoadingSeq !== loadingSeq ||
+        document.getElementById('collectionPicker').value !== queuedCollectionId ||
+        !compareData) return;
     try {
       await refreshComparisonPhotos(photoIds);
     } catch (e) {

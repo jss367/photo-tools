@@ -194,6 +194,40 @@ def test_compare_serializes_scoped_decision_refreshes(live_server, page):
     assert result == {"beforeRelease": [1], "afterRelease": [1, 2]}
 
 
+def test_compare_discards_queued_refresh_after_collection_load(live_server, page):
+    """Queued work stays bound to the collection that originated it."""
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+
+    calls = page.evaluate(
+        """async () => {
+          var calls = [];
+          var releaseFirst;
+          var firstGate = new Promise(function(resolve) {
+            releaseFirst = resolve;
+          });
+          var originalRefresh = refreshComparisonPhotos;
+          refreshComparisonPhotos = async function(ids) {
+            calls.push(ids[0]);
+            if (ids[0] === 1) await firstGate;
+          };
+          try {
+            var first = refreshDecisionPhotos([1]);
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            var queued = refreshDecisionPhotos([2]);
+            loadingSeq++;
+            releaseFirst();
+            await Promise.all([first, queued]);
+            return calls;
+          } finally {
+            refreshComparisonPhotos = originalRefresh;
+          }
+        }"""
+    )
+
+    assert calls == [1]
+
+
 def test_compare_treats_second_detected_species_as_additional(live_server, page):
     """A second subject is additional information, not a tag conflict."""
     from labels_fingerprint import TOL_SENTINEL

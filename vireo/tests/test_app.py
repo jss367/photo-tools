@@ -20779,6 +20779,10 @@ def _grouped_decision_module():
 _ID_CONFLICTS_BATCH_STUB = """
 var compareData = {photos: __input.photos};
 var selectedRows = new Set(__input.photos.map(function(p) { return p.photo_id; }));
+var loadingSeq = 0;
+var document = {
+  getElementById: function() { return {value: '1'}; },
+};
 function bestPrediction(photo) { return photo.prediction; }
 var __fullReloads = 0;
 var __targetedRefreshes = 0;

@@ -270,6 +270,85 @@ def test_compare_scoped_refresh_exits_empty_needs_review_filter(live_server, pag
     assert result == {"filter": "all", "needsReview": 0}
 
 
+def test_compare_decision_refresh_keeps_its_origin_scope(live_server, page):
+    """A collection load during the POST supersedes its later refresh."""
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+
+    calls = page.evaluate(
+        """async () => {
+          var predId = compareData.photos[0].predictions[
+            Object.keys(compareData.photos[0].predictions)[0]
+          ][0].id;
+          var originalFetch = jsonFetch;
+          var originalRefresh = refreshComparisonPhotos;
+          var releasePost;
+          var postGate = new Promise(function(resolve) { releasePost = resolve; });
+          var refreshCalls = [];
+          jsonFetch = async function(url) {
+            if (url.indexOf('/api/predictions/') === 0) {
+              await postGate;
+              return {ok: true};
+            }
+            return originalFetch(url);
+          };
+          refreshComparisonPhotos = async function(ids) {
+            refreshCalls.push(ids);
+          };
+          try {
+            var decision = predictionAction(predId, 'reviewed');
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            loadingSeq++;
+            releasePost();
+            await decision;
+            return refreshCalls;
+          } finally {
+            jsonFetch = originalFetch;
+            refreshComparisonPhotos = originalRefresh;
+          }
+        }"""
+    )
+
+    assert calls == []
+
+
+def test_compare_grouped_409_performs_full_reload(live_server, page):
+    """An external grouped decision cannot be reconciled from one photo."""
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+
+    result = page.evaluate(
+        """async () => {
+          var predId = compareData.photos[0].predictions[
+            Object.keys(compareData.photos[0].predictions)[0]
+          ][0].id;
+          var originalFetch = jsonFetch;
+          var originalLoad = loadComparison;
+          var originalRefresh = refreshDecisionPhotos;
+          var fullLoads = 0;
+          var targetedRefreshes = 0;
+          jsonFetch = async function() {
+            var error = new Error('prediction already accepted');
+            error.status = 409;
+            error.answered = true;
+            throw error;
+          };
+          loadComparison = async function() { fullLoads++; };
+          refreshDecisionPhotos = async function() { targetedRefreshes++; };
+          try {
+            await predictionAction(predId, 'accept');
+            return {fullLoads: fullLoads, targetedRefreshes: targetedRefreshes};
+          } finally {
+            jsonFetch = originalFetch;
+            loadComparison = originalLoad;
+            refreshDecisionPhotos = originalRefresh;
+          }
+        }"""
+    )
+
+    assert result == {"fullLoads": 1, "targetedRefreshes": 0}
+
+
 def test_compare_treats_second_detected_species_as_additional(live_server, page):
     """A second subject is additional information, not a tag conflict."""
     from labels_fingerprint import TOL_SENTINEL

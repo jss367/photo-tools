@@ -1577,6 +1577,7 @@ function bestPrediction(photo) {
 }
 
 async function predictionAction(predId, action) {
+  var decisionScope = currentComparisonScope();
   var url = '/api/predictions/' + predId + '/' + endpointForAction(action);
   var entryPhotoIds = comparePhotoIdsForPredictions([predId]);
   var data;
@@ -1596,6 +1597,14 @@ async function predictionAction(predId, action) {
     // refresh below shows which it was either way.
     if (e && e.answered) {
       showToast(e.message || 'Could not apply that decision', 'error');
+      // Another tab can settle an entire burst before this stale row reaches
+      // the server. The 409 does not name those grouped photos, so a scoped
+      // refresh cannot reconcile the comparison safely.
+      if (e.status === 409 && (action === 'accept' || action === 'replace' ||
+          action === 'accept_subject')) {
+        await loadComparison();
+        return;
+      }
     } else {
       showToast('Could not confirm the decision (' +
         (e && e.message ? e.message : 'the request failed') +
@@ -1606,7 +1615,7 @@ async function predictionAction(predId, action) {
       await loadComparison();
       return;
     }
-    await refreshDecisionPhotos(entryPhotoIds);
+    await refreshDecisionPhotos(entryPhotoIds, decisionScope);
     return;
   }
 
@@ -1624,12 +1633,12 @@ async function predictionAction(predId, action) {
     // Status can itself be part of a saved collection's rules. Re-query this
     // photo so a row that no longer belongs is removed without reloading the
     // rest of the comparison.
-    await refreshDecisionPhotos(entryPhotoIds);
+    await refreshDecisionPhotos(entryPhotoIds, decisionScope);
     return;
   }
 
   var affectedPhotoIds = entryPhotoIds.concat((data && data.photo_ids) || []);
-  await refreshDecisionPhotos(affectedPhotoIds);
+  await refreshDecisionPhotos(affectedPhotoIds, decisionScope);
 }
 
 function endpointForAction(action) {
@@ -1682,7 +1691,19 @@ function setComparePredictionStatus(predId, status) {
   return changed;
 }
 
-async function refreshComparisonPhotos(photoIds) {
+function currentComparisonScope() {
+  return {
+    collectionId: document.getElementById('collectionPicker').value,
+    loadingSeq: loadingSeq,
+  };
+}
+
+function comparisonScopeIsCurrent(scope) {
+  return Boolean(compareData) && scope.loadingSeq === loadingSeq &&
+    document.getElementById('collectionPicker').value === scope.collectionId;
+}
+
+async function refreshComparisonPhotos(photoIds, scope) {
   if (!compareData) return;
   var uniqueIds = Array.from(new Set((photoIds || []).map(Number).filter(function(id) {
     return Number.isInteger(id) && id > 0;
@@ -1692,8 +1713,10 @@ async function refreshComparisonPhotos(photoIds) {
     return;
   }
 
-  var collId = document.getElementById('collectionPicker').value;
-  var refreshSeq = loadingSeq;
+  var refreshScope = scope || currentComparisonScope();
+  if (!comparisonScopeIsCurrent(refreshScope)) return;
+  var collId = refreshScope.collectionId;
+  var refreshSeq = refreshScope.loadingSeq;
   var refreshed = new Map();
   // Keep each URL comfortably below browser/server limits for large burst
   // groups while still issuing far less work than a whole-collection reload.
@@ -1744,20 +1767,17 @@ async function refreshComparisonPhotos(photoIds) {
   renderCompare();
 }
 
-function refreshDecisionPhotos(photoIds) {
+function refreshDecisionPhotos(photoIds, scope) {
   // Decision buttons on different rows can be used before an earlier scoped
   // request finishes. Serialize the reads so an older server snapshot can
   // never merge after a newer one and overwrite its state.
-  var queuedCollectionId = document.getElementById('collectionPicker').value;
-  var queuedLoadingSeq = loadingSeq;
+  var queuedScope = scope || currentComparisonScope();
   var refresh = decisionRefreshQueue.then(async function() {
     // Capture scope when the decision is made, not when its queued refresh
     // eventually starts. A collection load while it waits supersedes it.
-    if (queuedLoadingSeq !== loadingSeq ||
-        document.getElementById('collectionPicker').value !== queuedCollectionId ||
-        !compareData) return;
+    if (!comparisonScopeIsCurrent(queuedScope)) return;
     try {
-      await refreshComparisonPhotos(photoIds);
+      await refreshComparisonPhotos(photoIds, queuedScope);
     } catch (e) {
       showToast('Could not refresh the changed photo — reloading the comparison.', 'error');
       await loadComparison();
@@ -1769,6 +1789,7 @@ function refreshDecisionPhotos(photoIds) {
 }
 
 async function batchAction(action) {
+  var decisionScope = currentComparisonScope();
   var ids = Array.from(selectedRows);
   var photos = (compareData.photos || []).filter(function(photo) {
     return ids.indexOf(photo.photo_id) >= 0;
@@ -1839,7 +1860,7 @@ async function batchAction(action) {
     await loadComparison();
     return;
   }
-  await refreshDecisionPhotos(refreshPhotoIds);
+  await refreshDecisionPhotos(refreshPhotoIds, decisionScope);
 }
 
 updateConflictThresholdControl();

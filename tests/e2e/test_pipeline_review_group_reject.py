@@ -2436,6 +2436,33 @@ def test_tauri_disables_navigation_when_group_review_is_dirty(live_server, page)
     assert native_state == {"result": False, "route": None}
 
 
+def test_tauri_edit_photo_allows_untouched_suggested_species(live_server, page):
+    """A prefilled prediction is an Apply suggestion, not a user edit."""
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate(
+        "pipelineResults.encounters[0].species = ['American Robin']; "
+        "openGroupReview(0, 0)"
+    )
+    page.wait_for_function("grmState && grmState.seeded === true")
+    assert page.locator("#grmSpecies").input_value() == "American Robin"
+    assert page.evaluate("grmState.speciesFieldTouched") is False
+    assert page.evaluate("grmHasPendingUserEdits()") is False
+
+    page.evaluate("window.__TAURI_INTERNALS__ = {}")
+    card = page.locator("#grmOverlay .grm-card[data-photo-id]").first
+    photo_id = card.get_attribute("data-photo-id")
+    card.click(button="right")
+    edit_item = page.locator(".vireo-ctx-item", has_text="Edit Photo")
+    expect(edit_item).not_to_have_class(re.compile(r"\bvireo-ctx-disabled\b"))
+    edit_item.click()
+
+    page.wait_for_url(f"**/edit/{photo_id}")
+
+
 def test_popup_blocked_browse_preserves_dirty_group_review(live_server, page):
     photo_ids = live_server["data"]["photos"][:4]
     _write_grouped_pipeline_cache(live_server, photo_ids)

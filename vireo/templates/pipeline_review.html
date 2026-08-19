@@ -7844,7 +7844,14 @@ function grmHasPendingUserEdits() {
     return !!((grmState.touched && grmState.touched.size) || grmState.speciesFieldTouched);
   }
   var diff = grmComputeDiff();
-  return grmFlagsDirty(diff) || diff.speciesChanged || !!grmState.speciesFieldTouched;
+  // An unconfirmed classifier prediction pre-fills the species field and
+  // makes diff.speciesChanged true before the user has touched anything.
+  // That is a proposed Apply action, not unsaved user work, so it must not
+  // block same-window navigation in Tauri. Only protect a species change
+  // after the user has actually edited the field, and only while that edit
+  // still produces a real confirmation change.
+  return grmFlagsDirty(diff) ||
+    (!!grmState.speciesFieldTouched && diff.speciesChanged);
 }
 
 window.getLightboxBrowseDisabledHint = function(photoId, willNavigateInPlace) {

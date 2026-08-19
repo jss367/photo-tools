@@ -1688,8 +1688,8 @@ async function refreshComparisonPhotos(photoIds) {
   }
 
   var collId = document.getElementById('collectionPicker').value;
+  var refreshSeq = loadingSeq;
   var refreshed = new Map();
-  var refreshedModels = new Set(compareData.models || []);
   // Keep each URL comfortably below browser/server limits for large burst
   // groups while still issuing far less work than a whole-collection reload.
   for (var start = 0; start < uniqueIds.length; start += 100) {
@@ -1698,7 +1698,12 @@ async function refreshComparisonPhotos(photoIds) {
       params.append('photo_id', String(photoId));
     });
     var data = await jsonFetch('/api/predictions/compare?' + params.toString());
-    (data.models || []).forEach(function(model) { refreshedModels.add(model); });
+    // A full load, including a collection switch, supersedes this scoped
+    // response. Never merge rows fetched for the old collection into the new
+    // comparison after its request wins the race.
+    if (refreshSeq !== loadingSeq ||
+        document.getElementById('collectionPicker').value !== collId ||
+        !compareData) return;
     (data.photos || []).forEach(function(photo) {
       refreshed.set(Number(photo.photo_id), photo);
     });
@@ -1708,8 +1713,20 @@ async function refreshComparisonPhotos(photoIds) {
   var untouched = (compareData.photos || []).filter(function(photo) {
     return !requested.has(Number(photo.photo_id));
   });
-  compareData.photos = untouched.concat(Array.from(refreshed.values()));
-  compareData.models = Array.from(refreshedModels).sort();
+  var mergedPhotos = untouched.concat(Array.from(refreshed.values()));
+  var mergedModels = new Set();
+  mergedPhotos.forEach(function(photo) {
+    Object.keys(photo.predictions || {}).forEach(function(model) {
+      mergedModels.add(model);
+    });
+    (photo.subjects || []).forEach(function(subject) {
+      Object.keys(subject.predictions || {}).forEach(function(model) {
+        mergedModels.add(model);
+      });
+    });
+  });
+  compareData.photos = mergedPhotos;
+  compareData.models = Array.from(mergedModels).sort();
   populateModelSelects(compareData.models);
   renderCompare();
 }
@@ -1775,14 +1792,25 @@ async function batchAction(action) {
       refused[0]);
   }
   if (unconfirmed) {
+    var reloadsAll = action === 'accept' || action === 'replace' ||
+      action === 'accept_subject';
     reportParts.push(unconfirmed + ' of ' + attempted +
       ' could not be confirmed (the request failed with no answer from the ' +
-      'server) — the refresh below shows whether they landed');
+      'server) — the ' + (reloadsAll ? 'reload' : 'refresh') +
+      ' below shows whether they landed');
   }
   if (reportParts.length) {
     showToast(reportParts.join('; '), 'error');
   }
   selectedRows.clear();
+  // A grouped keyword decision may commit for unselected burst members before
+  // its response is lost. Without the response photo_ids, a targeted refresh
+  // cannot discover those members, so reconcile the whole collection.
+  if (unconfirmed && (action === 'accept' || action === 'replace' ||
+      action === 'accept_subject')) {
+    await loadComparison();
+    return;
+  }
   await refreshDecisionPhotos(refreshPhotoIds);
 }
 

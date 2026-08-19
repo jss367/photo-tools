@@ -20756,6 +20756,9 @@ async function %s(url) {
   }
   var members = __groups[predId] || [predId];
   members.forEach(function(m) { __status[m] = 'accepted'; });
+  if ((__input.unconfirmed || []).indexOf(predId) >= 0) {
+    throw new Error('connection lost after commit');
+  }
   return {ok: true, prediction_ids: members};
 }
 var __toasts = [];
@@ -20777,16 +20780,19 @@ _ID_CONFLICTS_BATCH_STUB = """
 var compareData = {photos: __input.photos};
 var selectedRows = new Set(__input.photos.map(function(p) { return p.photo_id; }));
 function bestPrediction(photo) { return photo.prediction; }
-async function loadComparison() {}
+var __fullReloads = 0;
+var __targetedRefreshes = 0;
+async function loadComparison() { __fullReloads++; }
 """
 
 _ID_CONFLICTS_BATCH_DRIVER = """
 // This harness tests grouped decision accounting, not comparison transport.
 // The production refresh has browser dependencies and is covered by E2E tests.
-refreshDecisionPhotos = async function() {};
+refreshDecisionPhotos = async function() { __targetedRefreshes++; };
 batchAction('accept').then(function() {
   process.stdout.write(JSON.stringify({
     toasts: __toasts, requests: __requests, status: __status,
+    fullReloads: __fullReloads, targetedRefreshes: __targetedRefreshes,
   }));
 });
 """
@@ -20860,6 +20866,28 @@ def test_id_conflicts_batch_accept_reports_group_expanded_rows_as_applied(
     assert [t["message"] for t in stale["toasts"]] == [
         "1 of 2 not applied — prediction already rejected; cannot accept",
     ]
+
+
+def test_id_conflicts_batch_unconfirmed_accept_fully_reloads(app_and_db):
+    """A lost grouped-write response cannot be reconciled by selected IDs."""
+    app, _ = app_and_db
+    html = app.test_client().get("/id-conflicts").get_data(as_text=True)
+    photos = [
+        {"photo_id": 1, "prediction": {"id": 11}},
+        {"photo_id": 2, "prediction": {"id": 12}},
+    ]
+
+    result = _run_id_conflicts_batch(html, {
+        "photos": photos,
+        "status": {"11": "pending", "12": "pending", "13": "pending"},
+        "groups": {"11": [11, 13]},
+        "unconfirmed": [11],
+    })
+
+    assert result["status"]["13"] == "accepted"
+    assert result["fullReloads"] == 1
+    assert result["targetedRefreshes"] == 0
+    assert "reload below" in result["toasts"][0]["message"]
 
 
 # Review's accept handlers, driven against the same burst-expanding server.

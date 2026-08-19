@@ -435,6 +435,7 @@ var excludeState = {
 };
 var selectedRows = new Set();
 var loadingSeq = 0;
+var decisionRefreshQueue = Promise.resolve();
 var signalCache = new Map();
 var CONFLICT_THRESHOLD_KEY = 'vireo.compare.conflictThreshold';
 var conflictMinConfidence = loadConflictThreshold();
@@ -1619,8 +1620,12 @@ async function predictionAction(predId, action) {
       predId, action === 'reject' ? 'rejected' : 'reviewed'
     )) {
       renderCompare();
-      return;
     }
+    // Status can itself be part of a saved collection's rules. Re-query this
+    // photo so a row that no longer belongs is removed without reloading the
+    // rest of the comparison.
+    await refreshDecisionPhotos(entryPhotoIds);
+    return;
   }
 
   var affectedPhotoIds = entryPhotoIds.concat((data && data.photo_ids) || []);
@@ -1731,13 +1736,21 @@ async function refreshComparisonPhotos(photoIds) {
   renderCompare();
 }
 
-async function refreshDecisionPhotos(photoIds) {
-  try {
-    await refreshComparisonPhotos(photoIds);
-  } catch (e) {
-    showToast('Could not refresh the changed photo — reloading the comparison.', 'error');
-    await loadComparison();
-  }
+function refreshDecisionPhotos(photoIds) {
+  // Decision buttons on different rows can be used before an earlier scoped
+  // request finishes. Serialize the reads so an older server snapshot can
+  // never merge after a newer one and overwrite its state.
+  var refresh = decisionRefreshQueue.then(async function() {
+    try {
+      await refreshComparisonPhotos(photoIds);
+    } catch (e) {
+      showToast('Could not refresh the changed photo — reloading the comparison.', 'error');
+      await loadComparison();
+    }
+  });
+  // A failed reload must not poison every later refresh in the queue.
+  decisionRefreshQueue = refresh.catch(function() {});
+  return refresh;
 }
 
 async function batchAction(action) {

@@ -101,7 +101,9 @@ def test_compare_page_thumbnail_opens_lightbox(live_server, page):
 def test_compare_reject_updates_in_place_without_reloading_collection(
     live_server, page
 ):
-    """Reject is a status-only decision and must not refetch the collection."""
+    """Reject refreshes one photo, never the complete collection."""
+    from urllib.parse import parse_qs, urlparse
+
     compare_requests = []
     page.on(
         "request",
@@ -122,7 +124,9 @@ def test_compare_reject_updates_in_place_without_reloading_collection(
 
     row = page.locator(f'tr[data-photo-id="{photo_id}"]')
     expect(row.locator(".status-pill.rejected")).to_be_visible()
-    assert compare_requests == []
+    assert len(compare_requests) == 1
+    query = parse_qs(urlparse(compare_requests[0]).query)
+    assert query["photo_id"] == [photo_id]
 
 
 def test_compare_accept_refreshes_only_the_changed_photo(live_server, page):
@@ -153,6 +157,41 @@ def test_compare_accept_refreshes_only_the_changed_photo(live_server, page):
     assert len(compare_requests) == 1
     query = parse_qs(urlparse(compare_requests[0]).query)
     assert query["photo_id"] == [str(photo_id)]
+
+
+def test_compare_serializes_scoped_decision_refreshes(live_server, page):
+    """An older scoped response cannot merge after a newer decision."""
+    page.goto(f"{live_server['url']}/id-conflicts")
+    page.wait_for_function("() => window.compareData !== null")
+
+    result = page.evaluate(
+        """async () => {
+          var calls = [];
+          var releaseFirst;
+          var firstGate = new Promise(function(resolve) {
+            releaseFirst = resolve;
+          });
+          var originalRefresh = refreshComparisonPhotos;
+          refreshComparisonPhotos = async function(ids) {
+            calls.push(ids[0]);
+            if (ids[0] === 1) await firstGate;
+          };
+          try {
+            var first = refreshDecisionPhotos([1]);
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            var second = refreshDecisionPhotos([2]);
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            var beforeRelease = calls.slice();
+            releaseFirst();
+            await Promise.all([first, second]);
+            return {beforeRelease: beforeRelease, afterRelease: calls};
+          } finally {
+            refreshComparisonPhotos = originalRefresh;
+          }
+        }"""
+    )
+
+    assert result == {"beforeRelease": [1], "afterRelease": [1, 2]}
 
 
 def test_compare_treats_second_detected_species_as_additional(live_server, page):

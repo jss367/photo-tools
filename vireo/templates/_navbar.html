@@ -1790,6 +1790,13 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .missing-photos-toolbar input[type="checkbox"] { margin: 0; }
 .missing-photos-toolbar .spacer { flex: 1; }
 .missing-photo-row input[type="checkbox"] { margin: 0; flex-shrink: 0; }
+.missing-photos-action-status {
+  min-height: 18px;
+  margin: 0 0 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.missing-photos-action-status.error { color: var(--danger); }
 .banner-dismiss {
   margin-left: auto;
   background: none;
@@ -2580,10 +2587,11 @@ function sendReport() {
       </label>
       <label title="Also delete the .xmp sidecar files left behind on disk."><input type="checkbox" id="missingPhotosDeleteSidecars" checked> Also delete leftover XMP sidecars</label>
     </div>
+    <div class="missing-photos-action-status" id="missingPhotosActionStatus" role="status" aria-live="polite" hidden></div>
     <div id="missingPhotosList" style="flex:1;overflow-y:auto;"></div>
     <div class="modal-actions">
       <button class="modal-btn danger" id="missingPhotosRemoveBtn" onclick="removeSelectedMissingPhotos()" disabled>Remove selected</button>
-      <button class="modal-btn" onclick="refreshMissingPhotosNow()">Check Again</button>
+      <button class="modal-btn" id="missingPhotosRefreshBtn" onclick="refreshMissingPhotosNow()">Check Again</button>
       <button class="modal-btn modal-btn-cancel" onclick="closeMissingPhotosModal()">Close</button>
     </div>
   </div>
@@ -13534,6 +13542,7 @@ async function startRemoveFolder(folderId, path, photoCount) {
 
 /* ---------- Missing Originals Modal ---------- */
 let _missingPhotosSelected = new Set();
+let _missingPhotosDeleteInFlight = false;
 
 // Scope for the Missing Originals modal. null folderId = whole workspace.
 // The banner poll (checkMissingPhotos) is always workspace-wide; only the
@@ -13558,6 +13567,7 @@ function openMissingPhotosModal(folderId, label) {
     note.textContent = '';
   }
   document.getElementById('missingPhotosDeleteSidecars').checked = true;
+  _setMissingPhotosActionStatus('');
   document.getElementById('missingPhotosModal').classList.add('open');
   loadMissingPhotos();
 }
@@ -13795,6 +13805,7 @@ async function loadMissingPhotos() {
         '<button class="modal-btn primary" onclick="refreshMissingPhotosNow()">Check now</button>';
       return;
     }
+    if (!_missingPhotosDeleteInFlight) _setMissingPhotosActionStatus('');
     // A folder-scoped load is a subset — don't overwrite the workspace-wide
     // banner cache with it, or the banner's dismissed-count math goes stale.
     if (!scoped && cacheId === _missingPhotosCacheFetchId) _missingPhotosCache = photos;
@@ -13860,7 +13871,7 @@ async function refreshMissingPhotosNow() {
     if (container) container.innerHTML = '<p style="color:var(--text-secondary);">Failed to start check.</p>';
     return;
   }
-  loadMissingPhotos();
+  await loadMissingPhotos();
 }
 
 function toggleMissingPhoto(id, checked) {
@@ -13883,27 +13894,89 @@ function _updateMissingPhotosBulkBtn() {
   const n = _missingPhotosSelected.size;
   document.getElementById('missingPhotosSelectedCount').textContent =
     `${n} selected`;
-  document.getElementById('missingPhotosRemoveBtn').disabled = (n === 0);
+  document.getElementById('missingPhotosRemoveBtn').disabled =
+    _missingPhotosDeleteInFlight || n === 0;
+}
+
+function _setMissingPhotosActionStatus(message, state) {
+  const status = document.getElementById('missingPhotosActionStatus');
+  if (!status) return;
+  status.textContent = message || '';
+  status.hidden = !message;
+  status.classList.toggle('error', state === 'error');
+  status.setAttribute('role', state === 'error' ? 'alert' : 'status');
+  status.setAttribute('aria-live', state === 'error' ? 'assertive' : 'polite');
+}
+
+function _setMissingPhotosDeleteBusy(busy, count) {
+  _missingPhotosDeleteInFlight = busy;
+  const button = document.getElementById('missingPhotosRemoveBtn');
+  const refreshButton = document.getElementById('missingPhotosRefreshBtn');
+  if (button) {
+    button.textContent = busy
+      ? `Removing ${count} photo${count === 1 ? '' : 's'}…`
+      : 'Remove selected';
+  }
+  if (refreshButton) refreshButton.disabled = busy;
+  document.querySelectorAll(
+    '#missingPhotosToolbar input, #missingPhotosList input, #missingPhotosList button'
+  ).forEach(function(control) {
+    control.disabled = busy;
+  });
+  _updateMissingPhotosBulkBtn();
 }
 
 async function removeOneMissingPhoto(id) {
+  if (_missingPhotosDeleteInFlight) return;
   const deleteSidecars = document.getElementById('missingPhotosDeleteSidecars').checked;
   const sidecarMsg = deleteSidecars
     ? '\n\nLeftover XMP sidecars will also be deleted from disk.'
     : '\n\nThe XMP sidecar on disk will not be touched.';
   if (!confirm(`Remove this photo from Vireo?\n\nCached thumbnail/preview/working copy (if any) will also be deleted.${sidecarMsg}`)) return;
-  await _deleteMissingPhotoIds([id], deleteSidecars);
-  refreshMissingPhotosNow();
+  await _runMissingPhotosRemoval([id], deleteSidecars);
 }
 
 async function removeSelectedMissingPhotos() {
+  if (_missingPhotosDeleteInFlight) return;
   const ids = Array.from(_missingPhotosSelected);
   if (ids.length === 0) return;
   const deleteSidecars = document.getElementById('missingPhotosDeleteSidecars').checked;
   const sidecarMsg = deleteSidecars ? '\n\nLeftover XMP sidecars will also be deleted from disk.' : '';
   if (!confirm(`Remove ${ids.length} photo${ids.length !== 1 ? 's' : ''} from Vireo?\n\nCached thumbnails/previews/working copies will be deleted.${sidecarMsg}`)) return;
-  await _deleteMissingPhotoIds(ids, deleteSidecars);
-  refreshMissingPhotosNow();
+  await _runMissingPhotosRemoval(ids, deleteSidecars);
+}
+
+async function _runMissingPhotosRemoval(ids, deleteSidecars) {
+  if (_missingPhotosDeleteInFlight || ids.length === 0) return;
+  _setMissingPhotosDeleteBusy(true, ids.length);
+  _setMissingPhotosActionStatus(
+    `Removing ${ids.length} photo${ids.length === 1 ? '' : 's'}…`
+  );
+  try {
+    const payload = await _deleteMissingPhotoIds(ids, deleteSidecars);
+    const deleted = Number(payload && payload.deleted) || 0;
+    const noun = deleted === 1 ? 'photo' : 'photos';
+    if (deleted > 0) {
+      showToast(`Removed ${deleted} ${noun} from Vireo.`, 'success');
+      _setMissingPhotosActionStatus(
+        `Removed ${deleted} ${noun}. Rechecking missing originals…`
+      );
+    } else {
+      _setMissingPhotosActionStatus(
+        'No photos were removed. Rechecking missing originals…'
+      );
+    }
+    await refreshMissingPhotosNow();
+  } catch (err) {
+    // safeFetch already surfaces the specific server/network error as a toast.
+    // Keep a persistent failure state in the modal too, since the toast fades.
+    _setMissingPhotosActionStatus(
+      'Could not remove the selected photos. Please try again.',
+      'error',
+    );
+  } finally {
+    _setMissingPhotosDeleteBusy(false, 0);
+  }
 }
 
 async function _deleteMissingPhotoIds(ids, deleteSidecars) {
@@ -13944,6 +14017,14 @@ async function _deleteMissingPhotoIds(ids, deleteSidecars) {
       'warning',
     );
   }
+  const skipped = Number(payload && payload.skipped) || 0;
+  if (skipped > 0) {
+    const noun = skipped === 1 ? 'photo' : 'photos';
+    showToast(
+      `Skipped ${skipped} ${noun} no longer available in this workspace.`,
+      'warning',
+    );
+  }
   // The server just invalidated the Missing Originals cache, but callers
   // only bump the modal/cache generation counters (via refreshMissingPhotosNow
   // → loadMissingPhotos). A banner /api/photos/missing GET that was already
@@ -13962,6 +14043,7 @@ async function _deleteMissingPhotoIds(ids, deleteSidecars) {
       console.error('Failed to refresh Misses after delete:', err);
     }
   }
+  return payload;
 }
 </script>
 <script src="/static/vireo-utils.js"></script>

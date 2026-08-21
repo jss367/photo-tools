@@ -88,6 +88,7 @@ def test_publish_site_job_writes_life_list_highlights_and_images(tmp_path, monke
 
     resp = client.post("/api/jobs/publish-site", json={
         "destination": str(dest),
+        "include_highlights": True,
         "photos_per_species": 2,
         "limit_per_bucket": 2,
         "max_size": 512,
@@ -122,6 +123,108 @@ def test_publish_site_job_writes_life_list_highlights_and_images(tmp_path, monke
     assert (dest / unidentified["image"]).exists()
 
     db.close()
+
+
+def test_publish_site_defaults_to_one_life_list_photo_and_no_highlights(
+    tmp_path, monkeypatch,
+):
+    app, db, _meta = _seed_publish_app(tmp_path, monkeypatch)
+    client = app.test_client()
+    dest = tmp_path / "published"
+
+    resp = client.post("/api/jobs/publish-site", json={
+        "destination": str(dest),
+    })
+    assert resp.status_code == 200
+
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+    assert job["status"] == "completed"
+    assert job["config"]["include_life_list"] is True
+    assert job["config"]["photos_per_species"] == 1
+    assert job["config"]["include_highlights"] is False
+    assert job["result"]["exported_images"] == 2
+
+    life = json.loads((dest / "data" / "life-list.json").read_text())
+    highlights = json.loads((dest / "data" / "highlights.json").read_text())
+    assert life["meta"]["species_count"] == 2
+    assert all(len(entry["photos"]) == 1 for entry in life["species"])
+    assert highlights["buckets"] == []
+    assert highlights["unidentified"]["photos"] == []
+
+    db.close()
+
+
+def test_publish_site_preflight_reports_exact_unique_photo_count(
+    tmp_path, monkeypatch,
+):
+    app, db, _meta = _seed_publish_app(tmp_path, monkeypatch)
+    client = app.test_client()
+
+    default = client.post("/api/jobs/publish-site/preflight", json={})
+    assert default.status_code == 200
+    assert default.get_json() == {
+        "life_list_species": 2,
+        "highlight_buckets": 0,
+        "unidentified_photos": 0,
+        "image_count": 2,
+        "data_file_count": 3,
+    }
+
+    with_highlights = client.post("/api/jobs/publish-site/preflight", json={
+        "include_highlights": True,
+        "limit_per_bucket": 3,
+    })
+    assert with_highlights.status_code == 200
+    assert with_highlights.get_json() == {
+        "life_list_species": 2,
+        "highlight_buckets": 2,
+        "unidentified_photos": 1,
+        "image_count": 3,
+        "data_file_count": 3,
+    }
+
+    db.close()
+
+
+def test_publish_site_can_publish_highlights_without_life_list(
+    tmp_path, monkeypatch,
+):
+    app, db, _meta = _seed_publish_app(tmp_path, monkeypatch)
+    client = app.test_client()
+    dest = tmp_path / "published"
+
+    resp = client.post("/api/jobs/publish-site", json={
+        "destination": str(dest),
+        "include_life_list": False,
+        "include_highlights": True,
+        "limit_per_bucket": 1,
+    })
+    assert resp.status_code == 200
+
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+    assert job["status"] == "completed"
+    assert job["result"]["exported_images"] == 3
+
+    life = json.loads((dest / "data" / "life-list.json").read_text())
+    highlights = json.loads((dest / "data" / "highlights.json").read_text())
+    assert life["species"] == []
+    assert [bucket["species"] for bucket in highlights["buckets"]] == [
+        "Northern Cardinal",
+        "House Sparrow",
+    ]
+    assert len(highlights["unidentified"]["photos"]) == 1
+
+    db.close()
+
+
+def test_publish_site_requires_at_least_one_content_section(app_and_db):
+    app, _db = app_and_db
+    resp = app.test_client().post("/api/jobs/publish-site/preflight", json={
+        "include_life_list": False,
+        "include_highlights": False,
+    })
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "select Life List, Highlights, or both"
 
 
 def test_publish_site_job_can_include_locations(tmp_path, monkeypatch):

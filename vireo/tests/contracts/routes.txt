@@ -290,6 +290,7 @@ POST         /api/jobs/precompute-embeddings
 POST         /api/jobs/prepare-full-resolution
 POST         /api/jobs/previews
 POST         /api/jobs/publish-site
+POST         /api/jobs/publish-site/preflight
 POST         /api/jobs/regroup
 POST         /api/jobs/repair-metadata
 POST         /api/jobs/runtime-warning/dismiss

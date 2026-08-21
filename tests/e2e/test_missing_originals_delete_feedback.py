@@ -27,6 +27,7 @@ def _prepare_missing_originals_delete(page):
           window.__missingRefreshCount = 0;
           window.refreshMissingPhotosNow = async () => {
             window.__missingRefreshCount += 1;
+            return 'ready';
           };
         }"""
     )
@@ -79,7 +80,7 @@ def test_missing_originals_delete_shows_busy_and_success_feedback(live_server, p
     expect(remove_button).to_be_enabled()
     expect(page.locator("#missingPhotosRefreshBtn")).to_be_enabled()
     expect(page.locator("#missingPhotosActionStatus")).to_have_text(
-        "Removed 2 photos. Rechecking missing originals…"
+        "Removed 2 photos."
     )
     assert page.evaluate("window.__missingRefreshCount") == 1
     assert page.evaluate("window.__missingRemoveToasts") == [
@@ -113,3 +114,39 @@ def test_missing_originals_delete_failure_restores_controls(live_server, page):
     )
     expect(status).to_have_attribute("role", "alert")
     assert page.evaluate("window.__missingRefreshCount") == 0
+
+
+def test_missing_originals_refresh_failure_preserves_delete_success(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+    _prepare_missing_originals_delete(page)
+
+    page.evaluate(
+        """() => {
+          window.safeFetch = async () => ({
+            deleted: 2,
+            restored: [],
+            folder_offline: [],
+            skipped: 0,
+          });
+          window.refreshMissingPhotosNow = async () => {
+            window.__missingRefreshCount += 1;
+            throw new Error('refresh failed');
+          };
+          window.__missingRemoveFinished = false;
+          removeSelectedMissingPhotos().then(() => {
+            window.__missingRemoveFinished = true;
+          });
+        }"""
+    )
+    page.wait_for_function("window.__missingRemoveFinished === true")
+
+    status = page.locator("#missingPhotosActionStatus")
+    expect(status).to_have_text(
+        "Removed 2 photos, but could not refresh missing originals."
+    )
+    expect(status).to_have_attribute("role", "alert")
+    expect(page.locator("#missingPhotosRemoveBtn")).to_be_enabled()
+    assert page.evaluate("window.__missingRefreshCount") == 1
+    assert page.evaluate("window.__missingRemoveToasts") == [
+        {"message": "Removed 2 photos from Vireo.", "kind": "success"}
+    ]

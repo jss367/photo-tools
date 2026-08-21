@@ -13793,7 +13793,7 @@ async function loadMissingPhotos() {
     if (payload && payload.pending) {
       container.innerHTML = '<p style="color:var(--text-secondary);">Checking missing originals…</p>';
       _scheduleMissingPhotosPoll(_missingPhotosScope.folderId, true);
-      return;
+      return 'pending';
     }
     if (!ready) {
       const err = payload && payload.error ? _escapeHtml(payload.error) : '';
@@ -13803,7 +13803,7 @@ async function loadMissingPhotos() {
       container.innerHTML =
         '<p style="color:var(--text-secondary);">' + msg + '</p>' +
         '<button class="modal-btn primary" onclick="refreshMissingPhotosNow()">Check now</button>';
-      return;
+      return 'failed';
     }
     if (!_missingPhotosDeleteInFlight) _setMissingPhotosActionStatus('');
     // A folder-scoped load is a subset — don't overwrite the workspace-wide
@@ -13815,7 +13815,7 @@ async function loadMissingPhotos() {
     if (photos.length === 0) {
       container.innerHTML = '<p style="color:var(--text-secondary);">No photos with missing originals.</p>';
       checkMissingPhotos();
-      return;
+      return 'ready';
     }
     toolbar.style.display = 'flex';
     document.getElementById('missingPhotosSelectAll').checked = false;
@@ -13851,8 +13851,10 @@ async function loadMissingPhotos() {
       `;
     }).join('');
     _updateMissingPhotosBulkBtn();
+    return 'ready';
   } catch (e) {
     container.innerHTML = '<p style="color:var(--text-secondary);">Failed to check photos.</p>';
+    return 'failed';
   }
 }
 
@@ -13869,9 +13871,9 @@ async function refreshMissingPhotosNow() {
     });
   } catch (e) {
     if (container) container.innerHTML = '<p style="color:var(--text-secondary);">Failed to start check.</p>';
-    return;
+    return 'failed';
   }
-  await loadMissingPhotos();
+  return await loadMissingPhotos();
 }
 
 function toggleMissingPhoto(id, checked) {
@@ -13953,7 +13955,19 @@ async function _runMissingPhotosRemoval(ids, deleteSidecars) {
     `Removing ${ids.length} photo${ids.length === 1 ? '' : 's'}…`
   );
   try {
-    const payload = await _deleteMissingPhotoIds(ids, deleteSidecars);
+    let payload;
+    try {
+      payload = await _deleteMissingPhotoIds(ids, deleteSidecars);
+    } catch (err) {
+      // safeFetch already surfaces the specific server/network error as a
+      // toast. Keep a persistent failure state in the modal too, since the
+      // toast fades.
+      _setMissingPhotosActionStatus(
+        'Could not remove the selected photos. Please try again.',
+        'error',
+      );
+      return;
+    }
     const deleted = Number(payload && payload.deleted) || 0;
     const noun = deleted === 1 ? 'photo' : 'photos';
     if (deleted > 0) {
@@ -13966,14 +13980,27 @@ async function _runMissingPhotosRemoval(ids, deleteSidecars) {
         'No photos were removed. Rechecking missing originals…'
       );
     }
-    await refreshMissingPhotosNow();
-  } catch (err) {
-    // safeFetch already surfaces the specific server/network error as a toast.
-    // Keep a persistent failure state in the modal too, since the toast fades.
-    _setMissingPhotosActionStatus(
-      'Could not remove the selected photos. Please try again.',
-      'error',
-    );
+    let refreshState = 'failed';
+    try {
+      refreshState = await refreshMissingPhotosNow();
+    } catch (err) {
+      // Keep refresh failures separate from the deletion result. This also
+      // protects callers/tests that replace refreshMissingPhotosNow with a
+      // rejecting implementation even though the production helper normally
+      // reports failure via its return value.
+    }
+    if (refreshState === 'ready') {
+      _setMissingPhotosActionStatus(
+        deleted > 0 ? `Removed ${deleted} ${noun}.` : 'No photos were removed.'
+      );
+    } else if (refreshState === 'failed') {
+      _setMissingPhotosActionStatus(
+        deleted > 0
+          ? `Removed ${deleted} ${noun}, but could not refresh missing originals.`
+          : 'No photos were removed, and missing originals could not be refreshed.',
+        'error',
+      );
+    }
   } finally {
     _setMissingPhotosDeleteBusy(false, 0);
   }

@@ -11655,12 +11655,16 @@ async function developPhotos(photoIds) {
       onProgress: function(prog) {
         showToast('Developing: ' + prog.current + '/' + prog.total + ' — ' + (prog.current_file || ''), 'info');
       },
-      onComplete: function(result) {
+      onComplete: function(event) {
+        var result = (event && event.result) || {};
+        var developedCount = result.developed || 0;
         var errorCount = result.errors || 0;
+        var completed = event && event.status === 'completed';
         showToast(
-          'Development complete: ' + (result.developed || 0) +
+          (completed ? 'Development complete: ' : 'Development failed: ') +
+            developedCount +
             ' developed, ' + errorCount + ' errors',
-          errorCount ? 'warning' : 'success'
+          completed ? (errorCount ? 'warning' : 'success') : 'error'
         );
       },
       onError: function() {}

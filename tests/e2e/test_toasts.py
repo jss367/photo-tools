@@ -45,3 +45,58 @@ def test_toasts_use_semantic_colors_and_accessibility_roles(live_server, page):
     expect(default_toast).to_have_text("Neutral default")
     assert default_toast.get_attribute("data-type") == "info"
     assert default_toast.evaluate("el => el.style.background") == "var(--info)"
+
+
+def test_develop_completion_toast_reads_nested_job_result(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+
+    toasts = page.evaluate(
+        """async () => {
+          const payloads = [
+            {
+              status: 'completed',
+              result: {developed: 2, errors: 0, total: 2},
+              errors: []
+            },
+            {
+              status: 'failed',
+              result: {developed: 1, errors: 1, total: 2},
+              errors: ['robin.jpg: export failed']
+            }
+          ];
+          const original = {
+            confirm: window.confirm,
+            safeFetch: window.safeFetch,
+            safeEventSource: window.safeEventSource,
+            showToast: window.showToast
+          };
+          const seen = [];
+          window.confirm = () => true;
+          window.safeFetch = async url => url.endsWith('/status')
+            ? {available: true}
+            : {job_id: 42};
+          window.safeEventSource = (_url, callbacks) => {
+            callbacks.onComplete(payloads.shift());
+            return {close: () => {}};
+          };
+          window.showToast = (message, type) => seen.push({message, type});
+          try {
+            await developPhotos([1, 2]);
+            await developPhotos([1, 2]);
+            return seen.filter(item => item.message.startsWith('Development'));
+          } finally {
+            Object.assign(window, original);
+          }
+        }"""
+    )
+
+    assert toasts == [
+        {
+            "message": "Development complete: 2 developed, 0 errors",
+            "type": "success",
+        },
+        {
+            "message": "Development failed: 1 developed, 1 errors",
+            "type": "error",
+        },
+    ]

@@ -100,3 +100,48 @@ def test_develop_completion_toast_reads_nested_job_result(live_server, page):
             "type": "error",
         },
     ]
+
+
+def test_partial_path_copy_uses_warning_with_counts(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+
+    result = page.evaluate(
+        """async () => {
+          const original = {
+            safeFetch: window.safeFetch,
+            showToast: window.showToast,
+            clipboard: Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+          };
+          const seen = [];
+          let copied = '';
+          window.safeFetch = async url => {
+            if (url.endsWith('/2')) throw new Error('missing');
+            return {path: url.endsWith('/1') ? '/photos/one.jpg' : '/photos/three.jpg'};
+          };
+          window.showToast = (message, type) => seen.push({message, type});
+          Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: {writeText: async text => { copied = text; }}
+          });
+          try {
+            await copyPhotoPaths([1, 2, 3]);
+            return {copied, seen};
+          } finally {
+            window.safeFetch = original.safeFetch;
+            window.showToast = original.showToast;
+            if (original.clipboard) {
+              Object.defineProperty(navigator, 'clipboard', original.clipboard);
+            } else {
+              delete navigator.clipboard;
+            }
+          }
+        }"""
+    )
+
+    assert result == {
+        "copied": "/photos/one.jpg\n/photos/three.jpg",
+        "seen": [{
+            "message": "2 of 3 paths copied; 1 could not be copied",
+            "type": "warning",
+        }],
+    }

@@ -10675,7 +10675,15 @@ async function copyPhotoPaths(photoIds) {
   if (navigator.clipboard) {
     try {
       await navigator.clipboard.writeText(paths.join('\n'));
-      showToast(photoIds.length === 1 ? 'Path copied' : 'Paths copied', 'success');
+      if (failed > 0) {
+        showToast(
+          paths.length + ' of ' + photoIds.length + ' paths copied; ' +
+            failed + ' could not be copied',
+          'warning'
+        );
+      } else {
+        showToast(photoIds.length === 1 ? 'Path copied' : 'Paths copied', 'success');
+      }
     } catch (e) {
       console.error(e);
     }

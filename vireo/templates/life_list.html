@@ -6,6 +6,7 @@
 <link rel="icon" type="image/png" href="/favicon.ico">
 <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
 <link rel="stylesheet" href="/static/vireo-base.css">
+<link rel="stylesheet" href="/static/vireo-folder-browser.css">
 <title>Vireo - Life List</title>
 <style>
   .lifelist-controls { display:flex; align-items:center; gap:20px; padding:12px 24px; background:var(--bg-secondary); border-bottom:1px solid var(--border-primary); flex-wrap:wrap; }
@@ -278,6 +279,8 @@
   </div>
 </div>
 
+{% include '_folder_browser.html' %}
+
 <div class="lifelist-grid" id="content"></div>
 
 <div id="emptyState" class="lifelist-empty" style="display:none;">
@@ -291,6 +294,7 @@
 
 <div class="ll-tabpanel" id="tab-explorer"></div>
 
+<script src="/static/vireo-folder-browser.js"></script>
 <script>
 var currentData = null;
 var debounceTimer = null;
@@ -821,13 +825,46 @@ function closePublishModal() {
   document.getElementById('publishModal').classList.remove('open');
 }
 
+const publishFolderBrowser = new VireoFolderBrowser({
+  overlayId: 'folderBrowser',
+  defaultMode: 'destination',
+  modes: {
+    destination: {
+      title: 'Select Website Publish Folder',
+      multiple: false,
+      showCounts: false,
+      startPath: function() {
+        return document.getElementById('publishDest').value.trim();
+      },
+      onSelect: function(path) {
+        document.getElementById('publishDest').value = path;
+      },
+    },
+  },
+});
+
 async function browsePublishDest() {
-  if (typeof pickDirectory !== 'function') {
-    showToast('Folder picker is available in the desktop app.', 'info');
-    return;
+  var destination = document.getElementById('publishDest');
+  if (typeof pickDirectory === 'function') {
+    var seqBeforePicker = publishFolderBrowser.sequence;
+    try {
+      var selected = await pickDirectory('Select website publish folder', {
+        defaultPath: destination.value.trim() || undefined,
+      });
+      if (selected) {
+        destination.value = Array.isArray(selected) ? selected[0] : selected;
+        return;
+      }
+      if (typeof isTauri === 'function' && isTauri()) return;
+      if (publishFolderBrowser.sequence !== seqBeforePicker) {
+        publishFolderBrowser.open('destination', {skipInitialBrowse: true});
+        return;
+      }
+    } catch (error) {
+      console.error('Could not open native publish-folder picker:', error);
+    }
   }
-  var selected = await pickDirectory('Select website publish folder');
-  if (selected) document.getElementById('publishDest').value = selected;
+  publishFolderBrowser.open('destination');
 }
 
 async function startPublishSite() {

@@ -131,6 +131,8 @@ def test_page_renders(life_app):
     assert b"Representative filename" in resp.data
     assert b"Quality score" in resp.data
     assert b"link.download = ''" in resp.data
+    assert b'id="folderBrowser"' in resp.data
+    assert b"publishFolderBrowser.open('destination')" in resp.data
 
 
 def test_groups_by_species_and_counts(life_app):

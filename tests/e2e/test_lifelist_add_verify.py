@@ -156,6 +156,28 @@ def test_lightbox_panel_add_and_flip_to_selected(live_server, page):
     assert re.search(r"\bprimary\b", selected.get_attribute("class") or "")
 
 
+def test_publish_site_offers_folder_browser(live_server, page):
+    """Publish destination remains browsable outside the native webview."""
+    page.goto(f"{live_server['url']}/life-list")
+
+    page.get_by_role("button", name="Publish Site", exact=True).click()
+    expect(page.locator("#publishModal")).to_have_class("modal-overlay open")
+
+    page.get_by_role("button", name="Browse", exact=True).click()
+    expect(page.locator("#folderBrowser")).to_have_class(
+        "folder-browser-overlay open"
+    )
+    expect(page.locator("#folderBrowserTitle")).to_have_text(
+        "Select Website Publish Folder"
+    )
+
+    page.keyboard.press("Escape")
+    expect(page.locator("#folderBrowser")).not_to_have_class(
+        "folder-browser-overlay open"
+    )
+    expect(page.locator("#publishModal")).to_have_class("modal-overlay open")
+
+
 def test_lightbox_panel_hides_after_current_photo_rejected(live_server, page):
     """When the currently-open photo is rejected via lightbox flag controls,
     _photo_can_be_life_list_preference stops accepting it on the server. The

@@ -6420,7 +6420,7 @@ async function selectAllMatchingPhotos() {
     };
   }
 
-  showToast('Selecting all matching photos...');
+  showToast('Selecting all matching photos...', 'info');
   try {
     var data = await safeFetch(url, fetchOpts, { toast: false });
     if (requestSeq !== selectAllRequestSeq || !windowIsCurrent()) return;
@@ -6428,7 +6428,11 @@ async function selectAllMatchingPhotos() {
     (data.photo_ids || data.ids || []).forEach(function(id) { selectedPhotos.add(id); });
     renderGrid();
     updateBatchBar();
-    showToast('Selected ' + selectedPhotos.size.toLocaleString() + ' photo' + (selectedPhotos.size === 1 ? '' : 's'));
+    showToast(
+      'Selected ' + selectedPhotos.size.toLocaleString() + ' photo' +
+        (selectedPhotos.size === 1 ? '' : 's'),
+      'success'
+    );
   } catch(e) {
     showToast('Could not select all photos: ' + (e.message || e), 'error');
   }
@@ -7646,7 +7650,7 @@ function _reportSkippedAccepts(data) {
   var accepted = data.accepted || 0;
   showToast((accepted ? 'Accepted ' + accepted + ' photo' +
     (accepted === 1 ? '' : 's') + '; skipped ' : 'Nothing accepted: ') +
-    parts.join(', '));
+    parts.join(', '), 'warning');
 }
 
 async function acceptDetailPredictions(predictionIds, photoId, expectedSpecies) {
@@ -7697,7 +7701,7 @@ function _reportSkippedRejects(data) {
   if (!parts.length) return;
   var rejected = data.rejected || 0;
   showToast((rejected ? 'Rejected ' + rejected + '; skipped ' :
-    'Nothing rejected: ') + parts.join(', '));
+    'Nothing rejected: ') + parts.join(', '), 'warning');
 }
 
 async function rejectDetailPredictions(predictionIds, photoId) {
@@ -8544,7 +8548,7 @@ async function confirmBatchCollection() {
     });
   } catch(e) { return; }
 
-  showToast('Added ' + ids.length + ' photos to "' + collectionName + '"');
+  showToast('Added ' + ids.length + ' photos to "' + collectionName + '"', 'success');
   loadCollections();
   clearSelection();
 }
@@ -8739,10 +8743,18 @@ async function startCaptureTimeJob() {
       body: JSON.stringify(payload),
     });
     hideCaptureTimeModal();
-    showToast('Adjusting capture time for ' + payload.photo_ids.length + ' photo' + (payload.photo_ids.length === 1 ? '' : 's') + '...');
+    showToast(
+      'Adjusting capture time for ' + payload.photo_ids.length + ' photo' +
+        (payload.photo_ids.length === 1 ? '' : 's') + '...',
+      'info'
+    );
     safeEventSource('/api/jobs/' + data.job_id + '/stream', {
       onProgress: function(prog) {
-        showToast('Adjusting capture time: ' + prog.current + '/' + prog.total + ' — ' + (prog.current_file || ''));
+        showToast(
+          'Adjusting capture time: ' + prog.current + '/' + prog.total +
+            ' — ' + (prog.current_file || ''),
+          'info'
+        );
       },
       onComplete: function(done) {
         if (done.status && done.status !== 'completed') {
@@ -8809,7 +8821,7 @@ function clearSelection() {
 async function undoLast() {
   try {
     var data = await safeFetch('/api/undo', { method: 'POST' });
-    showToast('Undone: ' + data.undone + ' — Ctrl+Shift+Z to redo');
+    showToast('Undone: ' + data.undone + ' — Ctrl+Shift+Z to redo', 'success');
     if (typeof window.vireoRefreshEditRecipeCache === 'function') {
       window.vireoRefreshEditRecipeCache(data.edit_recipes);
     }
@@ -8822,7 +8834,7 @@ async function undoLast() {
 async function redoLast() {
   try {
     var data = await safeFetch('/api/redo', { method: 'POST' });
-    showToast('Redone: ' + data.redone);
+    showToast('Redone: ' + data.redone, 'success');
     if (typeof window.vireoRefreshEditRecipeCache === 'function') {
       window.vireoRefreshEditRecipeCache(data.edit_recipes);
     }
@@ -10653,14 +10665,17 @@ async function copyPhotoPaths(photoIds) {
   if (!paths.length) {
     if (failed > 0) {
       console.warn('copyPhotoPaths: ' + failed + ' path(s) failed');
-      showToast(failed === 1 ? '1 path could not be copied' : failed + ' paths could not be copied');
+      showToast(
+        failed === 1 ? '1 path could not be copied' : failed + ' paths could not be copied',
+        'error'
+      );
     }
     return;
   }
   if (navigator.clipboard) {
     try {
       await navigator.clipboard.writeText(paths.join('\n'));
-      showToast(photoIds.length === 1 ? 'Path copied' : 'Paths copied');
+      showToast(photoIds.length === 1 ? 'Path copied' : 'Paths copied', 'success');
     } catch (e) {
       console.error(e);
     }
@@ -11868,7 +11883,11 @@ async function makeAvailableOffline() {
       showToast('Offline cache error: ' + data.error, 'error');
       return;
     }
-    showToast('Offline caching started (' + activeIds.length + ' photo' + (activeIds.length === 1 ? '' : 's') + ')');
+    showToast(
+      'Offline caching started (' + activeIds.length + ' photo' +
+        (activeIds.length === 1 ? '' : 's') + ')',
+      'info'
+    );
   } catch(err) {
     showToast('Offline cache failed: ' + err.message, 'error');
   }
@@ -11903,7 +11922,8 @@ async function prepareFullResolutionSelection(photoIds) {
     showToast(
       'Preparing ' + activeIds.length.toLocaleString() +
       ' photo' + (activeIds.length === 1 ? '' : 's') +
-      ' for full-resolution inspection…'
+      ' for full-resolution inspection…',
+      'info'
     );
     safeEventSource('/api/jobs/' + data.job_id + '/stream', {
       onProgress: function(progress) {

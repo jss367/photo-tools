@@ -257,7 +257,7 @@ def test_location_review_assigns_a_custom_name_to_coordinate_group(
     expect(success_toast).to_have_text(
         'Assigned “Anza-Borrego Desert State Park” to 2 photos'
     )
-    assert success_toast.evaluate("el => el.style.background") == "var(--accent)"
+    assert success_toast.evaluate("el => el.style.background") == "var(--success)"
     expect(page.locator("#locationReviewEmptyTitle")).to_have_text(
         "All locations reviewed"
     )

@@ -13543,6 +13543,7 @@ async function startRemoveFolder(folderId, path, photoCount) {
 /* ---------- Missing Originals Modal ---------- */
 let _missingPhotosSelected = new Set();
 let _missingPhotosDeleteInFlight = false;
+let _missingPhotosRemovalRefreshResult = null;
 
 // Scope for the Missing Originals modal. null folderId = whole workspace.
 // The banner poll (checkMissingPhotos) is always workspace-wide; only the
@@ -13567,7 +13568,7 @@ function openMissingPhotosModal(folderId, label) {
     note.textContent = '';
   }
   document.getElementById('missingPhotosDeleteSidecars').checked = true;
-  _setMissingPhotosActionStatus('');
+  if (!_missingPhotosRemovalRefreshResult) _setMissingPhotosActionStatus('');
   document.getElementById('missingPhotosModal').classList.add('open');
   loadMissingPhotos();
 }
@@ -13803,9 +13804,13 @@ async function loadMissingPhotos() {
       container.innerHTML =
         '<p style="color:var(--text-secondary);">' + msg + '</p>' +
         '<button class="modal-btn primary" onclick="refreshMissingPhotosNow()">Check now</button>';
+      _finalizeMissingPhotosRemovalRefresh('failed');
       return 'failed';
     }
-    if (!_missingPhotosDeleteInFlight) _setMissingPhotosActionStatus('');
+    const finalizedRemoval = _finalizeMissingPhotosRemovalRefresh('ready');
+    if (!finalizedRemoval && !_missingPhotosDeleteInFlight) {
+      _setMissingPhotosActionStatus('');
+    }
     // A folder-scoped load is a subset — don't overwrite the workspace-wide
     // banner cache with it, or the banner's dismissed-count math goes stale.
     if (!scoped && cacheId === _missingPhotosCacheFetchId) _missingPhotosCache = photos;
@@ -13854,6 +13859,7 @@ async function loadMissingPhotos() {
     return 'ready';
   } catch (e) {
     container.innerHTML = '<p style="color:var(--text-secondary);">Failed to check photos.</p>';
+    _finalizeMissingPhotosRemovalRefresh('failed');
     return 'failed';
   }
 }
@@ -13910,6 +13916,27 @@ function _setMissingPhotosActionStatus(message, state) {
   status.setAttribute('aria-live', state === 'error' ? 'assertive' : 'polite');
 }
 
+function _finalizeMissingPhotosRemovalRefresh(refreshState) {
+  const result = _missingPhotosRemovalRefreshResult;
+  if (!result || refreshState === 'pending') return false;
+  _missingPhotosRemovalRefreshResult = null;
+  if (refreshState === 'ready') {
+    _setMissingPhotosActionStatus(
+      result.deleted > 0
+        ? `Removed ${result.deleted} ${result.noun}.`
+        : 'No photos were removed.'
+    );
+  } else {
+    _setMissingPhotosActionStatus(
+      result.deleted > 0
+        ? `Removed ${result.deleted} ${result.noun}, but could not refresh missing originals.`
+        : 'No photos were removed, and missing originals could not be refreshed.',
+      'error',
+    );
+  }
+  return true;
+}
+
 function _setMissingPhotosDeleteBusy(busy, count) {
   _missingPhotosDeleteInFlight = busy;
   const button = document.getElementById('missingPhotosRemoveBtn');
@@ -13950,6 +13977,7 @@ async function removeSelectedMissingPhotos() {
 
 async function _runMissingPhotosRemoval(ids, deleteSidecars) {
   if (_missingPhotosDeleteInFlight || ids.length === 0) return;
+  _missingPhotosRemovalRefreshResult = null;
   _setMissingPhotosDeleteBusy(true, ids.length);
   _setMissingPhotosActionStatus(
     `Removing ${ids.length} photo${ids.length === 1 ? '' : 's'}…`
@@ -13970,6 +13998,7 @@ async function _runMissingPhotosRemoval(ids, deleteSidecars) {
     }
     const deleted = Number(payload && payload.deleted) || 0;
     const noun = deleted === 1 ? 'photo' : 'photos';
+    _missingPhotosRemovalRefreshResult = {deleted: deleted, noun: noun};
     if (deleted > 0) {
       showToast(`Removed ${deleted} ${noun} from Vireo.`, 'success');
       _setMissingPhotosActionStatus(
@@ -13989,16 +14018,9 @@ async function _runMissingPhotosRemoval(ids, deleteSidecars) {
       // rejecting implementation even though the production helper normally
       // reports failure via its return value.
     }
-    if (refreshState === 'ready') {
-      _setMissingPhotosActionStatus(
-        deleted > 0 ? `Removed ${deleted} ${noun}.` : 'No photos were removed.'
-      );
-    } else if (refreshState === 'failed') {
-      _setMissingPhotosActionStatus(
-        deleted > 0
-          ? `Removed ${deleted} ${noun}, but could not refresh missing originals.`
-          : 'No photos were removed, and missing originals could not be refreshed.',
-        'error',
+    if (refreshState !== 'pending') {
+      _finalizeMissingPhotosRemovalRefresh(
+        refreshState === 'ready' ? 'ready' : 'failed'
       );
     }
   } finally {

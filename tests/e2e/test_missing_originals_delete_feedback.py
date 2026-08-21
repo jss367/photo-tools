@@ -150,3 +150,54 @@ def test_missing_originals_refresh_failure_preserves_delete_success(live_server,
     assert page.evaluate("window.__missingRemoveToasts") == [
         {"message": "Removed 2 photos from Vireo.", "kind": "success"}
     ]
+
+
+def test_pending_missing_originals_refresh_finalizes_on_later_failure(
+    live_server, page
+):
+    page.goto(f"{live_server['url']}/browse")
+    _prepare_missing_originals_delete(page)
+
+    page.evaluate(
+        """() => {
+          window.safeFetch = async () => ({
+            deleted: 2,
+            restored: [],
+            folder_offline: [],
+            skipped: 0,
+          });
+          window.refreshMissingPhotosNow = async () => {
+            window.__missingRefreshCount += 1;
+            return 'pending';
+          };
+          window.__missingRemoveFinished = false;
+          removeSelectedMissingPhotos().then(() => {
+            window.__missingRemoveFinished = true;
+          });
+        }"""
+    )
+    page.wait_for_function("window.__missingRemoveFinished === true")
+
+    status = page.locator("#missingPhotosActionStatus")
+    expect(status).to_have_text(
+        "Removed 2 photos. Rechecking missing originals…"
+    )
+
+    page.evaluate(
+        """() => {
+          window.fetch = async () => ({
+            ok: true,
+            json: async () => ({status: 'error', error: 'scan failed'}),
+          });
+          window.__missingTerminalLoadFinished = false;
+          loadMissingPhotos().then(() => {
+            window.__missingTerminalLoadFinished = true;
+          });
+        }"""
+    )
+    page.wait_for_function("window.__missingTerminalLoadFinished === true")
+
+    expect(status).to_have_text(
+        "Removed 2 photos, but could not refresh missing originals."
+    )
+    expect(status).to_have_attribute("role", "alert")

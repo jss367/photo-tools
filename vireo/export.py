@@ -160,6 +160,12 @@ def normalize_metadata_fields(fields):
 DEFAULT_EXPORT_SUBFOLDER = "exported"
 
 MAX_EXPORT_SUBFOLDER_LEN = 120
+# Cross-platform component byte cap. ext4/HFS+/APFS all limit a path
+# component to 255 bytes, so multi-byte names (CJK, emoji) that pass the
+# character count above can still be uncreatable. Leave a small margin
+# below 255 so a following extension doesn't push a rendered file name
+# over on the odd filesystem that measures per-component encoded lengths.
+MAX_EXPORT_SUBFOLDER_BYTES = 240
 
 
 def normalize_subfolder_name(name):
@@ -178,6 +184,10 @@ def normalize_subfolder_name(name):
     if len(name) > MAX_EXPORT_SUBFOLDER_LEN:
         raise ValueError(
             f"subfolder_name must be {MAX_EXPORT_SUBFOLDER_LEN} characters or fewer"
+        )
+    if len(name.encode("utf-8")) > MAX_EXPORT_SUBFOLDER_BYTES:
+        raise ValueError(
+            f"subfolder_name must be {MAX_EXPORT_SUBFOLDER_BYTES} bytes or fewer when encoded"
         )
     if name in (".", ".."):
         raise ValueError("subfolder_name must not be '.' or '..'")
@@ -232,6 +242,11 @@ def normalize_export_preset_name(name):
             f"preset name must be {MAX_EXPORT_PRESET_NAME_LEN} characters or fewer"
         )
     # Names travel in the DELETE route path, so keep them URL-path safe.
+    # Reject "." and ".." explicitly: encodeURIComponent leaves them
+    # unchanged and browser URL resolution collapses the segment, so the
+    # UI cannot address such a preset for deletion.
+    if name in (".", ".."):
+        raise ValueError("preset name must not be '.' or '..'")
     if "/" in name or "\\" in name or any(ord(ch) < 32 for ch in name):
         raise ValueError("preset name must not contain slashes or control characters")
     return name

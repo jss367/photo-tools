@@ -128,6 +128,23 @@ def test_normalize_subfolder_name_rejects_windows_reserved_names():
         assert normalize_subfolder_name(valid) == valid
 
 
+def test_normalize_subfolder_name_rejects_names_exceeding_byte_limit():
+    from export import MAX_EXPORT_SUBFOLDER_BYTES, normalize_subfolder_name
+
+    # 120 CJK ideographs pass the character-count guard (120 <= 120) but
+    # each encodes to three UTF-8 bytes, so the encoded length exceeds
+    # what ext4/HFS+ allow for one path component.
+    too_many_bytes = "写" * 120
+    assert len(too_many_bytes) <= 120
+    assert len(too_many_bytes.encode("utf-8")) > MAX_EXPORT_SUBFOLDER_BYTES
+    with pytest.raises(ValueError, match="bytes or fewer"):
+        normalize_subfolder_name(too_many_bytes)
+
+    # A name that fits in both bounds is still accepted verbatim.
+    fits = "写" * 40
+    assert normalize_subfolder_name(fits) == fits
+
+
 def test_normalize_max_size():
     from export import normalize_max_size
 
@@ -193,6 +210,21 @@ def test_normalize_export_preset_name():
     for bad in (None, "", "   ", "a/b", "a\\b", "a" * 81, 3):
         with pytest.raises(ValueError):
             normalize_export_preset_name(bad)
+
+
+def test_normalize_export_preset_name_rejects_dot_segments():
+    # "." and ".." are URL path segments the browser collapses even after
+    # encodeURIComponent, so the DELETE UI cannot address such a preset.
+    # Reject them at save time so they never make it into the store.
+    from export import normalize_export_preset_name
+
+    for bad in (".", "..", "  .  ", "  ..  "):
+        with pytest.raises(ValueError, match=r"'\.' or '\.\.'"):
+            normalize_export_preset_name(bad)
+
+    # Names that contain dots but aren't dot-segments remain valid.
+    assert normalize_export_preset_name("v1.0") == "v1.0"
+    assert normalize_export_preset_name("...ish") == "...ish"
 
 
 def test_export_timestamp_parts_normalizes_utc_suffix():

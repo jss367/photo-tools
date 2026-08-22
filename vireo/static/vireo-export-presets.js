@@ -207,11 +207,17 @@ var VireoExportPresets = (function() {
         !window.confirm('Replace the existing preset “' + name + '”?')) {
       return;
     }
+    // Snapshot the modal edit generation before the network round trip. If
+    // the user tweaks any control while the POST + refresh are in flight,
+    // the controls no longer match what got saved, so keep the dropdown on
+    // Custom instead of relabeling the edited fields as this preset.
+    var editGeneration = modalEditGeneration;
+    var payload = collectSettings();
     try {
       var data = await safeFetch('/api/export/presets', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name: name, settings: collectSettings()}),
+        body: JSON.stringify({name: name, settings: payload}),
       }, {toast: false});
       if (data.error) throw new Error(data.error);
     } catch (err) {
@@ -219,11 +225,17 @@ var VireoExportPresets = (function() {
       return;
     }
     await refresh();
-    presetSelect().value = SAVED_PREFIX + name;
-    VireoViewPreferences.write(LAST_USED_KEY, SAVED_PREFIX + name);
+    var edited = editGeneration !== modalEditGeneration;
+    if (!edited) {
+      presetSelect().value = SAVED_PREFIX + name;
+      VireoViewPreferences.write(LAST_USED_KEY, SAVED_PREFIX + name);
+    }
     updateButtons();
     if (typeof showToast === 'function') {
-      showToast('Saved export preset “' + name + '”', 'info');
+      var msg = edited
+        ? 'Saved export preset “' + name + '” (kept your edits as Custom)'
+        : 'Saved export preset “' + name + '”';
+      showToast(msg, 'info');
     }
   }
 
@@ -271,7 +283,18 @@ var VireoExportPresets = (function() {
         return;
       }
       var last = VireoViewPreferences.read(LAST_USED_KEY);
-      if (!last || last === 'custom') { updateButtons(); return; }
+      if (!last || last === 'custom') {
+        // A date-only or time-only preset applied earlier this session may
+        // have left a presetFields hint on the combined capture-date+time
+        // checkbox (see applySettings). The host has just reset the modal
+        // to the "both" default; drop the stale split so
+        // selectedExportMetadataFields() reflects that default instead of
+        // silently exporting only one half.
+        var combined = document.getElementById('exportMetadataCaptureDateTime');
+        if (combined) delete combined.dataset.presetFields;
+        updateButtons();
+        return;
+      }
       var sel = presetSelect();
       if (last.indexOf(SAVED_PREFIX) === 0) {
         var preset = findPreset(last.slice(SAVED_PREFIX.length));

@@ -185,10 +185,64 @@ def _paired_preview_dir(preview_dir):
     return os.path.join(preview_dir, _PAIRED_PREVIEW_DIRNAME)
 
 
-def _paired_preview_path(preview_dir, photo_id, size, pair_source):
+def _paired_render_state_hash(
+    photo, size, pair_source, pair_source_path, recipe,
+):
+    """Signature hash for a paired-source render's shadow cache filename.
+
+    Includes the paired source file's mtime/size, the recipe (whose effect
+    depends on the RAW render), the edit-math version, and the request size
+    so a swapped source file or an updated recipe yields a distinct
+    filename. Recipe invalidation does not remove these shadow files and
+    their TTL sweep only fires on the next publish, so keying by state is
+    what prevents the shadow cache from returning bytes rendered from a
+    prior state.
+    """
+    from image_edits import EDIT_MATH_VERSION, recipe_to_json
+
+    source_state = None
+    if pair_source_path:
+        try:
+            stat = os.stat(pair_source_path)
+        except OSError:
+            source_state = None
+        else:
+            source_state = {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+    signature = json.dumps(
+        {
+            "photo_id": int(photo["id"]),
+            "size": size,
+            "pair_source": pair_source,
+            "source_state": source_state,
+            "recipe": recipe_to_json(recipe) if recipe else None,
+            "edit_math_version": EDIT_MATH_VERSION,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(signature).hexdigest()[:16]
+
+
+def _paired_preview_path(
+    preview_dir, photo_id, size, pair_source, state_hash,
+):
     return os.path.join(
         _paired_preview_dir(preview_dir),
-        f"{photo_id}_{size}_{pair_source}.jpg",
+        f"{photo_id}_{size}_{pair_source}_{state_hash}.jpg",
+    )
+
+
+def _paired_original_dir(vireo_dir):
+    return os.path.join(vireo_dir, "originals", _PAIRED_PREVIEW_DIRNAME)
+
+
+def _paired_original_path(vireo_dir, photo_id, pair_source, state_hash):
+    return os.path.join(
+        _paired_original_dir(vireo_dir),
+        f"{photo_id}_{pair_source}_{state_hash}.jpg",
     )
 
 
@@ -36678,8 +36732,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # follows can share one decode instead of racing two — the paired
         # URLs necessarily differ (prefetch vs no prefetch) so the browser
         # cannot coalesce them and the server must.
+        # Key the paired shadow cache by render/source state so a changed
+        # edit recipe or a swapped paired source produces a distinct
+        # filename. Otherwise repeatedly accessed entries would keep
+        # returning bytes rendered from the previous state indefinitely —
+        # regular preview-cache invalidation does not remove these shadow
+        # files, and the TTL sweep only fires when a new render publishes.
         paired_cache_path = (
-            _paired_preview_path(preview_dir, photo_id, size, pair_source)
+            _paired_preview_path(
+                preview_dir,
+                photo_id,
+                size,
+                pair_source,
+                _paired_render_state_hash(
+                    photo, size, pair_source, pair_source_path, render_recipe,
+                ),
+            )
             if bypass_cache
             else None
         )
@@ -37344,40 +37412,128 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if pair_source == "jpeg":
                 return send_file(pair_source_path)
 
-            import io
-
-            from image_loader import (
-                RAW_DECODE_PRESERVE_HIGHLIGHTS,
-                load_image,
+            # Paired RAW originals coordinate through a source-aware shadow
+            # cache: a speculative /original?source=raw&prefetch=1 warmup and
+            # the follow-up visible /original?source=raw request use distinct
+            # URLs (prefetch vs no prefetch) so the browser cannot coalesce
+            # them, and the RAW decode is expensive enough that racing two
+            # concurrent producers doubles disk and CPU cost. Key the shadow
+            # by render/source state so a swapped RAW file or an updated
+            # recipe never serves stale bytes.
+            paired_original_state = _paired_render_state_hash(
+                photo, 0, pair_source, pair_source_path, recipe,
             )
-
-            load_kwargs = (
-                {"raw_decode": RAW_DECODE_PRESERVE_HIGHLIGHTS}
-                if pair_source == "raw" else {}
+            paired_original_cache = _paired_original_path(
+                vireo_dir, photo_id, pair_source, paired_original_state,
             )
-            img = load_image(pair_source_path, max_size=None, **load_kwargs)
-            if img is None:
-                return "Could not load image", 500
-            if recipe:
-                import local_masks
-                from image_edits import apply_recipe_to_loaded_image
+            if (
+                os.path.exists(paired_original_cache)
+                and os.path.getsize(paired_original_cache)
+            ):
+                return send_file(paired_original_cache, mimetype="image/jpeg")
 
-                img = apply_recipe_to_loaded_image(
-                    img,
-                    recipe,
-                    native_size=_recipe_source_dimensions(photo),
-                    local_mask=local_masks.load_snapshot(
-                        vireo_dir, photo_id, recipe,
-                    ),
+            def _render_paired_original():
+                import io
+
+                from image_loader import (
+                    RAW_DECODE_PRESERVE_HIGHLIGHTS,
+                    load_image,
                 )
-            buf = io.BytesIO()
-            img.save(
-                buf,
-                format="JPEG",
-                quality=cfg.load().get("working_copy_quality", 92),
-            )
-            img.close()
-            return Response(buf.getvalue(), mimetype="image/jpeg")
+
+                load_kwargs = (
+                    {"raw_decode": RAW_DECODE_PRESERVE_HIGHLIGHTS}
+                    if pair_source == "raw" else {}
+                )
+                img = load_image(
+                    pair_source_path, max_size=None, **load_kwargs
+                )
+                if img is None:
+                    raise _ArtifactResponseError(
+                        make_response(("Could not load image", 500)),
+                    )
+                if recipe:
+                    import local_masks
+                    from image_edits import apply_recipe_to_loaded_image
+
+                    img = apply_recipe_to_loaded_image(
+                        img,
+                        recipe,
+                        native_size=_recipe_source_dimensions(photo),
+                        local_mask=local_masks.load_snapshot(
+                            vireo_dir, photo_id, recipe,
+                        ),
+                    )
+                buf = io.BytesIO()
+                img.save(
+                    buf,
+                    format="JPEG",
+                    quality=cfg.load().get("working_copy_quality", 92),
+                )
+                img.close()
+                data = buf.getvalue()
+                # Publish the rendered bytes to the shadow cache so an
+                # equal-key follower serves them from disk instead of
+                # decoding the same source. Best-effort: a full or read-only
+                # disk must never turn a successful producer into a 500.
+                try:
+                    _sweep_stale_paired_previews(
+                        _paired_original_dir(vireo_dir),
+                    )
+                    atomic_write_bytes(data, paired_original_cache)
+                except Exception:
+                    log.warning(
+                        "Failed to publish paired original cache %s",
+                        paired_original_cache, exc_info=True,
+                    )
+                return make_response(
+                    Response(data, mimetype="image/jpeg"),
+                )
+
+            if _artifact_flight_guarded:
+                return _render_paired_original()
+
+            artifact_key = os.path.abspath(paired_original_cache)
+            speculative = request.args.get("prefetch") == "1"
+            speculative_slot = False
+            if speculative:
+                speculative_slot = preview_prefetch_slots.acquire(
+                    blocking=False,
+                )
+                if not speculative_slot:
+                    return Response(status=204)
+
+            def _paired_consumer():
+                # Producer already published the shadow-cache file, so a
+                # re-entering waiter hits the cache-hit check above and
+                # serves it via send_file — no second decode.
+                response = make_response(
+                    serve_original_photo(
+                        photo_id, _artifact_flight_guarded=True,
+                    )
+                )
+                if response.status_code >= 400:
+                    raise _ArtifactResponseError(response)
+                return response
+
+            try:
+                result = original_artifact_flights.run(
+                    artifact_key,
+                    _render_paired_original,
+                    _paired_consumer,
+                    join=not speculative,
+                )
+                if result.skipped:
+                    return Response(status=204)
+                return result.value
+            except _ArtifactResponseError as exc:
+                return exc.to_response()
+            except ArtifactProducerFailed as exc:
+                if isinstance(exc.__cause__, _ArtifactResponseError):
+                    return exc.__cause__.to_response()
+                raise
+            finally:
+                if speculative_slot:
+                    preview_prefetch_slots.release()
 
         def _file_render_state(path):
             if not path:

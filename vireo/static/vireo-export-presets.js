@@ -17,6 +17,7 @@ var VireoExportPresets = (function() {
   var modalEditGeneration = 0;
   var modalOpenGeneration = 0;
   var refreshGeneration = 0;
+  var savingNames = Object.create(null);
 
   function $(id) { return document.getElementById(id); }
   function overlay() { return $('exportOverlay'); }
@@ -210,6 +211,21 @@ var VireoExportPresets = (function() {
     if (name === null) return;
     name = name.trim();
     if (!name) return;
+    if (savingNames[name]) {
+      if (typeof showToast === 'function') {
+        showToast('That export preset is already being saved', 'info');
+      }
+      return;
+    }
+    savingNames[name] = true;
+    try {
+      await saveNamedPreset(name);
+    } finally {
+      delete savingNames[name];
+    }
+  }
+
+  async function saveNamedPreset(name) {
     var replace = !!findPreset(name);
     if (replace &&
         !window.confirm('Replace the existing preset “' + name + '”?')) {
@@ -254,9 +270,15 @@ var VireoExportPresets = (function() {
     var refreshResult = await refresh();
     var edited = editGeneration !== modalEditGeneration;
     var reopened = openGeneration !== modalOpenGeneration;
+    var savedPreset = refreshResult.current && refreshResult.ok
+      ? findPreset(name) : null;
     var keptCurrent = edited || reopened ||
-      !refreshResult.current || !refreshResult.ok;
+      !refreshResult.current || !refreshResult.ok || !savedPreset;
     if (!keptCurrent) {
+      // The server normalizes fields such as whitespace around templates.
+      // Apply that stored snapshot before labeling the controls with its
+      // name so immediate export and later restoration behave identically.
+      applySettings(savedPreset.settings);
       presetSelect().value = SAVED_PREFIX + name;
       VireoViewPreferences.write(LAST_USED_KEY, SAVED_PREFIX + name);
     }

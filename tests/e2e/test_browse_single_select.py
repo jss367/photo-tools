@@ -390,7 +390,9 @@ def test_export_preset_uncached_replace_requires_confirmation(live_server, page)
             }
             if (url === '/api/export/presets' && (!options || !options.method)) {
               return Promise.resolve({presets: window.__presetSaveSucceeded ? [{
-                name: 'Existing elsewhere', settings: {destination: ''}
+                name: 'Existing elsewhere', settings: {
+                  destination: '', naming_template: '{original}_web'
+                }
               }] : []});
             }
             return realSafeFetch(url, options, config);
@@ -398,6 +400,7 @@ def test_export_preset_uncached_replace_requires_confirmation(live_server, page)
           await VireoExportPresets.modalOpened();
         }"""
     )
+    page.locator("#exportTemplate").fill("  {original}_web  ")
     page.locator("#exportPresetSaveBtn").click()
 
     expect(page.locator("#exportPreset")).to_have_value(
@@ -407,6 +410,62 @@ def test_export_preset_uncached_replace_requires_confirmation(live_server, page)
     assert page.evaluate(
         "() => window.__presetSaveBodies.map(body => body.replace)"
     ) == [False, True]
+    expect(page.locator("#exportTemplate")).to_have_value("{original}_web")
+
+
+def test_export_preset_serializes_saves_to_same_name(live_server, page):
+    """A second same-name save cannot overtake the first request."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+
+    page.evaluate(
+        """async () => {
+          const realSafeFetch = window.safeFetch;
+          window.__serializedSaveBodies = [];
+          window.__serializedSaveResolvers = [];
+          window.__serializedPresetGets = 0;
+          window.prompt = function() { return 'Shared name'; };
+          window.confirm = function() { return true; };
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets' && options &&
+                options.method === 'POST') {
+              window.__serializedSaveBodies.push(JSON.parse(options.body));
+              return new Promise(function(resolve) {
+                window.__serializedSaveResolvers.push(resolve);
+              });
+            }
+            if (url === '/api/export/presets' && (!options || !options.method)) {
+              window.__serializedPresetGets++;
+              return Promise.resolve({presets: [{
+                name: 'Shared name', settings: {
+                  destination: document.getElementById('exportDest').value
+                }
+              }]});
+            }
+            return realSafeFetch(url, options, config);
+          };
+          await VireoExportPresets.modalOpened();
+        }"""
+    )
+    page.locator("#exportDest").fill("/first")
+    page.locator("#exportPresetSaveBtn").click()
+    page.wait_for_function("() => window.__serializedSaveBodies.length === 1")
+
+    page.locator("#exportDest").fill("/second")
+    page.locator("#exportPresetSaveBtn").click()
+    assert page.evaluate("() => window.__serializedSaveBodies.length") == 1
+
+    page.evaluate("() => window.__serializedSaveResolvers[0]({ok: true})")
+    page.wait_for_function("() => window.__serializedPresetGets === 2")
+    page.locator("#exportPresetSaveBtn").click()
+    page.wait_for_function("() => window.__serializedSaveBodies.length === 2")
+    assert page.evaluate(
+        "() => window.__serializedSaveBodies.map(body => body.settings.destination)"
+    ) == ["/first", "/second"]
 
 
 def test_export_preset_dropdown_reflects_custom_on_reopen(live_server, page):

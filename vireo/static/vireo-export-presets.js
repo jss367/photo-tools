@@ -53,6 +53,58 @@ var VireoExportPresets = (function() {
     updateButtons();
   }
 
+  /* Snapshot the raw values of every editable modal field. Used by
+   * modalOpened to detect which specific fields a user changed during a
+   * delayed preset GET, so the saved preset can be applied to the
+   * untouched fields while the user's edit is preserved verbatim. Keys
+   * are field ids; each entry is either a string (`.value`) for text,
+   * range, and select inputs or a boolean (`.checked`) for checkboxes.
+   * Buttons are skipped because they carry no field state. */
+  function snapshotEditableFields() {
+    var modal = overlay();
+    var snapshot = Object.create(null);
+    if (!modal) return snapshot;
+    modal.querySelectorAll('input, select, textarea').forEach(function(control) {
+      if (!control.id) return;
+      if (control.id === 'exportPreset') return;
+      snapshot[control.id] = control.type === 'checkbox'
+        ? !!control.checked
+        : control.value;
+    });
+    return snapshot;
+  }
+
+  /* Reapply the specific fields the user edited between two snapshots,
+   * called after applySettings has overwritten every field with the
+   * preset's values. `before` is the host-reset state captured at modal
+   * open; `edited` is the state captured right before applying the preset
+   * (so it already contains the user's in-flight edits). Any field where
+   * edited != before was user-touched; restore its edited value over what
+   * the preset just wrote. Every other field keeps the preset's value —
+   * preventing the earlier behavior of skipping the preset wholesale and
+   * silently exporting with host-reset defaults for the fields the user
+   * did not touch. */
+  function restoreUserEditedFields(before, edited) {
+    var modal = overlay();
+    if (!modal) return false;
+    var editedAny = false;
+    modal.querySelectorAll('input, select, textarea').forEach(function(control) {
+      if (!control.id) return;
+      if (control.id === 'exportPreset') return;
+      if (!(control.id in before) || !(control.id in edited)) return;
+      var prior = before[control.id];
+      var latest = edited[control.id];
+      if (latest === prior) return;
+      if (control.type === 'checkbox') {
+        control.checked = latest;
+      } else {
+        control.value = latest;
+      }
+      editedAny = true;
+    });
+    return editedAny;
+  }
+
   function subfolderName() {
     var input = $('exportSubfolderName');
     if (!input) return DEFAULT_SUBFOLDER;
@@ -393,19 +445,27 @@ var VireoExportPresets = (function() {
     if (submit) submit.disabled = true;
     setPresetActionsDisabled(true);
     syncSubfolderNameState();
+    // Remember the host-reset field values AND the last-used preset name
+    // before awaiting the presets list. If the user edits a control
+    // during the in-flight request, markCustom writes LAST_USED_KEY to
+    // 'custom', so re-reading it after the await would silently lose the
+    // saved-preset intent we opened the modal to restore. Capturing both
+    // here lets us later apply the preset to every field the user did
+    // not touch and put the user's edit back over the one they did.
+    var beforeSnapshot = snapshotEditableFields();
+    var last = VireoViewPreferences.read(LAST_USED_KEY);
     try {
       var refreshResult = await refresh();
       if (!refreshResult.current) return;
       if (openGeneration !== modalOpenGeneration ||
           !overlay().classList.contains('open')) return;
-      // Do not replace a destination, template, or other control the user
-      // changed while the preset request was in flight.
-      if (editGeneration !== modalEditGeneration) {
-        restorationComplete = true;
-        updateButtons();
-        return;
-      }
-      var last = VireoViewPreferences.read(LAST_USED_KEY);
+      // Track whether an in-flight edit touched a control so, after
+      // applying the preset below, we can restore that specific control
+      // while every other field still reflects the saved preset. Without
+      // this, the previous behavior skipped the preset wholesale and
+      // silently left the host-reset defaults (JPEG format, {original}
+      // template, no metadata) in place beside the user's edit.
+      var userEditedDuringRestoration = editGeneration !== modalEditGeneration;
       if (!last || last === 'custom') {
         // A date-only or time-only preset applied earlier this session may
         // have left a presetFields hint on the combined capture-date+time
@@ -425,6 +485,12 @@ var VireoExportPresets = (function() {
         return;
       }
       var sel = presetSelect();
+      // Snapshot the post-edit state (any in-flight user changes are in
+      // here) right before applying the preset, so we can diff against
+      // beforeSnapshot to find only the user-edited fields and restore
+      // them after applySettings has overwritten them.
+      var editedSnapshot = userEditedDuringRestoration
+        ? snapshotEditableFields() : null;
       if (last.indexOf(SAVED_PREFIX) === 0) {
         var preset = findPreset(last.slice(SAVED_PREFIX.length));
         if (!preset) {
@@ -447,6 +513,22 @@ var VireoExportPresets = (function() {
         if (sel.value === last && typeof applyExportPreset === 'function') {
           applyExportPreset(last);
         }
+      }
+      // If the user edited any control while the request was in flight,
+      // put those specific values back over what the preset just wrote —
+      // the preset still fills every field the user did not touch — and
+      // flip the selector to Custom since the applied state is a mix of
+      // preset and edit.
+      if (editedSnapshot &&
+          restoreUserEditedFields(beforeSnapshot, editedSnapshot)) {
+        sel.value = 'custom';
+        VireoViewPreferences.write(LAST_USED_KEY, 'custom');
+        // The user's edit may have changed the subfolder checkbox or the
+        // resize / format select; re-sync every derived UI bit the
+        // delegated input/change listener would normally handle.
+        syncSubfolderNameState();
+        if (typeof updateExportFormatControls === 'function') updateExportFormatControls();
+        if (typeof updateExportPreview === 'function') updateExportPreview();
       }
       restorationComplete = true;
       updateButtons();

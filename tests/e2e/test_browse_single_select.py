@@ -188,7 +188,12 @@ def test_export_defaults_beside_original_and_offers_folder_browser(
 
 
 def test_export_presets_do_not_overwrite_edits_while_loading(live_server, page):
-    """Delayed preset restoration gates export and preserves newer edits."""
+    """Delayed preset restoration gates export and preserves newer edits.
+
+    Fields the user touched during the in-flight preset GET keep the user's
+    value; every other field takes the saved preset's value so the export
+    never silently uses host-reset defaults for the untouched fields.
+    """
     page.goto(f"{live_server['url']}/browse")
     first = page.locator(".grid-card").first
     first.wait_for(state="visible")
@@ -219,14 +224,30 @@ def test_export_presets_do_not_overwrite_edits_while_loading(live_server, page):
     page.evaluate(
         """() => window.__resolveExportPresets({presets: [{
           name: 'Delayed preset',
-          settings: {destination: '/preset-destination'}
+          settings: {
+            destination: '/preset-destination',
+            format: 'png',
+            naming_template: '{date}_{original}',
+            metadata_fields: ['species', 'rating']
+          }
         }]})"""
     )
 
     expect(page.locator("#exportSubmitBtn")).to_be_enabled()
     expect(page.locator("#exportPreset")).to_be_enabled()
     expect(page.locator("#exportPresetSaveBtn")).to_be_enabled()
+    # The user's edit survives verbatim over the preset's value.
     expect(page.locator("#exportDest")).to_have_value("/user-selected")
+    # Every field the user did not touch takes the preset's value; without
+    # this the modal would silently export with host-reset defaults for
+    # format/template/metadata beside the user's destination edit.
+    expect(page.locator("#exportFormat")).to_have_value("png")
+    expect(page.locator("#exportTemplate")).to_have_value("{date}_{original}")
+    expect(page.locator("#exportMetadataSpecies")).to_be_checked()
+    expect(page.locator("#exportMetadataRating")).to_be_checked()
+    expect(page.locator("#exportMetadataLocation")).not_to_be_checked()
+    # The applied state is a mix of preset and edit, so the selector
+    # advertises Custom rather than the preset name.
     expect(page.locator("#exportPreset")).to_have_value("custom")
 
 

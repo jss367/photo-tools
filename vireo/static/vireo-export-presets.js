@@ -194,8 +194,28 @@ var VireoExportPresets = (function() {
       }
     });
     syncSubfolderNameState();
+    persistPresetAffectedPreferences();
     if (typeof updateExportFormatControls === 'function') updateExportFormatControls();
     if (typeof updateExportPreview === 'function') updateExportPreview();
+  }
+
+  /* applySettings() writes controls with .value/.checked assignments, which
+   * fire neither `input` nor `change`; VireoViewPreferences persists on
+   * those events, so a preset's subfolder / reveal / metadata choices
+   * never reach localStorage on their own. If the user then tweaks any
+   * unrelated field (markCustom flips LAST_USED_KEY to `custom`) and
+   * reopens the modal, restoreAll() would put the stale pre-preset
+   * preferences back and silently lose those preset-derived choices.
+   * Mirror the applied state into localStorage now so a Custom reopen
+   * still reflects what the preset actually set. */
+  function persistPresetAffectedPreferences() {
+    if (typeof VireoViewPreferences === 'undefined' ||
+        typeof VireoViewPreferences.persist !== 'function') return;
+    var overlayEl = overlay();
+    if (!overlayEl) return;
+    overlayEl.querySelectorAll('[data-view-preference]').forEach(function(el) {
+      VireoViewPreferences.persist(el);
+    });
   }
 
   function onPresetChange() {

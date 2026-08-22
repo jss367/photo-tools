@@ -275,6 +275,80 @@ def test_export_presets_ignore_stale_overlapping_refresh(live_server, page):
     expect(page.locator('option[value="saved:Stale preset"]')).to_have_count(0)
 
 
+def test_export_preset_persists_browse_preferences_on_apply(live_server, page):
+    """Applying a preset must persist the fields the host tracks as prefs.
+
+    Regression: ``applySettings`` uses ``.checked`` / ``.value`` assignments
+    that don't fire input/change, so VireoViewPreferences never records the
+    preset's subfolder, reveal, or metadata choices. If the user then
+    changes any unrelated field (calls markCustom, flipping LAST_USED_KEY
+    to 'custom') and closes and reopens, ``restoreAll()`` restores the
+    stale pre-preset preferences and silently loses the preset-derived
+    choices.
+    """
+    page.goto(f"{live_server['url']}/browse")
+    # Prime the persisted preferences to the OPPOSITE of what the preset
+    # will set, so a silent drop of the preset's values would fall back to
+    # these values on reopen.
+    page.evaluate(
+        """() => {
+          localStorage.setItem('vireo.browse.export.subfolder', '0');
+          localStorage.setItem('vireo.browse.export.revealAfter', '1');
+          localStorage.setItem('vireo.browse.export.metadata.rating', '0');
+        }"""
+    )
+    page.reload()
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    # Seed a saved preset and tell the modal to auto-apply it on open.
+    page.evaluate(
+        """() => {
+          window.__presetPayload = {presets: [{name: 'Preset A', settings: {
+            export_to_subfolder: true,
+            subfolder_name: 'from-preset',
+            reveal_after_export: false,
+            metadata_fields: ['rating'],
+          }}]};
+          const realSafeFetch = window.safeFetch;
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets' &&
+                (!options || !options.method || options.method === 'GET')) {
+              return Promise.resolve(window.__presetPayload);
+            }
+            return realSafeFetch(url, options, config);
+          };
+          VireoViewPreferences.write('vireo.export.lastPreset', 'saved:Preset A');
+        }"""
+    )
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportSubfolder")).to_be_checked()
+    expect(page.locator("#exportSubfolderName")).to_have_value("from-preset")
+    expect(page.locator("#exportRevealAfter")).not_to_be_checked()
+    expect(page.locator("#exportMetadataRating")).to_be_checked()
+
+    # Tweak an unrelated control (quality) so markCustom fires — this is
+    # the trigger for the bug: LAST_USED_KEY becomes 'custom' and the next
+    # reopen will restore preferences instead of the saved preset.
+    page.locator("#exportQuality").fill("77")
+    page.locator("#exportQuality").dispatch_event("input")
+    expect(page.locator("#exportPreset")).to_have_value("custom")
+
+    page.locator("#exportOverlay [data-export-cancel]").click()
+    expect(page.locator("#exportOverlay")).not_to_have_class(
+        "modal-overlay open"
+    )
+
+    # Reopen: restoreAll runs from the host, so the persisted preferences
+    # decide what the controls show. They must match what the preset
+    # actually put on screen, not the pre-preset seed values.
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportSubfolder")).to_be_checked()
+    expect(page.locator("#exportSubfolderName")).to_have_value("from-preset")
+    expect(page.locator("#exportRevealAfter")).not_to_be_checked()
+    expect(page.locator("#exportMetadataRating")).to_be_checked()
+
+
 def test_export_presets_keep_submit_gated_when_saved_preset_load_fails(
     live_server, page,
 ):

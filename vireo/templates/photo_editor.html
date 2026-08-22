@@ -3255,6 +3255,7 @@ const exportFolderBrowser = new VireoFolderBrowser({
       },
       onSelect: function(path) {
         document.getElementById('exportDest').value = path;
+        VireoExportPresets.markCustom();
       },
     },
   },
@@ -3315,6 +3316,7 @@ async function browseForExportDestination() {
     });
     if (result) {
       destination.value = Array.isArray(result) ? result[0] : result;
+      VireoExportPresets.markCustom();
       return;
     }
     if (typeof isTauri === 'function' && isTauri()) return;
@@ -3333,6 +3335,7 @@ function insertTemplateVar(value) {
   input.value = input.value.substring(0, start) + value + input.value.substring(end);
   input.selectionStart = input.selectionEnd = start + value.length;
   input.focus();
+  VireoExportPresets.markCustom();
   updateExportPreview();
 }
 

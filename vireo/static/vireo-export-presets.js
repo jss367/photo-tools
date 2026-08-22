@@ -150,10 +150,27 @@ var VireoExportPresets = (function() {
     $('exportTemplate').value = settings.naming_template || '{original}';
     var fields = Array.isArray(settings.metadata_fields) ? settings.metadata_fields : [];
     document.querySelectorAll('#exportOverlay .export-metadata-option input').forEach(function(input) {
-      // Browse renders capture date+time as one combined checkbox.
-      input.checked = input.value === 'capture_date_time'
-        ? (fields.indexOf('capture_date') !== -1 || fields.indexOf('capture_time') !== -1)
-        : fields.indexOf(input.value) !== -1;
+      if (input.value !== 'capture_date_time') {
+        input.checked = fields.indexOf(input.value) !== -1;
+        return;
+      }
+      // Browse renders capture date+time as one combined checkbox, but a
+      // preset saved in Photo Editor may specify just one of the two. Check
+      // the combined box when either is present, and stash the exact split
+      // on the checkbox so selectedExportMetadataFields() can honor it
+      // instead of silently sending both. Any user edit clears the stash
+      // (see the modal-scoped input/change handler) so it reverts to the
+      // Browse default of "both".
+      var hasDate = fields.indexOf('capture_date') !== -1;
+      var hasTime = fields.indexOf('capture_time') !== -1;
+      input.checked = hasDate || hasTime;
+      if (hasDate && !hasTime) {
+        input.dataset.presetFields = 'capture_date';
+      } else if (hasTime && !hasDate) {
+        input.dataset.presetFields = 'capture_time';
+      } else {
+        delete input.dataset.presetFields;
+      }
     });
     syncSubfolderNameState();
     if (typeof updateExportFormatControls === 'function') updateExportFormatControls();
@@ -165,8 +182,13 @@ var VireoExportPresets = (function() {
     if (value.indexOf(SAVED_PREFIX) === 0) {
       var preset = findPreset(value.slice(SAVED_PREFIX.length));
       if (preset) applySettings(preset.settings);
-    } else if (typeof applyExportPreset === 'function') {
-      applyExportPreset(value);
+    } else {
+      // Built-in presets don't touch metadata_fields, so a preserved
+      // date-only / time-only hint from a previously-applied saved preset
+      // would silently carry over. Drop it when switching away.
+      var combined = document.getElementById('exportMetadataCaptureDateTime');
+      if (combined) delete combined.dataset.presetFields;
+      if (typeof applyExportPreset === 'function') applyExportPreset(value);
     }
     VireoViewPreferences.write(LAST_USED_KEY, value);
     updateButtons();
@@ -251,6 +273,24 @@ var VireoExportPresets = (function() {
     updateButtons();
   }
 
+  /* Flip the preset dropdown to "Custom" and remember that in the last-used
+   * key. Hosts call this after mutating a modal field programmatically
+   * (destination picker, template-variable buttons, …) because assigning
+   * `.value` directly fires no input/change event, so the delegated listener
+   * below would otherwise miss the edit and reopen the modal with the stale
+   * preset. Same effect as the listener; kept as a public method so callers
+   * are explicit rather than dispatching synthetic events. */
+  function markCustom() {
+    if (typeof markExportCustom === 'function') markExportCustom();
+    VireoViewPreferences.write(LAST_USED_KEY, 'custom');
+    // The combined "capture date & time" checkbox may carry a preset's exact
+    // split (see applySettings). Once we're Custom, drop the hint so Browse
+    // reverts to its default of sending both when the box is checked.
+    var combined = document.getElementById('exportMetadataCaptureDateTime');
+    if (combined) delete combined.dataset.presetFields;
+    updateButtons();
+  }
+
   function init() {
     if (!overlay() || !presetSelect()) return;
     presetSelect().addEventListener('change', onPresetChange);
@@ -265,14 +305,12 @@ var VireoExportPresets = (function() {
         var target = event.target;
         if (!target || target.id === 'exportPreset') return;
         if (!target.matches || !target.matches('input, select, textarea')) return;
-        if (typeof markExportCustom === 'function') markExportCustom();
-        VireoViewPreferences.write(LAST_USED_KEY, 'custom');
+        markCustom();
         if (target.id === 'exportSubfolder') syncSubfolderNameState();
         if ((target.id === 'exportSubfolder' || target.id === 'exportSubfolderName') &&
             typeof updateExportPreview === 'function') {
           updateExportPreview();
         }
-        updateButtons();
       });
     });
     refresh();
@@ -282,5 +320,6 @@ var VireoExportPresets = (function() {
   return {
     modalOpened: modalOpened,
     subfolderName: subfolderName,
+    markCustom: markCustom,
   };
 })();

@@ -11710,7 +11710,17 @@ function selectedExportMetadataFields() {
   return Array.from(document.querySelectorAll('.export-metadata-option input:checked'))
     .reduce(function(fields, input) {
       if (input.value === 'capture_date_time') {
-        fields.push('capture_date', 'capture_time');
+        // A preset saved in Photo Editor may specify just date or just time.
+        // VireoExportPresets.applySettings stashes that split here so we
+        // honor it instead of quietly promoting the box to "both". Manual
+        // edits clear the stash, at which point the combined box means both.
+        if (input.dataset.presetFields) {
+          input.dataset.presetFields.split(',').forEach(function(field) {
+            if (field) fields.push(field);
+          });
+        } else {
+          fields.push('capture_date', 'capture_time');
+        }
       } else {
         fields.push(input.value);
       }
@@ -11739,6 +11749,7 @@ const exportFolderBrowser = new VireoFolderBrowser({
       },
       onSelect: function(path) {
         document.getElementById('exportDest').value = path;
+        VireoExportPresets.markCustom();
       },
     },
   },
@@ -11753,6 +11764,7 @@ async function browseForExportDestination() {
     });
     if (result) {
       destination.value = Array.isArray(result) ? result[0] : result;
+      VireoExportPresets.markCustom();
       return;
     }
     if (typeof isTauri === 'function' && isTauri()) return;
@@ -11772,6 +11784,7 @@ function insertTemplateVar(v) {
   input.value = val.substring(0, start) + v + val.substring(end);
   input.selectionStart = input.selectionEnd = start + v.length;
   input.focus();
+  VireoExportPresets.markCustom();
   updateExportPreview();
 }
 

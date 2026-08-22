@@ -147,6 +147,110 @@ def test_latest_development_settings_copy_wins(live_server, page):
     assert copied_exposure == 1.5
 
 
+def test_later_cross_tab_development_settings_copy_wins(live_server, page):
+    """A pending Browse fetch cannot overwrite a newer cross-tab copy."""
+    page.goto(f"{live_server['url']}/browse")
+    card = page.locator(".grid-card").first
+    card.wait_for(state="visible")
+    photo_id = int(card.get_attribute("data-id"))
+    other_page = page.context.new_page()
+    try:
+        other_page.goto(f"{live_server['url']}/browse")
+        other_page.locator(".grid-card").first.wait_for(state="visible")
+        page.evaluate(
+            """photoId => {
+              const originalSafeFetch = window.safeFetch;
+              window.__originalCopySafeFetch = originalSafeFetch;
+              window.safeFetch = function(url, options, config) {
+                if (url === '/api/photos/' + photoId + '/edit-recipe') {
+                  return new Promise(resolve => { window.__resolveOldCopy = resolve; });
+                }
+                return originalSafeFetch(url, options, config);
+              };
+              window.__oldCopyPromise = copyDevelopmentSettingsFromPhoto(photoId);
+            }""",
+            photo_id,
+        )
+        other_page.evaluate(
+            """() => window.vireoEditNav.setCopiedRecipe(
+              {adjustments: {exposure: 2.0}},
+              {source: 'newer-tab.jpg', at: Date.now()}
+            )"""
+        )
+        page.evaluate(
+            """async () => {
+              window.__resolveOldCopy({
+                recipe: {adjustments: {exposure: -1.0}},
+              });
+              await window.__oldCopyPromise;
+              window.safeFetch = window.__originalCopySafeFetch;
+            }"""
+        )
+
+        assert page.evaluate(
+            "() => window.vireoEditNav.getCopiedRecipe().recipe.adjustments.exposure"
+        ) == 2.0
+        assert other_page.evaluate(
+            "() => window.vireoEditNav.getCopiedRecipe().source"
+        ) == "newer-tab.jpg"
+    finally:
+        other_page.close()
+
+
+def test_development_settings_paste_blocks_overlapping_requests(
+    live_server, page
+):
+    page.goto(f"{live_server['url']}/browse")
+    card = page.locator(".grid-card").first
+    card.wait_for(state="visible")
+    photo_id = int(card.get_attribute("data-id"))
+
+    pending_state = page.evaluate(
+        """photoId => {
+          window.vireoEditNav.setCopiedRecipe({adjustments: {exposure: 1.0}});
+          selectedPhotos.clear();
+          selectedPhotos.add(photoId);
+          selectedPhotoId = photoId;
+          const originalSafeFetch = window.safeFetch;
+          window.__originalPasteSafeFetch = originalSafeFetch;
+          window.__pasteRequestCount = 0;
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/photos/edit-recipe/apply') {
+              window.__pasteRequestCount += 1;
+              return new Promise(resolve => { window.__resolvePaste = resolve; });
+            }
+            return originalSafeFetch(url, options, config);
+          };
+          window.__pastePromise = pasteEditSettingsToSelection();
+          pasteEditSettingsToSelection();
+          const pasteItem = buildPhotoContextMenu([photoId], photoId)
+            .find(item => item.label === 'Paste Development Settings');
+          return {
+            requestCount: window.__pasteRequestCount,
+            inFlight: _browseDevelopmentPasteInFlight,
+            menuDisabled: pasteItem.disabled,
+            menuHint: pasteItem.disabledHint,
+          };
+        }""",
+        photo_id,
+    )
+    assert pending_state == {
+        "requestCount": 1,
+        "inFlight": True,
+        "menuDisabled": True,
+        "menuHint": "A development settings paste is already running",
+    }
+
+    page.evaluate(
+        """async () => {
+          window.__resolvePaste({applied: [], skipped: [], count: 0, recipes: {}});
+          await window.__pastePromise;
+          window.safeFetch = window.__originalPasteSafeFetch;
+        }"""
+    )
+    assert page.evaluate("() => _browseDevelopmentPasteInFlight") is False
+
+
 def test_view_on_map_context_action_targets_right_clicked_photo(live_server, page):
     """Browse's right-click View on Map action targets the context photo."""
     url = live_server["url"]

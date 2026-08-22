@@ -2239,6 +2239,7 @@ window.vireoEditNav = (function() {
   var LAST_KEY = 'vireo:lastPhoto';
   var NAV_KEY = 'vireo:editNav';
   var COPY_KEY = 'vireo:copiedRecipe';
+  var COPY_PENDING_KEY = 'vireo:copiedRecipePending';
   function read(key) {
     try { return JSON.parse(localStorage.getItem(key)); }
     catch (_) { return null; }
@@ -2270,8 +2271,30 @@ window.vireoEditNav = (function() {
       return nav && Array.isArray(nav.ids) ? nav.ids : null;
     },
     setCopiedRecipe: function(recipe, meta) {
+      write(COPY_PENDING_KEY, null);
       if (!recipe || typeof recipe !== 'object') { write(COPY_KEY, null); return; }
       write(COPY_KEY, {recipe: recipe, source: (meta && meta.source) || null, at: (meta && meta.at) || null});
+    },
+    beginCopiedRecipe: function() {
+      var token = String(Date.now()) + ':' + Math.random().toString(36).slice(2);
+      write(COPY_PENDING_KEY, token);
+      return token;
+    },
+    isCopiedRecipeCurrent: function(token) {
+      return !!token && read(COPY_PENDING_KEY) === token;
+    },
+    setCopiedRecipeIfCurrent: function(recipe, meta, token) {
+      if (!token || read(COPY_PENDING_KEY) !== token) return false;
+      write(COPY_PENDING_KEY, null);
+      if (!recipe || typeof recipe !== 'object') {
+        write(COPY_KEY, null);
+        return true;
+      }
+      write(COPY_KEY, {recipe: recipe, source: (meta && meta.source) || null, at: (meta && meta.at) || null});
+      return true;
+    },
+    cancelCopiedRecipe: function(token) {
+      if (token && read(COPY_PENDING_KEY) === token) write(COPY_PENDING_KEY, null);
     },
     getCopiedRecipe: function() { return read(COPY_KEY); },
     // Cursors hold photo ids whose visibility is workspace-scoped (api_photo_detail

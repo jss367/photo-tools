@@ -6771,29 +6771,62 @@ async function copyDevelopmentSettingsFromPhoto(photoId) {
   var photo = photos.find(function(candidate) { return candidate.id === Number(photoId); });
   if (!photoId || !window.vireoEditNav) return;
   var copySeq = ++_browseDevelopmentCopySeq;
+  var copyToken = typeof window.vireoEditNav.beginCopiedRecipe === 'function'
+    ? window.vireoEditNav.beginCopiedRecipe()
+    : null;
   try {
     // Fetch the authoritative recipe so a long-lived Browse tab cannot copy
     // settings that were changed in another surface since its last refresh.
     var data = await safeFetch('/api/photos/' + photoId + '/edit-recipe', {}, {toast: false});
     if (copySeq !== _browseDevelopmentCopySeq) return;
+    if (
+      copyToken &&
+      typeof window.vireoEditNav.isCopiedRecipeCurrent === 'function' &&
+      !window.vireoEditNav.isCopiedRecipeCurrent(copyToken)
+    ) return;
     var recipe = data && data.recipe;
     if (!_browseHasDevelopmentSettings(recipe)) {
+      if (typeof window.vireoEditNav.cancelCopiedRecipe === 'function') {
+        window.vireoEditNav.cancelCopiedRecipe(copyToken);
+      }
       showToast('This photo has no development settings to copy', 'error');
       return;
     }
-    window.vireoEditNav.setCopiedRecipe(recipe, {
+    var meta = {
       source: (photo && photo.filename) || null,
       at: Date.now(),
-    });
+    };
+    if (
+      copyToken &&
+      typeof window.vireoEditNav.setCopiedRecipeIfCurrent === 'function'
+    ) {
+      if (!window.vireoEditNav.setCopiedRecipeIfCurrent(recipe, meta, copyToken)) return;
+    } else {
+      window.vireoEditNav.setCopiedRecipe(recipe, meta);
+    }
     showToast('Development settings copied', 'success');
     updatePasteEditSection(getActiveSelection());
   } catch (e) {
     if (copySeq !== _browseDevelopmentCopySeq) return;
+    if (
+      copyToken &&
+      typeof window.vireoEditNav.isCopiedRecipeCurrent === 'function' &&
+      !window.vireoEditNav.isCopiedRecipeCurrent(copyToken)
+    ) return;
+    if (typeof window.vireoEditNav.cancelCopiedRecipe === 'function') {
+      window.vireoEditNav.cancelCopiedRecipe(copyToken);
+    }
     showToast(e.message || 'Could not copy development settings', 'error');
   }
 }
 
+var _browseDevelopmentPasteInFlight = false;
+
 async function pasteEditSettingsToSelection() {
+  if (_browseDevelopmentPasteInFlight) {
+    showToast('A development settings paste is already running.', 'warning');
+    return;
+  }
   var ids = getActiveSelection();
   if (ids.length < 1) { showToast('Select photos first.', 'error'); return; }
   var copied = window.vireoEditNav ? window.vireoEditNav.getCopiedRecipe() : null;
@@ -6802,6 +6835,7 @@ async function pasteEditSettingsToSelection() {
     return;
   }
   var btn = document.getElementById('pasteEditBtn');
+  _browseDevelopmentPasteInFlight = true;
   if (btn) btn.disabled = true;
   try {
     var data = await safeFetch('/api/photos/edit-recipe/apply', {
@@ -6837,6 +6871,7 @@ async function pasteEditSettingsToSelection() {
   } catch (e) {
     showToast(e.message || 'Could not paste development settings', 'error');
   } finally {
+    _browseDevelopmentPasteInFlight = false;
     if (btn) btn.disabled = false;
   }
 }
@@ -10806,8 +10841,10 @@ function buildPhotoContextMenu(photoIds, contextPhotoId) {
       disabledHint: 'Right-click a photo to choose the settings to copy',
       onClick: function() { copyDevelopmentSettingsFromPhoto(developmentSourceId); } },
     { label: 'Paste Development Settings',
-      disabled: !(copiedDevelopment && copiedDevelopment.recipe),
-      disabledHint: 'Copy development settings from a photo first',
+      disabled: _browseDevelopmentPasteInFlight || !(copiedDevelopment && copiedDevelopment.recipe),
+      disabledHint: _browseDevelopmentPasteInFlight
+        ? 'A development settings paste is already running'
+        : 'Copy development settings from a photo first',
       onClick: function() { pasteEditSettingsToSelection(); } },
     { label: 'Develop',
       onClick: function() { developSelected(); } },

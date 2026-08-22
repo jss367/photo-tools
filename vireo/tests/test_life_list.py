@@ -130,6 +130,12 @@ def test_page_renders(life_app):
     assert b'id="exportColumns"' in resp.data
     assert b"Representative filename" in resp.data
     assert b"Quality score" in resp.data
+    assert b'id="publishLifeList" type="checkbox" checked' in resp.data
+    assert b"Representative photo only" in resp.data
+    assert b'id="publishHighlights" type="checkbox"' in resp.data
+    assert b"Include Highlights" in resp.data
+    assert b"/api/jobs/publish-site/preflight" in resp.data
+    assert b"Calculating what will be published" in resp.data
     assert b"link.download = ''" in resp.data
     assert b'id="folderBrowser"' in resp.data
     assert b"publishFolderBrowser.open('destination')" in resp.data

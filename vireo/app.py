@@ -26912,48 +26912,190 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
         return jsonify({"job_id": job_id})
 
-    @app.route("/api/jobs/publish-site", methods=["POST"])
-    def api_job_publish_site():
-        """Publish workspace life-list and highlights data for a static site."""
-        body = request.get_json(silent=True) or {}
-        destination = (body.get("destination") or "").strip()
-        if not destination:
-            return json_error("destination required")
-        if not os.path.isabs(destination):
-            return json_error("destination must be an absolute path")
+    def _publish_site_bool(body, key, default):
+        raw = body.get(key, default)
+        if isinstance(raw, str):
+            normalized = raw.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True, None
+            if normalized in {"0", "false", "no", "off"}:
+                return False, None
+            return None, f"{key} must be a boolean"
+        if not isinstance(raw, bool):
+            return None, f"{key} must be a boolean"
+        return raw, None
+
+    def _parse_publish_site_options(body, require_destination=False):
+        if not isinstance(body, dict):
+            return None, "request body must be a JSON object"
+
+        destination = body.get("destination", "")
+        if not isinstance(destination, str):
+            return None, "destination must be a string"
+        destination = destination.strip()
+        if require_destination and not destination:
+            return None, "destination required"
+        if destination and not os.path.isabs(destination):
+            return None, "destination must be an absolute path"
 
         try:
-            photos_per_species = int(body.get("photos_per_species") or 12)
-            limit_per_bucket = int(body.get("limit_per_bucket") or 12)
+            photos_per_species = int(body.get("photos_per_species", 1))
+            limit_per_bucket = int(body.get("limit_per_bucket", 3))
         except (TypeError, ValueError):
-            return json_error("photos_per_species and limit_per_bucket must be numbers")
+            return None, "photos_per_species and limit_per_bucket must be numbers"
         photos_per_species = max(1, min(photos_per_species, 100))
         limit_per_bucket = max(1, min(limit_per_bucket, 100))
+
+        include_life_list, error = _publish_site_bool(
+            body, "include_life_list", True,
+        )
+        if error:
+            return None, error
+        include_highlights, error = _publish_site_bool(
+            body, "include_highlights", False,
+        )
+        if error:
+            return None, error
+        include_locations, error = _publish_site_bool(
+            body, "include_locations", False,
+        )
+        if error:
+            return None, error
+        if not include_life_list and not include_highlights:
+            return None, "select Life List, Highlights, or both"
+
         max_size = body.get("max_size", 2400)
         if max_size in ("", None):
             max_size = None
         elif isinstance(max_size, bool):
-            return json_error("max_size must be a number")
+            return None, "max_size must be a number"
         else:
             try:
                 max_size = int(max_size)
             except (TypeError, ValueError):
-                return json_error("max_size must be a number")
+                return None, "max_size must be a number"
         quality = body.get("quality", 88)
         if isinstance(quality, bool):
-            return json_error("quality must be a number")
+            return None, "quality must be a number"
         try:
             quality = int(quality)
         except (TypeError, ValueError):
-            return json_error("quality must be a number")
+            return None, "quality must be a number"
         quality = max(1, min(quality, 100))
-        raw_include_locations = body.get("include_locations", False)
-        if isinstance(raw_include_locations, str):
-            include_locations = raw_include_locations.strip().lower() in {
-                "1", "true", "yes", "on",
-            }
+
+        return {
+            "destination": destination,
+            "include_life_list": include_life_list,
+            "photos_per_species": photos_per_species,
+            "include_highlights": include_highlights,
+            "limit_per_bucket": limit_per_bucket,
+            "include_locations": include_locations,
+            "max_size": max_size,
+            "quality": quality,
+        }, None
+
+    def _empty_published_life_list(photos_per_species):
+        return {
+            "species": [],
+            "meta": {
+                "species_count": 0,
+                "photo_count": 0,
+                "photos_per_species": photos_per_species,
+            },
+        }
+
+    def _empty_published_highlights(limit_per_bucket):
+        return {
+            "buckets": [],
+            "unidentified": {
+                "photo_count": 0,
+                "photos": [],
+                "loaded_count": 0,
+                "has_more": False,
+            },
+            "folders": [],
+            "meta": {"total_in_scope": 0, "eligible": 0,
+                     "limit_per_bucket": limit_per_bucket},
+            "scope": "workspace",
+        }
+
+    def _build_publish_site_payloads(db, options):
+        if options["include_life_list"]:
+            life_list = _build_life_list_payload(
+                db,
+                photos_per_species=options["photos_per_species"],
+            )
         else:
-            include_locations = bool(raw_include_locations)
+            life_list = _empty_published_life_list(
+                options["photos_per_species"],
+            )
+        if options["include_highlights"]:
+            highlights = _build_highlights_payload(
+                db,
+                scope="workspace",
+                min_quality=0.0,
+                limit_per_bucket=options["limit_per_bucket"],
+            )
+        else:
+            highlights = _empty_published_highlights(
+                options["limit_per_bucket"],
+            )
+        return life_list, highlights
+
+    def _publish_site_photo_ids(life_list, highlights):
+        photo_ids = {
+            p["id"]
+            for entry in life_list.get("species", [])
+            for p in ([entry.get("best")] + (entry.get("photos") or []))
+            if p and p.get("id")
+        }
+        for bucket in highlights.get("buckets", []):
+            photo_ids.update(
+                p["id"] for p in (bucket.get("photos") or []) if p.get("id")
+            )
+        unidentified = highlights.get("unidentified") or {}
+        photo_ids.update(
+            p["id"] for p in (unidentified.get("photos") or []) if p.get("id")
+        )
+        return photo_ids
+
+    @app.route("/api/jobs/publish-site/preflight", methods=["POST"])
+    def api_job_publish_site_preflight():
+        """Return exact content and unique-photo counts for a site publish."""
+        options, error = _parse_publish_site_options(
+            request.get_json(silent=True),
+        )
+        if error:
+            return json_error(error)
+        life_list, highlights = _build_publish_site_payloads(_get_db(), options)
+        return jsonify({
+            "life_list_species": life_list.get("meta", {}).get(
+                "species_count", 0,
+            ),
+            "highlight_buckets": len(highlights.get("buckets", [])),
+            "unidentified_photos": len(
+                (highlights.get("unidentified") or {}).get("photos") or []
+            ),
+            "image_count": len(_publish_site_photo_ids(life_list, highlights)),
+            "data_file_count": 3,
+        })
+
+    @app.route("/api/jobs/publish-site", methods=["POST"])
+    def api_job_publish_site():
+        """Publish selected workspace website data and optimized photos."""
+        options, error = _parse_publish_site_options(
+            request.get_json(silent=True),
+            require_destination=True,
+        )
+        if error:
+            return json_error(error)
+
+        destination = options["destination"]
+        photos_per_species = options["photos_per_species"]
+        limit_per_bucket = options["limit_per_bucket"]
+        max_size = options["max_size"]
+        quality = options["quality"]
+        include_locations = options["include_locations"]
 
         import config as cfg
         db = _get_db()
@@ -26971,26 +27113,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             thread_db.set_active_workspace(active_ws)
             job["_start_time"] = time.time()
 
-            life_list = _build_life_list_payload(
-                thread_db,
-                photos_per_species=photos_per_species,
+            life_list, highlights = _build_publish_site_payloads(
+                thread_db, options,
             )
-            highlights = _build_highlights_payload(
-                thread_db,
-                scope="workspace",
-                min_quality=0.0,
-                limit_per_bucket=limit_per_bucket,
-            )
-            photo_ids = {
-                p["id"]
-                for entry in life_list.get("species", [])
-                for p in ([entry.get("best")] + (entry.get("photos") or []))
-                if p and p.get("id")
-            }
-            for bucket in highlights.get("buckets", []):
-                photo_ids.update(
-                    p["id"] for p in (bucket.get("photos") or []) if p.get("id")
-                )
+            photo_ids = _publish_site_photo_ids(life_list, highlights)
             job["progress"]["total"] = len(photo_ids)
 
             def progress_cb(current, total, filename):
@@ -27028,7 +27154,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             work,
             config={
                 "destination": destination,
+                "include_life_list": options["include_life_list"],
                 "photos_per_species": photos_per_species,
+                "include_highlights": options["include_highlights"],
                 "limit_per_bucket": limit_per_bucket,
                 "max_size": max_size,
                 "quality": quality,

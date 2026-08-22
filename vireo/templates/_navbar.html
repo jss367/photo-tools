@@ -10949,15 +10949,30 @@ function closeSimilar() {
 })();
 
 function showToast(msg, type) {
-  type = type || 'error';
+  var colors = {
+    success: 'var(--success)',
+    info: 'var(--info)',
+    warning: 'var(--warning)',
+    error: 'var(--danger)'
+  };
+  var textColors = {
+    success: 'var(--success-text)',
+    info: 'var(--info-text)',
+    warning: 'var(--warning-text)',
+    error: 'var(--danger-text)'
+  };
+  // A missing or unknown type is neutral information. Callers that need an
+  // assertive error must opt into it instead of making routine confirmations
+  // look like failures.
+  type = Object.prototype.hasOwnProperty.call(colors, type) ? type : 'info';
   var container = document.getElementById('toastContainer');
   if (!container) return;
   var toast = document.createElement('div');
-  var bg = type === 'error' ? 'var(--danger)'
-         : type === 'warning' ? 'var(--warning)'
-         : 'var(--accent)';
-  var color = (type === 'error' || type === 'warning')
-            ? 'var(--text-primary)' : 'var(--accent-text)';
+  var bg = colors[type];
+  var color = textColors[type];
+  toast.dataset.type = type;
+  toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+  toast.setAttribute('aria-live', type === 'error' ? 'assertive' : 'polite');
   toast.style.cssText = 'pointer-events:auto;padding:10px 16px;border-radius:6px;font-size:14px;max-width:400px;word-break:break-word;background:' + bg + ';color:' + color + ';box-shadow:0 2px 8px rgba(0,0,0,0.3);opacity:0;transition:opacity 0.2s;';
   toast.textContent = msg;
   container.appendChild(toast);
@@ -11573,7 +11588,7 @@ async function openInEditor(photoIds, editorIndex) {
     });
     showToast('Opened ' + data.opened + ' photo(s) in editor', 'success');
   } catch(e) {
-    showToast(e.message || 'Failed to open in editor');
+    showToast(e.message || 'Failed to open in editor', 'error');
   }
 }
 
@@ -11629,11 +11644,11 @@ async function developPhotos(photoIds) {
   try {
     var status = await safeFetch('/api/darktable/status', {}, { toast: false });
     if (!status.available) {
-      showToast('darktable-cli not found. Configure it in Settings.');
+      showToast('darktable-cli not found. Configure it in Settings.', 'warning');
       return;
     }
   } catch(_) {
-    showToast('Could not check darktable availability.');
+    showToast('Could not check darktable availability.', 'error');
     return;
   }
   if (!confirm('Develop ' + photoIds.length + ' photo(s) with darktable?')) return;
@@ -11643,18 +11658,27 @@ async function developPhotos(photoIds) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({photo_ids: photoIds}),
     });
-    showToast('Developing ' + photoIds.length + ' photo(s)...');
+    showToast('Developing ' + photoIds.length + ' photo(s)...', 'info');
     safeEventSource('/api/jobs/' + data.job_id + '/stream', {
       onProgress: function(prog) {
-        showToast('Developing: ' + prog.current + '/' + prog.total + ' — ' + (prog.current_file || ''));
+        showToast('Developing: ' + prog.current + '/' + prog.total + ' — ' + (prog.current_file || ''), 'info');
       },
-      onComplete: function(result) {
-        showToast('Development complete: ' + (result.developed || 0) + ' developed, ' + (result.errors || 0) + ' errors');
+      onComplete: function(event) {
+        var result = (event && event.result) || {};
+        var developedCount = result.developed || 0;
+        var errorCount = result.errors || 0;
+        var completed = event && event.status === 'completed';
+        showToast(
+          (completed ? 'Development complete: ' : 'Development failed: ') +
+            developedCount +
+            ' developed, ' + errorCount + ' errors',
+          completed ? (errorCount ? 'warning' : 'success') : 'error'
+        );
       },
       onError: function() {}
     });
   } catch(e) {
-    showToast(e.message || 'Error starting develop job');
+    showToast(e.message || 'Error starting develop job', 'error');
   }
 }
 

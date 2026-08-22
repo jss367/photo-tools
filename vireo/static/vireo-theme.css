@@ -21,9 +21,14 @@
   --accent-hover: #5AF0DA;
   --accent-dim: #0A4A42;
   --accent-text: #0A1F2E;
+  --success: #35D07F;
+  --success-text: #0A1F2E;
   --warning: #F0C040;
+  --warning-text: #0A1F2E;
   --danger: #E74C3C;
+  --danger-text: #000000;
   --info: #12C3B5;
+  --info-text: #0A1F2E;
 }
 
 /* Vireo Light — clean, airy complement to the dark theme */
@@ -47,9 +52,14 @@
   --accent-hover: #026E78;
   --accent-dim: #D0F0F0;
   --accent-text: #FAFFFE;
+  --success: #247A4D;
+  --success-text: #FAFFFE;
   --warning: #B8860B;
+  --warning-text: #0A1F2E;
   --danger: #C0392B;
+  --danger-text: #FAFFFE;
   --info: #0D5B79;
+  --info-text: #FAFFFE;
 }
 
 /* Classic Dark (original teal/navy) */
@@ -73,9 +83,14 @@
   --accent-hover: #3db890;
   --accent-dim: #2a5a4a;
   --accent-text: #1a1a2e;
+  --success: #45C982;
+  --success-text: #1a1a2e;
   --warning: #f0c040;
+  --warning-text: #1a1a2e;
   --danger: #e74c3c;
+  --danger-text: #000000;
   --info: #7ec8e3;
+  --info-text: #1a1a2e;
 }
 
 /* Vireo Gold (default) — warm yellow/grey palette matching the logo */
@@ -99,9 +114,14 @@
   --accent-hover: #B89200;
   --accent-dim: #FFF8D0;
   --accent-text: #3A3A3A;
+  --success: #2E7D32;
+  --success-text: #FFFFFF;
   --warning: #C87A00;
+  --warning-text: #000000;
   --danger: #C0392B;
-  --info: #7A7A7A;
+  --danger-text: #FFFFFF;
+  --info: #4F6D7A;
+  --info-text: #FFFFFF;
 }
 
 /* High Contrast */
@@ -125,7 +145,12 @@
   --accent-hover: #FFFF44;
   --accent-dim: #554400;
   --accent-text: #000000;
+  --success: #00E676;
+  --success-text: #000000;
   --warning: #FFB800;
+  --warning-text: #000000;
   --danger: #FF4444;
+  --danger-text: #000000;
   --info: #44BBFF;
+  --info-text: #000000;
 }

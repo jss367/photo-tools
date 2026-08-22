@@ -279,15 +279,19 @@ var VireoExportPresets = (function() {
    * `.value` directly fires no input/change event, so the delegated listener
    * below would otherwise miss the edit and reopen the modal with the stale
    * preset. Same effect as the listener; kept as a public method so callers
-   * are explicit rather than dispatching synthetic events. */
+   * are explicit rather than dispatching synthetic events.
+   *
+   * Note: the combined "capture date & time" checkbox's ``presetFields``
+   * hint (see applySettings) is *not* cleared here. It only reflects the
+   * split the user selected via the preset, so tweaks to unrelated fields
+   * (quality, destination, template) must not silently promote a
+   * date-only or time-only preset to both. The hint is dropped only when
+   * the combined checkbox itself is edited (see the delegated listener
+   * below) or when a different preset is applied (see onPresetChange /
+   * applySettings). */
   function markCustom() {
     if (typeof markExportCustom === 'function') markExportCustom();
     VireoViewPreferences.write(LAST_USED_KEY, 'custom');
-    // The combined "capture date & time" checkbox may carry a preset's exact
-    // split (see applySettings). Once we're Custom, drop the hint so Browse
-    // reverts to its default of sending both when the box is checked.
-    var combined = document.getElementById('exportMetadataCaptureDateTime');
-    if (combined) delete combined.dataset.presetFields;
     updateButtons();
   }
 
@@ -305,6 +309,14 @@ var VireoExportPresets = (function() {
         var target = event.target;
         if (!target || target.id === 'exportPreset') return;
         if (!target.matches || !target.matches('input, select, textarea')) return;
+        // The combined "capture date & time" checkbox may carry a preset's
+        // exact date/time split (see applySettings). Only drop that hint
+        // when the box itself is edited so unrelated tweaks (quality,
+        // destination, template, other metadata boxes) don't silently
+        // promote a date-only or time-only preset to sending both.
+        if (target.id === 'exportMetadataCaptureDateTime') {
+          delete target.dataset.presetFields;
+        }
         markCustom();
         if (target.id === 'exportSubfolder') syncSubfolderNameState();
         if ((target.id === 'exportSubfolder' || target.id === 'exportSubfolderName') &&

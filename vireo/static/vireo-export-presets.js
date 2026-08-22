@@ -11,6 +11,8 @@
 var VireoExportPresets = (function() {
   var SAVED_PREFIX = 'saved:';
   var LAST_USED_KEY = 'vireo.export.lastPreset';
+  var CAPTURE_SPLIT_KEY =
+    'vireo.browse.export.metadata.captureDateTime.presetFields';
   var DEFAULT_SUBFOLDER = 'exported';
   var presets = [];
   var builtinOptions = null;
@@ -61,6 +63,30 @@ var VireoExportPresets = (function() {
     var input = $('exportSubfolderName');
     var checkbox = $('exportSubfolder');
     if (input && checkbox) input.disabled = !checkbox.checked;
+  }
+
+  function captureSplitControl() {
+    return document.getElementById('exportMetadataCaptureDateTime');
+  }
+
+  function persistCaptureSplitHint() {
+    var combined = captureSplitControl();
+    if (!combined) return;
+    VireoViewPreferences.write(
+      CAPTURE_SPLIT_KEY, combined.dataset.presetFields || ''
+    );
+  }
+
+  function restoreCaptureSplitHint() {
+    var combined = captureSplitControl();
+    if (!combined) return;
+    var split = VireoViewPreferences.read(CAPTURE_SPLIT_KEY);
+    if (combined.checked &&
+        (split === 'capture_date' || split === 'capture_time')) {
+      combined.dataset.presetFields = split;
+    } else {
+      delete combined.dataset.presetFields;
+    }
   }
 
   function captureBuiltins() {
@@ -216,6 +242,7 @@ var VireoExportPresets = (function() {
     overlayEl.querySelectorAll('[data-view-preference]').forEach(function(el) {
       VireoViewPreferences.persist(el);
     });
+    persistCaptureSplitHint();
   }
 
   function onPresetChange() {
@@ -229,7 +256,10 @@ var VireoExportPresets = (function() {
       // date-only / time-only hint from a previously-applied saved preset
       // would silently carry over. Drop it when switching away.
       var combined = document.getElementById('exportMetadataCaptureDateTime');
-      if (combined) delete combined.dataset.presetFields;
+      if (combined) {
+        delete combined.dataset.presetFields;
+        persistCaptureSplitHint();
+      }
       if (typeof applyExportPreset === 'function') applyExportPreset(value);
     }
     VireoViewPreferences.write(LAST_USED_KEY, value);
@@ -383,8 +413,7 @@ var VireoExportPresets = (function() {
         // to the "both" default; drop the stale split so
         // selectedExportMetadataFields() reflects that default instead of
         // silently exporting only one half.
-        var combined = document.getElementById('exportMetadataCaptureDateTime');
-        if (combined) delete combined.dataset.presetFields;
+        restoreCaptureSplitHint();
         // Host reset the selector to a built-in default before opening, but
         // VireoViewPreferences.restoreAll has since restored persisted
         // fields (subfolder, metadata boxes, reveal-after) that mark the
@@ -405,6 +434,7 @@ var VireoExportPresets = (function() {
           if (refreshResult.ok) {
             VireoViewPreferences.write(LAST_USED_KEY, 'custom');
             sel.value = 'custom';
+            restoreCaptureSplitHint();
             restorationComplete = true;
             updateButtons();
           }
@@ -476,6 +506,7 @@ var VireoExportPresets = (function() {
         // promote a date-only or time-only preset to sending both.
         if (target.id === 'exportMetadataCaptureDateTime') {
           delete target.dataset.presetFields;
+          persistCaptureSplitHint();
         }
         markCustom();
         if (target.id === 'exportSubfolder') syncSubfolderNameState();

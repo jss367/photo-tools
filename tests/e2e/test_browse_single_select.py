@@ -308,7 +308,7 @@ def test_export_preset_persists_browse_preferences_on_apply(live_server, page):
             export_to_subfolder: true,
             subfolder_name: 'from-preset',
             reveal_after_export: false,
-            metadata_fields: ['rating'],
+            metadata_fields: ['rating', 'capture_date'],
           }}]};
           const realSafeFetch = window.safeFetch;
           window.safeFetch = function(url, options, config) {
@@ -326,6 +326,9 @@ def test_export_preset_persists_browse_preferences_on_apply(live_server, page):
     expect(page.locator("#exportSubfolderName")).to_have_value("from-preset")
     expect(page.locator("#exportRevealAfter")).not_to_be_checked()
     expect(page.locator("#exportMetadataRating")).to_be_checked()
+    assert page.evaluate("() => selectedExportMetadataFields()") == [
+        "capture_date", "rating",
+    ]
 
     # Tweak an unrelated control (quality) so markCustom fires — this is
     # the trigger for the bug: LAST_USED_KEY becomes 'custom' and the next
@@ -347,6 +350,9 @@ def test_export_preset_persists_browse_preferences_on_apply(live_server, page):
     expect(page.locator("#exportSubfolderName")).to_have_value("from-preset")
     expect(page.locator("#exportRevealAfter")).not_to_be_checked()
     expect(page.locator("#exportMetadataRating")).to_be_checked()
+    assert page.evaluate("() => selectedExportMetadataFields()") == [
+        "capture_date", "rating",
+    ]
 
 
 def test_export_presets_keep_submit_gated_when_saved_preset_load_fails(

@@ -1,3 +1,5 @@
+import re
+
 from playwright.sync_api import expect
 
 _PNG_1X1 = (
@@ -25,6 +27,83 @@ def test_right_click_photo_opens_menu(live_server, page):
     expect(menu.locator(".vireo-ctx-item", has_text="Copy Path")).to_be_visible()
     expect(menu.locator(".vireo-ctx-item", has_text="Delete")).to_be_visible()
     expect(menu.get_by_text("View on Map", exact=True)).to_be_visible()
+    expect(menu.get_by_text("Copy Development Settings", exact=True)).to_be_visible()
+    expect(menu.get_by_text("Paste Development Settings", exact=True)).to_be_visible()
+
+
+def test_browse_labels_lightbox_adjustments_as_quick_adjust(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+
+    expect(page.locator("#lightboxAdjustBtn")).to_have_text("Quick Adjust")
+
+
+def test_right_click_copies_and_pastes_development_settings(
+    live_server, page
+):
+    """A grid photo's saved recipe can be copied onto selected targets."""
+    page.goto(f"{live_server['url']}/browse")
+
+    cards = page.locator(".grid-card")
+    cards.first.wait_for(state="visible")
+    assert cards.count() >= 3
+    alternate_id = int(cards.nth(0).get_attribute("data-id"))
+    source_id = int(cards.nth(1).get_attribute("data-id"))
+    target_ids = [
+        alternate_id,
+        int(cards.nth(2).get_attribute("data-id")),
+    ]
+
+    alternate_response = page.request.put(
+        f"{live_server['url']}/api/photos/{alternate_id}/edit-recipe",
+        data={"recipe": {"adjustments": {"exposure": -0.5}}},
+    )
+    response = page.request.put(
+        f"{live_server['url']}/api/photos/{source_id}/edit-recipe",
+        data={"recipe": {"adjustments": {"exposure": 1.5}}},
+    )
+    assert alternate_response.ok
+    assert response.ok
+    page.reload()
+    cards = page.locator(".grid-card")
+    cards.first.wait_for(state="visible")
+
+    # Copy from the exact right-clicked photo, not the first item in the
+    # preserved multi-selection.
+    cards.nth(0).click(modifiers=["Meta"])
+    cards.nth(1).click(modifiers=["Meta"])
+    cards.nth(1).click(button="right")
+    menu = page.locator(".vireo-ctx-menu")
+    copy_item = menu.get_by_text("Copy Development Settings", exact=True)
+    expect(copy_item).not_to_have_class(re.compile(r"vireo-ctx-disabled"))
+    copy_item.click()
+    page.wait_for_function(
+        """() => window.vireoEditNav.getCopiedRecipe()?.recipe
+          ?.adjustments?.exposure === 1.5"""
+    )
+
+    # Reload to clear the source selection while retaining the shared recipe
+    # clipboard, then select both targets and paste from their context menu.
+    page.reload()
+    cards = page.locator(".grid-card")
+    cards.first.wait_for(state="visible")
+    cards.nth(0).click(modifiers=["Meta"])
+    cards.nth(2).click(modifiers=["Meta"])
+    cards.nth(0).click(button="right")
+    paste_item = page.locator(".vireo-ctx-menu").get_by_text(
+        "Paste Development Settings", exact=True
+    )
+    expect(paste_item).not_to_have_class(re.compile(r"vireo-ctx-disabled"))
+    paste_item.click()
+
+    for target_id in target_ids:
+        page.wait_for_function(
+            """async photoId => {
+              const response = await fetch('/api/photos/' + photoId + '/edit-recipe');
+              const data = await response.json();
+              return data.recipe?.adjustments?.exposure === 1.5;
+            }""",
+            arg=target_id,
+        )
 
 
 def test_view_on_map_context_action_targets_right_clicked_photo(live_server, page):

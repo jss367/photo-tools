@@ -1954,8 +1954,8 @@ body.sidebar-resizing {
     <div class="selection-panel hidden" id="selectionPanel">
       <div class="selection-heading" id="selectionCount">0 photos selected</div>
       <div class="detail-section" id="pasteEditSection" hidden>
-        <div class="detail-section-title">Edit Settings</div>
-        <button class="selection-action-btn" id="pasteEditBtn" type="button" onclick="pasteEditSettingsToSelection()">Paste Edit Settings</button>
+        <div class="detail-section-title">Development Settings</div>
+        <button class="selection-action-btn" id="pasteEditBtn" type="button" onclick="pasteEditSettingsToSelection()">Paste Development Settings</button>
         <div class="selection-action-hint" id="pasteEditHint"></div>
       </div>
       <div class="detail-section">
@@ -6755,7 +6755,47 @@ function updatePasteEditSection(ids) {
     var n = ids.length.toLocaleString();
     hint.textContent = copied.source
       ? 'Copied from ' + copied.source + ' — applies to ' + n + ' selected photos.'
-      : 'Applies the copied edit settings to ' + n + ' selected photos.';
+      : 'Applies the copied development settings to ' + n + ' selected photos.';
+  }
+}
+
+function _browseHasDevelopmentSettings(recipe) {
+  return !!(recipe && typeof recipe === 'object' && Object.keys(recipe).some(function(key) {
+    return key !== 'version';
+  }));
+}
+
+function _browseDevelopmentRecipeFor(photoId) {
+  var photo = photos.find(function(candidate) { return candidate.id === Number(photoId); });
+  if (photo && Object.prototype.hasOwnProperty.call(photo, 'edit_recipe')) {
+    return photo.edit_recipe;
+  }
+  if (typeof window.vireoPhotoEditRecipe === 'function') {
+    return window.vireoPhotoEditRecipe(photoId);
+  }
+  return null;
+}
+
+async function copyDevelopmentSettingsFromPhoto(photoId) {
+  var photo = photos.find(function(candidate) { return candidate.id === Number(photoId); });
+  if (!photoId || !window.vireoEditNav) return;
+  try {
+    // Fetch the authoritative recipe so a long-lived Browse tab cannot copy
+    // settings that were changed in another surface since its last refresh.
+    var data = await safeFetch('/api/photos/' + photoId + '/edit-recipe', {}, {toast: false});
+    var recipe = data && data.recipe;
+    if (!_browseHasDevelopmentSettings(recipe)) {
+      showToast('This photo has no development settings to copy', 'error');
+      return;
+    }
+    window.vireoEditNav.setCopiedRecipe(recipe, {
+      source: (photo && photo.filename) || null,
+      at: Date.now(),
+    });
+    showToast('Development settings copied', 'success');
+    updatePasteEditSection(getActiveSelection());
+  } catch (e) {
+    showToast(e.message || 'Could not copy development settings', 'error');
   }
 }
 
@@ -6764,7 +6804,7 @@ async function pasteEditSettingsToSelection() {
   if (ids.length < 1) { showToast('Select photos first.', 'error'); return; }
   var copied = window.vireoEditNav ? window.vireoEditNav.getCopiedRecipe() : null;
   if (!copied || !copied.recipe) {
-    showToast('No copied edit settings. Use "Copy Settings" in the editor first.', 'error');
+    showToast('Copy development settings from a photo first.', 'error');
     return;
   }
   var btn = document.getElementById('pasteEditBtn');
@@ -6776,7 +6816,7 @@ async function pasteEditSettingsToSelection() {
       body: JSON.stringify({
         recipe: copied.recipe,
         photo_ids: ids,
-        description: copied.source ? ('Pasted edit settings from ' + copied.source) : 'Pasted edit settings',
+        description: copied.source ? ('Pasted development settings from ' + copied.source) : 'Pasted development settings',
       }),
     }, {toast: false});
     var count = data.count || 0;
@@ -6794,14 +6834,14 @@ async function pasteEditSettingsToSelection() {
       });
       window.vireoRefreshEditRecipeCache(updates);
     }
-    var appliedMsg = 'Pasted edit settings to ' + count.toLocaleString() + ' photo' + (count === 1 ? '' : 's');
+    var appliedMsg = 'Pasted development settings to ' + count.toLocaleString() + ' photo' + (count === 1 ? '' : 's');
     if (skipped > 0) {
       showToast(appliedMsg + '; skipped ' + skipped.toLocaleString() + '.', 'warning');
     } else {
       showToast(appliedMsg, 'success');
     }
   } catch (e) {
-    showToast(e.message || 'Could not paste edit settings', 'error');
+    showToast(e.message || 'Could not paste development settings', 'error');
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -10692,9 +10732,21 @@ function openPhotoEditor(photoId) {
   window.location.href = '/edit/' + photoId;
 }
 
-function buildPhotoContextMenu(photoIds) {
+function buildPhotoContextMenu(photoIds, contextPhotoId) {
   var one = photoIds.length === 1;
   var hint = one ? undefined : 'Select a single photo';
+  // A right-click identifies an unambiguous copy source even when that image
+  // belongs to a multi-selection. The batch-bar More menu only has a source
+  // when exactly one photo is selected.
+  var developmentSourceId = contextPhotoId != null
+    ? Number(contextPhotoId)
+    : (one ? Number(photoIds[0]) : null);
+  var developmentRecipe = developmentSourceId != null
+    ? _browseDevelopmentRecipeFor(developmentSourceId)
+    : null;
+  var copiedDevelopment = window.vireoEditNav
+    ? window.vireoEditNav.getCopiedRecipe()
+    : null;
 
   var rateChip = function(n) {
     return {
@@ -10758,6 +10810,16 @@ function buildPhotoContextMenu(photoIds) {
     { separator: true },
     { label: 'Edit Photo', disabled: !one, disabledHint: hint,
       onClick: function() { openPhotoEditor(photoIds[0]); } },
+    { label: 'Copy Development Settings',
+      disabled: developmentSourceId == null || !_browseHasDevelopmentSettings(developmentRecipe),
+      disabledHint: developmentSourceId == null
+        ? 'Right-click a photo to choose the settings to copy'
+        : 'This photo has no development settings',
+      onClick: function() { copyDevelopmentSettingsFromPhoto(developmentSourceId); } },
+    { label: 'Paste Development Settings',
+      disabled: !(copiedDevelopment && copiedDevelopment.recipe),
+      disabledHint: 'Copy development settings from a photo first',
+      onClick: function() { pasteEditSettingsToSelection(); } },
     { label: 'Develop',
       onClick: function() { developSelected(); } },
   ].concat(buildOpenInEditorMenuItems(photoIds)).concat([
@@ -10826,7 +10888,7 @@ document.addEventListener('contextmenu', function(e) {
   }
   refreshCardSelectionVisuals();
   updateBatchBar();
-  openContextMenu(e, buildPhotoContextMenu(ids));
+  openContextMenu(e, buildPhotoContextMenu(ids, pid));
 });
 
 /* ---------- Folder tree context menu ---------- */

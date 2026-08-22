@@ -42,6 +42,7 @@ import remote_setup
 import source_discovery
 from artifact_flight import (
     ArtifactProducerFailed,
+    atomic_write_bytes,
     original_artifact_flights,
     preview_artifact_flights,
     preview_prefetch_slots,
@@ -168,6 +169,51 @@ class _ArtifactResponseError(RuntimeError):
         return Response(
             self.data, status=self.status_code, mimetype=self.mimetype,
         )
+
+
+# Paired-source preview renders (`?source=jpeg|raw`) intentionally sit outside
+# the durable (photo_id, size) preview cache so RAW and JPEG pixels can never
+# contaminate one another.  For coordination alone we do publish them to a
+# dedicated subdirectory so an equal-key follower can serve the producer's
+# already-decoded bytes instead of racing another concurrent decode against
+# the same source.  These files are kept short-lived and swept on write.
+_PAIRED_PREVIEW_DIRNAME = "paired"
+_PAIRED_PREVIEW_TTL_SEC = 15 * 60
+
+
+def _paired_preview_dir(preview_dir):
+    return os.path.join(preview_dir, _PAIRED_PREVIEW_DIRNAME)
+
+
+def _paired_preview_path(preview_dir, photo_id, size, pair_source):
+    return os.path.join(
+        _paired_preview_dir(preview_dir),
+        f"{photo_id}_{size}_{pair_source}.jpg",
+    )
+
+
+def _sweep_stale_paired_previews(paired_dir):
+    """Best-effort removal of paired-preview cache files older than the TTL.
+
+    Paired renders are only kept around long enough for a browser warmup
+    and the follow-up visible request to share one decode; anything older
+    is dead weight, so we sweep before publishing a new file rather than
+    growing an unbounded shadow cache.
+    """
+    if not os.path.isdir(paired_dir):
+        return
+    cutoff = time.time() - _PAIRED_PREVIEW_TTL_SEC
+    try:
+        entries = os.listdir(paired_dir)
+    except OSError:
+        return
+    for name in entries:
+        path = os.path.join(paired_dir, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            continue
 
 
 # Stable ordering and labels for the palette + nav rendering.
@@ -36627,6 +36673,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # never contaminate one another. Browser caching still makes repeated
         # viewing cheap; the ordinary unpaired path keeps the disk LRU.
         bypass_cache = pair_source is not None
+        # Paired renders coordinate through a distinct source-aware artifact
+        # so a browser warmup (prefetch=1) and the visible request that
+        # follows can share one decode instead of racing two — the paired
+        # URLs necessarily differ (prefetch vs no prefetch) so the browser
+        # cannot coalesce them and the server must.
+        paired_cache_path = (
+            _paired_preview_path(preview_dir, photo_id, size, pair_source)
+            if bypass_cache
+            else None
+        )
 
         # Reject corrupt zero-byte cache files (prior write interrupted).
         # Treat them as a miss so the regeneration path below produces a
@@ -36723,13 +36779,28 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 pass
             return Response(data, mimetype="image/jpeg")
 
+        # Paired-render cache hit: an earlier equal-key producer already
+        # decoded and atomically published these bytes to the paired shadow
+        # cache, so waiters skip repeating that work.
+        if (
+            paired_cache_path
+            and os.path.exists(paired_cache_path)
+            and os.path.getsize(paired_cache_path)
+        ):
+            return send_file(paired_cache_path, mimetype="image/jpeg")
+
         # Cache miss: coordinate every durable preview producer in this
         # process before decoding.  The recursive producer re-runs all cache
         # and invalidation checks under the flight; equal-key waiters then
         # re-enter once more and serve the atomically published JPEG through
-        # their own Flask request context.
-        if not bypass_cache and not _artifact_flight_guarded:
-            artifact_key = os.path.abspath(cache_path)
+        # their own Flask request context.  Paired renders are coordinated
+        # too, keyed by the source-aware paired path so RAW and JPEG variants
+        # of the same photo never share a flight — the shared artifact for
+        # waiters lives at that paired path rather than the durable cache.
+        if not _artifact_flight_guarded:
+            artifact_key = os.path.abspath(
+                paired_cache_path if bypass_cache else cache_path,
+            )
             speculative = request.args.get("prefetch") == "1"
             speculative_slot = False
             if speculative:
@@ -36795,6 +36866,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 evict_preview_cache_if_over_quota(db, vireo_dir)
             except Exception:
                 pass
+        # Publish the paired-render bytes so an equal-key follower still
+        # inside preview_artifact_flights.run() finds a ready artifact when
+        # it re-enters _serve_preview instead of decoding the same source.
+        # Best-effort: a full or read-only disk must never turn a successful
+        # producer render into a 500.
+        if bypass_cache and paired_cache_path and rendered.data is not None:
+            try:
+                _sweep_stale_paired_previews(_paired_preview_dir(preview_dir))
+                atomic_write_bytes(rendered.data, paired_cache_path)
+            except Exception:
+                log.warning(
+                    "Failed to publish paired preview cache %s",
+                    paired_cache_path, exc_info=True,
+                )
         if rendered.data is not None:
             return Response(rendered.data, mimetype="image/jpeg")
         return send_file(cache_path, mimetype="image/jpeg")

@@ -4516,6 +4516,77 @@ def test_full_redirect_forwards_prefetch_flag_to_original(client_with_photo):
     assert "prefetch" not in resp.headers["Location"]
 
 
+def test_paired_preview_shares_decode_across_warmup_and_visible(
+    client_with_photo, monkeypatch,
+):
+    """A paired-source warmup and the follow-up visible request must share
+    one decode: the paired URLs differ (prefetch=1 vs nothing) so the browser
+    cannot coalesce them, so the server must — through the paired shadow
+    cache — otherwise both requests decode the same source concurrently.
+    """
+    import preview_materializer
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    folder = db.conn.execute(
+        "SELECT f.path FROM photos p JOIN folders f ON f.id=p.folder_id "
+        "WHERE p.id=?",
+        (photo_id,),
+    ).fetchone()
+    raw_path = os.path.join(folder["path"], "test.NEF")
+    with open(raw_path, "wb") as raw_file:
+        raw_file.write(b"raw bytes")
+    companion_path = os.path.join(folder["path"], "test.JPG")
+    Image.new("RGB", (800, 600), (200, 60, 40)).save(companion_path, "JPEG")
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='test.NEF', extension='.nef',
+               companion_path='test.JPG',
+               width=800, height=600
+           WHERE id=?""",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    render_calls = []
+    real_render = preview_materializer.render_preview_bytes
+
+    def counting_render(*args, **kwargs):
+        render_calls.append(kwargs.get("pair_source"))
+        return real_render(*args, **kwargs)
+
+    monkeypatch.setattr(
+        preview_materializer, "render_preview_bytes", counting_render,
+    )
+
+    client = app.test_client()
+
+    # Warmup URL (prefetch=1) publishes the shared paired bytes.
+    warmup = client.get(f"/photos/{photo_id}/preview?size=1920&source=jpeg&prefetch=1")
+    assert warmup.status_code == 200
+    assert len(render_calls) == 1
+
+    # The follow-up visible URL for the SAME paired variant has no prefetch
+    # marker, so the browser cannot coalesce it with the warmup. Without
+    # coordinated bytes on the server, this would kick off a second decode.
+    visible = client.get(f"/photos/{photo_id}/preview?size=1920&source=jpeg")
+    assert visible.status_code == 200
+    assert visible.data == warmup.data
+    assert len(render_calls) == 1, (
+        "second paired request re-decoded the same source; the paired "
+        "shadow cache should have satisfied it"
+    )
+
+    # The distinct RAW variant is a separate flight and must not be served
+    # from the JPEG paired shadow — pixel contamination is the exact
+    # contract bypass_cache exists to preserve.
+    raw_probe = client.get(f"/photos/{photo_id}/preview?size=1920&source=raw")
+    assert raw_probe.status_code in (200, 500)
+    if raw_probe.status_code == 200:
+        assert len(render_calls) == 2
+        assert render_calls[-1] == "raw"
+
+
 def test_preview_skips_recent_failed_raw_working_copy(
     client_with_photo, monkeypatch,
 ):

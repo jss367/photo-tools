@@ -1897,7 +1897,7 @@ def test_browse_lightbox_arrows_preserve_one_to_one_zoom(live_server, page):
             route.continue_()
 
     page.route(re.compile(r"/api/photos/\d+$"), _hold_when_active)
-    page.route("**/photos/*/original", _hold_when_active)
+    page.route("**/photos/*/original*", _hold_when_active)
 
     page.goto(f"{url}/browse")
 
@@ -1973,7 +1973,7 @@ def test_browse_lightbox_predecodes_adjacent_photo_for_current_source_tier(
         original_requests.append(route.request.url)
         route.fulfill(body=svg, content_type="image/svg+xml")
 
-    page.route("**/photos/*/original", serve_original)
+    page.route("**/photos/*/original*", serve_original)
     page.goto(f"{live_server['url']}/browse")
     first_card = page.locator(".grid-card").first
     first_card.wait_for(state="visible")
@@ -1990,6 +1990,13 @@ def test_browse_lightbox_predecodes_adjacent_photo_for_current_source_tier(
     )
 
     assert any(f"/photos/{next_id}/original" in url for url in original_requests)
+    assert any(
+        f"/photos/{next_id}/original" in url and "prefetch=1" in url
+        for url in original_requests
+    )
+    assert "prefetch=1" in page.evaluate(
+        "nextId => window._lbSrcUrl(nextId, 'original')", arg=next_id,
+    )
     assert page.evaluate("window._lightboxCurrentId") != next_id
 
 
@@ -2021,12 +2028,14 @@ def test_browse_lightbox_preloads_current_original_after_preview_settles(
         "**/photos/*/full",
         lambda route: route.fulfill(body=full_svg, content_type="image/svg+xml"),
     )
-    page.route("**/photos/*/original", serve_original)
+    page.route("**/photos/*/original*", serve_original)
     page.goto(f"{live_server['url']}/browse")
     page.locator(".grid-card").first.dblclick()
     expect(page.locator("#lightboxOverlay")).to_have_class("lightbox-overlay active")
 
     assert page.evaluate("window._lightboxCurrentId") == current_id
+    page.wait_for_timeout(800)
+    assert original_requests == []
     page.wait_for_function(
         """photoId => window._lbOriginalPreload && (
             window._lbOriginalPreload.photoId === photoId &&
@@ -2036,6 +2045,10 @@ def test_browse_lightbox_preloads_current_original_after_preview_settles(
     )
 
     assert any(f"/photos/{current_id}/original" in url for url in original_requests)
+    assert all("prefetch=1" in url for url in original_requests)
+    assert "prefetch=1" in page.evaluate(
+        "photoId => window._lbSrcUrl(photoId, 'original')", arg=current_id,
+    )
     assert page.evaluate("window._lbCurrentSrcKey") == "full"
 
 
@@ -2069,7 +2082,7 @@ def test_browse_lightbox_waits_for_fit_image_before_preloading_original(
         route.fulfill(body=original_svg, content_type="image/svg+xml")
 
     page.route("**/photos/*/full", hold_full)
-    page.route("**/photos/*/original", serve_original)
+    page.route("**/photos/*/original*", serve_original)
     page.goto(f"{live_server['url']}/browse")
     page.locator(".grid-card").first.dblclick()
     page.wait_for_function("window._lbFullUsesOriginal === false")
@@ -2114,7 +2127,7 @@ def test_browse_lightbox_skips_original_when_full_covers_one_to_one(
         original_requests.append(route.request.url)
         route.fulfill(body=svg, content_type="image/svg+xml")
 
-    page.route("**/photos/*/original", serve_original)
+    page.route("**/photos/*/original*", serve_original)
     page.goto(f"{live_server['url']}/browse")
     page.locator(".grid-card").first.dblclick()
     page.wait_for_function("window._lbNativeZoom !== null")
@@ -2159,7 +2172,7 @@ def test_browse_lightbox_cancels_original_warmup_when_zoom_leaves_fit(
         original_requests.append(route.request.url)
         route.fulfill(body=preview_svg, content_type="image/svg+xml")
 
-    page.route("**/photos/*/original", serve_original)
+    page.route("**/photos/*/original*", serve_original)
     page.goto(f"{live_server['url']}/browse")
     page.locator(".grid-card").first.dblclick()
     page.wait_for_function("window._lbOriginalPreloadTimer !== null")
@@ -2207,7 +2220,7 @@ def test_browse_lightbox_does_not_preload_when_full_already_uses_original(
         original_requests.append(route.request.url)
         route.fulfill(body=svg, content_type="image/svg+xml")
 
-    page.route("**/photos/*/original", serve_original)
+    page.route("**/photos/*/original*", serve_original)
     page.goto(f"{live_server['url']}/browse")
     page.locator(".grid-card").first.dblclick()
     expect(page.locator("#lightboxOverlay")).to_have_class("lightbox-overlay active")
@@ -2232,7 +2245,7 @@ def test_browse_lightbox_carries_current_viewport_to_previously_seen_photo(
         lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
     )
     page.route(
-        "**/photos/*/original",
+        "**/photos/*/original*",
         lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
     )
 
@@ -2346,7 +2359,7 @@ def test_browse_lightbox_holds_off_center_transform_until_next_photo_is_ready(
             return
         route.fulfill(body=first_svg, content_type="image/svg+xml")
 
-    page.route("**/photos/*/original", hold_next_original)
+    page.route("**/photos/*/original*", hold_next_original)
 
     first_card = page.locator(".grid-card").first
     first_card.wait_for(state="visible")
@@ -2568,7 +2581,7 @@ def test_browse_lightbox_resize_deferred_during_transition_reapplies_after_load(
             return
         route.fulfill(body=first_svg, content_type="image/svg+xml")
 
-    page.route("**/photos/*/original", hold_next_original)
+    page.route("**/photos/*/original*", hold_next_original)
 
     first_card = page.locator(".grid-card").first
     first_card.wait_for(state="visible")
@@ -2706,7 +2719,7 @@ def test_browse_lightbox_mid_transition_save_keeps_navigation_handoff(
             return
         route.fulfill(body=first_svg, content_type="image/svg+xml")
 
-    page.route("**/photos/*/original", hold_next_original)
+    page.route("**/photos/*/original*", hold_next_original)
 
     first_card = page.locator(".grid-card").first
     first_card.wait_for(state="visible")
@@ -2924,7 +2937,7 @@ def test_browse_lightbox_defers_overlays_while_visual_transition_pending(
             return
         route.fulfill(body=first_svg, content_type="image/svg+xml")
 
-    page.route("**/photos/*/original", hold_next_original)
+    page.route("**/photos/*/original*", hold_next_original)
 
     detection_requests = []
 
@@ -3065,7 +3078,7 @@ def test_browse_lightbox_pending_high_zoom_survives_native_zoom_race(live_server
         lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
     )
     page.route(
-        "**/photos/*/original",
+        "**/photos/*/original*",
         lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
     )
 
@@ -3161,7 +3174,7 @@ def test_browse_lightbox_manual_zoom_cancels_pending_restore(live_server, page):
         lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
     )
     page.route(
-        "**/photos/*/original",
+        "**/photos/*/original*",
         lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
     )
 
@@ -3240,7 +3253,7 @@ def test_browse_lightbox_manual_zoom_cancels_pending_restore(live_server, page):
 def test_browse_lightbox_one_to_one_nav_falls_back_when_original_fails(live_server, page):
     """1:1 arrow navigation falls back to /full when the original is unavailable."""
     image_body = base64.b64decode(_PNG_1X1)
-    page.route("**/photos/*/original", lambda route: route.fulfill(status=503, body="missing"))
+    page.route("**/photos/*/original*", lambda route: route.fulfill(status=503, body="missing"))
     page.route("**/photos/*/full", lambda route: route.fulfill(body=image_body, content_type="image/png"))
 
     url = live_server["url"]
@@ -3302,7 +3315,7 @@ def test_browse_lightbox_restored_pending_one_to_one_waits_for_fallback_after_in
             }
         ),
     )
-    page.route("**/photos/*/original", lambda route: route.abort())
+    page.route("**/photos/*/original*", lambda route: route.abort())
     held_fallback = {}
 
     def hold_fallback(route):
@@ -3396,7 +3409,7 @@ def test_browse_lightbox_one_to_one_uses_device_pixels_and_natural_layout(live_s
         lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
     )
     page.route(
-        "**/photos/*/original",
+        "**/photos/*/original*",
         lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
     )
 
@@ -3496,7 +3509,7 @@ def test_browse_lightbox_defers_one_to_one_until_original_size_known(live_server
         else:
             route.fulfill(body=original_svg, content_type="image/svg+xml")
 
-    page.route("**/photos/*/original", hold_original)
+    page.route("**/photos/*/original*", hold_original)
 
     url = live_server["url"]
     page.set_viewport_size({"width": 1000, "height": 800})
@@ -3614,7 +3627,7 @@ def test_browse_lightbox_pending_one_to_one_guard_schedules_sharper_source(
         else:
             route.fulfill(body=original_svg, content_type="image/svg+xml")
 
-    page.route("**/photos/*/original", hold_original)
+    page.route("**/photos/*/original*", hold_original)
 
     url = live_server["url"]
     page.set_viewport_size({"width": 1000, "height": 800})
@@ -3704,7 +3717,7 @@ def test_browse_lightbox_waits_for_original_before_one_to_one_snap(live_server, 
         else:
             route.fulfill(body=original_svg, content_type="image/svg+xml")
 
-    page.route("**/photos/*/original", hold_first_original)
+    page.route("**/photos/*/original*", hold_first_original)
 
     # The fixture photos are seeded without width/height, so /api/photos/<id>
     # returns width=null. When that async metadata fetch resolves it overwrites
@@ -3804,7 +3817,7 @@ def test_browse_lightbox_resize_preserves_deferred_one_to_one(live_server, page)
         else:
             route.fulfill(body=original_svg, content_type="image/svg+xml")
 
-    page.route("**/photos/*/original", hold_first_original)
+    page.route("**/photos/*/original*", hold_first_original)
 
     # The fixture photos are seeded without width/height, so /api/photos/<id>
     # returns width=null. When that async metadata fetch resolves it overwrites
@@ -3924,7 +3937,7 @@ def test_browse_lightbox_does_not_retry_original_after_unavailable(live_server, 
         lambda route: route.fulfill(body=full_svg, content_type="image/svg+xml"),
     )
     page.route(
-        "**/photos/*/original",
+        "**/photos/*/original*",
         lambda route: route.abort(),
     )
     page.route(
@@ -3999,7 +4012,7 @@ def test_browse_lightbox_waits_for_fallback_tier_after_original_fails(live_serve
         "**/photos/*/full",
         lambda route: route.fulfill(body=full_svg, content_type="image/svg+xml"),
     )
-    page.route("**/photos/*/original", lambda route: route.abort())
+    page.route("**/photos/*/original*", lambda route: route.abort())
     held_fallback = {}
 
     def hold_3840(route):
@@ -4118,7 +4131,7 @@ def test_browse_lightbox_ignores_stale_original_failure_after_nav(live_server, p
         else:
             route.abort()
 
-    page.route("**/photos/*/original", hold_original)
+    page.route("**/photos/*/original*", hold_original)
 
     url = live_server["url"]
     page.goto(f"{url}/browse")
@@ -4140,7 +4153,7 @@ def test_browse_lightbox_ignores_stale_original_failure_after_nav(live_server, p
         }"""
     )
 
-    with page.expect_request("**/photos/*/original"):
+    with page.expect_request("**/photos/*/original*"):
         page.evaluate(
             """() => {
                 window._lbPhotoW = 8000;
@@ -4323,7 +4336,7 @@ def test_browse_lightbox_deferred_one_to_one_survives_original_failure_to_fallba
         "**/photos/*/full",
         lambda route: route.fulfill(body=full_svg, content_type="image/svg+xml"),
     )
-    page.route("**/photos/*/original", lambda route: route.abort())
+    page.route("**/photos/*/original*", lambda route: route.abort())
     held_fallback = {}
 
     def hold_fallback(route):
@@ -4448,7 +4461,7 @@ def test_browse_lightbox_resize_preserves_post_original_failure_fallback(
         "**/photos/*/full",
         lambda route: route.fulfill(body=full_svg, content_type="image/svg+xml"),
     )
-    page.route("**/photos/*/original", lambda route: route.abort())
+    page.route("**/photos/*/original*", lambda route: route.abort())
     held_fallback = {}
 
     def hold_fallback(route):

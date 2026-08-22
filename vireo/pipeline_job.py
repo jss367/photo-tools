@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass
 
 import numpy as np
+from artifact_flight import ArtifactProducerFailed
 from classifier_cache import acquire_cached_classifier
 from db import Database, commit_with_retry
 from job_contract import progress_event
@@ -30,14 +31,13 @@ from pipeline_locks import (
     release_archive_destination,
     try_reserve_archive_destination,
 )
-from render_source import (
-    companion_image_can_replace_raw_result as _companion_image_can_replace_raw_result,
+from preview_materializer import (
+    PreviewMaterializationError,
+    PreviewSourceUnavailable,
+    materialize_preview,
 )
 from render_source import (
     has_current_working_copy_failure as _has_current_working_copy_failure,
-)
-from render_source import (
-    image_is_smaller_than_expected as _image_is_smaller_than_expected,
 )
 from render_source import (
     photo_value as _photo_value,
@@ -3833,11 +3833,6 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
 
             try:
                 import config as cfg
-                from image_edits import apply_recipe_to_loaded_image
-                from image_loader import (
-                    RAW_DECODE_PRESERVE_HIGHLIGHTS,
-                    load_image,
-                )
 
                 thread_db = Database(db_path)
                 thread_db.set_active_workspace(workspace_id)
@@ -3922,195 +3917,32 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             continue
                     if not os.path.exists(cache_path):
                         folder_path = folders.get(detail_photo["folder_id"])
-                        raw_source_path = None
-                        if (
-                            not recipe
-                            and folder_path
-                            and os.path.splitext(detail_photo["filename"])[1].lower()
-                            in _RAW_EXTENSIONS
-                        ):
-                            # Mirror /photos/<id>/preview: an unedited RAW
-                            # must warm from the camera-rendered source,
-                            # not the highlight-preserving working copy.
-                            # Otherwise the pipeline preview stage writes
-                            # flatter/darker bytes into the tracked preview
-                            # cache and _serve_preview returns those cache
-                            # hits before its own RAW-source branch ever
-                            # runs, so the migration's one-time purge is
-                            # undone the first time this stage runs.
-                            candidate = os.path.join(
-                                folder_path, detail_photo["filename"],
-                            )
-                            if os.path.exists(candidate) and not _has_current_working_copy_failure(
+                        try:
+                            materialized = materialize_preview(
+                                thread_db,
                                 detail_photo,
-                                base_dir,
-                                trust_existing_working_copy=False,
-                                live_source_path=candidate,
-                                folder_path=folder_path,
-                            ):
-                                raw_source_path = candidate
-                        if raw_source_path:
-                            canonical = raw_source_path
-                        else:
-                            canonical = _recipe_render_source(
-                                detail_photo, recipe, max_size, base_dir, folders,
+                                folder_path,
+                                size=max_size,
+                                vireo_dir=base_dir,
+                                preview_quality=preview_quality,
+                                recipe=recipe,
+                                cache_path=cache_path,
                             )
-                        if (
-                            os.path.splitext(canonical)[1].lower() in _RAW_EXTENSIONS
-                            and _has_current_working_copy_failure(
-                                detail_photo,
-                                base_dir,
-                                trust_existing_working_copy=False,
-                                live_source_path=canonical,
-                                folder_path=folders.get(detail_photo["folder_id"]),
-                            )
-                        ):
+                        except PreviewSourceUnavailable as exc:
                             skipped += 1
                             log.info(
-                                "Skipping pipeline preview for photo %s; RAW "
-                                "working-copy extraction already failed for "
-                                "current source mtime",
-                                photo["id"],
+                                "Skipping pipeline preview for photo %s: %s",
+                                photo["id"], exc,
                             )
-                            continue
-                        load_max_size = (
-                            None if recipe and recipe.get("crop") else max_size
-                        )
-                        raw_decode = (
-                            RAW_DECODE_PRESERVE_HIGHLIGHTS
-                            if recipe
-                            and os.path.splitext(canonical)[1].lower() in _RAW_EXTENSIONS
-                            else None
-                        )
-                        load_kwargs = (
-                            {"raw_decode": raw_decode} if raw_decode else {}
-                        )
-                        img = load_image(canonical, max_size=load_max_size, **load_kwargs)
-                        if (
-                            img is not None
-                            and os.path.splitext(canonical)[1].lower() in _RAW_EXTENSIONS
-                            and detail_photo["width"]
-                            and detail_photo["height"]
-                        ):
-                            expected_w, expected_h = _scaled_recipe_source_dimensions(
-                                detail_photo, load_max_size,
-                            )
-                            if _image_is_smaller_than_expected(
-                                img, expected_w, expected_h,
-                            ):
-                                companion_rel = detail_photo["companion_path"]
-                                folder_path = folders.get(
-                                    detail_photo["folder_id"]
-                                )
-                                if companion_rel and folder_path:
-                                    companion_abs = os.path.join(
-                                        folder_path, companion_rel,
-                                    )
-                                    if (
-                                        os.path.exists(companion_abs)
-                                        and companion_abs != canonical
-                                    ):
-                                        companion_img = load_image(
-                                            companion_abs,
-                                            max_size=load_max_size,
-                                        )
-                                        if _companion_image_can_replace_raw_result(
-                                            companion_img, img,
-                                            expected_w, expected_h,
-                                        ):
-                                            log.info(
-                                                "RAW decode for photo %s "
-                                                "pipeline preview at size=%s "
-                                                "returned undersized embedded "
-                                                "preview (%dx%d, expected "
-                                                "%dx%d); falling back to "
-                                                "companion JPEG",
-                                                detail_photo["id"], max_size,
-                                                img.size[0], img.size[1],
-                                                expected_w, expected_h,
-                                            )
-                                            img.close()
-                                            img = companion_img
-                                            canonical = companion_abs
-                                        elif companion_img is not None:
-                                            companion_img.close()
-                        if (
-                            img is None
-                            and os.path.splitext(canonical)[1].lower() in _RAW_EXTENSIONS
-                        ):
-                            companion_rel = detail_photo["companion_path"]
-                            folder_path = folders.get(detail_photo["folder_id"])
-                            if companion_rel and folder_path:
-                                companion_abs = os.path.join(folder_path, companion_rel)
-                                if (
-                                    os.path.exists(companion_abs)
-                                    and companion_abs != canonical
-                                ):
-                                    log.info(
-                                        "RAW decode failed for photo %s pipeline "
-                                        "preview at size=%s; falling back to "
-                                        "companion JPEG",
-                                        detail_photo["id"], max_size,
-                                    )
-                                    file_mtime = detail_photo["file_mtime"]
-                                    if file_mtime is not None:
-                                        with contextlib.suppress(Exception):
-                                            thread_db.conn.execute(
-                                                "UPDATE photos SET"
-                                                " working_copy_failed_at=datetime('now'),"
-                                                " working_copy_failed_mtime=?,"
-                                                " working_copy_failed_source='source'"
-                                                " WHERE id=?",
-                                                (file_mtime, detail_photo["id"]),
-                                            )
-                                            commit_with_retry(thread_db.conn)
-                                    img = load_image(
-                                        companion_abs, max_size=load_max_size,
-                                    )
-                                    if img is not None:
-                                        canonical = companion_abs
-                        if img:
-                            if recipe:
-                                import local_masks
-                                img = apply_recipe_to_loaded_image(
-                                    img, recipe, max_size=max_size,
-                                    native_size=_recipe_source_dimensions(
-                                        detail_photo
-                                    ),
-                                    local_mask=local_masks.load_snapshot(
-                                        effective_vireo_dir,
-                                        photo["id"], recipe,
-                                    ),
-                                )
-                            # Atomic write: with SLOT_CAP > 1 two pipelines
-                            # processing the same photo can both miss the
-                            # os.path.exists() check above and race here on the
-                            # deterministic {id}_{max_size}.jpg path. A direct
-                            # img.save(cache_path) would interleave/truncate the
-                            # JPEG bytes; tempfile + os.replace makes the visible
-                            # file flip atomically (same pattern as
-                            # thumbnails.generate_thumbnail).
-                            fd, tmp_path = tempfile.mkstemp(
-                                prefix=f'.{photo["id"]}.', suffix=".jpg.tmp",
-                                dir=preview_dir,
-                            )
-                            os.close(fd)
-                            try:
-                                img.save(tmp_path, format="JPEG", quality=preview_quality)
-                                os.replace(tmp_path, cache_path)
-                            except Exception:
-                                with contextlib.suppress(OSError):
-                                    os.unlink(tmp_path)
-                                raise
-                            with contextlib.suppress(Exception):
-                                thread_db.preview_cache_insert(
-                                    photo["id"], max_size, os.path.getsize(cache_path),
-                                )
-                            generated += 1
-                        else:
-                            # image_loader already logged the failure at WARNING;
-                            # count it here so it surfaces in the rollup.
+                        except (ArtifactProducerFailed, PreviewMaterializationError):
+                            # image_loader logged the source failure; count it
+                            # here so it remains visible in the stage rollup.
                             failed += 1
+                        else:
+                            if materialized.generated:
+                                generated += 1
+                            else:
+                                skipped += 1
 
                     stages["previews"]["count"] = i + 1
                     stages["previews"]["total"] = total

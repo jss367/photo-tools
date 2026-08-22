@@ -1,6 +1,11 @@
+import contextlib
 import json
+import os
 import sys
+import threading
+import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -1601,7 +1606,6 @@ def test_batch_keyword_with_type_override(app_and_db):
 
 # --- Working copy integration tests for serving endpoints ---
 
-import os
 
 
 def test_preview_uses_working_copy(app_and_db):
@@ -1828,6 +1832,145 @@ def test_preview_sized_caches_per_size(app_and_db):
     assert size_2560 > size_1920
 
 
+def test_concurrent_preview_cache_misses_decode_once(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """Equal interactive cache misses join one durable preview producer."""
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    source_dir = tmp_path / "preview-source"
+    source_dir.mkdir()
+    source_path = source_dir / "source.jpg"
+    Image.new("RGB", (2400, 1600), (40, 80, 120)).save(source_path, "JPEG")
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        "UPDATE photos SET filename='source.jpg', extension='.jpg', "
+        "working_copy_path=NULL WHERE id=?",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    cache_path = os.path.join(vireo_dir, "previews", f"{photo_id}_1920.jpg")
+    with contextlib.suppress(OSError):
+        os.unlink(cache_path)
+    db.preview_cache_delete(photo_id, 1920)
+
+    started = threading.Event()
+    release = threading.Event()
+    call_count = 0
+    count_lock = threading.Lock()
+
+    def blocking_load(path, max_size=None, **kwargs):
+        nonlocal call_count
+        with count_lock:
+            call_count += 1
+        started.set()
+        assert release.wait(5), "test did not release preview producer"
+        return Image.new("RGB", (1920, 1280), (60, 100, 140))
+
+    monkeypatch.setattr(image_loader, "load_image", blocking_load)
+
+    def request_preview():
+        with app.test_client() as client:
+            response = client.get(f"/photos/{photo_id}/preview?size=1920")
+            return response.status_code, response.data
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(request_preview)
+        assert started.wait(5), "preview producer did not start"
+        with app.test_client() as speculative_client:
+            speculative = speculative_client.get(
+                f"/photos/{photo_id}/preview?size=1920&prefetch=1",
+            )
+        assert speculative.status_code == 204
+        second = pool.submit(request_preview)
+        time.sleep(0.1)
+        assert call_count == 1
+        release.set()
+        first_result = first.result(timeout=5)
+        second_result = second.result(timeout=5)
+
+    assert first_result[0] == second_result[0] == 200
+    assert first_result[1] == second_result[1]
+    assert call_count == 1
+
+
+def test_failed_preview_flight_wakes_waiter_and_next_request_retries(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """A 500 is shared by current waiters but never poisons the cache key."""
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    source_dir = tmp_path / "failed-preview-source"
+    source_dir.mkdir()
+    (source_dir / "source.jpg").write_bytes(b"source")
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        "UPDATE photos SET filename='source.jpg', extension='.jpg', "
+        "working_copy_path=NULL WHERE id=?",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    cache_path = os.path.join(vireo_dir, "previews", f"{photo_id}_1920.jpg")
+    with contextlib.suppress(OSError):
+        os.unlink(cache_path)
+    db.preview_cache_delete(photo_id, 1920)
+
+    started = threading.Event()
+    release = threading.Event()
+    call_count = 0
+    count_lock = threading.Lock()
+
+    def fail_once(path, max_size=None, **kwargs):
+        nonlocal call_count
+        with count_lock:
+            call_count += 1
+            current = call_count
+        if current == 1:
+            started.set()
+            assert release.wait(5), "test did not release failed producer"
+            return None
+        return Image.new("RGB", (1920, 1280), (20, 40, 60))
+
+    monkeypatch.setattr(image_loader, "load_image", fail_once)
+
+    def request_status():
+        with app.test_client() as client:
+            return client.get(
+                f"/photos/{photo_id}/preview?size=1920"
+            ).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(request_status)
+        assert started.wait(5), "failed preview producer did not start"
+        second = pool.submit(request_status)
+        time.sleep(0.1)
+        release.set()
+        assert first.result(timeout=5) == 500
+        assert second.result(timeout=5) == 500
+
+    assert call_count == 1
+    assert request_status() == 200
+    assert call_count == 2
+
+
 def test_preview_returns_404_for_deleted_photo_even_with_stale_cache(app_and_db):
     """Defense against SQLite id reuse: don't serve a cached image for a row
     that no longer exists.
@@ -1967,6 +2110,149 @@ def test_unedited_raw_original_uses_camera_display_cache_not_working_copy(
         assert rendered.getpixel((0, 0))[0] > 200
     assert open(working_path, "rb").read() == working_bytes
     assert db.get_photo(photo_id)["working_copy_path"] == f"working/{photo_id}.jpg"
+
+
+def test_concurrent_original_cache_misses_extract_once(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """Equal RAW /original misses share one camera-rendered extraction."""
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    source_dir = tmp_path / "concurrent-original-source"
+    source_dir.mkdir()
+    source_path = source_dir / "source.NEF"
+    source_path.write_bytes(b"fake raw")
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='source.NEF', extension='.nef', width=800, height=600,
+               working_copy_path=NULL, companion_path=NULL
+           WHERE id=?""",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    display_path = os.path.join(
+        vireo_dir, "originals", f"{photo_id}.display.jpg",
+    )
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(display_path)
+
+    producer_started = threading.Event()
+    release_producer = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def blocking_extract(source, output, **kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        producer_started.set()
+        assert release_producer.wait(timeout=5)
+        Image.new("RGB", (800, 600), (180, 180, 180)).save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(image_loader, "extract_working_copy", blocking_extract)
+
+    def request_original():
+        with app.test_client() as client:
+            response = client.get(f"/photos/{photo_id}/original")
+            return response.status_code, response.data
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(request_original)
+        assert producer_started.wait(timeout=5)
+        second = executor.submit(request_original)
+        time.sleep(0.1)
+        assert calls == 1
+        release_producer.set()
+        first_result = first.result(timeout=5)
+        second_result = second.result(timeout=5)
+
+    assert first_result[0] == 200
+    assert second_result[0] == 200
+    assert first_result[1] == second_result[1]
+    assert calls == 1
+    assert os.path.getsize(display_path) > 0
+
+
+def test_failed_original_flight_releases_waiters_and_allows_retry(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """An /original producer exception must not poison its artifact key."""
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    source_dir = tmp_path / "failed-original-source"
+    source_dir.mkdir()
+    (source_dir / "source.NEF").write_bytes(b"fake raw")
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='source.NEF', extension='.nef', width=800, height=600,
+               working_copy_path=NULL, companion_path=NULL
+           WHERE id=?""",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    display_path = os.path.join(
+        vireo_dir, "originals", f"{photo_id}.display.jpg",
+    )
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(display_path)
+
+    producer_started = threading.Event()
+    release_producer = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def fail_once(source, output, **kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            current = calls
+        if current == 1:
+            producer_started.set()
+            assert release_producer.wait(timeout=5)
+            raise RuntimeError("simulated extraction crash")
+        Image.new("RGB", (800, 600), "orange").save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(image_loader, "extract_working_copy", fail_once)
+
+    def request_original():
+        with app.test_client() as client:
+            return client.get(f"/photos/{photo_id}/original").status_code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(request_original)
+        assert producer_started.wait(timeout=5)
+        second = executor.submit(request_original)
+        time.sleep(0.1)
+        release_producer.set()
+        assert first.result(timeout=5) == 500
+        assert second.result(timeout=5) == 500
+
+    assert calls == 1
+    assert request_original() == 200
+    assert calls == 2
+    assert os.path.getsize(display_path) > 0
 
 
 def test_unedited_raw_display_cache_survives_when_companion_is_newer_than_raw_row(
@@ -5837,6 +6123,84 @@ def test_preview_job_writes_sized_filename_and_tracks(client_with_photo):
 
     # Legacy naming NOT produced
     assert not os.path.exists(os.path.join(preview_dir, f"{photo_id}.jpg"))
+
+
+def test_interactive_preview_joins_background_warmer(
+    client_with_photo, monkeypatch,
+):
+    """A visible request and the warmer must perform one shared decode."""
+    import image_loader
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    client = app.test_client()
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    preview_path = os.path.join(
+        vireo_dir, "previews", f"{photo_id}_1920.jpg",
+    )
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(preview_path)
+    db.preview_cache_delete(photo_id, 1920)
+
+    producer_started = threading.Event()
+    release_producer = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def blocking_load_image(file_path, max_size=1024, **kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        producer_started.set()
+        assert release_producer.wait(timeout=5)
+        return Image.new("RGB", (800, 600), "purple")
+
+    monkeypatch.setattr(image_loader, "load_image", blocking_load_image)
+
+    response = client.post(
+        "/api/jobs/previews", json={"photo_ids": [photo_id]},
+    )
+    assert response.status_code == 200
+    job_id = response.get_json()["job_id"]
+    assert producer_started.wait(timeout=5)
+
+    def request_visible_preview():
+        with app.test_client() as request_client:
+            visible = request_client.get(
+                f"/photos/{photo_id}/preview?size=1920",
+            )
+            return visible.status_code, visible.data
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        visible_future = executor.submit(request_visible_preview)
+        time.sleep(0.1)
+        assert calls == 1
+        release_producer.set()
+        visible_status, visible_data = visible_future.result(timeout=5)
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        job_data = client.get(f"/api/jobs/{job_id}").get_json()
+        if job_data.get("status") in ("completed", "failed"):
+            break
+        time.sleep(0.05)
+
+    assert job_data["status"] == "completed"
+    assert visible_status == 200
+    assert len(visible_data) > 100
+    assert calls == 1
+
+
+def test_preview_job_rejects_invalid_photo_id_scope(client_with_photo):
+    app, _, _ = client_with_photo
+    client = app.test_client()
+
+    response = client.post(
+        "/api/jobs/previews", json={"photo_ids": [True, "2", -1]},
+    )
+
+    assert response.status_code == 400
+    assert "positive integers" in response.get_json()["error"]
 
 
 def test_preview_job_applies_edit_recipe_to_warmed_file(

@@ -1240,17 +1240,16 @@ def test_pipeline_previews_stage_writes_atomically(tmp_path, monkeypatch):
     db = Database(db_path)
     ws_id = db._active_workspace_id
 
-    # Capture every path Image.save() is invoked with so we can prove the
-    # final cache_path was never the direct target — only the os.replace
-    # destination is.
-    saved_paths = []
-    real_save = Image.Image.save
+    # Capture atomic publications. The shared materializer encodes in memory,
+    # fsyncs a sibling temp file, then makes that file visible with replace.
+    replacements = []
+    real_replace = os.replace
 
-    def tracking_save(self, fp, *args, **kwargs):
-        saved_paths.append(fp)
-        return real_save(self, fp, *args, **kwargs)
+    def tracking_replace(source, destination):
+        replacements.append((os.fspath(source), os.fspath(destination)))
+        return real_replace(source, destination)
 
-    monkeypatch.setattr(Image.Image, "save", tracking_save)
+    monkeypatch.setattr(os, "replace", tracking_replace)
 
     params = PipelineParams(
         source=str(photo_dir),
@@ -1276,24 +1275,16 @@ def test_pipeline_previews_stage_writes_atomically(tmp_path, monkeypatch):
     with Image.open(final_path) as img:
         img.verify()
 
-    # No Image.save call targeted the final deterministic path directly —
-    # every write went through a sibling temp file. Thumbnails go through
-    # generate_thumbnail (also atomic) so those saves also won't target the
-    # preview path; restrict the check to saves inside preview_dir.
-    preview_dir_saves = [
-        p for p in saved_paths
-        if isinstance(p, str | bytes) and str(p).startswith(preview_dir)
+    preview_publications = [
+        (source, destination)
+        for source, destination in replacements
+        if destination == final_path
     ]
-    assert preview_dir_saves, "previews_stage should have written at least one file"
-    for p in preview_dir_saves:
-        assert str(p) != final_path, (
-            f"previews_stage wrote directly to {final_path}; expected a "
-            "temp sibling + os.replace to make the swap atomic under "
-            "concurrent same-photo pipelines"
-        )
-        assert str(p).endswith(".jpg.tmp"), (
-            f"expected .jpg.tmp temp file, got {p}"
-        )
+    assert len(preview_publications) == 1
+    temporary, destination = preview_publications[0]
+    assert os.path.dirname(temporary) == preview_dir
+    assert temporary.endswith(".jpg.tmp")
+    assert destination == final_path
 
 
 def test_pipeline_previews_stage_bounds_non_crop_recipe_loads(tmp_path, monkeypatch):

@@ -4217,6 +4217,9 @@ var _lbEyeTrackScreenAnchor = null; // eye offset from viewport center in CSS pi
 var _lbVisualTransitionPending = false; // keep the outgoing bitmap/transform frozen until the incoming image is decoded
 var _lbDeferredOverlayApply = null; // detections/eye render withheld while _lbVisualTransitionPending; drained when the transition clears
 var _lbAdjacentPreloads = {}; // decoded immediate neighbors, keyed by photo id + source URL
+var _lbAdjacentPreloadTimer = null;
+var _lbAdjacentPreloadRetry = {};
+var _lbLastNavDelta = 1;
 var _lbOriginalPreloadTimer = null; // short dwell before warming the current photo's 100% source
 var _lbOriginalPreload = null; // retained decoded original for an instant first 100% click
 var _lbEditRecipeByPhoto = {};
@@ -7806,7 +7809,9 @@ function openLightbox(photoId, filename, photoList, options) {
   var nextReadOnlyMessage = Object.prototype.hasOwnProperty.call(options, 'readOnlyMessage')
     ? options.readOnlyMessage
     : _lbReadOnlyMessage;
+  if (!alreadyOpen) _lbLastNavDelta = 1;
   _lbCancelOriginalPreload();
+  _lbCancelAdjacentPreloadTimer();
   var fallbackViewportState = options.fallbackViewportState || null;
   var eyeTrackAnchor = options.eyeTrackAnchor || null;
   _lbFlushPendingAdjustmentSave();
@@ -8161,7 +8166,7 @@ function openLightbox(photoId, filename, photoList, options) {
     if (typeof window._lbFlushDeferredLightboxLayoutRefresh === 'function') {
       window._lbFlushDeferredLightboxLayoutRefresh();
     }
-    _lbPrimeAdjacentPhotos(_lbCurrentSrcKey);
+    _lbScheduleAdjacentPhoto(_lbCurrentSrcKey);
     if (_lbCurrentSrcKey === 'full') _lbScheduleOriginalPreload(photoId);
   }
   function handleInitialImageError() {
@@ -8263,6 +8268,7 @@ function lightboxNav(delta) {
   var currentViewportState = _lbSaveViewportState(_lightboxCurrentId);
   var eyeTrackAnchor = _lbCaptureEyeTrackingAnchor();
   var next = _lightboxPhotoList[newIdx];
+  _lbLastNavDelta = delta < 0 ? -1 : 1;
   openLightbox(next.id, next.filename, _lightboxPhotoList, {
     fallbackViewportState: currentViewportState,
     preserveOneToOne: _lbIsOneToOneZoom(),
@@ -10290,7 +10296,7 @@ function _lbSyncSourceForZoom(targetZoom, preserveSharperSource) {
       _lbSwapTimer = null;
     }
     _lbDesiredSrcKey = _lbCurrentSrcKey;
-    _lbPrimeAdjacentPhotos(_lbCurrentSrcKey);
+    _lbScheduleAdjacentPhoto(_lbCurrentSrcKey);
     return;
   }
   _lbScheduleSourceSwap(targetZoom);
@@ -10418,7 +10424,7 @@ function _lbPickSourceKey(targetZoom) {
   return _lbOriginalUnavailable ? '3840' : 'original';
 }
 
-function _lbSrcUrl(photoId, key) {
+function _lbSrcUrl(photoId, key, speculative) {
   var url;
   if (key === 'original') url = '/photos/' + photoId + '/original';
   else if (key === 'full') url = '/photos/' + photoId + '/full';
@@ -10428,10 +10434,35 @@ function _lbSrcUrl(photoId, key) {
     : _vireoUrlWithRenderVersion(url, photoId);
   var version = _lbEditVersionByPhoto[String(photoId)];
   if (version) url = _vireoUrlWithQueryParam(url, 'editv', version);
+  var speculativeUrl = _vireoUrlWithQueryParam(url, 'prefetch', '1');
+  if (speculative) return speculativeUrl;
+
+  // Keep the exact URL of a successfully decoded warmup. Browser caches are
+  // URL-keyed, so dropping the prefetch marker here would force a second
+  // transfer/decode and throw away the retained Image object's main benefit.
+  var decodedWarmup = Object.values(_lbAdjacentPreloads).some(function(entry) {
+    return entry.photoId === photoId && entry.sourceKey === key &&
+      entry.status === 'decoded' && entry.url === speculativeUrl;
+  });
+  if (
+    !decodedWarmup && _lbOriginalPreload && key === 'original' &&
+    _lbOriginalPreload.photoId === photoId &&
+    _lbOriginalPreload.status === 'decoded' &&
+    _lbOriginalPreload.url === speculativeUrl
+  ) decodedWarmup = true;
+  if (decodedWarmup) return speculativeUrl;
   return url;
 }
 
+function _lbCancelAdjacentPreloadTimer() {
+  if (_lbAdjacentPreloadTimer) {
+    clearTimeout(_lbAdjacentPreloadTimer);
+    _lbAdjacentPreloadTimer = null;
+  }
+}
+
 function _lbClearAdjacentPreloads() {
+  _lbCancelAdjacentPreloadTimer();
   Object.keys(_lbAdjacentPreloads).forEach(function(cacheKey) {
     var entry = _lbAdjacentPreloads[cacheKey];
     if (entry && entry.img) {
@@ -10441,6 +10472,7 @@ function _lbClearAdjacentPreloads() {
     }
   });
   _lbAdjacentPreloads = {};
+  _lbAdjacentPreloadRetry = {};
 }
 
 function _lbCancelOriginalPreload() {
@@ -10472,9 +10504,10 @@ function _lbShouldPreloadOriginal(photoId) {
   return !!(img && img.complete && img.naturalWidth && img.naturalHeight);
 }
 
-function _lbScheduleOriginalPreload(photoId) {
+function _lbScheduleOriginalPreload(photoId, retryCount) {
   _lbCancelOriginalPreload();
   if (!_lbShouldPreloadOriginal(photoId)) return;
+  retryCount = retryCount || 0;
 
   // Give navigation and the neighboring fit-tier preloads first use of the
   // decoder. The dwell also prevents fast arrowing from starting expensive
@@ -10483,7 +10516,7 @@ function _lbScheduleOriginalPreload(photoId) {
     _lbOriginalPreloadTimer = null;
     if (!_lbShouldPreloadOriginal(photoId)) return;
 
-    var url = _lbSrcUrl(photoId, 'original');
+    var url = _lbSrcUrl(photoId, 'original', true);
     var preload = new Image();
     var entry = {
       img: preload,
@@ -10498,7 +10531,12 @@ function _lbScheduleOriginalPreload(photoId) {
     preload.onload = function() {
       if (!supportsDecode) entry.status = 'decoded';
     };
-    preload.onerror = function() { entry.status = 'failed'; };
+    preload.onerror = function() {
+      entry.status = 'failed';
+      if (retryCount < 1 && _lbShouldPreloadOriginal(photoId)) {
+        _lbScheduleOriginalPreload(photoId, retryCount + 1);
+      }
+    };
     preload.src = url;
     if (supportsDecode) {
       preload.decode().then(function() {
@@ -10507,7 +10545,7 @@ function _lbScheduleOriginalPreload(photoId) {
         // onload/onerror remains the fallback for WebViews with incomplete decode support.
       });
     }
-  }, 400);
+  }, 1400);
 }
 
 function _lbPrimeAdjacentPhotos(sourceKey) {
@@ -10521,27 +10559,50 @@ function _lbPrimeAdjacentPhotos(sourceKey) {
   if (currentIdx === -1) return;
 
   var keep = {};
-  [currentIdx - 1, currentIdx + 1].forEach(function(idx) {
+  [currentIdx + (_lbLastNavDelta < 0 ? -1 : 1)].forEach(function(idx) {
     if (idx < 0 || idx >= _lightboxPhotoList.length) return;
     var photo = _lightboxPhotoList[idx];
     if (Object.prototype.hasOwnProperty.call(photo, 'edit_recipe')) {
       _lbRememberEditRecipe(photo.id, photo.edit_recipe);
     }
     var key = sourceKey || 'full';
-    var url = _lbSrcUrl(photo.id, key);
+    var url = _lbSrcUrl(photo.id, key, true);
     var cacheKey = String(photo.id) + '|' + url;
     keep[cacheKey] = true;
     if (_lbAdjacentPreloads[cacheKey]) return;
 
     var preload = new Image();
-    var entry = { img: preload, photoId: photo.id, sourceKey: key, status: 'loading' };
+    var entry = {
+      img: preload,
+      photoId: photo.id,
+      sourceKey: key,
+      url: url,
+      status: 'loading'
+    };
     _lbAdjacentPreloads[cacheKey] = entry;
     preload.fetchPriority = 'low';
     var supportsDecode = typeof preload.decode === 'function';
     preload.onload = function() {
       if (!supportsDecode) entry.status = 'decoded';
     };
-    preload.onerror = function() { entry.status = 'failed'; };
+    preload.onerror = function() {
+      entry.status = 'failed';
+      delete _lbAdjacentPreloads[cacheKey];
+      var retry = _lbAdjacentPreloadRetry[cacheKey];
+      if (!retry || retry.openSeq !== _lbOpenSeq) {
+        retry = { openSeq: _lbOpenSeq, count: 0 };
+      }
+      retry.count += 1;
+      _lbAdjacentPreloadRetry[cacheKey] = retry;
+      if (retry.count <= 1) {
+        var retryOpenSeq = retry.openSeq;
+        _lbAdjacentPreloadTimer = setTimeout(function() {
+          _lbAdjacentPreloadTimer = null;
+          if (_lbOpenSeq !== retryOpenSeq || _lbVisualTransitionPending) return;
+          _lbPrimeAdjacentPhotos(key);
+        }, 750);
+      }
+    };
     preload.src = url;
     if (supportsDecode) {
       preload.decode().then(function() {
@@ -10564,6 +10625,16 @@ function _lbPrimeAdjacentPhotos(sourceKey) {
   });
 }
 
+function _lbScheduleAdjacentPhoto(sourceKey) {
+  _lbCancelAdjacentPreloadTimer();
+  var openSeq = _lbOpenSeq;
+  _lbAdjacentPreloadTimer = setTimeout(function() {
+    _lbAdjacentPreloadTimer = null;
+    if (_lbOpenSeq !== openSeq || _lbVisualTransitionPending) return;
+    _lbPrimeAdjacentPhotos(sourceKey);
+  }, 300);
+}
+
 function _lbScheduleSourceSwap(targetZoom) {
   if (!_lightboxCurrentId) return;
   var desired = _lbPickSourceKey(targetZoom);
@@ -10572,7 +10643,7 @@ function _lbScheduleSourceSwap(targetZoom) {
     _lbCancelOriginalPreload();
   }
   if (desired === _lbCurrentSrcKey) {
-    _lbPrimeAdjacentPhotos(desired);
+    _lbScheduleAdjacentPhoto(desired);
     return;
   }
 
@@ -10628,7 +10699,7 @@ function _lbScheduleSourceSwap(targetZoom) {
       });
       img.src = url;
       _lbCurrentSrcKey = key;
-      _lbPrimeAdjacentPhotos(key);
+      _lbScheduleAdjacentPhoto(key);
     };
     preloader.onerror = function() {
       if (_lightboxCurrentId !== photoId) return;

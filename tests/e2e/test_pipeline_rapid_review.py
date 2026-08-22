@@ -130,7 +130,7 @@ def _mock_pipeline_rapid_review(
         lambda route: route.fulfill(body=preview_body or image_body, content_type=preview_content_type),
     )
     page.route(
-        "**/photos/*/original",
+        "**/photos/*/original*",
         lambda route: route.fulfill(body=original_body or image_body, content_type=original_content_type),
     )
 
@@ -707,7 +707,7 @@ def test_classic_pipeline_review_opens_requested_burst_from_url(live_server, pag
         ),
     )
     page.route("**/photos/*/preview?*", lambda route: route.fulfill(body=image_body, content_type="image/png"))
-    page.route("**/photos/*/original", lambda route: route.fulfill(body=image_body, content_type="image/png"))
+    page.route("**/photos/*/original*", lambda route: route.fulfill(body=image_body, content_type="image/png"))
 
     page.goto(f"{live_server['url']}/pipeline/review?enc=0&burst=0")
 
@@ -782,7 +782,7 @@ def test_classic_pipeline_review_single_photo_opens_review_modal(live_server, pa
     )
     page.route("**/thumbnails/*.jpg", lambda route: route.fulfill(body=image_body, content_type="image/png"))
     page.route("**/photos/*/preview?*", lambda route: route.fulfill(body=image_body, content_type="image/png"))
-    page.route("**/photos/*/original", lambda route: route.fulfill(body=image_body, content_type="image/png"))
+    page.route("**/photos/*/original*", lambda route: route.fulfill(body=image_body, content_type="image/png"))
 
     page.goto(f"{live_server['url']}/pipeline/review")
     page.locator(".photo-card img").click()
@@ -874,7 +874,7 @@ def test_classic_pipeline_review_group_shortcuts_do_not_flag_prior_single_photo(
     page.route("**/api/photos/1/flag", stale_flag_route)
     page.route("**/thumbnails/*.jpg", lambda route: route.fulfill(body=image_body, content_type="image/png"))
     page.route("**/photos/*/preview?*", lambda route: route.fulfill(body=image_body, content_type="image/png"))
-    page.route("**/photos/*/original", lambda route: route.fulfill(body=image_body, content_type="image/png"))
+    page.route("**/photos/*/original*", lambda route: route.fulfill(body=image_body, content_type="image/png"))
 
     page.goto(f"{live_server['url']}/pipeline/review")
     page.locator(".photo-card[data-photo-id='1'] img").click()
@@ -948,7 +948,7 @@ def test_classic_pipeline_review_group_reject_shortcut_applies_to_multiselection
     )
     page.route("**/thumbnails/*.jpg", lambda route: route.fulfill(body=image_body, content_type="image/png"))
     page.route("**/photos/*/preview?*", lambda route: route.fulfill(body=image_body, content_type="image/png"))
-    page.route("**/photos/*/original", lambda route: route.fulfill(body=image_body, content_type="image/png"))
+    page.route("**/photos/*/original*", lambda route: route.fulfill(body=image_body, content_type="image/png"))
 
     page.goto(f"{live_server['url']}/pipeline/review")
     page.locator(".photo-card[data-photo-id='1'] img").click()

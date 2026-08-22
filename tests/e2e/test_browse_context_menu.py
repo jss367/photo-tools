@@ -63,12 +63,10 @@ def test_right_click_copies_and_pastes_development_settings(
     )
     assert alternate_response.ok
     assert response.ok
-    page.reload()
-    cards = page.locator(".grid-card")
-    cards.first.wait_for(state="visible")
 
-    # Copy from the exact right-clicked photo, not the first item in the
-    # preserved multi-selection.
+    # The recipes were added after Browse loaded, so its in-memory photo rows
+    # are stale. Copy must stay available and fetch the exact right-clicked
+    # photo's authoritative recipe, not the first item in the selection.
     cards.nth(0).click(modifiers=["Meta"])
     cards.nth(1).click(modifiers=["Meta"])
     cards.nth(1).click(button="right")

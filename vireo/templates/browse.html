@@ -6765,17 +6765,6 @@ function _browseHasDevelopmentSettings(recipe) {
   }));
 }
 
-function _browseDevelopmentRecipeFor(photoId) {
-  var photo = photos.find(function(candidate) { return candidate.id === Number(photoId); });
-  if (photo && Object.prototype.hasOwnProperty.call(photo, 'edit_recipe')) {
-    return photo.edit_recipe;
-  }
-  if (typeof window.vireoPhotoEditRecipe === 'function') {
-    return window.vireoPhotoEditRecipe(photoId);
-  }
-  return null;
-}
-
 async function copyDevelopmentSettingsFromPhoto(photoId) {
   var photo = photos.find(function(candidate) { return candidate.id === Number(photoId); });
   if (!photoId || !window.vireoEditNav) return;
@@ -10741,9 +10730,6 @@ function buildPhotoContextMenu(photoIds, contextPhotoId) {
   var developmentSourceId = contextPhotoId != null
     ? Number(contextPhotoId)
     : (one ? Number(photoIds[0]) : null);
-  var developmentRecipe = developmentSourceId != null
-    ? _browseDevelopmentRecipeFor(developmentSourceId)
-    : null;
   var copiedDevelopment = window.vireoEditNav
     ? window.vireoEditNav.getCopiedRecipe()
     : null;
@@ -10811,10 +10797,8 @@ function buildPhotoContextMenu(photoIds, contextPhotoId) {
     { label: 'Edit Photo', disabled: !one, disabledHint: hint,
       onClick: function() { openPhotoEditor(photoIds[0]); } },
     { label: 'Copy Development Settings',
-      disabled: developmentSourceId == null || !_browseHasDevelopmentSettings(developmentRecipe),
-      disabledHint: developmentSourceId == null
-        ? 'Right-click a photo to choose the settings to copy'
-        : 'This photo has no development settings',
+      disabled: developmentSourceId == null,
+      disabledHint: 'Right-click a photo to choose the settings to copy',
       onClick: function() { copyDevelopmentSettingsFromPhoto(developmentSourceId); } },
     { label: 'Paste Development Settings',
       disabled: !(copiedDevelopment && copiedDevelopment.recipe),

@@ -78,7 +78,7 @@ def test_browse_compare_opens_with_c_shortcut(live_server, page):
 def test_browse_compare_zoom_is_independent_and_can_be_reset(live_server, page):
     url = live_server["url"]
     page.route(
-        "**/photos/*/original",
+        "**/photos/*/original*",
         lambda route: route.fulfill(status=200, content_type="image/png", body=PNG_1X1),
     )
     page.goto(f"{url}/browse")
@@ -140,7 +140,7 @@ def test_browse_compare_keeps_preview_when_original_fails(live_server, page):
         "**/photos/*/full",
         lambda route: route.fulfill(status=200, content_type="image/png", body=PNG_1X1),
     )
-    page.route("**/photos/*/original", lambda route: route.fulfill(status=404))
+    page.route("**/photos/*/original*", lambda route: route.fulfill(status=404))
     page.goto(f"{url}/browse")
 
     cards = page.locator(".grid-card")

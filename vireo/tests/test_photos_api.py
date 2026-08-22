@@ -1,6 +1,11 @@
+import contextlib
 import json
+import os
 import sys
+import threading
+import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -1601,7 +1606,6 @@ def test_batch_keyword_with_type_override(app_and_db):
 
 # --- Working copy integration tests for serving endpoints ---
 
-import os
 
 
 def test_preview_uses_working_copy(app_and_db):
@@ -1828,6 +1832,146 @@ def test_preview_sized_caches_per_size(app_and_db):
     assert size_2560 > size_1920
 
 
+def test_concurrent_preview_cache_misses_decode_once(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """Equal interactive cache misses join one durable preview producer."""
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    source_dir = tmp_path / "preview-source"
+    source_dir.mkdir()
+    source_path = source_dir / "source.jpg"
+    Image.new("RGB", (2400, 1600), (40, 80, 120)).save(source_path, "JPEG")
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        "UPDATE photos SET filename='source.jpg', extension='.jpg', "
+        "working_copy_path=NULL WHERE id=?",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    cache_path = os.path.join(vireo_dir, "previews", f"{photo_id}_1920.jpg")
+    with contextlib.suppress(OSError):
+        os.unlink(cache_path)
+    db.preview_cache_delete(photo_id, 1920)
+
+    started = threading.Event()
+    release = threading.Event()
+    call_count = 0
+    count_lock = threading.Lock()
+
+    def blocking_load(path, max_size=None, **kwargs):
+        nonlocal call_count
+        with count_lock:
+            call_count += 1
+        started.set()
+        assert release.wait(5), "test did not release preview producer"
+        return Image.new("RGB", (1920, 1280), (60, 100, 140))
+
+    monkeypatch.setattr(image_loader, "load_image", blocking_load)
+
+    def request_preview():
+        with app.test_client() as client:
+            response = client.get(f"/photos/{photo_id}/preview?size=1920")
+            return response.status_code, response.data
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(request_preview)
+        assert started.wait(5), "preview producer did not start"
+        with app.test_client() as speculative_client:
+            speculative = speculative_client.get(
+                f"/photos/{photo_id}/preview?size=1920&prefetch=1",
+            )
+        assert speculative.status_code == 204
+        assert speculative.headers["Cache-Control"] == "no-store"
+        second = pool.submit(request_preview)
+        time.sleep(0.1)
+        assert call_count == 1
+        release.set()
+        first_result = first.result(timeout=5)
+        second_result = second.result(timeout=5)
+
+    assert first_result[0] == second_result[0] == 200
+    assert first_result[1] == second_result[1]
+    assert call_count == 1
+
+
+def test_failed_preview_flight_wakes_waiter_and_next_request_retries(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """A 500 is shared by current waiters but never poisons the cache key."""
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    source_dir = tmp_path / "failed-preview-source"
+    source_dir.mkdir()
+    (source_dir / "source.jpg").write_bytes(b"source")
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        "UPDATE photos SET filename='source.jpg', extension='.jpg', "
+        "working_copy_path=NULL WHERE id=?",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    cache_path = os.path.join(vireo_dir, "previews", f"{photo_id}_1920.jpg")
+    with contextlib.suppress(OSError):
+        os.unlink(cache_path)
+    db.preview_cache_delete(photo_id, 1920)
+
+    started = threading.Event()
+    release = threading.Event()
+    call_count = 0
+    count_lock = threading.Lock()
+
+    def fail_once(path, max_size=None, **kwargs):
+        nonlocal call_count
+        with count_lock:
+            call_count += 1
+            current = call_count
+        if current == 1:
+            started.set()
+            assert release.wait(5), "test did not release failed producer"
+            return None
+        return Image.new("RGB", (1920, 1280), (20, 40, 60))
+
+    monkeypatch.setattr(image_loader, "load_image", fail_once)
+
+    def request_status():
+        with app.test_client() as client:
+            return client.get(
+                f"/photos/{photo_id}/preview?size=1920"
+            ).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(request_status)
+        assert started.wait(5), "failed preview producer did not start"
+        second = pool.submit(request_status)
+        time.sleep(0.1)
+        release.set()
+        assert first.result(timeout=5) == 500
+        assert second.result(timeout=5) == 500
+
+    assert call_count == 1
+    assert request_status() == 200
+    assert call_count == 2
+
+
 def test_preview_returns_404_for_deleted_photo_even_with_stale_cache(app_and_db):
     """Defense against SQLite id reuse: don't serve a cached image for a row
     that no longer exists.
@@ -1967,6 +2111,149 @@ def test_unedited_raw_original_uses_camera_display_cache_not_working_copy(
         assert rendered.getpixel((0, 0))[0] > 200
     assert open(working_path, "rb").read() == working_bytes
     assert db.get_photo(photo_id)["working_copy_path"] == f"working/{photo_id}.jpg"
+
+
+def test_concurrent_original_cache_misses_extract_once(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """Equal RAW /original misses share one camera-rendered extraction."""
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    source_dir = tmp_path / "concurrent-original-source"
+    source_dir.mkdir()
+    source_path = source_dir / "source.NEF"
+    source_path.write_bytes(b"fake raw")
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='source.NEF', extension='.nef', width=800, height=600,
+               working_copy_path=NULL, companion_path=NULL
+           WHERE id=?""",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    display_path = os.path.join(
+        vireo_dir, "originals", f"{photo_id}.display.jpg",
+    )
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(display_path)
+
+    producer_started = threading.Event()
+    release_producer = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def blocking_extract(source, output, **kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        producer_started.set()
+        assert release_producer.wait(timeout=5)
+        Image.new("RGB", (800, 600), (180, 180, 180)).save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(image_loader, "extract_working_copy", blocking_extract)
+
+    def request_original():
+        with app.test_client() as client:
+            response = client.get(f"/photos/{photo_id}/original")
+            return response.status_code, response.data
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(request_original)
+        assert producer_started.wait(timeout=5)
+        second = executor.submit(request_original)
+        time.sleep(0.1)
+        assert calls == 1
+        release_producer.set()
+        first_result = first.result(timeout=5)
+        second_result = second.result(timeout=5)
+
+    assert first_result[0] == 200
+    assert second_result[0] == 200
+    assert first_result[1] == second_result[1]
+    assert calls == 1
+    assert os.path.getsize(display_path) > 0
+
+
+def test_failed_original_flight_releases_waiters_and_allows_retry(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """An /original producer exception must not poison its artifact key."""
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    source_dir = tmp_path / "failed-original-source"
+    source_dir.mkdir()
+    (source_dir / "source.NEF").write_bytes(b"fake raw")
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='source.NEF', extension='.nef', width=800, height=600,
+               working_copy_path=NULL, companion_path=NULL
+           WHERE id=?""",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    display_path = os.path.join(
+        vireo_dir, "originals", f"{photo_id}.display.jpg",
+    )
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(display_path)
+
+    producer_started = threading.Event()
+    release_producer = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def fail_once(source, output, **kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            current = calls
+        if current == 1:
+            producer_started.set()
+            assert release_producer.wait(timeout=5)
+            raise RuntimeError("simulated extraction crash")
+        Image.new("RGB", (800, 600), "orange").save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(image_loader, "extract_working_copy", fail_once)
+
+    def request_original():
+        with app.test_client() as client:
+            return client.get(f"/photos/{photo_id}/original").status_code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(request_original)
+        assert producer_started.wait(timeout=5)
+        second = executor.submit(request_original)
+        time.sleep(0.1)
+        release_producer.set()
+        assert first.result(timeout=5) == 500
+        assert second.result(timeout=5) == 500
+
+    assert calls == 1
+    assert request_original() == 200
+    assert calls == 2
+    assert os.path.getsize(display_path) > 0
 
 
 def test_unedited_raw_display_cache_survives_when_companion_is_newer_than_raw_row(
@@ -4199,6 +4486,225 @@ def test_full_is_alias_for_preview_at_configured_size(client_with_photo, monkeyp
     assert len(full) > 0
 
 
+def test_full_redirect_forwards_prefetch_flag_to_original(client_with_photo):
+    """When preview_max_size=0 the /full redirect must forward prefetch=1.
+
+    Speculative adjacent-image warmups hit /full?prefetch=1; if the redirect
+    to /original drops the flag, the warmup gets promoted to an interactive
+    request and consumes a full-decode slot while the current image is still
+    on screen — the exact contention this PR is designed to prevent.
+    """
+    app, db, photo_id = client_with_photo
+    db.update_workspace(
+        db._active_workspace_id,
+        config_overrides={"preview_max_size": 0},
+    )
+    client = app.test_client()
+
+    resp = client.get(f"/photos/{photo_id}/full?prefetch=1")
+    assert resp.status_code in (301, 302, 307, 308)
+    location = resp.headers["Location"]
+    assert location.endswith(f"/photos/{photo_id}/original?prefetch=1")
+
+    resp = client.get(f"/photos/{photo_id}/full?source=jpeg&prefetch=1")
+    assert resp.status_code in (301, 302, 307, 308)
+    location = resp.headers["Location"]
+    assert "source=jpeg" in location
+    assert "prefetch=1" in location
+
+    resp = client.get(f"/photos/{photo_id}/full")
+    assert resp.status_code in (301, 302, 307, 308)
+    assert "prefetch" not in resp.headers["Location"]
+
+
+def test_paired_preview_shares_decode_across_warmup_and_visible(
+    client_with_photo, monkeypatch,
+):
+    """A paired-source warmup and the follow-up visible request must share
+    one decode: the paired URLs differ (prefetch=1 vs nothing) so the browser
+    cannot coalesce them, so the server must — through the paired shadow
+    cache — otherwise both requests decode the same source concurrently.
+    """
+    import preview_materializer
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    folder = db.conn.execute(
+        "SELECT f.path FROM photos p JOIN folders f ON f.id=p.folder_id "
+        "WHERE p.id=?",
+        (photo_id,),
+    ).fetchone()
+    raw_path = os.path.join(folder["path"], "test.NEF")
+    with open(raw_path, "wb") as raw_file:
+        raw_file.write(b"raw bytes")
+    companion_path = os.path.join(folder["path"], "test.JPG")
+    Image.new("RGB", (800, 600), (200, 60, 40)).save(companion_path, "JPEG")
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='test.NEF', extension='.nef',
+               companion_path='test.JPG',
+               width=800, height=600
+           WHERE id=?""",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    render_calls = []
+    real_render = preview_materializer.render_preview_bytes
+
+    def counting_render(*args, **kwargs):
+        render_calls.append(kwargs.get("pair_source"))
+        return real_render(*args, **kwargs)
+
+    monkeypatch.setattr(
+        preview_materializer, "render_preview_bytes", counting_render,
+    )
+
+    client = app.test_client()
+
+    # Warmup URL (prefetch=1) publishes the shared paired bytes.
+    warmup = client.get(f"/photos/{photo_id}/preview?size=1920&source=jpeg&prefetch=1")
+    assert warmup.status_code == 200
+    assert len(render_calls) == 1
+
+    # The follow-up visible URL for the SAME paired variant has no prefetch
+    # marker, so the browser cannot coalesce it with the warmup. Without
+    # coordinated bytes on the server, this would kick off a second decode.
+    visible = client.get(f"/photos/{photo_id}/preview?size=1920&source=jpeg")
+    assert visible.status_code == 200
+    assert visible.data == warmup.data
+    assert len(render_calls) == 1, (
+        "second paired request re-decoded the same source; the paired "
+        "shadow cache should have satisfied it"
+    )
+
+    # The distinct RAW variant is a separate flight and must not be served
+    # from the JPEG paired shadow — pixel contamination is the exact
+    # contract bypass_cache exists to preserve.
+    raw_probe = client.get(f"/photos/{photo_id}/preview?size=1920&source=raw")
+    assert raw_probe.status_code in (200, 500)
+    if raw_probe.status_code == 200:
+        assert len(render_calls) == 2
+        assert render_calls[-1] == "raw"
+
+
+def test_paired_preview_cache_tracks_selected_source_state(
+    client_with_photo, monkeypatch,
+):
+    """Replacing a selected companion must not serve its old shadow render."""
+    import preview_materializer
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    folder = db.conn.execute(
+        "SELECT f.path FROM photos p JOIN folders f ON f.id=p.folder_id "
+        "WHERE p.id=?",
+        (photo_id,),
+    ).fetchone()["path"]
+    raw_path = os.path.join(folder, "state.NEF")
+    with open(raw_path, "wb") as raw_file:
+        raw_file.write(b"raw bytes")
+    companion_path = os.path.join(folder, "state.JPG")
+    Image.new("RGB", (800, 600), (200, 40, 40)).save(companion_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET filename='state.NEF', extension='.nef', "
+        "companion_path='state.JPG' WHERE id=?",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    render_count = 0
+    real_render = preview_materializer.render_preview_bytes
+
+    def counting_render(*args, **kwargs):
+        nonlocal render_count
+        render_count += 1
+        return real_render(*args, **kwargs)
+
+    monkeypatch.setattr(
+        preview_materializer, "render_preview_bytes", counting_render,
+    )
+    client = app.test_client()
+    url = f"/photos/{photo_id}/preview?size=1920&source=jpeg"
+    first = client.get(url)
+    assert first.status_code == 200
+
+    previous_mtime = os.stat(companion_path).st_mtime_ns
+    Image.new("RGB", (800, 600), (40, 40, 200)).save(companion_path, "JPEG")
+    os.utime(
+        companion_path,
+        ns=(previous_mtime + 1_000_000_000, previous_mtime + 1_000_000_000),
+    )
+    second = client.get(url)
+
+    assert second.status_code == 200
+    assert second.data != first.data
+    assert render_count == 2
+
+
+def test_paired_raw_original_shares_decode_across_warmup_and_visible(
+    client_with_photo, monkeypatch,
+):
+    """A selected RAW 1:1 warmup and visible request join one decode."""
+    import image_loader
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    folder = db.conn.execute(
+        "SELECT f.path FROM photos p JOIN folders f ON f.id=p.folder_id "
+        "WHERE p.id=?",
+        (photo_id,),
+    ).fetchone()["path"]
+    raw_path = os.path.join(folder, "original.NEF")
+    with open(raw_path, "wb") as raw_file:
+        raw_file.write(b"raw bytes")
+    companion_path = os.path.join(folder, "original.JPG")
+    Image.new("RGB", (800, 600), (50, 100, 150)).save(companion_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET filename='original.NEF', extension='.nef', "
+        "companion_path='original.JPG', width=800, height=600 WHERE id=?",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    started = threading.Event()
+    release = threading.Event()
+    call_count = 0
+    count_lock = threading.Lock()
+
+    def blocking_load(path, max_size=None, **kwargs):
+        nonlocal call_count
+        assert os.path.abspath(path) == os.path.abspath(raw_path)
+        with count_lock:
+            call_count += 1
+        started.set()
+        assert release.wait(5), "test did not release paired RAW producer"
+        return Image.new("RGB", (800, 600), (180, 70, 30))
+
+    monkeypatch.setattr(image_loader, "load_image", blocking_load)
+
+    def fetch(suffix):
+        with app.test_client() as client:
+            response = client.get(
+                f"/photos/{photo_id}/original?source=raw{suffix}",
+            )
+            return response.status_code, response.data
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        warmup = pool.submit(fetch, "&prefetch=1")
+        assert started.wait(5), "paired RAW producer did not start"
+        visible = pool.submit(fetch, "")
+        time.sleep(0.1)
+        assert call_count == 1
+        release.set()
+        warmup_result = warmup.result(timeout=5)
+        visible_result = visible.result(timeout=5)
+
+    assert warmup_result[0] == visible_result[0] == 200
+    assert warmup_result[1] == visible_result[1]
+    assert call_count == 1
+
+
 def test_preview_skips_recent_failed_raw_working_copy(
     client_with_photo, monkeypatch,
 ):
@@ -5837,6 +6343,84 @@ def test_preview_job_writes_sized_filename_and_tracks(client_with_photo):
 
     # Legacy naming NOT produced
     assert not os.path.exists(os.path.join(preview_dir, f"{photo_id}.jpg"))
+
+
+def test_interactive_preview_joins_background_warmer(
+    client_with_photo, monkeypatch,
+):
+    """A visible request and the warmer must perform one shared decode."""
+    import image_loader
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    client = app.test_client()
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    preview_path = os.path.join(
+        vireo_dir, "previews", f"{photo_id}_1920.jpg",
+    )
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(preview_path)
+    db.preview_cache_delete(photo_id, 1920)
+
+    producer_started = threading.Event()
+    release_producer = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def blocking_load_image(file_path, max_size=1024, **kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        producer_started.set()
+        assert release_producer.wait(timeout=5)
+        return Image.new("RGB", (800, 600), "purple")
+
+    monkeypatch.setattr(image_loader, "load_image", blocking_load_image)
+
+    response = client.post(
+        "/api/jobs/previews", json={"photo_ids": [photo_id]},
+    )
+    assert response.status_code == 200
+    job_id = response.get_json()["job_id"]
+    assert producer_started.wait(timeout=5)
+
+    def request_visible_preview():
+        with app.test_client() as request_client:
+            visible = request_client.get(
+                f"/photos/{photo_id}/preview?size=1920",
+            )
+            return visible.status_code, visible.data
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        visible_future = executor.submit(request_visible_preview)
+        time.sleep(0.1)
+        assert calls == 1
+        release_producer.set()
+        visible_status, visible_data = visible_future.result(timeout=5)
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        job_data = client.get(f"/api/jobs/{job_id}").get_json()
+        if job_data.get("status") in ("completed", "failed"):
+            break
+        time.sleep(0.05)
+
+    assert job_data["status"] == "completed"
+    assert visible_status == 200
+    assert len(visible_data) > 100
+    assert calls == 1
+
+
+def test_preview_job_rejects_invalid_photo_id_scope(client_with_photo):
+    app, _, _ = client_with_photo
+    client = app.test_client()
+
+    response = client.post(
+        "/api/jobs/previews", json={"photo_ids": [True, "2", -1]},
+    )
+
+    assert response.status_code == 400
+    assert "positive integers" in response.get_json()["error"]
 
 
 def test_preview_job_applies_edit_recipe_to_warmed_file(

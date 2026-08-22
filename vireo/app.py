@@ -40,6 +40,13 @@ import path_guard
 import places
 import remote_setup
 import source_discovery
+from artifact_flight import (
+    ArtifactProducerFailed,
+    atomic_write_bytes,
+    original_artifact_flights,
+    preview_artifact_flights,
+    preview_prefetch_slots,
+)
 from db import (
     _LIFE_LIST_ANCESTOR_SUPPRESSION_CLAUSE,
     KEYWORD_TYPES,
@@ -70,6 +77,10 @@ from preview_cache import (
 from preview_cache import (
     reconcile_preview_cache,
 )
+from preview_materializer import (
+    PreviewMaterializationError,
+    materialize_preview,
+)
 from proc import no_window_kwargs
 from render_source import (
     companion_image_can_replace_raw_result as _companion_image_can_replace_raw_result,
@@ -95,9 +106,6 @@ from render_source import (
 )
 from render_source import (
     scaled_recipe_source_dimensions as _scaled_recipe_source_dimensions,
-)
-from render_source import (
-    working_copy_path_if_satisfies as _working_copy_path_if_satisfies,
 )
 from schema import ensure_schema
 from services.local_folder import (
@@ -146,6 +154,138 @@ _CARD_CLEANUP_JOB_LOCK = threading.Lock()
 # hard ceiling as a final safety net for very large libraries; the Map UI
 # clearly reports truncation and lets users narrow the shared filters.
 MAP_RENDER_PHOTO_LIMIT = 10_000
+
+
+class _ArtifactResponseError(RuntimeError):
+    """Carry a producer's non-success Flask response to equal-key waiters."""
+
+    def __init__(self, response):
+        super().__init__(f"artifact producer returned HTTP {response.status_code}")
+        self.status_code = response.status_code
+        self.data = response.get_data()
+        self.mimetype = response.mimetype
+
+    def to_response(self):
+        return Response(
+            self.data, status=self.status_code, mimetype=self.mimetype,
+        )
+
+
+def _shed_prefetch_response():
+    """Return a non-cacheable empty response for declined speculative work."""
+    response = Response(status=204)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+# Paired-source preview renders (`?source=jpeg|raw`) intentionally sit outside
+# the durable (photo_id, size) preview cache so RAW and JPEG pixels can never
+# contaminate one another.  For coordination alone we do publish them to a
+# dedicated subdirectory so an equal-key follower can serve the producer's
+# already-decoded bytes instead of racing another concurrent decode against
+# the same source.  These files are kept short-lived and swept on write.
+_PAIRED_PREVIEW_DIRNAME = "paired"
+_PAIRED_PREVIEW_TTL_SEC = 15 * 60
+
+
+def _paired_preview_dir(preview_dir):
+    return os.path.join(preview_dir, _PAIRED_PREVIEW_DIRNAME)
+
+
+def _paired_render_state_hash(
+    photo, size, pair_source, pair_source_path, recipe,
+):
+    """Signature hash for a paired-source render's shadow cache filename.
+
+    Includes the paired source file's mtime/size, the recipe (whose effect
+    depends on the RAW render), the edit-math version, and the request size
+    so a swapped source file or an updated recipe yields a distinct
+    filename. Recipe invalidation does not remove these shadow files and
+    their TTL sweep only fires on the next publish, so keying by state is
+    what prevents the shadow cache from returning bytes rendered from a
+    prior state.
+    """
+    from image_edits import EDIT_MATH_VERSION, recipe_to_json
+
+    source_state = None
+    if pair_source_path:
+        try:
+            stat = os.stat(pair_source_path)
+        except OSError:
+            source_state = None
+        else:
+            source_state = {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+    signature = json.dumps(
+        {
+            "photo_id": int(photo["id"]),
+            "size": size,
+            "pair_source": pair_source,
+            "source_state": source_state,
+            "recipe": recipe_to_json(recipe) if recipe else None,
+            "edit_math_version": EDIT_MATH_VERSION,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(signature).hexdigest()[:16]
+
+
+def _paired_preview_path(
+    preview_dir, photo_id, size, pair_source, state_hash,
+):
+    return os.path.join(
+        _paired_preview_dir(preview_dir),
+        f"{photo_id}_{size}_{pair_source}_{state_hash}.jpg",
+    )
+
+
+def _paired_original_dir(vireo_dir):
+    return os.path.join(vireo_dir, "originals", _PAIRED_PREVIEW_DIRNAME)
+
+
+def _paired_original_path(vireo_dir, photo_id, pair_source, state_hash):
+    return os.path.join(
+        _paired_original_dir(vireo_dir),
+        f"{photo_id}_{pair_source}_{state_hash}.jpg",
+    )
+
+
+def _fresh_paired_artifact(path):
+    """Return whether a non-empty paired artifact is still inside its TTL."""
+    try:
+        return (
+            os.path.getsize(path) > 0
+            and os.path.getmtime(path) >= time.time() - _PAIRED_PREVIEW_TTL_SEC
+        )
+    except OSError:
+        return False
+
+
+def _sweep_stale_paired_previews(paired_dir):
+    """Best-effort removal of paired-preview cache files older than the TTL.
+
+    Paired renders are only kept around long enough for a browser warmup
+    and the follow-up visible request to share one decode; anything older
+    is dead weight, so we sweep before publishing a new file rather than
+    growing an unbounded shadow cache.
+    """
+    if not os.path.isdir(paired_dir):
+        return
+    cutoff = time.time() - _PAIRED_PREVIEW_TTL_SEC
+    try:
+        entries = os.listdir(paired_dir)
+    except OSError:
+        return
+    for name in entries:
+        path = os.path.join(paired_dir, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            continue
 
 
 # Stable ordering and labels for the palette + nav rendering.
@@ -26232,6 +26372,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     def api_job_previews():
         body = request.get_json(silent=True) or {}
         collection_id = body.get("collection_id")
+        requested_photo_ids = body.get("photo_ids")
+        if requested_photo_ids is not None:
+            if (
+                not isinstance(requested_photo_ids, list)
+                or any(
+                    isinstance(photo_id, bool)
+                    or not isinstance(photo_id, int)
+                    or photo_id <= 0
+                    for photo_id in requested_photo_ids
+                )
+            ):
+                return json_error("photo_ids must be a list of positive integers")
+            requested_photo_ids = list(dict.fromkeys(requested_photo_ids))
+        if collection_id is not None and requested_photo_ids is not None:
+            return json_error("collection_id and photo_ids cannot be combined")
         db = _get_db()
         err = _reject_visual_collection(db, collection_id)
         if err is not None:
@@ -26243,8 +26398,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             import contextlib
 
             import config as cfg
-            from image_edits import apply_recipe_to_loaded_image
-            from image_loader import RAW_DECODE_PRESERVE_HIGHLIGHTS, load_image
 
             thread_db = Database(db_path)
             thread_db.set_active_workspace(active_ws)
@@ -26268,7 +26421,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             preview_dir = os.path.join(vireo_dir, "previews")
             os.makedirs(preview_dir, exist_ok=True)
 
-            if collection_id:
+            if requested_photo_ids is not None:
+                photos = []
+                for photo_id in requested_photo_ids:
+                    scoped_photo = thread_db.get_photo(
+                        photo_id, verify_workspace=True,
+                    )
+                    if scoped_photo is not None:
+                        photos.append(scoped_photo)
+            elif collection_id:
                 photos = thread_db.get_collection_photos(collection_id, per_page=999999)
             else:
                 photos = thread_db.get_photos(per_page=999999)
@@ -26313,183 +26474,29 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         continue
 
                 if not os.path.exists(cache_path):
-                    from image_loader import RAW_EXTENSIONS
                     folder_path = folders.get(detail_photo["folder_id"])
-                    raw_source_path = None
-                    if (
-                        not recipe
-                        and folder_path
-                        and os.path.splitext(detail_photo["filename"])[1].lower()
-                        in RAW_EXTENSIONS
-                    ):
-                        # Mirror /photos/<id>/preview: an unedited RAW must
-                        # warm from the camera-rendered source, not the
-                        # highlight-preserving working copy. Otherwise the
-                        # precompute job writes flatter/darker bytes into the
-                        # tracked preview cache and _serve_preview returns
-                        # those cache hits before its own RAW-source branch
-                        # ever runs, so the migration's one-time purge is
-                        # undone on the first warmup.
-                        candidate = os.path.join(
-                            folder_path, detail_photo["filename"],
-                        )
-                        if os.path.exists(candidate) and not _has_current_working_copy_failure(
+                    try:
+                        materialized = materialize_preview(
+                            thread_db,
                             detail_photo,
-                            vireo_dir,
-                            trust_existing_working_copy=False,
-                            live_source_path=candidate,
-                            folder_path=folder_path,
-                        ):
-                            raw_source_path = candidate
-                    if raw_source_path:
-                        canonical = raw_source_path
-                        using_working_copy = False
-                    else:
-                        canonical, using_working_copy = _recipe_render_source(
-                            detail_photo, recipe, max_size, vireo_dir, folders,
+                            folder_path,
+                            size=max_size,
+                            vireo_dir=vireo_dir,
+                            preview_quality=preview_quality,
+                            recipe=recipe,
+                            cache_path=cache_path,
                         )
-                    if (
-                        not using_working_copy
-                        and os.path.splitext(canonical)[1].lower() in RAW_EXTENSIONS
-                        and _has_current_working_copy_failure(
-                            detail_photo,
-                            vireo_dir,
-                            trust_existing_working_copy=False,
-                            live_source_path=canonical,
-                            folder_path=folders.get(detail_photo["folder_id"]),
-                        )
-                    ):
+                    except (ArtifactProducerFailed, PreviewMaterializationError) as exc:
                         skipped += 1
                         log.info(
-                            "Skipping preview warmup for photo %s; RAW "
-                            "working-copy extraction already failed for "
-                            "current source mtime",
-                            photo["id"],
+                            "Skipping preview warmup for photo %s: %s",
+                            photo["id"], exc,
                         )
-                        continue
-                    load_max_size = (
-                        None if recipe and recipe.get("crop") else max_size
-                    )
-                    # Match serve_preview's decode mode so warmed bytes equal
-                    # the on-demand render — without this, an edited RAW
-                    # preview written here would still come from the JPEG-first
-                    # path and overwrite serve_preview's highlight-preserving
-                    # cache on first warm.
-                    raw_decode = (
-                        RAW_DECODE_PRESERVE_HIGHLIGHTS
-                        if recipe
-                        and os.path.splitext(canonical)[1].lower() in RAW_EXTENSIONS
-                        else None
-                    )
-                    load_kwargs = (
-                        {"raw_decode": raw_decode} if raw_decode else {}
-                    )
-                    img = load_image(canonical, max_size=load_max_size, **load_kwargs)
-                    if (
-                        img is not None
-                        and os.path.splitext(canonical)[1].lower() in RAW_EXTENSIONS
-                        and detail_photo["width"]
-                        and detail_photo["height"]
-                    ):
-                        # _load_raw falls back to an embedded JPEG when
-                        # libraw can't demosaic; that preview is often a
-                        # fraction of sensor resolution, so a non-None load
-                        # can still be undersized. Mirror serve_preview's
-                        # cache-miss undersized check so we don't bake an
-                        # embedded preview into the tracked warmed cache.
-                        expected_w, expected_h = _scaled_recipe_source_dimensions(
-                            detail_photo, load_max_size,
-                        )
-                        if _image_is_smaller_than_expected(
-                            img, expected_w, expected_h,
-                        ):
-                            companion_rel = detail_photo["companion_path"]
-                            folder_path = folders.get(
-                                detail_photo["folder_id"]
-                            )
-                            if companion_rel and folder_path:
-                                companion_abs = os.path.join(
-                                    folder_path, companion_rel,
-                                )
-                                if (
-                                    os.path.exists(companion_abs)
-                                    and companion_abs != canonical
-                                ):
-                                    companion_img = load_image(
-                                        companion_abs,
-                                        max_size=load_max_size,
-                                    )
-                                    if _companion_image_can_replace_raw_result(
-                                        companion_img, img,
-                                        expected_w, expected_h,
-                                    ):
-                                        log.info(
-                                            "RAW decode for photo %s preview "
-                                            "warmup at size=%s returned "
-                                            "undersized embedded preview "
-                                            "(%dx%d, expected %dx%d); "
-                                            "falling back to companion JPEG",
-                                            detail_photo["id"], max_size,
-                                            img.size[0], img.size[1],
-                                            expected_w, expected_h,
-                                        )
-                                        img.close()
-                                        img = companion_img
-                                        canonical = companion_abs
-                                    elif companion_img is not None:
-                                        companion_img.close()
-                    if (
-                        img is None
-                        and os.path.splitext(canonical)[1].lower() in RAW_EXTENSIONS
-                    ):
-                        # Mirror serve_preview's cache-miss fallback: libraw
-                        # couldn't decode this RAW (unsupported variant, etc.),
-                        # so try the companion JPEG before leaving the cache
-                        # cold. Record the source failure so future
-                        # _recipe_render_source calls (preview, edit-preview,
-                        # original) select the companion directly instead of
-                        # retrying the failed RAW.
-                        companion_rel = detail_photo["companion_path"]
-                        folder_path = folders.get(detail_photo["folder_id"])
-                        if companion_rel and folder_path:
-                            companion_abs = os.path.join(folder_path, companion_rel)
-                            if (
-                                os.path.exists(companion_abs)
-                                and companion_abs != canonical
-                            ):
-                                log.info(
-                                    "RAW decode failed for photo %s preview "
-                                    "warmup at size=%s; falling back to "
-                                    "companion JPEG",
-                                    detail_photo["id"], max_size,
-                                )
-                                _record_working_copy_failure(
-                                    thread_db, detail_photo, canonical,
-                                )
-                                img = load_image(
-                                    companion_abs, max_size=load_max_size,
-                                )
-                                if img is not None:
-                                    canonical = companion_abs
-                    if img:
-                        if recipe:
-                            import local_masks
-                            img = apply_recipe_to_loaded_image(
-                                img, recipe, max_size=max_size,
-                                native_size=_recipe_source_dimensions(
-                                    detail_photo
-                                ),
-                                local_mask=local_masks.load_snapshot(
-                                    vireo_dir,
-                                    photo["id"], recipe,
-                                ),
-                            )
-                        img.save(cache_path, format="JPEG", quality=preview_quality)
-                        with contextlib.suppress(Exception):
-                            thread_db.preview_cache_insert(
-                                photo["id"], max_size, os.path.getsize(cache_path),
-                            )
-                        generated += 1
+                    else:
+                        if materialized.generated:
+                            generated += 1
+                        else:
+                            skipped += 1
 
                 runner.push_event(
                     job["id"],
@@ -26511,8 +26518,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             return {"generated": generated, "skipped": skipped, "total": total}
 
-        job_id = runner.start("previews", work, config={"collection_id": collection_id},
-                               workspace_id=active_ws)
+        job_id = runner.start(
+            "previews",
+            work,
+            config={
+                "collection_id": collection_id,
+                "photo_ids": requested_photo_ids,
+            },
+            workspace_id=active_ws,
+        )
         return jsonify({"job_id": job_id})
 
     @app.route("/api/jobs/ingest", methods=["POST"])
@@ -36689,14 +36703,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return fixed | {int(pm)}
 
 
-    def _serve_preview(photo_id, size):
+    def _serve_preview(photo_id, size, *, _artifact_flight_guarded=False):
         """Serve a preview at the given size, using the preview_cache LRU.
 
         This is the single code path behind both /photos/<id>/preview and
         /photos/<id>/full. Callers have already validated size.
         """
-        import io
-
         import config as cfg
         from flask import send_file
 
@@ -36733,6 +36745,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # never contaminate one another. Browser caching still makes repeated
         # viewing cheap; the ordinary unpaired path keeps the disk LRU.
         bypass_cache = pair_source is not None
+        # Paired renders coordinate through a distinct source-aware artifact
+        # so a browser warmup (prefetch=1) and the visible request that
+        # follows can share one decode instead of racing two — the paired
+        # URLs necessarily differ (prefetch vs no prefetch) so the browser
+        # cannot coalesce them and the server must.
+        # Key the paired shadow cache by render/source state so a changed
+        # edit recipe or a swapped paired source produces a distinct
+        # filename. Otherwise repeatedly accessed entries would keep
+        # returning bytes rendered from the previous state indefinitely —
+        # regular preview-cache invalidation does not remove these shadow
+        # files, and the TTL sweep only fires when a new render publishes.
+        paired_cache_path = (
+            _paired_preview_path(
+                preview_dir,
+                photo_id,
+                size,
+                pair_source,
+                _paired_render_state_hash(
+                    photo, size, pair_source, pair_source_path, render_recipe,
+                ),
+            )
+            if bypass_cache
+            else None
+        )
 
         # Reject corrupt zero-byte cache files (prior write interrupted).
         # Treat them as a miss so the regeneration path below produces a
@@ -36829,215 +36865,109 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 pass
             return Response(data, mimetype="image/jpeg")
 
-        # Cache miss: generate, insert, evict-if-over-quota, serve.
-        from image_loader import (
-            RAW_DECODE_PRESERVE_HIGHLIGHTS,
-            RAW_EXTENSIONS,
-            load_image,
-        )
+        # Paired-render cache hit: an earlier equal-key producer already
+        # decoded and atomically published these bytes to the paired shadow
+        # cache, so waiters skip repeating that work.
+        if (
+            paired_cache_path
+            and _fresh_paired_artifact(paired_cache_path)
+        ):
+            return send_file(paired_cache_path, mimetype="image/jpeg")
 
-        folders = {folder_row["id"]: folder_row["path"]}
+        # Cache miss: coordinate every durable preview producer in this
+        # process before decoding.  The recursive producer re-runs all cache
+        # and invalidation checks under the flight; equal-key waiters then
+        # re-enter once more and serve the atomically published JPEG through
+        # their own Flask request context.  Paired renders are coordinated
+        # too, keyed by the source-aware paired path so RAW and JPEG variants
+        # of the same photo never share a flight — the shared artifact for
+        # waiters lives at that paired path rather than the durable cache.
+        if not _artifact_flight_guarded:
+            artifact_key = os.path.abspath(
+                paired_cache_path if bypass_cache else cache_path,
+            )
+            speculative = request.args.get("prefetch") == "1"
+            speculative_slot = False
+            if speculative:
+                speculative_slot = preview_prefetch_slots.acquire(blocking=False)
+                if not speculative_slot:
+                    return _shed_prefetch_response()
 
-        if pair_source_path:
-            canonical = pair_source_path
-            using_working_copy = False
-        elif (
-            not render_recipe
-            and os.path.splitext(photo["filename"])[1].lower()
-            in RAW_EXTENSIONS
-        ):
-            # An unedited RAW must use the camera-rendered decode for every
-            # lightbox tier.  Its working copy is an edit-quality,
-            # highlight-preserving render that intentionally looks
-            # flatter/darker; treating it as canonical makes the photo appear
-            # to gain a dark overlay when the lightbox swaps from /full to a
-            # sharper preview tier.  Keep the working copy as the offline
-            # fallback when the source itself is unavailable, and defer to it
-            # when the current RAW mtime is already marked as a source-side
-            # extraction failure: the RAW failure gate below returns 500
-            # before the companion/working-copy fallbacks further down can
-            # run, so forcing the RAW here would drop the preview for
-            # RAW+JPEG pairs whose companion or working copy could still
-            # satisfy the request.
-            source_path = os.path.join(
-                folder_row["path"], photo["filename"],
-            )
-            if os.path.exists(source_path) and not _has_current_working_copy_failure(
-                photo,
-                vireo_dir,
-                trust_existing_working_copy=False,
-                live_source_path=source_path,
-                folder_path=folder_row["path"],
-            ):
-                canonical = source_path
-                using_working_copy = False
-            else:
-                canonical, using_working_copy = _recipe_render_source(
-                    photo, render_recipe, size, vireo_dir, folders,
-                )
-        else:
-            canonical, using_working_copy = _recipe_render_source(
-                photo, render_recipe, size, vireo_dir, folders,
-            )
-        selected_ext = os.path.splitext(canonical)[1].lower()
-        if (
-            not using_working_copy
-            and selected_ext in RAW_EXTENSIONS
-            and _has_current_working_copy_failure(
-                photo,
-                vireo_dir,
-                trust_existing_working_copy=False,
-                live_source_path=canonical,
-                folder_path=folder_row["path"],
-            )
-        ):
-            log.info(
-                "Skipping cropped preview generation for photo %s; RAW "
-                "working-copy extraction already failed for current source mtime",
-                photo_id,
-            )
-            return "Could not load image", 500
-        load_max_size = (
-            None
-            if render_recipe and render_recipe.get("crop")
-            else size
-        )
-        raw_decode = (
-            RAW_DECODE_PRESERVE_HIGHLIGHTS
-            if (
-                selected_ext in RAW_EXTENSIONS
-                and (render_recipe or pair_source == "raw")
-            )
-            else None
-        )
-        load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
-        img = load_image(canonical, max_size=load_max_size, **load_kwargs)
-        if (
-            img is not None
-            and selected_ext in RAW_EXTENSIONS
-            and photo["width"]
-            and photo["height"]
-            and pair_source != "raw"
-        ):
-            # _load_raw falls back to the embedded camera JPEG when libraw
-            # can't demosaic the sensor data, even in preserve-highlights
-            # mode. That preview is often a fraction of the sensor's full
-            # resolution, so a "successful" load can still be undersized
-            # relative to what the request asked for. If a full-size
-            # companion JPEG could satisfy the requested size, prefer it
-            # over caching a downscaled embedded preview that future hits
-            # would silently keep serving.
-            expected_w, expected_h = _scaled_recipe_source_dimensions(
-                photo, load_max_size,
-            )
-            if _image_is_smaller_than_expected(img, expected_w, expected_h):
-                companion_rel = photo["companion_path"]
-                if companion_rel:
-                    companion_abs = os.path.join(folder_row["path"], companion_rel)
-                    if (
-                        os.path.exists(companion_abs)
-                        and companion_abs != canonical
-                    ):
-                        companion_img = load_image(
-                            companion_abs, max_size=load_max_size,
-                        )
-                        if _companion_image_can_replace_raw_result(
-                            companion_img, img, expected_w, expected_h,
-                        ):
-                            log.info(
-                                "RAW decode for photo %s preview at size=%s "
-                                "returned undersized embedded preview (%dx%d, "
-                                "expected %dx%d); falling back to "
-                                "companion JPEG",
-                                photo_id, size, img.size[0], img.size[1],
-                                expected_w, expected_h,
-                            )
-                            img.close()
-                            img = companion_img
-                            canonical = companion_abs
-                        elif companion_img is not None:
-                            companion_img.close()
-        if (
-            img is None
-            and selected_ext in RAW_EXTENSIONS
-            and pair_source != "raw"
-        ):
-            # libraw couldn't decode this RAW (unsupported variant, corrupt
-            # file, no usable embedded JPEG). Try the companion JPEG before
-            # 500ing so a sidecar that can satisfy the preview isn't refused
-            # — mirrors the fallback in serve_original_photo's edited path.
-            companion_rel = photo["companion_path"]
-            if companion_rel:
-                companion_abs = os.path.join(folder_row["path"], companion_rel)
-                if (
-                    os.path.exists(companion_abs)
-                    and companion_abs != canonical
-                ):
-                    log.info(
-                        "RAW decode failed for photo %s preview at size=%s; "
-                        "falling back to companion JPEG",
-                        photo_id, size,
+            def coordinated_request(*, guarded):
+                response = make_response(
+                    _serve_preview(
+                        photo_id, size, _artifact_flight_guarded=guarded,
                     )
-                    _record_working_copy_failure(db, photo, canonical)
-                    img = load_image(companion_abs, max_size=load_max_size)
-                    if img is not None:
-                        canonical = companion_abs
-            if img is None:
-                wc_path = _working_copy_path_if_satisfies(
-                    photo, render_recipe, size, vireo_dir, rel_slack=0.01,
                 )
-                if wc_path and os.path.abspath(wc_path) != os.path.abspath(canonical):
-                    log.info(
-                        "RAW decode failed for photo %s preview at size=%s; "
-                        "falling back to JPEG working copy",
-                        photo_id, size,
-                    )
-                    _record_working_copy_failure(db, photo, canonical)
-                    img = load_image(wc_path, max_size=load_max_size)
-                    if img is not None:
-                        canonical = wc_path
-        if img is None:
-            _record_working_copy_failure(db, photo, canonical)
-            return "Could not load image", 500
-        if render_recipe:
-            import local_masks
-            from image_edits import apply_recipe_to_loaded_image
-            img = apply_recipe_to_loaded_image(
-                img, render_recipe, max_size=size,
-                native_size=_recipe_source_dimensions(photo),
-                local_mask=local_masks.load_snapshot(
-                    vireo_dir, photo_id, render_recipe,
-                ),
-            )
+                if response.status_code >= 400:
+                    raise _ArtifactResponseError(response)
+                return response
+
+            try:
+                result = preview_artifact_flights.run(
+                    artifact_key,
+                    lambda: coordinated_request(guarded=True),
+                    lambda: coordinated_request(guarded=False),
+                    join=not speculative,
+                )
+                if result.skipped:
+                    return _shed_prefetch_response()
+                return result.value
+            except _ArtifactResponseError as exc:
+                return exc.to_response()
+            except ArtifactProducerFailed as exc:
+                if isinstance(exc.__cause__, _ArtifactResponseError):
+                    return exc.__cause__.to_response()
+                if isinstance(exc.__cause__, PreviewMaterializationError):
+                    return "Could not load image", 500
+                raise
+            finally:
+                if speculative_slot:
+                    preview_prefetch_slots.release()
 
         preview_quality = cfg.load().get("preview_quality", 90)
+        try:
+            rendered = materialize_preview(
+                db,
+                photo,
+                folder_row["path"],
+                size=size,
+                vireo_dir=vireo_dir,
+                preview_quality=preview_quality,
+                recipe=render_recipe,
+                cache_path=None if bypass_cache else cache_path,
+                pair_source=pair_source,
+                pair_source_path=pair_source_path,
+                coordinate=False,
+                publish_best_effort=True,
+            )
+        except PreviewMaterializationError:
+            return "Could not load image", 500
 
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=preview_quality)
-        data = buf.getvalue()
-
-        # Persist to disk and track in the LRU. Eviction may delete the file
-        # we just wrote (e.g. when preview_cache_max_mb is 0), but that's fine:
-        # we serve the bytes from memory below so disk state doesn't matter.
-        # Catch broadly: OSError for disk failures, sqlite3 errors for DB
-        # lock / FK violations (photo deleted between lookup and insert).
-        # The preview bytes are ready in memory — never fail the request
-        # over bookkeeping.
-        if not bypass_cache:
+        if not bypass_cache and rendered.published:
+            _invalid_preview_cache_paths.discard(cache_path)
+            _clear_preview_cache_invalid(db, photo_id, size)
             try:
-                os.makedirs(preview_dir, exist_ok=True)
-                with open(cache_path, "wb") as f:
-                    f.write(data)
-                _invalid_preview_cache_paths.discard(cache_path)
-                _clear_preview_cache_invalid(db, photo_id, size)
-                db.preview_cache_insert(photo_id, size, len(data))
                 evict_preview_cache_if_over_quota(db, vireo_dir)
-            except Exception as e:
+            except Exception:
+                pass
+        # Publish the paired-render bytes so an equal-key follower still
+        # inside preview_artifact_flights.run() finds a ready artifact when
+        # it re-enters _serve_preview instead of decoding the same source.
+        # Best-effort: a full or read-only disk must never turn a successful
+        # producer render into a 500.
+        if bypass_cache and paired_cache_path and rendered.data is not None:
+            try:
+                _sweep_stale_paired_previews(_paired_preview_dir(preview_dir))
+                atomic_write_bytes(rendered.data, paired_cache_path)
+            except Exception:
                 log.warning(
-                    "Failed to persist preview cache %s: %s", cache_path, e,
+                    "Failed to publish paired preview cache %s",
+                    paired_cache_path, exc_info=True,
                 )
-
-        return Response(data, mimetype="image/jpeg")
+        if rendered.data is not None:
+            return Response(rendered.data, mimetype="image/jpeg")
+        return send_file(cache_path, mimetype="image/jpeg")
 
     @app.route("/photos/<int:photo_id>/full")
     def serve_full_photo(photo_id):
@@ -37055,8 +36985,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         effective = _get_db().get_effective_config(cfg.load())
         pm = effective.get("preview_max_size")
         if pm == 0:
+            params = []
             source = (request.args.get("source") or "").strip().lower()
-            suffix = f"?source={source}" if source in {"jpeg", "raw"} else ""
+            if source in {"jpeg", "raw"}:
+                params.append(f"source={source}")
+            # Forward prefetch so speculative warmups keep their nonblocking
+            # slot on the /original path — otherwise the redirect launders
+            # them into interactive requests and starts an expensive decode
+            # while the current image is still on screen.
+            if request.args.get("prefetch") == "1":
+                params.append("prefetch=1")
+            suffix = f"?{'&'.join(params)}" if params else ""
             return redirect(f"/photos/{photo_id}/original{suffix}")
         return _serve_preview(photo_id, int(pm or 1920))
 
@@ -37450,7 +37389,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return Response(buf.getvalue(), mimetype="image/jpeg")
 
     @app.route("/photos/<int:photo_id>/original")
-    def serve_original_photo(photo_id):
+    def serve_original_photo(photo_id, *, _artifact_flight_guarded=False):
         """Serve full-resolution image for 1:1 zoom."""
         import config as cfg
         from flask import send_file
@@ -37482,48 +37421,131 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if pair_source and not pair_source_path:
             return "Not found", 404
         if pair_source_path:
-            # Explicit pair views bypass the canonical prepared-render cache,
-            # whose key has no RAW/JPEG source dimension.
+            # Explicit pair views bypass the canonical prepared-render cache.
             # The companion is already the photographer's developed result.
             # Its geometry can differ from the RAW, so never apply the RAW's
             # recipe or local mask in that coordinate space.
             if pair_source == "jpeg":
                 return send_file(pair_source_path)
 
-            import io
-
-            from image_loader import (
-                RAW_DECODE_PRESERVE_HIGHLIGHTS,
-                load_image,
+            # Paired RAW originals coordinate through a source-aware shadow
+            # cache: a speculative /original?source=raw&prefetch=1 warmup and
+            # the follow-up visible /original?source=raw request use distinct
+            # URLs (prefetch vs no prefetch) so the browser cannot coalesce
+            # them, and the RAW decode is expensive enough that racing two
+            # concurrent producers doubles disk and CPU cost. Key the shadow
+            # by render/source state so a swapped RAW file or an updated
+            # recipe never serves stale bytes.
+            paired_original_state = _paired_render_state_hash(
+                photo, 0, pair_source, pair_source_path, recipe,
             )
-
-            load_kwargs = (
-                {"raw_decode": RAW_DECODE_PRESERVE_HIGHLIGHTS}
-                if pair_source == "raw" else {}
+            paired_original_cache = _paired_original_path(
+                vireo_dir, photo_id, pair_source, paired_original_state,
             )
-            img = load_image(pair_source_path, max_size=None, **load_kwargs)
-            if img is None:
-                return "Could not load image", 500
-            if recipe:
-                import local_masks
-                from image_edits import apply_recipe_to_loaded_image
+            if _fresh_paired_artifact(paired_original_cache):
+                return send_file(paired_original_cache, mimetype="image/jpeg")
 
-                img = apply_recipe_to_loaded_image(
-                    img,
-                    recipe,
-                    native_size=_recipe_source_dimensions(photo),
-                    local_mask=local_masks.load_snapshot(
-                        vireo_dir, photo_id, recipe,
-                    ),
+            def _render_paired_original():
+                import io
+
+                from image_loader import (
+                    RAW_DECODE_PRESERVE_HIGHLIGHTS,
+                    load_image,
                 )
-            buf = io.BytesIO()
-            img.save(
-                buf,
-                format="JPEG",
-                quality=cfg.load().get("working_copy_quality", 92),
-            )
-            img.close()
-            return Response(buf.getvalue(), mimetype="image/jpeg")
+                load_kwargs = (
+                    {"raw_decode": RAW_DECODE_PRESERVE_HIGHLIGHTS}
+                    if pair_source == "raw" else {}
+                )
+                img = load_image(
+                    pair_source_path, max_size=None, **load_kwargs
+                )
+                if img is None:
+                    raise _ArtifactResponseError(
+                        make_response(("Could not load image", 500)),
+                    )
+                if recipe:
+                    import local_masks
+                    from image_edits import apply_recipe_to_loaded_image
+
+                    img = apply_recipe_to_loaded_image(
+                        img,
+                        recipe,
+                        native_size=_recipe_source_dimensions(photo),
+                        local_mask=local_masks.load_snapshot(
+                            vireo_dir, photo_id, recipe,
+                        ),
+                    )
+                buf = io.BytesIO()
+                img.save(
+                    buf,
+                    format="JPEG",
+                    quality=cfg.load().get("working_copy_quality", 92),
+                )
+                img.close()
+                data = buf.getvalue()
+                # Publish the rendered bytes to the shadow cache so an
+                # equal-key follower serves them from disk instead of
+                # decoding the same source. Best-effort: a full or read-only
+                # disk must never turn a successful producer into a 500.
+                try:
+                    _sweep_stale_paired_previews(
+                        _paired_original_dir(vireo_dir),
+                    )
+                    atomic_write_bytes(data, paired_original_cache)
+                except Exception:
+                    log.warning(
+                        "Failed to publish paired original cache %s",
+                        paired_original_cache, exc_info=True,
+                    )
+                return make_response(
+                    Response(data, mimetype="image/jpeg"),
+                )
+
+            if _artifact_flight_guarded:
+                return _render_paired_original()
+
+            artifact_key = os.path.abspath(paired_original_cache)
+            speculative = request.args.get("prefetch") == "1"
+            speculative_slot = False
+            if speculative:
+                speculative_slot = preview_prefetch_slots.acquire(
+                    blocking=False,
+                )
+                if not speculative_slot:
+                    return _shed_prefetch_response()
+
+            def _paired_consumer():
+                # Producer already published the shadow-cache file, so a
+                # re-entering waiter hits the cache-hit check above and
+                # serves it via send_file — no second decode.
+                response = make_response(
+                    serve_original_photo(
+                        photo_id, _artifact_flight_guarded=True,
+                    )
+                )
+                if response.status_code >= 400:
+                    raise _ArtifactResponseError(response)
+                return response
+
+            try:
+                result = original_artifact_flights.run(
+                    artifact_key,
+                    _render_paired_original,
+                    _paired_consumer,
+                    join=not speculative,
+                )
+                if result.skipped:
+                    return _shed_prefetch_response()
+                return result.value
+            except _ArtifactResponseError as exc:
+                return exc.to_response()
+            except ArtifactProducerFailed as exc:
+                if isinstance(exc.__cause__, _ArtifactResponseError):
+                    return exc.__cause__.to_response()
+                raise
+            finally:
+                if speculative_slot:
+                    preview_prefetch_slots.release()
 
         def _file_render_state(path):
             if not path:
@@ -37567,6 +37589,62 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
         if prepared_render:
             return send_file(prepared_render, mimetype="image/jpeg")
+
+        # Paired-source requests returned above using their source/edit-signed
+        # transient artifact. Every remaining cache-miss path resolves to one
+        # real destination, so coordinate by that path: edit
+        # signatures naturally stay separate, while equal preloads and visible
+        # 1:1 requests share one expensive extraction.
+        if not _artifact_flight_guarded:
+            if recipe:
+                artifact_path = _full_resolution_render_path(
+                    vireo_dir, photo, recipe, file_state,
+                )
+            elif primary_is_raw:
+                artifact_path = os.path.join(
+                    vireo_dir, "originals", f"{photo_id}.display.jpg",
+                )
+            else:
+                artifact_path = os.path.join(
+                    vireo_dir, "working", f"{photo_id}.jpg",
+                )
+            artifact_key = os.path.abspath(artifact_path)
+            speculative = request.args.get("prefetch") == "1"
+            speculative_slot = False
+            if speculative:
+                speculative_slot = preview_prefetch_slots.acquire(blocking=False)
+                if not speculative_slot:
+                    return _shed_prefetch_response()
+
+            def coordinated_request(*, guarded):
+                response = make_response(
+                    serve_original_photo(
+                        photo_id, _artifact_flight_guarded=guarded,
+                    )
+                )
+                if response.status_code >= 400:
+                    raise _ArtifactResponseError(response)
+                return response
+
+            try:
+                result = original_artifact_flights.run(
+                    artifact_key,
+                    lambda: coordinated_request(guarded=True),
+                    lambda: coordinated_request(guarded=False),
+                    join=not speculative,
+                )
+                if result.skipped:
+                    return _shed_prefetch_response()
+                return result.value
+            except _ArtifactResponseError as exc:
+                return exc.to_response()
+            except ArtifactProducerFailed as exc:
+                if isinstance(exc.__cause__, _ArtifactResponseError):
+                    return exc.__cause__.to_response()
+                raise
+            finally:
+                if speculative_slot:
+                    preview_prefetch_slots.release()
 
         # Decide whether to trust the working copy as the full-res asset
         # by reading its actual on-disk dimensions, NOT the current

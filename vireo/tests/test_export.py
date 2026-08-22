@@ -118,8 +118,9 @@ def test_normalize_subfolder_name_rejects_windows_reserved_names():
     from export import normalize_subfolder_name
 
     for bad in (
-        "CON", "con.txt", "PRN", "AUX.jpeg", "NUL", "COM1", "com9.log",
-        "LPT1", "lpt9.txt", "finals.",
+        "CON", "con.txt", "PRN", "AUX.jpeg", "NUL", "CONIN$", "conout$.log",
+        "COM1", "com9.log", "com¹.txt", "COM²", "com³.log", "LPT1",
+        "lpt9.txt", "LPT¹", "lpt².txt", "LPT³", "finals.",
     ):
         with pytest.raises(ValueError):
             normalize_subfolder_name(bad)

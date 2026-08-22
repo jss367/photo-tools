@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 # Characters not allowed in filenames (covers Windows + macOS + Linux)
 _UNSAFE_RE = re.compile(r'[<>:"/|?*\\]')
 _WINDOWS_RESERVED_SUBFOLDER_RE = re.compile(
-    r"^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$",
+    r"^(?:con|prn|aux|nul|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$",
     re.IGNORECASE,
 )
 _OUTPUT_FORMATS = {

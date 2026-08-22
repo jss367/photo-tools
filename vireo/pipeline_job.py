@@ -3934,7 +3934,16 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 "Skipping pipeline preview for photo %s: %s",
                                 photo["id"], exc,
                             )
-                        except (ArtifactProducerFailed, PreviewMaterializationError):
+                        except ArtifactProducerFailed as exc:
+                            if isinstance(exc.__cause__, PreviewSourceUnavailable):
+                                skipped += 1
+                                log.info(
+                                    "Skipping pipeline preview for photo %s: %s",
+                                    photo["id"], exc.__cause__,
+                                )
+                            else:
+                                failed += 1
+                        except PreviewMaterializationError:
                             # image_loader logged the source failure; count it
                             # here so it remains visible in the stage rollup.
                             failed += 1

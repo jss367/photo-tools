@@ -4587,6 +4587,123 @@ def test_paired_preview_shares_decode_across_warmup_and_visible(
         assert render_calls[-1] == "raw"
 
 
+def test_paired_preview_cache_tracks_selected_source_state(
+    client_with_photo, monkeypatch,
+):
+    """Replacing a selected companion must not serve its old shadow render."""
+    import preview_materializer
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    folder = db.conn.execute(
+        "SELECT f.path FROM photos p JOIN folders f ON f.id=p.folder_id "
+        "WHERE p.id=?",
+        (photo_id,),
+    ).fetchone()["path"]
+    raw_path = os.path.join(folder, "state.NEF")
+    with open(raw_path, "wb") as raw_file:
+        raw_file.write(b"raw bytes")
+    companion_path = os.path.join(folder, "state.JPG")
+    Image.new("RGB", (800, 600), (200, 40, 40)).save(companion_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET filename='state.NEF', extension='.nef', "
+        "companion_path='state.JPG' WHERE id=?",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    render_count = 0
+    real_render = preview_materializer.render_preview_bytes
+
+    def counting_render(*args, **kwargs):
+        nonlocal render_count
+        render_count += 1
+        return real_render(*args, **kwargs)
+
+    monkeypatch.setattr(
+        preview_materializer, "render_preview_bytes", counting_render,
+    )
+    client = app.test_client()
+    url = f"/photos/{photo_id}/preview?size=1920&source=jpeg"
+    first = client.get(url)
+    assert first.status_code == 200
+
+    previous_mtime = os.stat(companion_path).st_mtime_ns
+    Image.new("RGB", (800, 600), (40, 40, 200)).save(companion_path, "JPEG")
+    os.utime(
+        companion_path,
+        ns=(previous_mtime + 1_000_000_000, previous_mtime + 1_000_000_000),
+    )
+    second = client.get(url)
+
+    assert second.status_code == 200
+    assert second.data != first.data
+    assert render_count == 2
+
+
+def test_paired_raw_original_shares_decode_across_warmup_and_visible(
+    client_with_photo, monkeypatch,
+):
+    """A selected RAW 1:1 warmup and visible request join one decode."""
+    import image_loader
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    folder = db.conn.execute(
+        "SELECT f.path FROM photos p JOIN folders f ON f.id=p.folder_id "
+        "WHERE p.id=?",
+        (photo_id,),
+    ).fetchone()["path"]
+    raw_path = os.path.join(folder, "original.NEF")
+    with open(raw_path, "wb") as raw_file:
+        raw_file.write(b"raw bytes")
+    companion_path = os.path.join(folder, "original.JPG")
+    Image.new("RGB", (800, 600), (50, 100, 150)).save(companion_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET filename='original.NEF', extension='.nef', "
+        "companion_path='original.JPG', width=800, height=600 WHERE id=?",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    started = threading.Event()
+    release = threading.Event()
+    call_count = 0
+    count_lock = threading.Lock()
+
+    def blocking_load(path, max_size=None, **kwargs):
+        nonlocal call_count
+        assert os.path.abspath(path) == os.path.abspath(raw_path)
+        with count_lock:
+            call_count += 1
+        started.set()
+        assert release.wait(5), "test did not release paired RAW producer"
+        return Image.new("RGB", (800, 600), (180, 70, 30))
+
+    monkeypatch.setattr(image_loader, "load_image", blocking_load)
+
+    def fetch(suffix):
+        with app.test_client() as client:
+            response = client.get(
+                f"/photos/{photo_id}/original?source=raw{suffix}",
+            )
+            return response.status_code, response.data
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        warmup = pool.submit(fetch, "&prefetch=1")
+        assert started.wait(5), "paired RAW producer did not start"
+        visible = pool.submit(fetch, "")
+        time.sleep(0.1)
+        assert call_count == 1
+        release.set()
+        warmup_result = warmup.result(timeout=5)
+        visible_result = visible.result(timeout=5)
+
+    assert warmup_result[0] == visible_result[0] == 200
+    assert warmup_result[1] == visible_result[1]
+    assert call_count == 1
+
+
 def test_preview_skips_recent_failed_raw_working_copy(
     client_with_photo, monkeypatch,
 ):

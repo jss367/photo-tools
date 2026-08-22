@@ -66,6 +66,10 @@ def render_preview_bytes(
     )
 
     photo_id = photo["id"]
+    if not pair_source_path and not folder_path:
+        raise PreviewSourceUnavailable(
+            f"source folder for photo {photo_id} is unavailable"
+        )
     folders = {photo["folder_id"]: folder_path}
 
     if pair_source_path:
@@ -238,6 +242,10 @@ def materialize_preview(
     must never enter the ordinary ``(photo_id, size)`` cache.
     """
     photo_id = photo["id"]
+    if coordinate and publish_best_effort:
+        raise ValueError(
+            "coordinated previews require reliable artifact publication"
+        )
 
     def consume_published():
         if cache_path and os.path.exists(cache_path) and os.path.getsize(cache_path):

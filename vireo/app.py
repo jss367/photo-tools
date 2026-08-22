@@ -246,6 +246,17 @@ def _paired_original_path(vireo_dir, photo_id, pair_source, state_hash):
     )
 
 
+def _fresh_paired_artifact(path):
+    """Return whether a non-empty paired artifact is still inside its TTL."""
+    try:
+        return (
+            os.path.getsize(path) > 0
+            and os.path.getmtime(path) >= time.time() - _PAIRED_PREVIEW_TTL_SEC
+        )
+    except OSError:
+        return False
+
+
 def _sweep_stale_paired_previews(paired_dir):
     """Best-effort removal of paired-preview cache files older than the TTL.
 
@@ -36852,8 +36863,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # cache, so waiters skip repeating that work.
         if (
             paired_cache_path
-            and os.path.exists(paired_cache_path)
-            and os.path.getsize(paired_cache_path)
+            and _fresh_paired_artifact(paired_cache_path)
         ):
             return send_file(paired_cache_path, mimetype="image/jpeg")
 
@@ -37404,8 +37414,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if pair_source and not pair_source_path:
             return "Not found", 404
         if pair_source_path:
-            # Explicit pair views bypass the canonical prepared-render cache,
-            # whose key has no RAW/JPEG source dimension.
+            # Explicit pair views bypass the canonical prepared-render cache.
             # The companion is already the photographer's developed result.
             # Its geometry can differ from the RAW, so never apply the RAW's
             # recipe or local mask in that coordinate space.
@@ -37426,10 +37435,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             paired_original_cache = _paired_original_path(
                 vireo_dir, photo_id, pair_source, paired_original_state,
             )
-            if (
-                os.path.exists(paired_original_cache)
-                and os.path.getsize(paired_original_cache)
-            ):
+            if _fresh_paired_artifact(paired_original_cache):
                 return send_file(paired_original_cache, mimetype="image/jpeg")
 
             def _render_paired_original():
@@ -37439,7 +37445,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     RAW_DECODE_PRESERVE_HIGHLIGHTS,
                     load_image,
                 )
-
                 load_kwargs = (
                     {"raw_decode": RAW_DECODE_PRESERVE_HIGHLIGHTS}
                     if pair_source == "raw" else {}
@@ -37578,9 +37583,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if prepared_render:
             return send_file(prepared_render, mimetype="image/jpeg")
 
-        # Paired-source requests returned above because they intentionally
-        # have no durable canonical artifact.  Every remaining cache-miss path
-        # resolves to one real destination, so coordinate by that path: edit
+        # Paired-source requests returned above using their source/edit-signed
+        # transient artifact. Every remaining cache-miss path resolves to one
+        # real destination, so coordinate by that path: edit
         # signatures naturally stay separate, while equal preloads and visible
         # 1:1 requests share one expensive extraction.
         if not _artifact_flight_guarded:

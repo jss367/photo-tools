@@ -94,13 +94,16 @@ var VireoExportPresets = (function() {
     var generation = ++refreshGeneration;
     try {
       var data = await safeFetch('/api/export/presets', undefined, {toast: false});
-      if (generation !== refreshGeneration) return;
+      if (generation !== refreshGeneration) return {current: false, ok: false};
       if (data && Array.isArray(data.presets)) presets = data.presets;
     } catch (err) {
-      if (generation !== refreshGeneration) return;
+      if (generation !== refreshGeneration) return {current: false, ok: false};
       // Keep the last known list; save/delete surface their own errors.
+      populateSelect();
+      return {current: true, ok: false};
     }
     populateSelect();
+    return {current: true, ok: true};
   }
 
   function collectSettings() {
@@ -231,17 +234,19 @@ var VireoExportPresets = (function() {
       alert('Could not save preset: ' + err.message);
       return;
     }
-    await refresh();
+    var refreshResult = await refresh();
     var edited = editGeneration !== modalEditGeneration;
     var reopened = openGeneration !== modalOpenGeneration;
-    if (!edited && !reopened) {
+    var keptCurrent = edited || reopened ||
+      !refreshResult.current || !refreshResult.ok;
+    if (!keptCurrent) {
       presetSelect().value = SAVED_PREFIX + name;
       VireoViewPreferences.write(LAST_USED_KEY, SAVED_PREFIX + name);
     }
     updateButtons();
     if (typeof showToast === 'function') {
-      var msg = (edited || reopened)
-        ? 'Saved export preset “' + name + '” (kept your edits as Custom)'
+      var msg = keptCurrent
+        ? 'Saved export preset “' + name + '” (kept current selection)'
         : 'Saved export preset “' + name + '”';
       showToast(msg, 'info');
     }
@@ -251,6 +256,8 @@ var VireoExportPresets = (function() {
     var name = selectedSavedName();
     if (!name) return;
     if (!window.confirm('Delete the export preset “' + name + '”?')) return;
+    var editGeneration = modalEditGeneration;
+    var openGeneration = modalOpenGeneration;
     try {
       var data = await safeFetch('/api/export/presets/' + encodeURIComponent(name), {
         method: 'DELETE',
@@ -263,9 +270,13 @@ var VireoExportPresets = (function() {
     if (VireoViewPreferences.read(LAST_USED_KEY) === SAVED_PREFIX + name) {
       VireoViewPreferences.write(LAST_USED_KEY, 'custom');
     }
-    await refresh();
-    presetSelect().value = 'custom';
-    updateButtons();
+    var refreshResult = await refresh();
+    var edited = editGeneration !== modalEditGeneration;
+    var reopened = openGeneration !== modalOpenGeneration;
+    if (refreshResult.current && !edited && !reopened) {
+      presetSelect().value = 'custom';
+      updateButtons();
+    }
     if (typeof showToast === 'function') {
       showToast('Deleted export preset “' + name + '”', 'info');
     }
@@ -277,16 +288,19 @@ var VireoExportPresets = (function() {
   async function modalOpened() {
     var openGeneration = ++modalOpenGeneration;
     var editGeneration = modalEditGeneration;
+    var restorationComplete = false;
     var submit = $('exportSubmitBtn');
     if (submit) submit.disabled = true;
     syncSubfolderNameState();
     try {
-      await refresh();
+      var refreshResult = await refresh();
+      if (!refreshResult.current) return;
       if (openGeneration !== modalOpenGeneration ||
           !overlay().classList.contains('open')) return;
       // Do not replace a destination, template, or other control the user
       // changed while the preset request was in flight.
       if (editGeneration !== modalEditGeneration) {
+        restorationComplete = true;
         updateButtons();
         return;
       }
@@ -306,13 +320,25 @@ var VireoExportPresets = (function() {
         // dialog Custom. Snap the dropdown back so it doesn't advertise a
         // built-in preset while the fields below no longer match it.
         if (last === 'custom') presetSelect().value = 'custom';
+        restorationComplete = true;
         updateButtons();
         return;
       }
       var sel = presetSelect();
       if (last.indexOf(SAVED_PREFIX) === 0) {
         var preset = findPreset(last.slice(SAVED_PREFIX.length));
-        if (!preset) return;
+        if (!preset) {
+          // A successful list proves the saved preset was removed; fall back
+          // to Custom. A failed list cannot prove that, so keep Export gated
+          // rather than silently using the host defaults in its place.
+          if (refreshResult.ok) {
+            VireoViewPreferences.write(LAST_USED_KEY, 'custom');
+            sel.value = 'custom';
+            restorationComplete = true;
+            updateButtons();
+          }
+          return;
+        }
         sel.value = last;
         applySettings(preset.settings);
       } else {
@@ -321,13 +347,14 @@ var VireoExportPresets = (function() {
           applyExportPreset(last);
         }
       }
+      restorationComplete = true;
       updateButtons();
     } finally {
       // The export button is the only submission path on both host pages.
       // Keep it gated until the latest modal opening has either restored the
       // preset or deliberately preserved an edit made during the request.
       if (submit && openGeneration === modalOpenGeneration &&
-          overlay().classList.contains('open')) {
+          overlay().classList.contains('open') && restorationComplete) {
         submit.disabled = false;
       }
     }

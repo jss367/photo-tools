@@ -270,6 +270,91 @@ def test_export_presets_ignore_stale_overlapping_refresh(live_server, page):
     expect(page.locator('option[value="saved:Stale preset"]')).to_have_count(0)
 
 
+def test_export_presets_keep_submit_gated_when_saved_preset_load_fails(
+    live_server, page,
+):
+    """A failed GET cannot unlock export with defaults in place of a preset."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+
+    page.evaluate(
+        """async () => {
+          const realSafeFetch = window.safeFetch;
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets' && (!options || !options.method)) {
+              return Promise.reject(new Error('offline'));
+            }
+            return realSafeFetch(url, options, config);
+          };
+          VireoViewPreferences.write(
+            'vireo.export.lastPreset', 'saved:Unavailable preset'
+          );
+          await VireoExportPresets.modalOpened();
+        }"""
+    )
+
+    expect(page.locator("#exportSubmitBtn")).to_be_disabled()
+
+
+def test_export_preset_delete_preserves_newer_selection(live_server, page):
+    """A delayed delete completion cannot relabel a newer preset as Custom."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+
+    page.evaluate(
+        """async () => {
+          const realSafeFetch = window.safeFetch;
+          window.__deletedExportPreset = false;
+          window.confirm = function() { return true; };
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets' && (!options || !options.method)) {
+              var presets = [{
+                name: 'Keep me', settings: {destination: '/keep'}
+              }];
+              if (!window.__deletedExportPreset) {
+                presets.unshift({
+                  name: 'Delete me', settings: {destination: '/delete'}
+                });
+              }
+              return Promise.resolve({presets: presets});
+            }
+            if (url === '/api/export/presets/Delete%20me' &&
+                options && options.method === 'DELETE') {
+              return new Promise(function(resolve) {
+                window.__resolveExportPresetDelete = function() {
+                  window.__deletedExportPreset = true;
+                  resolve({});
+                };
+              });
+            }
+            return realSafeFetch(url, options, config);
+          };
+          await VireoExportPresets.modalOpened();
+        }"""
+    )
+    page.locator("#exportPreset").select_option("saved:Delete me")
+    page.locator("#exportPresetDeleteBtn").click()
+    page.wait_for_function(
+        "() => typeof window.__resolveExportPresetDelete === 'function'"
+    )
+    page.locator("#exportPreset").select_option("saved:Keep me")
+    page.evaluate("() => window.__resolveExportPresetDelete()")
+
+    expect(page.locator("#exportPreset")).to_have_value("saved:Keep me")
+    expect(page.locator("#exportDest")).to_have_value("/keep")
+    assert page.evaluate(
+        "() => VireoViewPreferences.read('vireo.export.lastPreset')"
+    ) == "saved:Keep me"
+
+
 def test_export_preset_dropdown_reflects_custom_on_reopen(live_server, page):
     """Reopening after a custom edit shows Custom, not the host's built-in reset.
 

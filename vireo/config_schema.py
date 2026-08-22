@@ -12,6 +12,7 @@ import math
 #   - setup_complete: internal state flag (not a user-facing setting)
 #   - ingest.recent_destinations: auto-populated MRU list, not a knob
 #   - keyboard_shortcuts.*: managed by a dedicated curated UI section
+#   - export_presets: structured settings managed by the export dialogs
 EXCLUDED = (
     "setup_complete",
     "ingest.recent_destinations",
@@ -26,6 +27,9 @@ EXCLUDED = (
     # List of remote-target dicts — custom settings UI (Remote targets
     # section), so it lives outside SCHEMA like external_editors.
     "remote_targets",
+    # List of validated {name, settings} dicts — managed by the shared export
+    # preset UI and its dedicated API, not the generic settings editor.
+    "export_presets",
 )
 
 

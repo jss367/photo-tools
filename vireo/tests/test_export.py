@@ -94,6 +94,157 @@ def test_normalize_metadata_fields_validates_and_deduplicates():
         normalize_metadata_fields(["copyright"])
 
 
+def test_normalize_subfolder_name_defaults_and_trims():
+    from export import normalize_subfolder_name
+
+    assert normalize_subfolder_name(None) == "exported"
+    assert normalize_subfolder_name("") == "exported"
+    assert normalize_subfolder_name("   ") == "exported"
+    assert normalize_subfolder_name("  finals ") == "finals"
+    assert normalize_subfolder_name("Best of 2024") == "Best of 2024"
+
+
+def test_normalize_subfolder_name_rejects_paths_and_unsafe_chars():
+    from export import normalize_subfolder_name
+
+    for bad in ("a/b", "a\\b", "..", ".", "../up", 'x"y', "tab\tname", "a" * 121):
+        with pytest.raises(ValueError):
+            normalize_subfolder_name(bad)
+    with pytest.raises(ValueError, match="must be a string"):
+        normalize_subfolder_name(7)
+
+
+def test_normalize_subfolder_name_rejects_windows_reserved_names():
+    from export import normalize_subfolder_name
+
+    for bad in (
+        "CON", "con.txt", "PRN", "AUX.jpeg", "NUL", "CONIN$", "conout$.log",
+        "COM1", "com9.log", "com¹.txt", "COM²", "com³.log", "LPT1",
+        "lpt9.txt", "LPT¹", "lpt².txt", "LPT³", "finals.",
+    ):
+        with pytest.raises(ValueError):
+            normalize_subfolder_name(bad)
+
+    for valid in ("console", "COM0", "COM10", "LPT0", "LPT10", "finals.v2"):
+        assert normalize_subfolder_name(valid) == valid
+
+
+def test_normalize_subfolder_name_rejects_names_exceeding_byte_limit():
+    from export import MAX_EXPORT_SUBFOLDER_BYTES, normalize_subfolder_name
+
+    # 120 CJK ideographs pass the character-count guard (120 <= 120) but
+    # each encodes to three UTF-8 bytes, so the encoded length exceeds
+    # what ext4/HFS+ allow for one path component.
+    too_many_bytes = "写" * 120
+    assert len(too_many_bytes) <= 120
+    assert len(too_many_bytes.encode("utf-8")) > MAX_EXPORT_SUBFOLDER_BYTES
+    with pytest.raises(ValueError, match="bytes or fewer"):
+        normalize_subfolder_name(too_many_bytes)
+
+    # A name that fits in both bounds is still accepted verbatim.
+    fits = "写" * 40
+    assert normalize_subfolder_name(fits) == fits
+
+
+def test_normalize_max_size():
+    from export import normalize_max_size
+
+    assert normalize_max_size(None) is None
+    assert normalize_max_size("") is None
+    assert normalize_max_size(0) is None
+    assert normalize_max_size("2048") == 2048
+    for bad in (True, "big", -1, 50001):
+        with pytest.raises(ValueError):
+            normalize_max_size(bad)
+
+
+def test_normalize_export_preset_settings_fills_defaults():
+    from export import normalize_export_preset_settings
+
+    assert normalize_export_preset_settings({}) == {
+        "destination": "",
+        "export_to_subfolder": False,
+        "subfolder_name": "exported",
+        "reveal_after_export": False,
+        "format": "jpg",
+        "max_size": None,
+        "quality": 92,
+        "naming_template": "{original}",
+        "metadata_fields": [],
+    }
+
+
+def test_normalize_export_preset_settings_normalizes_and_validates(tmp_path):
+    from export import normalize_export_preset_settings
+
+    destination = tmp_path / "out"
+    settings = normalize_export_preset_settings({
+        "destination": f"  {destination} ",
+        "export_to_subfolder": True,
+        "subfolder_name": " finals ",
+        "reveal_after_export": True,
+        "format": "PNG",
+        "max_size": "2048",
+        "quality": "85",
+        "naming_template": " {date}_{original} ",
+        "metadata_fields": ["species", "species", "rating"],
+    })
+    assert settings["destination"] == str(destination)
+    assert settings["subfolder_name"] == "finals"
+    assert settings["format"] == "png"
+    assert settings["max_size"] == 2048
+    assert settings["quality"] == 85
+    assert settings["naming_template"] == "{date}_{original}"
+    assert settings["metadata_fields"] == ["species", "rating"]
+
+    dormant = normalize_export_preset_settings({
+        "export_to_subfolder": False,
+        "subfolder_name": " future exports ",
+    })
+    assert dormant["subfolder_name"] == "future exports"
+    dormant_invalid = normalize_export_preset_settings({
+        "export_to_subfolder": False,
+        "subfolder_name": "not/a/component",
+    })
+    assert dormant_invalid["subfolder_name"] == "exported"
+    with pytest.raises(ValueError, match="subfolder_name"):
+        normalize_export_preset_settings({
+            "export_to_subfolder": True,
+            "subfolder_name": "not/a/component",
+        })
+
+    with pytest.raises(ValueError, match="unknown preset settings: sharpen"):
+        normalize_export_preset_settings({"sharpen": 70})
+    with pytest.raises(ValueError, match="absolute path"):
+        normalize_export_preset_settings({"destination": "relative/path"})
+    with pytest.raises(ValueError, match="must be an object"):
+        normalize_export_preset_settings(["not", "a", "dict"])
+
+
+def test_normalize_export_preset_name():
+    from export import normalize_export_preset_name
+
+    assert normalize_export_preset_name("  default ") == "default"
+    for bad in (None, "", "   ", "a/b", "a\\b", "a" * 81, 3):
+        with pytest.raises(ValueError):
+            normalize_export_preset_name(bad)
+
+
+def test_normalize_export_preset_name_rejects_dot_segments():
+    # "." and ".." are URL path segments the browser collapses even after
+    # encodeURIComponent, so the DELETE UI cannot address such a preset.
+    # Reject them at save time so they never make it into the store.
+    from export import normalize_export_preset_name
+
+    for bad in (".", "..", "  .  ", "  ..  "):
+        with pytest.raises(ValueError, match=r"'\.' or '\.\.'"):
+            normalize_export_preset_name(bad)
+
+    # Names that contain dots but aren't dot-segments remain valid.
+    assert normalize_export_preset_name("v1.0") == "v1.0"
+    assert normalize_export_preset_name("...ish") == "...ish"
+
+
 def test_export_timestamp_parts_normalizes_utc_suffix():
     assert _export_timestamp_parts("2024-06-15T14:30:22.5Z") == (
         "2024:06:15",
@@ -323,6 +474,52 @@ def test_export_photos_can_use_subfolder_under_custom_destination(export_env):
         os.path.join(env["dest"], "exported"),
     ]
     assert os.path.isfile(os.path.join(env["dest"], "exported", "bird1.jpg"))
+
+
+def test_export_photos_honors_custom_subfolder_name(export_env):
+    """A renamed subfolder is used instead of the historical "exported"."""
+    env = export_env
+
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={
+            "naming_template": "{original}",
+            "export_to_subfolder": True,
+            "subfolder_name": "finals",
+        },
+    )
+
+    assert result["exported"] == 1
+    assert result["errors"] == []
+    assert result["destination"] == os.path.join(env["dest"], "finals")
+    assert os.path.isfile(os.path.join(env["dest"], "finals", "bird1.jpg"))
+    assert not os.path.isdir(os.path.join(env["dest"], "exported"))
+
+
+def test_preview_export_renames_checks_custom_subfolder(export_env):
+    """Collision preflight looks inside the renamed subfolder."""
+    env = export_env
+    finals = os.path.join(env["dest"], "finals")
+    os.makedirs(finals)
+    with open(os.path.join(finals, "bird1.jpg"), "wb") as fh:
+        fh.write(b"existing")
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={
+            "naming_template": "{original}",
+            "export_to_subfolder": True,
+            "subfolder_name": "finals",
+            "vireo_dir": env["vireo_dir"],
+        },
+    )
+
+    assert [r["export_name"] for r in renames] == ["bird1_2.jpg"]
 
 
 def test_export_photos_embeds_only_selected_metadata(export_env, monkeypatch):

@@ -187,6 +187,472 @@ def test_export_defaults_beside_original_and_offers_folder_browser(
     assert request["export_to_subfolder"] is True
 
 
+def test_export_presets_do_not_overwrite_edits_while_loading(live_server, page):
+    """Delayed preset restoration gates export and preserves newer edits."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.evaluate(
+        """() => {
+          const realSafeFetch = window.safeFetch;
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets') {
+              return new Promise(function(resolve) {
+                window.__resolveExportPresets = resolve;
+              });
+            }
+            return realSafeFetch(url, options, config);
+          };
+          VireoViewPreferences.write(
+            'vireo.export.lastPreset', 'saved:Delayed preset'
+          );
+        }"""
+    )
+
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportSubmitBtn")).to_be_disabled()
+    expect(page.locator("#exportPreset")).to_be_disabled()
+    expect(page.locator("#exportPresetSaveBtn")).to_be_disabled()
+    expect(page.locator("#exportPresetDeleteBtn")).to_be_disabled()
+    expect(page.locator("#exportDest")).to_be_disabled()
+    expect(page.locator("#exportFormat")).to_be_disabled()
+    expect(page.locator("#exportTemplate")).to_be_disabled()
+    expect(page.locator("#exportMetadataSpecies")).to_be_disabled()
+    expect(page.locator("#exportOverlay [data-export-cancel]")).to_be_enabled()
+    # Programmatic assignment simulates an integration mutating a control;
+    # real user input is gated until restoration completes.
+    page.locator("#exportDest").evaluate(
+        "(element) => { element.value = '/user-selected'; }"
+    )
+    page.evaluate("() => VireoExportPresets.markCustom()")
+    page.evaluate(
+        """() => window.__resolveExportPresets({presets: [{
+          name: 'Delayed preset',
+          settings: {destination: '/preset-destination'}
+        }]})"""
+    )
+
+    expect(page.locator("#exportSubmitBtn")).to_be_enabled()
+    expect(page.locator("#exportPreset")).to_be_enabled()
+    expect(page.locator("#exportPresetSaveBtn")).to_be_enabled()
+    expect(page.locator("#exportDest")).to_be_enabled()
+    expect(page.locator("#exportFormat")).to_be_enabled()
+    expect(page.locator("#exportTemplate")).to_be_enabled()
+    expect(page.locator("#exportMetadataSpecies")).to_be_enabled()
+    expect(page.locator("#exportDest")).to_have_value("/user-selected")
+    expect(page.locator("#exportPreset")).to_have_value("custom")
+
+
+def test_export_presets_ignore_stale_overlapping_refresh(live_server, page):
+    """An older preset-list response cannot replace a newer response."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+
+    page.evaluate(
+        """() => {
+          const realSafeFetch = window.safeFetch;
+          window.__presetRefreshResolvers = [];
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets' && (!options || !options.method)) {
+              return new Promise(function(resolve) {
+                window.__presetRefreshResolvers.push(resolve);
+              });
+            }
+            return realSafeFetch(url, options, config);
+          };
+          window.__presetRefreshes = [
+            VireoExportPresets.modalOpened(),
+            VireoExportPresets.modalOpened(),
+          ];
+        }"""
+    )
+    page.wait_for_function("() => window.__presetRefreshResolvers.length === 2")
+    page.evaluate(
+        """async () => {
+          window.__presetRefreshResolvers[1]({presets: [{
+            name: 'Current preset', settings: {}
+          }]});
+          await window.__presetRefreshes[1];
+          window.__presetRefreshResolvers[0]({presets: [{
+            name: 'Stale preset', settings: {}
+          }]});
+          await window.__presetRefreshes[0];
+        }"""
+    )
+
+    expect(page.locator('option[value="saved:Current preset"]')).to_have_count(1)
+    expect(page.locator('option[value="saved:Stale preset"]')).to_have_count(0)
+
+
+def test_export_preset_persists_browse_preferences_on_apply(live_server, page):
+    """Applying a preset must persist the fields the host tracks as prefs.
+
+    Regression: ``applySettings`` uses ``.checked`` / ``.value`` assignments
+    that don't fire input/change, so VireoViewPreferences never records the
+    preset's subfolder, reveal, or metadata choices. If the user then
+    changes any unrelated field (calls markCustom, flipping LAST_USED_KEY
+    to 'custom') and closes and reopens, ``restoreAll()`` restores the
+    stale pre-preset preferences and silently loses the preset-derived
+    choices.
+    """
+    page.goto(f"{live_server['url']}/browse")
+    # Prime the persisted preferences to the OPPOSITE of what the preset
+    # will set, so a silent drop of the preset's values would fall back to
+    # these values on reopen.
+    page.evaluate(
+        """() => {
+          localStorage.setItem('vireo.browse.export.subfolder', '0');
+          localStorage.setItem('vireo.browse.export.revealAfter', '1');
+          localStorage.setItem('vireo.browse.export.metadata.rating', '0');
+        }"""
+    )
+    page.reload()
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    # Seed a saved preset and tell the modal to auto-apply it on open.
+    page.evaluate(
+        """() => {
+          window.__presetPayload = {presets: [{name: 'Preset A', settings: {
+            export_to_subfolder: true,
+            subfolder_name: 'from-preset',
+            reveal_after_export: false,
+            metadata_fields: ['rating', 'capture_date'],
+          }}]};
+          const realSafeFetch = window.safeFetch;
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets' &&
+                (!options || !options.method || options.method === 'GET')) {
+              return Promise.resolve(window.__presetPayload);
+            }
+            return realSafeFetch(url, options, config);
+          };
+          VireoViewPreferences.write('vireo.export.lastPreset', 'saved:Preset A');
+        }"""
+    )
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportSubfolder")).to_be_checked()
+    expect(page.locator("#exportSubfolderName")).to_have_value("from-preset")
+    expect(page.locator("#exportRevealAfter")).not_to_be_checked()
+    expect(page.locator("#exportMetadataRating")).to_be_checked()
+    assert page.evaluate("() => selectedExportMetadataFields()") == [
+        "capture_date", "rating",
+    ]
+
+    # Tweak an unrelated control (quality) so markCustom fires — this is
+    # the trigger for the bug: LAST_USED_KEY becomes 'custom' and the next
+    # reopen will restore preferences instead of the saved preset.
+    page.locator("#exportQuality").fill("77")
+    page.locator("#exportQuality").dispatch_event("input")
+    expect(page.locator("#exportPreset")).to_have_value("custom")
+
+    page.locator("#exportOverlay [data-export-cancel]").click()
+    expect(page.locator("#exportOverlay")).not_to_have_class(
+        "modal-overlay open"
+    )
+
+    # Reopen: restoreAll runs from the host, so the persisted preferences
+    # decide what the controls show. They must match what the preset
+    # actually put on screen, not the pre-preset seed values.
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportSubfolder")).to_be_checked()
+    expect(page.locator("#exportSubfolderName")).to_have_value("from-preset")
+    expect(page.locator("#exportRevealAfter")).not_to_be_checked()
+    expect(page.locator("#exportMetadataRating")).to_be_checked()
+    assert page.evaluate("() => selectedExportMetadataFields()") == [
+        "capture_date", "rating",
+    ]
+
+
+def test_export_presets_keep_submit_gated_when_saved_preset_load_fails(
+    live_server, page,
+):
+    """A failed GET cannot unlock export with defaults in place of a preset."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+
+    page.evaluate(
+        """async () => {
+          const realSafeFetch = window.safeFetch;
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets' && (!options || !options.method)) {
+              return Promise.reject(new Error('offline'));
+            }
+            return realSafeFetch(url, options, config);
+          };
+          VireoViewPreferences.write(
+            'vireo.export.lastPreset', 'saved:Unavailable preset'
+          );
+          await VireoExportPresets.modalOpened();
+        }"""
+    )
+
+    expect(page.locator("#exportSubmitBtn")).to_be_disabled()
+
+
+def test_export_preset_delete_preserves_newer_selection(live_server, page):
+    """A delayed delete completion cannot relabel a newer preset as Custom."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+
+    page.evaluate(
+        """async () => {
+          const realSafeFetch = window.safeFetch;
+          window.__deletedExportPreset = false;
+          window.confirm = function() { return true; };
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets' && (!options || !options.method)) {
+              var presets = [{
+                name: 'Keep me', settings: {destination: '/keep'}
+              }];
+              if (!window.__deletedExportPreset) {
+                presets.unshift({
+                  name: 'Delete me', settings: {destination: '/delete'}
+                });
+              }
+              return Promise.resolve({presets: presets});
+            }
+            if (url === '/api/export/presets/Delete%20me' &&
+                options && options.method === 'DELETE') {
+              return new Promise(function(resolve) {
+                window.__resolveExportPresetDelete = function() {
+                  window.__deletedExportPreset = true;
+                  resolve({});
+                };
+              });
+            }
+            return realSafeFetch(url, options, config);
+          };
+          await VireoExportPresets.modalOpened();
+        }"""
+    )
+    page.locator("#exportPreset").select_option("saved:Delete me")
+    page.locator("#exportPresetDeleteBtn").click()
+    page.wait_for_function(
+        "() => typeof window.__resolveExportPresetDelete === 'function'"
+    )
+    page.locator("#exportPreset").select_option("saved:Keep me")
+    page.evaluate("() => window.__resolveExportPresetDelete()")
+
+    expect(page.locator("#exportPreset")).to_have_value("saved:Keep me")
+    expect(page.locator("#exportDest")).to_have_value("/keep")
+    assert page.evaluate(
+        "() => VireoViewPreferences.read('vireo.export.lastPreset')"
+    ) == "saved:Keep me"
+
+
+def test_export_preset_uncached_replace_requires_confirmation(live_server, page):
+    """A server-side name conflict is confirmed before a replacement retry."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+
+    page.evaluate(
+        """async () => {
+          const realSafeFetch = window.safeFetch;
+          window.__presetSaveBodies = [];
+          window.__presetSaveSucceeded = false;
+          window.__presetReplaceConfirmations = 0;
+          window.prompt = function() { return 'Existing elsewhere'; };
+          window.confirm = function() {
+            window.__presetReplaceConfirmations++;
+            return true;
+          };
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets' && options &&
+                options.method === 'POST') {
+              var body = JSON.parse(options.body);
+              window.__presetSaveBodies.push(body);
+              if (!body.replace) {
+                var conflict = new Error('already exists');
+                conflict.code = 'export_preset_exists';
+                return Promise.reject(conflict);
+              }
+              window.__presetSaveSucceeded = true;
+              return Promise.resolve({ok: true, replaced: true});
+            }
+            if (url === '/api/export/presets' && (!options || !options.method)) {
+              return Promise.resolve({presets: window.__presetSaveSucceeded ? [{
+                name: 'Existing elsewhere', settings: {
+                  destination: '', naming_template: '{original}_web'
+                }
+              }] : []});
+            }
+            return realSafeFetch(url, options, config);
+          };
+          await VireoExportPresets.modalOpened();
+        }"""
+    )
+    page.locator("#exportTemplate").fill("  {original}_web  ")
+    page.locator("#exportPresetSaveBtn").click()
+
+    expect(page.locator("#exportPreset")).to_have_value(
+        "saved:Existing elsewhere"
+    )
+    assert page.evaluate("() => window.__presetReplaceConfirmations") == 1
+    assert page.evaluate(
+        "() => window.__presetSaveBodies.map(body => body.replace)"
+    ) == [False, True]
+    expect(page.locator("#exportTemplate")).to_have_value("{original}_web")
+
+
+def test_export_preset_serializes_saves_to_same_name(live_server, page):
+    """A second same-name save cannot overtake the first request."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+
+    page.evaluate(
+        """async () => {
+          const realSafeFetch = window.safeFetch;
+          window.__serializedSaveBodies = [];
+          window.__serializedSaveResolvers = [];
+          window.__serializedPresetGets = 0;
+          window.prompt = function() { return 'Shared name'; };
+          window.confirm = function() { return true; };
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets' && options &&
+                options.method === 'POST') {
+              window.__serializedSaveBodies.push(JSON.parse(options.body));
+              return new Promise(function(resolve) {
+                window.__serializedSaveResolvers.push(resolve);
+              });
+            }
+            if (url === '/api/export/presets' && (!options || !options.method)) {
+              window.__serializedPresetGets++;
+              return Promise.resolve({presets: [{
+                name: 'Shared name', settings: {
+                  destination: document.getElementById('exportDest').value
+                }
+              }]});
+            }
+            return realSafeFetch(url, options, config);
+          };
+          await VireoExportPresets.modalOpened();
+        }"""
+    )
+    page.locator("#exportDest").fill("/first")
+    page.locator("#exportPresetSaveBtn").click()
+    page.wait_for_function("() => window.__serializedSaveBodies.length === 1")
+
+    page.locator("#exportDest").fill("/second")
+    page.locator("#exportPresetSaveBtn").click()
+    assert page.evaluate("() => window.__serializedSaveBodies.length") == 1
+
+    page.evaluate("() => window.__serializedSaveResolvers[0]({ok: true})")
+    page.wait_for_function("() => window.__serializedPresetGets === 2")
+    page.locator("#exportPresetSaveBtn").click()
+    page.wait_for_function("() => window.__serializedSaveBodies.length === 2")
+    assert page.evaluate(
+        "() => window.__serializedSaveBodies.map(body => body.settings.destination)"
+    ) == ["/first", "/second"]
+
+
+def test_export_preset_serializes_save_against_same_name_delete(live_server, page):
+    """A replacement save cannot recreate a preset while deletion is pending."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+
+    page.evaluate(
+        """async () => {
+          const realSafeFetch = window.safeFetch;
+          window.__deleteRequests = 0;
+          window.__saveRequestsDuringDelete = 0;
+          window.prompt = function() { return 'Shared name'; };
+          window.confirm = function() { return true; };
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets/Shared%20name' && options &&
+                options.method === 'DELETE') {
+              window.__deleteRequests++;
+              return new Promise(function(resolve) {
+                window.__resolveSharedPresetDelete = resolve;
+              });
+            }
+            if (url === '/api/export/presets' && options &&
+                options.method === 'POST') {
+              window.__saveRequestsDuringDelete++;
+              return Promise.resolve({ok: true});
+            }
+            if (url === '/api/export/presets' && (!options || !options.method)) {
+              return Promise.resolve({presets: [{
+                name: 'Shared name', settings: {destination: '/shared'}
+              }]});
+            }
+            return realSafeFetch(url, options, config);
+          };
+          await VireoExportPresets.modalOpened();
+        }"""
+    )
+    page.locator("#exportPreset").select_option("saved:Shared name")
+    page.locator("#exportPresetDeleteBtn").click()
+    page.wait_for_function("() => window.__deleteRequests === 1")
+
+    page.locator("#exportPresetSaveBtn").click()
+    assert page.evaluate("() => window.__saveRequestsDuringDelete") == 0
+
+    page.evaluate("() => window.__resolveSharedPresetDelete({ok: true})")
+    expect(page.locator("#exportPreset")).to_have_value("custom")
+
+
+def test_export_preset_dropdown_reflects_custom_on_reopen(live_server, page):
+    """Reopening after a custom edit shows Custom, not the host's built-in reset.
+
+    Regression: the host resets ``#exportPreset`` to ``original-jpg`` before
+    ``modalOpened()`` runs and then ``VireoViewPreferences.restoreAll`` puts
+    persisted custom fields (subfolder toggle, metadata boxes, reveal-after)
+    back on screen. When ``LAST_USED_KEY`` was ``custom``, ``modalOpened``
+    used to return without snapping the dropdown back, so the modal
+    advertised "Full-size JPEG" while the fields below no longer matched it.
+    """
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    # Simulate a manual tweak: check the subfolder box, which fires the
+    # delegated input handler and calls markCustom() -> LAST_USED_KEY=custom.
+    page.locator("#exportSubfolder").check()
+    expect(page.locator("#exportPreset")).to_have_value("custom")
+
+    page.locator("#exportOverlay [data-export-cancel]").click()
+    expect(page.locator("#exportOverlay")).not_to_have_class(
+        "modal-overlay open"
+    )
+
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    # Persisted view preference restored the checkbox, so the dropdown must
+    # follow instead of falsely displaying the built-in reset default.
+    expect(page.locator("#exportSubfolder")).to_be_checked()
+    expect(page.locator("#exportPreset")).to_have_value("custom")
+
+
 def test_export_checkboxes_remember_the_previous_choices(live_server, page):
     """Export checkbox choices survive closing the dialog and reloading Browse."""
     page.goto(f"{live_server['url']}/browse")

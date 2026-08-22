@@ -1136,6 +1136,7 @@ def test_job_export_without_destination_uses_original_folder(app_and_db):
     assert job["config"]["destination"] == ""
     assert job["config"]["destination_mode"] == "original"
     assert job["config"]["export_to_subfolder"] is False
+    assert job["config"]["subfolder_name"] is None
 
 
 def test_job_export_subfolder_option_must_be_boolean(app_and_db):
@@ -1199,6 +1200,212 @@ def test_job_export_reveals_successful_output(
     assert "files" not in job["result"]
     assert reveal_calls == [[str(output)]]
     assert output.is_file()
+
+
+def test_job_export_rejects_invalid_subfolder_name(app_and_db):
+    """POST /api/jobs/export refuses path-escaping subfolder names."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()
+
+    for bad in ("../escape", "a/b", "a\\b", ".."):
+        resp = client.post("/api/jobs/export", json={
+            "photo_ids": [photo["id"]],
+            "export_to_subfolder": True,
+            "subfolder_name": bad,
+        })
+        assert resp.status_code == 400
+        assert "subfolder_name" in resp.get_json()["error"]
+
+
+def test_job_export_preflight_rejects_invalid_subfolder_name(app_and_db):
+    """The preflight applies the same subfolder-name validation as export."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()
+
+    resp = client.post("/api/jobs/export/preflight", json={
+        "photo_ids": [photo["id"]],
+        "export_to_subfolder": True,
+        "subfolder_name": "../escape",
+    })
+    assert resp.status_code == 400
+    assert "subfolder_name" in resp.get_json()["error"]
+
+
+def test_job_export_ignores_subfolder_name_when_subfolder_disabled(app_and_db):
+    """subfolder_name is inert while the subfolder checkbox is off."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()
+
+    resp = client.post("/api/jobs/export", json={
+        "photo_ids": [photo["id"]],
+        "export_to_subfolder": False,
+        "subfolder_name": "not/valid",
+    })
+    assert resp.status_code == 200
+
+
+def test_job_export_writes_into_renamed_subfolder(client_with_photo, tmp_path):
+    """A renamed subfolder replaces the historical "exported" directory."""
+    app, _db, photo_id = client_with_photo
+    destination = tmp_path / "exports"
+
+    response = app.test_client().post("/api/jobs/export", json={
+        "photo_ids": [photo_id],
+        "destination": str(destination),
+        "export_to_subfolder": True,
+        "subfolder_name": "finals",
+    })
+    assert response.status_code == 200
+
+    job = wait_for_job_via_client(
+        app.test_client(), response.get_json()["job_id"],
+    )
+    assert job["status"] == "completed"
+    assert job["config"]["subfolder_name"] == "finals"
+    assert (destination / "finals" / "test.jpg").is_file()
+    assert not (destination / "exported").exists()
+
+
+def test_export_presets_crud_roundtrip(app_and_db, tmp_path):
+    """Save, list, replace, and delete presets through /api/export/presets."""
+    app, _db = app_and_db
+    client = app.test_client()
+
+    assert client.get("/api/export/presets").get_json() == {"presets": []}
+
+    resp = client.post("/api/export/presets", json={
+        "name": "default",
+        "settings": {
+            "destination": str(tmp_path / "out"),
+            "export_to_subfolder": True,
+            "subfolder_name": "finals",
+            "reveal_after_export": True,
+            "format": "jpg",
+            "max_size": 2048,
+            "quality": 85,
+            "naming_template": "{date}_{original}",
+            "metadata_fields": ["species"],
+        },
+    })
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    assert body["replaced"] is False
+
+    listed = client.get("/api/export/presets").get_json()["presets"]
+    assert [p["name"] for p in listed] == ["default"]
+    assert listed[0]["settings"]["subfolder_name"] == "finals"
+    assert listed[0]["settings"]["reveal_after_export"] is True
+
+    # Replacement is conditional so an uncached client cannot silently
+    # overwrite a preset created elsewhere.
+    resp = client.post("/api/export/presets", json={
+        "name": "default",
+        "settings": {"quality": 70},
+    })
+    assert resp.status_code == 409
+    assert resp.get_json()["code"] == "export_preset_exists"
+    assert client.get("/api/export/presets").get_json()["presets"][0][
+        "settings"
+    ]["quality"] == 85
+
+    # Confirmed replacement succeeds, and omitted keys reset to defaults (a
+    # preset is a full dialog snapshot, not a patch).
+    resp = client.post("/api/export/presets", json={
+        "name": "default",
+        "settings": {"quality": 70},
+        "replace": True,
+    })
+    assert resp.status_code == 200
+    assert resp.get_json()["replaced"] is True
+    listed = client.get("/api/export/presets").get_json()["presets"]
+    assert len(listed) == 1
+    assert listed[0]["settings"]["quality"] == 70
+    assert listed[0]["settings"]["export_to_subfolder"] is False
+
+    assert client.delete("/api/export/presets/default").status_code == 200
+    assert client.get("/api/export/presets").get_json() == {"presets": []}
+    assert client.delete("/api/export/presets/default").status_code == 404
+
+
+def test_export_presets_sorted_by_name(app_and_db):
+    """Listing returns presets alphabetically regardless of save order."""
+    app, _db = app_and_db
+    client = app.test_client()
+
+    for name in ("Web small", "archive", "Default"):
+        resp = client.post("/api/export/presets", json={
+            "name": name, "settings": {},
+        })
+        assert resp.status_code == 200
+
+    listed = client.get("/api/export/presets").get_json()["presets"]
+    assert [p["name"] for p in listed] == ["archive", "Default", "Web small"]
+
+
+def test_export_presets_rejects_invalid_payloads(app_and_db):
+    """Preset saves are validated with the export endpoint's rules."""
+    app, _db = app_and_db
+    client = app.test_client()
+
+    resp = client.post("/api/export/presets", json={"name": "", "settings": {}})
+    assert resp.status_code == 400
+
+    resp = client.post("/api/export/presets", json={
+        "name": "x", "settings": {"sharpen": 70},
+    })
+    assert resp.status_code == 400
+    assert "unknown preset settings" in resp.get_json()["error"]
+
+    resp = client.post("/api/export/presets", json={
+        "name": "x", "settings": {"destination": "relative/path"},
+    })
+    assert resp.status_code == 400
+    assert "absolute path" in resp.get_json()["error"]
+
+    resp = client.post("/api/export/presets", json={
+        "name": "x", "settings": {
+            "export_to_subfolder": True,
+            "subfolder_name": "a/b",
+        },
+    })
+    assert resp.status_code == 400
+    assert "subfolder_name" in resp.get_json()["error"]
+
+    resp = client.post("/api/export/presets", json={
+        "name": "x",
+        "settings": {
+            "export_to_subfolder": False,
+            "subfolder_name": "a/b",
+        },
+    })
+    assert resp.status_code == 200
+    assert resp.get_json()["preset"]["settings"]["subfolder_name"] == "exported"
+    assert client.delete("/api/export/presets/x").status_code == 200
+
+    resp = client.post("/api/export/presets", json={
+        "name": "replace flag",
+        "settings": {},
+        "replace": "yes",
+    })
+    assert resp.status_code == 400
+    assert "replace must be a boolean" in resp.get_json()["error"]
+
+    # Truthy non-object JSON bodies (array, string, number) must produce a
+    # 400 validation error, not a 500 from AttributeError on ``.get(...)``.
+    for bad in ([1, 2, 3], "default", 3):
+        resp = client.post(
+            "/api/export/presets",
+            data=json.dumps(bad),
+            content_type="application/json",
+        )
+        assert resp.status_code == 400, bad
+        assert "JSON object" in resp.get_json()["error"]
+
+    assert client.get("/api/export/presets").get_json() == {"presets": []}
 
 
 def test_job_export_does_not_reveal_after_cancellation(

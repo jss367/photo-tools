@@ -1813,11 +1813,17 @@ body.sidebar-resizing {
         <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">
           Leave blank to export each photo beside its original.
         </div>
-        <label style="display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text-secondary);margin-bottom:12px;cursor:pointer;">
-          <input id="exportSubfolder" type="checkbox"
-                 data-view-preference="vireo.browse.export.subfolder">
-          Put exports in an “exported” subfolder
-        </label>
+        <div style="display:flex;align-items:center;gap:7px;margin-bottom:12px;">
+          <label style="display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text-secondary);cursor:pointer;white-space:nowrap;">
+            <input id="exportSubfolder" type="checkbox"
+                   data-view-preference="vireo.browse.export.subfolder">
+            Put exports in a subfolder named
+          </label>
+          <input id="exportSubfolderName" class="modal-input" type="text" value="exported"
+                 placeholder="exported" maxlength="120"
+                 data-view-preference="vireo.browse.export.subfolderName"
+                 style="flex:1;min-width:0;margin-bottom:0;padding:4px 8px;font-size:12px;">
+        </div>
 
         <label style="display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text-secondary);margin-bottom:12px;cursor:pointer;">
           <input id="exportRevealAfter" type="checkbox"
@@ -1826,14 +1832,20 @@ body.sidebar-resizing {
         </label>
 
         <label style="font-size:12px;color:var(--text-secondary);display:block;margin-bottom:4px;">Preset</label>
-        <select id="exportPreset" class="modal-input" style="cursor:pointer;">
-          <option value="original-jpg">Full-size JPEG</option>
-          <option value="web-jpg">Web JPEG, 2048 px</option>
-          <option value="small-jpg">Small JPEG, 1080 px</option>
-          <option value="archive-tiff">Full-size TIFF</option>
-          <option value="png">Full-size PNG</option>
-          <option value="custom">Custom</option>
-        </select>
+        <div style="display:flex;gap:8px;align-items:stretch;margin-bottom:12px;">
+          <select id="exportPreset" class="modal-input" style="cursor:pointer;flex:1;min-width:0;margin-bottom:0;">
+            <option value="original-jpg">Full-size JPEG</option>
+            <option value="web-jpg">Web JPEG, 2048 px</option>
+            <option value="small-jpg">Small JPEG, 1080 px</option>
+            <option value="archive-tiff">Full-size TIFF</option>
+            <option value="png">Full-size PNG</option>
+            <option value="custom">Custom</option>
+          </select>
+          <button id="exportPresetSaveBtn" class="modal-btn modal-btn-cancel" type="button"
+                  title="Save every setting in this dialog as a named preset">Save…</button>
+          <button id="exportPresetDeleteBtn" class="modal-btn modal-btn-cancel" type="button"
+                  title="Delete the selected saved preset" disabled>Delete</button>
+        </div>
 
         <label style="font-size:12px;color:var(--text-secondary);display:block;margin-bottom:4px;">Format</label>
         <select id="exportFormat" class="modal-input" style="cursor:pointer;">
@@ -2228,6 +2240,7 @@ body.sidebar-resizing {
 
 <script src="/static/vireo-work-locally.js"></script>
 <script src="/static/vireo-folder-browser.js"></script>
+<script src="/static/vireo-export-presets.js"></script>
 <script>
 /* Google Maps API key — populated from /api/config below (window._cfgPromise).
    Empty string when no key is configured; the Location section then
@@ -11672,9 +11685,13 @@ function openExportModal(photoIds) {
   });
   document.getElementById('exportDest').value = '';
   document.getElementById('exportSubfolder').checked = false;
+  document.getElementById('exportSubfolderName').value = 'exported';
   migrateExportCaptureDateTimePreference();
   VireoViewPreferences.restoreAll(document.getElementById('exportOverlay'));
   document.getElementById('exportOverlay').classList.add('open');
+  // Re-applies the last-used preset (saved or built-in) over the defaults
+  // and view preferences restored above; async but near-instant locally.
+  VireoExportPresets.modalOpened();
   updateExportPreview();
 }
 
@@ -11693,7 +11710,17 @@ function selectedExportMetadataFields() {
   return Array.from(document.querySelectorAll('.export-metadata-option input:checked'))
     .reduce(function(fields, input) {
       if (input.value === 'capture_date_time') {
-        fields.push('capture_date', 'capture_time');
+        // A preset saved in Photo Editor may specify just date or just time.
+        // VireoExportPresets.applySettings stashes that split here so we
+        // honor it instead of quietly promoting the box to "both". Manual
+        // edits clear the stash, at which point the combined box means both.
+        if (input.dataset.presetFields) {
+          input.dataset.presetFields.split(',').forEach(function(field) {
+            if (field) fields.push(field);
+          });
+        } else {
+          fields.push('capture_date', 'capture_time');
+        }
       } else {
         fields.push(input.value);
       }
@@ -11722,6 +11749,7 @@ const exportFolderBrowser = new VireoFolderBrowser({
       },
       onSelect: function(path) {
         document.getElementById('exportDest').value = path;
+        VireoExportPresets.markCustom();
       },
     },
   },
@@ -11736,6 +11764,7 @@ async function browseForExportDestination() {
     });
     if (result) {
       destination.value = Array.isArray(result) ? result[0] : result;
+      VireoExportPresets.markCustom();
       return;
     }
     if (typeof isTauri === 'function' && isTauri()) return;
@@ -11755,6 +11784,7 @@ function insertTemplateVar(v) {
   input.value = val.substring(0, start) + v + val.substring(end);
   input.selectionStart = input.selectionEnd = start + v.length;
   input.focus();
+  VireoExportPresets.markCustom();
   updateExportPreview();
 }
 
@@ -11827,14 +11857,17 @@ function updateExportPreview() {
     .replace('{seq}', '0001')
     .replace('{folder}', '');
   var ext = exportExtensionForFormat(document.getElementById('exportFormat').value);
-  document.getElementById('exportPreview').textContent = 'Preview: ' + preview + '.' + ext;
+  var subPrefix = document.getElementById('exportSubfolder').checked
+    ? VireoExportPresets.subfolderName() + '/'
+    : '';
+  document.getElementById('exportPreview').textContent =
+    'Preview: ' + subPrefix + preview + '.' + ext;
 }
 
 document.getElementById('exportTemplate').addEventListener('input', updateExportPreview);
 
-document.getElementById('exportPreset').addEventListener('change', function() {
-  applyExportPreset(this.value);
-});
+// The preset dropdown's change handling (built-in and saved presets) lives
+// in the shared vireo-export-presets.js module.
 
 document.getElementById('exportFormat').addEventListener('change', function() {
   markExportCustom();
@@ -11883,6 +11916,7 @@ async function startExport() {
     photo_ids: activeIds,
     destination: dest,
     export_to_subfolder: exportToSubfolder,
+    subfolder_name: VireoExportPresets.subfolderName(),
     naming_template: template,
     max_size: maxSize,
     quality: quality,

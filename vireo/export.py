@@ -30,6 +30,10 @@ log = logging.getLogger(__name__)
 
 # Characters not allowed in filenames (covers Windows + macOS + Linux)
 _UNSAFE_RE = re.compile(r'[<>:"/|?*\\]')
+_WINDOWS_RESERVED_SUBFOLDER_RE = re.compile(
+    r"^(?:con|prn|aux|nul|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$",
+    re.IGNORECASE,
+)
 _OUTPUT_FORMATS = {
     "jpg": {"extension": "jpg", "pil_format": "JPEG", "quality": True},
     "jpeg": {"extension": "jpg", "pil_format": "JPEG", "quality": True},
@@ -153,6 +157,159 @@ def normalize_metadata_fields(fields):
     return normalized
 
 
+DEFAULT_EXPORT_SUBFOLDER = "exported"
+
+MAX_EXPORT_SUBFOLDER_LEN = 120
+# Cross-platform component byte cap. ext4/HFS+/APFS all limit a path
+# component to 255 bytes, so multi-byte names (CJK, emoji) that pass the
+# character count above can still be uncreatable. Leave a small margin
+# below 255 so a following extension doesn't push a rendered file name
+# over on the odd filesystem that measures per-component encoded lengths.
+MAX_EXPORT_SUBFOLDER_BYTES = 240
+
+
+def normalize_subfolder_name(name):
+    """Validate a user-chosen export subfolder name (one path component).
+
+    ``None`` and blank strings fall back to the historical "exported"
+    default so requests that never send the field keep their behavior.
+    """
+    if name is None:
+        return DEFAULT_EXPORT_SUBFOLDER
+    if not isinstance(name, str):
+        raise ValueError("subfolder_name must be a string")
+    name = name.strip()
+    if not name:
+        return DEFAULT_EXPORT_SUBFOLDER
+    if len(name) > MAX_EXPORT_SUBFOLDER_LEN:
+        raise ValueError(
+            f"subfolder_name must be {MAX_EXPORT_SUBFOLDER_LEN} characters or fewer"
+        )
+    if len(name.encode("utf-8")) > MAX_EXPORT_SUBFOLDER_BYTES:
+        raise ValueError(
+            f"subfolder_name must be {MAX_EXPORT_SUBFOLDER_BYTES} bytes or fewer when encoded"
+        )
+    if name in (".", ".."):
+        raise ValueError("subfolder_name must not be '.' or '..'")
+    if name.endswith("."):
+        raise ValueError("subfolder_name must not end with a period")
+    if _WINDOWS_RESERVED_SUBFOLDER_RE.fullmatch(name):
+        raise ValueError("subfolder_name must not be a reserved Windows device name")
+    if _UNSAFE_RE.search(name) or any(ord(ch) < 32 for ch in name):
+        raise ValueError(
+            'subfolder_name must not contain path separators or < > : " | ? *'
+        )
+    return name
+
+
+def normalize_max_size(max_size):
+    """Validate the optional max long-edge resize; None disables resizing."""
+    if max_size in (None, "", 0):
+        return None
+    if isinstance(max_size, bool):
+        raise ValueError("max_size must be a positive integer")
+    try:
+        value = int(max_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_size must be a positive integer") from exc
+    if value < 1 or value > 50000:
+        raise ValueError("max_size must be between 1 and 50000")
+    return value
+
+
+MAX_EXPORT_PRESET_NAME_LEN = 80
+
+EXPORT_PRESET_SETTING_KEYS = frozenset({
+    "destination",
+    "export_to_subfolder",
+    "subfolder_name",
+    "reveal_after_export",
+    "format",
+    "max_size",
+    "quality",
+    "naming_template",
+    "metadata_fields",
+})
+
+
+def normalize_export_preset_name(name):
+    """Validate a saved-export-preset display name."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("preset name is required")
+    name = name.strip()
+    if len(name) > MAX_EXPORT_PRESET_NAME_LEN:
+        raise ValueError(
+            f"preset name must be {MAX_EXPORT_PRESET_NAME_LEN} characters or fewer"
+        )
+    # Names travel in the DELETE route path, so keep them URL-path safe.
+    # Reject "." and ".." explicitly: encodeURIComponent leaves them
+    # unchanged and browser URL resolution collapses the segment, so the
+    # UI cannot address such a preset for deletion.
+    if name in (".", ".."):
+        raise ValueError("preset name must not be '.' or '..'")
+    if "/" in name or "\\" in name or any(ord(ch) < 32 for ch in name):
+        raise ValueError("preset name must not contain slashes or control characters")
+    return name
+
+
+def normalize_export_preset_settings(settings):
+    """Validate and normalize a saved export preset's settings dict.
+
+    Presets snapshot the full export dialog, so every field the
+    /api/jobs/export endpoint accepts is validated here with the same
+    rules, and unknown keys are rejected rather than silently stored.
+    """
+    if not isinstance(settings, dict):
+        raise ValueError("preset settings must be an object")
+    unknown = sorted(set(settings) - EXPORT_PRESET_SETTING_KEYS)
+    if unknown:
+        raise ValueError(f"unknown preset settings: {', '.join(unknown)}")
+
+    destination = settings.get("destination", "")
+    if not isinstance(destination, str):
+        raise ValueError("destination must be a string")
+    destination = destination.strip()
+    if destination and not os.path.isabs(destination):
+        raise ValueError("destination must be an absolute path")
+
+    export_to_subfolder = settings.get("export_to_subfolder", False)
+    if not isinstance(export_to_subfolder, bool):
+        raise ValueError("export_to_subfolder must be a boolean")
+    reveal_after_export = settings.get("reveal_after_export", False)
+    if not isinstance(reveal_after_export, bool):
+        raise ValueError("reveal_after_export must be a boolean")
+
+    naming_template = settings.get("naming_template", "{original}")
+    if not isinstance(naming_template, str):
+        raise ValueError("naming_template must be a string")
+    naming_template = naming_template.strip() or "{original}"
+
+    raw_subfolder_name = settings.get("subfolder_name")
+    if export_to_subfolder:
+        subfolder_name = normalize_subfolder_name(raw_subfolder_name)
+    else:
+        # A disabled subfolder value is inert at export time. Preserve a
+        # valid dormant name for later toggling, but normalize invalid stale
+        # UI/config values to the safe default instead of rejecting the
+        # whole preset.
+        try:
+            subfolder_name = normalize_subfolder_name(raw_subfolder_name)
+        except ValueError:
+            subfolder_name = DEFAULT_EXPORT_SUBFOLDER
+
+    return {
+        "destination": destination,
+        "export_to_subfolder": export_to_subfolder,
+        "subfolder_name": subfolder_name,
+        "reveal_after_export": reveal_after_export,
+        "format": normalize_output_format(settings.get("format", "jpg"))["extension"],
+        "max_size": normalize_max_size(settings.get("max_size")),
+        "quality": normalize_quality(settings.get("quality", 92)),
+        "naming_template": naming_template,
+        "metadata_fields": normalize_metadata_fields(settings.get("metadata_fields")),
+    }
+
+
 def resolve_template(template, photo, species=None, seq=1):
     """Resolve a naming template against photo metadata.
 
@@ -230,9 +387,11 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
                 file. Supported values are species, capture_date,
                 capture_time, rating, location, and camera. The default is an
                 empty list, preserving the existing metadata-free export.
-            export_to_subfolder: bool -- create an ``exported`` directory
-                beneath the shared destination or each original photo's
-                folder.
+            export_to_subfolder: bool -- create a subfolder beneath the
+                shared destination or each original photo's folder.
+            subfolder_name: str -- name of that subfolder (a single path
+                component, validated by ``normalize_subfolder_name``).
+                Defaults to ``exported`` when omitted or blank.
             collect_files: bool -- include every exported path in the result.
                 Defaults to false so large background exports keep a compact
                 job result.
@@ -262,7 +421,10 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
         wc_max = 4096
     developed_dir = options.get("developed_dir") or ""
     metadata_fields = normalize_metadata_fields(options.get("metadata_fields"))
-    subfolder = "exported" if options.get("export_to_subfolder") else ""
+    subfolder = (
+        normalize_subfolder_name(options.get("subfolder_name"))
+        if options.get("export_to_subfolder") else ""
+    )
     collect_files = bool(options.get("collect_files", False))
 
     if destination:
@@ -1707,7 +1869,10 @@ def preview_export_renames(db, photo_ids, destination=None, options=None):
         wc_max = 4096
     vireo_dir = options.get("vireo_dir") or ""
     developed_dir = options.get("developed_dir") or ""
-    subfolder = "exported" if options.get("export_to_subfolder") else ""
+    subfolder = (
+        normalize_subfolder_name(options.get("subfolder_name"))
+        if options.get("export_to_subfolder") else ""
+    )
 
     photos_map = db.get_photos_by_ids(photo_ids)
     folders = {folder["id"]: folder["path"] for folder in db.get_folder_tree()}

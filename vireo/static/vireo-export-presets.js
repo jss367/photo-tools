@@ -207,11 +207,14 @@ var VireoExportPresets = (function() {
         !window.confirm('Replace the existing preset “' + name + '”?')) {
       return;
     }
-    // Snapshot the modal edit generation before the network round trip. If
-    // the user tweaks any control while the POST + refresh are in flight,
-    // the controls no longer match what got saved, so keep the dropdown on
-    // Custom instead of relabeling the edited fields as this preset.
+    // Snapshot the modal edit AND open generations before the network round
+    // trip. If the user tweaks any control while the POST + refresh are in
+    // flight, the controls no longer match what got saved; if they close and
+    // reopen the modal, modalOpened() has already restored Custom or another
+    // preset. In either case keep the dropdown as-is instead of relabeling
+    // the current fields as this preset.
     var editGeneration = modalEditGeneration;
+    var openGeneration = modalOpenGeneration;
     var payload = collectSettings();
     try {
       var data = await safeFetch('/api/export/presets', {
@@ -226,13 +229,14 @@ var VireoExportPresets = (function() {
     }
     await refresh();
     var edited = editGeneration !== modalEditGeneration;
-    if (!edited) {
+    var reopened = openGeneration !== modalOpenGeneration;
+    if (!edited && !reopened) {
       presetSelect().value = SAVED_PREFIX + name;
       VireoViewPreferences.write(LAST_USED_KEY, SAVED_PREFIX + name);
     }
     updateButtons();
     if (typeof showToast === 'function') {
-      var msg = edited
+      var msg = (edited || reopened)
         ? 'Saved export preset “' + name + '” (kept your edits as Custom)'
         : 'Saved export preset “' + name + '”';
       showToast(msg, 'info');

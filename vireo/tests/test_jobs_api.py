@@ -1359,6 +1359,17 @@ def test_export_presets_rejects_invalid_payloads(app_and_db):
     assert resp.status_code == 400
     assert "subfolder_name" in resp.get_json()["error"]
 
+    # Truthy non-object JSON bodies (array, string, number) must produce a
+    # 400 validation error, not a 500 from AttributeError on ``.get(...)``.
+    for bad in ([1, 2, 3], "default", 3):
+        resp = client.post(
+            "/api/export/presets",
+            data=json.dumps(bad),
+            content_type="application/json",
+        )
+        assert resp.status_code == 400, bad
+        assert "JSON object" in resp.get_json()["error"]
+
     assert client.get("/api/export/presets").get_json() == {"presets": []}
 
 

@@ -26726,7 +26726,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             normalize_export_preset_settings,
         )
 
-        body = request.get_json(silent=True) or {}
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return json_error("request body must be a JSON object")
         try:
             name = normalize_export_preset_name(body.get("name"))
             settings = normalize_export_preset_settings(body.get("settings"))

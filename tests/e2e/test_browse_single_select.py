@@ -212,6 +212,9 @@ def test_export_presets_do_not_overwrite_edits_while_loading(live_server, page):
 
     page.get_by_role("button", name="Export", exact=True).click()
     expect(page.locator("#exportSubmitBtn")).to_be_disabled()
+    expect(page.locator("#exportPreset")).to_be_disabled()
+    expect(page.locator("#exportPresetSaveBtn")).to_be_disabled()
+    expect(page.locator("#exportPresetDeleteBtn")).to_be_disabled()
     page.locator("#exportDest").fill("/user-selected")
     page.evaluate(
         """() => window.__resolveExportPresets({presets: [{
@@ -221,6 +224,8 @@ def test_export_presets_do_not_overwrite_edits_while_loading(live_server, page):
     )
 
     expect(page.locator("#exportSubmitBtn")).to_be_enabled()
+    expect(page.locator("#exportPreset")).to_be_enabled()
+    expect(page.locator("#exportPresetSaveBtn")).to_be_enabled()
     expect(page.locator("#exportDest")).to_have_value("/user-selected")
     expect(page.locator("#exportPreset")).to_have_value("custom")
 

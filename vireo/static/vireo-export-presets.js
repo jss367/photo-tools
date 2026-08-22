@@ -18,6 +18,7 @@ var VireoExportPresets = (function() {
   var modalOpenGeneration = 0;
   var refreshGeneration = 0;
   var savingNames = Object.create(null);
+  var presetActionsDisabled = false;
 
   function $(id) { return document.getElementById(id); }
   function overlay() { return $('exportOverlay'); }
@@ -37,7 +38,17 @@ var VireoExportPresets = (function() {
 
   function updateButtons() {
     var deleteBtn = $('exportPresetDeleteBtn');
-    if (deleteBtn) deleteBtn.disabled = !selectedSavedName();
+    if (deleteBtn) {
+      deleteBtn.disabled = presetActionsDisabled || !selectedSavedName();
+    }
+  }
+
+  function setPresetActionsDisabled(disabled) {
+    presetActionsDisabled = disabled;
+    presetSelect().disabled = disabled;
+    var saveBtn = $('exportPresetSaveBtn');
+    if (saveBtn) saveBtn.disabled = disabled;
+    updateButtons();
   }
 
   function subfolderName() {
@@ -330,6 +341,7 @@ var VireoExportPresets = (function() {
     var restorationComplete = false;
     var submit = $('exportSubmitBtn');
     if (submit) submit.disabled = true;
+    setPresetActionsDisabled(true);
     syncSubfolderNameState();
     try {
       var refreshResult = await refresh();
@@ -395,6 +407,7 @@ var VireoExportPresets = (function() {
       if (submit && openGeneration === modalOpenGeneration &&
           overlay().classList.contains('open') && restorationComplete) {
         submit.disabled = false;
+        setPresetActionsDisabled(false);
       }
     }
   }

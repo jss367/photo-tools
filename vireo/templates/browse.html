@@ -6772,7 +6772,7 @@ async function copyDevelopmentSettingsFromPhoto(photoId) {
   if (!photoId || !window.vireoEditNav) return;
   var copySeq = ++_browseDevelopmentCopySeq;
   var copyToken = typeof window.vireoEditNav.beginCopiedRecipe === 'function'
-    ? window.vireoEditNav.beginCopiedRecipe()
+    ? await window.vireoEditNav.beginCopiedRecipe()
     : null;
   try {
     // Fetch the authoritative recipe so a long-lived Browse tab cannot copy
@@ -6787,7 +6787,7 @@ async function copyDevelopmentSettingsFromPhoto(photoId) {
     var recipe = data && data.recipe;
     if (!_browseHasDevelopmentSettings(recipe)) {
       if (typeof window.vireoEditNav.cancelCopiedRecipe === 'function') {
-        window.vireoEditNav.cancelCopiedRecipe(copyToken);
+        if (!await window.vireoEditNav.cancelCopiedRecipe(copyToken)) return;
       }
       showToast('This photo has no development settings to copy', 'error');
       return;
@@ -6800,9 +6800,9 @@ async function copyDevelopmentSettingsFromPhoto(photoId) {
       copyToken &&
       typeof window.vireoEditNav.setCopiedRecipeIfCurrent === 'function'
     ) {
-      if (!window.vireoEditNav.setCopiedRecipeIfCurrent(recipe, meta, copyToken)) return;
+      if (!await window.vireoEditNav.setCopiedRecipeIfCurrent(recipe, meta, copyToken)) return;
     } else {
-      window.vireoEditNav.setCopiedRecipe(recipe, meta);
+      await window.vireoEditNav.setCopiedRecipe(recipe, meta);
     }
     showToast('Development settings copied', 'success');
     updatePasteEditSection(getActiveSelection());
@@ -6814,7 +6814,7 @@ async function copyDevelopmentSettingsFromPhoto(photoId) {
       !window.vireoEditNav.isCopiedRecipeCurrent(copyToken)
     ) return;
     if (typeof window.vireoEditNav.cancelCopiedRecipe === 'function') {
-      window.vireoEditNav.cancelCopiedRecipe(copyToken);
+      if (!await window.vireoEditNav.cancelCopiedRecipe(copyToken)) return;
     }
     showToast(e.message || 'Could not copy development settings', 'error');
   }

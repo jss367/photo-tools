@@ -128,6 +128,9 @@ def test_latest_development_settings_copy_wins(live_server, page):
           try {
             const older = copyDevelopmentSettingsFromPhoto(photoIds[0]);
             const latest = copyDevelopmentSettingsFromPhoto(photoIds[1]);
+            while (!pending[String(photoIds[0])] || !pending[String(photoIds[1])]) {
+              await new Promise(resolve => setTimeout(resolve, 0));
+            }
             pending[String(photoIds[1])]({
               recipe: {adjustments: {exposure: 1.5}},
             });
@@ -171,6 +174,7 @@ def test_later_cross_tab_development_settings_copy_wins(live_server, page):
             }""",
             photo_id,
         )
+        page.wait_for_function("() => typeof window.__resolveOldCopy === 'function'")
         other_page.evaluate(
             """() => window.vireoEditNav.setCopiedRecipe(
               {adjustments: {exposure: 2.0}},
@@ -206,8 +210,8 @@ def test_development_settings_paste_blocks_overlapping_requests(
     photo_id = int(card.get_attribute("data-id"))
 
     pending_state = page.evaluate(
-        """photoId => {
-          window.vireoEditNav.setCopiedRecipe({adjustments: {exposure: 1.0}});
+        """async photoId => {
+          await window.vireoEditNav.setCopiedRecipe({adjustments: {exposure: 1.0}});
           selectedPhotos.clear();
           selectedPhotos.add(photoId);
           selectedPhotoId = photoId;

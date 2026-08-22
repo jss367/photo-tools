@@ -1,3 +1,5 @@
+import re
+
 from playwright.sync_api import expect
 
 _PNG_1X1 = (
@@ -25,6 +27,232 @@ def test_right_click_photo_opens_menu(live_server, page):
     expect(menu.locator(".vireo-ctx-item", has_text="Copy Path")).to_be_visible()
     expect(menu.locator(".vireo-ctx-item", has_text="Delete")).to_be_visible()
     expect(menu.get_by_text("View on Map", exact=True)).to_be_visible()
+    expect(menu.get_by_text("Copy Development Settings", exact=True)).to_be_visible()
+    expect(menu.get_by_text("Paste Development Settings", exact=True)).to_be_visible()
+
+
+def test_browse_labels_lightbox_adjustments_as_quick_adjust(live_server, page):
+    page.goto(f"{live_server['url']}/browse")
+
+    expect(page.locator("#lightboxAdjustBtn")).to_have_text("Quick Adjust")
+
+
+def test_right_click_copies_and_pastes_development_settings(
+    live_server, page
+):
+    """A grid photo's saved recipe can be copied onto selected targets."""
+    page.goto(f"{live_server['url']}/browse")
+
+    cards = page.locator(".grid-card")
+    cards.first.wait_for(state="visible")
+    assert cards.count() >= 3
+    alternate_id = int(cards.nth(0).get_attribute("data-id"))
+    source_id = int(cards.nth(1).get_attribute("data-id"))
+    target_ids = [
+        alternate_id,
+        int(cards.nth(2).get_attribute("data-id")),
+    ]
+
+    alternate_response = page.request.put(
+        f"{live_server['url']}/api/photos/{alternate_id}/edit-recipe",
+        data={"recipe": {"adjustments": {"exposure": -0.5}}},
+    )
+    response = page.request.put(
+        f"{live_server['url']}/api/photos/{source_id}/edit-recipe",
+        data={"recipe": {"adjustments": {"exposure": 1.5}}},
+    )
+    assert alternate_response.ok
+    assert response.ok
+
+    # The recipes were added after Browse loaded, so its in-memory photo rows
+    # are stale. Copy must stay available and fetch the exact right-clicked
+    # photo's authoritative recipe, not the first item in the selection.
+    cards.nth(0).click(modifiers=["Meta"])
+    cards.nth(1).click(modifiers=["Meta"])
+    cards.nth(1).click(button="right")
+    menu = page.locator(".vireo-ctx-menu")
+    copy_item = menu.get_by_text("Copy Development Settings", exact=True)
+    expect(copy_item).not_to_have_class(re.compile(r"vireo-ctx-disabled"))
+    copy_item.click()
+    page.wait_for_function(
+        """() => window.vireoEditNav.getCopiedRecipe()?.recipe
+          ?.adjustments?.exposure === 1.5"""
+    )
+
+    # Reload to clear the source selection while retaining the shared recipe
+    # clipboard, then select both targets and paste from their context menu.
+    page.reload()
+    cards = page.locator(".grid-card")
+    cards.first.wait_for(state="visible")
+    cards.nth(0).click(modifiers=["Meta"])
+    cards.nth(2).click(modifiers=["Meta"])
+    cards.nth(0).click(button="right")
+    paste_item = page.locator(".vireo-ctx-menu").get_by_text(
+        "Paste Development Settings", exact=True
+    )
+    expect(paste_item).not_to_have_class(re.compile(r"vireo-ctx-disabled"))
+    paste_item.click()
+
+    for target_id in target_ids:
+        page.wait_for_function(
+            """async photoId => {
+              const response = await fetch('/api/photos/' + photoId + '/edit-recipe');
+              const data = await response.json();
+              return data.recipe?.adjustments?.exposure === 1.5;
+            }""",
+            arg=target_id,
+        )
+
+
+def test_latest_development_settings_copy_wins(live_server, page):
+    """An older, slower recipe response cannot replace the latest copy."""
+    page.goto(f"{live_server['url']}/browse")
+    cards = page.locator(".grid-card")
+    cards.first.wait_for(state="visible")
+    photo_ids = [
+        int(cards.nth(0).get_attribute("data-id")),
+        int(cards.nth(1).get_attribute("data-id")),
+    ]
+
+    copied_exposure = page.evaluate(
+        """async photoIds => {
+          const originalSafeFetch = window.safeFetch;
+          const pending = {};
+          window.safeFetch = function(url, options, config) {
+            const match = url.match(/^[/]api[/]photos[/]([0-9]+)[/]edit-recipe$/);
+            if (match) {
+              return new Promise(resolve => { pending[match[1]] = resolve; });
+            }
+            return originalSafeFetch(url, options, config);
+          };
+          try {
+            const older = copyDevelopmentSettingsFromPhoto(photoIds[0]);
+            const latest = copyDevelopmentSettingsFromPhoto(photoIds[1]);
+            while (!pending[String(photoIds[0])] || !pending[String(photoIds[1])]) {
+              await new Promise(resolve => setTimeout(resolve, 0));
+            }
+            pending[String(photoIds[1])]({
+              recipe: {adjustments: {exposure: 1.5}},
+            });
+            await latest;
+            pending[String(photoIds[0])]({
+              recipe: {adjustments: {exposure: -0.5}},
+            });
+            await older;
+            return window.vireoEditNav.getCopiedRecipe().recipe.adjustments.exposure;
+          } finally {
+            window.safeFetch = originalSafeFetch;
+          }
+        }""",
+        photo_ids,
+    )
+
+    assert copied_exposure == 1.5
+
+
+def test_later_cross_tab_development_settings_copy_wins(live_server, page):
+    """A pending Browse fetch cannot overwrite a newer cross-tab copy."""
+    page.goto(f"{live_server['url']}/browse")
+    card = page.locator(".grid-card").first
+    card.wait_for(state="visible")
+    photo_id = int(card.get_attribute("data-id"))
+    other_page = page.context.new_page()
+    try:
+        other_page.goto(f"{live_server['url']}/browse")
+        other_page.locator(".grid-card").first.wait_for(state="visible")
+        page.evaluate(
+            """photoId => {
+              const originalSafeFetch = window.safeFetch;
+              window.__originalCopySafeFetch = originalSafeFetch;
+              window.safeFetch = function(url, options, config) {
+                if (url === '/api/photos/' + photoId + '/edit-recipe') {
+                  return new Promise(resolve => { window.__resolveOldCopy = resolve; });
+                }
+                return originalSafeFetch(url, options, config);
+              };
+              window.__oldCopyPromise = copyDevelopmentSettingsFromPhoto(photoId);
+            }""",
+            photo_id,
+        )
+        page.wait_for_function("() => typeof window.__resolveOldCopy === 'function'")
+        other_page.evaluate(
+            """() => window.vireoEditNav.setCopiedRecipe(
+              {adjustments: {exposure: 2.0}},
+              {source: 'newer-tab.jpg', at: Date.now()}
+            )"""
+        )
+        page.evaluate(
+            """async () => {
+              window.__resolveOldCopy({
+                recipe: {adjustments: {exposure: -1.0}},
+              });
+              await window.__oldCopyPromise;
+              window.safeFetch = window.__originalCopySafeFetch;
+            }"""
+        )
+
+        assert page.evaluate(
+            "() => window.vireoEditNav.getCopiedRecipe().recipe.adjustments.exposure"
+        ) == 2.0
+        assert other_page.evaluate(
+            "() => window.vireoEditNav.getCopiedRecipe().source"
+        ) == "newer-tab.jpg"
+    finally:
+        other_page.close()
+
+
+def test_development_settings_paste_blocks_overlapping_requests(
+    live_server, page
+):
+    page.goto(f"{live_server['url']}/browse")
+    card = page.locator(".grid-card").first
+    card.wait_for(state="visible")
+    photo_id = int(card.get_attribute("data-id"))
+
+    pending_state = page.evaluate(
+        """async photoId => {
+          await window.vireoEditNav.setCopiedRecipe({adjustments: {exposure: 1.0}});
+          selectedPhotos.clear();
+          selectedPhotos.add(photoId);
+          selectedPhotoId = photoId;
+          const originalSafeFetch = window.safeFetch;
+          window.__originalPasteSafeFetch = originalSafeFetch;
+          window.__pasteRequestCount = 0;
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/photos/edit-recipe/apply') {
+              window.__pasteRequestCount += 1;
+              return new Promise(resolve => { window.__resolvePaste = resolve; });
+            }
+            return originalSafeFetch(url, options, config);
+          };
+          window.__pastePromise = pasteEditSettingsToSelection();
+          pasteEditSettingsToSelection();
+          const pasteItem = buildPhotoContextMenu([photoId], photoId)
+            .find(item => item.label === 'Paste Development Settings');
+          return {
+            requestCount: window.__pasteRequestCount,
+            inFlight: _browseDevelopmentPasteInFlight,
+            menuDisabled: pasteItem.disabled,
+            menuHint: pasteItem.disabledHint,
+          };
+        }""",
+        photo_id,
+    )
+    assert pending_state == {
+        "requestCount": 1,
+        "inFlight": True,
+        "menuDisabled": True,
+        "menuHint": "A development settings paste is already running",
+    }
+
+    page.evaluate(
+        """async () => {
+          window.__resolvePaste({applied: [], skipped: [], count: 0, recipes: {}});
+          await window.__pastePromise;
+          window.safeFetch = window.__originalPasteSafeFetch;
+        }"""
+    )
+    assert page.evaluate("() => _browseDevelopmentPasteInFlight") is False
 
 
 def test_view_on_map_context_action_targets_right_clicked_photo(live_server, page):

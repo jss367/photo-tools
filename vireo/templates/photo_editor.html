@@ -3952,7 +3952,7 @@ function editorNav(delta) {
   loadPhoto(ids[newIdx]);
 }
 
-function copyEditSettings() {
+async function copyEditSettings() {
   if (!editorState.photoId || !window.vireoEditNav) return;
   var recipe = recipeForSave(editorState.recipe);
   if (!recipe || Object.keys(recipe).length === 0) {
@@ -3960,7 +3960,7 @@ function copyEditSettings() {
     else setStatus('No edits to copy', true);
     return;
   }
-  window.vireoEditNav.setCopiedRecipe(recipe, {
+  await window.vireoEditNav.setCopiedRecipe(recipe, {
     source: (editorState.photo && editorState.photo.filename) || null,
     at: Date.now(),
   });

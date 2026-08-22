@@ -131,9 +131,9 @@ def test_single_click_reveals_batch_bar(live_server, page):
     # Develop moved off the bar into the unified More menu; it must still be
     # reachable for a single-photo selection.
     page.locator("#batchMoreBtn").click()
-    expect(
-        page.locator(".vireo-ctx-menu .vireo-ctx-item", has_text="Develop")
-    ).to_be_visible()
+    expect(page.locator(".vireo-ctx-menu").get_by_text(
+        "Develop", exact=True
+    )).to_be_visible()
     page.keyboard.press("Escape")
 
 

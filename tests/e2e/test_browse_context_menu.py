@@ -104,6 +104,49 @@ def test_right_click_copies_and_pastes_development_settings(
         )
 
 
+def test_latest_development_settings_copy_wins(live_server, page):
+    """An older, slower recipe response cannot replace the latest copy."""
+    page.goto(f"{live_server['url']}/browse")
+    cards = page.locator(".grid-card")
+    cards.first.wait_for(state="visible")
+    photo_ids = [
+        int(cards.nth(0).get_attribute("data-id")),
+        int(cards.nth(1).get_attribute("data-id")),
+    ]
+
+    copied_exposure = page.evaluate(
+        """async photoIds => {
+          const originalSafeFetch = window.safeFetch;
+          const pending = {};
+          window.safeFetch = function(url, options, config) {
+            const match = url.match(/^[/]api[/]photos[/]([0-9]+)[/]edit-recipe$/);
+            if (match) {
+              return new Promise(resolve => { pending[match[1]] = resolve; });
+            }
+            return originalSafeFetch(url, options, config);
+          };
+          try {
+            const older = copyDevelopmentSettingsFromPhoto(photoIds[0]);
+            const latest = copyDevelopmentSettingsFromPhoto(photoIds[1]);
+            pending[String(photoIds[1])]({
+              recipe: {adjustments: {exposure: 1.5}},
+            });
+            await latest;
+            pending[String(photoIds[0])]({
+              recipe: {adjustments: {exposure: -0.5}},
+            });
+            await older;
+            return window.vireoEditNav.getCopiedRecipe().recipe.adjustments.exposure;
+          } finally {
+            window.safeFetch = originalSafeFetch;
+          }
+        }""",
+        photo_ids,
+    )
+
+    assert copied_exposure == 1.5
+
+
 def test_view_on_map_context_action_targets_right_clicked_photo(live_server, page):
     """Browse's right-click View on Map action targets the context photo."""
     url = live_server["url"]

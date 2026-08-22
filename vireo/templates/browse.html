@@ -6765,13 +6765,17 @@ function _browseHasDevelopmentSettings(recipe) {
   }));
 }
 
+var _browseDevelopmentCopySeq = 0;
+
 async function copyDevelopmentSettingsFromPhoto(photoId) {
   var photo = photos.find(function(candidate) { return candidate.id === Number(photoId); });
   if (!photoId || !window.vireoEditNav) return;
+  var copySeq = ++_browseDevelopmentCopySeq;
   try {
     // Fetch the authoritative recipe so a long-lived Browse tab cannot copy
     // settings that were changed in another surface since its last refresh.
     var data = await safeFetch('/api/photos/' + photoId + '/edit-recipe', {}, {toast: false});
+    if (copySeq !== _browseDevelopmentCopySeq) return;
     var recipe = data && data.recipe;
     if (!_browseHasDevelopmentSettings(recipe)) {
       showToast('This photo has no development settings to copy', 'error');
@@ -6784,6 +6788,7 @@ async function copyDevelopmentSettingsFromPhoto(photoId) {
     showToast('Development settings copied', 'success');
     updatePasteEditSection(getActiveSelection());
   } catch (e) {
+    if (copySeq !== _browseDevelopmentCopySeq) return;
     showToast(e.message || 'Could not copy development settings', 'error');
   }
 }

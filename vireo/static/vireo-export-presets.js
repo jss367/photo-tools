@@ -292,6 +292,12 @@ var VireoExportPresets = (function() {
         // silently exporting only one half.
         var combined = document.getElementById('exportMetadataCaptureDateTime');
         if (combined) delete combined.dataset.presetFields;
+        // Host reset the selector to a built-in default before opening, but
+        // VireoViewPreferences.restoreAll has since restored persisted
+        // fields (subfolder, metadata boxes, reveal-after) that mark the
+        // dialog Custom. Snap the dropdown back so it doesn't advertise a
+        // built-in preset while the fields below no longer match it.
+        if (last === 'custom') presetSelect().value = 'custom';
         updateButtons();
         return;
       }

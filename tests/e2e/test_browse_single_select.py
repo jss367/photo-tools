@@ -225,6 +225,42 @@ def test_export_presets_do_not_overwrite_edits_while_loading(live_server, page):
     expect(page.locator("#exportPreset")).to_have_value("custom")
 
 
+def test_export_preset_dropdown_reflects_custom_on_reopen(live_server, page):
+    """Reopening after a custom edit shows Custom, not the host's built-in reset.
+
+    Regression: the host resets ``#exportPreset`` to ``original-jpg`` before
+    ``modalOpened()`` runs and then ``VireoViewPreferences.restoreAll`` puts
+    persisted custom fields (subfolder toggle, metadata boxes, reveal-after)
+    back on screen. When ``LAST_USED_KEY`` was ``custom``, ``modalOpened``
+    used to return without snapping the dropdown back, so the modal
+    advertised "Full-size JPEG" while the fields below no longer matched it.
+    """
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    # Simulate a manual tweak: check the subfolder box, which fires the
+    # delegated input handler and calls markCustom() -> LAST_USED_KEY=custom.
+    page.locator("#exportSubfolder").check()
+    expect(page.locator("#exportPreset")).to_have_value("custom")
+
+    page.locator("#exportOverlay [data-export-cancel]").click()
+    expect(page.locator("#exportOverlay")).not_to_have_class(
+        "modal-overlay open"
+    )
+
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    # Persisted view preference restored the checkbox, so the dropdown must
+    # follow instead of falsely displaying the built-in reset default.
+    expect(page.locator("#exportSubfolder")).to_be_checked()
+    expect(page.locator("#exportPreset")).to_have_value("custom")
+
+
 def test_export_checkboxes_remember_the_previous_choices(live_server, page):
     """Export checkbox choices survive closing the dialog and reloading Browse."""
     page.goto(f"{live_server['url']}/browse")

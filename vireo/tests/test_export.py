@@ -114,6 +114,20 @@ def test_normalize_subfolder_name_rejects_paths_and_unsafe_chars():
         normalize_subfolder_name(7)
 
 
+def test_normalize_subfolder_name_rejects_windows_reserved_names():
+    from export import normalize_subfolder_name
+
+    for bad in (
+        "CON", "con.txt", "PRN", "AUX.jpeg", "NUL", "COM1", "com9.log",
+        "LPT1", "lpt9.txt", "finals.",
+    ):
+        with pytest.raises(ValueError):
+            normalize_subfolder_name(bad)
+
+    for valid in ("console", "COM0", "COM10", "LPT0", "LPT10", "finals.v2"):
+        assert normalize_subfolder_name(valid) == valid
+
+
 def test_normalize_max_size():
     from export import normalize_max_size
 

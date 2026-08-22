@@ -1108,6 +1108,63 @@ def test_import_accepts_well_formed_keyboard_shortcuts(app_and_db):
     assert resp.status_code == 200
 
 
+def test_import_normalizes_export_presets(app_and_db):
+    app, _ = app_and_db
+    client = app.test_client()
+    payload = {
+        "export_presets": [{
+            "name": "  Web export  ",
+            "settings": {"quality": "85", "subfolder_name": " finals "},
+        }],
+    }
+
+    resp = client.post(
+        "/api/settings/import",
+        json={"json": json.dumps(payload)},
+    )
+
+    assert resp.status_code == 200
+    import config as cfg
+    assert cfg.get_export_presets() == [{
+        "name": "Web export",
+        "settings": {
+            "destination": "",
+            "export_to_subfolder": False,
+            "subfolder_name": "finals",
+            "reveal_after_export": False,
+            "format": "jpg",
+            "max_size": None,
+            "quality": 85,
+            "naming_template": "{original}",
+            "metadata_fields": [],
+        },
+    }]
+
+
+def test_import_rejects_invalid_export_presets_without_writing(app_and_db):
+    app, _ = app_and_db
+    import config as cfg
+
+    cfg.set("classification_threshold", 0.5)
+    client = app.test_client()
+    payload = {
+        "classification_threshold": 0.9,
+        "export_presets": [{
+            "name": "Unsafe",
+            "settings": {"subfolder_name": "CON.txt"},
+        }],
+    }
+
+    resp = client.post(
+        "/api/settings/import",
+        json={"json": json.dumps(payload)},
+    )
+
+    assert resp.status_code == 400
+    assert "export_presets[0].settings" in resp.get_json()["errors"]
+    assert cfg.load()["classification_threshold"] == 0.5
+
+
 def test_import_rejects_empty_object_at_nested_schema_leaf(app_and_db):
     app, _ = app_and_db
     client = app.test_client()

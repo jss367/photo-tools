@@ -14,6 +14,8 @@ var VireoExportPresets = (function() {
   var DEFAULT_SUBFOLDER = 'exported';
   var presets = [];
   var builtinOptions = null;
+  var modalEditGeneration = 0;
+  var modalOpenGeneration = 0;
 
   function $(id) { return document.getElementById(id); }
   function overlay() { return $('exportOverlay'); }
@@ -178,6 +180,7 @@ var VireoExportPresets = (function() {
   }
 
   function onPresetChange() {
+    modalEditGeneration++;
     var value = presetSelect().value;
     if (value.indexOf(SAVED_PREFIX) === 0) {
       var preset = findPreset(value.slice(SAVED_PREFIX.length));
@@ -252,25 +255,45 @@ var VireoExportPresets = (function() {
    * restores its view preferences: fetches the current preset list, then
    * re-applies whatever the user exported with last time. */
   async function modalOpened() {
+    var openGeneration = ++modalOpenGeneration;
+    var editGeneration = modalEditGeneration;
+    var submit = $('exportSubmitBtn');
+    if (submit) submit.disabled = true;
     syncSubfolderNameState();
-    await refresh();
-    if (!overlay().classList.contains('open')) return;
-    var last = VireoViewPreferences.read(LAST_USED_KEY);
-    if (!last || last === 'custom') { updateButtons(); return; }
-    var sel = presetSelect();
-    if (last.indexOf(SAVED_PREFIX) === 0) {
-      var preset = findPreset(last.slice(SAVED_PREFIX.length));
-      if (preset) {
+    try {
+      await refresh();
+      if (openGeneration !== modalOpenGeneration ||
+          !overlay().classList.contains('open')) return;
+      // Do not replace a destination, template, or other control the user
+      // changed while the preset request was in flight.
+      if (editGeneration !== modalEditGeneration) {
+        updateButtons();
+        return;
+      }
+      var last = VireoViewPreferences.read(LAST_USED_KEY);
+      if (!last || last === 'custom') { updateButtons(); return; }
+      var sel = presetSelect();
+      if (last.indexOf(SAVED_PREFIX) === 0) {
+        var preset = findPreset(last.slice(SAVED_PREFIX.length));
+        if (!preset) return;
         sel.value = last;
         applySettings(preset.settings);
+      } else {
+        sel.value = last;
+        if (sel.value === last && typeof applyExportPreset === 'function') {
+          applyExportPreset(last);
+        }
       }
-    } else {
-      sel.value = last;
-      if (sel.value === last && typeof applyExportPreset === 'function') {
-        applyExportPreset(last);
+      updateButtons();
+    } finally {
+      // The export button is the only submission path on both host pages.
+      // Keep it gated until the latest modal opening has either restored the
+      // preset or deliberately preserved an edit made during the request.
+      if (submit && openGeneration === modalOpenGeneration &&
+          overlay().classList.contains('open')) {
+        submit.disabled = false;
       }
     }
-    updateButtons();
   }
 
   /* Flip the preset dropdown to "Custom" and remember that in the last-used
@@ -290,6 +313,7 @@ var VireoExportPresets = (function() {
    * below) or when a different preset is applied (see onPresetChange /
    * applySettings). */
   function markCustom() {
+    modalEditGeneration++;
     if (typeof markExportCustom === 'function') markExportCustom();
     VireoViewPreferences.write(LAST_USED_KEY, 'custom');
     updateButtons();

@@ -187,6 +187,44 @@ def test_export_defaults_beside_original_and_offers_folder_browser(
     assert request["export_to_subfolder"] is True
 
 
+def test_export_presets_do_not_overwrite_edits_while_loading(live_server, page):
+    """Delayed preset restoration gates export and preserves newer edits."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.evaluate(
+        """() => {
+          const realSafeFetch = window.safeFetch;
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets') {
+              return new Promise(function(resolve) {
+                window.__resolveExportPresets = resolve;
+              });
+            }
+            return realSafeFetch(url, options, config);
+          };
+          VireoViewPreferences.write(
+            'vireo.export.lastPreset', 'saved:Delayed preset'
+          );
+        }"""
+    )
+
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportSubmitBtn")).to_be_disabled()
+    page.locator("#exportDest").fill("/user-selected")
+    page.evaluate(
+        """() => window.__resolveExportPresets({presets: [{
+          name: 'Delayed preset',
+          settings: {destination: '/preset-destination'}
+        }]})"""
+    )
+
+    expect(page.locator("#exportSubmitBtn")).to_be_enabled()
+    expect(page.locator("#exportDest")).to_have_value("/user-selected")
+    expect(page.locator("#exportPreset")).to_have_value("custom")
+
+
 def test_export_checkboxes_remember_the_previous_choices(live_server, page):
     """Export checkbox choices survive closing the dialog and reloading Browse."""
     page.goto(f"{live_server['url']}/browse")

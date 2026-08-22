@@ -1,6 +1,7 @@
 DELETE       /api/collections/<int:collection_id>
 DELETE       /api/edit-presets/<int:preset_id>
 DELETE       /api/embedding-cache
+DELETE       /api/export/presets/<name>
 DELETE       /api/folders/<int:folder_id>
 DELETE       /api/import/orphaned-staging
 DELETE       /api/keywords/<int:keyword_id>
@@ -50,6 +51,7 @@ GET          /api/edit-history
 GET          /api/embedding-cache
 GET          /api/embedding-matrix
 GET          /api/exiftool/status
+GET          /api/export/presets
 GET          /api/filters/fields
 GET          /api/filters/values
 GET          /api/folders
@@ -240,6 +242,7 @@ POST         /api/duplicates/bulk-resolve
 POST         /api/duplicates/delete-loser-files
 POST         /api/duplicates/scan
 POST         /api/encounters/species
+POST         /api/export/presets
 POST         /api/files/reveal
 POST         /api/folders/<int:folder_id>/relocate
 POST         /api/folders/<int:folder_id>/rescan

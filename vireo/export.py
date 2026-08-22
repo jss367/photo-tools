@@ -30,6 +30,10 @@ log = logging.getLogger(__name__)
 
 # Characters not allowed in filenames (covers Windows + macOS + Linux)
 _UNSAFE_RE = re.compile(r'[<>:"/|?*\\]')
+_WINDOWS_RESERVED_SUBFOLDER_RE = re.compile(
+    r"^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$",
+    re.IGNORECASE,
+)
 _OUTPUT_FORMATS = {
     "jpg": {"extension": "jpg", "pil_format": "JPEG", "quality": True},
     "jpeg": {"extension": "jpg", "pil_format": "JPEG", "quality": True},
@@ -177,6 +181,10 @@ def normalize_subfolder_name(name):
         )
     if name in (".", ".."):
         raise ValueError("subfolder_name must not be '.' or '..'")
+    if name.endswith("."):
+        raise ValueError("subfolder_name must not end with a period")
+    if _WINDOWS_RESERVED_SUBFOLDER_RE.fullmatch(name):
+        raise ValueError("subfolder_name must not be a reserved Windows device name")
     if _UNSAFE_RE.search(name) or any(ord(ch) < 32 for ch in name):
         raise ValueError(
             'subfolder_name must not contain path separators or < > : " | ? *'

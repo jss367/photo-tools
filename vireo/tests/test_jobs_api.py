@@ -1136,6 +1136,7 @@ def test_job_export_without_destination_uses_original_folder(app_and_db):
     assert job["config"]["destination"] == ""
     assert job["config"]["destination_mode"] == "original"
     assert job["config"]["export_to_subfolder"] is False
+    assert job["config"]["subfolder_name"] is None
 
 
 def test_job_export_subfolder_option_must_be_boolean(app_and_db):
@@ -1263,6 +1264,7 @@ def test_job_export_writes_into_renamed_subfolder(client_with_photo, tmp_path):
         app.test_client(), response.get_json()["job_id"],
     )
     assert job["status"] == "completed"
+    assert job["config"]["subfolder_name"] == "finals"
     assert (destination / "finals" / "test.jpg").is_file()
     assert not (destination / "exported").exists()
 

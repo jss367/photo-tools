@@ -20047,6 +20047,41 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         )
                         break
 
+        if "export_presets" in payload:
+            from export import (
+                normalize_export_preset_name,
+                normalize_export_preset_settings,
+            )
+
+            raw_presets = payload["export_presets"]
+            normalized_presets = []
+            if not isinstance(raw_presets, list):
+                errors["export_presets"] = "export_presets must be a JSON array"
+            else:
+                for i, entry in enumerate(raw_presets):
+                    entry_key = f"export_presets[{i}]"
+                    if not isinstance(entry, dict):
+                        errors[entry_key] = "export preset must be a JSON object"
+                        continue
+                    try:
+                        name = normalize_export_preset_name(entry.get("name"))
+                    except ValueError as exc:
+                        errors[f"{entry_key}.name"] = str(exc)
+                        name = None
+                    try:
+                        settings = normalize_export_preset_settings(
+                            entry.get("settings")
+                        )
+                    except ValueError as exc:
+                        errors[f"{entry_key}.settings"] = str(exc)
+                        settings = None
+                    if name is not None and settings is not None:
+                        normalized_presets.append({"name": name, "settings": settings})
+                normalized_presets.sort(
+                    key=lambda preset: preset["name"].casefold()
+                )
+                payload["export_presets"] = normalized_presets
+
         if errors:
             return jsonify({"error": "validation failed", "errors": errors}), 400
 
@@ -26963,6 +26998,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "destination": destination,
                 "destination_mode": "custom" if destination else "original",
                 "export_to_subfolder": export_to_subfolder,
+                "subfolder_name": subfolder_name,
                 "naming_template": naming_template,
                 "format": output_format,
                 "metadata_fields": metadata_fields,

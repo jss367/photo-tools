@@ -36815,8 +36815,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         effective = _get_db().get_effective_config(cfg.load())
         pm = effective.get("preview_max_size")
         if pm == 0:
+            params = []
             source = (request.args.get("source") or "").strip().lower()
-            suffix = f"?source={source}" if source in {"jpeg", "raw"} else ""
+            if source in {"jpeg", "raw"}:
+                params.append(f"source={source}")
+            # Forward prefetch so speculative warmups keep their nonblocking
+            # slot on the /original path — otherwise the redirect launders
+            # them into interactive requests and starts an expensive decode
+            # while the current image is still on screen.
+            if request.args.get("prefetch") == "1":
+                params.append("prefetch=1")
+            suffix = f"?{'&'.join(params)}" if params else ""
             return redirect(f"/photos/{photo_id}/original{suffix}")
         return _serve_preview(photo_id, int(pm or 1920))
 

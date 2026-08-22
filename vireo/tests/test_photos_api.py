@@ -4485,6 +4485,37 @@ def test_full_is_alias_for_preview_at_configured_size(client_with_photo, monkeyp
     assert len(full) > 0
 
 
+def test_full_redirect_forwards_prefetch_flag_to_original(client_with_photo):
+    """When preview_max_size=0 the /full redirect must forward prefetch=1.
+
+    Speculative adjacent-image warmups hit /full?prefetch=1; if the redirect
+    to /original drops the flag, the warmup gets promoted to an interactive
+    request and consumes a full-decode slot while the current image is still
+    on screen — the exact contention this PR is designed to prevent.
+    """
+    app, db, photo_id = client_with_photo
+    db.update_workspace(
+        db._active_workspace_id,
+        config_overrides={"preview_max_size": 0},
+    )
+    client = app.test_client()
+
+    resp = client.get(f"/photos/{photo_id}/full?prefetch=1")
+    assert resp.status_code in (301, 302, 307, 308)
+    location = resp.headers["Location"]
+    assert location.endswith(f"/photos/{photo_id}/original?prefetch=1")
+
+    resp = client.get(f"/photos/{photo_id}/full?source=jpeg&prefetch=1")
+    assert resp.status_code in (301, 302, 307, 308)
+    location = resp.headers["Location"]
+    assert "source=jpeg" in location
+    assert "prefetch=1" in location
+
+    resp = client.get(f"/photos/{photo_id}/full")
+    assert resp.status_code in (301, 302, 307, 308)
+    assert "prefetch" not in resp.headers["Location"]
+
+
 def test_preview_skips_recent_failed_raw_working_copy(
     client_with_photo, monkeypatch,
 ):

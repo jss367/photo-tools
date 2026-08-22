@@ -1891,6 +1891,7 @@ def test_concurrent_preview_cache_misses_decode_once(
                 f"/photos/{photo_id}/preview?size=1920&prefetch=1",
             )
         assert speculative.status_code == 204
+        assert speculative.headers["Cache-Control"] == "no-store"
         second = pool.submit(request_preview)
         time.sleep(0.1)
         assert call_count == 1

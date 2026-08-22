@@ -171,6 +171,13 @@ class _ArtifactResponseError(RuntimeError):
         )
 
 
+def _shed_prefetch_response():
+    """Return a non-cacheable empty response for declined speculative work."""
+    response = Response(status=204)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 # Paired-source preview renders (`?source=jpeg|raw`) intentionally sit outside
 # the durable (photo_id, size) preview cache so RAW and JPEG pixels can never
 # contaminate one another.  For coordination alone we do publish them to a
@@ -36884,7 +36891,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if speculative:
                 speculative_slot = preview_prefetch_slots.acquire(blocking=False)
                 if not speculative_slot:
-                    return Response(status=204)
+                    return _shed_prefetch_response()
 
             def coordinated_request(*, guarded):
                 response = make_response(
@@ -36904,7 +36911,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     join=not speculative,
                 )
                 if result.skipped:
-                    return Response(status=204)
+                    return _shed_prefetch_response()
                 return result.value
             except _ArtifactResponseError as exc:
                 return exc.to_response()
@@ -37505,7 +37512,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     blocking=False,
                 )
                 if not speculative_slot:
-                    return Response(status=204)
+                    return _shed_prefetch_response()
 
             def _paired_consumer():
                 # Producer already published the shadow-cache file, so a
@@ -37528,7 +37535,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     join=not speculative,
                 )
                 if result.skipped:
-                    return Response(status=204)
+                    return _shed_prefetch_response()
                 return result.value
             except _ArtifactResponseError as exc:
                 return exc.to_response()
@@ -37607,7 +37614,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if speculative:
                 speculative_slot = preview_prefetch_slots.acquire(blocking=False)
                 if not speculative_slot:
-                    return Response(status=204)
+                    return _shed_prefetch_response()
 
             def coordinated_request(*, guarded):
                 response = make_response(
@@ -37627,7 +37634,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     join=not speculative,
                 )
                 if result.skipped:
-                    return Response(status=204)
+                    return _shed_prefetch_response()
                 return result.value
             except _ArtifactResponseError as exc:
                 return exc.to_response()

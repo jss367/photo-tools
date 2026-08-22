@@ -1151,7 +1151,10 @@ def test_import_rejects_invalid_export_presets_without_writing(app_and_db):
         "classification_threshold": 0.9,
         "export_presets": [{
             "name": "Unsafe",
-            "settings": {"subfolder_name": "CON.txt"},
+            "settings": {
+                "export_to_subfolder": True,
+                "subfolder_name": "CON.txt",
+            },
         }],
     }
 
@@ -1162,6 +1165,34 @@ def test_import_rejects_invalid_export_presets_without_writing(app_and_db):
 
     assert resp.status_code == 400
     assert "export_presets[0].settings" in resp.get_json()["errors"]
+    assert cfg.load()["classification_threshold"] == 0.5
+
+
+def test_import_rejects_export_preset_names_that_collide_after_normalizing(
+    app_and_db,
+):
+    app, _ = app_and_db
+    import config as cfg
+
+    cfg.set("classification_threshold", 0.5)
+    client = app.test_client()
+    payload = {
+        "classification_threshold": 0.9,
+        "export_presets": [
+            {"name": "Travel", "settings": {"quality": 85}},
+            {"name": " Travel ", "settings": {"quality": 70}},
+        ],
+    }
+
+    resp = client.post(
+        "/api/settings/import",
+        json={"json": json.dumps(payload)},
+    )
+
+    assert resp.status_code == 400
+    assert resp.get_json()["errors"]["export_presets[1].name"] == (
+        "duplicate export preset name 'Travel'"
+    )
     assert cfg.load()["classification_threshold"] == 0.5
 
 

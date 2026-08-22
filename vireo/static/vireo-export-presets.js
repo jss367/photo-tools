@@ -19,7 +19,10 @@ var VireoExportPresets = (function() {
   var modalEditGeneration = 0;
   var modalOpenGeneration = 0;
   var refreshGeneration = 0;
-  var savingNames = Object.create(null);
+  // Save and delete both mutate the same server-side collection. Keep a
+  // per-name gate so a delayed delete cannot be overtaken by a replacement
+  // save (which would recreate the preset), and vice versa.
+  var mutatingNames = Object.create(null);
   var presetActionsDisabled = false;
   var restorationControlStates = null;
 
@@ -302,17 +305,17 @@ var VireoExportPresets = (function() {
     if (name === null) return;
     name = name.trim();
     if (!name) return;
-    if (savingNames[name]) {
+    if (mutatingNames[name]) {
       if (typeof showToast === 'function') {
-        showToast('That export preset is already being saved', 'info');
+        showToast('That export preset is already being changed', 'info');
       }
       return;
     }
-    savingNames[name] = true;
+    mutatingNames[name] = true;
     try {
       await saveNamedPreset(name);
     } finally {
-      delete savingNames[name];
+      delete mutatingNames[name];
     }
   }
 
@@ -385,30 +388,41 @@ var VireoExportPresets = (function() {
   async function deleteSelected() {
     var name = selectedSavedName();
     if (!name) return;
-    if (!window.confirm('Delete the export preset “' + name + '”?')) return;
-    var editGeneration = modalEditGeneration;
-    var openGeneration = modalOpenGeneration;
-    try {
-      var data = await safeFetch('/api/export/presets/' + encodeURIComponent(name), {
-        method: 'DELETE',
-      }, {toast: false});
-      if (data.error) throw new Error(data.error);
-    } catch (err) {
-      alert('Could not delete preset: ' + err.message);
+    if (mutatingNames[name]) {
+      if (typeof showToast === 'function') {
+        showToast('That export preset is already being changed', 'info');
+      }
       return;
     }
-    if (VireoViewPreferences.read(LAST_USED_KEY) === SAVED_PREFIX + name) {
-      VireoViewPreferences.write(LAST_USED_KEY, 'custom');
-    }
-    var refreshResult = await refresh();
-    var edited = editGeneration !== modalEditGeneration;
-    var reopened = openGeneration !== modalOpenGeneration;
-    if (refreshResult.current && !edited && !reopened) {
-      presetSelect().value = 'custom';
-      updateButtons();
-    }
-    if (typeof showToast === 'function') {
-      showToast('Deleted export preset “' + name + '”', 'info');
+    if (!window.confirm('Delete the export preset “' + name + '”?')) return;
+    mutatingNames[name] = true;
+    try {
+      var editGeneration = modalEditGeneration;
+      var openGeneration = modalOpenGeneration;
+      try {
+        var data = await safeFetch('/api/export/presets/' + encodeURIComponent(name), {
+          method: 'DELETE',
+        }, {toast: false});
+        if (data.error) throw new Error(data.error);
+      } catch (err) {
+        alert('Could not delete preset: ' + err.message);
+        return;
+      }
+      if (VireoViewPreferences.read(LAST_USED_KEY) === SAVED_PREFIX + name) {
+        VireoViewPreferences.write(LAST_USED_KEY, 'custom');
+      }
+      var refreshResult = await refresh();
+      var edited = editGeneration !== modalEditGeneration;
+      var reopened = openGeneration !== modalOpenGeneration;
+      if (refreshResult.current && !edited && !reopened) {
+        presetSelect().value = 'custom';
+        updateButtons();
+      }
+      if (typeof showToast === 'function') {
+        showToast('Deleted export preset “' + name + '”', 'info');
+      }
+    } finally {
+      delete mutatingNames[name];
     }
   }
 

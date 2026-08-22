@@ -20055,6 +20055,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             raw_presets = payload["export_presets"]
             normalized_presets = []
+            seen_preset_names = set()
             if not isinstance(raw_presets, list):
                 errors["export_presets"] = "export_presets must be a JSON array"
             else:
@@ -20068,6 +20069,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     except ValueError as exc:
                         errors[f"{entry_key}.name"] = str(exc)
                         name = None
+                    if name is not None:
+                        if name in seen_preset_names:
+                            errors[f"{entry_key}.name"] = (
+                                f"duplicate export preset name {name!r}"
+                            )
+                            name = None
+                        else:
+                            seen_preset_names.add(name)
                     try:
                         settings = normalize_export_preset_settings(
                             entry.get("settings")

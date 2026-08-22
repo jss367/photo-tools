@@ -567,6 +567,56 @@ def test_export_preset_serializes_saves_to_same_name(live_server, page):
     ) == ["/first", "/second"]
 
 
+def test_export_preset_serializes_save_against_same_name_delete(live_server, page):
+    """A replacement save cannot recreate a preset while deletion is pending."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+
+    page.evaluate(
+        """async () => {
+          const realSafeFetch = window.safeFetch;
+          window.__deleteRequests = 0;
+          window.__saveRequestsDuringDelete = 0;
+          window.prompt = function() { return 'Shared name'; };
+          window.confirm = function() { return true; };
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets/Shared%20name' && options &&
+                options.method === 'DELETE') {
+              window.__deleteRequests++;
+              return new Promise(function(resolve) {
+                window.__resolveSharedPresetDelete = resolve;
+              });
+            }
+            if (url === '/api/export/presets' && options &&
+                options.method === 'POST') {
+              window.__saveRequestsDuringDelete++;
+              return Promise.resolve({ok: true});
+            }
+            if (url === '/api/export/presets' && (!options || !options.method)) {
+              return Promise.resolve({presets: [{
+                name: 'Shared name', settings: {destination: '/shared'}
+              }]});
+            }
+            return realSafeFetch(url, options, config);
+          };
+          await VireoExportPresets.modalOpened();
+        }"""
+    )
+    page.locator("#exportPreset").select_option("saved:Shared name")
+    page.locator("#exportPresetDeleteBtn").click()
+    page.wait_for_function("() => window.__deleteRequests === 1")
+
+    page.locator("#exportPresetSaveBtn").click()
+    assert page.evaluate("() => window.__saveRequestsDuringDelete") == 0
+
+    page.evaluate("() => window.__resolveSharedPresetDelete({ok: true})")
+    expect(page.locator("#exportPreset")).to_have_value("custom")
+
+
 def test_export_preset_dropdown_reflects_custom_on_reopen(live_server, page):
     """Reopening after a custom edit shows Custom, not the host's built-in reset.
 

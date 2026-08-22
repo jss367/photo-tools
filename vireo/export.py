@@ -284,10 +284,23 @@ def normalize_export_preset_settings(settings):
         raise ValueError("naming_template must be a string")
     naming_template = naming_template.strip() or "{original}"
 
+    raw_subfolder_name = settings.get("subfolder_name")
+    if export_to_subfolder:
+        subfolder_name = normalize_subfolder_name(raw_subfolder_name)
+    else:
+        # A disabled subfolder value is inert at export time. Preserve a
+        # valid dormant name for later toggling, but normalize invalid stale
+        # UI/config values to the safe default instead of rejecting the
+        # whole preset.
+        try:
+            subfolder_name = normalize_subfolder_name(raw_subfolder_name)
+        except ValueError:
+            subfolder_name = DEFAULT_EXPORT_SUBFOLDER
+
     return {
         "destination": destination,
         "export_to_subfolder": export_to_subfolder,
-        "subfolder_name": normalize_subfolder_name(settings.get("subfolder_name")),
+        "subfolder_name": subfolder_name,
         "reveal_after_export": reveal_after_export,
         "format": normalize_output_format(settings.get("format", "jpg"))["extension"],
         "max_size": normalize_max_size(settings.get("max_size")),

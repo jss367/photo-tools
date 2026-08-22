@@ -1300,11 +1300,24 @@ def test_export_presets_crud_roundtrip(app_and_db, tmp_path):
     assert listed[0]["settings"]["subfolder_name"] == "finals"
     assert listed[0]["settings"]["reveal_after_export"] is True
 
-    # Saving under the same name replaces, and omitted keys reset to
-    # defaults (a preset is a full snapshot of the dialog, not a patch).
+    # Replacement is conditional so an uncached client cannot silently
+    # overwrite a preset created elsewhere.
     resp = client.post("/api/export/presets", json={
         "name": "default",
         "settings": {"quality": 70},
+    })
+    assert resp.status_code == 409
+    assert resp.get_json()["code"] == "export_preset_exists"
+    assert client.get("/api/export/presets").get_json()["presets"][0][
+        "settings"
+    ]["quality"] == 85
+
+    # Confirmed replacement succeeds, and omitted keys reset to defaults (a
+    # preset is a full dialog snapshot, not a patch).
+    resp = client.post("/api/export/presets", json={
+        "name": "default",
+        "settings": {"quality": 70},
+        "replace": True,
     })
     assert resp.status_code == 200
     assert resp.get_json()["replaced"] is True
@@ -1354,10 +1367,32 @@ def test_export_presets_rejects_invalid_payloads(app_and_db):
     assert "absolute path" in resp.get_json()["error"]
 
     resp = client.post("/api/export/presets", json={
-        "name": "x", "settings": {"subfolder_name": "a/b"},
+        "name": "x", "settings": {
+            "export_to_subfolder": True,
+            "subfolder_name": "a/b",
+        },
     })
     assert resp.status_code == 400
     assert "subfolder_name" in resp.get_json()["error"]
+
+    resp = client.post("/api/export/presets", json={
+        "name": "x",
+        "settings": {
+            "export_to_subfolder": False,
+            "subfolder_name": "a/b",
+        },
+    })
+    assert resp.status_code == 200
+    assert resp.get_json()["preset"]["settings"]["subfolder_name"] == "exported"
+    assert client.delete("/api/export/presets/x").status_code == 200
+
+    resp = client.post("/api/export/presets", json={
+        "name": "replace flag",
+        "settings": {},
+        "replace": "yes",
+    })
+    assert resp.status_code == 400
+    assert "replace must be a boolean" in resp.get_json()["error"]
 
     # Truthy non-object JSON bodies (array, string, number) must produce a
     # 400 validation error, not a 500 from AttributeError on ``.get(...)``.

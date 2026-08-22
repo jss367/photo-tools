@@ -26734,6 +26734,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             settings = normalize_export_preset_settings(body.get("settings"))
         except ValueError as exc:
             return json_error(str(exc))
+        replace = body.get("replace", False)
+        if not isinstance(replace, bool):
+            return json_error("replace must be a boolean")
 
         preset = {"name": name, "settings": settings}
         with _settings_write_lock:
@@ -26744,6 +26747,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 isinstance(entry, dict) and entry.get("name") == name
                 for entry in existing
             )
+            if replaced and not replace:
+                return json_error(
+                    f"export preset {name!r} already exists",
+                    status=409,
+                    code="export_preset_exists",
+                )
             presets = [
                 entry for entry in existing
                 if isinstance(entry, dict) and entry.get("name") != name

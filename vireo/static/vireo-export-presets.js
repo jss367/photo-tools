@@ -210,7 +210,8 @@ var VireoExportPresets = (function() {
     if (name === null) return;
     name = name.trim();
     if (!name) return;
-    if (findPreset(name) &&
+    var replace = !!findPreset(name);
+    if (replace &&
         !window.confirm('Replace the existing preset “' + name + '”?')) {
       return;
     }
@@ -223,16 +224,32 @@ var VireoExportPresets = (function() {
     var editGeneration = modalEditGeneration;
     var openGeneration = modalOpenGeneration;
     var payload = collectSettings();
-    try {
-      var data = await safeFetch('/api/export/presets', {
+    async function postPreset(allowReplace) {
+      return safeFetch('/api/export/presets', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name: name, settings: payload}),
+        body: JSON.stringify({
+          name: name,
+          settings: payload,
+          replace: allowReplace,
+        }),
       }, {toast: false});
-      if (data.error) throw new Error(data.error);
+    }
+    try {
+      await postPreset(replace);
     } catch (err) {
-      alert('Could not save preset: ' + err.message);
-      return;
+      if (err.code === 'export_preset_exists') {
+        if (!window.confirm('Replace the existing preset “' + name + '”?')) return;
+        try {
+          await postPreset(true);
+        } catch (replaceErr) {
+          alert('Could not save preset: ' + replaceErr.message);
+          return;
+        }
+      } else {
+        alert('Could not save preset: ' + err.message);
+        return;
+      }
     }
     var refreshResult = await refresh();
     var edited = editGeneration !== modalEditGeneration;

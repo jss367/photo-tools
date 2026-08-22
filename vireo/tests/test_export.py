@@ -197,6 +197,22 @@ def test_normalize_export_preset_settings_normalizes_and_validates(tmp_path):
     assert settings["naming_template"] == "{date}_{original}"
     assert settings["metadata_fields"] == ["species", "rating"]
 
+    dormant = normalize_export_preset_settings({
+        "export_to_subfolder": False,
+        "subfolder_name": " future exports ",
+    })
+    assert dormant["subfolder_name"] == "future exports"
+    dormant_invalid = normalize_export_preset_settings({
+        "export_to_subfolder": False,
+        "subfolder_name": "not/a/component",
+    })
+    assert dormant_invalid["subfolder_name"] == "exported"
+    with pytest.raises(ValueError, match="subfolder_name"):
+        normalize_export_preset_settings({
+            "export_to_subfolder": True,
+            "subfolder_name": "not/a/component",
+        })
+
     with pytest.raises(ValueError, match="unknown preset settings: sharpen"):
         normalize_export_preset_settings({"sharpen": 70})
     with pytest.raises(ValueError, match="absolute path"):

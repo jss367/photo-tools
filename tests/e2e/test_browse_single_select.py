@@ -355,6 +355,60 @@ def test_export_preset_delete_preserves_newer_selection(live_server, page):
     ) == "saved:Keep me"
 
 
+def test_export_preset_uncached_replace_requires_confirmation(live_server, page):
+    """A server-side name conflict is confirmed before a replacement retry."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+
+    page.evaluate(
+        """async () => {
+          const realSafeFetch = window.safeFetch;
+          window.__presetSaveBodies = [];
+          window.__presetSaveSucceeded = false;
+          window.__presetReplaceConfirmations = 0;
+          window.prompt = function() { return 'Existing elsewhere'; };
+          window.confirm = function() {
+            window.__presetReplaceConfirmations++;
+            return true;
+          };
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets' && options &&
+                options.method === 'POST') {
+              var body = JSON.parse(options.body);
+              window.__presetSaveBodies.push(body);
+              if (!body.replace) {
+                var conflict = new Error('already exists');
+                conflict.code = 'export_preset_exists';
+                return Promise.reject(conflict);
+              }
+              window.__presetSaveSucceeded = true;
+              return Promise.resolve({ok: true, replaced: true});
+            }
+            if (url === '/api/export/presets' && (!options || !options.method)) {
+              return Promise.resolve({presets: window.__presetSaveSucceeded ? [{
+                name: 'Existing elsewhere', settings: {destination: ''}
+              }] : []});
+            }
+            return realSafeFetch(url, options, config);
+          };
+          await VireoExportPresets.modalOpened();
+        }"""
+    )
+    page.locator("#exportPresetSaveBtn").click()
+
+    expect(page.locator("#exportPreset")).to_have_value(
+        "saved:Existing elsewhere"
+    )
+    assert page.evaluate("() => window.__presetReplaceConfirmations") == 1
+    assert page.evaluate(
+        "() => window.__presetSaveBodies.map(body => body.replace)"
+    ) == [False, True]
+
+
 def test_export_preset_dropdown_reflects_custom_on_reopen(live_server, page):
     """Reopening after a custom edit shows Custom, not the host's built-in reset.
 

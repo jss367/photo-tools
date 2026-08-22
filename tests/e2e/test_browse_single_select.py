@@ -215,7 +215,17 @@ def test_export_presets_do_not_overwrite_edits_while_loading(live_server, page):
     expect(page.locator("#exportPreset")).to_be_disabled()
     expect(page.locator("#exportPresetSaveBtn")).to_be_disabled()
     expect(page.locator("#exportPresetDeleteBtn")).to_be_disabled()
-    page.locator("#exportDest").fill("/user-selected")
+    expect(page.locator("#exportDest")).to_be_disabled()
+    expect(page.locator("#exportFormat")).to_be_disabled()
+    expect(page.locator("#exportTemplate")).to_be_disabled()
+    expect(page.locator("#exportMetadataSpecies")).to_be_disabled()
+    expect(page.locator("#exportOverlay [data-export-cancel]")).to_be_enabled()
+    # Programmatic assignment simulates an integration mutating a control;
+    # real user input is gated until restoration completes.
+    page.locator("#exportDest").evaluate(
+        "(element) => { element.value = '/user-selected'; }"
+    )
+    page.evaluate("() => VireoExportPresets.markCustom()")
     page.evaluate(
         """() => window.__resolveExportPresets({presets: [{
           name: 'Delayed preset',
@@ -226,6 +236,10 @@ def test_export_presets_do_not_overwrite_edits_while_loading(live_server, page):
     expect(page.locator("#exportSubmitBtn")).to_be_enabled()
     expect(page.locator("#exportPreset")).to_be_enabled()
     expect(page.locator("#exportPresetSaveBtn")).to_be_enabled()
+    expect(page.locator("#exportDest")).to_be_enabled()
+    expect(page.locator("#exportFormat")).to_be_enabled()
+    expect(page.locator("#exportTemplate")).to_be_enabled()
+    expect(page.locator("#exportMetadataSpecies")).to_be_enabled()
     expect(page.locator("#exportDest")).to_have_value("/user-selected")
     expect(page.locator("#exportPreset")).to_have_value("custom")
 

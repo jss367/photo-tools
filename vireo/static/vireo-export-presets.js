@@ -21,6 +21,7 @@ var VireoExportPresets = (function() {
   var refreshGeneration = 0;
   var savingNames = Object.create(null);
   var presetActionsDisabled = false;
+  var restorationControlStates = null;
 
   function $(id) { return document.getElementById(id); }
   function overlay() { return $('exportOverlay'); }
@@ -51,6 +52,35 @@ var VireoExportPresets = (function() {
     var saveBtn = $('exportPresetSaveBtn');
     if (saveBtn) saveBtn.disabled = disabled;
     updateButtons();
+  }
+
+  function setRestorationControlsDisabled(disabled) {
+    if (disabled) {
+      if (!restorationControlStates) {
+        restorationControlStates = [];
+        overlay().querySelectorAll(
+          'input, select, textarea, button:not([data-export-cancel])'
+        ).forEach(function(control) {
+          restorationControlStates.push({
+            control: control,
+            disabled: control.disabled,
+          });
+        });
+      }
+      restorationControlStates.forEach(function(state) {
+        state.control.disabled = true;
+      });
+      return;
+    }
+    if (!restorationControlStates) return;
+    restorationControlStates.forEach(function(state) {
+      state.control.disabled = state.disabled;
+    });
+    restorationControlStates = null;
+    syncSubfolderNameState();
+    if (typeof updateExportFormatControls === 'function') {
+      updateExportFormatControls();
+    }
   }
 
   function subfolderName() {
@@ -393,6 +423,7 @@ var VireoExportPresets = (function() {
     if (submit) submit.disabled = true;
     setPresetActionsDisabled(true);
     syncSubfolderNameState();
+    setRestorationControlsDisabled(true);
     try {
       var refreshResult = await refresh();
       if (!refreshResult.current) return;
@@ -456,6 +487,7 @@ var VireoExportPresets = (function() {
       // preset or deliberately preserved an edit made during the request.
       if (submit && openGeneration === modalOpenGeneration &&
           overlay().classList.contains('open') && restorationComplete) {
+        setRestorationControlsDisabled(false);
         submit.disabled = false;
         setPresetActionsDisabled(false);
       }

@@ -173,11 +173,12 @@ def test_normalize_export_preset_settings_fills_defaults():
     }
 
 
-def test_normalize_export_preset_settings_normalizes_and_validates():
+def test_normalize_export_preset_settings_normalizes_and_validates(tmp_path):
     from export import normalize_export_preset_settings
 
+    destination = tmp_path / "out"
     settings = normalize_export_preset_settings({
-        "destination": "  /tmp/out ",
+        "destination": f"  {destination} ",
         "export_to_subfolder": True,
         "subfolder_name": " finals ",
         "reveal_after_export": True,
@@ -187,7 +188,7 @@ def test_normalize_export_preset_settings_normalizes_and_validates():
         "naming_template": " {date}_{original} ",
         "metadata_fields": ["species", "species", "rating"],
     })
-    assert settings["destination"] == "/tmp/out"
+    assert settings["destination"] == str(destination)
     assert settings["subfolder_name"] == "finals"
     assert settings["format"] == "png"
     assert settings["max_size"] == 2048

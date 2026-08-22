@@ -1269,7 +1269,7 @@ def test_job_export_writes_into_renamed_subfolder(client_with_photo, tmp_path):
     assert not (destination / "exported").exists()
 
 
-def test_export_presets_crud_roundtrip(app_and_db):
+def test_export_presets_crud_roundtrip(app_and_db, tmp_path):
     """Save, list, replace, and delete presets through /api/export/presets."""
     app, _db = app_and_db
     client = app.test_client()
@@ -1279,7 +1279,7 @@ def test_export_presets_crud_roundtrip(app_and_db):
     resp = client.post("/api/export/presets", json={
         "name": "default",
         "settings": {
-            "destination": "/tmp/out",
+            "destination": str(tmp_path / "out"),
             "export_to_subfolder": True,
             "subfolder_name": "finals",
             "reveal_after_export": True,

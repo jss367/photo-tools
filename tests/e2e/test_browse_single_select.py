@@ -225,6 +225,51 @@ def test_export_presets_do_not_overwrite_edits_while_loading(live_server, page):
     expect(page.locator("#exportPreset")).to_have_value("custom")
 
 
+def test_export_presets_ignore_stale_overlapping_refresh(live_server, page):
+    """An older preset-list response cannot replace a newer response."""
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+    page.get_by_role("button", name="Export", exact=True).click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+
+    page.evaluate(
+        """() => {
+          const realSafeFetch = window.safeFetch;
+          window.__presetRefreshResolvers = [];
+          window.safeFetch = function(url, options, config) {
+            if (url === '/api/export/presets' && (!options || !options.method)) {
+              return new Promise(function(resolve) {
+                window.__presetRefreshResolvers.push(resolve);
+              });
+            }
+            return realSafeFetch(url, options, config);
+          };
+          window.__presetRefreshes = [
+            VireoExportPresets.modalOpened(),
+            VireoExportPresets.modalOpened(),
+          ];
+        }"""
+    )
+    page.wait_for_function("() => window.__presetRefreshResolvers.length === 2")
+    page.evaluate(
+        """async () => {
+          window.__presetRefreshResolvers[1]({presets: [{
+            name: 'Current preset', settings: {}
+          }]});
+          await window.__presetRefreshes[1];
+          window.__presetRefreshResolvers[0]({presets: [{
+            name: 'Stale preset', settings: {}
+          }]});
+          await window.__presetRefreshes[0];
+        }"""
+    )
+
+    expect(page.locator('option[value="saved:Current preset"]')).to_have_count(1)
+    expect(page.locator('option[value="saved:Stale preset"]')).to_have_count(0)
+
+
 def test_export_preset_dropdown_reflects_custom_on_reopen(live_server, page):
     """Reopening after a custom edit shows Custom, not the host's built-in reset.
 

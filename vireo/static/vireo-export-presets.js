@@ -16,6 +16,7 @@ var VireoExportPresets = (function() {
   var builtinOptions = null;
   var modalEditGeneration = 0;
   var modalOpenGeneration = 0;
+  var refreshGeneration = 0;
 
   function $(id) { return document.getElementById(id); }
   function overlay() { return $('exportOverlay'); }
@@ -90,10 +91,13 @@ var VireoExportPresets = (function() {
   }
 
   async function refresh() {
+    var generation = ++refreshGeneration;
     try {
       var data = await safeFetch('/api/export/presets', undefined, {toast: false});
+      if (generation !== refreshGeneration) return;
       if (data && Array.isArray(data.presets)) presets = data.presets;
     } catch (err) {
+      if (generation !== refreshGeneration) return;
       // Keep the last known list; save/delete surface their own errors.
     }
     populateSelect();

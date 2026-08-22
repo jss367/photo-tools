@@ -94,6 +94,93 @@ def test_normalize_metadata_fields_validates_and_deduplicates():
         normalize_metadata_fields(["copyright"])
 
 
+def test_normalize_subfolder_name_defaults_and_trims():
+    from export import normalize_subfolder_name
+
+    assert normalize_subfolder_name(None) == "exported"
+    assert normalize_subfolder_name("") == "exported"
+    assert normalize_subfolder_name("   ") == "exported"
+    assert normalize_subfolder_name("  finals ") == "finals"
+    assert normalize_subfolder_name("Best of 2024") == "Best of 2024"
+
+
+def test_normalize_subfolder_name_rejects_paths_and_unsafe_chars():
+    from export import normalize_subfolder_name
+
+    for bad in ("a/b", "a\\b", "..", ".", "../up", 'x"y', "tab\tname", "a" * 121):
+        with pytest.raises(ValueError):
+            normalize_subfolder_name(bad)
+    with pytest.raises(ValueError, match="must be a string"):
+        normalize_subfolder_name(7)
+
+
+def test_normalize_max_size():
+    from export import normalize_max_size
+
+    assert normalize_max_size(None) is None
+    assert normalize_max_size("") is None
+    assert normalize_max_size(0) is None
+    assert normalize_max_size("2048") == 2048
+    for bad in (True, "big", -1, 50001):
+        with pytest.raises(ValueError):
+            normalize_max_size(bad)
+
+
+def test_normalize_export_preset_settings_fills_defaults():
+    from export import normalize_export_preset_settings
+
+    assert normalize_export_preset_settings({}) == {
+        "destination": "",
+        "export_to_subfolder": False,
+        "subfolder_name": "exported",
+        "reveal_after_export": False,
+        "format": "jpg",
+        "max_size": None,
+        "quality": 92,
+        "naming_template": "{original}",
+        "metadata_fields": [],
+    }
+
+
+def test_normalize_export_preset_settings_normalizes_and_validates():
+    from export import normalize_export_preset_settings
+
+    settings = normalize_export_preset_settings({
+        "destination": "  /tmp/out ",
+        "export_to_subfolder": True,
+        "subfolder_name": " finals ",
+        "reveal_after_export": True,
+        "format": "PNG",
+        "max_size": "2048",
+        "quality": "85",
+        "naming_template": " {date}_{original} ",
+        "metadata_fields": ["species", "species", "rating"],
+    })
+    assert settings["destination"] == "/tmp/out"
+    assert settings["subfolder_name"] == "finals"
+    assert settings["format"] == "png"
+    assert settings["max_size"] == 2048
+    assert settings["quality"] == 85
+    assert settings["naming_template"] == "{date}_{original}"
+    assert settings["metadata_fields"] == ["species", "rating"]
+
+    with pytest.raises(ValueError, match="unknown preset settings: sharpen"):
+        normalize_export_preset_settings({"sharpen": 70})
+    with pytest.raises(ValueError, match="absolute path"):
+        normalize_export_preset_settings({"destination": "relative/path"})
+    with pytest.raises(ValueError, match="must be an object"):
+        normalize_export_preset_settings(["not", "a", "dict"])
+
+
+def test_normalize_export_preset_name():
+    from export import normalize_export_preset_name
+
+    assert normalize_export_preset_name("  default ") == "default"
+    for bad in (None, "", "   ", "a/b", "a\\b", "a" * 81, 3):
+        with pytest.raises(ValueError):
+            normalize_export_preset_name(bad)
+
+
 def test_export_timestamp_parts_normalizes_utc_suffix():
     assert _export_timestamp_parts("2024-06-15T14:30:22.5Z") == (
         "2024:06:15",
@@ -323,6 +410,52 @@ def test_export_photos_can_use_subfolder_under_custom_destination(export_env):
         os.path.join(env["dest"], "exported"),
     ]
     assert os.path.isfile(os.path.join(env["dest"], "exported", "bird1.jpg"))
+
+
+def test_export_photos_honors_custom_subfolder_name(export_env):
+    """A renamed subfolder is used instead of the historical "exported"."""
+    env = export_env
+
+    result = export_photos(
+        db=env["db"],
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={
+            "naming_template": "{original}",
+            "export_to_subfolder": True,
+            "subfolder_name": "finals",
+        },
+    )
+
+    assert result["exported"] == 1
+    assert result["errors"] == []
+    assert result["destination"] == os.path.join(env["dest"], "finals")
+    assert os.path.isfile(os.path.join(env["dest"], "finals", "bird1.jpg"))
+    assert not os.path.isdir(os.path.join(env["dest"], "exported"))
+
+
+def test_preview_export_renames_checks_custom_subfolder(export_env):
+    """Collision preflight looks inside the renamed subfolder."""
+    env = export_env
+    finals = os.path.join(env["dest"], "finals")
+    os.makedirs(finals)
+    with open(os.path.join(finals, "bird1.jpg"), "wb") as fh:
+        fh.write(b"existing")
+
+    renames = preview_export_renames(
+        db=env["db"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={
+            "naming_template": "{original}",
+            "export_to_subfolder": True,
+            "subfolder_name": "finals",
+            "vireo_dir": env["vireo_dir"],
+        },
+    )
+
+    assert [r["export_name"] for r in renames] == ["bird1_2.jpg"]
 
 
 def test_export_photos_embeds_only_selected_metadata(export_env, monkeypatch):

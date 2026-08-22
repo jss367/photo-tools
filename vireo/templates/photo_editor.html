@@ -965,20 +965,36 @@ body {
     <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">
       Leave blank to export the photo beside its original.
     </div>
+    <div style="display:flex;align-items:center;gap:7px;margin-bottom:12px;">
+      <label style="display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text-secondary);cursor:pointer;white-space:nowrap;">
+        <input id="exportSubfolder" type="checkbox">
+        Put the export in a subfolder named
+      </label>
+      <input id="exportSubfolderName" class="modal-input" type="text" value="exported"
+             placeholder="exported" maxlength="120"
+             style="flex:1;min-width:0;margin-bottom:0;padding:4px 8px;font-size:12px;">
+    </div>
+
     <label style="display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text-secondary);margin-bottom:12px;cursor:pointer;">
-      <input id="exportSubfolder" type="checkbox">
-      Put the export in an &ldquo;exported&rdquo; subfolder
+      <input id="exportRevealAfter" type="checkbox">
+      Show the exported file in the file manager when finished
     </label>
 
     <label style="font-size:12px;color:var(--text-secondary);display:block;margin-bottom:4px;">Preset</label>
-    <select id="exportPreset" class="modal-input" style="cursor:pointer;">
-      <option value="original-jpg">Full-size JPEG</option>
-      <option value="web-jpg">Web JPEG, 2048 px</option>
-      <option value="small-jpg">Small JPEG, 1080 px</option>
-      <option value="archive-tiff">Full-size TIFF</option>
-      <option value="png">Full-size PNG</option>
-      <option value="custom">Custom</option>
-    </select>
+    <div style="display:flex;gap:8px;align-items:stretch;margin-bottom:12px;">
+      <select id="exportPreset" class="modal-input" style="cursor:pointer;flex:1;min-width:0;margin-bottom:0;">
+        <option value="original-jpg">Full-size JPEG</option>
+        <option value="web-jpg">Web JPEG, 2048 px</option>
+        <option value="small-jpg">Small JPEG, 1080 px</option>
+        <option value="archive-tiff">Full-size TIFF</option>
+        <option value="png">Full-size PNG</option>
+        <option value="custom">Custom</option>
+      </select>
+      <button id="exportPresetSaveBtn" class="modal-btn modal-btn-cancel" type="button"
+              title="Save every setting in this dialog as a named preset">Save&hellip;</button>
+      <button id="exportPresetDeleteBtn" class="modal-btn modal-btn-cancel" type="button"
+              title="Delete the selected saved preset" disabled>Delete</button>
+    </div>
 
     <label style="font-size:12px;color:var(--text-secondary);display:block;margin-bottom:4px;">Format</label>
     <select id="exportFormat" class="modal-input" style="cursor:pointer;">
@@ -1041,6 +1057,7 @@ body {
 {% include '_folder_browser.html' %}
 
 <script src="/static/vireo-folder-browser.js"></script>
+<script src="/static/vireo-export-presets.js"></script>
 
 <script>
 var editorState = {
@@ -3268,12 +3285,17 @@ async function openExportModal() {
   });
   document.getElementById('exportDest').value = '';
   document.getElementById('exportSubfolder').checked = false;
+  document.getElementById('exportSubfolderName').value = 'exported';
+  document.getElementById('exportRevealAfter').checked = false;
   editorExportRequestGeneration++;
   setExportControlsBusy(false);
   setExportDismissible(true);
   document.getElementById('exportSubmitBtn').disabled = false;
   document.getElementById('exportSubmitBtn').textContent = 'Export Photo';
   document.getElementById('exportOverlay').classList.add('open');
+  // Re-applies the last-used preset (saved or built-in) over the defaults
+  // set above; async but near-instant locally.
+  VireoExportPresets.modalOpened();
   updateExportPreview();
 }
 
@@ -3387,7 +3409,11 @@ function updateExportPreview() {
     preview = preview.split('{' + key + '}').join(replacements[key]);
   });
   var extension = exportExtensionForFormat(document.getElementById('exportFormat').value);
-  document.getElementById('exportPreview').textContent = 'Preview: ' + preview + '.' + extension;
+  var subPrefix = document.getElementById('exportSubfolder').checked
+    ? VireoExportPresets.subfolderName() + '/'
+    : '';
+  document.getElementById('exportPreview').textContent =
+    'Preview: ' + subPrefix + preview + '.' + extension;
 }
 
 function selectedExportMetadataFields() {
@@ -3420,11 +3446,13 @@ async function startExport() {
     photo_ids: [exportPhotoId],
     destination: document.getElementById('exportDest').value.trim(),
     export_to_subfolder: document.getElementById('exportSubfolder').checked,
+    subfolder_name: VireoExportPresets.subfolderName(),
     naming_template: document.getElementById('exportTemplate').value || '{original}',
     max_size: maxSize,
     quality: parseInt(document.getElementById('exportQuality').value, 10) || 92,
     format: document.getElementById('exportFormat').value || 'jpg',
     metadata_fields: selectedExportMetadataFields(),
+    reveal_after_export: document.getElementById('exportRevealAfter').checked,
   };
   button.disabled = true;
   button.textContent = 'Checking filename…';
@@ -3501,9 +3529,8 @@ async function startExport() {
 }
 
 document.getElementById('exportTemplate').addEventListener('input', updateExportPreview);
-document.getElementById('exportPreset').addEventListener('change', function() {
-  applyExportPreset(this.value);
-});
+// The preset dropdown's change handling (built-in and saved presets) lives
+// in the shared vireo-export-presets.js module.
 document.getElementById('exportFormat').addEventListener('change', function() {
   markExportCustom();
   updateExportFormatControls();

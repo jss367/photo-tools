@@ -19436,7 +19436,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 current["remote_targets"] = normalized
 
             for key in body:
-                if key in ("keyboard_shortcuts", "remote_targets"):
+                # export_presets is validated and written only by the
+                # /api/export/presets endpoints; skip it here so a full-config
+                # snapshot save can't overwrite presets unvalidated.
+                if key in ("keyboard_shortcuts", "remote_targets", "export_presets"):
                     continue
                 if key in cfg.DEFAULTS:
                     # Deep-merge for nested-dict config sections so a curated
@@ -26670,6 +26673,69 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
         return jsonify({"job_id": job_id})
 
+    # -- Export presets --
+
+    @app.route("/api/export/presets")
+    def api_export_presets_list():
+        """List saved export presets (global; shared by every workspace)."""
+        import config as cfg
+
+        return jsonify({"presets": cfg.get_export_presets()})
+
+    @app.route("/api/export/presets", methods=["POST"])
+    def api_export_presets_save():
+        """Create or replace a saved export preset by name."""
+        import config as cfg
+        from export import (
+            normalize_export_preset_name,
+            normalize_export_preset_settings,
+        )
+
+        body = request.get_json(silent=True) or {}
+        try:
+            name = normalize_export_preset_name(body.get("name"))
+            settings = normalize_export_preset_settings(body.get("settings"))
+        except ValueError as exc:
+            return json_error(str(exc))
+
+        preset = {"name": name, "settings": settings}
+        with _settings_write_lock:
+            raw = _read_raw_config_file()
+            existing = raw.get("export_presets")
+            existing = existing if isinstance(existing, list) else []
+            replaced = any(
+                isinstance(entry, dict) and entry.get("name") == name
+                for entry in existing
+            )
+            presets = [
+                entry for entry in existing
+                if isinstance(entry, dict) and entry.get("name") != name
+            ]
+            presets.append(preset)
+            presets.sort(key=lambda entry: str(entry.get("name", "")).casefold())
+            raw["export_presets"] = presets
+            cfg.save(raw)
+        return jsonify({"ok": True, "replaced": replaced, "preset": preset})
+
+    @app.route("/api/export/presets/<name>", methods=["DELETE"])
+    def api_export_presets_delete(name):
+        """Delete a saved export preset."""
+        import config as cfg
+
+        with _settings_write_lock:
+            raw = _read_raw_config_file()
+            existing = raw.get("export_presets")
+            existing = existing if isinstance(existing, list) else []
+            remaining = [
+                entry for entry in existing
+                if not (isinstance(entry, dict) and entry.get("name") == name)
+            ]
+            if len(remaining) == len(existing):
+                return json_error(f"unknown export preset {name!r}", status=404)
+            raw["export_presets"] = remaining
+            cfg.save(raw)
+        return jsonify({"ok": True})
+
     # -- Export job route --
 
     @app.route("/api/jobs/export/preflight", methods=["POST"])
@@ -26698,25 +26764,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error("export_to_subfolder must be a boolean")
         if not isinstance(naming_template, str):
             return json_error("naming_template must be a string")
-        if max_size in ("", 0):
-            max_size = None
-        if max_size is not None:
-            if isinstance(max_size, bool):
-                return json_error("max_size must be a positive integer")
-            try:
-                max_size = int(max_size)
-            except (TypeError, ValueError):
-                return json_error("max_size must be a positive integer")
-            if max_size < 1 or max_size > 50000:
-                return json_error("max_size must be between 1 and 50000")
 
         try:
             from export import (
                 ExportPreflightError,
+                normalize_max_size,
                 normalize_output_format,
+                normalize_subfolder_name,
                 preview_export_renames,
             )
             output_format = normalize_output_format(output_format)["extension"]
+            max_size = normalize_max_size(max_size)
+            subfolder_name = (
+                normalize_subfolder_name(body.get("subfolder_name"))
+                if export_to_subfolder else None
+            )
         except ValueError as exc:
             return json_error(str(exc))
 
@@ -26748,6 +26810,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "naming_template": naming_template,
                     "format": output_format,
                     "export_to_subfolder": export_to_subfolder,
+                    "subfolder_name": subfolder_name,
                     "max_size": max_size,
                     "working_copy_max_size": effective_cfg.get(
                         "working_copy_max_size", 4096,
@@ -26795,27 +26858,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error("export_to_subfolder must be a boolean")
         if not isinstance(reveal_after_export, bool):
             return json_error("reveal_after_export must be a boolean")
-        if max_size in ("", 0):
-            max_size = None
-        if max_size is not None:
-            if isinstance(max_size, bool):
-                return json_error("max_size must be a positive integer")
-            try:
-                max_size = int(max_size)
-            except (TypeError, ValueError):
-                return json_error("max_size must be a positive integer")
-            if max_size < 1 or max_size > 50000:
-                return json_error("max_size must be between 1 and 50000")
         try:
             from export import (
+                normalize_max_size,
                 normalize_metadata_fields,
                 normalize_output_format,
                 normalize_quality,
+                normalize_subfolder_name,
             )
             output_format_info = normalize_output_format(output_format)
             output_format = output_format_info["extension"]
             quality = normalize_quality(quality)
             metadata_fields = normalize_metadata_fields(metadata_fields)
+            max_size = normalize_max_size(max_size)
+            subfolder_name = (
+                normalize_subfolder_name(body.get("subfolder_name"))
+                if export_to_subfolder else None
+            )
         except ValueError as exc:
             return json_error(str(exc))
 
@@ -26883,6 +26942,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "developed_dir": developed_dir,
                     "metadata_fields": metadata_fields,
                     "export_to_subfolder": export_to_subfolder,
+                    "subfolder_name": subfolder_name,
                     "collect_files": reveal_after_export,
                 },
                 progress_cb=progress_cb,

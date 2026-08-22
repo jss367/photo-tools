@@ -62,6 +62,14 @@ DEFAULTS = {
     # List of {"name": str, "path": str} dicts. Source of truth for the
     # multi-editor "Open in Editor" picker.
     "external_editors": [],
+    # Saved export-dialog presets. Each entry: {"name": str, "settings": dict}
+    # where settings snapshots the full export dialog (destination,
+    # export_to_subfolder, subfolder_name, reveal_after_export, format,
+    # max_size, quality, naming_template, metadata_fields). Written only by
+    # the /api/export/presets endpoints, which validate via
+    # export.normalize_export_preset_settings. Custom UI (the export modal),
+    # so excluded from SCHEMA like remote_targets.
+    "export_presets": [],
     "report_url": "https://script.google.com/macros/s/AKfycbwqjy8KaB0X04b9R614PWkikRmEsbarXXdarl0S0QC6thT9Uoyn8F74Gku-5z9h-TTf/exec",
     "darktable_style": "",
     "darktable_output_format": "jpg",
@@ -838,6 +846,31 @@ def get_remote_targets():
         if coerced is not None:
             targets.append(coerced)
     return targets
+
+
+def get_export_presets():
+    """Return saved export presets with a trusted shape, sorted by name.
+
+    Entries with a malformed name or settings payload are dropped so callers
+    can rely on {"name": str, "settings": dict}, mirroring
+    get_remote_targets(). Settings contents were validated on write.
+    """
+    raw = load().get("export_presets") or []
+    if not isinstance(raw, list):
+        return []
+    presets = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        settings = entry.get("settings")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(settings, dict):
+            continue
+        presets.append({"name": name, "settings": settings})
+    presets.sort(key=lambda preset: preset["name"].casefold())
+    return presets
 
 
 def get_remote_target(target_id):

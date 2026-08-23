@@ -949,6 +949,96 @@ def test_config_update_immediately_enforces_working_copy_quota(
     assert row["working_copy_evicted_mtime"] is None
 
 
+def test_settings_global_patch_enforces_and_clears_working_copy_quota(
+    app_and_db, tmp_path,
+):
+    """The schema-driven PATCH mirrors the legacy /api/config quota transitions.
+
+    Reducing the quota through PATCH must evict immediately (not wait until
+    the next scan or config save); raising it must clear the per-row
+    eviction marker so scan/backfill can regenerate deferred copies.
+    Without both, the schema-rendered Settings form (which drives this
+    endpoint) is silently a no-op on the working-copy budget.
+    """
+    app, db = app_and_db
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    path = working_dir / "1.jpg"
+    path.write_bytes(b"working-copy")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path='working/1.jpg' WHERE id=1"
+    )
+    db.conn.commit()
+
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "working_copy_cache_max_mb", "value": 0},
+    )
+    assert response.status_code == 200
+    assert not path.exists()
+    row = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime "
+        "FROM photos WHERE id=1"
+    ).fetchone()
+    assert row["working_copy_path"] is None
+    assert row["working_copy_evicted_mtime"] == 1.0
+
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "working_copy_cache_max_mb", "value": 1},
+    )
+    assert response.status_code == 200
+    row = db.conn.execute(
+        "SELECT working_copy_evicted_mtime FROM photos WHERE id=1"
+    ).fetchone()
+    assert row["working_copy_evicted_mtime"] is None
+
+
+def test_settings_global_delete_restores_default_and_clears_evictions(
+    app_and_db, tmp_path,
+):
+    """Deleting a shrunk override reverts to the (larger) default quota and
+    must clear the eviction marker — otherwise startup-backfill stays
+    permanently blocked on rows evicted under the smaller value even though
+    the effective quota is now larger."""
+    import config as cfg
+
+    app, db = app_and_db
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    path = working_dir / "1.jpg"
+    path.write_bytes(b"working-copy")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path='working/1.jpg' WHERE id=1"
+    )
+    db.conn.commit()
+
+    # Shrink first via PATCH so an override is in place and eviction runs.
+    app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "working_copy_cache_max_mb", "value": 0},
+    ).close()
+    row = db.conn.execute(
+        "SELECT working_copy_evicted_mtime FROM photos WHERE id=1"
+    ).fetchone()
+    assert row["working_copy_evicted_mtime"] == 1.0
+
+    # Deleting the override reverts to the default (20480 MB) — a raise.
+    response = app.test_client().delete(
+        "/api/settings/global/working_copy_cache_max_mb"
+    )
+    assert response.status_code == 200
+    row = db.conn.execute(
+        "SELECT working_copy_evicted_mtime FROM photos WHERE id=1"
+    ).fetchone()
+    assert row["working_copy_evicted_mtime"] is None
+    # The on-disk config file must no longer carry the override — otherwise
+    # cfg.load() would still merge the shrunk value on top of the defaults.
+    with open(cfg.CONFIG_PATH) as f:
+        raw = json.load(f)
+    assert "working_copy_cache_max_mb" not in raw
+
+
 def test_api_storage_reports_each_backing_volume(
     app_and_db, tmp_path, monkeypatch,
 ):

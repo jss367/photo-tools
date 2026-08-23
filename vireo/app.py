@@ -19791,12 +19791,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "effective": effective_layer,
         })
 
-    def _settings_post_save_side_effects(current):
+    def _settings_post_save_side_effects(current, previous=None):
         """Side effects mirrored from the legacy /api/config POST handler.
 
         Keeps the new schema-driven write path behaviorally identical to the
         old curated-form save: HF_TOKEN env var is kept in sync, and the
-        preview cache is evicted if its budget shrunk.
+        preview and working-copy caches are evicted if their budgets shrunk.
+
+        When ``previous`` is provided and the working-copy quota grew, clear
+        the per-row ``working_copy_evicted_mtime`` markers so scan/startup
+        backfill can regenerate previously quota-evicted copies into the
+        larger budget — mirroring the legacy /api/config POST behavior.
         """
         hf_token = current.get("hf_token", "")
         if hf_token:
@@ -19805,6 +19810,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             del os.environ["HF_TOKEN"]
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
         evict_preview_cache_if_over_quota(_get_db(), vireo_dir)
+        if previous is not None:
+            try:
+                prev_quota = int(
+                    previous.get("working_copy_cache_max_mb", 20480)
+                )
+            except (TypeError, ValueError):
+                prev_quota = 20480
+            try:
+                cur_quota = int(
+                    current.get("working_copy_cache_max_mb", 20480)
+                )
+            except (TypeError, ValueError):
+                cur_quota = 20480
+            if cur_quota > prev_quota:
+                quota_db = _get_db()
+                quota_db.conn.execute(
+                    "UPDATE photos SET working_copy_evicted_mtime=NULL "
+                    "WHERE working_copy_evicted_mtime IS NOT NULL"
+                )
+                commit_with_retry(quota_db.conn)
+        evict_working_copy_cache_if_over_quota(_get_db(), vireo_dir)
 
     def _read_raw_config_file():
         """Return the parsed contents of ~/.vireo/config.json, or {}.
@@ -19874,12 +19900,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error(f"unknown process id: {value}", status=400)
 
         with _settings_write_lock:
+            previous = cfg.load()
             raw = _read_raw_config_file()
             schema.set_dotted(raw, key, value)
             cfg.save(raw)
             if key == "inat_token":
                 _advance_inat_token_generation()
-            _settings_post_save_side_effects(cfg.load())
+            _settings_post_save_side_effects(cfg.load(), previous)
         return jsonify({"ok": True, "key": key, "value": value})
 
     @app.route("/api/settings/global/<path:key>", methods=["DELETE"])
@@ -19892,12 +19919,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error(f"unknown setting {key!r}", status=400)
 
         with _settings_write_lock:
+            previous = cfg.load()
             raw = _read_raw_config_file()
             schema.delete_dotted(raw, key)
             cfg.save(raw)
             if key == "inat_token":
                 _advance_inat_token_generation()
-            _settings_post_save_side_effects(cfg.load())
+            _settings_post_save_side_effects(cfg.load(), previous)
         return jsonify({"ok": True, "key": key})
 
     def _read_workspace_overrides(db):
@@ -20282,6 +20310,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return jsonify({"error": "validation failed", "errors": errors}), 400
 
         with _settings_write_lock:
+            previous = cfg.load()
             # Exports omit secret values (see /api/settings/export), so a
             # restored backup must not wipe the tokens already configured on
             # this machine: absent secret keys keep their current on-disk
@@ -20296,7 +20325,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             cfg.save(payload)
             if "inat_token" in payload:
                 _advance_inat_token_generation()
-            _settings_post_save_side_effects(cfg.load())
+            _settings_post_save_side_effects(cfg.load(), previous)
         return jsonify({"ok": True})
 
     def _computation_store():
@@ -38362,7 +38391,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     )
                     return send_file(trusted_wc_path, mimetype="image/jpeg")
             if not primary_is_raw:
-                updates = ["working_copy_path=?"]
+                # working_copy_evicted_mtime is cleared alongside the path so
+                # scan/startup backfill doesn't treat this re-materialized copy
+                # as still-evicted; without that, later scans stay blocked on
+                # the stale marker.
+                updates = [
+                    "working_copy_path=?",
+                    "working_copy_evicted_mtime=NULL",
+                ]
                 params = [wc_rel]
                 if not photo["width"] or not photo["height"]:
                     updates.extend(["width=?", "height=?"])
@@ -38373,6 +38409,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     params,
                 )
                 db.conn.commit()
+                # On-demand writes still count against the working-copy quota.
+                # Without this, opening many oversized originals after eviction
+                # would refill the cache past the configured limit until the
+                # next scan or config save.
+                try:
+                    evict_working_copy_cache_if_over_quota(db, vireo_dir)
+                except Exception:
+                    log.exception(
+                        "Working-copy quota enforcement failed after on-demand write"
+                    )
             return send_file(wc_abs, mimetype="image/jpeg")
 
         # extract_working_copy failed on a RAW source: try the full-res
@@ -38390,7 +38436,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             with _PILImage.open(wc_abs) as upgraded:
                 uw, uh = upgraded.size
             if not primary_is_raw:
-                updates = ["working_copy_path=?"]
+                updates = [
+                    "working_copy_path=?",
+                    "working_copy_evicted_mtime=NULL",
+                ]
                 params = [wc_rel]
                 if not photo["width"] or not photo["height"]:
                     updates.extend(["width=?", "height=?"])
@@ -38401,6 +38450,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     params,
                 )
                 db.conn.commit()
+                try:
+                    evict_working_copy_cache_if_over_quota(db, vireo_dir)
+                except Exception:
+                    log.exception(
+                        "Working-copy quota enforcement failed after on-demand write"
+                    )
             log.info(
                 "RAW extraction failed for photo %s original; served "
                 "companion JPEG instead", photo_id,

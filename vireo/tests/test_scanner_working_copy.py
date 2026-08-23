@@ -1199,3 +1199,131 @@ def test_startup_backfill_does_not_persist_to_history(tmp_path, monkeypatch):
         "SELECT id FROM job_history WHERE type='working_copy_backfill'"
     ).fetchall()
     assert rows == [], "ephemeral job must not persist to history"
+
+
+def _make_noisy_jpeg(path, width, height):
+    """A high-entropy JPEG so extracted working copies stay large enough to
+    exercise the quota tracker (uniform-gray JPEGs compress to a few KB)."""
+    import numpy as np
+
+    rng = np.random.default_rng(1234)
+    arr = rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
+    Image.fromarray(arr, "RGB").save(str(path), "JPEG", quality=95)
+
+
+def _photo_id_of_file(db, folder_id, filename, path):
+    return db.add_photo(
+        folder_id, filename, ".jpg",
+        file_size=os.path.getsize(str(path)),
+        file_mtime=os.path.getmtime(str(path)),
+        width=2000, height=1500,
+    )
+
+
+def test_batch_generation_stops_when_quota_exhausted(tmp_path, monkeypatch):
+    """A single backfill batch cannot generate multiples of the quota.
+
+    Regression: without incremental enforcement, a library much larger than
+    ``working_copy_cache_max_mb`` would produce the entire set of working
+    copies before the post-loop eviction ran, temporarily using far more
+    disk than the configured cap. The loop now stops once cumulative new
+    bytes reach the quota, and the post-loop enforce reclaims to fit.
+    """
+    import config as cfg
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    # A tiny 1 MB quota with noisy JPEGs (~700 KB each at 1000 px q=90) means
+    # two files fill the batch cap; the rest must be deferred.
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+    photo_ids = []
+    for i in range(6):
+        src = folder / f"big-{i}.jpg"
+        _make_noisy_jpeg(src, 2000, 1500)
+        photo_ids.append(
+            _photo_id_of_file(db, folder_id, f"big-{i}.jpg", src)
+        )
+
+    _extract_working_copies(db, str(vireo_dir))
+
+    working_dir = vireo_dir / "working"
+    on_disk = list(working_dir.glob("*.jpg")) if working_dir.exists() else []
+    total_bytes = sum(p.stat().st_size for p in on_disk)
+    quota_bytes = 1 * 1024 * 1024
+    assert total_bytes <= quota_bytes, (
+        f"post-loop enforce must keep on-disk usage within the {quota_bytes} "
+        f"byte quota; observed {total_bytes} bytes across {len(on_disk)} files"
+    )
+    # And the loop must NOT have generated all six files (each ~700 KB).
+    assert len(on_disk) < len(photo_ids), (
+        "batch generation must stop before producing multiples of the quota; "
+        f"produced {len(on_disk)} of {len(photo_ids)} candidates"
+    )
+
+
+def test_incremental_enforcement_bounds_transient_overshoot(tmp_path, monkeypatch):
+    """Mid-batch enforce runs so transient usage stays close to the quota.
+
+    Records every call to ``evict_if_over_quota`` during a batch that
+    generates significantly more than the quota — at least one call must
+    fire before the post-loop enforce so the transient overshoot is
+    bounded.
+    """
+    import config as cfg
+    import working_copy_cache
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+    for i in range(4):
+        src = folder / f"big-{i}.jpg"
+        _make_noisy_jpeg(src, 2000, 1500)
+        _photo_id_of_file(db, folder_id, f"big-{i}.jpg", src)
+
+    call_sites = []
+    real_evict = working_copy_cache.evict_if_over_quota
+
+    def tracking_evict(*args, **kwargs):
+        call_sites.append(True)
+        return real_evict(*args, **kwargs)
+
+    # scanner reimports evict_if_over_quota via ``from working_copy_cache
+    # import evict_if_over_quota`` INSIDE _extract_working_copies, so the
+    # local binding resolves against this attribute at call time.
+    monkeypatch.setattr(
+        working_copy_cache, "evict_if_over_quota", tracking_evict,
+    )
+
+    _extract_working_copies(db, str(vireo_dir))
+
+    # Post-loop enforce + at least one incremental enforce = >= 2 calls.
+    assert len(call_sites) >= 2, (
+        f"expected incremental enforcement to fire during a large batch; "
+        f"observed {len(call_sites)} evict_if_over_quota calls"
+    )

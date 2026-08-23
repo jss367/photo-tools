@@ -447,30 +447,80 @@ def test_classify_batch_skips_gpu_lock_for_cpu_only_session(tmp_path):
     )
 
 
-def test_missing_label_descriptions_self_heals(tmp_path):
-    """A model dir without label_descriptions.json triggers the models
-    self-heal hook; the healed file is used for common-name mapping."""
+def _reset_heal_state():
+    """Clear the module-level bounded-retry state between tests so each
+    test that exercises the heal path gets a fresh attempt slot."""
+    import timm_classifier as tc
+    with tc._HEAL_LOCK:
+        tc._HEAL_STATE.clear()
+        tc._HEAL_THREADS.clear()
+
+
+def test_missing_label_descriptions_spawns_async_heal(tmp_path):
+    """A model dir without label_descriptions.json spawns the heal on a
+    background thread — startup never waits on the network probe. The
+    healed file lands on disk once the thread completes."""
     from timm_classifier import TimmClassifier
 
+    _reset_heal_state()
     model_dir = _make_model_dir(tmp_path)
     (model_dir / "label_descriptions.json").unlink()
     fake_session = _make_fake_session()
 
+    heal_gate = __import__("threading").Event()
     def _fake_ensure(dir_arg, model_str, progress_callback=None):
+        heal_gate.wait(timeout=5)
         assert dir_arg == str(model_dir)
         with open(os.path.join(dir_arg, "label_descriptions.json"), "w") as f:
             json.dump({"Sturnus vulgaris": "European Starling, Bird"}, f)
         return True
 
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
     with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
          patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
          patch("models.ensure_timm_label_descriptions", side_effect=_fake_ensure) as ensure:
-        clf = TimmClassifier(
-            "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
-        )
+        clf = TimmClassifier(model_str)
+        # Startup returned before the (blocked) heal call, proving the
+        # network probe is off the critical path.
+        assert not (model_dir / "label_descriptions.json").exists()
+        assert clf._common_names == {}
+        heal_gate.set()
+        import timm_classifier as tc
+        tc._HEAL_THREADS[model_str].join(timeout=5)
 
     assert ensure.called
-    assert clf._common_names["sturnus vulgaris"] == "European Starling"
+    assert (model_dir / "label_descriptions.json").exists()
+    # A new classifier instance sees the healed file.
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session):
+        clf2 = TimmClassifier(model_str)
+    assert clf2._common_names["sturnus vulgaris"] == "European Starling"
+
+
+def test_heal_bounded_to_one_attempt_per_process(tmp_path):
+    """Second TimmClassifier construction with the file still missing
+    does not re-spawn the heal — an already-failed attempt would just
+    re-block on the same unreachable HF."""
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+    fake_session = _make_fake_session()
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions", side_effect=OSError("offline")) as ensure:
+        TimmClassifier(model_str)
+        import timm_classifier as tc
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+        first_calls = ensure.call_count
+        # File is still missing, but a second init must not re-attempt.
+        TimmClassifier(model_str)
+
+    assert first_calls == 1
+    assert ensure.call_count == 1
 
 
 def test_self_heal_failure_keeps_classifier_working(tmp_path):
@@ -478,33 +528,38 @@ def test_self_heal_failure_keeps_classifier_working(tmp_path):
     still constructs and falls back to taxonomy/scientific names."""
     from timm_classifier import TimmClassifier
 
+    _reset_heal_state()
     model_dir = _make_model_dir(tmp_path)
     (model_dir / "label_descriptions.json").unlink()
     fake_session = _make_fake_session()
 
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
     with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
          patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
          patch("models.ensure_timm_label_descriptions", side_effect=OSError("offline")):
-        clf = TimmClassifier(
-            "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
-        )
-
-    assert clf._common_names == {}
-    assert clf._resolve_common_name("Sturnus vulgaris") == "Sturnus vulgaris"
+        clf = TimmClassifier(model_str)
+        # Even before the background heal thread finishes, the classifier
+        # is usable via the taxonomy fallback.
+        assert clf._common_names == {}
+        assert clf._resolve_common_name("Sturnus vulgaris") == "Sturnus vulgaris"
+        import timm_classifier as tc
+        tc._HEAL_THREADS[model_str].join(timeout=5)
 
 
 def test_present_label_descriptions_skips_self_heal(tmp_path):
     """No self-heal attempt when the file is already on disk."""
     from timm_classifier import TimmClassifier
 
+    _reset_heal_state()
     _make_model_dir(tmp_path)
     fake_session = _make_fake_session()
 
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
     with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
          patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
          patch("models.ensure_timm_label_descriptions") as ensure:
-        TimmClassifier(
-            "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
-        )
+        TimmClassifier(model_str)
 
+    import timm_classifier as tc
+    assert model_str not in tc._HEAL_THREADS
     assert not ensure.called

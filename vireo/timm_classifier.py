@@ -7,6 +7,7 @@ Model files are stored in ~/.vireo/models/timm-inat21-eva02-l/.
 import json
 import logging
 import os
+import threading
 
 import numpy as np
 import onnx_runtime
@@ -19,6 +20,59 @@ _MODEL_DIR_MAP = {
 }
 
 _MODELS_ROOT = os.path.expanduser("~/.vireo/models")
+
+# Bounded retry for the background label_descriptions.json heal: at most
+# one heal attempt per (model_str) per process. A previous attempt that
+# succeeded leaves the file on disk (so future TimmClassifier inits skip
+# spawning entirely); a previous attempt that failed sets state="failed"
+# and later inits skip too — HF was unreachable once, so repeat network
+# probes on every classify job would just re-block for the same reason.
+_HEAL_LOCK = threading.Lock()
+_HEAL_STATE: dict = {}  # model_str -> "in_flight" | "done" | "failed"
+_HEAL_THREADS: dict = {}  # model_str -> threading.Thread (kept for tests)
+
+
+def _spawn_label_desc_heal(model_dir, model_str):
+    """Best-effort async heal of a missing label_descriptions.json.
+
+    Runs the network-touching self-heal in a daemon thread so
+    TimmClassifier construction stays offline-only after the initial
+    model download — matching the docs' promise (help.json: "Only for
+    downloading AI models on first use"). Existing classifier instances
+    use the taxonomy fallback until the file is on disk; the next
+    TimmClassifier construction picks it up.
+
+    Bounded to one attempt per process per model_str (see _HEAL_STATE).
+    Returns the spawned Thread, or None if a prior attempt already ran.
+    """
+    with _HEAL_LOCK:
+        if _HEAL_STATE.get(model_str) is not None:
+            return None
+        _HEAL_STATE[model_str] = "in_flight"
+
+    def _worker():
+        try:
+            import models as _models_mod
+            ok = _models_mod.ensure_timm_label_descriptions(
+                model_dir, model_str,
+            )
+        except Exception as e:
+            log.info(
+                "label_descriptions heal failed for %s: %s", model_str, e,
+            )
+            ok = False
+        with _HEAL_LOCK:
+            _HEAL_STATE[model_str] = "done" if ok else "failed"
+
+    thread = threading.Thread(
+        target=_worker,
+        name=f"label-desc-heal:{model_str}",
+        daemon=True,
+    )
+    with _HEAL_LOCK:
+        _HEAL_THREADS[model_str] = thread
+    thread.start()
+    return thread
 
 
 class TimmClassifier:
@@ -59,23 +113,17 @@ class TimmClassifier:
                     "Download the model from the Models page in Settings."
                 )
 
-        import models as _models_mod
-
         # Installs that predate the label_descriptions.json export have no
         # scientific→common mapping and leak raw binomials ("Bubulcus
         # ibis") into predictions whenever the taxonomy fallback misses.
-        # Best-effort self-heal before the file is read; offline failures
-        # keep the taxonomy fallback.
+        # Spawn the heal off the startup path — the network probes can
+        # take a full HF timeout when offline, and classifier construction
+        # runs per classify job. This instance proceeds with the taxonomy
+        # fallback; the next TimmClassifier picks up the healed file.
         if not os.path.isfile(label_desc_path):
-            try:
-                _models_mod.ensure_timm_label_descriptions(
-                    model_dir, model_str,
-                )
-            except Exception as e:
-                log.info(
-                    "label_descriptions self-heal failed for %s: %s",
-                    model_str, e,
-                )
+            _spawn_label_desc_heal(model_dir, model_str)
+
+        import models as _models_mod
 
         # Load ONNX session with self-heal on corruption: if the bytes
         # are truncated / partial, delete them and re-download once

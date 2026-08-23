@@ -3268,6 +3268,7 @@ function browseStackCoverCompare(a, b) {
     [a.quality_score, b.quality_score],
     [a.subject_sharpness, b.subject_sharpness],
     [a.sharpness, b.sharpness],
+    [a.rating == null ? 0 : 1, b.rating == null ? 0 : 1],
     [a.rating == null ? 0 : a.rating, b.rating == null ? 0 : b.rating],
     [(a.width || 0) * (a.height || 0), (b.width || 0) * (b.height || 0)],
     [a.file_size || 0, b.file_size || 0],
@@ -3454,7 +3455,12 @@ async function toggleBrowseStack(event, coverId) {
   if (badge) badge.setAttribute('aria-expanded', 'true');
   insertBrowseStackTray(coverId);
   var cacheKey = String(coverId);
-  if (browseStackMembers[cacheKey] || browseStackErrors[cacheKey]) return;
+  if (browseStackMembers[cacheKey]) return;
+  // Errors are presentation state, not a durable cache result. Re-expanding
+  // after collapse retries a transient failure instead of pinning the stack
+  // to its first failed request until the whole Browse dataset reloads.
+  delete browseStackErrors[cacheKey];
+  insertBrowseStackTray(coverId);
   var memberIds = cover.browse_stack.photo_ids || [];
   if (memberIds.length > 500) {
     browseStackErrors[cacheKey] = 'This stack is too large to expand in Browse.';

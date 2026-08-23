@@ -27,6 +27,12 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
     page.locator("#browseStacksToggle").check()
     expect(cards).to_have_count(3)
     expect(page.locator("#filterSummary")).to_contain_text("3 items · 5 photos")
+    assert page.evaluate(
+        """() => browseStackCoverCompare(
+          {id: 1, rating: 0, width: 1, height: 1},
+          {id: 2, rating: null, width: 999, height: 999}
+        ) < 0"""
+    )
 
     stack_card = page.locator(
         f'.grid-card[data-id="{burst_ids[1]}"]'
@@ -322,6 +328,29 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
             && preview.photo.id !== ids[0] && preview.navigationPhotos === photos;
         }""",
         [burst_ids[0], live_server["data"]["photos"][3]],
+    )
+
+    assert page.evaluate(
+        """async coverId => {
+          var originalSafeFetch = safeFetch;
+          var memberLoads = 0;
+          delete browseStackMembers[String(coverId)];
+          browseStackErrors[String(coverId)] = 'Could not load this stack.';
+          expandedBrowseStacks.delete(coverId);
+          safeFetch = function(url) {
+            if (url === '/api/photos/by-ids') memberLoads++;
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            await toggleBrowseStack(null, coverId);
+          } finally {
+            safeFetch = originalSafeFetch;
+          }
+          return memberLoads === 1
+            && !!browseStackMembers[String(coverId)]
+            && !browseStackErrors[String(coverId)];
+        }""",
+        burst_ids[1],
     )
 
     hydration_chunks = page.evaluate(

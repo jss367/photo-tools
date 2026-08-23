@@ -98,6 +98,21 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
     hidden_member.click()
     expect(page.locator("#detailFilename")).to_have_text("hawk3.jpg")
 
+    page.evaluate(
+        """coverId => {
+          document.querySelector(
+            '.browse-stack-tray[data-stack-cover-id="' + coverId + '"]'
+          ).dataset.beforeColorRefresh = '1';
+        }""",
+        burst_ids[1],
+    )
+    page.evaluate("() => setColorLabel('red')")
+    page.wait_for_function(
+        "photoId => colorLabels[photoId] === 'red'",
+        arg=burst_ids[2],
+    )
+    expect(tray).not_to_have_attribute("data-before-color-refresh", "1")
+
     page.locator("#batchBar button", has_text="Export").click()
     expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
     expect(page.locator("#exportPreview")).to_contain_text("hawk3")
@@ -123,6 +138,19 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
         expect(
             tray.locator(f'.browse-stack-member[data-id="{photo_id}"]')
         ).to_have_class("browse-stack-member selected")
+
+    tray.get_by_role("button", name="Collapse stack").click()
+    expect(tray).to_be_hidden()
+    assert page.evaluate(
+        """coverId => {
+          var preview = getBrowseShortcutPhoto();
+          return selectedPhotos.size === 3 && selectedPhotoId === coverId
+            && preview.photo.id === coverId && preview.navigationPhotos === photos;
+        }""",
+        burst_ids[1],
+    )
+    badge.click()
+    expect(tray).to_be_visible()
 
     page.evaluate("() => setSelectionWildlifeExcluded(true)")
     page.wait_for_function(
@@ -216,12 +244,17 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
     # A collapsed stack has no hydrated member cache. Rejecting its current
     # cover still hydrates that one group and promotes the correct replacement.
     assert page.evaluate("() => Object.keys(browseStackMembers).length") == 0
+    page.locator(f'.grid-card[data-id="{burst_ids[0]}"]').click()
     page.evaluate(
         "photoId => setFlagFor(photoId, 'rejected')",
         burst_ids[0],
     )
     expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
     expect(page.locator(f'.grid-card[data-id="{burst_ids[0]}"]')).to_have_count(0)
+    page.wait_for_function(
+        "photoId => selectedPhotoId === photoId",
+        arg=burst_ids[1],
+    )
 
     hydration_chunks = page.evaluate(
         """async coverId => {

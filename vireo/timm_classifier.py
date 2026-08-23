@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import threading
+import time
 
 import numpy as np
 import onnx_runtime
@@ -48,11 +49,60 @@ _MODELS_ROOT = os.path.expanduser("~/.vireo/models")
 # "done" is contradicted by the disk, and the same attempt cap keeps a
 # pathological "heal reports success but the file stays unusable" state
 # from firing a network probe per classify job.
+#
+# Once that burst is spent, failures switch from "immediate retry" to
+# "rate-limited retry" rather than to "never again". Three probes are a
+# few seconds of a genuine outage; connectivity often returns minutes or
+# hours later, and stopping there would still leak raw scientific names
+# for the life of the installation with no in-app remedy — Repair leaves
+# already-verified required artifacts alone, so the installation
+# generation this state is keyed to never changes. So each further
+# consecutive failure doubles the wait, capped at
+# _HEAL_RETRY_MAX_SECONDS. The retry count past the burst is deliberately
+# unbounded: bounded *rate*, not bounded *attempts*. At the cap this is
+# one probe an hour on a background thread.
+#
+# "done" is not rate-limited this way — it is capped outright, because a
+# heal that keeps reporting success while the file stays unusable is a
+# bug, not a network condition, and waiting longer cannot fix it.
 _HEAL_MAX_ATTEMPTS = 3
+_HEAL_RETRY_BASE_SECONDS = 60.0
+_HEAL_RETRY_MAX_SECONDS = 3600.0
 _HEAL_LOCK = threading.Lock()
 _HEAL_STATE: dict = {}  # heal key -> "in_flight" | "done" | "failed"
 _HEAL_ATTEMPTS: dict = {}  # heal key -> int
+_HEAL_FAILURES: dict = {}  # heal key -> consecutive failure count
+_HEAL_RETRY_AT: dict = {}  # heal key -> monotonic deadline for the next try
 _HEAL_THREADS: dict = {}  # model_str -> threading.Thread (kept for tests)
+
+
+def reset_label_desc_heal_state(model_str=None):
+    """Forget recorded heal verdicts so the next construction retries.
+
+    Called by ``models.download_model``, i.e. when the user clicks Repair
+    in Settings → Models. Repair means "try this again": a spent attempt
+    budget or an open backoff window is invisible to the user, so
+    honouring the button they just pressed means clearing both. Without
+    this, a verdict recorded during an outage survives Repair entirely —
+    Repair skips required artifacts that already verify, so the
+    installation generation the verdict is keyed to never changes and
+    the user has no in-app way back to correct common names.
+
+    ``model_str=None`` clears every model. In-flight entries are left
+    alone: their worker is about to record its own verdict, and dropping
+    the marker would let a duplicate worker start alongside it.
+    """
+    with _HEAL_LOCK:
+        keys = [
+            k for k in list(_HEAL_STATE)
+            if (model_str is None or k[0] == model_str)
+            and _HEAL_STATE.get(k) != "in_flight"
+        ]
+        for k in keys:
+            _HEAL_STATE.pop(k, None)
+            _HEAL_ATTEMPTS.pop(k, None)
+            _HEAL_FAILURES.pop(k, None)
+            _HEAL_RETRY_AT.pop(k, None)
 
 
 def _installation_generation(model_dir):
@@ -98,9 +148,10 @@ def _spawn_label_desc_heal(model_dir, model_str):
     use the taxonomy fallback until the file is on disk; the next
     TimmClassifier construction picks it up.
 
-    Bounded per installation generation (see _HEAL_STATE). Returns the
-    spawned Thread, or None when a prior attempt for this installation
-    already settled the question.
+    Bounded, then rate-limited, per installation generation (see
+    _HEAL_STATE). Returns the spawned Thread, or None when a prior
+    attempt for this installation already settled the question or is
+    still inside its retry backoff window.
     """
     key = (model_str, _installation_generation(model_dir))
     with _HEAL_LOCK:
@@ -108,8 +159,14 @@ def _spawn_label_desc_heal(model_dir, model_str):
         if state == "in_flight":
             return None
         attempts = _HEAL_ATTEMPTS.get(key, 0)
-        if state in ("done", "failed") and attempts >= _HEAL_MAX_ATTEMPTS:
+        if state == "done" and attempts >= _HEAL_MAX_ATTEMPTS:
             return None
+        if state == "failed" and attempts >= _HEAL_MAX_ATTEMPTS:
+            # Immediate-retry burst spent; fall back to the backoff
+            # schedule rather than giving up on the installation.
+            retry_at = _HEAL_RETRY_AT.get(key)
+            if retry_at is not None and time.monotonic() < retry_at:
+                return None
         _HEAL_STATE[key] = "in_flight"
         _HEAL_ATTEMPTS[key] = attempts + 1
 
@@ -126,6 +183,23 @@ def _spawn_label_desc_heal(model_dir, model_str):
             ok = False
         with _HEAL_LOCK:
             _HEAL_STATE[key] = "done" if ok else "failed"
+            if ok:
+                _HEAL_FAILURES.pop(key, None)
+                _HEAL_RETRY_AT.pop(key, None)
+            else:
+                failures = _HEAL_FAILURES.get(key, 0) + 1
+                _HEAL_FAILURES[key] = failures
+                delay = min(
+                    _HEAL_RETRY_BASE_SECONDS
+                    * (2 ** max(0, failures - _HEAL_MAX_ATTEMPTS)),
+                    _HEAL_RETRY_MAX_SECONDS,
+                )
+                _HEAL_RETRY_AT[key] = time.monotonic() + delay
+                log.info(
+                    "label_descriptions heal for %s failed (%d in a row); "
+                    "next attempt no sooner than %.0fs from now",
+                    model_str, failures, delay,
+                )
 
     thread = threading.Thread(
         target=_worker,

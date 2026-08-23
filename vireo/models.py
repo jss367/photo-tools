@@ -908,6 +908,35 @@ def download_model(model_id, progress_callback=None):
             progress_callback=progress_callback,
         )
 
+    # Settings → Models offers Repair as the fix for a model that is
+    # missing its optional files, so Repair has to actually be able to
+    # fix them. For label_descriptions.json (the scientific→common name
+    # mapping) the ONNX repo copy is only one of two sources: when the
+    # repo doesn't carry the file yet, the loop above skips it silently
+    # and Repair would be a permanent no-op. ensure_timm_label_descriptions
+    # also derives the mapping from the upstream timm config, so run it
+    # here — it returns immediately when the file is already usable, and
+    # never raises.
+    model_str = km.get("model_str") or ""
+    if (
+        "label_descriptions.json" in optional_files_list
+        and model_str.startswith("hf-hub:")
+    ):
+        ensure_timm_label_descriptions(
+            model_dir, model_str, progress_callback=progress_callback,
+        )
+        # Repair means "try again". The background heal's per-installation
+        # attempt budget and backoff window are invisible to the user, and
+        # Repair leaves already-verified required artifacts alone, so the
+        # installation generation they are keyed to does not change —
+        # without an explicit reset the button cannot revive a heal that
+        # failed during an outage.
+        try:
+            import timm_classifier
+            timm_classifier.reset_label_desc_heal_state(model_str)
+        except Exception as e:  # pragma: no cover - defensive
+            log.debug("Could not reset label-description heal state: %s", e)
+
     state = _classify_model_state(model_dir, files)
     # "unverified" is an acceptable post-download state: every required file
     # is present, only the cryptographic check was skipped because the HF

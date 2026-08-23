@@ -3096,3 +3096,132 @@ def test_download_model_still_refetches_corrupt_files(tmp_path, monkeypatch):
     assert (model_dir / "image_encoder.onnx.data").read_bytes() == (
         contents["image_encoder.onnx.data"]
     )
+
+
+def test_download_model_repairs_label_descriptions_from_upstream(
+    tmp_path, monkeypatch
+):
+    """Repair is the button Settings offers for a missing optional file,
+    so Repair has to be able to fix label_descriptions.json even when our
+    ONNX repo does not carry it yet — the optional loop skips files the
+    repo doesn't have, which would make Repair a permanent no-op and
+    leave predictions showing raw scientific names forever."""
+    import hashlib
+
+    import model_verify
+    models, _ = _patch_download_model_env(tmp_path, monkeypatch)
+    model_dir = tmp_path / "models" / "timm-inat21-eva02-l"
+
+    km = next(
+        m for m in models.KNOWN_MODELS if m["id"] == "timm-inat21-eva02-l"
+    )
+    contents = {name: b"x" * (11 * 1024 * 1024) for name in km["files"]}
+    expected = {
+        name: hashlib.sha256(data).hexdigest()
+        for name, data in contents.items()
+    }
+
+    def fake_download(repo_id, filename, local_dir, subfolder=None,
+                      progress_callback=None, revision=None):
+        dest = os.path.join(local_dir, filename)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(contents.get(filename, b"{}"))
+        return dest
+
+    # The ONNX repo has the required files but not the optional mapping.
+    hf_subdir = km.get("hf_subdir", km["id"])
+    _stub_hf_for_download_tests(
+        monkeypatch,
+        lambda repo_id, revision=None: {
+            f"{hf_subdir}/{n}" for n in km["files"]
+        },
+    )
+    monkeypatch.setattr(models, "_hf_download_with_retry", fake_download)
+    monkeypatch.setattr(
+        model_verify, "fetch_expected_hashes",
+        lambda subdir, revision="main": expected,
+    )
+    monkeypatch.setattr(
+        models, "_load_upstream_timm_config",
+        lambda model_str: {
+            "label_descriptions": {"Bubulcus ibis": "Cattle Egret, Bird"},
+        },
+    )
+
+    models.download_model("timm-inat21-eva02-l")
+
+    healed = model_dir / "label_descriptions.json"
+    assert healed.exists(), (
+        "Repair must fall back to the upstream model config when the ONNX "
+        "repo has no label_descriptions.json"
+    )
+    assert json.loads(healed.read_text()) == {
+        "Bubulcus ibis": "Cattle Egret, Bird"
+    }
+
+
+def test_download_model_clears_a_failed_heal_verdict(tmp_path, monkeypatch):
+    """Repair must also reset the background heal's per-installation
+    state. It skips required artifacts that already verify, so the
+    installation generation the "failed" verdict is keyed to never
+    changes — the verdict would otherwise outlive the repair the user
+    just asked for."""
+    import hashlib
+
+    import model_verify
+    import timm_classifier
+    models, _ = _patch_download_model_env(tmp_path, monkeypatch)
+
+    km = next(
+        m for m in models.KNOWN_MODELS if m["id"] == "timm-inat21-eva02-l"
+    )
+    contents = {name: b"y" * (11 * 1024 * 1024) for name in km["files"]}
+    expected = {
+        name: hashlib.sha256(data).hexdigest()
+        for name, data in contents.items()
+    }
+
+    def fake_download(repo_id, filename, local_dir, subfolder=None,
+                      progress_callback=None, revision=None):
+        dest = os.path.join(local_dir, filename)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(contents.get(filename, b"{}"))
+        return dest
+
+    hf_subdir = km.get("hf_subdir", km["id"])
+    _stub_hf_for_download_tests(
+        monkeypatch,
+        lambda repo_id, revision=None: {
+            f"{hf_subdir}/{n}" for n in km["files"]
+        },
+    )
+    monkeypatch.setattr(models, "_hf_download_with_retry", fake_download)
+    monkeypatch.setattr(
+        model_verify, "fetch_expected_hashes",
+        lambda subdir, revision="main": expected,
+    )
+    monkeypatch.setattr(
+        models, "_load_upstream_timm_config",
+        lambda model_str: {"label_descriptions": {"Bubulcus ibis": "Egret"}},
+    )
+
+    model_str = km["model_str"]
+    stale = (model_str, ("stale-generation",))
+    with timm_classifier._HEAL_LOCK:
+        timm_classifier._HEAL_STATE[stale] = "failed"
+        timm_classifier._HEAL_ATTEMPTS[stale] = timm_classifier._HEAL_MAX_ATTEMPTS
+        timm_classifier._HEAL_RETRY_AT[stale] = float("inf")
+    try:
+        models.download_model("timm-inat21-eva02-l")
+        assert stale not in timm_classifier._HEAL_STATE, (
+            "Repair must clear the failed heal verdict it cannot otherwise "
+            "invalidate"
+        )
+        assert stale not in timm_classifier._HEAL_RETRY_AT
+    finally:
+        with timm_classifier._HEAL_LOCK:
+            timm_classifier._HEAL_STATE.pop(stale, None)
+            timm_classifier._HEAL_ATTEMPTS.pop(stale, None)
+            timm_classifier._HEAL_RETRY_AT.pop(stale, None)

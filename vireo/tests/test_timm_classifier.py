@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -455,6 +456,8 @@ def _reset_heal_state():
     with tc._HEAL_LOCK:
         tc._HEAL_STATE.clear()
         tc._HEAL_ATTEMPTS.clear()
+        tc._HEAL_FAILURES.clear()
+        tc._HEAL_RETRY_AT.clear()
         tc._HEAL_THREADS.clear()
 
 
@@ -1212,3 +1215,141 @@ def test_instance_exposes_the_consumed_label_descriptions_identity(tmp_path):
         pre_heal = TimmClassifier(model_str)
     assert pre_heal.label_descriptions_identity == NO_LABEL_DESCRIPTIONS
     assert pre_heal.label_descriptions_identity != clf.label_descriptions_identity
+
+
+def test_heal_retries_again_after_the_burst_once_backoff_elapses(tmp_path):
+    """Spending the immediate-retry burst must not strand the install.
+
+    ``_HEAL_MAX_ATTEMPTS`` back-to-back probes are a few seconds of a
+    real outage; connectivity usually returns minutes or hours later.
+    Stopping there would leak raw scientific names for the life of the
+    installation with no in-app remedy, because Repair skips
+    already-verified required artifacts and so never changes the
+    installation generation the verdict is keyed to. After the burst the
+    heal switches to rate-limited retries, not to silence.
+    """
+    import timm_classifier as tc
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+    fake_session = _make_fake_session()
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions",
+               side_effect=OSError("offline")) as ensure:
+        for _ in range(tc._HEAL_MAX_ATTEMPTS):
+            TimmClassifier(model_str)
+            tc._HEAL_THREADS[model_str].join(timeout=5)
+        assert ensure.call_count == tc._HEAL_MAX_ATTEMPTS
+
+        # Inside the backoff window: no probe, so a classify job per
+        # photo can't become a network probe per photo.
+        TimmClassifier(model_str)
+        assert ensure.call_count == tc._HEAL_MAX_ATTEMPTS
+
+        # Connectivity is back and the wait has elapsed.
+        with tc._HEAL_LOCK:
+            assert tc._HEAL_RETRY_AT, "a failure must schedule a next attempt"
+            for heal_key in tc._HEAL_RETRY_AT:
+                tc._HEAL_RETRY_AT[heal_key] = time.monotonic() - 1
+
+        TimmClassifier(model_str)
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+
+    assert ensure.call_count == tc._HEAL_MAX_ATTEMPTS + 1, (
+        "a failed heal must stay retryable once its backoff window expires"
+    )
+
+
+def test_heal_backoff_grows_with_consecutive_failures(tmp_path):
+    """Each post-burst failure waits longer, up to a cap, so a machine
+    that stays offline settles into one probe an hour."""
+    import timm_classifier as tc
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+    fake_session = _make_fake_session()
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    delays = []
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions",
+               side_effect=OSError("offline")):
+        for _ in range(tc._HEAL_MAX_ATTEMPTS + 3):
+            TimmClassifier(model_str)
+            tc._HEAL_THREADS[model_str].join(timeout=5)
+            with tc._HEAL_LOCK:
+                heal_key = next(iter(tc._HEAL_RETRY_AT))
+                delays.append(tc._HEAL_RETRY_AT[heal_key] - time.monotonic())
+                tc._HEAL_RETRY_AT[heal_key] = time.monotonic() - 1
+
+    post_burst = delays[tc._HEAL_MAX_ATTEMPTS - 1:]
+    assert all(
+        post_burst[i] < post_burst[i + 1]
+        for i in range(len(post_burst) - 1)
+    ), f"backoff must grow: {post_burst}"
+    assert all(d <= tc._HEAL_RETRY_MAX_SECONDS + 1 for d in delays)
+
+
+def test_repair_clears_a_failed_heal_verdict(tmp_path):
+    """Settings → Repair means "try again", so it must clear a spent
+    attempt budget and an open backoff window — both invisible to the
+    user. Repair leaves already-verified required artifacts alone, so
+    the installation generation the verdict is keyed to does not change;
+    without this reset the button could not revive the heal at all."""
+    import timm_classifier as tc
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+    fake_session = _make_fake_session()
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions",
+               side_effect=OSError("offline")) as ensure:
+        for _ in range(tc._HEAL_MAX_ATTEMPTS):
+            TimmClassifier(model_str)
+            tc._HEAL_THREADS[model_str].join(timeout=5)
+        TimmClassifier(model_str)
+        assert ensure.call_count == tc._HEAL_MAX_ATTEMPTS
+
+        # No reinstall: model.onnx on disk is untouched, exactly as
+        # Repair leaves it when its SHA256 already matches.
+        tc.reset_label_desc_heal_state(model_str)
+
+        TimmClassifier(model_str)
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+
+    assert ensure.call_count == tc._HEAL_MAX_ATTEMPTS + 1, (
+        "an explicit Repair must make a failed heal retryable immediately"
+    )
+
+
+def test_repair_reset_leaves_an_in_flight_heal_alone(tmp_path):
+    """Clearing state for a heal that is still running would let a second
+    worker start beside it and double the network probes."""
+    import timm_classifier as tc
+
+    _reset_heal_state()
+    heal_key = ("model-x", (1, 2, 3, 4))
+    with tc._HEAL_LOCK:
+        tc._HEAL_STATE[heal_key] = "in_flight"
+    tc.reset_label_desc_heal_state("model-x")
+    assert tc._HEAL_STATE.get(heal_key) == "in_flight"
+
+    with tc._HEAL_LOCK:
+        tc._HEAL_STATE[heal_key] = "failed"
+        tc._HEAL_ATTEMPTS[heal_key] = 9
+    tc.reset_label_desc_heal_state()
+    assert heal_key not in tc._HEAL_STATE
+    assert heal_key not in tc._HEAL_ATTEMPTS

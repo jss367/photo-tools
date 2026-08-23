@@ -127,7 +127,9 @@ class TimmClassifier:
         # alone must not suppress the repair, or one truncated write
         # would leak scientific names forever (and, if we let json.load
         # raise here, brick every classify job).
-        descs = _models_mod.load_label_descriptions(label_desc_path)
+        descs, label_desc_signature = _models_mod.read_label_descriptions(
+            label_desc_path,
+        )
 
         # Record what this instance actually consumed for
         # ``label_descriptions.json`` so ``acquire_cached_classifier``
@@ -141,13 +143,13 @@ class TimmClassifier:
         # would reuse the stale classifier — its ``_common_names``
         # stays empty until eviction, so raw scientific names would
         # leak indefinitely under regular use.
-        label_desc_state = None
-        if descs is not None:
-            try:
-                stat = os.stat(label_desc_path)
-                label_desc_state = (stat.st_size, int(stat.st_mtime_ns))
-            except OSError:
-                pass
+        # The signature comes from the descriptor that produced ``descs``
+        # (``read_label_descriptions``), not from a stat taken afterwards:
+        # a Repair or heal that republishes the file between the read and
+        # a path stat would otherwise stamp this instance with the
+        # replacement's identity — the same "keyed by artifacts it never
+        # read" hazard, just a narrower window.
+        label_desc_state = label_desc_signature if descs is not None else None
         self.optional_files_snapshot = {
             "label_descriptions.json": label_desc_state,
         }

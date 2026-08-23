@@ -1141,6 +1141,47 @@ def _load_upstream_timm_config(model_str):
         return json.load(f)
 
 
+def _open_file_signature(fileobj):
+    """``(size, mtime_ns)`` taken from an already-open file's descriptor.
+
+    Read off the descriptor rather than the path so it describes the
+    bytes this reader actually got, even if the file is atomically
+    republished (Repair, self-heal) a moment later. A path stat taken
+    after the read would describe the *replacement*.
+    """
+    try:
+        st = os.fstat(fileobj.fileno())
+    except OSError:
+        return None
+    return (st.st_size, int(st.st_mtime_ns))
+
+
+def read_label_descriptions(path):
+    """Return ``(mapping_or_None, signature_or_None)``.
+
+    ``signature`` identifies the file state this call actually consumed
+    (see ``_open_file_signature``); None when the file was absent or
+    could not be stat-ed. Callers that cache the parsed result key it by
+    this signature, so an instance is never treated as having read a
+    file that only landed after it read.
+
+    See ``load_label_descriptions`` for the mapping semantics.
+    """
+    signature = None
+    try:
+        with open(path) as f:
+            signature = _open_file_signature(f)
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, None
+    except (OSError, ValueError) as e:
+        log.warning("Unusable %s (%s); will re-heal.", path, e)
+        return None, signature
+    if not isinstance(data, dict):
+        return None, signature
+    return data, signature
+
+
 def load_label_descriptions(path):
     """Return the {scientific name: description} mapping, or None.
 
@@ -1154,15 +1195,7 @@ def load_label_descriptions(path):
     An empty mapping is a complete document (the model simply has no
     common names) and is returned as-is, not treated as broken.
     """
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError) as e:
-        log.warning("Unusable %s (%s); will re-heal.", path, e)
-        return None
-    return data if isinstance(data, dict) else None
+    return read_label_descriptions(path)[0]
 
 
 def label_descriptions_usable(path):

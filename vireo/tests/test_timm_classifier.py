@@ -618,6 +618,62 @@ def test_optional_files_snapshot_records_present_label_descriptions(tmp_path):
     }
 
 
+def test_snapshot_ignores_a_republish_that_lands_after_the_read(tmp_path):
+    """The snapshot must describe the bytes this instance parsed, not the
+    file sitting at the path once construction moves on.
+
+    The snapshot used to be a fresh ``os.stat`` taken after
+    ``load_label_descriptions`` returned. A Repair (or the heal spawned
+    by a sibling construction) that atomically republishes
+    label_descriptions.json in that gap would stamp this instance with
+    the *replacement's* identity — so the cache would key a classifier
+    holding the old labels under the new file's fingerprint and keep
+    serving it. Same "keyed by artifacts it never read" hazard as the
+    heal-during-session-load case, one line narrower. Reading the
+    signature off the descriptor that produced the mapping closes it.
+    """
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    target = model_dir / "label_descriptions.json"
+    consumed = target.stat()
+    consumed_signature = (consumed.st_size, int(consumed.st_mtime_ns))
+
+    real_json_load = json.load
+    republished = []
+
+    def _load_then_republish(fp, *args, **kwargs):
+        data = real_json_load(fp, *args, **kwargs)
+        if not republished and getattr(fp, "name", "") == str(target):
+            replacement = model_dir / "label_descriptions.json.new"
+            # Different entry count => different size, so the signatures
+            # differ regardless of filesystem mtime granularity.
+            replacement.write_text(json.dumps({
+                "Sturnus vulgaris": "Common Starling, Bird",
+            }))
+            os.replace(replacement, target)
+            republished.append(True)
+        return data
+
+    fake_session = _make_fake_session()
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.json.load", side_effect=_load_then_republish):
+        clf = TimmClassifier(model_str)
+
+    assert republished, "the republish hook never fired"
+    now = target.stat()
+    assert (now.st_size, int(now.st_mtime_ns)) != consumed_signature
+
+    # It parsed the pre-republish file, so it must be keyed as such.
+    assert clf._common_names["sturnus vulgaris"] == "European Starling"
+    assert clf.optional_files_snapshot == {
+        "label_descriptions.json": consumed_signature,
+    }
+
+
 def test_optional_files_snapshot_records_absent_label_descriptions(tmp_path):
     """When label_descriptions.json is missing at construction time,
     the instance records ``None`` — locking the cache entry to the

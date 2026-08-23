@@ -2189,6 +2189,53 @@ def test_tree_of_life_ready_false_when_model_dir_missing():
 _TIMM_MODEL_STR = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
 
 
+def test_read_label_descriptions_signature_describes_the_bytes_read(tmp_path):
+    """The returned signature identifies the file this call actually
+    read, not whatever is at the path afterwards.
+
+    TimmClassifier caches by this signature, so it has to survive an
+    atomic republish (Repair, self-heal) landing right after the read.
+    A path stat taken after the read would describe the replacement and
+    stamp the instance with an identity for bytes it never saw — the
+    cache would then hand that stale instance to later classify jobs.
+    """
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+    target.write_text(json.dumps({"Sturnus vulgaris": "European Starling, Bird"}))
+    before = target.stat()
+
+    descs, signature = models.read_label_descriptions(str(target))
+
+    # Someone republishes different labels the instant after the read.
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text(json.dumps({
+        "Sturnus vulgaris": "Common Starling, Bird",
+        "Turdus migratorius": "American Robin, Bird",
+    }))
+    os.replace(replacement, target)
+    after = target.stat()
+
+    assert descs == {"Sturnus vulgaris": "European Starling, Bird"}
+    assert signature == (before.st_size, int(before.st_mtime_ns))
+    assert signature != (after.st_size, int(after.st_mtime_ns))
+
+
+def test_read_label_descriptions_reports_absent_and_unusable(tmp_path):
+    """Absent has no signature at all; unusable-but-present keeps the
+    mapping at None (heal it) — matching load_label_descriptions."""
+    import models
+
+    missing = tmp_path / "label_descriptions.json"
+    assert models.read_label_descriptions(str(missing)) == (None, None)
+
+    missing.write_text('{"Sturnus vulgaris": "European Star')
+    descs, signature = models.read_label_descriptions(str(missing))
+    assert descs is None
+    assert signature is not None
+    assert models.load_label_descriptions(str(missing)) is None
+
+
 def test_ensure_label_descriptions_noop_when_present(tmp_path, monkeypatch):
     """An existing file short-circuits — no network calls at all."""
     import models

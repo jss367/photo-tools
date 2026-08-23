@@ -2566,6 +2566,111 @@ def test_ensure_label_descriptions_leaves_a_changed_torn_file_alone(
     assert target.read_text() == '{"Ardea ibis": "Western Cattle Egr'
 
 
+def test_download_optional_files_preserves_pre_existing_on_transient_failure(
+    monkeypatch, tmp_path,
+):
+    """A Repair that hits a transient network error while re-fetching an
+    already-installed optional JSON must not delete the working copy.
+
+    The atomic-publish path in _hf_download_with_retry leaves the
+    destination intact when its ``copy2`` stage fails; the outer catch in
+    ``_download_optional_files`` used to unconditionally unlink
+    ``local_path`` afterwards, turning a working ``label_descriptions.json``
+    into a missing one on any transient blip. The pre/post signature
+    check must keep the pre-existing file when nothing was published.
+    """
+    import models
+
+    hf_subdir = "timm-eva02-large-inat21"
+    filename = "label_descriptions.json"
+    pre_existing = tmp_path / filename
+    pre_existing.write_text(
+        json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}),
+    )
+    pre_signature = models._path_signature(str(pre_existing))
+
+    def _fake_list_repo_files(repo_id, revision=None):
+        return [f"{hf_subdir}/{filename}"]
+
+    monkeypatch.setattr(
+        "huggingface_hub.list_repo_files", _fake_list_repo_files,
+    )
+
+    def _flaky_download(**kwargs):
+        raise RuntimeError("transient network failure")
+
+    monkeypatch.setattr(
+        models, "_download_and_verify_file", _flaky_download,
+    )
+
+    models._download_optional_files(
+        [filename], str(tmp_path), hf_subdir,
+        expected_hashes={}, revision=None, progress_callback=None,
+    )
+
+    assert pre_existing.exists(), (
+        "a transient RuntimeError during optional-file refresh must not "
+        "delete the previously installed copy"
+    )
+    assert models._path_signature(str(pre_existing)) == pre_signature, (
+        "the pre-existing file must be untouched, not replaced"
+    )
+    assert json.loads(pre_existing.read_text()) == {
+        "Bubulcus ibis": "Cattle Egret, Bird",
+    }
+
+
+def test_download_optional_files_removes_replacement_that_failed_verification(
+    monkeypatch, tmp_path,
+):
+    """If the download actually replaced the destination with a corrupt
+    file (VerifyError after atomic publish), the outer catch must remove
+    the corrupt replacement — not preserve it as if it were the good
+    pre-existing artifact."""
+    import model_verify
+    import models
+
+    hf_subdir = "timm-eva02-large-inat21"
+    filename = "label_descriptions.json"
+    pre_existing = tmp_path / filename
+    pre_existing.write_text(
+        json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}),
+    )
+
+    def _fake_list_repo_files(repo_id, revision=None):
+        return [f"{hf_subdir}/{filename}"]
+
+    monkeypatch.setattr(
+        "huggingface_hub.list_repo_files", _fake_list_repo_files,
+    )
+
+    def _publishes_then_fails(**kwargs):
+        # Atomic publish landed a new file, but verification decided it
+        # is corrupt. Simulate by rewriting the destination and raising.
+        local_path = os.path.join(kwargs["model_dir"], kwargs["filename"])
+        with open(local_path, "w") as f:
+            f.write("corrupt-payload")
+        # Force a fresh mtime/inode so the pre/post signature comparison
+        # sees the file as replaced even on filesystems with low mtime
+        # resolution.
+        os.utime(local_path, ns=(0, 0))
+        raise model_verify.VerifyError("corrupt after 3 attempts")
+
+    monkeypatch.setattr(
+        models, "_download_and_verify_file", _publishes_then_fails,
+    )
+
+    models._download_optional_files(
+        [filename], str(tmp_path), hf_subdir,
+        expected_hashes={}, revision=None, progress_callback=None,
+    )
+
+    assert not pre_existing.exists(), (
+        "a corrupt replacement must not be left on disk masquerading as "
+        "the pre-existing usable file"
+    )
+
+
 def test_load_label_descriptions_returns_none_for_broken_files(tmp_path):
     """None means 'heal it'; a parsed dict (even empty) means 'usable'."""
     import models

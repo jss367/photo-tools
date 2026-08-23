@@ -499,10 +499,17 @@ def test_missing_label_descriptions_spawns_async_heal(tmp_path):
     assert clf2._common_names["sturnus vulgaris"] == "European Starling"
 
 
-def test_heal_bounded_to_one_attempt_per_process(tmp_path):
-    """Second TimmClassifier construction with the file still missing
-    does not re-spawn the heal — an already-failed attempt would just
-    re-block on the same unreachable HF."""
+def test_heal_bounded_to_max_attempts_after_failures(tmp_path):
+    """Successive TimmClassifier constructions retry the heal after a
+    failure, but only up to ``_HEAL_MAX_ATTEMPTS`` per installation.
+
+    A permanent block on ``failed`` would strand the installation when
+    the first probe happened to run during a transient outage:
+    connectivity comes back, but no later construction re-probes, and
+    Settings Repair does not reliably recover this state either. The
+    bounded retry lets a transient outage self-heal while capping the
+    network cost of a persistent one to a small burst.
+    """
     from timm_classifier import TimmClassifier
 
     _reset_heal_state()
@@ -510,19 +517,60 @@ def test_heal_bounded_to_one_attempt_per_process(tmp_path):
     (model_dir / "label_descriptions.json").unlink()
     fake_session = _make_fake_session()
 
+    import timm_classifier as tc
     model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
     with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
          patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
          patch("models.ensure_timm_label_descriptions", side_effect=OSError("offline")) as ensure:
-        TimmClassifier(model_str)
-        import timm_classifier as tc
-        tc._HEAL_THREADS[model_str].join(timeout=5)
-        first_calls = ensure.call_count
-        # File is still missing, but a second init must not re-attempt.
+        for _ in range(tc._HEAL_MAX_ATTEMPTS):
+            TimmClassifier(model_str)
+            tc._HEAL_THREADS[model_str].join(timeout=5)
+        # File still missing after the cap: further constructions must
+        # not spawn a probe — otherwise a persistent outage would fire a
+        # network probe on every classify job.
         TimmClassifier(model_str)
 
-    assert first_calls == 1
-    assert ensure.call_count == 1
+    assert ensure.call_count == tc._HEAL_MAX_ATTEMPTS
+
+
+def test_heal_recovers_after_transient_offline_failure(tmp_path):
+    """A failed probe must not permanently strand the installation:
+    once HF is reachable again, the next TimmClassifier construction
+    re-probes and publishes the healed file."""
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+    fake_session = _make_fake_session()
+
+    import timm_classifier as tc
+    calls = {"n": 0}
+
+    def _flaky_ensure(dir_arg, model_str, progress_callback=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("offline")
+        with open(os.path.join(dir_arg, "label_descriptions.json"), "w") as f:
+            json.dump({"Sturnus vulgaris": "European Starling, Bird"}, f)
+        return True
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions", side_effect=_flaky_ensure):
+        TimmClassifier(model_str)
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+        assert not (model_dir / "label_descriptions.json").exists()
+
+        # Connectivity restored: the next construction re-probes and
+        # publishes the healed file, instead of being stranded by the
+        # earlier "failed" verdict.
+        TimmClassifier(model_str)
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+
+    assert calls["n"] == 2
+    assert (model_dir / "label_descriptions.json").exists()
 
 
 def test_reinstalling_the_model_clears_a_failed_heal_verdict(tmp_path):
@@ -548,12 +596,15 @@ def test_reinstalling_the_model_clears_a_failed_heal_verdict(tmp_path):
          patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
          patch("models.ensure_timm_label_descriptions",
                side_effect=OSError("offline")) as ensure:
+        # Exhaust the bounded-retry budget on the first installation so
+        # the "failed" state is locked in for this generation.
+        for _ in range(tc._HEAL_MAX_ATTEMPTS):
+            TimmClassifier(model_str)
+            tc._HEAL_THREADS[model_str].join(timeout=5)
+        assert ensure.call_count == tc._HEAL_MAX_ATTEMPTS
+        # Same installation, budget exhausted: no further probe.
         TimmClassifier(model_str)
-        tc._HEAL_THREADS[model_str].join(timeout=5)
-        assert ensure.call_count == 1
-        # Same installation, still missing: no re-probe.
-        TimmClassifier(model_str)
-        assert ensure.call_count == 1
+        assert ensure.call_count == tc._HEAL_MAX_ATTEMPTS
 
         # User removes the model and downloads it again. The new
         # installation writes a new model.onnx, and its optional-file
@@ -566,9 +617,9 @@ def test_reinstalling_the_model_clears_a_failed_heal_verdict(tmp_path):
         TimmClassifier(model_str)
         tc._HEAL_THREADS[model_str].join(timeout=5)
 
-    assert ensure.call_count == 2, (
+    assert ensure.call_count == tc._HEAL_MAX_ATTEMPTS + 1, (
         "a fresh installation must not inherit the previous one's "
-        "failed heal verdict"
+        "exhausted heal budget"
     )
 
 

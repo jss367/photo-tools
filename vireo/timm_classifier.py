@@ -33,14 +33,21 @@ _MODELS_ROOT = os.path.expanduser("~/.vireo/models")
 # user restarts Vireo. Vireo repairs its own broken model state; "restart
 # the app" is not a fix.
 #
-# A "failed" entry blocks retries for its generation: HF was unreachable
-# once, so repeat network probes on every classify job would just
-# re-block for the same reason. A "done" entry does *not* block, because
-# reaching this function at all means the file is missing or unusable
-# again (callers only spawn when the read came back None) — the recorded
-# "done" is contradicted by the disk. _HEAL_MAX_ATTEMPTS caps that
-# re-attempt loop so a pathological "heal reports success but the file
-# stays unusable" state cannot fire a network probe per classify job.
+# ``_HEAL_MAX_ATTEMPTS`` caps *both* "failed" and "done" retries. A
+# permanent "failed" block would strand the installation whenever the
+# first probe happened to run while HF was unreachable: connectivity
+# comes back, but no later classifier construction re-probes, and
+# Settings Repair does not reliably recover this state either (verified
+# required artifacts are skipped, so the installation generation does not
+# change). Allowing up to _HEAL_MAX_ATTEMPTS probes per installation
+# bounds the network cost of a persistent outage to a small burst rather
+# than a probe per classify job, while still letting a transient outage
+# self-recover. A "done" entry does not block either, because reaching
+# this function at all means the file is missing or unusable again
+# (callers only spawn when the read came back None) — the recorded
+# "done" is contradicted by the disk, and the same attempt cap keeps a
+# pathological "heal reports success but the file stays unusable" state
+# from firing a network probe per classify job.
 _HEAL_MAX_ATTEMPTS = 3
 _HEAL_LOCK = threading.Lock()
 _HEAL_STATE: dict = {}  # heal key -> "in_flight" | "done" | "failed"
@@ -98,12 +105,13 @@ def _spawn_label_desc_heal(model_dir, model_str):
     key = (model_str, _installation_generation(model_dir))
     with _HEAL_LOCK:
         state = _HEAL_STATE.get(key)
-        if state in ("in_flight", "failed"):
+        if state == "in_flight":
             return None
-        if state == "done" and _HEAL_ATTEMPTS.get(key, 0) >= _HEAL_MAX_ATTEMPTS:
+        attempts = _HEAL_ATTEMPTS.get(key, 0)
+        if state in ("done", "failed") and attempts >= _HEAL_MAX_ATTEMPTS:
             return None
         _HEAL_STATE[key] = "in_flight"
-        _HEAL_ATTEMPTS[key] = _HEAL_ATTEMPTS.get(key, 0) + 1
+        _HEAL_ATTEMPTS[key] = attempts + 1
 
     def _worker():
         try:

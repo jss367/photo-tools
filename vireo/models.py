@@ -1062,9 +1062,14 @@ def _download_optional_files(
     Uses list_repo_files as a preflight so that optional files not yet
     uploaded to the HF repo are skipped silently without burning the
     retry budget in _hf_download_with_retry on a 404. Any per-file
-    download or verification failure is logged and the local file is
-    removed — required files remain the source of truth for install
-    completeness, so a missing/broken optional never fails the install.
+    download or verification failure is logged; if this invocation
+    published a replacement that then failed verification, the replaced
+    file is removed. A pre-existing usable file is left in place when the
+    failure happened before it was replaced (transient network error or
+    ENOSPC in the atomic staging path) — required files remain the source
+    of truth for install completeness, so a missing/broken optional never
+    fails the install, and a Repair must never turn a working
+    ``label_descriptions.json`` into a missing one just because HF blipped.
     """
     if not filenames:
         return
@@ -1103,6 +1108,8 @@ def _download_optional_files(
             progress_callback(
                 f"Downloading optional {fi + 1}/{len(filenames)}: {filename}",
             )
+        local_path = os.path.join(model_dir, filename)
+        pre_signature = _path_signature(local_path)
         try:
             _download_and_verify_file(
                 filename=filename,
@@ -1114,15 +1121,42 @@ def _download_optional_files(
                 optional=True,
             )
         except (model_verify.VerifyError, RuntimeError) as e:
-            log.warning(
-                "Optional file %s could not be downloaded/verified (%s); "
-                "removing partial file. Model remains usable without it.",
-                filename, e,
-            )
-            local_path = os.path.join(model_dir, filename)
-            with contextlib.suppress(OSError):
-                if os.path.isfile(local_path):
-                    os.unlink(local_path)
+            post_signature = _path_signature(local_path)
+            if pre_signature is not None and post_signature == pre_signature:
+                # Atomic staging (or the network probe before it) failed
+                # without touching the previously usable destination. Leave
+                # it in place — otherwise a Repair against a flaky network
+                # or a full disk would silently degrade a working install.
+                log.warning(
+                    "Optional file %s could not be refreshed (%s); "
+                    "keeping the previously installed copy at %s.",
+                    filename, e, local_path,
+                )
+            else:
+                log.warning(
+                    "Optional file %s could not be downloaded/verified (%s); "
+                    "removing partial file. Model remains usable without it.",
+                    filename, e,
+                )
+                with contextlib.suppress(OSError):
+                    if os.path.isfile(local_path):
+                        os.unlink(local_path)
+
+
+def _path_signature(path):
+    """``(size, mtime_ns, inode)`` identifying the current on-disk file,
+    or None when it is absent or unstat-able.
+
+    Includes ``st_ino`` because ``os.replace`` swaps the destination inode
+    even when the replacement lands with the same ``(size, mtime_ns)``
+    (``shutil.copy2`` preserves the source's mtime), so an atomic
+    republish is always visible as a change.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_size, int(st.st_mtime_ns), st.st_ino)
 
 
 def _load_upstream_timm_config(model_str):

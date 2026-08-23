@@ -23072,56 +23072,60 @@ class Database:
         """
         return ctes, params
 
-    def query_browse_stacks(self, rules, sort="date", page=1, per_page=50,
-                            collection_id=None, folder_id=None):
-        """Return one representative row per exact-duplicate or burst stack.
+    _STACK_COVER_ORDER = """
+        CASE COALESCE(flag, 'none')
+          WHEN 'flagged' THEN 2 WHEN 'none' THEN 1 ELSE 0 END DESC,
+        quality_score IS NULL, quality_score DESC,
+        subject_sharpness IS NULL, subject_sharpness DESC,
+        sharpness IS NULL, sharpness DESC,
+        rating IS NULL, rating DESC,
+        (COALESCE(width, 0) * COALESCE(height, 0)) DESC,
+        COALESCE(file_size, 0) DESC,
+        id ASC
+    """
 
-        The returned rows have three private columns consumed by the HTTP
-        layer: ``_browse_stack_kind``, ``_browse_stack_count``, and
-        ``_browse_stack_member_ids``. Singles carry a null kind and otherwise
-        retain the ordinary photo-list shape.
+    _STACK_SORT_ORDERS = {
+        "date": (
+            "_stack_min_timestamp IS NULL, _stack_min_timestamp ASC, "
+            "_stack_min_filename ASC, id ASC"
+        ),
+        "date_desc": (
+            "_stack_max_timestamp IS NULL, _stack_max_timestamp DESC, "
+            "_stack_min_filename ASC, id ASC"
+        ),
+        "name": "_stack_min_filename ASC, id ASC",
+        "name_desc": "_stack_max_filename DESC, id ASC",
+        "rating": (
+            "_stack_max_rating IS NULL, _stack_max_rating DESC, "
+            "_stack_min_filename ASC, id ASC"
+        ),
+        "sharpness": (
+            "_stack_max_sharpness DESC, _stack_min_filename ASC, id ASC"
+        ),
+        # Mirrors the unstacked key `p.sharpness ASC, p.filename ASC`:
+        # SQLite sorts NULL first, so unscored logical items lead and
+        # then fall through to the same filename tie-breaker.
+        "sharpness_asc": (
+            "_stack_softest_sharpness ASC, _stack_min_filename ASC, id ASC"
+        ),
+        "quality": (
+            "_stack_max_quality DESC, _stack_min_filename ASC, id ASC"
+        ),
+    }
+
+    def _stack_sort_clause(self, sort):
+        return self._STACK_SORT_ORDERS.get(sort, self._STACK_SORT_ORDERS["date"])
+
+    def _ranked_stack_query(self, rules, collection_id=None, folder_id=None):
+        """Return the CTE + ``ranked`` window-function block shared by every
+        stack-projected query. Callers append their own outer SELECT (with
+        ORDER BY and optional LIMIT/OFFSET).
         """
         ctes, params = self._browse_stack_query_parts(
             rules, collection_id=collection_id, folder_id=folder_id,
         )
-        cover_order = """
-            CASE COALESCE(flag, 'none')
-              WHEN 'flagged' THEN 2 WHEN 'none' THEN 1 ELSE 0 END DESC,
-            quality_score IS NULL, quality_score DESC,
-            subject_sharpness IS NULL, subject_sharpness DESC,
-            sharpness IS NULL, sharpness DESC,
-            rating IS NULL, rating DESC,
-            (COALESCE(width, 0) * COALESCE(height, 0)) DESC,
-            COALESCE(file_size, 0) DESC,
-            id ASC
-        """
-        order = {
-            "date": (
-                "_stack_min_timestamp IS NULL, _stack_min_timestamp ASC, "
-                "_stack_min_filename ASC, id ASC"
-            ),
-            "date_desc": (
-                "_stack_max_timestamp IS NULL, _stack_max_timestamp DESC, "
-                "_stack_min_filename ASC, id ASC"
-            ),
-            "name": "_stack_min_filename ASC, id ASC",
-            "name_desc": "_stack_max_filename DESC, id ASC",
-            "rating": (
-                "_stack_max_rating IS NULL, _stack_max_rating DESC, "
-                "_stack_min_filename ASC, id ASC"
-            ),
-            "sharpness": "_stack_max_sharpness DESC, _stack_min_filename ASC, id ASC",
-            # Mirrors the unstacked key `p.sharpness ASC, p.filename ASC`:
-            # SQLite sorts NULL first, so unscored logical items lead and
-            # then fall through to the same filename tie-breaker.
-            "sharpness_asc": (
-                "_stack_softest_sharpness ASC, _stack_min_filename ASC, id ASC"
-            ),
-            "quality": "_stack_max_quality DESC, _stack_min_filename ASC, id ASC",
-        }.get(sort, "_stack_min_timestamp IS NULL, _stack_min_timestamp ASC, id ASC")
-        page = max(1, page)
-        offset = (page - 1) * per_page
-        query = ctes + f"""
+        cover_order = self._STACK_COVER_ORDER
+        ranked = ctes + f"""
             , ranked AS (
                 SELECT keyed.*,
                        ROW_NUMBER() OVER (
@@ -23162,6 +23166,25 @@ class Database:
                            AS _stack_max_quality
                 FROM keyed
             )
+        """
+        return ranked, params
+
+    def query_browse_stacks(self, rules, sort="date", page=1, per_page=50,
+                            collection_id=None, folder_id=None):
+        """Return one representative row per exact-duplicate or burst stack.
+
+        The returned rows have three private columns consumed by the HTTP
+        layer: ``_browse_stack_kind``, ``_browse_stack_count``, and
+        ``_browse_stack_member_ids``. Singles carry a null kind and otherwise
+        retain the ordinary photo-list shape.
+        """
+        ranked, params = self._ranked_stack_query(
+            rules, collection_id=collection_id, folder_id=folder_id,
+        )
+        order = self._stack_sort_clause(sort)
+        page = max(1, page)
+        offset = (page - 1) * per_page
+        query = ranked + f"""
             SELECT ranked.*,
                    _stack_kind AS _browse_stack_kind
             FROM ranked
@@ -23181,6 +23204,50 @@ class Database:
             params,
         ).fetchone()
         return int(row["n"] or 0)
+
+    def get_collection_photo_ids_stacked(self, collection_id, sort="date"):
+        """Return every photo ID matching a collection, in stack-projected
+        order. For each stack (in the same order ``query_browse_stacks``
+        places covers) emit the cover ID first, then the remaining member
+        IDs in the intra-stack order the projection exposes as
+        ``browse_stack.photo_ids``. Singles carry themselves.
+
+        Without this, Select-all-matching with Stacks enabled would seed
+        Best Batch, Burst Review, and the export-preview filename from a
+        hidden member whenever a stack's quality-ranked cover isn't its
+        earliest member under the selected sort (Codex P2 on PR #1561).
+        """
+        ranked, params = self._ranked_stack_query(
+            [], collection_id=collection_id,
+        )
+        order = self._stack_sort_clause(sort)
+        query = ranked + f"""
+            SELECT id, _browse_stack_member_ids
+            FROM ranked
+            WHERE _stack_cover_rank = 1
+            ORDER BY {order}
+        """
+        photo_ids = []
+        for row in self.conn.execute(query, params).fetchall():
+            cover_id = row["id"]
+            raw = row["_browse_stack_member_ids"]
+            member_ids = (
+                [int(value) for value in str(raw).split(",") if value]
+                if raw
+                else [cover_id]
+            )
+            # Cover first, then the intra-stack order minus the cover — the
+            # same shape ``browse_stack.photo_ids`` carries in the paginated
+            # /photos response, so the client's first selected id is always
+            # the visible top-level card.
+            seen = {cover_id}
+            photo_ids.append(cover_id)
+            for member_id in member_ids:
+                if member_id in seen:
+                    continue
+                photo_ids.append(member_id)
+                seen.add(member_id)
+        return photo_ids
 
     def collapse_browse_stack_photo_ids(self, photo_ids):
         """Collapse an already ordered ID result, preserving group order.

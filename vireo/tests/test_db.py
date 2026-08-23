@@ -935,6 +935,82 @@ def test_collection_photo_ids_honors_sort(tmp_path):
         assert ids == grid, f"sort={sort}: photo-ids and grid diverged"
 
 
+def test_collection_photo_ids_stacked_puts_cover_before_hidden_members(tmp_path):
+    """``get_collection_photo_ids_stacked`` emits each stack cover before its
+    hidden members and singles in stack-projected order — mirroring the
+    Stacks-enabled grid the user sees.
+
+    Regression for Codex P2 on PR #1561: without this, Select-all-matching
+    would seed Best Batch, Burst Review, and the export-preview filename
+    from a hidden burst frame whenever the quality-ranked cover isn't the
+    stack's earliest member under the selected sort.
+    """
+    import json
+
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder('/photos', name='photos')
+    # Burst pair where the earlier-named member is the low-quality frame and
+    # a later-named member is the quality-ranked cover. Under sort=name the
+    # unstacked ordering would insert the low-quality frame first; the
+    # stack-projected list must invert that so the visible cover leads.
+    burst_soft = db.add_photo(
+        folder_id=fid, filename='burst-a.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+        timestamp='2024-01-01T00:00:00',
+    )
+    burst_cover = db.add_photo(
+        folder_id=fid, filename='burst-b.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+        timestamp='2024-01-02T00:00:00',
+    )
+    single_later = db.add_photo(
+        folder_id=fid, filename='zebra.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+        timestamp='2024-06-01T00:00:00',
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id='burst-1', quality_score=0.1 WHERE id=?",
+        (burst_soft,),
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id='burst-1', quality_score=0.95 WHERE id=?",
+        (burst_cover,),
+    )
+    db.conn.commit()
+
+    rules = [{"field": "rating", "op": ">=", "value": 0}]
+    cid = db.add_collection('All', json.dumps(rules))
+
+    # Baseline: without projection the low-quality burst frame leads under
+    # sort=name, so Select-all-matching would seed from a hidden member.
+    assert db.get_collection_photo_ids(cid, sort='name') == [
+        burst_soft, burst_cover, single_later,
+    ]
+
+    # Stack-projected: the burst cover leads, then its hidden member, then
+    # the single — matching the paginated /photos response the user sees.
+    stacked = db.get_collection_photo_ids_stacked(cid, sort='name')
+    assert stacked == [burst_cover, burst_soft, single_later]
+
+    # The stack projection also agrees with the paginated grid's first item
+    # for every supported sort — that first id is what drives Best Batch
+    # seed, burst-review order, and export preview.
+    for sort in ('date', 'name', 'name_desc', 'rating', 'quality'):
+        stacked = db.get_collection_photo_ids_stacked(cid, sort=sort)
+        grid = db.query_browse_stacks(
+            [], collection_id=cid, sort=sort, per_page=99,
+        )
+        first_visible = grid[0]['id']
+        assert stacked[0] == first_visible, (
+            f"sort={sort}: first stacked id != first visible card"
+        )
+        # And every visible cover appears in the flattened list.
+        assert set(row['id'] for row in grid) <= set(stacked)
+
+
 def test_collection_photos_keyword_rule(tmp_path):
     """get_collection_photos filters by keyword contains rule."""
     import json

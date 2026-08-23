@@ -202,6 +202,73 @@ def test_collection_photo_ids_honors_sort_query(app_and_db):
     assert resp_bogus.get_json()["photo_ids"] == resp_date.get_json()["photo_ids"]
 
 
+def test_collection_photo_ids_stacks_query_puts_cover_first(app_and_db):
+    """``/photo-ids?stacks=true`` returns each cover before its hidden members
+    so Select-all-matching with Stacks enabled seeds Best Batch, burst-review,
+    and the export preview from the visible top-level card (Codex P2 on
+    PR #1561).
+
+    Without ``stacks=true``, the endpoint returns raw member order — a hidden
+    burst frame with an earlier filename can insert ahead of the visible
+    higher-quality cover, so ``bestBatchSeedId()`` and Burst Review would
+    start from the wrong photo.
+    """
+    app, db = app_and_db
+    _clear_default_collections(app, db)
+    client = app.test_client()
+
+    # bird1 and bird3 share a burst; bird3 has the higher rating so the
+    # stack projection promotes it to cover even though bird1 sorts first
+    # by filename.
+    p1_id = db.conn.execute(
+        "SELECT id FROM photos WHERE filename = 'bird1.jpg'"
+    ).fetchone()["id"]
+    p3_id = db.conn.execute(
+        "SELECT id FROM photos WHERE filename = 'bird3.jpg'"
+    ).fetchone()["id"]
+    p2_id = db.conn.execute(
+        "SELECT id FROM photos WHERE filename = 'bird2.jpg'"
+    ).fetchone()["id"]
+    db.conn.execute(
+        "UPDATE photos SET burst_id = 'B1' WHERE id IN (?, ?)",
+        (p1_id, p3_id),
+    )
+    db.conn.commit()
+
+    resp = client.post(
+        "/api/collections",
+        json={
+            "name": "All",
+            "rules": [{"field": "rating", "op": ">=", "value": 0}],
+        },
+    )
+    assert resp.status_code == 200
+    collection_id = resp.get_json()["id"]
+
+    # Baseline (no stacks): raw member order under sort=name puts the
+    # hidden burst frame first — the shape the Codex finding calls out.
+    unstacked = client.get(
+        f"/api/collections/{collection_id}/photo-ids?sort=name"
+    ).get_json()
+    assert unstacked["photo_ids"] == [p1_id, p2_id, p3_id]
+
+    # With Stacks enabled: cover first, then its hidden member, then the
+    # single — the same shape ``/photos?stacks=true`` renders.
+    stacked = client.get(
+        f"/api/collections/{collection_id}/photo-ids?sort=name&stacks=true"
+    ).get_json()
+    assert stacked["photo_ids"] == [p3_id, p1_id, p2_id]
+    assert stacked["total"] == 3
+
+    # And the first stacked id agrees with the paginated /photos response,
+    # which is the invariant Best Batch seed / Burst Review / export
+    # preview all rely on.
+    photos_resp = client.get(
+        f"/api/collections/{collection_id}/photos?sort=name&stacks=true"
+    ).get_json()
+    assert stacked["photo_ids"][0] == photos_resp["photos"][0]["id"]
+
+
 def test_delete_collection(app_and_db):
     """DELETE /api/collections/<id> removes it."""
     app, db = app_and_db

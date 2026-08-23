@@ -14122,20 +14122,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     def api_collection_photo_ids(collection_id):
         """Return every photo ID matching a collection.
 
-        Accepts ``sort`` so Select-all-matching keeps the same insertion
-        order the grid shows — Best Batch seed, burst-review order, and
-        export preview all read the first ``selectedPhotos`` entry, and
-        a date-only ordering here would pick a different photo whenever
-        the grid is sorted by name/rating/sharpness/quality (Codex P2 on
-        PR #1561).
+        Accepts ``sort`` and ``stacks`` so Select-all-matching keeps the
+        same insertion order the grid shows — Best Batch seed,
+        burst-review order, and export preview all read the first
+        ``selectedPhotos`` entry, and a date-only ordering here would
+        pick a different photo whenever the grid is sorted by
+        name/rating/sharpness/quality. ``stacks=true`` further emits
+        each stack's cover before its hidden members so the first id is
+        always the visible top-level card even when the quality-ranked
+        cover isn't the stack's earliest member under the sort (Codex
+        P2 on PR #1561).
         """
         db = _get_db()
         err = _reject_visual_collection(db, collection_id)
         if err is not None:
             return err
         sort = request.args.get("sort", "date")
+        stacks = _request_bool_arg("stacks")
         try:
-            photo_ids = db.get_collection_photo_ids(collection_id, sort=sort)
+            if stacks:
+                photo_ids = db.get_collection_photo_ids_stacked(
+                    collection_id, sort=sort,
+                )
+            else:
+                photo_ids = db.get_collection_photo_ids(collection_id, sort=sort)
         except ValueError as e:
             app.logger.exception(
                 "Collection %s has unresolvable rules", collection_id

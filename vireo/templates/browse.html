@@ -7149,12 +7149,15 @@ async function selectAllMatchingPhotos() {
   var url;
   var fetchOpts = {};
   if (activeCollectionId && !dashboardCollectionScope) {
-    // Mirror the grid's sort so the selection's first photo — which drives
-    // Best Batch seed, burst-review order, and export preview — matches the
-    // first visible card even when the collection is sorted by name, rating,
-    // sharpness, or quality (Codex P2 on PR #1561).
+    // Mirror the grid's sort AND its Stacks projection so the selection's
+    // first photo — which drives Best Batch seed, burst-review order, and
+    // export preview — matches the first visible card even when the
+    // collection is sorted by name/rating/sharpness/quality or when a
+    // stack's quality-ranked cover isn't the earliest member under the
+    // sort (Codex P2 on PR #1561).
     var idsParams = new URLSearchParams();
     idsParams.set('sort', document.getElementById('sortSelect').value);
+    if (browseStacksEnabled()) idsParams.set('stacks', 'true');
     url = '/api/collections/' + activeCollectionId + '/photo-ids?' + idsParams.toString();
   } else {
     url = '/api/photos/query';

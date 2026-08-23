@@ -136,6 +136,28 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
     page.evaluate("() => setSelectionWildlifeExcluded(false)")
     expect(tray.locator(".no-wildlife-badge")).to_have_count(0)
 
+    page.evaluate(
+        """photoId => document.dispatchEvent(new CustomEvent('lifelist:changed', {
+          detail: {species: 'Test species', photoId: photoId},
+        }))""",
+        burst_ids[0],
+    )
+    expect(tray.locator(
+        f'.browse-stack-member[data-id="{burst_ids[0]}"] .representative-badge'
+    )).to_be_visible()
+    page.evaluate(
+        """photoId => document.dispatchEvent(new CustomEvent('lifelist:changed', {
+          detail: {species: 'Test species', photoId: photoId},
+        }))""",
+        burst_ids[2],
+    )
+    expect(tray.locator(
+        f'.browse-stack-member[data-id="{burst_ids[0]}"] .representative-badge'
+    )).to_have_count(0)
+    expect(tray.locator(
+        f'.browse-stack-member[data-id="{burst_ids[2]}"] .representative-badge'
+    )).to_be_visible()
+
     page.locator("#batchBar button", has_text="★5").click()
     page.wait_for_function(
         """ids => ids.every(function(id) {

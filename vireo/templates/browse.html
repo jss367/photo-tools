@@ -3660,7 +3660,9 @@ document.addEventListener('lifelist:changed', function(e) {
   var photoId = detail.photoId;
   if (!species || !photoId) return;
   var changed = [];
-  photos.forEach(function(p) {
+  loadedBrowsePhotoIds().forEach(function(id) {
+    var p = findBrowsePhoto(id);
+    if (!p) return;
     var entries = Array.isArray(p.life_list) ? p.life_list : [];
     var touched = false;
     entries.forEach(function(entry) {
@@ -3686,7 +3688,10 @@ document.addEventListener('lifelist:changed', function(e) {
     }
     if (touched) changed.push(p.id);
   });
-  if (changed.length) refreshGridCards(changed);
+  if (changed.length) {
+    refreshGridCards(changed);
+    refreshExpandedBrowseStackMembers(changed);
+  }
 });
 
 function getGridCard(photoId) {

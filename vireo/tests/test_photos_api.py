@@ -11549,6 +11549,26 @@ def test_api_photos_query_visual_ranks_by_similarity(app_and_db, monkeypatch):
     assert stacked["photos"][0]["id"] == photos["bird2.jpg"]
     assert stacked["photos"][0]["similarity"] == 0.95
 
+    # Select-all-matching over a visual result set: ids_only must apply the
+    # same cover-first projection, or the client's first selected id is a
+    # hidden member and Best Batch / Burst Review / the export preview start
+    # on a photo that is not the visible first card (Codex P2 on PR #1561).
+    stacked_ids = client.post('/api/photos/query', json={
+        "rules": [], "stacks": True, "ids_only": True,
+        "visual": {"prompt": "a bird", "strength": "balanced"},
+    }).get_json()
+    assert stacked_ids["ids"] == [photos["bird2.jpg"], photos["bird1.jpg"]]
+    # Every underlying member is still selectable — the projection reorders,
+    # it never drops hidden members.
+    assert stacked_ids["total"] == 2
+    assert stacked_ids["ids"][0] == stacked["photos"][0]["id"]
+
+    unstacked_ids = client.post('/api/photos/query', json={
+        "rules": [], "ids_only": True,
+        "visual": {"prompt": "a bird", "strength": "balanced"},
+    }).get_json()
+    assert unstacked_ids["ids"] == [photos["bird1.jpg"], photos["bird2.jpg"]]
+
     # Metadata rules constrain the candidate set before scoring.
     resp = client.post('/api/photos/query', json={
         "rules": [{"field": "filename", "op": "is", "value": "bird2.jpg"}],

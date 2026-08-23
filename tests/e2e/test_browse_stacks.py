@@ -1056,3 +1056,164 @@ def test_shift_click_stack_member_from_grid_anchor_range_selects(live_server, pa
     # What is highlighted equals what a batch action will act on.
     assert selection_state["active"] == selection_state["highlighted"]
     expect(hidden_member).to_have_class("browse-stack-member selected")
+
+
+def test_export_preview_resolves_unloaded_stack_member(live_server, page):
+    """The export preview must name the photo that will actually be written.
+
+    Select-all-matching (and the stack "select all" action) puts hidden
+    member ids in the selection, but ``browseStackMembers`` only carries
+    trays the user expanded, so the first selected id is often absent from
+    the grid, the tray caches, and the lightbox cache. Previewing the
+    stack's loaded cover instead asserts a filename the export will never
+    write — a plausible-looking stand-in is worse than no preview. Resolve
+    the real photo (Codex P2 on PR #1561).
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'export-preview-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        # hawk2 becomes the quality-ranked cover; hawk1/hawk3 stay hidden.
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator("#grid > .grid-card")).to_have_count(3)
+
+    # The stack is collapsed, so the hidden member is in no client cache.
+    assert page.evaluate(
+        "id => !findBrowsePhoto(id)", burst_ids[0]
+    ) is True
+
+    page.evaluate("id => openExportModal([id])", burst_ids[0])
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    preview = page.locator("#exportPreview")
+    # Resolved from the server: the hidden member's own filename.
+    expect(preview).to_have_text("Preview: hawk1.jpg")
+    # And never the cover's — that would name a file the export won't write.
+    assert "hawk2" not in preview.inner_text()
+
+    page.locator("#exportOverlay button", has_text="Cancel").click()
+
+
+def test_select_all_matching_puts_stack_cover_first_outside_collections(
+    live_server, page
+):
+    """Select-all on the general query path must return cover-first order.
+
+    ``/api/photos/query`` with ``ids_only`` returned raw member order, so the
+    workspace, folder, dashboard-collection, unsaved-filter, and
+    visual-search paths seeded ``selectedPhotos`` with a hidden burst frame
+    whenever a stack's quality-ranked cover was not its earliest member.
+    Best Batch, Burst Review, and the export preview all read that first
+    entry, so they started on a photo the user could not see (Codex P2 on
+    PR #1561).
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'select-all-order-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        # The middle (not the earliest) frame wins the cover ranking.
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator("#grid > .grid-card")).to_have_count(3)
+
+    outcome = page.evaluate(
+        """async () => {
+          await selectAllMatchingPhotos();
+          return {
+            collectionScoped: !!(activeCollectionId && !dashboardCollectionScope),
+            selected: Array.from(selectedPhotos),
+            firstCardId: parseInt(
+              document.querySelector('#grid > .grid-card').dataset.id, 10
+            ),
+          };
+        }"""
+    )
+    # This test only means something on the non-collection path.
+    assert outcome["collectionScoped"] is False
+    # Every underlying photo is still selected — the projection reorders,
+    # it never drops hidden members.
+    assert sorted(outcome["selected"]) == sorted(live_server["data"]["photos"])
+    # The first selected id is the visible first card, not a hidden frame.
+    assert outcome["selected"][0] == outcome["firstCardId"] == burst_ids[1]
+
+
+def test_stack_metadata_lookups_chunk_their_get_urls(live_server, page):
+    """iNat and color-label lookups must chunk, like the by-ids expansion.
+
+    An expanded stack hands every member id to ``loadInatStatus`` and
+    ``fetchColorLabels``, which concatenate them into a GET query string. A
+    stack large enough to exceed the request-target limit made both requests
+    fail, silently dropping iNaturalist badges and color-label fields for
+    the whole tray even though the chunked ``/api/photos/by-ids`` expansion
+    succeeded (Codex P2 on PR #1561).
+    """
+    page.goto(f"{live_server['url']}/browse")
+    expect(page.locator("#grid > .grid-card")).to_have_count(5)
+
+    outcome = page.evaluate(
+        """async () => {
+          var ids = [];
+          for (var i = 1; i <= 501; i++) ids.push(i);
+          var originalSafeFetch = safeFetch;
+          var inatChunks = [];
+          var colorChunks = [];
+          safeFetch = function(url) {
+            var match = /[?&](?:photo_ids|ids)=([^&]*)/.exec(url);
+            var count = match ? match[1].split(',').length : 0;
+            if (url.indexOf('/api/inat/submissions') === 0) {
+              inatChunks.push(count);
+              var inat = {};
+              inat[match[1].split(',')[0]] = true;
+              return Promise.resolve(inat);
+            }
+            if (url.indexOf('/api/photos/color_labels') === 0) {
+              colorChunks.push(count);
+              var colors = {};
+              colors[match[1].split(',')[0]] = 'red';
+              return Promise.resolve(colors);
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            await loadInatStatus(ids);
+            await fetchColorLabels(ids);
+          } finally {
+            safeFetch = originalSafeFetch;
+          }
+          return {
+            inatChunks: inatChunks,
+            colorChunks: colorChunks,
+            // Results from every chunk have to survive the merge, not just
+            // the last one.
+            inatSubmitted: [inatSubmitted['1'], inatSubmitted['501']],
+            colorLabels: [colorLabels['1'], colorLabels['501']],
+            fetchedFirst: colorLabelsFetched.has(1),
+            fetchedLast: colorLabelsFetched.has(501),
+          };
+        }"""
+    )
+    # Same 500-id cap the /api/photos/by-ids expansion path already uses.
+    assert outcome["inatChunks"] == [500, 1]
+    assert outcome["colorChunks"] == [500, 1]
+    assert outcome["inatSubmitted"] == [True, True]
+    assert outcome["colorLabels"] == ["red", "red"]
+    assert outcome["fetchedFirst"] is True
+    assert outcome["fetchedLast"] is True

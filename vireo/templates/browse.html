@@ -12578,6 +12578,10 @@ function openExportModal(photoIds) {
   // Re-applies the last-used preset (saved or built-in) over the defaults
   // and view preferences restored above; async but near-instant locally.
   VireoExportPresets.modalOpened();
+  // Drop on-demand preview hydration from the previous open so a rename
+  // (or a photo that has since left the workspace) can't be previewed from
+  // a stale cache.
+  _exportPreviewPhotos = {};
   updateExportPreview();
 }
 
@@ -12718,33 +12722,73 @@ function markExportCustom() {
   document.getElementById('exportPreset').value = 'custom';
 }
 
+// Photos fetched on demand for the export preview, keyed by id (null means
+// "asked, and the server could not resolve it"). The preview names the first
+// file the export will write, so when that photo is not in the grid, an
+// expanded stack tray, or the lightbox cache, it has to be resolved rather
+// than substituted. /api/photos/<id> returns the same species-rank keyword
+// list the export worker names files with, so the preview matches the file
+// on disk. Cleared each time the modal opens so a renamed photo cannot show
+// a stale name (Codex P2 on PR #1561).
+var _exportPreviewPhotos = {};
+var _exportPreviewFetches = {};
+
+function hydrateExportPreviewPhoto(photoId) {
+  if (photoId == null) return;
+  var key = String(photoId);
+  if (_exportPreviewFetches[key]) return;
+  _exportPreviewFetches[key] = safeFetch('/api/photos/' + photoId, {}, { toast: false })
+    .then(function(photo) {
+      _exportPreviewPhotos[key] = (photo && photo.id != null) ? photo : null;
+    })
+    .catch(function() {
+      _exportPreviewPhotos[key] = null;
+    })
+    .then(function() {
+      delete _exportPreviewFetches[key];
+      // Only repaint while the modal is still open; a closed modal has
+      // already dropped _exportPhotoIds and would preview a stale id.
+      if (document.getElementById('exportOverlay').classList.contains('open')) {
+        updateExportPreview();
+      }
+    });
+  return _exportPreviewFetches[key];
+}
+
 function updateExportPreview() {
   var template = document.getElementById('exportTemplate').value;
   if (!template) { document.getElementById('exportPreview').textContent = ''; return; }
   // Use first selected photo for preview
   var firstId = (_exportPhotoIds || getActiveSelection())[0];
+  if (firstId == null) { document.getElementById('exportPreview').textContent = ''; return; }
   var photo = findBrowsePhoto(firstId);
   // Find Similar and other shared-lightbox entry points can display photos
   // outside Browse's currently loaded page. Their metadata remains available
   // through the lightbox cache/list after the viewer closes for this modal.
   if (!photo && typeof _lbPhotoData === 'function') photo = _lbPhotoData(firstId);
-  // Select-all-matching with Stacks enabled populates selectedPhotos with
-  // every underlying member id, but browseStackMembers is only hydrated for
-  // trays the user has expanded. A non-cover member id from an unexpanded
-  // stack is absent from findBrowsePhoto and the lightbox cache — fall back
-  // to the stack's loaded cover so the preview shows a real filename instead
-  // of blanking (Codex P2 on PR #1561).
-  if (!photo) {
-    for (var i = 0; i < photos.length; i++) {
-      var cover = photos[i];
-      var stack = cover && cover.browse_stack;
-      if (stack && (stack.photo_ids || []).indexOf(firstId) !== -1) {
-        photo = cover;
-        break;
-      }
+  // Select-all-matching with Stacks enabled puts every underlying member id
+  // in selectedPhotos, but browseStackMembers only carries trays the user
+  // expanded — and the selection spans pages the grid never loaded. So the
+  // first id is often absent from findBrowsePhoto and the lightbox cache.
+  // Resolve that photo from the server rather than previewing a stand-in:
+  // rendering the stack's loaded cover here would assert a filename the
+  // export will never write, which is exactly the kind of plausible-looking
+  // proxy CORE_PHILOSOPHY forbids (Codex P2 on PR #1561).
+  if (!photo && Object.prototype.hasOwnProperty.call(_exportPreviewPhotos, String(firstId))) {
+    photo = _exportPreviewPhotos[String(firstId)];
+    if (!photo) {
+      document.getElementById('exportPreview').textContent =
+        'Preview unavailable: could not load photo ' + firstId + '.';
+      return;
     }
   }
-  if (!photo) { document.getElementById('exportPreview').textContent = ''; return; }
+  if (!photo) {
+    hydrateExportPreviewPhoto(firstId);
+    document.getElementById('exportPreview').textContent =
+      'Preview: loading photo ' + firstId + '\u2026';
+    return;
+  }
+  if (!photo.filename) { document.getElementById('exportPreview').textContent = ''; return; }
   var stem = photo.filename.replace(/\.[^.]+$/, '');
   var ts = photo.timestamp || '';
   var datePart = ts ? ts.substring(0, 10) : 'unknown-date';

@@ -3343,6 +3343,14 @@ async function reconcileBrowseStackCovers(photoIds) {
       return member.id === selectedPhotoId;
     })) {
       selectedIndex = oldIndex;
+      // The demoted cover is gone from the top-level photos array. Grid
+      // selection and preview navigation both look it up there and would
+      // otherwise land on an unselected card with an index of -1 in the
+      // navigation list. Hand focus to the newly promoted cover, which now
+      // occupies that grid slot.
+      if (selectedPhotoId === oldCoverId) {
+        selectedPhotoId = newCover.id;
+      }
     }
     changed = true;
   });
@@ -3400,6 +3408,15 @@ async function toggleBrowseStack(event, coverId) {
     var selectedHiddenMember = selectedPhotoId !== coverId && members.some(function(member) {
       return member.id === selectedPhotoId;
     });
+    // A stack-wide Select all clears selectedPhotoId but leaves every member
+    // ID in selectedPhotos. Once the tray collapses, hidden members are gone
+    // from the navigation list, so a preview shortcut would fall through to
+    // the first hidden member and yield a 0/N lightbox. Detect that case so
+    // we can re-pin focus to the visible cover after removing the tray.
+    var batchHasHiddenMembers = selectedPhotoId == null && selectedPhotos.size > 0
+      && members.some(function(member) {
+        return member.id !== coverId && selectedPhotos.has(member.id);
+      });
     expandedBrowseStacks.delete(coverId);
     var tray = document.querySelector('.browse-stack-tray[data-stack-cover-id="' + coverId + '"]');
     if (tray) tray.remove();
@@ -3411,6 +3428,13 @@ async function toggleBrowseStack(event, coverId) {
     if (selectedHiddenMember) {
       var coverIndex = photos.findIndex(function(photo) { return photo.id === coverId; });
       selectPhoto({shiftKey: false, metaKey: false, ctrlKey: false}, coverId, coverIndex);
+    } else if (batchHasHiddenMembers) {
+      // Preserve the batch (Select all) selection but pin single-photo focus
+      // to the visible cover so preview shortcuts, keyboard navigation, and
+      // the grid caret all resolve inside the top-level cover list.
+      selectedPhotoId = coverId;
+      selectedIndex = photos.findIndex(function(photo) { return photo.id === coverId; });
+      refreshCardSelectionVisuals();
     }
     return;
   }
@@ -10064,6 +10088,7 @@ async function setColorLabel(color) {
   colorLabelsFetched.add(photoId);
   if (selectedPhotoId === photoId) updateDetailColors();
   refreshGridCards([photoId]);
+  refreshExpandedBrowseStackMembers([photoId]);
   scheduleCollectionCountsRefresh();
 }
 

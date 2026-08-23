@@ -25156,6 +25156,25 @@ def test_visual_stack_cover_prefers_zero_rating_over_null(tmp_path):
     }]
 
 
+def test_browse_stack_rating_sort_puts_zero_before_null(tmp_path):
+    db, fid = _filter_db(tmp_path)
+    unrated_id = db.add_photo(
+        folder_id=fid, filename="a-unrated.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0,
+    )
+    zero_id = db.add_photo(
+        folder_id=fid, filename="z-zero.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0,
+    )
+    db.conn.execute("UPDATE photos SET rating = NULL WHERE id = ?", (unrated_id,))
+    db.conn.execute("UPDATE photos SET rating = 0 WHERE id = ?", (zero_id,))
+    db.conn.commit()
+
+    rows = db.query_browse_stacks([], sort="rating")
+
+    assert [row["id"] for row in rows] == [zero_id, unrated_id]
+
+
 def test_get_filter_field_values_counts_respect_rules(tmp_path):
     import pytest
     db, fid = _filter_db(tmp_path)

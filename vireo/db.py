@@ -23094,7 +23094,10 @@ class Database:
             ),
             "name": "_stack_min_filename ASC, id ASC",
             "name_desc": "_stack_max_filename DESC, id ASC",
-            "rating": "_stack_max_rating DESC, _stack_min_filename ASC, id ASC",
+            "rating": (
+                "_stack_max_rating IS NULL, _stack_max_rating DESC, "
+                "_stack_min_filename ASC, id ASC"
+            ),
             "sharpness": "_stack_max_sharpness DESC, _stack_min_filename ASC, id ASC",
             "sharpness_asc": "_stack_min_sharpness ASC, _stack_min_filename ASC, id ASC",
             "quality": "_stack_max_quality DESC, _stack_min_filename ASC, id ASC",
@@ -23123,7 +23126,7 @@ class Database:
                            AS _stack_min_filename,
                        MAX(filename) OVER (PARTITION BY _stack_key)
                            AS _stack_max_filename,
-                       MAX(COALESCE(rating, 0)) OVER (PARTITION BY _stack_key)
+                       MAX(rating) OVER (PARTITION BY _stack_key)
                            AS _stack_max_rating,
                        MAX(sharpness) OVER (PARTITION BY _stack_key)
                            AS _stack_max_sharpness,

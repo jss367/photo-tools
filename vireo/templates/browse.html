@@ -3271,8 +3271,41 @@ function browseStackCoverCompare(a, b) {
   return a.id - b.id;
 }
 
-function reconcileBrowseStackCovers(photoIds) {
+async function reconcileBrowseStackCovers(photoIds) {
   var wanted = new Set((photoIds || []).map(Number));
+  var windowIsCurrent = observeBrowseWindow();
+  var uncachedCovers = photos.filter(function(photo) {
+    if (!photo.browse_stack || browseStackMembers[String(photo.id)]) return false;
+    return wanted.has(photo.id) || (photo.browse_stack.photo_ids || []).some(function(id) {
+      return wanted.has(id);
+    });
+  });
+  for (var h = 0; h < uncachedCovers.length; h++) {
+    var uncachedCover = uncachedCovers[h];
+    var uncachedKey = String(uncachedCover.id);
+    try {
+      var data = await safeFetch('/api/photos/by-ids', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({photo_ids: uncachedCover.browse_stack.photo_ids || []}),
+      }, {toast: false});
+      if (!windowIsCurrent()) return false;
+      var stack = uncachedCover.browse_stack;
+      var similarity = uncachedCover.similarity;
+      var clientSimilarity = uncachedCover._similarity;
+      browseStackMembers[uncachedKey] = (data.photos || []).map(function(member) {
+        if (member.id !== uncachedCover.id) return member;
+        Object.assign(uncachedCover, member);
+        uncachedCover.browse_stack = stack;
+        if (similarity !== undefined) uncachedCover.similarity = similarity;
+        if (clientSimilarity !== undefined) uncachedCover._similarity = clientSimilarity;
+        return uncachedCover;
+      });
+    } catch (e) {
+      return false;
+    }
+  }
+
   var changed = false;
   Object.keys(browseStackMembers).forEach(function(oldKey) {
     var members = browseStackMembers[oldKey] || [];
@@ -3287,6 +3320,8 @@ function reconcileBrowseStackCovers(photoIds) {
     var stack = oldCover.browse_stack;
     oldCover.browse_stack = null;
     newCover.browse_stack = stack;
+    if (oldCover.similarity !== undefined) newCover.similarity = oldCover.similarity;
+    if (oldCover._similarity !== undefined) newCover._similarity = oldCover._similarity;
     photos[oldIndex] = newCover;
 
     var newKey = String(newCover.id);
@@ -7115,7 +7150,7 @@ async function applyBestBatchPickOnly() {
   } catch(e) { return; }
   var p = findBrowsePhoto(bestId);
   if (p) p.flag = 'flagged';
-  reconcileBrowseStackCovers([bestId]);
+  await reconcileBrowseStackCovers([bestId]);
   refreshGridCards([bestId]);
   refreshExpandedBrowseStackMembers([bestId]);
   _refreshBatchInspectorIfActive();
@@ -7142,7 +7177,7 @@ async function applyBestBatchPickAndReject() {
     if (p) p.flag = flag;
     _clearRepresentativeStateIfIneligible(id, flag);
   });
-  reconcileBrowseStackCovers(touchedIds);
+  await reconcileBrowseStackCovers(touchedIds);
   refreshGridCards(touchedIds);
   refreshExpandedBrowseStackMembers(touchedIds);
   _refreshBatchInspectorIfActive();
@@ -8737,7 +8772,7 @@ async function batchSetRating(rating) {
     var p = findBrowsePhoto(id);
     if (p) p.rating = rating;
   });
-  reconcileBrowseStackCovers(ids);
+  await reconcileBrowseStackCovers(ids);
   refreshGridCards(ids);
   refreshExpandedBrowseStackMembers(ids);
   _refreshBatchInspectorIfActive();
@@ -8894,7 +8929,7 @@ async function batchSetFlag(flag) {
     if (p) p.flag = flag;
     _clearRepresentativeStateIfIneligible(id, flag);
   });
-  reconcileBrowseStackCovers(ids);
+  await reconcileBrowseStackCovers(ids);
   refreshGridCards(ids);
   refreshExpandedBrowseStackMembers(ids);
   if (selectedPhotoId != null && ids.indexOf(selectedPhotoId) !== -1) {
@@ -9885,7 +9920,7 @@ async function setRating(photoId, rating) {
     // set on a hidden member updates the tray-cached row instead of vanishing.
     var p = findBrowsePhoto(photoId);
     if (p) p.rating = rating;
-    reconcileBrowseStackCovers([photoId]);
+    await reconcileBrowseStackCovers([photoId]);
     refreshGridCards([photoId]);
     refreshExpandedBrowseStackMembers([photoId]);
     scheduleCollectionCountsRefresh();
@@ -9917,7 +9952,7 @@ async function setFlag(flag) {
     var p = findBrowsePhoto(photoId);
     if (p) p.flag = flag;
     _clearRepresentativeStateIfIneligible(photoId, flag);
-    reconcileBrowseStackCovers([photoId]);
+    await reconcileBrowseStackCovers([photoId]);
     refreshGridCards([photoId]);
     refreshExpandedBrowseStackMembers([photoId]);
     if (selectedPhotoId === photoId) updateDetailFlagButtons(flag);
@@ -11208,7 +11243,7 @@ async function setRatingFor(photoId, rating) {
   } catch(e) { return; }
   var p = findBrowsePhoto(photoId);
   if (p) p.rating = rating;
-  reconcileBrowseStackCovers([photoId]);
+  await reconcileBrowseStackCovers([photoId]);
   refreshGridCards([photoId]);
   refreshExpandedBrowseStackMembers([photoId]);
   scheduleCollectionCountsRefresh();
@@ -11226,7 +11261,7 @@ async function setFlagFor(photoId, flag) {
   var p = findBrowsePhoto(photoId);
   if (p) p.flag = flag;
   _clearRepresentativeStateIfIneligible(photoId, flag);
-  reconcileBrowseStackCovers([photoId]);
+  await reconcileBrowseStackCovers([photoId]);
   refreshGridCards([photoId]);
   refreshExpandedBrowseStackMembers([photoId]);
   _refreshInspectorAfterSinglePhotoEdit(photoId, function() { updateDetailFlagButtons(flag); });

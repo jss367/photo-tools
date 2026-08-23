@@ -129,6 +129,7 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
 
     page.evaluate(
         """ids => {
+          photos.find(function(photo) { return photo.browse_stack; })._similarity = 0.95;
           bestBatchData = {
             best_photo_id: ids[0],
             suggested_reject_ids: ids.slice(1),
@@ -152,8 +153,22 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
         f'.browse-stack-tray[data-stack-cover-id="{burst_ids[0]}"]'
     )).to_be_visible()
     expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_have_count(0)
+    assert page.evaluate(
+        "coverId => photos.find(function(photo) { return photo.id === coverId; })._similarity",
+        burst_ids[0],
+    ) == 0.95
 
     # Stacks is a presentation preference, so it survives a return to Browse.
     page.reload()
     expect(page.locator("#browseStacksToggle")).to_be_checked()
     expect(page.locator("#grid > .grid-card")).to_have_count(3)
+
+    # A collapsed stack has no hydrated member cache. Rejecting its current
+    # cover still hydrates that one group and promotes the correct replacement.
+    assert page.evaluate("() => Object.keys(browseStackMembers).length") == 0
+    page.evaluate(
+        "photoId => setFlagFor(photoId, 'rejected')",
+        burst_ids[0],
+    )
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[0]}"]')).to_have_count(0)

@@ -23099,7 +23099,10 @@ class Database:
                 "_stack_min_filename ASC, id ASC"
             ),
             "sharpness": "_stack_max_sharpness DESC, _stack_min_filename ASC, id ASC",
-            "sharpness_asc": "_stack_min_sharpness ASC, _stack_min_filename ASC, id ASC",
+            "sharpness_asc": (
+                "_stack_any_sharpness_null DESC, _stack_min_sharpness ASC, "
+                "_stack_min_filename ASC, id ASC"
+            ),
             "quality": "_stack_max_quality DESC, _stack_min_filename ASC, id ASC",
         }.get(sort, "_stack_min_timestamp IS NULL, _stack_min_timestamp ASC, id ASC")
         page = max(1, page)
@@ -23132,6 +23135,8 @@ class Database:
                            AS _stack_max_sharpness,
                        MIN(sharpness) OVER (PARTITION BY _stack_key)
                            AS _stack_min_sharpness,
+                       MAX(sharpness IS NULL) OVER (PARTITION BY _stack_key)
+                           AS _stack_any_sharpness_null,
                        MAX(quality_score) OVER (PARTITION BY _stack_key)
                            AS _stack_max_quality
                 FROM keyed

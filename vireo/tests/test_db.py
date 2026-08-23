@@ -25175,6 +25175,44 @@ def test_browse_stack_rating_sort_puts_zero_before_null(tmp_path):
     assert [row["id"] for row in rows] == [zero_id, unrated_id]
 
 
+def test_browse_stack_sharpness_asc_preserves_null_member(tmp_path):
+    # Softest-first must treat a stack containing any unscored member as
+    # unscored — mirroring how sharpness_asc places an unscored single at
+    # the head — otherwise MIN(sharpness) ignores the NULL and Stacks
+    # silently buries the unscored frame behind scored singles.
+    db, fid = _filter_db(tmp_path)
+    stack_null_id = db.add_photo(
+        folder_id=fid, filename="burst-a.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0,
+    )
+    stack_scored_id = db.add_photo(
+        folder_id=fid, filename="burst-b.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0,
+    )
+    scored_single_id = db.add_photo(
+        folder_id=fid, filename="single-scored.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0,
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id = 'shared-burst' WHERE id IN (?, ?)",
+        (stack_null_id, stack_scored_id),
+    )
+    db.conn.execute(
+        "UPDATE photos SET sharpness = NULL WHERE id = ?", (stack_null_id,))
+    db.conn.execute(
+        "UPDATE photos SET sharpness = 0.9 WHERE id = ?", (stack_scored_id,))
+    db.conn.execute(
+        "UPDATE photos SET sharpness = 0.5 WHERE id = ?", (scored_single_id,))
+    db.conn.commit()
+
+    rows = db.query_browse_stacks([], sort="sharpness_asc")
+    ids = [row["id"] for row in rows]
+
+    # The stack sits ahead of the scored single because one of its members
+    # has no sharpness score.
+    assert ids.index(stack_scored_id) < ids.index(scored_single_id)
+
+
 def test_get_filter_field_values_counts_respect_rules(tmp_path):
     import pytest
     db, fid = _filter_db(tmp_path)

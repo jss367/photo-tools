@@ -3,6 +3,7 @@
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 from unittest.mock import MagicMock, patch
@@ -453,6 +454,7 @@ def _reset_heal_state():
     import timm_classifier as tc
     with tc._HEAL_LOCK:
         tc._HEAL_STATE.clear()
+        tc._HEAL_ATTEMPTS.clear()
         tc._HEAL_THREADS.clear()
 
 
@@ -521,6 +523,122 @@ def test_heal_bounded_to_one_attempt_per_process(tmp_path):
 
     assert first_calls == 1
     assert ensure.call_count == 1
+
+
+def test_reinstalling_the_model_clears_a_failed_heal_verdict(tmp_path):
+    """Removing the model in Settings and downloading it again must get
+    a fresh heal attempt.
+
+    The bounded-retry state used to be keyed by model_str alone and
+    lived for the life of the process, so a heal that failed once (HF
+    unreachable) would keep suppressing the repair for a *brand new*
+    installation whose download could now succeed. The user's only
+    recourse was restarting Vireo — Vireo repairs its own model state.
+    """
+    import timm_classifier as tc
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+    fake_session = _make_fake_session()
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions",
+               side_effect=OSError("offline")) as ensure:
+        TimmClassifier(model_str)
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+        assert ensure.call_count == 1
+        # Same installation, still missing: no re-probe.
+        TimmClassifier(model_str)
+        assert ensure.call_count == 1
+
+        # User removes the model and downloads it again. The new
+        # installation writes a new model.onnx, and its optional-file
+        # fetch still did not supply label_descriptions.json.
+        shutil.rmtree(model_dir)
+        model_dir = _make_model_dir(tmp_path)
+        (model_dir / "label_descriptions.json").unlink()
+        (model_dir / "model.onnx").write_text("dummy-reinstalled")
+
+        TimmClassifier(model_str)
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+
+    assert ensure.call_count == 2, (
+        "a fresh installation must not inherit the previous one's "
+        "failed heal verdict"
+    )
+
+
+def test_deleting_the_healed_file_reopens_the_heal(tmp_path):
+    """A completed heal must not suppress the repair once the file it
+    produced is gone again.
+
+    "done" recorded that a heal succeeded, but reaching the spawn at all
+    means the file read back as missing/unusable. Trusting the stale
+    "done" leaked raw scientific names until the app restarted.
+    """
+    import timm_classifier as tc
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    target = model_dir / "label_descriptions.json"
+    target.unlink()
+    fake_session = _make_fake_session()
+
+    def _fake_ensure(dir_arg, model_str, progress_callback=None):
+        with open(os.path.join(dir_arg, "label_descriptions.json"), "w") as f:
+            json.dump({"Sturnus vulgaris": "European Starling, Bird"}, f)
+        return True
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions",
+               side_effect=_fake_ensure) as ensure:
+        TimmClassifier(model_str)
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+        assert ensure.call_count == 1
+        assert target.exists()
+
+        # Something removes the healed file out from under us.
+        target.unlink()
+        TimmClassifier(model_str)
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+
+    assert ensure.call_count == 2
+    assert target.exists()
+
+
+def test_reheal_after_done_is_bounded(tmp_path):
+    """The "done was contradicted, try again" path is capped so a heal
+    that keeps reporting success without producing a usable file cannot
+    fire an HF probe on every classify job."""
+    import timm_classifier as tc
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+    fake_session = _make_fake_session()
+
+    # Pathological: claims success, never writes the file.
+    def _lying_ensure(dir_arg, model_str, progress_callback=None):
+        return True
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions",
+               side_effect=_lying_ensure) as ensure:
+        for _ in range(tc._HEAL_MAX_ATTEMPTS + 3):
+            TimmClassifier(model_str)
+            tc._HEAL_THREADS[model_str].join(timeout=5)
+
+    assert ensure.call_count == tc._HEAL_MAX_ATTEMPTS
 
 
 def test_self_heal_failure_keeps_classifier_working(tmp_path):
@@ -618,12 +736,36 @@ def test_optional_files_snapshot_records_present_label_descriptions(tmp_path):
     }
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="Windows blocks os.replace() over a file that is still open, so "
-           "the mid-read atomic-republish race this test simulates cannot "
-           "occur on Windows.",
-)
+class _RepublishOnClose:
+    """File proxy that atomically republishes the file it wrapped, right
+    after the reader closes it.
+
+    Staging the republish at close (rather than mid-``json.load``) is
+    what makes this test run on every platform: Windows refuses
+    ``os.replace`` over a path that still has an open handle, because
+    CPython does not open files with FILE_SHARE_DELETE. Closing first is
+    also the *narrower* hazard — it is the window a path stat taken
+    after the ``with`` block would fall into, which is exactly the bug
+    under test.
+    """
+
+    def __init__(self, fh, on_close):
+        self._fh = fh
+        self._on_close = on_close
+
+    def __getattr__(self, name):
+        return getattr(self._fh, name)
+
+    def __enter__(self):
+        self._fh.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        result = self._fh.__exit__(*exc_info)
+        self._on_close()
+        return result
+
+
 def test_snapshot_ignores_a_republish_that_lands_after_the_read(tmp_path):
     """The snapshot must describe the bytes this instance parsed, not the
     file sitting at the path once construction moves on.
@@ -646,27 +788,32 @@ def test_snapshot_ignores_a_republish_that_lands_after_the_read(tmp_path):
     consumed = target.stat()
     consumed_signature = (consumed.st_size, int(consumed.st_mtime_ns))
 
-    real_json_load = json.load
+    real_open = open
     republished = []
 
-    def _load_then_republish(fp, *args, **kwargs):
-        data = real_json_load(fp, *args, **kwargs)
-        if not republished and getattr(fp, "name", "") == str(target):
-            replacement = model_dir / "label_descriptions.json.new"
-            # Different entry count => different size, so the signatures
-            # differ regardless of filesystem mtime granularity.
-            replacement.write_text(json.dumps({
-                "Sturnus vulgaris": "Common Starling, Bird",
-            }))
-            os.replace(replacement, target)
-            republished.append(True)
-        return data
+    def _republish():
+        if republished:
+            return
+        replacement = model_dir / "label_descriptions.json.new"
+        # Different entry count => different size, so the signatures
+        # differ regardless of filesystem mtime granularity.
+        replacement.write_text(json.dumps({
+            "Sturnus vulgaris": "Common Starling, Bird",
+        }))
+        os.replace(replacement, target)
+        republished.append(True)
+
+    def _open_and_republish_on_close(file, *args, **kwargs):
+        fh = real_open(file, *args, **kwargs)
+        if str(file) != str(target):
+            return fh
+        return _RepublishOnClose(fh, _republish)
 
     fake_session = _make_fake_session()
     model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
     with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
          patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
-         patch("models.json.load", side_effect=_load_then_republish):
+         patch("models.open", _open_and_republish_on_close, create=True):
         clf = TimmClassifier(model_str)
 
     assert republished, "the republish hook never fired"

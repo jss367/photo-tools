@@ -21,15 +21,48 @@ _MODEL_DIR_MAP = {
 
 _MODELS_ROOT = os.path.expanduser("~/.vireo/models")
 
-# Bounded retry for the background label_descriptions.json heal: at most
-# one heal attempt per (model_str) per process. A previous attempt that
-# succeeded leaves the file on disk (so future TimmClassifier inits skip
-# spawning entirely); a previous attempt that failed sets state="failed"
-# and later inits skip too — HF was unreachable once, so repeat network
-# probes on every classify job would just re-block for the same reason.
+# Bounded retry for the background label_descriptions.json heal.
+#
+# Keyed by (model_str, installation generation) rather than model_str
+# alone: removing the model in Settings and re-downloading it produces a
+# *different installation*, and the previous installation's verdict must
+# not carry over. Without the generation, a "failed" would suppress the
+# heal for a fresh download that could now succeed, and a "done" would
+# suppress it for a fresh download whose optional-file fetch did not
+# supply label_descriptions.json — leaking scientific names until the
+# user restarts Vireo. Vireo repairs its own broken model state; "restart
+# the app" is not a fix.
+#
+# A "failed" entry blocks retries for its generation: HF was unreachable
+# once, so repeat network probes on every classify job would just
+# re-block for the same reason. A "done" entry does *not* block, because
+# reaching this function at all means the file is missing or unusable
+# again (callers only spawn when the read came back None) — the recorded
+# "done" is contradicted by the disk. _HEAL_MAX_ATTEMPTS caps that
+# re-attempt loop so a pathological "heal reports success but the file
+# stays unusable" state cannot fire a network probe per classify job.
+_HEAL_MAX_ATTEMPTS = 3
 _HEAL_LOCK = threading.Lock()
-_HEAL_STATE: dict = {}  # model_str -> "in_flight" | "done" | "failed"
+_HEAL_STATE: dict = {}  # heal key -> "in_flight" | "done" | "failed"
+_HEAL_ATTEMPTS: dict = {}  # heal key -> int
 _HEAL_THREADS: dict = {}  # model_str -> threading.Thread (kept for tests)
+
+
+def _installation_generation(model_dir):
+    """Identity of the model installation currently in ``model_dir``.
+
+    ``model.onnx`` is the artifact every installation writes, so its
+    (size, mtime_ns) changes when the user removes the model and
+    downloads it again. Deriving the generation from disk rather than
+    from a ``remove_model()`` callback means no deletion path can bypass
+    it — wiping ~/.vireo/models by hand resets the heal state just the
+    same as the Settings button does.
+    """
+    try:
+        st = os.stat(os.path.join(model_dir, "model.onnx"))
+    except OSError:
+        return None
+    return (st.st_size, int(st.st_mtime_ns))
 
 
 def _spawn_label_desc_heal(model_dir, model_str):
@@ -42,13 +75,19 @@ def _spawn_label_desc_heal(model_dir, model_str):
     use the taxonomy fallback until the file is on disk; the next
     TimmClassifier construction picks it up.
 
-    Bounded to one attempt per process per model_str (see _HEAL_STATE).
-    Returns the spawned Thread, or None if a prior attempt already ran.
+    Bounded per installation generation (see _HEAL_STATE). Returns the
+    spawned Thread, or None when a prior attempt for this installation
+    already settled the question.
     """
+    key = (model_str, _installation_generation(model_dir))
     with _HEAL_LOCK:
-        if _HEAL_STATE.get(model_str) is not None:
+        state = _HEAL_STATE.get(key)
+        if state in ("in_flight", "failed"):
             return None
-        _HEAL_STATE[model_str] = "in_flight"
+        if state == "done" and _HEAL_ATTEMPTS.get(key, 0) >= _HEAL_MAX_ATTEMPTS:
+            return None
+        _HEAL_STATE[key] = "in_flight"
+        _HEAL_ATTEMPTS[key] = _HEAL_ATTEMPTS.get(key, 0) + 1
 
     def _worker():
         try:
@@ -62,7 +101,7 @@ def _spawn_label_desc_heal(model_dir, model_str):
             )
             ok = False
         with _HEAL_LOCK:
-            _HEAL_STATE[model_str] = "done" if ok else "failed"
+            _HEAL_STATE[key] = "done" if ok else "failed"
 
     thread = threading.Thread(
         target=_worker,

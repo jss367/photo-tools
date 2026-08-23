@@ -2507,6 +2507,47 @@ def test_load_label_descriptions_returns_none_for_broken_files(tmp_path):
     }
 
 
+def test_label_descriptions_with_non_string_values_are_unusable(tmp_path):
+    """A JSON object whose values are not all strings must read as
+    "heal it", not as a usable mapping.
+
+    The classifier builds its common-name map with ``desc.rsplit(", ", 1)``.
+    A null, number, or list value parses fine as JSON, so it used to pass
+    the usable gate — then raised AttributeError/TypeError during
+    TimmClassifier construction and aborted the classify job. Worse, the
+    heal path would never repair it: the file parses, so "already
+    healed" was the verdict forever. Same "existence suppresses repair"
+    hazard as a torn write; treat a schema-invalid file the same way.
+
+    Rejected whole rather than filtered: keeping the valid half would
+    mark the artifact healed and leak raw scientific names for every
+    dropped species indefinitely.
+    """
+    import models
+
+    for name, payload in [
+        ("null.json", {"Bubulcus ibis": None}),
+        ("number.json", {"Bubulcus ibis": 42}),
+        ("list.json", {"Bubulcus ibis": ["Cattle Egret", "Bird"]}),
+        ("nested.json", {"Bubulcus ibis": {"common": "Cattle Egret"}}),
+        ("partial.json", {
+            "Bubulcus ibis": "Cattle Egret, Bird",
+            "Sturnus vulgaris": None,
+        }),
+    ]:
+        broken = tmp_path / name
+        broken.write_text(json.dumps(payload))
+        assert models.load_label_descriptions(str(broken)) is None, name
+        assert models.label_descriptions_usable(str(broken)) is False, name
+        # The signature is still reported: the caller consumed a real
+        # file state and must key any cache entry by it.
+        descs, signature = models.read_label_descriptions(str(broken))
+        assert descs is None, name
+        assert signature == (
+            broken.stat().st_size, int(broken.stat().st_mtime_ns),
+        ), name
+
+
 def test_hf_download_publishes_file_atomically(tmp_path, monkeypatch):
     """The destination must never be visible half-written.
 

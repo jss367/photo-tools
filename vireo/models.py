@@ -1179,18 +1179,36 @@ def read_label_descriptions(path):
         return None, signature
     if not isinstance(data, dict):
         return None, signature
+    if not all(isinstance(v, str) for v in data.values()):
+        # Parseable JSON but the wrong schema: a null/number/list value
+        # would sail past this gate and then blow up on ``.rsplit`` while
+        # the classifier builds its common-name map — and because the file
+        # parses, the heal would never repair it. Same "existence
+        # suppresses repair" hazard as a truncated write, so treat it the
+        # same way and report the file as unusable. Rejected whole rather
+        # than filtered: a half-valid mapping is still a broken artifact,
+        # and silently keeping the good half would mark it healed and
+        # leak scientific names for every dropped entry forever.
+        log.warning(
+            "Unusable %s (non-string description values); will re-heal.",
+            path,
+        )
+        return None, signature
     return data, signature
 
 
 def load_label_descriptions(path):
     """Return the {scientific name: description} mapping, or None.
 
-    None means "not usable, heal it": missing, unreadable, or not
-    parseable as a JSON object. Existence alone is not enough — a file
-    truncated by a process exit mid-write (or a disk-full write) still
-    passes os.path.isfile but blows up json.load. Vireo repairs broken
-    state itself rather than asking the user to delete files, so every
-    "do I need to heal?" check goes through this.
+    None means "not usable, heal it": missing, unreadable, not parseable
+    as a JSON object, or a JSON object whose values are not all strings.
+    Existence alone is not enough — a file truncated by a process exit
+    mid-write (or a disk-full write) still passes os.path.isfile but
+    blows up json.load, and a file that parses but carries a null or a
+    list where a description belongs blows up the classifier's
+    ``rsplit`` instead. Vireo repairs broken state itself rather than
+    asking the user to delete files, so every "do I need to heal?" check
+    goes through this.
 
     An empty mapping is a complete document (the model simply has no
     common names) and is returned as-is, not treated as broken.

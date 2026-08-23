@@ -511,7 +511,7 @@ def test_stack_metadata_callbacks_follow_promoted_cover(live_server, page):
     }
 
 
-def test_concurrent_stack_hydration_keeps_promoted_cache(live_server, page):
+def test_concurrent_stack_hydration_uses_newest_request(live_server, page):
     db = live_server["db"]
     burst_ids = live_server["data"]["photos"][:3]
     with db.conn:
@@ -555,19 +555,21 @@ def test_concurrent_stack_hydration_keeps_promoted_cache(live_server, page):
               await new Promise(function(resolve) { setTimeout(resolve, 0); });
             }
 
-            var promotedResponse = JSON.parse(JSON.stringify(baseline));
-            promotedResponse.photos.forEach(function(photo) {
+            // The older response arrives first, but the second request was
+            // issued after a newer mutation and must remain authoritative.
+            releases[0](JSON.parse(JSON.stringify(baseline)));
+            await first;
+            var keysAfterOlderResponse = Object.keys(browseStackMembers);
+
+            var newerResponse = JSON.parse(JSON.stringify(baseline));
+            newerResponse.photos.forEach(function(photo) {
               if (photo.id === oldCoverId) photo.flag = 'rejected';
               if (photo.id === promotedId) photo.flag = 'flagged';
             });
-            releases[0](promotedResponse);
-            await first;
-
-            // This older response still ranks the original cover first. It
-            // must not recreate that demoted cache key after promotion.
-            releases[1](JSON.parse(JSON.stringify(baseline)));
+            releases[1](newerResponse);
             await second;
             return {
+              keysAfterOlderResponse: keysAfterOlderResponse,
               cacheKeys: Object.keys(browseStackMembers).map(Number),
               currentCoverId: browseStackCoverIdForPhoto(oldCoverId),
               gridHasPromotedCover: photos.some(function(photo) {
@@ -581,6 +583,7 @@ def test_concurrent_stack_hydration_keeps_promoted_cache(live_server, page):
         burst_ids,
     )
     assert hydration_state == {
+        "keysAfterOlderResponse": [],
         "cacheKeys": [burst_ids[0]],
         "currentCoverId": burst_ids[0],
         "gridHasPromotedCover": True,

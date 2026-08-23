@@ -2371,6 +2371,8 @@ var selectedPhotos = new Set(); // multi-select
 var expandedBrowseStacks = new Set();
 var browseStackMembers = {};
 var browseStackErrors = {};
+var browseStackHydrationSeq = 0;
+var browseStackHydrationRequests = {};
 
 function setBrowseTotals(data) {
   totalPhotos = Number(data && data.total) || 0;
@@ -3297,6 +3299,8 @@ async function reconcileBrowseStackCovers(photoIds) {
   for (var h = 0; h < uncachedCovers.length; h++) {
     var uncachedCover = uncachedCovers[h];
     var uncachedKey = String(uncachedCover.id);
+    var hydrationSeq = ++browseStackHydrationSeq;
+    browseStackHydrationRequests[uncachedKey] = hydrationSeq;
     try {
       var memberIds = uncachedCover.browse_stack.photo_ids || [];
       var hydratedMembers = [];
@@ -3309,9 +3313,13 @@ async function reconcileBrowseStackCovers(photoIds) {
         if (!windowIsCurrent()) return false;
         hydratedMembers = hydratedMembers.concat(data.photos || []);
       }
-      // Another edit can hydrate this same collapsed stack while our request
-      // is in flight. Keep the winner's cache, and do not resurrect the old
-      // key if that hydration already promoted a replacement into the slot.
+      // Overlapping edits may hydrate the same collapsed stack. Request order
+      // tracks mutation freshness, so only the newest request may cache even
+      // when an older response happens to arrive first.
+      if (browseStackHydrationRequests[uncachedKey] !== hydrationSeq) continue;
+      delete browseStackHydrationRequests[uncachedKey];
+      // Expansion can also hydrate this key while reconciliation is in flight;
+      // and another response may already have promoted a replacement.
       if (browseStackMembers[uncachedKey] || !uncachedCover.browse_stack
           || !photos.some(function(photo) {
             return photo === uncachedCover && photo.id === uncachedCover.id;
@@ -3330,6 +3338,9 @@ async function reconcileBrowseStackCovers(photoIds) {
         return uncachedCover;
       });
     } catch (e) {
+      if (browseStackHydrationRequests[uncachedKey] === hydrationSeq) {
+        delete browseStackHydrationRequests[uncachedKey];
+      }
       return false;
     }
   }
@@ -5889,6 +5900,7 @@ async function resetAndLoad(options) {
   expandedBrowseStacks.clear();
   browseStackMembers = {};
   browseStackErrors = {};
+  browseStackHydrationRequests = {};
   photos = [];
   currentPage = 1;
   allLoaded = false;

@@ -56,6 +56,23 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
             tray.locator(f'.browse-stack-member[data-id="{photo_id}"]')
         ).to_have_class("browse-stack-member selected")
 
+    page.locator("#batchBar button", has_text="★5").click()
+    page.wait_for_function(
+        """ids => ids.every(function(id) {
+          var photo = findBrowsePhoto(id);
+          return photo && photo.rating === 5;
+        })""",
+        arg=burst_ids,
+    )
+    page.locator("#batchBar button", has_text="Flag").click()
+    page.wait_for_function(
+        """ids => ids.every(function(id) {
+          var photo = findBrowsePhoto(id);
+          return photo && photo.flag === 'flagged';
+        })""",
+        arg=burst_ids,
+    )
+
     # Stacks is a presentation preference, so it survives a return to Browse.
     page.reload()
     expect(page.locator("#browseStacksToggle")).to_be_checked()

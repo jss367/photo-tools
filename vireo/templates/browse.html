@@ -8617,10 +8617,11 @@ async function batchSetRating(rating) {
     });
   } catch(e) { return; }
   ids.forEach(function(id) {
-    var p = photos.find(function(x) { return x.id === id; });
+    var p = findBrowsePhoto(id);
     if (p) p.rating = rating;
   });
   refreshGridCards(ids);
+  refreshExpandedBrowseStackMembers(ids);
   _refreshBatchInspectorIfActive();
   scheduleCollectionCountsRefresh();
   refreshPendingSyncBanner();
@@ -8766,11 +8767,12 @@ async function batchSetFlag(flag) {
     });
   } catch(e) { return; }
   ids.forEach(function(id) {
-    var p = photos.find(function(x) { return x.id === id; });
+    var p = findBrowsePhoto(id);
     if (p) p.flag = flag;
     _clearRepresentativeStateIfIneligible(id, flag);
   });
   refreshGridCards(ids);
+  refreshExpandedBrowseStackMembers(ids);
   if (selectedPhotoId != null && ids.indexOf(selectedPhotoId) !== -1) {
     updateDetailFlagButtons(flag);
   }
@@ -8795,6 +8797,7 @@ async function batchSetColorLabel(color) {
     colorLabelsFetched.add(id);
   });
   refreshGridCards(ids);
+  refreshExpandedBrowseStackMembers(ids);
   _refreshBatchInspectorIfActive();
   scheduleCollectionCountsRefresh();
   showUndoToast();

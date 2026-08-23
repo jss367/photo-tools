@@ -52,17 +52,33 @@ def _installation_generation(model_dir):
     """Identity of the model installation currently in ``model_dir``.
 
     ``model.onnx`` is the artifact every installation writes, so its
-    (size, mtime_ns) changes when the user removes the model and
-    downloads it again. Deriving the generation from disk rather than
-    from a ``remove_model()`` callback means no deletion path can bypass
-    it — wiping ~/.vireo/models by hand resets the heal state just the
-    same as the Settings button does.
+    identity changes when the user removes the model and downloads it
+    again. Deriving the generation from disk rather than from a
+    ``remove_model()`` callback means no deletion path can bypass it —
+    wiping ~/.vireo/models by hand resets the heal state just the same
+    as the Settings button does.
+
+    ``st_ctime_ns`` and ``st_ino`` are folded in alongside size/mtime
+    because ``download_model`` publishes weights via ``shutil.copy2``,
+    which preserves the source file's mtime — a re-download from an
+    unchanged HF cache blob can therefore land bytes with an identical
+    ``(size, mtime_ns)`` tuple. ``st_ctime_ns`` (metadata-change time on
+    POSIX, creation time on Windows) is set by the OS when the copy
+    creates the destination and cannot be spoofed by ``copy2``;
+    ``st_ino`` is a fresh inode for any newly created file. Either
+    would suffice; using both keeps the marker robust across
+    filesystems that report one of them as a constant.
     """
     try:
         st = os.stat(os.path.join(model_dir, "model.onnx"))
     except OSError:
         return None
-    return (st.st_size, int(st.st_mtime_ns))
+    return (
+        st.st_size,
+        int(st.st_mtime_ns),
+        int(st.st_ctime_ns),
+        st.st_ino,
+    )
 
 
 def _spawn_label_desc_heal(model_dir, model_str):
@@ -245,9 +261,9 @@ class TimmClassifier:
     def _resolve_common_name(self, scientific_name):
         """Map a scientific name to a common name.
 
-        Priority: taxonomy.json (current preferred name, with synonym
-        resolution for outdated binomials) > label_descriptions bundled
-        with the model > scientific name as-is.
+        Priority: taxonomy common name > taxonomy-resolved current
+        scientific name (via synonym resolution) > label_descriptions
+        bundled with the model > input scientific name as-is.
 
         Taxonomy is consulted first so that a healed
         ``label_descriptions.json`` shipping the iNat21-vintage common
@@ -259,11 +275,28 @@ class TimmClassifier:
         scientific-name synonym map cannot resolve a common name — so
         the comparison falls back to text identity and reports a false
         disagreement with a model that emitted the current name.
+
+        The taxonomy-resolved *scientific* name is preferred over the
+        model-era label mapping when synonym resolution rewrote the
+        input (``taxon.scientific_name != scientific_name``): on legacy
+        or offline installs lacking ``label_descriptions.json``, the
+        old-name fall-through was persisting raw obsolete binomials
+        (``"Bubulcus ibis"``) with matching ``auto:`` tags even though
+        the resolved taxon already carried the accepted current name
+        (``"Ardea ibis"``). A taxonomy hit that echoes the input
+        (direct match with no common name) still falls through to the
+        label mapping, so classes the taxonomy tracks only structurally
+        keep their common-name fallback.
         """
         if self._taxonomy:
             taxon = self._taxonomy.lookup(scientific_name)
-            if taxon and taxon.get("common_name"):
-                return taxon["common_name"]
+            if taxon:
+                common = taxon.get("common_name")
+                if common:
+                    return common
+                canonical_sci = taxon.get("scientific_name")
+                if canonical_sci and canonical_sci != scientific_name:
+                    return canonical_sci
 
         key = scientific_name.lower()
         if key in self._common_names:

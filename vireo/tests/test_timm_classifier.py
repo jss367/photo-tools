@@ -572,6 +572,62 @@ def test_reinstalling_the_model_clears_a_failed_heal_verdict(tmp_path):
     )
 
 
+def test_reinstall_that_lands_identical_size_and_mtime_still_reheals(tmp_path):
+    """A remove+re-download that reproduces the previous model.onnx's
+    ``(size, mtime_ns)`` must still get a fresh heal attempt.
+
+    ``download_model`` publishes weights via ``shutil.copy2``, which
+    preserves the source file's mtime. If HF hands back the same cached
+    blob on the re-download (unchanged in the repo since the last
+    fetch), the copied destination lands with an identical
+    ``(size, mtime_ns)`` tuple. A generation marker derived from only
+    those two fields would keep the previous installation's ``failed``
+    verdict — reintroducing the "user must restart Vireo" bug this
+    keying is supposed to prevent.
+    """
+    import timm_classifier as tc
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+    fake_session = _make_fake_session()
+
+    onnx_path = model_dir / "model.onnx"
+    weight_bytes = onnx_path.read_bytes()
+    frozen_mtime_ns = onnx_path.stat().st_mtime_ns
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions",
+               side_effect=OSError("offline")) as ensure:
+        TimmClassifier(model_str)
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+        assert ensure.call_count == 1
+
+        # Simulate a remove+re-download that lands the exact same
+        # bytes at the exact same mtime — the copy2-preserves-mtime
+        # scenario Codex flagged. Size and mtime_ns will both match
+        # the previous installation's.
+        shutil.rmtree(model_dir)
+        model_dir = _make_model_dir(tmp_path)
+        (model_dir / "label_descriptions.json").unlink()
+        onnx_path = model_dir / "model.onnx"
+        onnx_path.write_bytes(weight_bytes)
+        os.utime(onnx_path, ns=(frozen_mtime_ns, frozen_mtime_ns))
+        assert onnx_path.stat().st_size == len(weight_bytes)
+        assert onnx_path.stat().st_mtime_ns == frozen_mtime_ns
+
+        TimmClassifier(model_str)
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+
+    assert ensure.call_count == 2, (
+        "a re-download that reproduces size+mtime must not inherit "
+        "the previous installation's failed heal verdict"
+    )
+
+
 def test_deleting_the_healed_file_reopens_the_heal(tmp_path):
     """A completed heal must not suppress the repair once the file it
     produced is gone again.
@@ -996,6 +1052,44 @@ def test_label_description_used_when_taxonomy_misses(tmp_path):
         )
 
     assert clf._resolve_common_name("Sturnus vulgaris") == "European Starling"
+
+
+def test_synonym_resolution_used_when_taxonomy_lacks_common_name(tmp_path):
+    """A taxonomy synonym hit without a common_name must still return
+    the resolved current scientific name, not fall through to the
+    old-binomial label mapping (or worse, to the input on legacy /
+    offline installs lacking label_descriptions.json).
+
+    Otherwise ``_build_results`` persists the obsolete binomial and its
+    ``auto:`` tag on every prediction whose taxonomy entry happens to
+    lack a preferred common name, so the fix that adds synonym
+    resolution silently does nothing for those species.
+    """
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    _make_model_dir(
+        tmp_path,
+        # No entry for the obsolete binomial — mirrors the legacy /
+        # offline install scenario where label_descriptions.json is
+        # missing or does not cover this class.
+        label_descriptions={},
+    )
+    fake_session = _make_fake_session()
+    taxonomy = _StubTaxonomy(
+        {"bubulcus ibis": {"scientific_name": "Ardea ibis",
+                           "common_name": ""}},
+    )
+
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session",
+               return_value=fake_session):
+        clf = TimmClassifier(
+            "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21",
+            taxonomy=taxonomy,
+        )
+
+    assert clf._resolve_common_name("Bubulcus ibis") == "Ardea ibis"
 
 
 def test_taxonomy_without_common_name_falls_back_to_label(tmp_path):

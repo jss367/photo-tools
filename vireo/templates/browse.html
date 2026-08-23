@@ -3284,16 +3284,21 @@ async function reconcileBrowseStackCovers(photoIds) {
     var uncachedCover = uncachedCovers[h];
     var uncachedKey = String(uncachedCover.id);
     try {
-      var data = await safeFetch('/api/photos/by-ids', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({photo_ids: uncachedCover.browse_stack.photo_ids || []}),
-      }, {toast: false});
-      if (!windowIsCurrent()) return false;
+      var memberIds = uncachedCover.browse_stack.photo_ids || [];
+      var hydratedMembers = [];
+      for (var offset = 0; offset < memberIds.length; offset += 500) {
+        var data = await safeFetch('/api/photos/by-ids', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({photo_ids: memberIds.slice(offset, offset + 500)}),
+        }, {toast: false});
+        if (!windowIsCurrent()) return false;
+        hydratedMembers = hydratedMembers.concat(data.photos || []);
+      }
       var stack = uncachedCover.browse_stack;
       var similarity = uncachedCover.similarity;
       var clientSimilarity = uncachedCover._similarity;
-      browseStackMembers[uncachedKey] = (data.photos || []).map(function(member) {
+      browseStackMembers[uncachedKey] = hydratedMembers.map(function(member) {
         if (member.id !== uncachedCover.id) return member;
         Object.assign(uncachedCover, member);
         uncachedCover.browse_stack = stack;
@@ -10972,7 +10977,7 @@ async function setKeywordType(kwId, newType, el) {
     // disagreements, so the prediction panels move too — _refreshBrowseKeyword
     // State repaints them, except where loadDetail below already will.
     await _refreshBrowseKeywordState(
-      photos.map(function(photo) { return photo.id; }),
+      loadedBrowsePhotoIds(),
       { skipDetail: !!selectedPhotoId },
     );
     if (selectedPhotoId) loadDetail(selectedPhotoId);

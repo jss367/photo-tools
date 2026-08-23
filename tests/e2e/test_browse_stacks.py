@@ -200,3 +200,27 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
     )
     expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
     expect(page.locator(f'.grid-card[data-id="{burst_ids[0]}"]')).to_have_count(0)
+
+    hydration_chunks = page.evaluate(
+        """async coverId => {
+          var cover = photos.find(function(photo) { return photo.id === coverId; });
+          cover.browse_stack.photo_ids = Array(501).fill(coverId);
+          delete browseStackMembers[String(coverId)];
+          var originalSafeFetch = safeFetch;
+          var chunks = [];
+          safeFetch = function(url, options) {
+            if (url === '/api/photos/by-ids') {
+              chunks.push(JSON.parse(options.body).photo_ids.length);
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            await reconcileBrowseStackCovers([coverId]);
+          } finally {
+            safeFetch = originalSafeFetch;
+          }
+          return chunks;
+        }""",
+        burst_ids[1],
+    )
+    assert hydration_chunks == [500, 1]

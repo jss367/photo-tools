@@ -1843,7 +1843,7 @@ body.sidebar-resizing {
                  oninput="updateThumbSize(this.value)">
           <span style="font-size:10px;color:var(--text-faint);">&#9638;</span>
         </label>
-        <label class="browse-stack-toggle" title="Collapse exact duplicates and processed bursts">
+        <label class="browse-stack-toggle" title="Collapse exact duplicates and camera bursts (photos sharing an EXIF burst id)">
           <input type="checkbox" id="browseStacksToggle"
                  data-view-preference="vireo.browse.stacks"
                  onchange="toggleBrowseStacks()">
@@ -8636,7 +8636,7 @@ async function batchSetRating(rating) {
 // until the page reloads rather than lighting up incorrectly.
 function _clearRepresentativeStateIfIneligible(photoId, flag) {
   if (flag !== 'rejected') return;
-  var p = photos.find(function(x) { return x.id === photoId; });
+  var p = findBrowsePhoto(photoId);
   if (!p) return;
   if (p.is_species_representative) p.is_species_representative = false;
   if (Array.isArray(p.life_list)) {
@@ -9753,10 +9753,13 @@ async function setRating(photoId, rating) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ rating: rating }),
     });
-    // Update local state
-    var p = photos.find(function(x) { return x.id === photoId; });
+    // Update local state — findBrowsePhoto looks in the top-level `photos`
+    // array AND in any expanded stack tray's `browseStackMembers`, so a rating
+    // set on a hidden member updates the tray-cached row instead of vanishing.
+    var p = findBrowsePhoto(photoId);
     if (p) p.rating = rating;
     refreshGridCards([photoId]);
+    refreshExpandedBrowseStackMembers([photoId]);
     scheduleCollectionCountsRefresh();
     loadDetail(photoId);
     refreshPendingSyncBanner();
@@ -9783,10 +9786,11 @@ async function setFlag(flag) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ flag: flag }),
     });
-    var p = photos.find(function(x) { return x.id === photoId; });
+    var p = findBrowsePhoto(photoId);
     if (p) p.flag = flag;
     _clearRepresentativeStateIfIneligible(photoId, flag);
     refreshGridCards([photoId]);
+    refreshExpandedBrowseStackMembers([photoId]);
     if (selectedPhotoId === photoId) updateDetailFlagButtons(flag);
     scheduleCollectionCountsRefresh();
   } catch(e) {}
@@ -9809,9 +9813,10 @@ async function setWildlifeExcludedFor(photoId, excluded) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ excluded: excluded }),
   }, { toast: false });
-  var p = photos.find(function(x) { return x.id === photoId; });
+  var p = findBrowsePhoto(photoId);
   if (p) p.wildlife_excluded = excluded ? 1 : 0;
   renderGrid();
+  refreshExpandedBrowseStackMembers([photoId]);
   if (selectedPhotoId === photoId) loadDetail(photoId);
   showUndoToast();
 }
@@ -9819,7 +9824,13 @@ window.setWildlifeExcludedFor = setWildlifeExcludedFor;
 
 async function toggleDetailWildlifeExcluded() {
   if (!selectedPhotoId) return;
-  var p = photos.find(function(x) { return x.id === selectedPhotoId; });
+  // Read the current value via findBrowsePhoto so a stack member that lives
+  // only in browseStackMembers (not the top-level photos array) still yields
+  // its true wildlife_excluded state. photos.find() would return undefined for
+  // hidden members and always send excluded=true — clicking "Include Wildlife
+  // Classification" on an already-excluded member would silently re-exclude
+  // it instead of including it.
+  var p = findBrowsePhoto(selectedPhotoId);
   var current = p ? !!p.wildlife_excluded : false;
   try {
     await setWildlifeExcludedFor(selectedPhotoId, !current);

@@ -22992,9 +22992,16 @@ class Database:
 
         Stacks are a presentation of the current result set, not durable
         catalog state: filters apply to members first, then exact duplicates
-        and processed bursts collapse only when at least two matching photos
+        and camera bursts collapse only when at least two matching photos
         remain. Exact duplicates claim their members before bursts so one
         photo can never appear in two Browse items.
+
+        "Camera burst" here means photos that share an EXIF ImageUniqueID —
+        the only value the scanner writes to ``photos.burst_id`` (see
+        ``scanner.py``). The pipeline's time/embedding-derived burst groups
+        live in ``pipeline_results_ws*.json`` and are not persisted to
+        ``burst_id``, so they intentionally do not participate in Browse
+        stacking today; the pipeline review page is where users see those.
         """
         folder_join, join_clause, where, params = self._build_query_from_rules(rules)
         where, params = self._append_collection_restriction(

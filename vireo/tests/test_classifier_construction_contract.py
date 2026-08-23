@@ -344,6 +344,117 @@ def test_missing_optional_files_snapshot_falls_back_to_disk(tmp_path):
         reset_default_cache_for_tests()
 
 
+def test_acquire_calls_notify_reuse_on_every_acquire(tmp_path):
+    """Regression for the "bounded retry unreachable from cache hits" gap.
+
+    ``TimmClassifier``'s ``label_descriptions.json`` self-heal is
+    spawned from ``__init__``, but the process-wide ``ModelCache``
+    reuses the constructed instance across later classify jobs without
+    re-entering ``__init__``. If the first probe fails while HF is
+    unreachable, no later job would ever re-arm the bounded retry —
+    scientific names would leak indefinitely even after connectivity
+    returns.
+
+    ``acquire_cached_classifier`` now invokes ``instance.notify_reuse()``
+    on every acquire so the classifier's own retry state machine runs
+    from the acquisition path, not just the factory path. This test
+    proves that hook fires on both cache-miss and cache-hit acquires.
+    """
+    reset_default_cache_for_tests()
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "text_encoder.onnx").write_bytes(b"weights")
+    (model_dir / "config.json").write_bytes(b"config")
+
+    required = ["text_encoder.onnx", "config.json"]
+
+    class _Instance:
+        def __init__(self):
+            self.reuse_calls = 0
+
+        def notify_reuse(self):
+            self.reuse_calls += 1
+
+    factory_calls = []
+
+    def _factory():
+        factory_calls.append(1)
+        return _Instance()
+
+    try:
+        first = acquire_cached_classifier(
+            model_type="bioclip",
+            model_str="model-a",
+            weights_path=str(model_dir),
+            labels=["bird"],
+            factory=_factory,
+            files=required,
+        )
+        try:
+            instance = first.__enter__()
+            assert factory_calls == [1]
+            assert instance.reuse_calls == 1, (
+                "notify_reuse must fire on cache miss too"
+            )
+
+            second = acquire_cached_classifier(
+                model_type="bioclip",
+                model_str="model-a",
+                weights_path=str(model_dir),
+                labels=["bird"],
+                factory=_factory,
+                files=required,
+            )
+            try:
+                assert factory_calls == [1], (
+                    "same fingerprint must be a cache hit — the factory "
+                    "does not run a second time"
+                )
+                assert second.__enter__() is instance
+                assert instance.reuse_calls == 2, (
+                    "the hook must also fire on cache hit — otherwise "
+                    "instance-owned bounded retries never re-arm"
+                )
+            finally:
+                second.release()
+        finally:
+            first.release()
+    finally:
+        reset_default_cache_for_tests()
+
+
+def test_acquire_survives_a_notify_reuse_that_raises(tmp_path):
+    """A crashing ``notify_reuse`` on a shared classifier must not brick
+    every acquirer. The hook is best-effort background bookkeeping; it
+    is not on the classify path's data flow, so an exception from it is
+    logged and swallowed."""
+    reset_default_cache_for_tests()
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "text_encoder.onnx").write_bytes(b"weights")
+
+    class _Instance:
+        def notify_reuse(self):
+            raise RuntimeError("hook exploded")
+
+    try:
+        handle = acquire_cached_classifier(
+            model_type="bioclip",
+            model_str="model-a",
+            weights_path=str(model_dir),
+            labels=["bird"],
+            factory=_Instance,
+            files=["text_encoder.onnx"],
+        )
+        try:
+            # The value is still delivered; the hook's failure is isolated.
+            assert isinstance(handle.__enter__(), _Instance)
+        finally:
+            handle.release()
+    finally:
+        reset_default_cache_for_tests()
+
+
 def test_shared_classifier_cache_preserves_authoritative_label_order(tmp_path):
     reset_default_cache_for_tests()
     model_dir = tmp_path / "model"

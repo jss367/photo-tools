@@ -1353,3 +1353,195 @@ def test_repair_reset_leaves_an_in_flight_heal_alone(tmp_path):
     tc.reset_label_desc_heal_state()
     assert heal_key not in tc._HEAL_STATE
     assert heal_key not in tc._HEAL_ATTEMPTS
+
+
+def test_notify_reuse_rearms_heal_when_snapshot_says_absent(tmp_path):
+    """A ``TimmClassifier`` whose snapshot recorded a missing
+    ``label_descriptions.json`` must re-arm the bounded heal every time
+    ``acquire_cached_classifier`` returns it — otherwise a first-probe
+    failure while HF was unreachable would strand the installation, and
+    connectivity coming back would never trigger a retry: no later job
+    re-enters ``TimmClassifier.__init__`` while the cached instance is
+    hot, so the state machine's remaining attempts stay unreachable.
+    """
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+    fake_session = _make_fake_session()
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions", side_effect=OSError("offline")):
+        clf = TimmClassifier(model_str)
+        import timm_classifier as tc
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+
+    # First attempt failed; snapshot recorded the file as absent.
+    assert clf.optional_files_snapshot["label_descriptions.json"] is None
+
+    # Simulate the cache-hit path: connectivity has returned; the next
+    # acquire fires ``notify_reuse``. The bounded retry state machine
+    # should now hand out a fresh attempt slot instead of blocking.
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch(
+             "models.ensure_timm_label_descriptions",
+             side_effect=lambda dir_arg, mstr, progress_callback=None: (
+                 open(
+                     os.path.join(dir_arg, "label_descriptions.json"), "w",
+                 ).write(json.dumps({"Sturnus vulgaris": "European Starling, Bird"}))
+                 or True
+             ),
+         ):
+        clf.notify_reuse()
+        import timm_classifier as tc2
+        tc2._HEAL_THREADS[model_str].join(timeout=5)
+
+    assert (model_dir / "label_descriptions.json").exists(), (
+        "notify_reuse must let the bounded retry re-arm so a transient "
+        "outage can self-heal even when the cached classifier keeps "
+        "getting reused"
+    )
+
+
+def test_notify_reuse_does_nothing_when_snapshot_captured_the_file(tmp_path):
+    """When the classifier was constructed with a valid
+    ``label_descriptions.json``, ``notify_reuse`` must not spawn another
+    heal — the bounded-retry budget exists to bound network probes, and
+    an already-healthy install has no probe to spend it on.
+    """
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    _make_model_dir(tmp_path)
+    fake_session = _make_fake_session()
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session):
+        clf = TimmClassifier(model_str)
+
+    with patch("models.ensure_timm_label_descriptions") as ensure:
+        clf.notify_reuse()
+
+    assert not ensure.called
+
+
+def test_acquire_cache_hit_actually_rearms_the_bounded_heal(tmp_path):
+    """End-to-end regression: a full ``acquire_cached_classifier`` round
+    trip must fire ``notify_reuse`` on cache hits so the bounded retry
+    reaches the code paths a hot cache would otherwise keep hidden.
+
+    A cache-miss acquire spawns the heal from ``__init__`` (attempt 1).
+    We complete that thread, then perform a second acquire that hits the
+    cache. The cache-hit ``notify_reuse`` hook must spawn a fresh heal
+    attempt using the same bounded-retry state machine — otherwise the
+    remaining budget stays unreachable while the classifier is cached,
+    and a first-probe failure during a transient outage strands the
+    installation for the life of the process.
+    """
+    import threading
+
+    from classifier_cache import acquire_cached_classifier
+    from model_cache import reset_default_cache_for_tests
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    reset_default_cache_for_tests()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+    fake_session = _make_fake_session()
+
+    import timm_classifier as tc
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+
+    # Sequence a probe: block each call on its own Event so the test
+    # can precisely observe heal completion between acquires and avoid
+    # racing with the daemon heal thread.
+    gates = [threading.Event(), threading.Event(), threading.Event()]
+    call_index = {"n": 0}
+
+    def _sequenced_ensure(dir_arg, mstr, progress_callback=None):
+        i = call_index["n"]
+        call_index["n"] += 1
+        gates[i].wait(timeout=5)
+        raise OSError("offline")
+
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions", side_effect=_sequenced_ensure):
+
+        def _factory():
+            return TimmClassifier(model_str)
+
+        first = acquire_cached_classifier(
+            model_type="timm",
+            model_str=model_str,
+            weights_path=str(model_dir),
+            labels=None,
+            factory=_factory,
+            files=["model.onnx", "class_names.json", "config.json"],
+            optional_files=["label_descriptions.json"],
+        )
+        try:
+            clf1 = first.__enter__()
+            # Release the first probe; wait for the heal thread to
+            # settle into "failed" before the next acquire so the
+            # cache-hit notify_reuse actually reaches the spawn path
+            # (an "in_flight" state would dedup it out).
+            gates[0].set()
+            tc._HEAL_THREADS[model_str].join(timeout=5)
+            attempts_after_first = tc._HEAL_ATTEMPTS[
+                (model_str, tc._installation_generation(str(model_dir)))
+            ]
+
+            # Simulate the ambient time being past the backoff window
+            # so notify_reuse can actually spawn the next probe: b71b2b4
+            # introduced ``_HEAL_RETRY_AT`` to rate-limit re-probes after
+            # the immediate burst, and this test needs the *next* attempt
+            # to fire immediately rather than 60s from now.
+            with tc._HEAL_LOCK:
+                for heal_key in list(tc._HEAL_RETRY_AT):
+                    tc._HEAL_RETRY_AT[heal_key] = time.monotonic() - 1
+
+            second = acquire_cached_classifier(
+                model_type="timm",
+                model_str=model_str,
+                weights_path=str(model_dir),
+                labels=None,
+                factory=_factory,
+                files=["model.onnx", "class_names.json", "config.json"],
+                optional_files=["label_descriptions.json"],
+            )
+            try:
+                clf2 = second.__enter__()
+                # Same cached instance (cache hit): the factory did not
+                # run a second time, so ``__init__`` did not run either.
+                assert clf2 is clf1
+                # Cache-hit ``notify_reuse`` must have consumed a fresh
+                # attempt slot from the bounded-retry budget.
+                gates[1].set()
+                tc._HEAL_THREADS[model_str].join(timeout=5)
+                attempts_after_second = tc._HEAL_ATTEMPTS[
+                    (model_str, tc._installation_generation(str(model_dir)))
+                ]
+                assert attempts_after_second > attempts_after_first, (
+                    "cache-hit acquire must re-arm the bounded heal; "
+                    "otherwise the retry state machine is unreachable "
+                    "while the classifier stays cached and connectivity "
+                    "recovery would never trigger a retry"
+                )
+            finally:
+                second.release()
+        finally:
+            # Any still-blocked heal threads must be released before
+            # the test cleans up — otherwise the daemon thread would
+            # leak into the next test.
+            for g in gates:
+                g.set()
+            first.release()
+
+    reset_default_cache_for_tests()

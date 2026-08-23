@@ -302,6 +302,12 @@ class TimmClassifier:
         from computation_cache import label_descriptions_identity
         self.label_descriptions_identity = label_descriptions_identity(descs)
 
+        # Remember the model coordinates so cache reuse (see
+        # ``notify_reuse`` below) can re-arm the background heal without
+        # having to pass them in from every caller.
+        self._model_dir = model_dir
+        self._model_str = model_str
+
         # Spawn the heal off the startup path — the network probes can
         # take a full HF timeout when offline, and classifier construction
         # runs per classify job. This instance proceeds with the taxonomy
@@ -350,6 +356,35 @@ class TimmClassifier:
             len(self._class_names),
             len(self._common_names),
         )
+
+    def notify_reuse(self):
+        """Re-arm the ``label_descriptions.json`` heal on cache reuse.
+
+        ``__init__`` spawns the heal once, but the process-wide
+        ``ModelCache`` reuses this instance across subsequent classify
+        jobs. When the first heal happened to fail (e.g. HF was
+        unreachable during that probe), later classify jobs would then
+        never re-enter ``__init__``, so ``_spawn_label_desc_heal``'s
+        bounded-retry state machine — which allows up to
+        ``_HEAL_MAX_ATTEMPTS`` probes per installation once
+        connectivity returns — was unreachable. That left this instance
+        stuck under the ``label_descriptions.json = None`` fingerprint
+        indefinitely: an outage bracketing one probe leaked raw
+        scientific names for the rest of the process's life.
+
+        ``acquire_cached_classifier`` calls this on every acquire so
+        the bounded retry actually fires from the acquisition path,
+        not only from ``__init__``. Concurrent duplicate calls are
+        already deduped by ``_HEAL_LOCK`` (an ``in_flight`` entry is
+        a no-op), so calling it on a fresh construction — where
+        ``__init__`` already spawned — is cheap and correct.
+        """
+        if (
+            self.optional_files_snapshot.get("label_descriptions.json")
+            is not None
+        ):
+            return
+        _spawn_label_desc_heal(self._model_dir, self._model_str)
 
     def _resolve_common_name(self, scientific_name):
         """Map a scientific name to a common name.

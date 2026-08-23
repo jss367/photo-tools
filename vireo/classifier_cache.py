@@ -166,9 +166,33 @@ def acquire_cached_classifier(
         snapshot = getattr(instance, "optional_files_snapshot", None)
         return _key(state=snapshot)
 
-    return get_default_cache().acquire(
+    handle = get_default_cache().acquire(
         _key(),
         factory,
         post_load_key=_post_load_key,
         cancel_check=cancel_check,
     )
+
+    # Give the loaded classifier a chance to run bounded-retry
+    # background work that only its ``__init__`` normally kicks off.
+    # On a cache hit the shared cache serves the previously constructed
+    # instance without calling ``__init__`` again, so a classifier that
+    # spawned a self-heal (see ``TimmClassifier._spawn_label_desc_heal``)
+    # and hit a transient failure would otherwise never re-probe:
+    # ``__init__`` is the only caller, and cached-only jobs never touch
+    # it. Firing the hook here — under the acquisition path — makes the
+    # bounded retry state machine reachable from every job. The classifier
+    # is responsible for internal dedup (the heal already uses a lock +
+    # ``in_flight`` marker), so calling this on a fresh construction is a
+    # harmless no-op.
+    value = handle._value
+    hook = getattr(value, "notify_reuse", None)
+    if hook is not None:
+        try:
+            hook()
+        except Exception:
+            import logging as _logging
+            _logging.getLogger(__name__).exception(
+                "classifier notify_reuse hook raised; ignoring",
+            )
+    return handle

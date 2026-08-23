@@ -25213,6 +25213,129 @@ def test_browse_stack_sharpness_asc_preserves_null_member(tmp_path):
     assert ids.index(stack_scored_id) < ids.index(scored_single_id)
 
 
+def _stacked_vs_unstacked_order(db, sort):
+    """Return ``(stacked_ids, expected_ids)`` for a Browse sort.
+
+    "Stacked ordering agrees with unstacked ordering" means each logical
+    item appears in the same relative position its first-appearing member
+    occupies in the ordinary photo query. Softest-first is a culling sort:
+    a frame that moves simply because Stacks was toggled is exactly the
+    kind of hidden behaviour CORE_PHILOSOPHY's "no black boxes" rule
+    forbids, so the two views must not disagree.
+    """
+    rows = db.query_browse_stacks([], sort=sort)
+    stacked_ids = [row["id"] for row in rows]
+    cover_by_member = {}
+    for row in rows:
+        raw = row["_browse_stack_member_ids"]
+        member_ids = (
+            [int(part) for part in str(raw).split(",") if part]
+            if raw else [row["id"]]
+        )
+        for member_id in member_ids:
+            cover_by_member[member_id] = row["id"]
+    expected_ids = []
+    for photo in db.query_photos([], sort=sort):
+        cover_id = cover_by_member.get(photo["id"], photo["id"])
+        if cover_id not in expected_ids:
+            expected_ids.append(cover_id)
+    return stacked_ids, expected_ids, cover_by_member
+
+
+def _sharpness_sort_db(tmp_path, specs):
+    """Seed photos from ``(filename, sharpness, burst_id)`` triples."""
+    db, fid = _filter_db(tmp_path)
+    ids = {}
+    for filename, sharpness, burst_id in specs:
+        photo_id = db.add_photo(
+            folder_id=fid, filename=filename, extension=".jpg",
+            file_size=1, file_mtime=1.0,
+        )
+        ids[filename] = photo_id
+        db.conn.execute(
+            "UPDATE photos SET sharpness = ?, burst_id = ? WHERE id = ?",
+            (sharpness, burst_id, photo_id),
+        )
+    db.conn.commit()
+    return db, ids
+
+
+def test_browse_stack_sharpness_asc_null_stack_uses_filename_tiebreak(tmp_path):
+    # A burst holding NULL + 0.9 and a lone unscored single are both
+    # "unscored" for softest-first, so the filename tie-breaker must decide
+    # them exactly as it does unstacked. Ordering by MIN(sharpness) instead
+    # compares 0.9 against NULL and always parks the single first.
+    db, ids = _sharpness_sort_db(tmp_path, [
+        ("a-burst-1.jpg", None, "shared-burst"),
+        ("a-burst-2.jpg", 0.9, "shared-burst"),
+        ("z-single.jpg", None, None),
+    ])
+
+    stacked_ids, expected_ids, cover_of = _stacked_vs_unstacked_order(
+        db, "sharpness_asc")
+
+    # The burst's min filename sorts before the single's, so the burst leads.
+    assert stacked_ids == expected_ids
+    assert stacked_ids.index(cover_of[ids["a-burst-1.jpg"]]) < stacked_ids.index(
+        cover_of[ids["z-single.jpg"]])
+
+
+def test_browse_stack_sharpness_asc_null_stack_tiebreak_respects_order(tmp_path):
+    # Same shape with the filenames swapped: the single now sorts first.
+    # Without this direction the previous test could pass on a rule that
+    # merely reverses the bug rather than honouring the filename order.
+    db, ids = _sharpness_sort_db(tmp_path, [
+        ("m-burst-1.jpg", None, "shared-burst"),
+        ("m-burst-2.jpg", 0.9, "shared-burst"),
+        ("a-single.jpg", None, None),
+    ])
+
+    stacked_ids, expected_ids, cover_of = _stacked_vs_unstacked_order(
+        db, "sharpness_asc")
+
+    assert stacked_ids == expected_ids
+    assert stacked_ids.index(cover_of[ids["a-single.jpg"]]) < stacked_ids.index(
+        cover_of[ids["m-burst-1.jpg"]])
+
+
+def test_browse_stack_sharpness_asc_null_member_stack_leads_scored_single(tmp_path):
+    # A stack containing an unscored member ranks as unscored, so it stays
+    # ahead of every scored single just as its unscored member does when
+    # Stacks is off.
+    db, ids = _sharpness_sort_db(tmp_path, [
+        ("burst-a.jpg", None, "shared-burst"),
+        ("burst-b.jpg", 0.9, "shared-burst"),
+        ("single-scored.jpg", 0.5, None),
+    ])
+
+    stacked_ids, expected_ids, cover_of = _stacked_vs_unstacked_order(
+        db, "sharpness_asc")
+
+    assert stacked_ids == expected_ids
+    assert stacked_ids.index(cover_of[ids["burst-a.jpg"]]) < stacked_ids.index(
+        cover_of[ids["single-scored.jpg"]])
+
+
+def test_browse_stack_sharpness_asc_scored_stacks_keep_softest_first(tmp_path):
+    # Fully scored stacks still order by their softest member, and scored
+    # items stay behind every unscored one.
+    db, ids = _sharpness_sort_db(tmp_path, [
+        ("sharp-burst-1.jpg", 0.8, "sharp-burst"),
+        ("sharp-burst-2.jpg", 0.7, "sharp-burst"),
+        ("soft-burst-1.jpg", 0.3, "soft-burst"),
+        ("soft-burst-2.jpg", 0.6, "soft-burst"),
+        ("unscored-single.jpg", None, None),
+    ])
+
+    stacked_ids, expected_ids, cover_of = _stacked_vs_unstacked_order(
+        db, "sharpness_asc")
+
+    assert stacked_ids == expected_ids
+    assert stacked_ids[0] == cover_of[ids["unscored-single.jpg"]]
+    assert stacked_ids.index(cover_of[ids["soft-burst-1.jpg"]]) < stacked_ids.index(
+        cover_of[ids["sharp-burst-1.jpg"]])
+
+
 def test_get_filter_field_values_counts_respect_rules(tmp_path):
     import pytest
     db, fid = _filter_db(tmp_path)

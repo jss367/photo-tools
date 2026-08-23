@@ -23099,9 +23099,11 @@ class Database:
                 "_stack_min_filename ASC, id ASC"
             ),
             "sharpness": "_stack_max_sharpness DESC, _stack_min_filename ASC, id ASC",
+            # Mirrors the unstacked key `p.sharpness ASC, p.filename ASC`:
+            # SQLite sorts NULL first, so unscored logical items lead and
+            # then fall through to the same filename tie-breaker.
             "sharpness_asc": (
-                "_stack_any_sharpness_null DESC, _stack_min_sharpness ASC, "
-                "_stack_min_filename ASC, id ASC"
+                "_stack_softest_sharpness ASC, _stack_min_filename ASC, id ASC"
             ),
             "quality": "_stack_max_quality DESC, _stack_min_filename ASC, id ASC",
         }.get(sort, "_stack_min_timestamp IS NULL, _stack_min_timestamp ASC, id ASC")
@@ -23133,10 +23135,17 @@ class Database:
                            AS _stack_max_rating,
                        MAX(sharpness) OVER (PARTITION BY _stack_key)
                            AS _stack_max_sharpness,
-                       MIN(sharpness) OVER (PARTITION BY _stack_key)
-                           AS _stack_min_sharpness,
-                       MAX(sharpness IS NULL) OVER (PARTITION BY _stack_key)
-                           AS _stack_any_sharpness_null,
+                       -- Softest-first treats a stack as only as sharp as
+                       -- its softest member, and a stack holding any unscored
+                       -- member is itself unscored. MIN() alone silently drops
+                       -- the NULL, which both buries the unscored frame behind
+                       -- scored singles and lets the surviving minimum beat the
+                       -- filename tie-breaker between two unscored items.
+                       CASE
+                         WHEN MAX(sharpness IS NULL)
+                              OVER (PARTITION BY _stack_key) = 1 THEN NULL
+                         ELSE MIN(sharpness) OVER (PARTITION BY _stack_key)
+                       END AS _stack_softest_sharpness,
                        MAX(quality_score) OVER (PARTITION BY _stack_key)
                            AS _stack_max_quality
                 FROM keyed

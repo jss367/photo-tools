@@ -256,6 +256,37 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
         arg=burst_ids[1],
     )
 
+    # Restore the original cover, then demote it while it remains part of a
+    # batch. Exact selected IDs stay unchanged while preview maps the now-hidden
+    # focused member to the collapsed replacement cover.
+    page.evaluate(
+        "photoId => setFlagFor(photoId, 'flagged')",
+        burst_ids[0],
+    )
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[0]}"]')).to_be_visible()
+    page.evaluate(
+        """ids => {
+          selectedPhotoId = ids[0];
+          selectedIndex = photos.findIndex(function(photo) { return photo.id === ids[0]; });
+          selectedPhotos = new Set([ids[0], ids[1]]);
+        }""",
+        [burst_ids[0], live_server["data"]["photos"][3]],
+    )
+    page.evaluate(
+        "photoId => setFlagFor(photoId, 'rejected')",
+        burst_ids[0],
+    )
+    assert page.evaluate(
+        """ids => {
+          var active = getActiveSelection();
+          var preview = getBrowseShortcutPhoto();
+          return selectedPhotoId === ids[0]
+            && active.length === 2 && active.includes(ids[0]) && active.includes(ids[1])
+            && preview.photo.id !== ids[0] && preview.navigationPhotos === photos;
+        }""",
+        [burst_ids[0], live_server["data"]["photos"][3]],
+    )
+
     hydration_chunks = page.evaluate(
         """async coverId => {
           var cover = photos.find(function(photo) { return photo.id === coverId; });

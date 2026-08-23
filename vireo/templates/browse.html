@@ -3348,7 +3348,7 @@ async function reconcileBrowseStackCovers(photoIds) {
       // otherwise land on an unselected card with an index of -1 in the
       // navigation list. Hand focus to the newly promoted cover, which now
       // occupies that grid slot.
-      if (selectedPhotoId === oldCoverId) {
+      if (selectedPhotoId === oldCoverId && selectedPhotos.size === 0) {
         selectedPhotoId = newCover.id;
       }
     }
@@ -6627,10 +6627,18 @@ function getBrowseShortcutPhoto() {
   if (selectedPhotoId != null) {
     var selected = findBrowsePhoto(selectedPhotoId);
     if (selected) {
+      var selectedNavigation = browsePhotoNavigationList(selectedPhotoId);
+      if (selectedNavigation === photos && !photos.some(function(photo) {
+        return photo.id === selectedPhotoId;
+      })) {
+        var selectedCoverId = browseStackCoverIdForPhoto(selectedPhotoId);
+        var selectedCover = photos.find(function(photo) { return photo.id === selectedCoverId; });
+        if (selectedCover) selected = selectedCover;
+      }
       return {
         photo: selected,
         index: selectedIndex,
-        navigationPhotos: browsePhotoNavigationList(selectedPhotoId),
+        navigationPhotos: selectedNavigation,
       };
     }
   }
@@ -6639,10 +6647,18 @@ function getBrowseShortcutPhoto() {
     for (var selectedOffset = 0; selectedOffset < selectedIds.length; selectedOffset++) {
       var selectedMember = findBrowsePhoto(selectedIds[selectedOffset]);
       if (selectedMember) {
+        var memberNavigation = browsePhotoNavigationList(selectedMember.id);
+        if (memberNavigation === photos && !photos.some(function(photo) {
+          return photo.id === selectedMember.id;
+        })) {
+          var memberCoverId = browseStackCoverIdForPhoto(selectedMember.id);
+          var memberCover = photos.find(function(photo) { return photo.id === memberCoverId; });
+          if (memberCover) selectedMember = memberCover;
+        }
         return {
           photo: selectedMember,
           index: selectedIndex,
-          navigationPhotos: browsePhotoNavigationList(selectedMember.id),
+          navigationPhotos: memberNavigation,
         };
       }
     }

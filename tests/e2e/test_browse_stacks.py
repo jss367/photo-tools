@@ -49,6 +49,32 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
     expect(tray.locator(
         f'.browse-stack-member[data-id="{burst_ids[2]}"] .det-box'
     )).to_be_visible()
+    page.evaluate(
+        """photoId => {
+          window._testOriginalOrientationCheck = window.vireoPhotoHasOrientationEdit;
+          window.vireoPhotoHasOrientationEdit = function(id) { return id === photoId; };
+          document.dispatchEvent(new CustomEvent('lightbox:renderchanged', {
+            detail: {photoIds: [photoId]},
+          }));
+        }""",
+        burst_ids[2],
+    )
+    expect(tray.locator(
+        f'.browse-stack-member[data-id="{burst_ids[2]}"] .det-box'
+    )).to_be_hidden()
+    page.evaluate(
+        """photoId => {
+          window.vireoPhotoHasOrientationEdit = window._testOriginalOrientationCheck;
+          delete window._testOriginalOrientationCheck;
+          document.dispatchEvent(new CustomEvent('lightbox:renderchanged', {
+            detail: {photoIds: [photoId]},
+          }));
+        }""",
+        burst_ids[2],
+    )
+    expect(tray.locator(
+        f'.browse-stack-member[data-id="{burst_ids[2]}"] .det-box'
+    )).to_be_visible()
     page.locator("#detBoxToggle").click()
     expect(tray.locator(".det-box")).to_have_count(0)
     assert page.evaluate(
@@ -321,3 +347,36 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
         burst_ids[1],
     )
     assert hydration_chunks == [500, 1]
+
+    assert page.evaluate(
+        """async args => {
+          var coverId = args.coverId;
+          var oldCover = photos.find(function(photo) { return photo.id === coverId; });
+          var oldIndex = photos.indexOf(oldCover);
+          var stack = oldCover.browse_stack;
+          stack.photo_ids = args.memberIds;
+          delete browseStackMembers[String(coverId)];
+          expandedBrowseStacks.delete(coverId);
+          var releaseExpand;
+          var originalSafeFetch = safeFetch;
+          safeFetch = function(url) {
+            if (url === '/api/photos/by-ids') {
+              return new Promise(function(resolve) { releaseExpand = resolve; });
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          var pendingExpand = toggleBrowseStack(null, coverId);
+          await new Promise(function(resolve) { setTimeout(resolve, 0); });
+          oldCover.browse_stack = null;
+          var replacement = Object.assign({}, oldCover, {
+            id: coverId + 100000,
+            browse_stack: stack,
+          });
+          photos[oldIndex] = replacement;
+          releaseExpand({photos: [oldCover]});
+          await pendingExpand;
+          safeFetch = originalSafeFetch;
+          return browseStackMembers[String(coverId)] === undefined;
+        }""",
+        {"coverId": burst_ids[1], "memberIds": burst_ids},
+    )

@@ -3468,7 +3468,13 @@ async function toggleBrowseStack(event, coverId) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({photo_ids: memberIds}),
     });
-    if (!windowIsCurrent()) return;
+    // A cover-changing edit can hydrate and promote this stack while the
+    // expansion request is in flight. The dataset epoch stays current in
+    // that case, so also verify the captured cover still owns this grid slot
+    // before writing its old cache key.
+    if (!windowIsCurrent() || !cover.browse_stack || !photos.some(function(photo) {
+      return photo === cover && photo.id === coverId;
+    })) return;
     // Reuse the top-level cover object inside the member cache. The cover is
     // rendered in both places; sharing one object keeps rating/flag/keyword/
     // wildlife/location mutations from updating the grid copy while leaving
@@ -3485,7 +3491,9 @@ async function toggleBrowseStack(event, coverId) {
       if (windowIsCurrent() && expandedBrowseStacks.has(coverId)) insertBrowseStackTray(coverId);
     });
   } catch (error) {
-    if (!windowIsCurrent()) return;
+    if (!windowIsCurrent() || !cover.browse_stack || !photos.some(function(photo) {
+      return photo === cover && photo.id === coverId;
+    })) return;
     browseStackErrors[cacheKey] = 'Could not load this stack.';
     insertBrowseStackTray(coverId);
   }
@@ -3550,7 +3558,10 @@ document.addEventListener('lightbox:renderchanged', function(e) {
         window.vireoPhotoHasOrientationEdit(id)
       )
     );
-    document.querySelectorAll('.grid-card[data-id="' + id + '"] .det-box').forEach(function(box) {
+    document.querySelectorAll(
+      '.grid-card[data-id="' + id + '"] .det-box, ' +
+      '.browse-stack-member[data-id="' + id + '"] .det-box'
+    ).forEach(function(box) {
       box.style.display = hideDetectionOverlays ? 'none' : '';
     });
   });

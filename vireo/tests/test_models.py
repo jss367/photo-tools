@@ -2295,3 +2295,80 @@ def test_ensure_label_descriptions_survives_network_failure(
         str(tmp_path), _TIMM_MODEL_STR
     ) is False
     assert not (tmp_path / "label_descriptions.json").exists()
+
+
+def test_ensure_label_descriptions_via_onnx_repo_publishes_atomically(
+    tmp_path, monkeypatch
+):
+    """The ONNX-repo path routes the download through a scratch subdir
+    and os.replace()s onto the published target, so readers never see a
+    partial file at the target path and a process exit mid-copy cannot
+    leave a truncated file that suppresses future heals."""
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+
+    def _fake_optional(filenames, model_dir, hf_subdir, *args, **kwargs):
+        # The download must be directed at a scratch subdir of the model
+        # dir, not the model dir itself — that is what keeps the target
+        # invisible while bytes are still being written.
+        assert os.path.dirname(model_dir.rstrip(os.sep)) == str(tmp_path)
+        assert os.path.basename(model_dir).startswith(".label_desc_heal_")
+        assert not target.exists()
+        # Simulate a non-atomic underlying copy: an interrupted transfer
+        # would leave partial bytes at this scratch path, which is safe
+        # because it is not the published target.
+        with open(os.path.join(model_dir, "label_descriptions.json"), "w") as f:
+            json.dump({"Bubulcus ibis": "Cattle Egret, Bird"}, f)
+        assert not target.exists()
+
+    monkeypatch.setattr(models, "_download_optional_files", _fake_optional)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is True
+    assert json.loads(target.read_text()) == {
+        "Bubulcus ibis": "Cattle Egret, Bird"
+    }
+    # Scratch subdir is cleaned up on success.
+    leftovers = [
+        p for p in os.listdir(tmp_path)
+        if p.startswith(".label_desc_heal_")
+    ]
+    assert leftovers == []
+
+
+def test_ensure_label_descriptions_partial_scratch_download_not_published(
+    tmp_path, monkeypatch
+):
+    """When the ONNX-repo download leaves no completed file in the
+    scratch dir (interrupted before finishing), nothing is promoted to
+    the target, so the next heal attempt still runs instead of being
+    short-circuited by a stale partial file."""
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+
+    def _fake_partial(filenames, model_dir, hf_subdir, *args, **kwargs):
+        # Simulate an interrupted download: a .tmp scratch remnant, but
+        # no completed label_descriptions.json in the scratch dir.
+        with open(
+            os.path.join(model_dir, "label_descriptions.json.tmp"), "w",
+        ) as f:
+            f.write("{ partial")
+
+    def _no_upstream(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(models, "_download_optional_files", _fake_partial)
+    monkeypatch.setattr(models, "_load_upstream_timm_config", _no_upstream)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is False
+    assert not target.exists()
+    leftovers = [
+        p for p in os.listdir(tmp_path)
+        if p.startswith(".label_desc_heal_")
+    ]
+    assert leftovers == []

@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 
 import model_verify
 
@@ -1078,22 +1079,46 @@ def ensure_timm_label_descriptions(model_dir, model_str, progress_callback=None)
         (m for m in KNOWN_MODELS if m.get("model_str") == model_str), None
     )
     if km and "label_descriptions.json" in (km.get("optional_files") or []):
+        # _download_optional_files writes each file to
+        # os.path.join(model_dir, filename), and the underlying shutil.copy2
+        # is not atomic — the destination becomes visible while it is still
+        # being written. Two concurrent classifier inits could then see a
+        # partial file (isfile succeeds, json.load fails), and a process
+        # exit mid-copy would leave a truncated file that the next heal's
+        # existence check would treat as already healed. Download into a
+        # scratch subdir on the same filesystem and os.replace onto the
+        # published target atomically.
+        scratch_dir = tempfile.mkdtemp(
+            prefix=".label_desc_heal_", dir=model_dir,
+        )
+        scratch_target = os.path.join(scratch_dir, "label_descriptions.json")
         try:
-            _download_optional_files(
-                ["label_descriptions.json"], model_dir,
-                km.get("hf_subdir", km["id"]), {}, None, progress_callback,
-            )
-        except Exception as e:
-            log.info(
-                "Optional label_descriptions.json download failed for %s: %s",
-                model_str, e,
-            )
-        if os.path.isfile(target):
-            log.info(
-                "Self-healed label_descriptions.json for %s from %s",
-                model_str, ONNX_REPO,
-            )
-            return True
+            try:
+                _download_optional_files(
+                    ["label_descriptions.json"], scratch_dir,
+                    km.get("hf_subdir", km["id"]), {}, None, progress_callback,
+                )
+            except Exception as e:
+                log.info(
+                    "Optional label_descriptions.json download failed for %s: %s",
+                    model_str, e,
+                )
+            if os.path.isfile(scratch_target):
+                try:
+                    os.replace(scratch_target, target)
+                except OSError as e:
+                    log.warning(
+                        "Could not publish healed label_descriptions.json "
+                        "for %s: %s", model_str, e,
+                    )
+                else:
+                    log.info(
+                        "Self-healed label_descriptions.json for %s from %s",
+                        model_str, ONNX_REPO,
+                    )
+                    return True
+        finally:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
 
     try:
         config = _load_upstream_timm_config(model_str)

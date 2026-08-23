@@ -509,3 +509,79 @@ def test_stack_metadata_callbacks_follow_promoted_cover(live_server, page):
         "inatRefreshed": True,
         "colorsRefreshed": True,
     }
+
+
+def test_concurrent_stack_hydration_keeps_promoted_cache(live_server, page):
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'concurrent-hydration-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
+    assert page.evaluate("() => Object.keys(browseStackMembers).length") == 0
+
+    hydration_state = page.evaluate(
+        """async ids => {
+          var oldCoverId = ids[1];
+          var promotedId = ids[0];
+          var originalSafeFetch = safeFetch;
+          var options = {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({photo_ids: ids}),
+          };
+          var baseline = await originalSafeFetch('/api/photos/by-ids', options);
+          var releases = [];
+          safeFetch = function(url) {
+            if (url === '/api/photos/by-ids') {
+              return new Promise(function(resolve) { releases.push(resolve); });
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            var first = reconcileBrowseStackCovers([oldCoverId]);
+            var second = reconcileBrowseStackCovers([oldCoverId]);
+            while (releases.length < 2) {
+              await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            }
+
+            var promotedResponse = JSON.parse(JSON.stringify(baseline));
+            promotedResponse.photos.forEach(function(photo) {
+              if (photo.id === oldCoverId) photo.flag = 'rejected';
+              if (photo.id === promotedId) photo.flag = 'flagged';
+            });
+            releases[0](promotedResponse);
+            await first;
+
+            // This older response still ranks the original cover first. It
+            // must not recreate that demoted cache key after promotion.
+            releases[1](JSON.parse(JSON.stringify(baseline)));
+            await second;
+            return {
+              cacheKeys: Object.keys(browseStackMembers).map(Number),
+              currentCoverId: browseStackCoverIdForPhoto(oldCoverId),
+              gridHasPromotedCover: photos.some(function(photo) {
+                return photo.id === promotedId && !!photo.browse_stack;
+              }),
+            };
+          } finally {
+            safeFetch = originalSafeFetch;
+          }
+        }""",
+        burst_ids,
+    )
+    assert hydration_state == {
+        "cacheKeys": [burst_ids[0]],
+        "currentCoverId": burst_ids[0],
+        "gridHasPromotedCover": True,
+    }

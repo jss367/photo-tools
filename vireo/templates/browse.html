@@ -3309,6 +3309,15 @@ async function reconcileBrowseStackCovers(photoIds) {
         if (!windowIsCurrent()) return false;
         hydratedMembers = hydratedMembers.concat(data.photos || []);
       }
+      // Another edit can hydrate this same collapsed stack while our request
+      // is in flight. Keep the winner's cache, and do not resurrect the old
+      // key if that hydration already promoted a replacement into the slot.
+      if (browseStackMembers[uncachedKey] || !uncachedCover.browse_stack
+          || !photos.some(function(photo) {
+            return photo === uncachedCover && photo.id === uncachedCover.id;
+          })) {
+        continue;
+      }
       var stack = uncachedCover.browse_stack;
       var similarity = uncachedCover.similarity;
       var clientSimilarity = uncachedCover._similarity;

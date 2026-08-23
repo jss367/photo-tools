@@ -21784,6 +21784,11 @@ def test_compare_canonical_display_prefers_db_canonical_for_aliases(
     ], detector_model="MDV6")[0]
     db.add_prediction(det_id, "Desert Verdin", 1.0, "model-a")
     db.add_prediction(det_id, "Verdin", 0.9, "model-b")
+    # A third model that spells the root keyword in its own casing. The
+    # catalog holds "Verdin", so that is the spelling the group must show —
+    # a label that flips case with model sort order is the same
+    # order-dependence in miniature.
+    db.add_prediction(det_id, "verdin", 0.8, "model-c")
     cid = db.add_collection(
         "AliasDisplay",
         json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
@@ -21811,6 +21816,7 @@ def test_compare_canonical_display_prefers_db_canonical_for_aliases(
     # "Verdin" — not "Desert Verdin", not whichever model sorts first.
     assert preds["model-a"][0]["canonical_display"] == "Verdin"
     assert preds["model-b"][0]["canonical_display"] == "Verdin"
+    assert preds["model-c"][0]["canonical_display"] == "Verdin"
 
 
 def test_compare_canonical_display_keeps_raw_when_only_case_differs(
@@ -21821,10 +21827,11 @@ def test_compare_canonical_display_keeps_raw_when_only_case_differs(
     ``resolve_species_display_name``'s last resort applies the keyword-case
     convention when no keyword row and no linked taxon match. For a Latin
     binomial the DB has never seen, that rewrites ``Bubulcus ibis`` to
-    ``Bubulcus Ibis`` under a title-case convention. Preferring
-    ``db_species`` unconditionally would leak that mangled case into the ID
-    Conflicts consensus label. The display must keep the model's spelling
-    when the DB-canonical only differs in casing.
+    ``Bubulcus Ibis`` under a title-case convention — a spelling neither the
+    model nor the catalog ever held. The compare endpoint therefore feeds
+    the display the ``apply_case_convention=False`` resolution, which stops
+    before that last resort, so the model's own spelling survives even
+    though the display otherwise prefers the DB-canonical name.
     """
     from unittest.mock import patch
 
@@ -21869,6 +21876,10 @@ def test_compare_canonical_display_keeps_raw_when_only_case_differs(
         )
     assert resp.status_code == 200
     preds = resp.get_json()["photos"][0]["predictions"]
-    # Not "Bubulcus Ibis": the model's own lowercase-species spelling wins
-    # because the DB-canonical only re-cased it.
+    # Not "Bubulcus Ibis": nothing was stored under this name, so the
+    # display resolution had nothing to canonicalize to and handed back the
+    # model's own spelling.
     assert preds["model-a"][0]["canonical_display"] == "Bubulcus ibis"
+    # The keyword comparison still uses the case-applying resolution, since
+    # that is the spelling add_keyword would land on.
+    assert db.resolve_species_display_name("Bubulcus ibis") == "Bubulcus Ibis"

@@ -17537,6 +17537,38 @@ def test_species_display_name_resolves_hierarchy_alias_through_taxon(tmp_path):
     assert db.resolve_species_display_name("Desert Verdin") == "Verdin"
 
 
+def test_species_display_name_can_skip_the_case_convention_last_resort(tmp_path):
+    """``apply_case_convention=False`` never mints an unstored spelling.
+
+    Display callers (the ID Conflicts consensus label) need "the spelling
+    some keyword row holds, or the caller's own". Case 4 instead applies the
+    catalog's keyword case convention to an unknown name, producing a
+    spelling neither a model nor the catalog ever said.
+    """
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    # Three Title Case species keywords make 'title' the detected convention.
+    for name in ("Black Phoebe", "Barn Owl", "Blue Jay"):
+        db.add_keyword(name, is_species=True)
+    db.conn.commit()
+    assert db.detect_keyword_case_convention() == "title"
+
+    # Unknown name: the default resolution invents Title Case, the display
+    # resolution hands the caller's own spelling straight back.
+    assert db.resolve_species_display_name("Bubulcus ibis") == "Bubulcus Ibis"
+    assert db.resolve_species_display_name(
+        "Bubulcus ibis", apply_case_convention=False,
+    ) == "Bubulcus ibis"
+
+    # Stored names are unaffected — both forms return the row's spelling,
+    # including through a case-insensitive match.
+    for apply_case in (True, False):
+        assert db.resolve_species_display_name(
+            "black phoebe", apply_case_convention=apply_case,
+        ) == "Black Phoebe"
+
+
 def test_species_keywords_canonicalize_hierarchy_leaf_to_root_spelling(tmp_path):
     """After repair leaves only a differently-spelled hierarchy leaf, the
     per-photo species list must still surface the canonical root spelling so

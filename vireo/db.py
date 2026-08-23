@@ -10746,7 +10746,7 @@ class Database:
             return "".join(chars)
         return word[0].upper() + word[1:]
 
-    def resolve_species_display_name(self, name):
+    def resolve_species_display_name(self, name, apply_case_convention=True):
         """Predict the stored species name that add_keyword(is_species=True) would use.
 
         Species relabel endpoints snapshot curation dst_existed before
@@ -10789,6 +10789,14 @@ class Database:
         canonicalized through a unique linked taxon. This keeps accepted
         hierarchy buckets and species curation on the same root key while the
         photo itself retains the hierarchy-bearing keyword association.
+
+        Pass ``apply_case_convention=False`` to skip case 4 and return the
+        caller's own spelling when nothing is stored. Callers that *display*
+        the result want "the spelling some row actually holds, or the name I
+        gave you" — case 4 mints a spelling (``Bubulcus ibis`` ->
+        ``Bubulcus Ibis``) that no row anywhere carries, which is fine for
+        predicting where add_keyword will land but wrong to show a user as
+        though a model or the catalog had said it.
         """
         name = normalize_keyword_display(name)
         if not name:
@@ -10852,6 +10860,8 @@ class Database:
             ).fetchone()
             if leaf is not None and leaf["name"]:
                 return leaf["name"]
+        if not apply_case_convention:
+            return name
         import config as cfg
         override = cfg.get("keyword_case")
         if override and override != "auto":

@@ -3251,6 +3251,7 @@ function browsePhotoNavigationList(photoId) {
   // navigate to its neighboring frames, not to the next stack cover.
   var stackIds = Object.keys(browseStackMembers);
   for (var i = 0; i < stackIds.length; i++) {
+    if (!expandedBrowseStacks.has(Number(stackIds[i]))) continue;
     var members = browseStackMembers[stackIds[i]] || [];
     if (members.some(function(photo) { return photo.id === photoId; })) {
       return members;
@@ -3316,7 +3317,13 @@ async function toggleBrowseStack(event, coverId) {
       body: JSON.stringify({photo_ids: memberIds}),
     });
     if (!windowIsCurrent()) return;
-    browseStackMembers[cacheKey] = data.photos || [];
+    // Reuse the top-level cover object inside the member cache. The cover is
+    // rendered in both places; sharing one object keeps rating/flag/keyword/
+    // wildlife/location mutations from updating the grid copy while leaving
+    // a stale duplicate in the expanded tray.
+    browseStackMembers[cacheKey] = (data.photos || []).map(function(photo) {
+      return photo.id === coverId ? cover : photo;
+    });
     insertBrowseStackTray(coverId);
     var loadedIds = browseStackMembers[cacheKey].map(function(photo) { return photo.id; });
     loadInatStatus(loadedIds).then(function() {

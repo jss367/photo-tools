@@ -40,6 +40,25 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
     expect(tray).to_contain_text("hawk1.jpg")
     expect(tray).to_contain_text("hawk2.jpg")
     expect(tray).to_contain_text("hawk3.jpg")
+    assert page.evaluate(
+        """coverId => {
+          var cover = photos.find(function(photo) { return photo.id === coverId; });
+          var member = browseStackMembers[String(coverId)].find(function(photo) {
+            return photo.id === coverId;
+          });
+          return cover === member;
+        }""",
+        burst_ids[1],
+    )
+
+    badge.click()
+    expect(tray).to_be_hidden()
+    assert page.evaluate(
+        "coverId => browsePhotoNavigationList(coverId) === photos",
+        burst_ids[1],
+    )
+    badge.click()
+    expect(tray).to_be_visible()
 
     cover_member = tray.locator(
         f'.browse-stack-member[data-id="{burst_ids[1]}"]'

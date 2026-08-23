@@ -2382,7 +2382,31 @@ var browseStackHydrationRequests = {};
 // and its badges, silently contradicting the edit the user just confirmed.
 // markBrowseStackExpansionsStale() flags such a request so toggleBrowseStack
 // discards it and refetches instead of guessing at the post-edit state.
+//
+// Each cacheKey stores a list, not a single request: collapsing does not
+// cancel an in-flight expansion, and a subsequent re-expand starts a new
+// attempt. Tracking every pending request means a mid-flight edit reaches
+// all of them, so an untracked earlier response cannot cache pre-edit
+// members while only the newest request was marked stale. Codex P2 on
+// PR #1561.
 var browseStackExpansionRequests = {};
+
+function _pushBrowseStackExpansionRequest(cacheKey, request) {
+  var list = browseStackExpansionRequests[cacheKey];
+  if (!list) {
+    list = [];
+    browseStackExpansionRequests[cacheKey] = list;
+  }
+  list.push(request);
+}
+
+function _removeBrowseStackExpansionRequest(cacheKey, request) {
+  var list = browseStackExpansionRequests[cacheKey];
+  if (!list) return;
+  var idx = list.indexOf(request);
+  if (idx >= 0) list.splice(idx, 1);
+  if (!list.length) delete browseStackExpansionRequests[cacheKey];
+}
 
 function setBrowseTotals(data) {
   totalPhotos = Number(data && data.total) || 0;
@@ -3269,9 +3293,11 @@ function markBrowseStackExpansionsStale(photoIds) {
   var wanted = (photoIds || []).map(Number);
   if (!wanted.length) return;
   Object.keys(browseStackExpansionRequests).forEach(function(cacheKey) {
-    var request = browseStackExpansionRequests[cacheKey];
-    if (!request || request.stale) return;
-    request.stale = wanted.some(function(id) { return request.memberIds.has(id); });
+    var requests = browseStackExpansionRequests[cacheKey] || [];
+    requests.forEach(function(request) {
+      if (!request || request.stale) return;
+      request.stale = wanted.some(function(id) { return request.memberIds.has(id); });
+    });
   });
 }
 
@@ -3549,7 +3575,7 @@ async function toggleBrowseStack(event, coverId) {
   var MAX_EXPANSION_ATTEMPTS = 4;
   for (var attempt = 1; attempt <= MAX_EXPANSION_ATTEMPTS; attempt++) {
     var request = {memberIds: new Set(memberIds.map(Number)), stale: false};
-    browseStackExpansionRequests[cacheKey] = request;
+    _pushBrowseStackExpansionRequest(cacheKey, request);
     var hydrated = [];
     var abortedForRace = false;
     try {
@@ -3568,9 +3594,7 @@ async function toggleBrowseStack(event, coverId) {
           // The captured cover no longer owns this grid slot (a promotion
           // landed between chunks). Drop the request bookkeeping and let
           // whoever hydrates the new cover own the tray from here.
-          if (browseStackExpansionRequests[cacheKey] === request) {
-            delete browseStackExpansionRequests[cacheKey];
-          }
+          _removeBrowseStackExpansionRequest(cacheKey, request);
           abortedForRace = true;
           break;
         }
@@ -3584,18 +3608,14 @@ async function toggleBrowseStack(event, coverId) {
         hydrated = hydrated.concat(data.photos || []);
       }
     } catch (error) {
-      if (browseStackExpansionRequests[cacheKey] === request) {
-        delete browseStackExpansionRequests[cacheKey];
-      }
+      _removeBrowseStackExpansionRequest(cacheKey, request);
       if (!coverStillOwnsSlot()) return;
       browseStackErrors[cacheKey] = 'Could not load this stack.';
       insertBrowseStackTray(coverId);
       return;
     }
     if (abortedForRace) return;
-    if (browseStackExpansionRequests[cacheKey] === request) {
-      delete browseStackExpansionRequests[cacheKey];
-    }
+    _removeBrowseStackExpansionRequest(cacheKey, request);
     if (!coverStillOwnsSlot()) return;
     if (browseStackMembers[cacheKey]) {
       // Cover reconciliation hydrated this key while we were in flight. It
@@ -3646,8 +3666,14 @@ async function toggleBrowseStack(event, coverId) {
 function selectBrowseStackMember(event, photoId, coverId) {
   if (event) event.stopPropagation();
   var coverIndex = photos.findIndex(function(photo) { return photo.id === coverId; });
+  // Pass shiftKey through so a top-level anchor + Shift-click on a hidden
+  // member range-selects instead of dropping the modifier (symmetric with
+  // the reverse direction: member anchor + Shift-click on a top-level
+  // card). selectPhoto's shift branch folds the click target into the
+  // resulting range so the hidden member always ends up in the selection.
+  // Codex P2 on PR #1561.
   selectPhoto({
-    shiftKey: false,
+    shiftKey: !!(event && event.shiftKey),
     metaKey: !!(event && event.metaKey),
     ctrlKey: !!(event && event.ctrlKey),
   }, photoId, coverIndex);
@@ -7077,6 +7103,13 @@ function selectPhoto(e, id, idx) {
     // Fold the anchor in so the highlighted set and the acted-on set cannot
     // disagree. Codex P2 on PR #1561.
     if (selectedPhotoId != null) selectedPhotos.add(selectedPhotoId);
+    // Same reasoning for the shift-click *target*: usually id === photos[idx].id
+    // and the loop already added it, but selectBrowseStackMember() passes the
+    // hidden member's id with the cover's grid slot as idx — so the loop can
+    // only reach the cover. Fold the target in so a Shift-click on a hidden
+    // stack member always ends up in the resulting range. Codex P2 on
+    // PR #1561.
+    selectedPhotos.add(id);
   } else if (e.metaKey || e.ctrlKey) {
     // Cmd/Ctrl-click: toggle in selection. Fold the focused photo into the
     // set so batch operations include it (otherwise the highlighted

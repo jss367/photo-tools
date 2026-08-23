@@ -895,3 +895,164 @@ def test_expanding_stack_over_500_chunks_by_ids_requests(live_server, page):
     assert outcome["error"] is None
     assert outcome["cached"] is True
     assert outcome["expanded"] is True
+
+
+def test_recollapse_and_reexpand_marks_all_expansion_requests_stale(live_server, page):
+    """Every in-flight stack expansion must be markable stale, not just the newest.
+
+    Collapsing the tray does not cancel a pending ``/api/photos/by-ids`` request,
+    and a subsequent re-expand starts a new one. The pending-request map used to
+    overwrite its bookkeeping to the second request, so a stack-wide edit could
+    reach only the newest request via ``markBrowseStackExpansionsStale``; the
+    first response then wrote pre-edit members into ``browseStackMembers``.
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'recollapse-stale-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
+
+    state = page.evaluate(
+        """async ids => {
+          var coverId = ids[1];
+          var originalSafeFetch = safeFetch;
+          var held = [];
+          safeFetch = function(url) {
+            if (url === '/api/photos/by-ids') {
+              return new Promise(function(resolve) { held.push(resolve); });
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            var expansion1 = toggleBrowseStack(null, coverId);
+            while (held.length < 1) {
+              await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            }
+            var trackedAfterFirst = (
+              browseStackExpansionRequests[String(coverId)] || []
+            ).length;
+            // Collapse does not cancel the in-flight request.
+            await toggleBrowseStack(null, coverId);
+            var expansion2 = toggleBrowseStack(null, coverId);
+            while (held.length < 2) {
+              await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            }
+            var trackedList = browseStackExpansionRequests[String(coverId)] || [];
+            var trackedAfterReexpand = trackedList.length;
+            var allNotStale = trackedList.every(function(r) { return !r.stale; });
+            // Simulate a stack-wide edit that runs while both requests are
+            // in flight (setSelectionWildlifeExcluded and friends all funnel
+            // through markBrowseStackExpansionsStale for exactly this case).
+            markBrowseStackExpansionsStale(ids);
+            var allStaleAfterMark = trackedList.every(function(r) { return r.stale; });
+            // Settle every pending promise so the outer expansions terminate.
+            // Retries after markStale will push additional resolves, so drain
+            // until nothing new appears (bounded by settleGuard as a safety net).
+            var settleGuard = 0;
+            while (held.length && settleGuard++ < 40) {
+              var batch = held.slice();
+              held.length = 0;
+              batch.forEach(function(resolve) { resolve({photos: []}); });
+              await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            }
+            try { await expansion1; } catch (e) {}
+            try { await expansion2; } catch (e) {}
+            return {
+              trackedAfterFirst: trackedAfterFirst,
+              trackedAfterReexpand: trackedAfterReexpand,
+              allNotStale: allNotStale,
+              allStaleAfterMark: allStaleAfterMark,
+            };
+          } finally {
+            safeFetch = originalSafeFetch;
+          }
+        }""",
+        burst_ids,
+    )
+    assert state["trackedAfterFirst"] == 1
+    # Both the pre-collapse request and the post-reexpand request must be
+    # tracked concurrently — otherwise the earlier one is invisible to
+    # markBrowseStackExpansionsStale and can cache pre-edit members.
+    assert state["trackedAfterReexpand"] == 2
+    assert state["allNotStale"] is True
+    assert state["allStaleAfterMark"] is True
+
+
+def test_shift_click_stack_member_from_grid_anchor_range_selects(live_server, page):
+    """Shift-clicking a hidden stack member from a top-level anchor must range-select.
+
+    The click handler used to force ``shiftKey=false`` through
+    ``selectPhoto``, so the modifier was silently dropped and the click became
+    a single-select of the member. The reverse direction (member anchor plus
+    Shift-click on a grid card) already range-selects; this direction has to
+    match — and the clicked member must land in the resulting range even
+    though it is not in the top-level ``photos`` array.
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    other_ids = live_server["data"]["photos"][3:]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'shift-click-member-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator("#grid > .grid-card")).to_have_count(3)
+
+    stack_card = page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')
+    stack_card.locator(".browse-stack-badge").click()
+    tray = page.locator(
+        f'.browse-stack-tray[data-stack-cover-id="{burst_ids[1]}"]'
+    )
+    expect(tray.locator(".browse-stack-member")).to_have_count(3)
+
+    # Anchor on a top-level card outside the stack.
+    page.locator(f'.grid-card[data-id="{other_ids[0]}"]').click()
+
+    hidden_member = tray.locator(
+        f'.browse-stack-member[data-id="{burst_ids[2]}"]'
+    )
+    hidden_member.click(modifiers=["Shift"])
+
+    selection_state = page.evaluate(
+        """() => {
+          function ids(nodes) {
+            return Array.from(new Set(Array.from(nodes).map(function(el) {
+              return parseInt(el.dataset.id, 10);
+            }))).sort(function(a, b) { return a - b; });
+          }
+          return {
+            active: getActiveSelection().slice().sort(function(a, b) { return a - b; }),
+            highlighted: ids(document.querySelectorAll(
+              '.grid-card.selected, .browse-stack-member.selected'
+            )),
+          };
+        }"""
+    )
+    # The clicked hidden member is in the selection despite not being a
+    # top-level card — otherwise the range loop can only reach the cover.
+    assert burst_ids[2] in selection_state["active"]
+    # The pre-click top-level anchor is still selected (this is a range,
+    # not a single-select replacement).
+    assert other_ids[0] in selection_state["active"]
+    # What is highlighted equals what a batch action will act on.
+    assert selection_state["active"] == selection_state["highlighted"]
+    expect(hidden_member).to_have_class("browse-stack-member selected")

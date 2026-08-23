@@ -134,7 +134,7 @@ from werkzeug.exceptions import BadRequest
 from working_copy_cache import (
     evict_if_over_quota as evict_working_copy_cache_if_over_quota,
 )
-from working_copy_cache import working_copy_stats
+from working_copy_cache import working_copy_quota_bytes, working_copy_stats
 from xmp import read_sync_preview_metadata
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -19561,13 +19561,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # All-settings region can't race with the curated form's full-snapshot
         # save and silently overwrite a recently-saved schema value.
         with _settings_write_lock:
-            current = cfg.load()
-            try:
-                previous_working_copy_quota = int(
-                    current.get("working_copy_cache_max_mb", 20480)
-                )
-            except (TypeError, ValueError):
-                previous_working_copy_quota = 20480
+            previous = cfg.load()
+            current = dict(previous)
 
             # Handle keyboard_shortcuts with validation
             if "keyboard_shortcuts" in body:
@@ -19646,38 +19641,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         return json_error(
                             f"unknown process id: {pid}", status=400
                         )
-            # Apply HF token to environment immediately
-            hf_token = current.get("hf_token", "")
-            if hf_token:
-                os.environ["HF_TOKEN"] = hf_token
-            elif "HF_TOKEN" in os.environ:
-                del os.environ["HF_TOKEN"]
             cfg.save(current)
-            try:
-                current_working_copy_quota = int(
-                    current.get("working_copy_cache_max_mb", 20480)
-                )
-            except (TypeError, ValueError):
-                current_working_copy_quota = 20480
-            if current_working_copy_quota > previous_working_copy_quota:
-                # Raising the ceiling makes quota-evicted rows eligible for
-                # the normal scan/startup backfill again. It does not perform
-                # expensive RAW decoding in this settings request; the next
-                # scoped scan or startup backfill fills the new space.
-                quota_db = _get_db()
-                quota_db.conn.execute(
-                    "UPDATE photos SET working_copy_evicted_mtime=NULL "
-                    "WHERE working_copy_evicted_mtime IS NOT NULL"
-                )
-                commit_with_retry(quota_db.conn)
             if "inat_token" in body:
                 _advance_inat_token_generation()
-            # If the user shrunk the preview cache quota, evict immediately to the
-            # new size rather than waiting for the next cache write. No-op when
-            # already under quota, so always safe to call.
-            vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
-            evict_preview_cache_if_over_quota(_get_db(), vireo_dir)
-            evict_working_copy_cache_if_over_quota(_get_db(), vireo_dir)
+            _settings_post_save_side_effects(current, previous)
         return jsonify({"ok": True})
 
     @app.route("/api/settings/schema")
@@ -19794,43 +19761,43 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     def _settings_post_save_side_effects(current, previous=None):
         """Side effects mirrored from the legacy /api/config POST handler.
 
-        Keeps the new schema-driven write path behaviorally identical to the
-        old curated-form save: HF_TOKEN env var is kept in sync, and the
-        preview and working-copy caches are evicted if their budgets shrunk.
-
-        When ``previous`` is provided and the working-copy quota grew, clear
-        the per-row ``working_copy_evicted_mtime`` markers so scan/startup
-        backfill can regenerate previously quota-evicted copies into the
-        larger budget — mirroring the legacy /api/config POST behavior.
+        Keeps every global settings write behaviorally identical to the old
+        curated-form save: HF_TOKEN stays in sync, cache budgets take effect
+        immediately, and raising the working-copy ceiling makes deliberately
+        evicted rows eligible for a future backfill again.
         """
         hf_token = current.get("hf_token", "")
         if hf_token:
             os.environ["HF_TOKEN"] = hf_token
         elif "HF_TOKEN" in os.environ:
             del os.environ["HF_TOKEN"]
+
+        previous = previous or {}
+        try:
+            previous_working_copy_quota = int(
+                previous.get("working_copy_cache_max_mb", 20480)
+            )
+        except (TypeError, ValueError):
+            previous_working_copy_quota = 20480
+        try:
+            current_working_copy_quota = int(
+                current.get("working_copy_cache_max_mb", 20480)
+            )
+        except (TypeError, ValueError):
+            current_working_copy_quota = 20480
+        quota_db = _get_db()
+        if current_working_copy_quota > previous_working_copy_quota:
+            # The next scoped scan or startup backfill can use the newly
+            # available space; settings writes never perform RAW decoding.
+            quota_db.conn.execute(
+                "UPDATE photos SET working_copy_evicted_mtime=NULL "
+                "WHERE working_copy_evicted_mtime IS NOT NULL"
+            )
+            commit_with_retry(quota_db.conn)
+
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
-        evict_preview_cache_if_over_quota(_get_db(), vireo_dir)
-        if previous is not None:
-            try:
-                prev_quota = int(
-                    previous.get("working_copy_cache_max_mb", 20480)
-                )
-            except (TypeError, ValueError):
-                prev_quota = 20480
-            try:
-                cur_quota = int(
-                    current.get("working_copy_cache_max_mb", 20480)
-                )
-            except (TypeError, ValueError):
-                cur_quota = 20480
-            if cur_quota > prev_quota:
-                quota_db = _get_db()
-                quota_db.conn.execute(
-                    "UPDATE photos SET working_copy_evicted_mtime=NULL "
-                    "WHERE working_copy_evicted_mtime IS NOT NULL"
-                )
-                commit_with_retry(quota_db.conn)
-        evict_working_copy_cache_if_over_quota(_get_db(), vireo_dir)
+        evict_preview_cache_if_over_quota(quota_db, vireo_dir)
+        evict_working_copy_cache_if_over_quota(quota_db, vireo_dir)
 
     def _read_raw_config_file():
         """Return the parsed contents of ~/.vireo/config.json, or {}.
@@ -38269,7 +38236,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         else:
             wc_rel = f"working/{photo_id}.jpg"
             wc_abs = os.path.join(vireo_dir, wc_rel)
-        quality = cfg.load().get("working_copy_quality", 92)
+        working_copy_config = cfg.load()
+        quality = working_copy_config.get("working_copy_quality", 92)
+        working_copy_budget = working_copy_quota_bytes(
+            working_copy_config.get("working_copy_cache_max_mb", 20480)
+        )
 
         # Unedited RAW primaries use their camera-rendered full-size preview
         # when available. Edited renders took the recipe branch above and keep
@@ -38324,6 +38295,86 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 if tmp_path:
                     with contextlib.suppress(OSError):
                         os.unlink(tmp_path)
+
+        def _serve_generated_original(uw, uh):
+            """Persist/enforce a non-RAW copy, or serve it transiently."""
+            if primary_is_raw:
+                return send_file(wc_abs, mimetype="image/jpeg")
+
+            try:
+                generated_size = os.path.getsize(wc_abs)
+            except OSError:
+                generated_size = working_copy_budget + 1
+            cacheable = (
+                working_copy_budget > 0
+                and generated_size <= working_copy_budget
+            )
+            if cacheable:
+                updates = [
+                    "working_copy_path=?",
+                    "working_copy_evicted_mtime=NULL",
+                ]
+                params = [wc_rel]
+            else:
+                # The response still needs a decoded JPEG, but a zero quota
+                # (or one smaller than this single rendition) must not turn
+                # that response into a persistent cache entry.
+                updates = [
+                    "working_copy_path=NULL",
+                    "working_copy_evicted_mtime=COALESCE(file_mtime, -1)",
+                ]
+                params = []
+            if not photo["width"] or not photo["height"]:
+                updates.extend(["width=?", "height=?"])
+                params.extend([uw, uh])
+            params.append(photo_id)
+            db.conn.execute(
+                f"UPDATE photos SET {', '.join(updates)} WHERE id=?",
+                params,
+            )
+            db.conn.commit()
+
+            if cacheable:
+                # The on-demand route is also a cache writer. Apply the same
+                # oldest-first ceiling as scanner/backfill generation.
+                response = send_file(wc_abs, mimetype="image/jpeg")
+                try:
+                    evict_working_copy_cache_if_over_quota(db, vireo_dir)
+                except Exception:
+                    # Serving the successfully generated image is more useful
+                    # than turning a transient maintenance error into a 500;
+                    # startup and later writes will retry enforcement.
+                    log.exception(
+                        "Working-copy quota enforcement failed after "
+                        "on-demand write"
+                    )
+                return response
+
+            # Move the one-shot rendition out of the managed working-copy
+            # directory before returning. A streaming response removes this
+            # unique file in ``finally`` even when the client disconnects;
+            # unlike ``call_on_close``, that cleanup survives the outer
+            # single-flight response wrapping used by this route.
+            transient_dir = os.path.join(vireo_dir, "originals")
+            os.makedirs(transient_dir, exist_ok=True)
+            fd, transient_path = tempfile.mkstemp(
+                prefix=f".{photo_id}.transient.",
+                suffix=".jpg",
+                dir=transient_dir,
+            )
+            os.close(fd)
+            os.replace(wc_abs, transient_path)
+
+            def _stream_transient():
+                try:
+                    with open(transient_path, "rb") as rendition:
+                        while chunk := rendition.read(1024 * 1024):
+                            yield chunk
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.unlink(transient_path)
+
+            return Response(_stream_transient(), mimetype="image/jpeg")
 
         if _extract_original_copy(source_for_extraction):
             # Update DB so future requests are fast; also backfill
@@ -38390,36 +38441,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         db, photo, source_for_extraction,
                     )
                     return send_file(trusted_wc_path, mimetype="image/jpeg")
-            if not primary_is_raw:
-                # working_copy_evicted_mtime is cleared alongside the path so
-                # scan/startup backfill doesn't treat this re-materialized copy
-                # as still-evicted; without that, later scans stay blocked on
-                # the stale marker.
-                updates = [
-                    "working_copy_path=?",
-                    "working_copy_evicted_mtime=NULL",
-                ]
-                params = [wc_rel]
-                if not photo["width"] or not photo["height"]:
-                    updates.extend(["width=?", "height=?"])
-                    params.extend([uw, uh])
-                params.append(photo_id)
-                db.conn.execute(
-                    f"UPDATE photos SET {', '.join(updates)} WHERE id=?",
-                    params,
-                )
-                db.conn.commit()
-                # On-demand writes still count against the working-copy quota.
-                # Without this, opening many oversized originals after eviction
-                # would refill the cache past the configured limit until the
-                # next scan or config save.
-                try:
-                    evict_working_copy_cache_if_over_quota(db, vireo_dir)
-                except Exception:
-                    log.exception(
-                        "Working-copy quota enforcement failed after on-demand write"
-                    )
-            return send_file(wc_abs, mimetype="image/jpeg")
+            return _serve_generated_original(uw, uh)
 
         # extract_working_copy failed on a RAW source: try the full-res
         # companion JPEG as a fallback before giving up. This catches
@@ -38435,32 +38457,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             from PIL import Image as _PILImage
             with _PILImage.open(wc_abs) as upgraded:
                 uw, uh = upgraded.size
-            if not primary_is_raw:
-                updates = [
-                    "working_copy_path=?",
-                    "working_copy_evicted_mtime=NULL",
-                ]
-                params = [wc_rel]
-                if not photo["width"] or not photo["height"]:
-                    updates.extend(["width=?", "height=?"])
-                    params.extend([uw, uh])
-                params.append(photo_id)
-                db.conn.execute(
-                    f"UPDATE photos SET {', '.join(updates)} WHERE id=?",
-                    params,
-                )
-                db.conn.commit()
-                try:
-                    evict_working_copy_cache_if_over_quota(db, vireo_dir)
-                except Exception:
-                    log.exception(
-                        "Working-copy quota enforcement failed after on-demand write"
-                    )
             log.info(
                 "RAW extraction failed for photo %s original; served "
                 "companion JPEG instead", photo_id,
             )
-            return send_file(wc_abs, mimetype="image/jpeg")
+            return _serve_generated_original(uw, uh)
 
         # Fallback: serve via load_image
         raw_decode = (

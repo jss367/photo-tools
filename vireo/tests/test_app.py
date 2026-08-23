@@ -1039,6 +1039,81 @@ def test_settings_global_delete_restores_default_and_clears_evictions(
     assert "working_copy_cache_max_mb" not in raw
 
 
+def test_original_route_enforces_working_copy_quota(
+    client_with_photo, tmp_path,
+):
+    app, db, photo_id = client_with_photo
+    import config as cfg
+    from PIL import Image
+
+    photo = db.get_photo(photo_id)
+    folder = db.conn.execute(
+        "SELECT path FROM folders WHERE id=?", (photo["folder_id"],)
+    ).fetchone()
+    jpeg_path = os.path.join(folder["path"], photo["filename"])
+    tiff_path = os.path.join(folder["path"], "test.tiff")
+    Image.open(jpeg_path).save(tiff_path, "TIFF")
+    os.remove(jpeg_path)
+    source_mtime = os.path.getmtime(tiff_path)
+    db.conn.execute(
+        "UPDATE photos SET filename='test.tiff', extension='.tiff', "
+        "file_size=?, file_mtime=?, working_copy_evicted_mtime=? WHERE id=?",
+        (os.path.getsize(tiff_path), source_mtime, source_mtime, photo_id),
+    )
+
+    old_photo_id = db.add_photo(
+        folder_id=photo["folder_id"], filename="old.tiff", extension=".tiff",
+        file_size=1, file_mtime=1.0, width=800, height=600,
+    )
+    working_dir = tmp_path / "vireo" / "working"
+    working_dir.mkdir()
+    old_path = working_dir / f"{old_photo_id}.jpg"
+    old_path.write_bytes(b"x" * (1024 * 1024))
+    os.utime(old_path, (1, 1))
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{old_photo_id}.jpg", old_photo_id),
+    )
+    db.conn.commit()
+    cfg.set("working_copy_cache_max_mb", 1)
+
+    response = app.test_client().get(f"/photos/{photo_id}/original")
+
+    assert response.status_code == 200
+    assert not old_path.exists()
+    current_path = working_dir / f"{photo_id}.jpg"
+    assert current_path.exists()
+    row = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime "
+        "FROM photos WHERE id=?", (photo_id,),
+    ).fetchone()
+    assert row["working_copy_path"] == f"working/{photo_id}.jpg"
+    assert row["working_copy_evicted_mtime"] is None
+
+    # A rendition larger than a zero-byte budget is still usable for the
+    # current response, but it must remain untracked and disappear when the
+    # response closes instead of becoming a persistent cache entry.
+    current_path.unlink()
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=NULL, "
+        "working_copy_evicted_mtime=? WHERE id=?",
+        (source_mtime, photo_id),
+    )
+    db.conn.commit()
+    cfg.set("working_copy_cache_max_mb", 0)
+
+    response = app.test_client().get(f"/photos/{photo_id}/original")
+    assert response.status_code == 200
+    assert not current_path.exists()
+    row = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime "
+        "FROM photos WHERE id=?", (photo_id,),
+    ).fetchone()
+    assert row["working_copy_path"] is None
+    assert row["working_copy_evicted_mtime"] == source_mtime
+    assert response.data
+    response.close()
+    assert not list((tmp_path / "vireo" / "originals").glob("*.transient.*"))
 def test_api_storage_reports_each_backing_volume(
     app_and_db, tmp_path, monkeypatch,
 ):

@@ -23,7 +23,8 @@ DEFAULT_QUOTA_MB = 20 * 1024
 _eviction_lock = threading.Lock()
 
 
-def _quota_bytes(quota_mb=None):
+def working_copy_quota_bytes(quota_mb=None):
+    """Return the configured working-copy budget in bytes."""
     if quota_mb is None:
         import config as cfg
 
@@ -62,7 +63,7 @@ def working_copy_stats(vireo_dir, quota_mb=None):
         "count": count,
         "size": total,
         "path": working_dir,
-        "quota_bytes": _quota_bytes(quota_mb),
+        "quota_bytes": working_copy_quota_bytes(quota_mb),
     }
 
 
@@ -77,7 +78,7 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None):
 
     Returns a small result payload useful to startup/config callers and tests.
     """
-    max_bytes = _quota_bytes(quota_mb)
+    max_bytes = working_copy_quota_bytes(quota_mb)
     working_dir = os.path.join(vireo_dir, "working")
     if not os.path.isdir(working_dir):
         return {

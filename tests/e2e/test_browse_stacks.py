@@ -828,3 +828,70 @@ def test_stack_expansion_response_yields_to_fresher_hydration(live_server, page)
     )
     assert state["error"] is None
     assert state["cached"] == [[pid, 4] for pid in sorted(burst_ids)]
+
+
+def test_expanding_stack_over_500_chunks_by_ids_requests(live_server, page):
+    """A stack with more than 500 members must be expandable.
+
+    ``/api/photos/by-ids`` caps each POST at 500 ids, so the expansion path
+    used to bail with a permanent ``This stack is too large to expand in
+    Browse.`` error on the badge for anything over that. Cover reconciliation
+    already chunks in 500-id slices; the expansion path must do the same so
+    the tray actually shows every member instead of leaving the stack
+    permanently unexpandable.
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'over-500-expansion-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
+
+    outcome = page.evaluate(
+        """async coverId => {
+          var cover = photos.find(function(photo) { return photo.id === coverId; });
+          // Simulate a stack whose photo_ids list exceeds the /api/photos/by-ids
+          // 500-id cap. The server-side ordering is irrelevant to this test;
+          // what matters is that the client stops surfacing a permanent
+          // "too large" error and chunks its fetches instead.
+          cover.browse_stack.photo_ids = Array(501).fill(coverId);
+          delete browseStackMembers[String(coverId)];
+          delete browseStackErrors[String(coverId)];
+          expandedBrowseStacks.delete(coverId);
+          var originalSafeFetch = safeFetch;
+          var chunks = [];
+          safeFetch = function(url, options) {
+            if (url === '/api/photos/by-ids') {
+              chunks.push(JSON.parse(options.body).photo_ids.length);
+              return Promise.resolve({photos: [cover]});
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            await toggleBrowseStack(null, coverId);
+          } finally {
+            safeFetch = originalSafeFetch;
+          }
+          return {
+            chunks: chunks,
+            error: browseStackErrors[String(coverId)] || null,
+            cached: !!browseStackMembers[String(coverId)],
+            expanded: expandedBrowseStacks.has(coverId),
+          };
+        }""",
+        burst_ids[1],
+    )
+    assert outcome["chunks"] == [500, 1]
+    assert outcome["error"] is None
+    assert outcome["cached"] is True
+    assert outcome["expanded"] is True

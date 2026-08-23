@@ -3533,11 +3533,6 @@ async function toggleBrowseStack(event, coverId) {
   delete browseStackErrors[cacheKey];
   insertBrowseStackTray(coverId);
   var memberIds = cover.browse_stack.photo_ids || [];
-  if (memberIds.length > 500) {
-    browseStackErrors[cacheKey] = 'This stack is too large to expand in Browse.';
-    insertBrowseStackTray(coverId);
-    return;
-  }
   var windowIsCurrent = observeBrowseWindow();
   function coverStillOwnsSlot() {
     // A cover-changing edit can hydrate and promote this stack while the
@@ -3555,13 +3550,39 @@ async function toggleBrowseStack(event, coverId) {
   for (var attempt = 1; attempt <= MAX_EXPANSION_ATTEMPTS; attempt++) {
     var request = {memberIds: new Set(memberIds.map(Number)), stale: false};
     browseStackExpansionRequests[cacheKey] = request;
-    var data;
+    var hydrated = [];
+    var abortedForRace = false;
     try {
-      data = await safeFetch('/api/photos/by-ids', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({photo_ids: memberIds}),
-      });
+      // /api/photos/by-ids caps each POST at 500 ids. Cover reconciliation
+      // already chunks in 500-id slices for the same reason; do the same
+      // here so an exact-duplicate or burst stack with more than 500 members
+      // is still expandable instead of surfacing a permanent "too large"
+      // error on its badge.
+      for (var offset = 0; offset < memberIds.length; offset += 500) {
+        var data = await safeFetch('/api/photos/by-ids', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({photo_ids: memberIds.slice(offset, offset + 500)}),
+        });
+        if (!coverStillOwnsSlot()) {
+          // The captured cover no longer owns this grid slot (a promotion
+          // landed between chunks). Drop the request bookkeeping and let
+          // whoever hydrates the new cover own the tray from here.
+          if (browseStackExpansionRequests[cacheKey] === request) {
+            delete browseStackExpansionRequests[cacheKey];
+          }
+          abortedForRace = true;
+          break;
+        }
+        if (request.stale || browseStackMembers[cacheKey]) {
+          // An edit or a fresher hydration landed mid-chunk. Stop fetching
+          // the rest of the stack and let the outer loop's stale / cache
+          // branches decide what to do; the partial payload is worthless
+          // for painting either way.
+          break;
+        }
+        hydrated = hydrated.concat(data.photos || []);
+      }
     } catch (error) {
       if (browseStackExpansionRequests[cacheKey] === request) {
         delete browseStackExpansionRequests[cacheKey];
@@ -3571,6 +3592,7 @@ async function toggleBrowseStack(event, coverId) {
       insertBrowseStackTray(coverId);
       return;
     }
+    if (abortedForRace) return;
     if (browseStackExpansionRequests[cacheKey] === request) {
       delete browseStackExpansionRequests[cacheKey];
     }
@@ -3597,7 +3619,7 @@ async function toggleBrowseStack(event, coverId) {
     // rendered in both places; sharing one object keeps rating/flag/keyword/
     // wildlife/location mutations from updating the grid copy while leaving
     // a stale duplicate in the expanded tray.
-    browseStackMembers[cacheKey] = (data.photos || []).map(function(photo) {
+    browseStackMembers[cacheKey] = hydrated.map(function(photo) {
       return photo.id === coverId ? cover : photo;
     });
     break;

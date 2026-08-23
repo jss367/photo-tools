@@ -161,6 +161,32 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
     expect(page.locator("#exportPreview")).to_contain_text("hawk3")
     page.locator("#exportOverlay button", has_text="Cancel").click()
 
+    other_card_id = live_server["data"]["photos"][3]
+    page.locator(f'.grid-card[data-id="{other_card_id}"]').click(
+        modifiers=["Meta"]
+    )
+    tray.get_by_role("button", name="Collapse stack").click()
+    multi_collapse_state = page.evaluate(
+        """() => {
+          var preview = getBrowseShortcutPhoto();
+          return {
+            selectedPhotoId: selectedPhotoId,
+            selectedIds: Array.from(selectedPhotos),
+            previewId: preview && preview.photo.id,
+            topLevelNavigation: !!preview && preview.navigationPhotos === photos,
+          };
+        }"""
+    )
+    assert multi_collapse_state == {
+        "selectedPhotoId": burst_ids[2],
+        "selectedIds": [burst_ids[2], other_card_id],
+        "previewId": burst_ids[1],
+        "topLevelNavigation": True,
+    }
+    badge.click()
+    expect(tray).to_be_visible()
+    hidden_member.click()
+
     tray.get_by_role("button", name="Collapse stack").click()
     expect(tray).to_be_hidden()
     page.wait_for_function(

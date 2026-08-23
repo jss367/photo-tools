@@ -3439,7 +3439,15 @@ async function toggleBrowseStack(event, coverId) {
     // member cache for a cheap re-expand and for batch state reconciliation.
     if (selectedHiddenMember) {
       var coverIndex = photos.findIndex(function(photo) { return photo.id === coverId; });
-      selectPhoto({shiftKey: false, metaKey: false, ctrlKey: false}, coverId, coverIndex);
+      if (selectedPhotos.size > 0) {
+        // Keep the exact multi-selection intact. The focused hidden member is
+        // still an active batch target, and getBrowseShortcutPhoto maps that
+        // focus to the collapsed cover solely for preview/navigation.
+        selectedIndex = coverIndex;
+        refreshCardSelectionVisuals();
+      } else {
+        selectPhoto({shiftKey: false, metaKey: false, ctrlKey: false}, coverId, coverIndex);
+      }
     } else if (batchHasHiddenMembers) {
       // Preserve the batch (Select all) selection but pin single-photo focus
       // to the visible cover so preview shortcuts, keyboard navigation, and

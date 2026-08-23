@@ -9,6 +9,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
@@ -2372,3 +2374,183 @@ def test_ensure_label_descriptions_partial_scratch_download_not_published(
         if p.startswith(".label_desc_heal_")
     ]
     assert leftovers == []
+
+
+def test_ensure_label_descriptions_reheals_truncated_file(
+    tmp_path, monkeypatch
+):
+    """A present-but-unparseable file must not suppress the heal.
+
+    A process killed mid-write leaves a truncated label_descriptions.json.
+    If existence alone gated the repair, that install would leak raw
+    scientific names forever (Vireo self-heals broken state instead of
+    asking the user to delete files)."""
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+    # Truncated mid-write: passes os.path.isfile, fails json.load.
+    target.write_text('{"Bubulcus ibis": "Cattle Eg')
+
+    def _fake_optional(filenames, model_dir, hf_subdir, *args, **kwargs):
+        with open(os.path.join(model_dir, "label_descriptions.json"), "w") as f:
+            json.dump({"Bubulcus ibis": "Cattle Egret, Bird"}, f)
+
+    monkeypatch.setattr(models, "_download_optional_files", _fake_optional)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is True
+    assert json.loads(target.read_text()) == {
+        "Bubulcus ibis": "Cattle Egret, Bird"
+    }
+
+
+def test_ensure_label_descriptions_drops_truncated_file_when_offline(
+    tmp_path, monkeypatch
+):
+    """The torn file is removed even when every repair path fails, so the
+    next process retries instead of json.load-ing garbage."""
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+    target.write_text('{"Bubulcus ibis": "Cattle Eg')
+
+    def _boom(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(models, "_download_optional_files", _boom)
+    monkeypatch.setattr(models, "_load_upstream_timm_config", _boom)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is False
+    assert not target.exists()
+
+
+def test_load_label_descriptions_returns_none_for_broken_files(tmp_path):
+    """None means 'heal it'; a parsed dict (even empty) means 'usable'."""
+    import models
+
+    missing = tmp_path / "nope.json"
+    assert models.load_label_descriptions(str(missing)) is None
+    assert models.label_descriptions_usable(str(missing)) is False
+
+    torn = tmp_path / "torn.json"
+    torn.write_text('{"Bubulcus ibis": "Cattle Eg')
+    assert models.load_label_descriptions(str(torn)) is None
+
+    empty_file = tmp_path / "empty.json"
+    empty_file.write_text("")
+    assert models.load_label_descriptions(str(empty_file)) is None
+
+    not_a_dict = tmp_path / "list.json"
+    not_a_dict.write_text("[1, 2, 3]")
+    assert models.load_label_descriptions(str(not_a_dict)) is None
+
+    # An empty mapping is a complete document, not a broken one.
+    empty_map = tmp_path / "empty-map.json"
+    empty_map.write_text("{}")
+    assert models.load_label_descriptions(str(empty_map)) == {}
+    assert models.label_descriptions_usable(str(empty_map)) is True
+
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}))
+    assert models.load_label_descriptions(str(good)) == {
+        "Bubulcus ibis": "Cattle Egret, Bird"
+    }
+
+
+def test_hf_download_publishes_file_atomically(tmp_path, monkeypatch):
+    """The destination must never be visible half-written.
+
+    copy2 straight onto the destination lets a concurrent reader (the
+    background label_descriptions heal racing a TimmClassifier init)
+    json.load a partial file, and a crash mid-copy leaves a truncated
+    file behind. Copy beside it, then os.replace."""
+    import shutil as _shutil
+
+    import huggingface_hub
+    import models
+
+    cached = tmp_path / "cache" / "label_descriptions.json"
+    cached.parent.mkdir()
+    cached.write_text(json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}))
+
+    dest_dir = tmp_path / "model"
+    dest_dir.mkdir()
+    final = dest_dir / "label_descriptions.json"
+
+    monkeypatch.setattr(
+        huggingface_hub, "hf_hub_download", lambda **kw: str(cached),
+    )
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda **kw: None,
+    )
+
+    observed = {}
+    real_copy2 = _shutil.copy2
+
+    def _spy_copy2(src, dst):
+        observed["dst"] = str(dst)
+        # Mid-copy the reader watches `final`; it must not exist yet.
+        observed["final_existed_during_copy"] = final.exists()
+        return real_copy2(src, dst)
+
+    monkeypatch.setattr(models.shutil, "copy2", _spy_copy2)
+
+    out = models._hf_download_with_retry(
+        models.ONNX_REPO, "label_descriptions.json", str(dest_dir),
+    )
+
+    assert out == str(final)
+    assert observed["dst"] != str(final)
+    assert observed["final_existed_during_copy"] is False
+    assert json.loads(final.read_text()) == {
+        "Bubulcus ibis": "Cattle Egret, Bird"
+    }
+    # No temp turds left behind.
+    assert sorted(p.name for p in dest_dir.iterdir()) == [
+        "label_descriptions.json"
+    ]
+
+
+def test_hf_download_cleans_up_temp_on_copy_failure(tmp_path, monkeypatch):
+    """A failed copy leaves neither a temp file nor a partial destination,
+    so the retry loop starts from a clean slate."""
+    import shutil as _shutil
+
+    import huggingface_hub
+    import models
+
+    cached = tmp_path / "cache" / "model.onnx"
+    cached.parent.mkdir()
+    cached.write_bytes(b"weights")
+
+    dest_dir = tmp_path / "model"
+    dest_dir.mkdir()
+
+    monkeypatch.setattr(
+        huggingface_hub, "hf_hub_download", lambda **kw: str(cached),
+    )
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda **kw: None,
+    )
+
+    real_copy2 = _shutil.copy2
+
+    def _partial_then_fail(src, dst):
+        # Simulate a disk-full / interrupted copy: bytes land, then boom.
+        real_copy2(src, dst)
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(models.shutil, "copy2", _partial_then_fail)
+    # _hf_download_with_retry sleeps between attempts; don't pay for it.
+    import time as _time_mod
+    monkeypatch.setattr(_time_mod, "sleep", lambda s: None)
+
+    with pytest.raises(RuntimeError):
+        models._hf_download_with_retry(
+            models.ONNX_REPO, "model.onnx", str(dest_dir),
+        )
+
+    assert list(dest_dir.iterdir()) == []

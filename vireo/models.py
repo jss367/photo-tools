@@ -10,6 +10,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 
 import model_verify
 
@@ -626,7 +627,25 @@ def _hf_download_with_retry(repo_id, filename, local_dir,
             # as a connection failure.
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
             if cached_path != dest_path:
-                shutil.copy2(cached_path, dest_path)
+                # Publish atomically. copy2 straight onto dest_path makes
+                # the destination visible while it is still being written,
+                # so a concurrent reader (e.g. the background
+                # label_descriptions heal racing a TimmClassifier init)
+                # can json.load a torn file, and a process exit mid-copy
+                # leaves a truncated file whose mere existence suppresses
+                # future repairs. Copy beside it, then os.replace (atomic
+                # on POSIX and Windows) so readers only ever see the whole
+                # file or no file.
+                tmp_path = (
+                    f"{dest_path}.part-{os.getpid()}-{threading.get_ident()}"
+                )
+                try:
+                    shutil.copy2(cached_path, tmp_path)
+                    os.replace(tmp_path, dest_path)
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp_path)
+                    raise
 
             if from_cache:
                 size_mb = os.path.getsize(dest_path) / 1024 / 1024
@@ -1054,6 +1073,35 @@ def _load_upstream_timm_config(model_str):
         return json.load(f)
 
 
+def load_label_descriptions(path):
+    """Return the {scientific name: description} mapping, or None.
+
+    None means "not usable, heal it": missing, unreadable, or not
+    parseable as a JSON object. Existence alone is not enough — a file
+    truncated by a process exit mid-write (or a disk-full write) still
+    passes os.path.isfile but blows up json.load. Vireo repairs broken
+    state itself rather than asking the user to delete files, so every
+    "do I need to heal?" check goes through this.
+
+    An empty mapping is a complete document (the model simply has no
+    common names) and is returned as-is, not treated as broken.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        log.warning("Unusable %s (%s); will re-heal.", path, e)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def label_descriptions_usable(path):
+    """True when `path` holds a parseable descriptions mapping."""
+    return load_label_descriptions(path) is not None
+
+
 def ensure_timm_label_descriptions(model_dir, model_str, progress_callback=None):
     """Self-heal a missing label_descriptions.json for a timm model.
 
@@ -1063,7 +1111,7 @@ def ensure_timm_label_descriptions(model_dir, model_str, progress_callback=None)
     taxonomy renamed it to "Ardea ibis"), the raw scientific name leaks
     into predictions and the review UI. Try, in order:
 
-    1. nothing to do — the file already exists
+    1. nothing to do — a parseable file already exists
     2. the vireo ONNX repo's copy (normal optional-file path)
     3. derive it from the upstream timm repo's config.json, which embeds
        the same {"Genus species": "Common Name, Category"} mapping
@@ -1072,8 +1120,15 @@ def ensure_timm_label_descriptions(model_dir, model_str, progress_callback=None)
     afterwards.
     """
     target = os.path.join(model_dir, "label_descriptions.json")
-    if os.path.isfile(target):
+    if label_descriptions_usable(target):
         return True
+
+    # Present but unparseable — a torn write from an earlier build or a
+    # killed process. Drop it so the paths below can republish; leaving
+    # it would make existence suppress the heal forever.
+    if os.path.exists(target):
+        with contextlib.suppress(OSError):
+            os.unlink(target)
 
     km = next(
         (m for m in KNOWN_MODELS if m.get("model_str") == model_str), None
@@ -1103,7 +1158,10 @@ def ensure_timm_label_descriptions(model_dir, model_str, progress_callback=None)
                     "Optional label_descriptions.json download failed for %s: %s",
                     model_str, e,
                 )
-            if os.path.isfile(scratch_target):
+            # Validate before publishing: a scratch file that arrived
+            # truncated or unparseable must not be promoted, or its
+            # existence at `target` would suppress every later repair.
+            if label_descriptions_usable(scratch_target):
                 try:
                     os.replace(scratch_target, target)
                 except OSError as e:

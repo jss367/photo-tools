@@ -113,17 +113,28 @@ class TimmClassifier:
                     "Download the model from the Models page in Settings."
                 )
 
+        import models as _models_mod
+
         # Installs that predate the label_descriptions.json export have no
         # scientific→common mapping and leak raw binomials ("Bubulcus
         # ibis") into predictions whenever the taxonomy fallback misses.
+        # Read the file exactly once, here, *before* spawning any repair:
+        # this instance must never observe a file the heal is publishing
+        # underneath it, so there is no torn-read window no matter how
+        # the writer behaves.
+        #
+        # A present-but-unparseable file counts as missing. Existence
+        # alone must not suppress the repair, or one truncated write
+        # would leak scientific names forever (and, if we let json.load
+        # raise here, brick every classify job).
+        descs = _models_mod.load_label_descriptions(label_desc_path)
+
         # Spawn the heal off the startup path — the network probes can
         # take a full HF timeout when offline, and classifier construction
         # runs per classify job. This instance proceeds with the taxonomy
         # fallback; the next TimmClassifier picks up the healed file.
-        if not os.path.isfile(label_desc_path):
+        if descs is None:
             _spawn_label_desc_heal(model_dir, model_str)
-
-        import models as _models_mod
 
         # Load ONNX session with self-heal on corruption: if the bytes
         # are truncated / partial, delete them and re-download once
@@ -150,17 +161,13 @@ class TimmClassifier:
         # Build scientific -> common name mapping from label_descriptions
         # Format: {"Sturnus vulgaris": "European Starling, Bird"}
         self._common_names = {}
-        if os.path.isfile(label_desc_path):
-            with open(label_desc_path) as f:
-                descs = json.load(f)
-            if isinstance(descs, dict):
-                for sci_name, desc in descs.items():
-                    # desc format: "Common Name, Category" -- take part before last comma
-                    parts = desc.rsplit(", ", 1)
-                    common = parts[0] if len(parts) > 1 else desc
-                    # If common name equals scientific name, it has no common name
-                    if common.lower() != sci_name.lower():
-                        self._common_names[sci_name.lower()] = common
+        for sci_name, desc in (descs or {}).items():
+            # desc format: "Common Name, Category" -- take part before last comma
+            parts = desc.rsplit(", ", 1)
+            common = parts[0] if len(parts) > 1 else desc
+            # If common name equals scientific name, it has no common name
+            if common.lower() != sci_name.lower():
+                self._common_names[sci_name.lower()] = common
 
         # Also use taxonomy.json for any names not in label_descriptions
         self._taxonomy = taxonomy

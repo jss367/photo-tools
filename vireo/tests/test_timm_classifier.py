@@ -563,3 +563,74 @@ def test_present_label_descriptions_skips_self_heal(tmp_path):
     import timm_classifier as tc
     assert model_str not in tc._HEAL_THREADS
     assert not ensure.called
+
+
+def test_corrupt_label_descriptions_heals_instead_of_aborting(tmp_path):
+    """A truncated label_descriptions.json must not brick the classifier.
+
+    Existence alone used to gate the heal *and* json.load ran unguarded,
+    so one torn write (process killed mid-download) would raise out of
+    every subsequent TimmClassifier construction and abort the classify
+    job forever. Treat unparseable as missing: construct with the
+    taxonomy fallback and spawn the repair."""
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    # Truncated mid-write: os.path.isfile passes, json.load raises.
+    (model_dir / "label_descriptions.json").write_text(
+        '{"Sturnus vulgaris": "European Star'
+    )
+    fake_session = _make_fake_session()
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions", return_value=False) as ensure:
+        clf = TimmClassifier(model_str)
+        import timm_classifier as tc
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+
+    assert ensure.called
+    assert clf._common_names == {}
+    assert clf._resolve_common_name("Sturnus vulgaris") == "Sturnus vulgaris"
+
+
+def test_classifier_never_reads_a_repair_it_just_spawned(tmp_path):
+    """The instance that spawns the heal must not read the file the heal
+    is publishing underneath it — otherwise a partially written file
+    could be json.load-ed mid-write. The read happens once, before the
+    thread starts, so a heal that completes during ONNX session init is
+    invisible to this instance (and picked up by the next one)."""
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+
+    heal_done = __import__("threading").Event()
+
+    def _fake_ensure(dir_arg, model_str, progress_callback=None):
+        with open(os.path.join(dir_arg, "label_descriptions.json"), "w") as f:
+            json.dump({"Sturnus vulgaris": "European Starling, Bird"}, f)
+        heal_done.set()
+        return True
+
+    fake_session = _make_fake_session()
+
+    def _slow_create_session(*args, **kwargs):
+        # Session init is where the real race lives: the heal lands while
+        # the classifier is still constructing.
+        heal_done.wait(timeout=5)
+        return fake_session
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", side_effect=_slow_create_session), \
+         patch("models.ensure_timm_label_descriptions", side_effect=_fake_ensure):
+        clf = TimmClassifier(model_str)
+
+    assert heal_done.is_set()
+    # File is on disk now, but this instance never re-read it.
+    assert (model_dir / "label_descriptions.json").exists()
+    assert clf._common_names == {}

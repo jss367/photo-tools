@@ -324,6 +324,7 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
         "photoId => selectedPhotoId === photoId",
         arg=burst_ids[1],
     )
+    expect(page.locator("#detailFilename")).to_have_text("hawk2.jpg")
 
     # Restore the original cover, then demote it while it remains part of a
     # batch. Exact selected IDs stay unchanged while preview maps the now-hidden
@@ -435,3 +436,76 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
         }""",
         {"coverId": burst_ids[1], "memberIds": burst_ids},
     )
+
+
+def test_stack_metadata_callbacks_follow_promoted_cover(live_server, page):
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'metadata-race-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
+
+    callback_refreshes = page.evaluate(
+        """async ids => {
+          var oldCoverId = ids[1];
+          var promotedId = ids[0];
+          var originalLoadInatStatus = loadInatStatus;
+          var originalFetchColorLabels = fetchColorLabels;
+          var releaseInat;
+          var releaseColors;
+          loadInatStatus = function() {
+            return new Promise(function(resolve) { releaseInat = resolve; });
+          };
+          fetchColorLabels = function() {
+            return new Promise(function(resolve) { releaseColors = resolve; });
+          };
+          try {
+            await toggleBrowseStack(null, oldCoverId);
+            var members = browseStackMembers[String(oldCoverId)];
+            members.find(function(photo) { return photo.id === oldCoverId; }).flag = 'rejected';
+            members.find(function(photo) { return photo.id === promotedId; }).flag = 'flagged';
+            await reconcileBrowseStackCovers([oldCoverId, promotedId]);
+
+            var currentCoverId = browseStackCoverIdForPhoto(oldCoverId);
+            var traySelector = '.browse-stack-tray[data-stack-cover-id="'
+              + currentCoverId + '"]';
+            var tray = document.querySelector(traySelector);
+            tray.dataset.beforeInatRefresh = '1';
+            releaseInat();
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            var inatRefreshed = !document.querySelector(traySelector)
+              .hasAttribute('data-before-inat-refresh');
+
+            document.querySelector(traySelector).dataset.beforeColorRefresh = '1';
+            releaseColors();
+            await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            var colorsRefreshed = !document.querySelector(traySelector)
+              .hasAttribute('data-before-color-refresh');
+            return {
+              currentCoverId: currentCoverId,
+              inatRefreshed: inatRefreshed,
+              colorsRefreshed: colorsRefreshed,
+            };
+          } finally {
+            loadInatStatus = originalLoadInatStatus;
+            fetchColorLabels = originalFetchColorLabels;
+          }
+        }""",
+        burst_ids,
+    )
+    assert callback_refreshes == {
+        "currentCoverId": burst_ids[0],
+        "inatRefreshed": True,
+        "colorsRefreshed": True,
+    }

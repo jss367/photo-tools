@@ -3286,6 +3286,8 @@ function browseStackCoverCompare(a, b) {
 async function reconcileBrowseStackCovers(photoIds) {
   var wanted = new Set((photoIds || []).map(Number));
   var windowIsCurrent = observeBrowseWindow();
+  var focusedReplacementId = null;
+  var refreshFocusedDetail = false;
   var uncachedCovers = photos.filter(function(photo) {
     if (!photo.browse_stack || browseStackMembers[String(photo.id)]) return false;
     return wanted.has(photo.id) || (photo.browse_stack.photo_ids || []).some(function(id) {
@@ -3362,11 +3364,19 @@ async function reconcileBrowseStackCovers(photoIds) {
       // occupies that grid slot.
       if (selectedPhotoId === oldCoverId && selectedPhotos.size === 0) {
         selectedPhotoId = newCover.id;
+        focusedReplacementId = newCover.id;
+        refreshFocusedDetail = document.getElementById('detailContent').classList.contains('visible');
       }
     }
     changed = true;
   });
   if (changed) renderGrid();
+  // Keep the inspector bound to the same visible grid focus. Call this after
+  // renderGrid() so the promoted cover and its tray are already in place when
+  // the async detail response paints.
+  if (focusedReplacementId != null && refreshFocusedDetail) {
+    loadDetail(focusedReplacementId);
+  }
   return changed;
 }
 
@@ -3498,12 +3508,18 @@ async function toggleBrowseStack(event, coverId) {
     });
     insertBrowseStackTray(coverId);
     var loadedIds = browseStackMembers[cacheKey].map(function(photo) { return photo.id; });
-    loadInatStatus(loadedIds).then(function() {
-      if (windowIsCurrent() && expandedBrowseStacks.has(coverId)) insertBrowseStackTray(coverId);
-    });
-    fetchColorLabels(loadedIds).then(function() {
-      if (windowIsCurrent() && expandedBrowseStacks.has(coverId)) insertBrowseStackTray(coverId);
-    });
+    function refreshCurrentStackTray() {
+      if (!windowIsCurrent()) return;
+      // Rating/flag edits can promote another member while either metadata
+      // request is in flight. Resolve the current cache key through the old
+      // cover (which remains a member) instead of testing the captured key.
+      var currentCoverId = browseStackCoverIdForPhoto(coverId);
+      if (currentCoverId != null && expandedBrowseStacks.has(currentCoverId)) {
+        insertBrowseStackTray(currentCoverId);
+      }
+    }
+    loadInatStatus(loadedIds).then(refreshCurrentStackTray);
+    fetchColorLabels(loadedIds).then(refreshCurrentStackTray);
   } catch (error) {
     if (!windowIsCurrent() || !cover.browse_stack || !photos.some(function(photo) {
       return photo === cover && photo.id === coverId;

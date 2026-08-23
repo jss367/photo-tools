@@ -2373,6 +2373,16 @@ var browseStackMembers = {};
 var browseStackErrors = {};
 var browseStackHydrationSeq = 0;
 var browseStackHydrationRequests = {};
+// In-flight stack expansions, keyed by cover id: {memberIds, stale}.
+// A tray's header offers "Select all" the moment it opens, so a stack-wide
+// edit can be applied while its members are still loading. Those members are
+// not in `photos` and not yet in `browseStackMembers`, so findBrowsePhoto()
+// cannot patch them — the edit has nowhere to land. Installing the response
+// that was already in flight would then repaint pre-edit values in the tray
+// and its badges, silently contradicting the edit the user just confirmed.
+// markBrowseStackExpansionsStale() flags such a request so toggleBrowseStack
+// discards it and refetches instead of guessing at the post-edit state.
+var browseStackExpansionRequests = {};
 
 function setBrowseTotals(data) {
   totalPhotos = Number(data && data.total) || 0;
@@ -3248,8 +3258,26 @@ function restoreExpandedBrowseStacks() {
   Array.from(expandedBrowseStacks).forEach(insertBrowseStackTray);
 }
 
+// Every mutation path reports the photo ids whose local state it just changed
+// (see refreshExpandedBrowseStackMembers / reconcileBrowseStackCovers callers).
+// Any stack expansion still in flight fetched those photos before the edit
+// committed, so its payload is pre-edit for exactly the members the mutation
+// could not reach. Mark it rather than trying to replay the mutation onto the
+// response: the set of fields an edit can touch keeps growing, and a refetch
+// is correct for all of them without per-field bookkeeping.
+function markBrowseStackExpansionsStale(photoIds) {
+  var wanted = (photoIds || []).map(Number);
+  if (!wanted.length) return;
+  Object.keys(browseStackExpansionRequests).forEach(function(cacheKey) {
+    var request = browseStackExpansionRequests[cacheKey];
+    if (!request || request.stale) return;
+    request.stale = wanted.some(function(id) { return request.memberIds.has(id); });
+  });
+}
+
 function refreshExpandedBrowseStackMembers(photoIds) {
   var wanted = new Set((photoIds || []).map(Number));
+  markBrowseStackExpansionsStale(photoIds);
   Object.keys(browseStackMembers).forEach(function(coverId) {
     var members = browseStackMembers[coverId] || [];
     if (members.some(function(member) { return wanted.has(member.id); })) {
@@ -3287,6 +3315,11 @@ function browseStackCoverCompare(a, b) {
 
 async function reconcileBrowseStackCovers(photoIds) {
   var wanted = new Set((photoIds || []).map(Number));
+  // Callers run this straight after applying the edit locally, before the
+  // trailing refreshExpandedBrowseStackMembers(). Marking here too closes the
+  // window in which this function's own awaits would let a stale expansion
+  // response land unflagged.
+  markBrowseStackExpansionsStale(photoIds);
   var windowIsCurrent = observeBrowseWindow();
   var focusedReplacementId = null;
   var refreshFocusedDetail = false;
@@ -3506,19 +3539,60 @@ async function toggleBrowseStack(event, coverId) {
     return;
   }
   var windowIsCurrent = observeBrowseWindow();
-  try {
-    var data = await safeFetch('/api/photos/by-ids', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({photo_ids: memberIds}),
-    });
+  function coverStillOwnsSlot() {
     // A cover-changing edit can hydrate and promote this stack while the
     // expansion request is in flight. The dataset epoch stays current in
     // that case, so also verify the captured cover still owns this grid slot
     // before writing its old cache key.
-    if (!windowIsCurrent() || !cover.browse_stack || !photos.some(function(photo) {
+    return windowIsCurrent() && !!cover.browse_stack && photos.some(function(photo) {
       return photo === cover && photo.id === coverId;
-    })) return;
+    });
+  }
+  // Bounded only as a safety net: every retry has to be provoked by an edit
+  // that already completed its own server round trip, so this cannot spin on
+  // its own. The cap stops a future marking bug from becoming a refetch loop.
+  var MAX_EXPANSION_ATTEMPTS = 4;
+  for (var attempt = 1; attempt <= MAX_EXPANSION_ATTEMPTS; attempt++) {
+    var request = {memberIds: new Set(memberIds.map(Number)), stale: false};
+    browseStackExpansionRequests[cacheKey] = request;
+    var data;
+    try {
+      data = await safeFetch('/api/photos/by-ids', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({photo_ids: memberIds}),
+      });
+    } catch (error) {
+      if (browseStackExpansionRequests[cacheKey] === request) {
+        delete browseStackExpansionRequests[cacheKey];
+      }
+      if (!coverStillOwnsSlot()) return;
+      browseStackErrors[cacheKey] = 'Could not load this stack.';
+      insertBrowseStackTray(coverId);
+      return;
+    }
+    if (browseStackExpansionRequests[cacheKey] === request) {
+      delete browseStackExpansionRequests[cacheKey];
+    }
+    if (!coverStillOwnsSlot()) return;
+    if (browseStackMembers[cacheKey]) {
+      // Cover reconciliation hydrated this key while we were in flight. It
+      // issued its fetch after the edit that triggered it, so its cache is
+      // strictly fresher than this response — keep it and just finish the
+      // metadata passes below.
+      break;
+    }
+    if (request.stale) {
+      // An edit landed while this response was in flight, and its hidden
+      // members had no cache entry to be patched in — so this payload holds
+      // pre-edit values for them. Never paint that: the tray keeps saying
+      // "Loading stack…" while we go fetch the post-edit truth.
+      if (attempt < MAX_EXPANSION_ATTEMPTS) continue;
+      browseStackErrors[cacheKey] =
+        'This stack kept changing while it loaded. Collapse and expand it to see current state.';
+      insertBrowseStackTray(coverId);
+      return;
+    }
     // Reuse the top-level cover object inside the member cache. The cover is
     // rendered in both places; sharing one object keeps rating/flag/keyword/
     // wildlife/location mutations from updating the grid copy while leaving
@@ -3526,27 +3600,25 @@ async function toggleBrowseStack(event, coverId) {
     browseStackMembers[cacheKey] = (data.photos || []).map(function(photo) {
       return photo.id === coverId ? cover : photo;
     });
-    insertBrowseStackTray(coverId);
-    var loadedIds = browseStackMembers[cacheKey].map(function(photo) { return photo.id; });
-    function refreshCurrentStackTray() {
-      if (!windowIsCurrent()) return;
-      // Rating/flag edits can promote another member while either metadata
-      // request is in flight. Resolve the current cache key through the old
-      // cover (which remains a member) instead of testing the captured key.
-      var currentCoverId = browseStackCoverIdForPhoto(coverId);
-      if (currentCoverId != null && expandedBrowseStacks.has(currentCoverId)) {
-        insertBrowseStackTray(currentCoverId);
-      }
-    }
-    loadInatStatus(loadedIds).then(refreshCurrentStackTray);
-    fetchColorLabels(loadedIds).then(refreshCurrentStackTray);
-  } catch (error) {
-    if (!windowIsCurrent() || !cover.browse_stack || !photos.some(function(photo) {
-      return photo === cover && photo.id === coverId;
-    })) return;
-    browseStackErrors[cacheKey] = 'Could not load this stack.';
-    insertBrowseStackTray(coverId);
+    break;
   }
+  insertBrowseStackTray(coverId);
+  var loadedIds = (browseStackMembers[cacheKey] || []).map(function(photo) {
+    return photo.id;
+  });
+  if (!loadedIds.length) return;
+  function refreshCurrentStackTray() {
+    if (!windowIsCurrent()) return;
+    // Rating/flag edits can promote another member while either metadata
+    // request is in flight. Resolve the current cache key through the old
+    // cover (which remains a member) instead of testing the captured key.
+    var currentCoverId = browseStackCoverIdForPhoto(coverId);
+    if (currentCoverId != null && expandedBrowseStacks.has(currentCoverId)) {
+      insertBrowseStackTray(currentCoverId);
+    }
+  }
+  loadInatStatus(loadedIds).then(refreshCurrentStackTray);
+  fetchColorLabels(loadedIds).then(refreshCurrentStackTray);
 }
 
 function selectBrowseStackMember(event, photoId, coverId) {
@@ -5901,6 +5973,7 @@ async function resetAndLoad(options) {
   browseStackMembers = {};
   browseStackErrors = {};
   browseStackHydrationRequests = {};
+  browseStackExpansionRequests = {};
   photos = [];
   currentPage = 1;
   allLoaded = false;

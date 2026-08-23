@@ -667,3 +667,164 @@ def test_shift_range_from_stack_member_keeps_selection_honest(live_server, page)
     )
     assert sorted(export_ids) == selection_state["active"]
     page.locator("#exportOverlay button", has_text="Cancel").click()
+
+
+def test_stack_edit_during_expansion_outlives_the_pending_response(live_server, page):
+    """A stack-wide edit applied while the tray is loading must survive.
+
+    The tray header offers "Select all" the moment it opens, so a user can
+    apply Wildlife Exclude to every member before the expansion's
+    ``/api/photos/by-ids`` response lands. Those hidden members are in neither
+    ``photos`` nor ``browseStackMembers`` yet, so ``findBrowsePhoto()`` cannot
+    patch them — and installing the already-in-flight response then repainted
+    pre-edit values in the tray and its "No Wildlife" badges, contradicting an
+    edit the user had just confirmed, until a full reload.
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'stale-expansion-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
+
+    state = page.evaluate(
+        """async ids => {
+          var coverId = ids[1];
+          var originalSafeFetch = safeFetch;
+          var byIdsOptions = {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({photo_ids: ids}),
+          };
+          // The payload the in-flight expansion would carry: pre-edit.
+          var preEdit = await originalSafeFetch('/api/photos/by-ids', byIdsOptions);
+          var release = null;
+          safeFetch = function(url) {
+            if (url === '/api/photos/by-ids' && !release) {
+              return new Promise(function(resolve) { release = resolve; });
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            var expansion = toggleBrowseStack(null, coverId);
+            while (!release) {
+              await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            }
+            var loadingWhileSelectable = !!document.querySelector(
+              '.browse-stack-tray[data-stack-cover-id="' + coverId + '"] .browse-stack-loading'
+            );
+            selectBrowseStackAll(null, coverId);
+            var selected = getActiveSelection().slice().sort(function(a, b) { return a - b; });
+            await setSelectionWildlifeExcluded(true);
+            // Only now does the response fetched before the edit arrive.
+            release(JSON.parse(JSON.stringify(preEdit)));
+            await expansion;
+            return {
+              loadingWhileSelectable: loadingWhileSelectable,
+              selected: selected,
+              cached: (browseStackMembers[String(coverId)] || []).map(function(photo) {
+                return [photo.id, photo.wildlife_excluded ? 1 : 0];
+              }).sort(function(a, b) { return a[0] - b[0]; }),
+              badges: document.querySelectorAll(
+                '.browse-stack-tray[data-stack-cover-id="' + coverId + '"] .no-wildlife-badge'
+              ).length,
+              error: browseStackErrors[String(coverId)] || null,
+            };
+          } finally {
+            safeFetch = originalSafeFetch;
+          }
+        }""",
+        burst_ids,
+    )
+    # The edit was reachable while the members were still loading.
+    assert state["loadingWhileSelectable"] is True
+    assert state["selected"] == sorted(burst_ids)
+    assert state["error"] is None
+    # Every member — cover and hidden alike — reflects the edit the user made.
+    assert state["cached"] == [[pid, 1] for pid in sorted(burst_ids)]
+    assert state["badges"] == 3
+
+
+def test_stack_expansion_response_yields_to_fresher_hydration(live_server, page):
+    """An in-flight expansion must not overwrite a post-edit hydration.
+
+    ``reconcileBrowseStackCovers()`` hydrates an uncached stack *after* the
+    edit that triggered it, so its cache is strictly fresher than an expansion
+    request issued before that edit. The expansion's unconditional write used
+    to clobber it and put the pre-edit ratings back in the tray.
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'reconcile-clobber-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
+
+    state = page.evaluate(
+        """async ids => {
+          var coverId = ids[1];
+          var originalSafeFetch = safeFetch;
+          var byIdsOptions = {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({photo_ids: ids}),
+          };
+          var preEdit = await originalSafeFetch('/api/photos/by-ids', byIdsOptions);
+          var held = [];
+          safeFetch = function(url) {
+            if (url === '/api/photos/by-ids') {
+              return new Promise(function(resolve) { held.push(resolve); });
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            var expansion = toggleBrowseStack(null, coverId);
+            while (held.length < 1) {
+              await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            }
+            selectBrowseStackAll(null, coverId);
+            var rated = batchSetRating(4);
+            // batchSetRating -> reconcileBrowseStackCovers issues the second
+            // by-ids request, this one after the rating committed.
+            while (held.length < 2) {
+              await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            }
+            held[1](await originalSafeFetch('/api/photos/by-ids', byIdsOptions));
+            await rated;
+            // The pre-edit expansion response finally arrives last.
+            held[0](JSON.parse(JSON.stringify(preEdit)));
+            await expansion;
+            return {
+              cached: (browseStackMembers[String(coverId)] || []).map(function(photo) {
+                return [photo.id, photo.rating];
+              }).sort(function(a, b) { return a[0] - b[0]; }),
+              error: browseStackErrors[String(coverId)] || null,
+            };
+          } finally {
+            safeFetch = originalSafeFetch;
+          }
+        }""",
+        burst_ids,
+    )
+    assert state["error"] is None
+    assert state["cached"] == [[pid, 4] for pid in sorted(burst_ids)]

@@ -8095,6 +8095,32 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # Healthy visual clause: results are the similarity-ranked
                 # matches; sort is relevance by design while it is active.
                 if payload.get("ids_only"):
+                    if stacks:
+                        # Same cover-first flattening the paginated visual
+                        # branch below applies, so Select-all-matching
+                        # inserts each stack's visible cover ahead of its
+                        # hidden members and Best Batch, burst-review,
+                        # and export preview start from the visible first
+                        # card rather than a hidden burst frame (Codex
+                        # P2 on PR #1561).
+                        stack_items = db.collapse_browse_stack_photo_ids(
+                            ordered_ids,
+                        )
+                        stacked_ids = []
+                        seen_ids = set()
+                        for item in stack_items:
+                            cover = item["cover_id"]
+                            if cover not in seen_ids:
+                                stacked_ids.append(cover)
+                                seen_ids.add(cover)
+                            for member in item["member_ids"]:
+                                if member in seen_ids:
+                                    continue
+                                stacked_ids.append(member)
+                                seen_ids.add(member)
+                        return jsonify({"ids": stacked_ids,
+                                        "total": len(stacked_ids),
+                                        "visual": visual_info})
                     return jsonify({"ids": ordered_ids, "total": len(ordered_ids),
                                     "visual": visual_info})
                 stack_items = (
@@ -8149,9 +8175,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # Select-all and other bulk flows need the complete matching id
             # set; it must resolve exactly the photos the filtered grid
             # shows, so it shares this endpoint rather than a legacy path.
+            # Under ``stacks=true`` emit each stack's cover ahead of its
+            # hidden members — matching the collection ``/photo-ids``
+            # projection — so Best Batch, burst-review, and export
+            # preview start from the visible first card rather than a
+            # hidden burst frame (Codex P2 on PR #1561).
             try:
-                ids = db.query_photo_ids(rules, sort=sort, collection_id=collection_id,
-                                         folder_id=folder_id)
+                if stacks:
+                    ids = db.query_photo_ids_stacked(
+                        rules, sort=sort,
+                        collection_id=collection_id, folder_id=folder_id,
+                    )
+                else:
+                    ids = db.query_photo_ids(rules, sort=sort, collection_id=collection_id,
+                                             folder_id=folder_id)
             except ValueError as exc:
                 return json_error(str(exc), 400)
             payload_out = {"ids": ids, "total": len(ids)}

@@ -23205,20 +23205,16 @@ class Database:
         ).fetchone()
         return int(row["n"] or 0)
 
-    def get_collection_photo_ids_stacked(self, collection_id, sort="date"):
-        """Return every photo ID matching a collection, in stack-projected
-        order. For each stack (in the same order ``query_browse_stacks``
-        places covers) emit the cover ID first, then the remaining member
-        IDs in the intra-stack order the projection exposes as
-        ``browse_stack.photo_ids``. Singles carry themselves.
-
-        Without this, Select-all-matching with Stacks enabled would seed
-        Best Batch, Burst Review, and the export-preview filename from a
-        hidden member whenever a stack's quality-ranked cover isn't its
-        earliest member under the selected sort (Codex P2 on PR #1561).
+    def _stacked_photo_ids(self, rules, sort="date",
+                           collection_id=None, folder_id=None):
+        """Shared cover-first stacked ID projection used by every select-all
+        endpoint that honors Stacks. For each stack (in the same order
+        ``query_browse_stacks`` places covers) emits the cover ID first, then
+        the remaining member IDs in the intra-stack order the projection
+        exposes as ``browse_stack.photo_ids``. Singles carry themselves.
         """
         ranked, params = self._ranked_stack_query(
-            [], collection_id=collection_id,
+            rules, collection_id=collection_id, folder_id=folder_id,
         )
         order = self._stack_sort_clause(sort)
         query = ranked + f"""
@@ -23248,6 +23244,35 @@ class Database:
                 photo_ids.append(member_id)
                 seen.add(member_id)
         return photo_ids
+
+    def get_collection_photo_ids_stacked(self, collection_id, sort="date"):
+        """Return every photo ID matching a collection, in stack-projected
+        order. See ``_stacked_photo_ids``.
+
+        Without this, Select-all-matching with Stacks enabled would seed
+        Best Batch, Burst Review, and the export-preview filename from a
+        hidden member whenever a stack's quality-ranked cover isn't its
+        earliest member under the selected sort (Codex P2 on PR #1561).
+        """
+        return self._stacked_photo_ids(
+            [], sort=sort, collection_id=collection_id,
+        )
+
+    def query_photo_ids_stacked(self, rules, sort="date",
+                                collection_id=None, folder_id=None):
+        """Return every photo ID matching a universal-filter rule tree, in
+        stack-projected order — the rules analog of
+        ``get_collection_photo_ids_stacked``.
+
+        Without this, Select-all-matching with Stacks enabled in the
+        workspace, folder, dashboard-collection, or unsaved-filter paths
+        would seed Best Batch, Burst Review, and the export-preview filename
+        from a hidden member whenever a stack's quality-ranked cover isn't
+        its earliest member under the selected sort (Codex P2 on PR #1561).
+        """
+        return self._stacked_photo_ids(
+            rules, sort=sort, collection_id=collection_id, folder_id=folder_id,
+        )
 
     def collapse_browse_stack_photo_ids(self, photo_ids):
         """Collapse an already ordered ID result, preserving group order.

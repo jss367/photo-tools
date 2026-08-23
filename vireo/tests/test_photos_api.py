@@ -11065,13 +11065,22 @@ def test_api_photos_query_browse_stacks(app_and_db):
     assert single["browse_stack"] is None
 
     # Selection deliberately stays photo-based even while the grid is
-    # projected into stacks.
+    # projected into stacks. Under ``stacks=true`` the ids_only response
+    # now emits each stack's cover ahead of its hidden members so
+    # Select-all-matching, Best Batch, burst-review, and export preview
+    # start from the visible first card rather than a hidden burst frame
+    # (Codex P2 on PR #1561, browse.html:7160).
     ids_only = client.post("/api/photos/query", json={
         "rules": [], "sort": "name", "stacks": True, "ids_only": True,
     }).get_json()
     assert ids_only["total"] == 3
     assert len(ids_only["ids"]) == len(listed)
     assert set(ids_only["ids"]) == {photo["id"] for photo in listed}
+    stack_cover_idx = ids_only["ids"].index(second)
+    stack_hidden_idx = ids_only["ids"].index(first)
+    assert stack_cover_idx < stack_hidden_idx, (
+        "stack cover must precede its hidden members in ids_only order"
+    )
 
 
 def test_api_photos_query_group_tree_and_paging(app_and_db):

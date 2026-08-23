@@ -6734,9 +6734,20 @@ function updateScrollPosition() {
 async function loadInatStatus(photoIds) {
   if (photoIds.length === 0) return;
   try {
-    var data = await safeFetch('/api/inat/submissions?photo_ids=' + photoIds.join(','), {}, { toast: false });
-    if (!data.error) {
-      for (var k in data) inatSubmitted[k] = true;
+    // Chunk the GET URL so oversized stacks (or any large id set) don't
+    // exceed the browser/proxy/server request-target limit and drop the
+    // whole page's iNaturalist badges when a stack expansion hydrates a
+    // large member list (Codex P2 on PR #1561). Matches the 500-id cap
+    // the /api/photos/by-ids stack-expansion path already uses.
+    for (var offset = 0; offset < photoIds.length; offset += 500) {
+      var chunk = photoIds.slice(offset, offset + 500);
+      var data = await safeFetch(
+        '/api/inat/submissions?photo_ids=' + chunk.join(','),
+        {}, { toast: false },
+      );
+      if (data && !data.error) {
+        for (var k in data) inatSubmitted[k] = true;
+      }
     }
   } catch(e) {}
 }
@@ -7166,6 +7177,14 @@ async function selectAllMatchingPhotos() {
       sort: document.getElementById('sortSelect').value,
       ids_only: true,
     };
+    // Mirror the grid's Stacks projection on the general query path as
+    // well — workspace, folder, dashboard-collection, unsaved-filter,
+    // and visual-search Select-all now share the same cover-first
+    // projection so Best Batch, burst-review, and export preview start
+    // from the visible first card even when a stack's quality-ranked
+    // cover isn't the earliest member under the selected sort (Codex
+    // P2 on PR #1561).
+    if (browseStacksEnabled()) idsBody.stacks = true;
     var idsVisual = window.VireoFilter && VireoFilter.getVisual ? VireoFilter.getVisual() : null;
     if (idsVisual) idsBody.visual = idsVisual;
     if (activeFolderId) idsBody.folder_id = activeFolderId;
@@ -10245,22 +10264,36 @@ async function toggleDetailWildlifeExcluded() {
 async function fetchColorLabels(photoIds) {
   if (!photoIds.length) return;
   var gen = colorLabelGen;
-  var data = await safeFetch('/api/photos/color_labels?ids=' + photoIds.join(','), {}, { toast: false });
-  if (data) {
-    // Only clear stale entries if no local edits happened during the fetch
-    if (colorLabelGen === gen) {
-      photoIds.forEach(function(id) { delete colorLabels[id]; });
-    }
-    for (var id in data) colorLabels[id] = data[id];
-    // Mark every requested id as fetched — an absent id in `data` means "no
-    // color set" now that we've asked, so the batch inspector can trust
-    // colorLabels[id] === undefined for these ids as a definite value.
-    photoIds.forEach(function(id) { colorLabelsFetched.add(id); });
-    // A batch selection that included any of these ids may have rendered as
-    // unanimous no-colour with no Mixed marker; refresh it now that we can
-    // trust the state.
-    _refreshBatchInspectorIfActive();
+  // Chunk the GET URL so oversized stacks (or any large id set) don't
+  // exceed the browser/proxy/server request-target limit and drop the
+  // whole page's color labels when a stack expansion hydrates a large
+  // member list (Codex P2 on PR #1561). Matches the 500-id cap the
+  // /api/photos/by-ids stack-expansion path already uses.
+  var combined = {};
+  var chunkFailed = false;
+  for (var offset = 0; offset < photoIds.length; offset += 500) {
+    var chunk = photoIds.slice(offset, offset + 500);
+    var data = await safeFetch(
+      '/api/photos/color_labels?ids=' + chunk.join(','),
+      {}, { toast: false },
+    );
+    if (!data) { chunkFailed = true; break; }
+    for (var id in data) combined[id] = data[id];
   }
+  if (chunkFailed) return;
+  // Only clear stale entries if no local edits happened during the fetch
+  if (colorLabelGen === gen) {
+    photoIds.forEach(function(id) { delete colorLabels[id]; });
+  }
+  for (var pid in combined) colorLabels[pid] = combined[pid];
+  // Mark every requested id as fetched — an absent id in `combined` means
+  // "no color set" now that we've asked, so the batch inspector can trust
+  // colorLabels[id] === undefined for these ids as a definite value.
+  photoIds.forEach(function(id) { colorLabelsFetched.add(id); });
+  // A batch selection that included any of these ids may have rendered as
+  // unanimous no-colour with no Mixed marker; refresh it now that we can
+  // trust the state.
+  _refreshBatchInspectorIfActive();
 }
 
 async function setColorLabel(color) {

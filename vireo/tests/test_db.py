@@ -1011,6 +1011,97 @@ def test_collection_photo_ids_stacked_puts_cover_before_hidden_members(tmp_path)
         assert set(row['id'] for row in grid) <= set(stacked)
 
 
+def test_query_photo_ids_stacked_puts_cover_before_hidden_members(tmp_path):
+    """``query_photo_ids_stacked`` is the rules analog of
+    ``get_collection_photo_ids_stacked``: it emits each stack's cover
+    before its hidden members, mirroring the Stacks-enabled grid.
+
+    Regression for Codex P2 on PR #1561 (browse.html:7160): without this
+    the workspace/folder/dashboard-collection/unsaved-filter Select-all
+    paths would seed Best Batch and burst-review from a hidden burst
+    frame whenever the quality-ranked cover wasn't the earliest member
+    under the selected sort.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder('/photos', name='photos')
+    burst_soft = db.add_photo(
+        folder_id=fid, filename='burst-a.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+        timestamp='2024-01-01T00:00:00',
+    )
+    burst_cover = db.add_photo(
+        folder_id=fid, filename='burst-b.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+        timestamp='2024-01-02T00:00:00',
+    )
+    single_later = db.add_photo(
+        folder_id=fid, filename='zebra.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+        timestamp='2024-06-01T00:00:00',
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id='burst-1', quality_score=0.1 WHERE id=?",
+        (burst_soft,),
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id='burst-1', quality_score=0.95 WHERE id=?",
+        (burst_cover,),
+    )
+    db.conn.commit()
+
+    rules = [{"field": "rating", "op": ">=", "value": 0}]
+
+    # Baseline: unstacked returns the raw member order under sort=name.
+    assert db.query_photo_ids(rules, sort='name') == [
+        burst_soft, burst_cover, single_later,
+    ]
+
+    # Stack-projected: the burst cover leads, then its hidden member, then
+    # the single — matching what the Stacks-enabled grid shows.
+    stacked = db.query_photo_ids_stacked(rules, sort='name')
+    assert stacked == [burst_cover, burst_soft, single_later]
+
+    # And every supported sort's first id agrees with the first visible
+    # card the paginated grid would show.
+    for sort in ('date', 'name', 'name_desc', 'rating', 'quality'):
+        stacked = db.query_photo_ids_stacked(rules, sort=sort)
+        grid = db.query_browse_stacks(rules, sort=sort, per_page=99)
+        first_visible = grid[0]['id']
+        assert stacked[0] == first_visible, (
+            f"sort={sort}: first stacked id != first visible card"
+        )
+        assert set(row['id'] for row in grid) <= set(stacked)
+
+
+def test_query_photo_ids_stacked_folder_scoped(tmp_path):
+    """``query_photo_ids_stacked`` restricts to the requested folder — the
+    Stacks-enabled folder Select-all path relies on it (Codex P2 on
+    PR #1561).
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid_a = db.add_folder('/photos/a', name='a')
+    fid_b = db.add_folder('/photos/b', name='b')
+    in_a = db.add_photo(
+        folder_id=fid_a, filename='in-a.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0, timestamp='2024-01-01T00:00:00',
+    )
+    in_b = db.add_photo(
+        folder_id=fid_b, filename='in-b.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0, timestamp='2024-01-02T00:00:00',
+    )
+
+    only_a = db.query_photo_ids_stacked([], folder_id=fid_a)
+    only_b = db.query_photo_ids_stacked([], folder_id=fid_b)
+    assert only_a == [in_a]
+    assert only_b == [in_b]
+
+
 def test_collection_photos_keyword_rule(tmp_path):
     """get_collection_photos filters by keyword contains rule."""
     import json

@@ -21023,13 +21023,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         }
                     )
 
-        # The named categories historically missed valid Vireo-managed files
-        # such as taxonomy.json, SQLite WAL/backups, logs, and display-source
-        # renders under originals/. Count the whole generated-storage root and
-        # expose the difference as "other" so the headline matches disk usage
-        # without pretending those files are safe cache-clear candidates.
-        storage_root_size = _dir_size_recursive(storage_root)
-
         def _is_within(path, root):
             try:
                 return os.path.commonpath(
@@ -21053,7 +21046,46 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             size for path, size in named_storage
             if _is_within(path, storage_root)
         )
-        other_size = max(0, storage_root_size - named_inside_root)
+
+        catalog_root = os.path.dirname(os.path.abspath(db_path))
+        if os.path.abspath(storage_root) == catalog_root:
+            # In the conventional layout this is Vireo's dedicated data
+            # directory. Include taxonomy, logs, SQLite sidecars/backups, and
+            # other managed files that do not have their own category.
+            storage_root_size = _dir_size_recursive(storage_root)
+            other_size = max(0, storage_root_size - named_inside_root)
+        else:
+            # ``--thumb-dir`` may be any directory (for example
+            # /data/thumbs). Its parent is not necessarily owned by Vireo, so
+            # never recurse across that shared parent and classify siblings as
+            # Vireo data. Count only explicit auxiliary paths Vireo creates.
+            auxiliary_paths = [
+                os.path.join(storage_root, dirname)
+                for dirname in (
+                    "originals",
+                    "external-edits",
+                    "external-dng",
+                    "inat-uploads",
+                    "inat-exports",
+                    "edit-masks",
+                )
+            ]
+            auxiliary_paths.extend([
+                app.config["CARD_CLEANUP_DIR"],
+                app.config["COMPUTATION_CACHE_DIR"],
+                f"{db_path}-wal",
+                f"{db_path}-shm",
+                f"{db_path}-journal",
+            ])
+            other_size = 0
+            for path in auxiliary_paths:
+                try:
+                    if os.path.isfile(path):
+                        other_size += os.path.getsize(path)
+                    elif os.path.isdir(path):
+                        other_size += _dir_size_recursive(path)
+                except OSError:
+                    continue
         total = sum(size for _path, size in named_storage) + other_size
         reclaimable = thumb["size"] + preview["size"] + emb["size"]
 

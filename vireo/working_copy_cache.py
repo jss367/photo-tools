@@ -14,12 +14,14 @@ A source-file change makes the marker stale and allows extraction again.
 import logging
 import os
 import threading
+import time
 
 from db import commit_with_retry
 
 log = logging.getLogger(__name__)
 
 DEFAULT_QUOTA_MB = 20 * 1024
+_UNTRACKED_WRITE_GRACE_SECONDS = 60
 _eviction_lock = threading.Lock()
 
 
@@ -68,13 +70,15 @@ def working_copy_stats(vireo_dir, quota_mb=None):
 
 
 def evict_if_over_quota(db, vireo_dir, quota_mb=None):
-    """Delete oldest tracked working copies until usage is within quota.
+    """Delete oldest canonical working copies until usage is within quota.
 
-    Only database-tracked ``working/<photo_id>.jpg`` files participate.  This
-    avoids deleting a file another extraction thread has finished writing but
-    has not yet committed to the catalog.  Files that cannot be removed keep
-    their database references so storage accounting remains honest and a
-    later pass can retry.
+    Legacy Vireo versions wrote ``working/<photo_id>.jpg`` without recording
+    ``working_copy_path``. Those canonical files participate too, otherwise a
+    zero quota can never reclaim them. Recently modified untracked files get a
+    short grace period so a concurrent writer can finish and commit its row.
+    Unknown files are counted toward usage but never deleted. Files that
+    cannot be removed keep their database references so accounting remains
+    honest and a later pass can retry.
 
     Returns a small result payload useful to startup/config callers and tests.
     """
@@ -89,26 +93,49 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None):
     with _eviction_lock:
         rows = db.conn.execute(
             "SELECT id, working_copy_path, file_mtime FROM photos "
-            "WHERE working_copy_path IS NOT NULL"
         ).fetchall()
-        entries = []
+        files = {}
         total = 0
+        try:
+            with os.scandir(working_dir) as directory_entries:
+                for entry in directory_entries:
+                    try:
+                        if not entry.is_file():
+                            continue
+                        st = entry.stat()
+                    except OSError as exc:
+                        log.warning(
+                            "Could not stat working-copy file %s: %s",
+                            entry.path, exc,
+                        )
+                        continue
+                    files[entry.name] = (entry.path, st)
+                    total += st.st_size
+        except OSError as exc:
+            log.warning("Could not inspect working-copy cache %s: %s", working_dir, exc)
+
+        entries = []
+        untracked_cutoff_ns = (
+            time.time_ns() - _UNTRACKED_WRITE_GRACE_SECONDS * 1_000_000_000
+        )
         for row in rows:
             expected_rel = f"working/{row['id']}.jpg"
-            if row["working_copy_path"] != expected_rel:
+            tracked = row["working_copy_path"] == expected_rel
+            if row["working_copy_path"] is not None and not tracked:
                 # Do not let a malformed or legacy catalog path expand the
                 # deletion scope outside Vireo's managed working directory.
                 continue
-            path = os.path.join(working_dir, f"{row['id']}.jpg")
-            try:
-                st = os.stat(path)
-            except FileNotFoundError:
+            file_entry = files.get(f"{row['id']}.jpg")
+            if file_entry is None:
                 continue
-            except OSError as exc:
-                log.warning("Could not stat working-copy file %s: %s", path, exc)
+            path, st = file_entry
+            if not tracked and st.st_mtime_ns > untracked_cutoff_ns:
+                # This may be an extraction that has published its final path
+                # but has not committed working_copy_path yet.
                 continue
-            total += st.st_size
-            entries.append((st.st_mtime_ns, row["id"], st.st_size, path, expected_rel))
+            entries.append(
+                (st.st_mtime_ns, row["id"], st.st_size, path, expected_rel)
+            )
 
         if total <= max_bytes:
             return {
@@ -136,7 +163,8 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None):
             db.conn.execute(
                 "UPDATE photos SET working_copy_path=NULL, "
                 "working_copy_evicted_mtime=COALESCE(file_mtime, -1) "
-                "WHERE id=? AND working_copy_path=?",
+                "WHERE id=? AND (working_copy_path IS NULL "
+                "OR working_copy_path=?)",
                 (photo_id, expected_rel),
             )
         if evicted:

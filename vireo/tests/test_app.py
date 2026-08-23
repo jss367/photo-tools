@@ -911,6 +911,36 @@ def test_api_storage_counts_unclassified_vireo_root_files_as_other(
     assert after["total"] - before["total"] == len(payload)
 
 
+def test_api_storage_custom_thumb_dir_ignores_unrelated_siblings(
+    app_and_db, tmp_path,
+):
+    app, _ = app_and_db
+    shared_root = tmp_path / "shared-volume"
+    custom_thumbs = shared_root / "thumbs"
+    custom_thumbs.mkdir(parents=True)
+    app.config["THUMB_CACHE_DIR"] = str(custom_thumbs)
+
+    before = app.test_client().get("/api/storage").get_json()
+    unrelated = b"not-owned-by-vireo"
+    (shared_root / "unrelated.bin").write_bytes(unrelated)
+    after_unrelated = app.test_client().get("/api/storage").get_json()
+
+    assert after_unrelated["other"]["size"] == before["other"]["size"]
+    assert after_unrelated["total"] == before["total"]
+
+    originals = shared_root / "originals"
+    originals.mkdir()
+    owned = b"vireo-display-render"
+    (originals / "1.display.jpg").write_bytes(owned)
+    after_owned = app.test_client().get("/api/storage").get_json()
+
+    assert (
+        after_owned["other"]["size"] - after_unrelated["other"]["size"]
+        == len(owned)
+    )
+    assert after_owned["total"] - after_unrelated["total"] == len(owned)
+
+
 def test_config_update_immediately_enforces_working_copy_quota(
     app_and_db, tmp_path,
 ):

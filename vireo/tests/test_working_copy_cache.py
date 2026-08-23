@@ -129,6 +129,52 @@ def test_working_copy_stats_include_all_direct_files(tmp_path):
     }
 
 
+def test_evicts_legacy_canonical_file_without_catalog_path(tmp_path):
+    from working_copy_cache import evict_if_over_quota
+
+    db, working_dir, photo_ids = _seed_working_copies(tmp_path, [100])
+    photo_id = photo_ids[0]
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=NULL WHERE id=?", (photo_id,)
+    )
+    db.conn.commit()
+    try:
+        result = evict_if_over_quota(db, str(tmp_path), quota_mb=0)
+
+        assert result["evicted"] == 1
+        assert result["remaining_bytes"] == 0
+        assert not (working_dir / f"{photo_id}.jpg").exists()
+        row = db.conn.execute(
+            "SELECT working_copy_path, working_copy_evicted_mtime "
+            "FROM photos WHERE id=?", (photo_id,),
+        ).fetchone()
+        assert row["working_copy_path"] is None
+        assert row["working_copy_evicted_mtime"] == 10.0
+    finally:
+        db.close()
+
+
+def test_recent_untracked_working_copy_gets_writer_grace(tmp_path):
+    from working_copy_cache import evict_if_over_quota
+
+    db, working_dir, photo_ids = _seed_working_copies(tmp_path, [100])
+    photo_id = photo_ids[0]
+    path = working_dir / f"{photo_id}.jpg"
+    os.utime(path, None)
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=NULL WHERE id=?", (photo_id,)
+    )
+    db.conn.commit()
+    try:
+        result = evict_if_over_quota(db, str(tmp_path), quota_mb=0)
+
+        assert result["evicted"] == 0
+        assert result["remaining_bytes"] == 100
+        assert path.exists()
+    finally:
+        db.close()
+
+
 def test_zero_quota_skips_working_copy_generation(
     tmp_path, monkeypatch,
 ):

@@ -41,6 +41,20 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
     expect(tray).to_contain_text("hawk2.jpg")
     expect(tray).to_contain_text("hawk3.jpg")
 
+    cover_member = tray.locator(
+        f'.browse-stack-member[data-id="{burst_ids[1]}"]'
+    )
+    cover_member.dblclick()
+    expect(page.locator("#lightboxFilename")).to_have_text("hawk2.jpg")
+    page.locator("[title='Next (→)']").click()
+    expect(page.locator("#lightboxFilename")).to_have_text("hawk3.jpg")
+    page.keyboard.press("Escape")
+    page.wait_for_function(
+        "photoId => selectedPhotoId === photoId",
+        arg=burst_ids[2],
+    )
+    expect(page.locator("#detailFilename")).to_have_text("hawk3.jpg")
+
     hidden_member = tray.locator(
         f'.browse-stack-member[data-id="{burst_ids[2]}"]'
     )
@@ -64,6 +78,7 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
         })""",
         arg=burst_ids,
     )
+    expect(page.locator("#ratingMixed")).to_be_hidden()
     page.locator("#batchBar button", has_text="Flag").click()
     page.wait_for_function(
         """ids => ids.every(function(id) {
@@ -72,6 +87,7 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
         })""",
         arg=burst_ids,
     )
+    expect(page.locator("#flagMixed")).to_be_hidden()
 
     # Stacks is a presentation preference, so it survives a return to Browse.
     page.reload()

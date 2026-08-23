@@ -3246,7 +3246,9 @@ function refreshExpandedBrowseStackMembers(photoIds) {
 }
 
 function browsePhotoNavigationList(photoId) {
-  if (photos.some(function(photo) { return photo.id === photoId; })) return photos;
+  // Prefer an expanded stack's member list even for its cover, which also
+  // exists in the top-level grid. Opening that cover from the tray should
+  // navigate to its neighboring frames, not to the next stack cover.
   var stackIds = Object.keys(browseStackMembers);
   for (var i = 0; i < stackIds.length; i++) {
     var members = browseStackMembers[stackIds[i]] || [];
@@ -3255,6 +3257,28 @@ function browsePhotoNavigationList(photoId) {
     }
   }
   return photos;
+}
+
+function browseStackCoverIdForPhoto(photoId) {
+  var stackIds = Object.keys(browseStackMembers);
+  for (var i = 0; i < stackIds.length; i++) {
+    if ((browseStackMembers[stackIds[i]] || []).some(function(photo) {
+      return photo.id === photoId;
+    })) {
+      return Number(stackIds[i]);
+    }
+  }
+  return null;
+}
+
+function loadedBrowsePhotoIds() {
+  var ids = new Set(photos.map(function(photo) { return photo.id; }));
+  Object.keys(browseStackMembers).forEach(function(coverId) {
+    (browseStackMembers[coverId] || []).forEach(function(photo) {
+      ids.add(photo.id);
+    });
+  });
+  return Array.from(ids);
 }
 
 async function toggleBrowseStack(event, coverId) {
@@ -8024,7 +8048,7 @@ document.addEventListener('vireo:edit-history-changed', function() {
   // Card badges move with the same edits, so refresh the loaded grid rows too.
   // `skipPanels` because the sidebar refresh below is the broader one: without
   // it the prediction panels would be fetched twice per undo.
-  var loadedIds = photos.map(function(photo) { return photo.id; });
+  var loadedIds = loadedBrowsePhotoIds();
   if (loadedIds.length) _refreshBrowseKeywordState(loadedIds, {skipPanels: true});
   refreshBrowseSidebarPanels();
 });
@@ -8692,9 +8716,8 @@ async function _refreshBrowseKeywordState(photoIds, opts) {
   // otherwise fetch the prediction panels twice.
   if (!opts.skipPanels) refreshPredictionPanels(opts);
   if (!Array.isArray(photoIds) || !photoIds.length) return;
-  var loadedIds = new Set(photos.map(function(photo) { return photo.id; }));
   var ids = Array.from(new Set(photoIds)).filter(function(id) {
-    return loadedIds.has(id);
+    return !!findBrowsePhoto(id);
   });
   if (!ids.length) return;
 
@@ -8707,7 +8730,7 @@ async function _refreshBrowseKeywordState(photoIds, opts) {
         body: JSON.stringify({photo_ids: ids.slice(offset, offset + 500)}),
       }, {toast: false});
       (data.photos || []).forEach(function(updated) {
-        var local = photos.find(function(photo) { return photo.id === updated.id; });
+        var local = findBrowsePhoto(updated.id);
         if (!local) return;
         local.species = Array.isArray(updated.species) ? updated.species : [];
         local.life_list = Array.isArray(updated.life_list) ? updated.life_list : [];
@@ -8722,7 +8745,10 @@ async function _refreshBrowseKeywordState(photoIds, opts) {
     // The keyword save already succeeded; a later page reload remains a safe
     // fallback if this non-critical card refresh is interrupted.
   }
-  if (refreshed.length) refreshGridCards(refreshed);
+  if (refreshed.length) {
+    refreshGridCards(refreshed);
+    refreshExpandedBrowseStackMembers(refreshed);
+  }
 }
 
 // Server-side eligibility requires the photo to still carry the species
@@ -8739,7 +8765,7 @@ function _clearRepresentativeStateAfterKeywordRemoval(photoIds, keywordName) {
   if (!keywordName) return;
   var touched = [];
   photoIds.forEach(function(id) {
-    var p = photos.find(function(x) { return x.id === id; });
+    var p = findBrowsePhoto(id);
     if (!p || !Array.isArray(p.life_list)) return;
     var next = p.life_list.filter(function(entry) {
       return !entry || entry.species !== keywordName;
@@ -8755,7 +8781,10 @@ function _clearRepresentativeStateAfterKeywordRemoval(photoIds, keywordName) {
       touched.push(id);
     }
   });
-  if (touched.length) refreshGridCards(touched);
+  if (touched.length) {
+    refreshGridCards(touched);
+    refreshExpandedBrowseStackMembers(touched);
+  }
 }
 
 async function batchSetFlag(flag) {
@@ -9926,13 +9955,13 @@ function _batchUnanimous(ids, get) {
 
 function _batchRatingState(ids) {
   return _batchUnanimous(ids, function(id) {
-    var p = photos.find(function(x) { return x.id === id; });
+    var p = findBrowsePhoto(id);
     return p ? (p.rating || 0) : 0;
   });
 }
 function _batchFlagState(ids) {
   return _batchUnanimous(ids, function(id) {
-    var p = photos.find(function(x) { return x.id === id; });
+    var p = findBrowsePhoto(id);
     return p ? (p.flag || 'none') : 'none';
   });
 }
@@ -9946,7 +9975,7 @@ function _batchColorState(ids) {
 // asserting a shared value we can't actually verify.
 function _batchAllLoaded(ids) {
   return ids.every(function(id) {
-    return photos.some(function(p) { return p.id === id; });
+    return !!findBrowsePhoto(id);
   });
 }
 
@@ -9970,7 +9999,7 @@ function renderBatchInspector(ids, opts) {
     } else {
       var counts = {exif: 0, assigned: 0, none: 0};
       ids.forEach(function(id) {
-        var p = photos.find(function(photo) { return photo.id === id; });
+        var p = findBrowsePhoto(id);
         var status = p && counts[p.location_status] != null ? p.location_status : 'none';
         counts[status]++;
       });
@@ -10288,8 +10317,9 @@ async function _afterLocationMutation(photoIds, detailPhotoId) {
     return;
   }
   if (photoIds && photoIds.length) {
-    var loadedIds = new Set(photos.map(function(photo) { return photo.id; }));
-    var idsToRefresh = photoIds.filter(function(id) { return loadedIds.has(id); });
+    var idsToRefresh = photoIds.filter(function(id) {
+      return !!findBrowsePhoto(id);
+    });
     try {
       for (var offset = 0; offset < idsToRefresh.length; offset += 500) {
         var statusData = await safeFetch('/api/photos/by-ids', {
@@ -10298,12 +10328,13 @@ async function _afterLocationMutation(photoIds, detailPhotoId) {
           body: JSON.stringify({photo_ids: idsToRefresh.slice(offset, offset + 500)})
         }, {toast: false});
         (statusData.photos || []).forEach(function(updated) {
-          var local = photos.find(function(photo) { return photo.id === updated.id; });
+          var local = findBrowsePhoto(updated.id);
           if (local) local.location_status = updated.location_status || 'none';
         });
       }
     } catch (e) {}
     refreshGridCards(idsToRefresh);
+    refreshExpandedBrowseStackMembers(idsToRefresh);
   }
   // If a multi-selection is still active, keep the batch inspector rendered.
   // Falling through to loadDetail(anchor) would strip .batch-mode and rewire
@@ -11026,7 +11057,11 @@ document.addEventListener('lightbox:closed', function(event) {
   // batch. Preserve that batch instead of replacing it with the viewed photo.
   if (photoId == null || selectedPhotos.size > 0) return;
   var idx = photos.findIndex(function(photo) { return photo.id === photoId; });
-  if (idx < 0) return;
+  if (idx < 0) {
+    var coverId = browseStackCoverIdForPhoto(photoId);
+    idx = photos.findIndex(function(photo) { return photo.id === coverId; });
+  }
+  if (idx < 0 || !findBrowsePhoto(photoId)) return;
   // Skip `selectPhoto` when the focused photo is already the one being
   // returned to: it calls `loadDetail`, which refetches and rerenders the
   // detail panel and would silently discard an unsubmitted `#locationInput`

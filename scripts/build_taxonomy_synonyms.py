@@ -129,7 +129,9 @@ def main():
             "the shipped map with a suspiciously small one."
         )
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    out_dir = os.path.dirname(args.output)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(args.output, "w") as f:
         json.dump(synonyms, f, indent=1, sort_keys=True, ensure_ascii=False)
         f.write("\n")

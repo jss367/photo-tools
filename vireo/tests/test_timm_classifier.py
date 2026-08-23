@@ -768,3 +768,107 @@ def test_classifier_never_reads_a_repair_it_just_spawned(tmp_path):
     # File is on disk now, but this instance never re-read it.
     assert (model_dir / "label_descriptions.json").exists()
     assert clf._common_names == {}
+
+
+class _StubTaxonomy:
+    """Minimal Taxonomy substitute for _resolve_common_name tests."""
+
+    def __init__(self, by_scientific):
+        # by_scientific: {scientific_lower: {"common_name": ..., ...}}
+        self._by_scientific = by_scientific
+
+    def lookup(self, name):
+        return self._by_scientific.get(name.lower().strip())
+
+    def get_hierarchy(self, name):
+        return {}
+
+
+def test_taxonomy_wins_over_stale_label_description(tmp_path):
+    """When label_descriptions carries an iNat21-vintage common name for
+    a class the taxonomy has under a current preferred name, the
+    classifier must persist the taxonomy name — otherwise
+    /api/predictions/compare cannot canonicalize it and reports a false
+    disagreement with a model that emits the current name.
+    """
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    _make_model_dir(
+        tmp_path,
+        label_descriptions={"Bubulcus ibis": "Cattle Egret, Bird"},
+    )
+    fake_session = _make_fake_session()
+    taxonomy = _StubTaxonomy(
+        {"bubulcus ibis": {"scientific_name": "Ardea ibis",
+                           "common_name": "Western Cattle-Egret"}},
+    )
+
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session",
+               return_value=fake_session):
+        clf = TimmClassifier(
+            "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21",
+            taxonomy=taxonomy,
+        )
+
+    # Sanity: the stale mapping is still populated from the file so the
+    # dict remains a valid fallback for names the taxonomy misses.
+    assert clf._common_names.get("bubulcus ibis") == "Cattle Egret"
+    # But the resolver must return the taxonomy's current preferred name.
+    assert clf._resolve_common_name("Bubulcus ibis") == "Western Cattle-Egret"
+
+
+def test_label_description_used_when_taxonomy_misses(tmp_path):
+    """Taxonomy-first must not lose classes the taxonomy has never
+    heard of — the label description remains the fallback so a model
+    with entries outside taxonomy.json still emits common names.
+    """
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    _make_model_dir(
+        tmp_path,
+        label_descriptions={"Sturnus vulgaris": "European Starling, Bird"},
+    )
+    fake_session = _make_fake_session()
+    taxonomy = _StubTaxonomy({})  # empty — every lookup misses
+
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session",
+               return_value=fake_session):
+        clf = TimmClassifier(
+            "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21",
+            taxonomy=taxonomy,
+        )
+
+    assert clf._resolve_common_name("Sturnus vulgaris") == "European Starling"
+
+
+def test_taxonomy_without_common_name_falls_back_to_label(tmp_path):
+    """A taxonomy hit with a blank common_name must not shadow the
+    label description; the resolver should still produce a common name
+    when one is available in either source.
+    """
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    _make_model_dir(
+        tmp_path,
+        label_descriptions={"Sturnus vulgaris": "European Starling, Bird"},
+    )
+    fake_session = _make_fake_session()
+    taxonomy = _StubTaxonomy(
+        {"sturnus vulgaris": {"scientific_name": "Sturnus vulgaris",
+                              "common_name": ""}},
+    )
+
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session",
+               return_value=fake_session):
+        clf = TimmClassifier(
+            "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21",
+            taxonomy=taxonomy,
+        )
+
+    assert clf._resolve_common_name("Sturnus vulgaris") == "European Starling"

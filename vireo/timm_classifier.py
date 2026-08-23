@@ -206,16 +206,29 @@ class TimmClassifier:
     def _resolve_common_name(self, scientific_name):
         """Map a scientific name to a common name.
 
-        Priority: label_descriptions from model > taxonomy.json > scientific name as-is.
-        """
-        key = scientific_name.lower()
-        if key in self._common_names:
-            return self._common_names[key]
+        Priority: taxonomy.json (current preferred name, with synonym
+        resolution for outdated binomials) > label_descriptions bundled
+        with the model > scientific name as-is.
 
+        Taxonomy is consulted first so that a healed
+        ``label_descriptions.json`` shipping the iNat21-vintage common
+        name (e.g. ``"Bubulcus ibis" -> "Cattle Egret, Bird"``) does not
+        override the taxonomy's current preferred name
+        (``"Western Cattle-Egret"``). Persisting the stale form leaves
+        ``/api/predictions/compare`` unable to canonicalize the species
+        — the taxonomy does not index ``"Cattle Egret"`` and the
+        scientific-name synonym map cannot resolve a common name — so
+        the comparison falls back to text identity and reports a false
+        disagreement with a model that emitted the current name.
+        """
         if self._taxonomy:
             taxon = self._taxonomy.lookup(scientific_name)
             if taxon and taxon.get("common_name"):
                 return taxon["common_name"]
+
+        key = scientific_name.lower()
+        if key in self._common_names:
+            return self._common_names[key]
 
         return scientific_name
 

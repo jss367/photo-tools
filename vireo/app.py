@@ -8117,8 +8117,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     [photos_map[pid] for pid in page_ids if pid in photos_map],
                     stack_items=page_stack_items,
                 )
+                similarity_by_cover = {
+                    item["cover_id"]: max(
+                        (
+                            sims_by_pid[pid]
+                            for pid in item["member_ids"]
+                            if pid in sims_by_pid
+                        ),
+                        default=None,
+                    )
+                    for item in (page_stack_items or [])
+                }
                 for entry in photo_dicts:
-                    entry["similarity"] = sims_by_pid.get(entry["id"])
+                    entry["similarity"] = similarity_by_cover.get(
+                        entry["id"], sims_by_pid.get(entry["id"]),
+                    )
                 response = {
                     "photos": photo_dicts,
                     "total": len(logical_ids),
@@ -14086,7 +14099,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 total = db.count_browse_stacks([], collection_id=collection_id)
             else:
                 photos = db.get_collection_photos(
-                    collection_id, page=page, per_page=per_page,
+                    collection_id, page=page, per_page=per_page, sort=sort,
                 )
                 total = underlying_total
         except ValueError as e:

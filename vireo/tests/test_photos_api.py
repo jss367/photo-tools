@@ -11070,6 +11070,7 @@ def test_api_photos_query_browse_stacks(app_and_db):
         "rules": [], "sort": "name", "stacks": True, "ids_only": True,
     }).get_json()
     assert ids_only["total"] == 3
+    assert len(ids_only["ids"]) == len(listed)
     assert set(ids_only["ids"]) == {photo["id"] for photo in listed}
 
 
@@ -11518,6 +11519,26 @@ def test_api_photos_query_visual_ranks_by_similarity(app_and_db, monkeypatch):
     assert [p["filename"] for p in data["photos"]] == ["bird1.jpg", "bird2.jpg"]
     assert data["photos"][0]["similarity"] == 0.95
     assert data["total"] == 2
+
+    # A quality-ranked stack cover can differ from the most relevant member;
+    # the visible score must still describe the stack's relevance ordering.
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'visual-burst' WHERE id IN (?, ?)",
+            (photos["bird1.jpg"], photos["bird2.jpg"]),
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (photos["bird2.jpg"],),
+        )
+    stacked = client.post('/api/photos/query', json={
+        "rules": [], "stacks": True,
+        "visual": {"prompt": "a bird", "strength": "balanced"},
+    }).get_json()
+    assert stacked["total"] == 1
+    assert stacked["underlying_total"] == 2
+    assert stacked["photos"][0]["id"] == photos["bird2.jpg"]
+    assert stacked["photos"][0]["similarity"] == 0.95
 
     # Metadata rules constrain the candidate set before scoring.
     resp = client.post('/api/photos/query', json={

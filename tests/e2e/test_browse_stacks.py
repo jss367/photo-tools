@@ -82,6 +82,20 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
     expect(page.locator("#batchCount")).to_have_text("1 selected")
     expect(page.locator("#detailFilename")).to_have_text("hawk3.jpg")
 
+    tray.get_by_role("button", name="Collapse stack").click()
+    expect(tray).to_be_hidden()
+    page.wait_for_function(
+        "coverId => selectedPhotoId === coverId",
+        arg=burst_ids[1],
+    )
+    expect(page.locator("#detailFilename")).to_have_text("hawk2.jpg")
+    assert page.evaluate(
+        "coverId => browsePhotoNavigationList(coverId) === photos",
+        burst_ids[1],
+    )
+    badge.click()
+    expect(tray).to_be_visible()
+
     tray.get_by_role("button", name="Select all").click()
     expect(page.locator("#batchCount")).to_have_text("3 selected")
     for photo_id in burst_ids:
@@ -107,6 +121,25 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
         arg=burst_ids,
     )
     expect(page.locator("#flagMixed")).to_be_hidden()
+
+    page.evaluate(
+        """ids => {
+          bestBatchData = {
+            best_photo_id: ids[0],
+            suggested_reject_ids: ids.slice(1),
+          };
+          return applyBestBatchPickAndReject();
+        }""",
+        burst_ids,
+    )
+    page.wait_for_function(
+        """ids => ids.every(function(id, index) {
+          var photo = findBrowsePhoto(id);
+          return photo && photo.flag === (index === 0 ? 'flagged' : 'rejected');
+        })""",
+        arg=burst_ids,
+    )
+    expect(page.locator("#flagMixed")).to_be_visible()
 
     # Stacks is a presentation preference, so it survives a return to Browse.
     page.reload()

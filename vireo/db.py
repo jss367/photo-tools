@@ -22794,7 +22794,7 @@ class Database:
         return folder_join, "", where, params
 
     def get_collection_photos(
-        self, collection_id, page=1, per_page=50, photo_ids=None,
+        self, collection_id, page=1, per_page=50, photo_ids=None, sort="date",
     ):
         """Build SQL from collection rules and return matching photos.
 
@@ -22825,13 +22825,24 @@ class Database:
         offset = (page - 1) * per_page
         params.extend([per_page, offset])
 
+        order = {
+            "date": _PHOTO_DATE_ASC_ORDER,
+            "date_desc": _PHOTO_DATE_DESC_ORDER,
+            "name": "p.filename ASC, p.id ASC",
+            "name_desc": "p.filename DESC, p.id ASC",
+            "rating": "p.rating DESC, p.filename ASC, p.id ASC",
+            "sharpness": "p.sharpness DESC, p.filename ASC, p.id ASC",
+            "sharpness_asc": "p.sharpness ASC, p.filename ASC, p.id ASC",
+            "quality": "p.quality_score DESC, p.filename ASC, p.id ASC",
+        }.get(sort, _PHOTO_DATE_ASC_ORDER)
+
         pcols = ", ".join(f"p.{c.strip()}" for c in self.PHOTO_COLS.split(","))
         query = f"""
             SELECT DISTINCT {pcols} FROM photos p
             {folder_join}
             {join_clause}
             {where}
-            ORDER BY {_PHOTO_DATE_ASC_ORDER}
+            ORDER BY {order}
             LIMIT ? OFFSET ?
         """
         return self.conn.execute(query, params).fetchall()

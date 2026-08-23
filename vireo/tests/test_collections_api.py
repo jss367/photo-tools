@@ -308,6 +308,22 @@ def test_collection_photos_pagination(app_and_db):
     assert data["total"] == 2
 
 
+def test_collection_photos_respects_requested_sort(app_and_db):
+    app, db = app_and_db
+    _clear_default_collections(app, db)
+    client = app.test_client()
+    cid = client.post(
+        "/api/collections", json={"name": "All sorted", "rules": []},
+    ).get_json()["id"]
+
+    response = client.get(f"/api/collections/{cid}/photos?sort=name_desc")
+
+    assert response.status_code == 200
+    assert [photo["filename"] for photo in response.get_json()["photos"]] == [
+        "bird3.jpg", "bird2.jpg", "bird1.jpg",
+    ]
+
+
 def test_collection_add_photos(app_and_db):
     """POST /api/collections/<id>/add-photos adds photo_ids and returns total."""
     app, db = app_and_db

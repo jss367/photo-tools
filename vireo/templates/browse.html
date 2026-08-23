@@ -3291,10 +3291,22 @@ async function toggleBrowseStack(event, coverId) {
   if (!cover || !cover.browse_stack) return;
   var badge = document.querySelector('.grid-card[data-id="' + coverId + '"] .browse-stack-badge');
   if (expandedBrowseStacks.has(coverId)) {
+    var members = browseStackMembers[String(coverId)] || [];
+    var selectedHiddenMember = selectedPhotoId !== coverId && members.some(function(member) {
+      return member.id === selectedPhotoId;
+    });
     expandedBrowseStacks.delete(coverId);
     var tray = document.querySelector('.browse-stack-tray[data-stack-cover-id="' + coverId + '"]');
     if (tray) tray.remove();
     if (badge) badge.setAttribute('aria-expanded', 'false');
+    // A collapsed tray cannot keep a single-photo focus on one of its hidden
+    // members: grid/lightbox navigation now uses the top-level cover list.
+    // Hand that focus back to the visible cover while retaining the warm
+    // member cache for a cheap re-expand and for batch state reconciliation.
+    if (selectedHiddenMember) {
+      var coverIndex = photos.findIndex(function(photo) { return photo.id === coverId; });
+      selectPhoto({shiftKey: false, metaKey: false, ctrlKey: false}, coverId, coverIndex);
+    }
     return;
   }
 
@@ -7036,9 +7048,11 @@ async function applyBestBatchPickOnly() {
       body: JSON.stringify({photo_ids: [bestId], flag: 'flagged'}),
     });
   } catch(e) { return; }
-  var p = photos.find(function(x) { return x.id === bestId; });
+  var p = findBrowsePhoto(bestId);
   if (p) p.flag = 'flagged';
   refreshGridCards([bestId]);
+  refreshExpandedBrowseStackMembers([bestId]);
+  _refreshBatchInspectorIfActive();
   scheduleCollectionCountsRefresh();
   showUndoToast();
   showToast('Flagged best photo.', 'success');
@@ -7055,11 +7069,16 @@ async function applyBestBatchPickAndReject() {
       body: JSON.stringify({best_photo_id: bestId, reject_photo_ids: rejectIds}),
     });
   } catch(e) { return; }
-  [bestId].concat(rejectIds).forEach(function(id) {
-    var p = photos.find(function(x) { return x.id === id; });
-    if (p) p.flag = id === bestId ? 'flagged' : 'rejected';
+  var touchedIds = [bestId].concat(rejectIds);
+  touchedIds.forEach(function(id) {
+    var p = findBrowsePhoto(id);
+    var flag = id === bestId ? 'flagged' : 'rejected';
+    if (p) p.flag = flag;
+    _clearRepresentativeStateIfIneligible(id, flag);
   });
-  refreshGridCards([bestId].concat(rejectIds));
+  refreshGridCards(touchedIds);
+  refreshExpandedBrowseStackMembers(touchedIds);
+  _refreshBatchInspectorIfActive();
   scheduleCollectionCountsRefresh();
   showUndoToast();
   showToast('Applied best-batch flags.', 'success');

@@ -25125,6 +25125,37 @@ def test_query_browse_stacks_collapses_duplicates_and_bursts(tmp_path):
     assert filtered[0]["_browse_stack_kind"] is None
 
 
+def test_visual_stack_cover_prefers_zero_rating_over_null(tmp_path):
+    db, fid = _filter_db(tmp_path)
+    zero_id = db.add_photo(
+        folder_id=fid, filename="zero.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0,
+    )
+    null_id = db.add_photo(
+        folder_id=fid, filename="null.jpg", extension=".jpg",
+        file_size=999, file_mtime=1.0,
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id = 'visual-burst', rating = 0, "
+        "width = 1, height = 1 WHERE id = ?",
+        (zero_id,),
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id = 'visual-burst', rating = NULL, "
+        "width = 999, height = 999 WHERE id = ?",
+        (null_id,),
+    )
+    db.conn.commit()
+
+    items = db.collapse_browse_stack_photo_ids([null_id, zero_id])
+
+    assert items == [{
+        "cover_id": zero_id,
+        "kind": "burst",
+        "member_ids": [null_id, zero_id],
+    }]
+
+
 def test_get_filter_field_values_counts_respect_rules(tmp_path):
     import pytest
     db, fid = _filter_db(tmp_path)

@@ -23222,6 +23222,7 @@ class Database:
                 row["quality_score"] if row["quality_score"] is not None else float("-inf"),
                 row["subject_sharpness"] if row["subject_sharpness"] is not None else float("-inf"),
                 row["sharpness"] if row["sharpness"] is not None else float("-inf"),
+                row["rating"] is not None,
                 row["rating"] if row["rating"] is not None else 0,
                 (row["width"] or 0) * (row["height"] or 0),
                 row["file_size"] or 0,

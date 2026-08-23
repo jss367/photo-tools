@@ -59,10 +59,27 @@ class TimmClassifier:
                     "Download the model from the Models page in Settings."
                 )
 
+        import models as _models_mod
+
+        # Installs that predate the label_descriptions.json export have no
+        # scientific→common mapping and leak raw binomials ("Bubulcus
+        # ibis") into predictions whenever the taxonomy fallback misses.
+        # Best-effort self-heal before the file is read; offline failures
+        # keep the taxonomy fallback.
+        if not os.path.isfile(label_desc_path):
+            try:
+                _models_mod.ensure_timm_label_descriptions(
+                    model_dir, model_str,
+                )
+            except Exception as e:
+                log.info(
+                    "label_descriptions self-heal failed for %s: %s",
+                    model_str, e,
+                )
+
         # Load ONNX session with self-heal on corruption: if the bytes
         # are truncated / partial, delete them and re-download once
         # rather than bricking the classify pipeline.
-        import models as _models_mod
 
         redownload = _models_mod.build_self_heal_redownloader(model_dir)
         log.info("Loading timm ONNX model: %s", model_path)

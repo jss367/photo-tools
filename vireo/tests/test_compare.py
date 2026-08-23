@@ -199,3 +199,40 @@ def test_compare_prediction_multi_species_refinement_beats_conflict():
         )
         assert result["category"] == "refinement"
         assert result["matched_keyword"] == "sparrow"
+
+
+def test_outdated_binomial_matches_via_synonym(monkeypatch):
+    """A 2021-era scientific name resolves through the synonym map and is
+    compared taxonomically instead of flagged 'Unknown prediction'."""
+    import taxonomy as tax_mod
+    from compare import compare_prediction_to_keywords
+
+    entry = {
+        "taxon_id": 1289388,
+        "scientific_name": "Ardea ibis",
+        "common_name": "Western Cattle-Egret",
+        "rank": "species",
+        "lineage_names": ["Animalia", "Chordata", "Aves", "Pelecaniformes",
+                          "Ardeidae", "Ardea", "Ardea ibis"],
+        "lineage_ranks": ["kingdom", "phylum", "class", "order", "family",
+                          "genus", "species"],
+    }
+    taxonomy = {
+        "taxa_by_common": {"western cattle-egret": entry},
+        "taxa_by_scientific": {"ardea ibis": entry},
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "taxonomy.json")
+        with open(path, "w") as f:
+            json.dump(taxonomy, f)
+        monkeypatch.setattr(
+            tax_mod, "_SCIENTIFIC_SYNONYMS",
+            {"bubulcus ibis": "Ardea ibis"},
+        )
+        tax = tax_mod.Taxonomy(path)
+
+        result = compare_prediction_to_keywords(
+            "Bubulcus ibis", ["Western Cattle-Egret"], tax
+        )
+        assert result["category"] == "match"
+        assert result["matched_keyword"] == "Western Cattle-Egret"

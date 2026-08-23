@@ -21430,3 +21430,63 @@ def test_browse_reject_reporter_names_workspace_detach_skips(app_and_db):
     # cannot drift back apart on this one signal.
     accept_body = _browse_js_function_body(html, "function _reportSkippedAccepts(")
     assert "skipped_out_of_workspace" in accept_body
+
+
+def test_compare_payload_carries_canonical_species(app_and_db, tmp_path):
+    """Predictions naming the same taxon differently (common name vs an
+    outdated binomial) share one canonical_species key so the ID Conflicts
+    page can group them as agreement instead of a false model conflict."""
+    from unittest.mock import patch
+
+    import taxonomy as tax_mod
+
+    app, db = app_and_db
+    photo_id = db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 1"
+    ).fetchone()["id"]
+    det_id = db.save_detections(photo_id, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="MDV6")[0]
+    db.add_prediction(det_id, "Western Cattle-Egret", 1.0, "model-a")
+    db.add_prediction(det_id, "Bubulcus ibis", 0.9, "model-b")
+    db.add_prediction(det_id, "Mystery Beast", 0.5, "model-c")
+    cid = db.add_collection(
+        "Canonical", json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+
+    entry = {
+        "taxon_id": 1289388,
+        "scientific_name": "Ardea ibis",
+        "common_name": "Western Cattle-Egret",
+        "rank": "species",
+        "lineage_names": ["Animalia", "Chordata", "Aves", "Pelecaniformes",
+                          "Ardeidae", "Ardea", "Ardea ibis"],
+        "lineage_ranks": ["kingdom", "phylum", "class", "order", "family",
+                          "genus", "species"],
+    }
+    tax_path = tmp_path / "taxonomy.json"
+    tax_path.write_text(json.dumps({
+        "taxa_by_common": {"western cattle-egret": entry},
+        "taxa_by_scientific": {"ardea ibis": entry},
+    }))
+    with patch.object(
+        tax_mod, "_SCIENTIFIC_SYNONYMS", {"bubulcus ibis": "Ardea ibis"},
+    ), patch(
+        "taxonomy.load_local_taxonomy",
+        return_value=tax_mod.Taxonomy(str(tax_path)),
+    ):
+        resp = app.test_client().get(
+            f"/api/predictions/compare?collection_id={cid}"
+        )
+
+    assert resp.status_code == 200
+    preds = resp.get_json()["photos"][0]["predictions"]
+    canonical_a = preds["model-a"][0]["canonical_species"]
+    canonical_b = preds["model-b"][0]["canonical_species"]
+    canonical_c = preds["model-c"][0]["canonical_species"]
+    assert canonical_a == canonical_b
+    assert canonical_a == "taxon:1289388"
+    # Unresolvable names fall back to normalized text so same-string
+    # predictions still group together.
+    assert canonical_c == "mystery beast"

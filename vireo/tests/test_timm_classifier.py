@@ -445,3 +445,66 @@ def test_classify_batch_skips_gpu_lock_for_cpu_only_session(tmp_path):
     assert snapshots["during_run"] == baseline, (
         "CPU-only session must not take the GPU semaphore in the batched path"
     )
+
+
+def test_missing_label_descriptions_self_heals(tmp_path):
+    """A model dir without label_descriptions.json triggers the models
+    self-heal hook; the healed file is used for common-name mapping."""
+    from timm_classifier import TimmClassifier
+
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+    fake_session = _make_fake_session()
+
+    def _fake_ensure(dir_arg, model_str, progress_callback=None):
+        assert dir_arg == str(model_dir)
+        with open(os.path.join(dir_arg, "label_descriptions.json"), "w") as f:
+            json.dump({"Sturnus vulgaris": "European Starling, Bird"}, f)
+        return True
+
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions", side_effect=_fake_ensure) as ensure:
+        clf = TimmClassifier(
+            "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+        )
+
+    assert ensure.called
+    assert clf._common_names["sturnus vulgaris"] == "European Starling"
+
+
+def test_self_heal_failure_keeps_classifier_working(tmp_path):
+    """When the self-heal can't produce the file (offline), the classifier
+    still constructs and falls back to taxonomy/scientific names."""
+    from timm_classifier import TimmClassifier
+
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+    fake_session = _make_fake_session()
+
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions", side_effect=OSError("offline")):
+        clf = TimmClassifier(
+            "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+        )
+
+    assert clf._common_names == {}
+    assert clf._resolve_common_name("Sturnus vulgaris") == "Sturnus vulgaris"
+
+
+def test_present_label_descriptions_skips_self_heal(tmp_path):
+    """No self-heal attempt when the file is already on disk."""
+    from timm_classifier import TimmClassifier
+
+    _make_model_dir(tmp_path)
+    fake_session = _make_fake_session()
+
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions") as ensure:
+        TimmClassifier(
+            "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+        )
+
+    assert not ensure.called

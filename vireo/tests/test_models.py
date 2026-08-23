@@ -2177,3 +2177,121 @@ def test_tree_of_life_ready_false_when_model_dir_missing():
     assert tree_of_life_ready(
         "hf-hub:imageomics/bioclip-2.5-vith14", ""
     ) is False
+
+
+# ---------------------------------------------------------------------------
+# ensure_timm_label_descriptions — self-heal for installs that predate the
+# label_descriptions.json export (they show raw scientific names in the UI)
+# ---------------------------------------------------------------------------
+
+_TIMM_MODEL_STR = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+
+
+def test_ensure_label_descriptions_noop_when_present(tmp_path, monkeypatch):
+    """An existing file short-circuits — no network calls at all."""
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+    target.write_text(json.dumps({"Sturnus vulgaris": "European Starling, Bird"}))
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("network path must not run when file exists")
+
+    monkeypatch.setattr(models, "_download_optional_files", _boom)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is True
+    # File untouched
+    assert json.loads(target.read_text()) == {
+        "Sturnus vulgaris": "European Starling, Bird"
+    }
+
+
+def test_ensure_label_descriptions_via_onnx_repo(tmp_path, monkeypatch):
+    """First preference: the vireo ONNX repo's optional-file download."""
+    import models
+
+    def _fake_optional(filenames, model_dir, hf_subdir, *args, **kwargs):
+        assert filenames == ["label_descriptions.json"]
+        assert hf_subdir == "timm-eva02-large-inat21"
+        with open(os.path.join(model_dir, "label_descriptions.json"), "w") as f:
+            json.dump({"Bubulcus ibis": "Cattle Egret, Bird"}, f)
+
+    monkeypatch.setattr(models, "_download_optional_files", _fake_optional)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is True
+    with open(tmp_path / "label_descriptions.json") as f:
+        assert json.load(f) == {"Bubulcus ibis": "Cattle Egret, Bird"}
+
+
+def test_ensure_label_descriptions_derives_from_upstream_config(
+    tmp_path, monkeypatch
+):
+    """When the ONNX repo doesn't have the file, derive it from the
+    upstream timm repo's config.json, which embeds label_descriptions."""
+    import models
+
+    monkeypatch.setattr(
+        models, "_download_optional_files", lambda *a, **k: None
+    )
+
+    upstream = tmp_path / "upstream-config.json"
+    upstream.write_text(json.dumps({
+        "architecture": "eva02_large_patch14_clip_336",
+        "label_names": ["Bubulcus ibis"],
+        "label_descriptions": {"Bubulcus ibis": "Cattle Egret, Bird"},
+    }))
+
+    monkeypatch.setattr(
+        models, "_load_upstream_timm_config",
+        lambda model_str: json.loads(upstream.read_text()),
+    )
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    assert models.ensure_timm_label_descriptions(
+        str(model_dir), _TIMM_MODEL_STR
+    ) is True
+    with open(model_dir / "label_descriptions.json") as f:
+        # Only the descriptions mapping is written, not the whole config
+        assert json.load(f) == {"Bubulcus ibis": "Cattle Egret, Bird"}
+
+
+def test_ensure_label_descriptions_upstream_missing_key(tmp_path, monkeypatch):
+    """An upstream config without label_descriptions fails gracefully."""
+    import models
+
+    monkeypatch.setattr(
+        models, "_download_optional_files", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        models, "_load_upstream_timm_config",
+        lambda model_str: {"architecture": "eva02"},
+    )
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is False
+    assert not (tmp_path / "label_descriptions.json").exists()
+
+
+def test_ensure_label_descriptions_survives_network_failure(
+    tmp_path, monkeypatch
+):
+    """Total network failure returns False without raising or leaving
+    partial files — the classifier keeps working with taxonomy fallback."""
+    import models
+
+    def _boom(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(models, "_download_optional_files", _boom)
+    monkeypatch.setattr(models, "_load_upstream_timm_config", _boom)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is False
+    assert not (tmp_path / "label_descriptions.json").exists()

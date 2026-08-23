@@ -1037,6 +1037,100 @@ def _download_optional_files(
                     os.unlink(local_path)
 
 
+def _load_upstream_timm_config(model_str):
+    """Fetch the upstream timm repo's config.json for a hf-hub model_str.
+
+    The timm config embeds ``label_descriptions`` ({"Sturnus vulgaris":
+    "European Starling, Bird"}) alongside the label names, so it can
+    reconstruct the common-name mapping even when our ONNX repo predates
+    the label_descriptions.json export.
+    """
+    from huggingface_hub import hf_hub_download
+
+    repo_id = model_str.removeprefix("hf-hub:")
+    config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
+    with open(config_path) as f:
+        return json.load(f)
+
+
+def ensure_timm_label_descriptions(model_dir, model_str, progress_callback=None):
+    """Self-heal a missing label_descriptions.json for a timm model.
+
+    Installs that predate the label_descriptions.json export resolve
+    common names through taxonomy.json alone; when that lookup misses
+    (e.g. the 2021 class list says "Bubulcus ibis" but the current
+    taxonomy renamed it to "Ardea ibis"), the raw scientific name leaks
+    into predictions and the review UI. Try, in order:
+
+    1. nothing to do — the file already exists
+    2. the vireo ONNX repo's copy (normal optional-file path)
+    3. derive it from the upstream timm repo's config.json, which embeds
+       the same {"Genus species": "Common Name, Category"} mapping
+
+    Best-effort: never raises; returns True when the file exists
+    afterwards.
+    """
+    target = os.path.join(model_dir, "label_descriptions.json")
+    if os.path.isfile(target):
+        return True
+
+    km = next(
+        (m for m in KNOWN_MODELS if m.get("model_str") == model_str), None
+    )
+    if km and "label_descriptions.json" in (km.get("optional_files") or []):
+        try:
+            _download_optional_files(
+                ["label_descriptions.json"], model_dir,
+                km.get("hf_subdir", km["id"]), {}, None, progress_callback,
+            )
+        except Exception as e:
+            log.info(
+                "Optional label_descriptions.json download failed for %s: %s",
+                model_str, e,
+            )
+        if os.path.isfile(target):
+            log.info(
+                "Self-healed label_descriptions.json for %s from %s",
+                model_str, ONNX_REPO,
+            )
+            return True
+
+    try:
+        config = _load_upstream_timm_config(model_str)
+    except Exception as e:
+        log.info(
+            "Could not fetch upstream timm config for %s: %s. "
+            "Predictions keep using taxonomy-based common names.",
+            model_str, e,
+        )
+        return False
+
+    descs = config.get("label_descriptions")
+    if not isinstance(descs, dict) or not descs:
+        log.info(
+            "Upstream timm config for %s has no label_descriptions; "
+            "cannot self-heal common names.", model_str,
+        )
+        return False
+
+    tmp_target = target + ".tmp"
+    try:
+        with open(tmp_target, "w") as f:
+            json.dump(descs, f)
+        os.replace(tmp_target, target)
+    except OSError as e:
+        log.warning("Could not write %s: %s", target, e)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_target)
+        return False
+
+    log.info(
+        "Self-healed label_descriptions.json for %s from upstream timm "
+        "config (%d entries)", model_str, len(descs),
+    )
+    return True
+
+
 def _purge_hf_cache_file(filename, hf_subdir, revision=None):
     """Delete a cached file from the HuggingFace cache so the next
     hf_hub_download call fetches fresh bytes instead of returning the

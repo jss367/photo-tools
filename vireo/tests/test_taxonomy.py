@@ -3369,3 +3369,96 @@ def test_deleted_taxonomy_with_no_fallback_releases_the_cache(tmp_path, monkeypa
         assert tax_mod._taxonomy_cache is None, (
             "an unservable taxonomy must not stay resident for the process"
         )
+
+
+# ---------------------------------------------------------------------------
+# Scientific-name synonyms — old binomials (e.g. from the 2021-era iNat21
+# class list) must resolve to the current taxonomy entry instead of missing.
+# ---------------------------------------------------------------------------
+
+def _add_cattle_egret(taxonomy_path):
+    """Extend a mock taxonomy.json with the renamed cattle egret."""
+    entry = {
+        "taxon_id": 1289388,
+        "scientific_name": "Ardea ibis",
+        "common_name": "Western Cattle-Egret",
+        "rank": "species",
+        "lineage_names": ["Animalia", "Chordata", "Aves", "Pelecaniformes",
+                          "Ardeidae", "Ardea", "Ardea ibis"],
+        "lineage_ranks": ["kingdom", "phylum", "class", "order", "family",
+                          "genus", "species"],
+    }
+    with open(taxonomy_path) as f:
+        data = json.load(f)
+    data["taxa_by_scientific"]["ardea ibis"] = entry
+    data["taxa_by_common"]["western cattle-egret"] = entry
+    with open(taxonomy_path, "w") as f:
+        json.dump(data, f)
+
+
+def test_lookup_resolves_scientific_synonym(monkeypatch):
+    """An outdated binomial resolves to the current taxon via synonyms."""
+    import taxonomy as tax_mod
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tax_path = _create_mock_taxonomy(tmpdir)
+        _add_cattle_egret(tax_path)
+        monkeypatch.setattr(
+            tax_mod, "_SCIENTIFIC_SYNONYMS",
+            {"bubulcus ibis": "Ardea ibis"},
+        )
+        tax = tax_mod.Taxonomy(tax_path)
+
+        result = tax.lookup("Bubulcus ibis")
+        assert result is not None
+        assert result["scientific_name"] == "Ardea ibis"
+        assert tax.is_taxon("Bubulcus ibis")
+        assert tax.relationship("Ardea ibis", "Bubulcus ibis") == "same"
+
+
+def test_lookup_direct_hit_beats_synonym(monkeypatch):
+    """A name present in the current taxonomy ignores any synonym entry."""
+    import taxonomy as tax_mod
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tax_path = _create_mock_taxonomy(tmpdir)
+        monkeypatch.setattr(
+            tax_mod, "_SCIENTIFIC_SYNONYMS",
+            {"melospiza melodia": "Anas platyrhynchos"},
+        )
+        tax = tax_mod.Taxonomy(tax_path)
+
+        result = tax.lookup("Melospiza melodia")
+        assert result["scientific_name"] == "Melospiza melodia"
+
+
+def test_lookup_synonym_missing_target_returns_none(monkeypatch):
+    """A synonym whose target isn't in the local taxonomy fails cleanly."""
+    import taxonomy as tax_mod
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tax_path = _create_mock_taxonomy(tmpdir)
+        monkeypatch.setattr(
+            tax_mod, "_SCIENTIFIC_SYNONYMS",
+            {"bubulcus ibis": "Ardea ibis"},
+        )
+        tax = tax_mod.Taxonomy(tax_path)
+
+        assert tax.lookup("Bubulcus ibis") is None
+
+
+def test_shipped_synonym_data_is_well_formed():
+    """The packaged synonym file loads and covers the known offenders."""
+    import taxonomy as tax_mod
+
+    synonyms = tax_mod.load_scientific_synonyms()
+    assert isinstance(synonyms, dict)
+    assert len(synonyms) > 100
+    for old, current in synonyms.items():
+        assert old == old.lower().strip(), old
+        assert isinstance(current, str) and current.strip(), old
+        # A synonym mapping a name to itself would shadow nothing but
+        # suggests a broken generator run.
+        assert old != current.lower(), old
+    assert synonyms["bubulcus ibis"] == "Ardea ibis"
+    assert synonyms["phalacrocorax brasilianus"] == "Nannopterum brasilianum"

@@ -83,6 +83,9 @@ def main():
         # os.path.dirname(__file__) which is _MEIPASS for the entry script.
         "--add-data", f"{os.path.join(vireo_dir, 'templates')}{sep}templates",
         "--add-data", f"{os.path.join(vireo_dir, 'static')}{sep}static",
+        # Packaged data (taxonomy scientific-name synonyms) — taxonomy.py
+        # resolves it relative to os.path.dirname(__file__) too.
+        "--add-data", f"{os.path.join(vireo_dir, 'data')}{sep}data",
         "--hidden-import", "config",
         "--hidden-import", "db",
         "--hidden-import", "jobs",

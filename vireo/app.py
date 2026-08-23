@@ -16933,6 +16933,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         edit_recipes_by_photo = db.get_photo_edit_recipes(photo_ids)
         taxonomy = load_local_taxonomy()
 
+        def canonical_species_key(*names):
+            """One identity key per taxon, however a model spelled it.
+
+            Different models name the same taxon differently ("Western
+            Cattle-Egret" vs the outdated binomial "Bubulcus ibis"), and
+            the ID Conflicts page must not read that as a model
+            disagreement. Resolve each candidate name through the taxonomy
+            (synonym-aware) to a taxon id; when nothing resolves, fall
+            back to the first name's normalized text so identical strings
+            still group together.
+            """
+            for candidate in names:
+                if candidate and taxonomy is not None:
+                    taxon = taxonomy.lookup(candidate)
+                    if taxon and taxon.get("taxon_id") is not None:
+                        return f"taxon:{taxon['taxon_id']}"
+            for candidate in names:
+                if candidate:
+                    return str(candidate).strip().lower()
+            return ""
+
         def summarize_photo(row):
             row_keys = row.keys()
             def row_bool(key):
@@ -17038,6 +17059,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "id": d["id"],
                 "detection_id": d["detection_id"],
                 "species": d["species"],
+                "canonical_species": canonical_species_key(
+                    d["species"], comparison_prediction,
+                ),
                 "confidence": d["confidence"],
                 "status": d["status"],
                 "category": comparison["category"],

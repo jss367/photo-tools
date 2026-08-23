@@ -47,6 +47,47 @@ class DownloadCancelled(Exception):
     """Raised when should_cancel() asked us to stop."""
 
 
+# Old scientific name (lowercase) -> current accepted scientific name.
+# taxonomy.json indexes only currently-accepted names, but classifier class
+# lists are frozen at training time (iNat21 is 2021 vintage), so renamed taxa
+# ("Bubulcus ibis" -> "Ardea ibis") would otherwise miss every lookup and
+# leak raw binomials into predictions and needless review conflicts. The map
+# ships with the app (scripts/build_taxonomy_synonyms.py regenerates it) and
+# is consulted only after direct lookups miss.
+SCIENTIFIC_SYNONYMS_PATH = os.path.join(
+    os.path.dirname(__file__), "data", "scientific_name_synonyms.json"
+)
+_SCIENTIFIC_SYNONYMS = None
+_scientific_synonyms_lock = threading.Lock()
+
+
+def load_scientific_synonyms():
+    """Load the packaged scientific-name synonym map (cached per process).
+
+    Returns {} when the data file is missing or unreadable — synonym
+    resolution is an enhancement, never a load-time failure.
+    """
+    global _SCIENTIFIC_SYNONYMS
+    if _SCIENTIFIC_SYNONYMS is not None:
+        return _SCIENTIFIC_SYNONYMS
+    with _scientific_synonyms_lock:
+        if _SCIENTIFIC_SYNONYMS is not None:
+            return _SCIENTIFIC_SYNONYMS
+        try:
+            with open(SCIENTIFIC_SYNONYMS_PATH) as f:
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                raise ValueError("synonym file is not a JSON object")
+        except (OSError, ValueError) as e:
+            log.warning(
+                "Scientific-name synonyms unavailable (%s); outdated "
+                "binomials will not resolve.", e,
+            )
+            loaded = {}
+        _SCIENTIFIC_SYNONYMS = loaded
+    return _SCIENTIFIC_SYNONYMS
+
+
 # `Content-Range: bytes */<total>` — the header a 416 response uses to tell
 # the client what the actual size of the resource is. RFC 7233 §4.2 pins the
 # format; a compliant server puts the total after the slash.
@@ -884,6 +925,14 @@ class Taxonomy:
         result = self._by_scientific.get(key)
         if result:
             return result
+
+        # Outdated binomial? Resolve through the shipped synonym map
+        # (e.g. "Bubulcus ibis" -> current entry for "Ardea ibis").
+        current_name = load_scientific_synonyms().get(key)
+        if current_name:
+            result = self._by_scientific.get(current_name.lower())
+            if result:
+                return result
 
         # Fuzzy: try normalized lookup (handles hyphens, e.g. "scrub jay" vs "scrub-jay")
         return self._by_common_normalized.get(self._normalize(name))

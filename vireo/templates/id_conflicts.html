@@ -1352,7 +1352,12 @@ function photoSignal(photo) {
   var disagreementPrefix = multiSubject && disagreementSubject !== null
     ? 'Subject ' + (disagreementSubject + 1) + ': ' : '';
   signal.model_disagreement_label = disagreementPair
-    ? disagreementPrefix + disagreementPair[0].species + ' vs ' + disagreementPair[1].species
+    // Same rule as the consensus group: name the taxon, not the raw
+    // string one model persisted. "Bubulcus ibis vs Blue Jay" leaks the
+    // outdated binomial into the disagreement note and pill tooltip
+    // exactly as the consensus label used to.
+    ? disagreementPrefix + (disagreementPair[0].display || disagreementPair[0].species) +
+      ' vs ' + (disagreementPair[1].display || disagreementPair[1].species)
     : '';
   signal.consensus_label = consensusCount >= 2 && consensusSpecies
     ? (multiSubject && consensusSubject !== null

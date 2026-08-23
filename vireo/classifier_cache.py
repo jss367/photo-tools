@@ -18,7 +18,10 @@ def _ordered_labels_identity(labels):
     return hashlib.sha256(body).hexdigest()
 
 
-def model_files_fingerprint(weights_path, files=None, optional_files=None):
+def model_files_fingerprint(
+    weights_path, files=None, optional_files=None,
+    optional_files_state=None,
+):
     """Cheap identity for in-process invalidation after model replacement.
 
     ``optional_files`` — filenames declared as ``optional_files`` in the
@@ -29,16 +32,30 @@ def model_files_fingerprint(weights_path, files=None, optional_files=None):
     optional file flips the fingerprint and prevents the pre-repair
     cached classifier — which was constructed without that artifact and
     therefore emits different labels — from being reused.
+
+    ``optional_files_state`` — a ``{filename: (size, mtime_ns) | None}``
+    dict overriding current disk state for the named optional files.
+    Files absent from the dict fall back to a live disk stat. Use this
+    when a constructed classifier has recorded which optional artifacts
+    it actually consumed, so the fingerprint post-construction matches
+    the instance rather than a disk state that a concurrent heal has
+    already changed underneath it — otherwise the stale pre-heal
+    instance would be rekeyed to the healed fingerprint and every later
+    acquirer would reuse it.
     """
     if not weights_path:
         return None
+    state = optional_files_state or {}
     if files:
         names = set(files)
         if optional_files and os.path.isdir(weights_path):
             for name in optional_files:
                 if name in names:
                     continue
-                if os.path.isfile(os.path.join(weights_path, name)):
+                if name in state:
+                    if state[name] is not None:
+                        names.add(name)
+                elif os.path.isfile(os.path.join(weights_path, name)):
                     names.add(name)
         names = sorted(names)
     elif os.path.isdir(weights_path):
@@ -53,6 +70,14 @@ def model_files_fingerprint(weights_path, files=None, optional_files=None):
 
     parts = []
     for name in names:
+        if name in state:
+            snap = state[name]
+            if snap is None:
+                parts.append((name, None, None))
+            else:
+                size, mtime_ns = snap
+                parts.append((name, int(size), int(mtime_ns)))
+            continue
         path = weights_path if name == "__file__" else os.path.join(
             weights_path, name
         )
@@ -73,6 +98,7 @@ def classifier_cache_key(
     files=None,
     optional_files=None,
     taxonomy_fingerprint=None,
+    optional_files_state=None,
 ):
     return (
         "classifier-v2",
@@ -81,7 +107,10 @@ def classifier_cache_key(
         os.path.abspath(weights_path) if weights_path else None,
         _ordered_labels_identity(labels),
         taxonomy_fingerprint,
-        model_files_fingerprint(weights_path, files, optional_files),
+        model_files_fingerprint(
+            weights_path, files, optional_files,
+            optional_files_state=optional_files_state,
+        ),
     )
 
 
@@ -111,7 +140,7 @@ def acquire_cached_classifier(
     optional artifact invalidates the pre-repair classifier entry.
     """
 
-    def _key():
+    def _key(state=None):
         return classifier_cache_key(
             model_type=model_type,
             model_str=model_str,
@@ -120,11 +149,26 @@ def acquire_cached_classifier(
             files=files,
             optional_files=optional_files,
             taxonomy_fingerprint=taxonomy_fingerprint,
+            optional_files_state=state,
         )
+
+    def _post_load_key(instance):
+        # If the constructed classifier recorded which optional
+        # artifacts it actually consumed, key the entry by that snapshot
+        # instead of a fresh disk read. Prevents an async heal that
+        # lands during construction (e.g. TimmClassifier's background
+        # ``label_descriptions.json`` repair completing while the ONNX
+        # session loads) from rekeying a pre-heal instance under the
+        # healed fingerprint — every later acquirer with that same
+        # fingerprint would otherwise reuse the stale classifier that
+        # never read the healed file, leaking raw scientific names
+        # indefinitely.
+        snapshot = getattr(instance, "optional_files_snapshot", None)
+        return _key(state=snapshot)
 
     return get_default_cache().acquire(
         _key(),
         factory,
-        post_load_key=lambda _value: _key(),
+        post_load_key=_post_load_key,
         cancel_check=cancel_check,
     )

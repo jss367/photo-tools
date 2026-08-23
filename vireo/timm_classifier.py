@@ -129,6 +129,29 @@ class TimmClassifier:
         # raise here, brick every classify job).
         descs = _models_mod.load_label_descriptions(label_desc_path)
 
+        # Record what this instance actually consumed for
+        # ``label_descriptions.json`` so ``acquire_cached_classifier``
+        # keys the entry by that state, not by whatever the disk shows
+        # after construction. The heal spawned below can publish the
+        # file mid-construction (network probes can take a full HF
+        # timeout, but they can also finish before the ONNX session
+        # opens); without this snapshot the post-load fingerprint would
+        # match the healed disk state, rekey this pre-heal instance
+        # under the healed fingerprint, and every later classify job
+        # would reuse the stale classifier — its ``_common_names``
+        # stays empty until eviction, so raw scientific names would
+        # leak indefinitely under regular use.
+        label_desc_state = None
+        if descs is not None:
+            try:
+                stat = os.stat(label_desc_path)
+                label_desc_state = (stat.st_size, int(stat.st_mtime_ns))
+            except OSError:
+                pass
+        self.optional_files_snapshot = {
+            "label_descriptions.json": label_desc_state,
+        }
+
         # Spawn the heal off the startup path — the network probes can
         # take a full HF timeout when offline, and classifier construction
         # runs per classify job. This instance proceeds with the taxonomy

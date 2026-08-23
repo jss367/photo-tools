@@ -596,6 +596,84 @@ def test_corrupt_label_descriptions_heals_instead_of_aborting(tmp_path):
     assert clf._resolve_common_name("Sturnus vulgaris") == "Sturnus vulgaris"
 
 
+def test_optional_files_snapshot_records_present_label_descriptions(tmp_path):
+    """When label_descriptions.json is on disk at construction time,
+    the instance records the file's (size, mtime_ns) under
+    ``optional_files_snapshot`` so ``acquire_cached_classifier`` keys
+    the entry by exactly what this instance consumed."""
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    fake_session = _make_fake_session()
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session):
+        clf = TimmClassifier(model_str)
+
+    stat = os.stat(model_dir / "label_descriptions.json")
+    assert clf.optional_files_snapshot == {
+        "label_descriptions.json": (stat.st_size, int(stat.st_mtime_ns)),
+    }
+
+
+def test_optional_files_snapshot_records_absent_label_descriptions(tmp_path):
+    """When label_descriptions.json is missing at construction time,
+    the instance records ``None`` — locking the cache entry to the
+    pre-heal fingerprint. If the background heal lands during
+    construction, the next acquire's disk-based fingerprint will not
+    match and a fresh classifier will be built (which will actually
+    read the healed file), instead of the stale pre-heal instance
+    getting rekeyed to the healed fingerprint and reused forever."""
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+    fake_session = _make_fake_session()
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions", side_effect=OSError("offline")):
+        clf = TimmClassifier(model_str)
+        import timm_classifier as tc
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+
+    assert clf.optional_files_snapshot == {
+        "label_descriptions.json": None,
+    }
+
+
+def test_optional_files_snapshot_records_absent_for_unparseable_file(tmp_path):
+    """A truncated label_descriptions.json is treated as missing by
+    the classifier (it uses the taxonomy fallback), so the snapshot
+    must also mark it absent — otherwise the pre-heal instance would
+    be keyed as if it had consumed the torn file, and the heal that
+    replaces it would not invalidate the cache entry."""
+    from timm_classifier import TimmClassifier
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").write_text(
+        '{"Sturnus vulgaris": "European Star'
+    )
+    fake_session = _make_fake_session()
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session", return_value=fake_session), \
+         patch("models.ensure_timm_label_descriptions", return_value=False):
+        clf = TimmClassifier(model_str)
+        import timm_classifier as tc
+        tc._HEAL_THREADS[model_str].join(timeout=5)
+
+    assert clf.optional_files_snapshot == {
+        "label_descriptions.json": None,
+    }
+
+
 def test_classifier_never_reads_a_repair_it_just_spawned(tmp_path):
     """The instance that spawns the heal must not read the file the heal
     is publishing underneath it — otherwise a partially written file

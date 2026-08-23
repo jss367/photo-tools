@@ -14,6 +14,11 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
             "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
             (burst_ids[1],),
         )
+    db.save_detections(burst_ids[2], [{
+        "box": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4},
+        "confidence": 0.91,
+        "category": "animal",
+    }], detector_model="test-detector")
 
     page.goto(f"{live_server['url']}/browse")
     cards = page.locator("#grid > .grid-card")
@@ -40,6 +45,12 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
     expect(tray).to_contain_text("hawk1.jpg")
     expect(tray).to_contain_text("hawk2.jpg")
     expect(tray).to_contain_text("hawk3.jpg")
+    page.locator("#detBoxToggle").click()
+    expect(tray.locator(
+        f'.browse-stack-member[data-id="{burst_ids[2]}"] .det-box'
+    )).to_be_visible()
+    page.locator("#detBoxToggle").click()
+    expect(tray.locator(".det-box")).to_have_count(0)
     assert page.evaluate(
         """coverId => {
           var cover = photos.find(function(photo) { return photo.id === coverId; });

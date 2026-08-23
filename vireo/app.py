@@ -16963,7 +16963,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     return str(candidate).strip().lower()
             return ""
 
-        def canonical_display_name(*names):
+        def canonical_display_name(raw_species, db_species):
             """Taxonomy-preferred display name that travels with each prediction.
 
             The ID Conflicts page groups predictions by ``canonical_species``,
@@ -16973,10 +16973,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             consensus and multi-subject summaries even though the server
             resolved the taxon. Return the taxonomy's preferred common name
             (falling back to the current scientific name) whenever any
-            candidate resolves; otherwise fall back to the first non-empty
-            raw candidate so the field is always safe to display.
+            candidate resolves.
+
+            When the taxonomy misses, prefer ``db_species`` only when
+            ``resolve_species_display_name`` actually canonicalized the name
+            (a hierarchy alias like ``Desert Verdin`` collapsed onto its
+            root ``Verdin`` — different lowercased spellings). When it only
+            differs by casing, the resolver's last resort applied the
+            keyword-case convention (rewriting an unresolved binomial like
+            ``Bubulcus ibis`` to ``Bubulcus Ibis`` under a title-case
+            convention); keep the model's own spelling in that case so a
+            keyword-storage concern does not mangle a Latin display name.
             """
-            for candidate in names:
+            for candidate in (raw_species, db_species):
                 if candidate and taxonomy is not None:
                     taxon = taxonomy.lookup(candidate)
                     if taxon and taxon.get("taxon_id") is not None:
@@ -16985,10 +16994,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             or taxon.get("scientific_name")
                             or str(candidate).strip()
                         )
-            for candidate in names:
-                if candidate:
-                    return str(candidate).strip()
-            return ""
+            raw_strip = str(raw_species).strip() if raw_species else ""
+            db_strip = str(db_species).strip() if db_species else ""
+            if (
+                db_strip
+                and raw_strip
+                and db_strip.lower() != raw_strip.lower()
+            ):
+                return db_strip
+            if raw_strip:
+                return raw_strip
+            return db_strip
 
         def summarize_photo(row):
             row_keys = row.keys()

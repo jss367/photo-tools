@@ -21736,3 +21736,139 @@ def test_compare_payload_carries_canonical_species(app_and_db, tmp_path):
     assert display_b == "Western Cattle-Egret"
     # Unresolvable names keep their raw form as a safe display fallback.
     assert display_c == "Mystery Beast"
+
+
+def test_compare_canonical_display_prefers_db_canonical_for_aliases(
+    app_and_db, tmp_path,
+):
+    """A hierarchy alias's group displays under the DB-canonical root name.
+
+    Codex P2 follow-up (app.py:17103). ``canonical_species_key`` collapses
+    an alias prediction (``Desert Verdin``) and a root prediction
+    (``Verdin``) into one identity, but ``canonical_display_name`` used to
+    return the *first non-empty raw* candidate. Since the frontend adopts
+    the first group member's display, the consensus label ended up
+    depending on alphabetical model order — ``Desert Verdin`` if the alias
+    model was visited first, ``Verdin`` otherwise. The alias prediction's
+    display must pick up the DB-canonical root so the group's name is
+    stable however the models sort.
+    """
+    from unittest.mock import patch
+
+    import taxonomy as tax_mod
+
+    app, db = app_and_db
+    photo_id = db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 1"
+    ).fetchone()["id"]
+    db.conn.execute(
+        "INSERT INTO taxa (id, name, rank) "
+        "VALUES (556, 'Auriparus flaviceps', 'species')"
+    )
+    root_id = db.conn.execute(
+        "INSERT INTO keywords (name, parent_id, is_species, type, taxon_id) "
+        "VALUES ('Verdin', NULL, 1, 'taxonomy', 556)"
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO keywords (name, parent_id, is_species, type, taxon_id) "
+        "VALUES ('Desert Verdin', ?, 1, 'taxonomy', 556)",
+        (root_id,),
+    )
+    db.conn.commit()
+    assert db.resolve_species_display_name("Desert Verdin") == "Verdin", (
+        "sanity: the DB resolver collapses the alias onto its root"
+    )
+    det_id = db.save_detections(photo_id, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="MDV6")[0]
+    db.add_prediction(det_id, "Desert Verdin", 1.0, "model-a")
+    db.add_prediction(det_id, "Verdin", 0.9, "model-b")
+    cid = db.add_collection(
+        "AliasDisplay",
+        json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+    tax_path = tmp_path / "taxonomy.json"
+    tax_path.write_text(json.dumps(
+        {"taxa_by_common": {}, "taxa_by_scientific": {}}
+    ))
+    with patch(
+        "taxonomy.load_local_taxonomy",
+        return_value=tax_mod.Taxonomy(str(tax_path)),
+    ):
+        resp = app.test_client().get(
+            f"/api/predictions/compare?collection_id={cid}"
+        )
+    assert resp.status_code == 200
+    preds = resp.get_json()["photos"][0]["predictions"]
+    assert preds["model-a"][0]["canonical_species"] == "verdin"
+    assert (
+        preds["model-a"][0]["canonical_species"]
+        == preds["model-b"][0]["canonical_species"]
+    )
+    # The alias prediction now advertises the DB-canonical root as its
+    # display, so a group seeded by that prediction still names the taxon
+    # "Verdin" — not "Desert Verdin", not whichever model sorts first.
+    assert preds["model-a"][0]["canonical_display"] == "Verdin"
+    assert preds["model-b"][0]["canonical_display"] == "Verdin"
+
+
+def test_compare_canonical_display_keeps_raw_when_only_case_differs(
+    app_and_db, tmp_path,
+):
+    """An unresolved binomial keeps the model's own spelling.
+
+    ``resolve_species_display_name``'s last resort applies the keyword-case
+    convention when no keyword row and no linked taxon match. For a Latin
+    binomial the DB has never seen, that rewrites ``Bubulcus ibis`` to
+    ``Bubulcus Ibis`` under a title-case convention. Preferring
+    ``db_species`` unconditionally would leak that mangled case into the ID
+    Conflicts consensus label. The display must keep the model's spelling
+    when the DB-canonical only differs in casing.
+    """
+    from unittest.mock import patch
+
+    import taxonomy as tax_mod
+
+    app, db = app_and_db
+    # Seed enough title-case species keywords for
+    # detect_keyword_case_convention to pick Title Case (needs >= 3 rows
+    # with multiple words); then predict a lowercase-genus binomial the DB
+    # has never seen — resolve_species_display_name will rewrite it to
+    # ``Bubulcus Ibis``.
+    db.add_keyword("Blue Jay", is_species=True)
+    db.add_keyword("Great Cormorant", is_species=True)
+    db.add_keyword("Cattle Egret", is_species=True)
+    resolved = db.resolve_species_display_name("Bubulcus ibis")
+    assert resolved == "Bubulcus Ibis", (
+        f"sanity: title-case convention should re-case the binomial "
+        f"(got {resolved!r})"
+    )
+    photo_id = db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 1"
+    ).fetchone()["id"]
+    det_id = db.save_detections(photo_id, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="MDV6")[0]
+    db.add_prediction(det_id, "Bubulcus ibis", 1.0, "model-a")
+    cid = db.add_collection(
+        "CaseFallback",
+        json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+    tax_path = tmp_path / "taxonomy.json"
+    tax_path.write_text(json.dumps(
+        {"taxa_by_common": {}, "taxa_by_scientific": {}}
+    ))
+    with patch(
+        "taxonomy.load_local_taxonomy",
+        return_value=tax_mod.Taxonomy(str(tax_path)),
+    ):
+        resp = app.test_client().get(
+            f"/api/predictions/compare?collection_id={cid}"
+        )
+    assert resp.status_code == 200
+    preds = resp.get_json()["photos"][0]["predictions"]
+    # Not "Bubulcus Ibis": the model's own lowercase-species spelling wins
+    # because the DB-canonical only re-cased it.
+    assert preds["model-a"][0]["canonical_display"] == "Bubulcus ibis"

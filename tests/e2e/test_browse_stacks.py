@@ -82,6 +82,22 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
     expect(page.locator("#batchCount")).to_have_text("1 selected")
     expect(page.locator("#detailFilename")).to_have_text("hawk3.jpg")
 
+    other_hidden_member = tray.locator(
+        f'.browse-stack-member[data-id="{burst_ids[0]}"]'
+    )
+    other_hidden_member.click(button="right")
+    page.wait_for_function(
+        "photoId => selectedPhotoId === photoId",
+        arg=burst_ids[0],
+    )
+    assert page.evaluate(
+        "coverId => selectedIndex === photos.findIndex(function(photo) { return photo.id === coverId; })",
+        burst_ids[1],
+    )
+    page.evaluate("() => closeContextMenu()")
+    hidden_member.click()
+    expect(page.locator("#detailFilename")).to_have_text("hawk3.jpg")
+
     page.locator("#batchBar button", has_text="Export").click()
     expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
     expect(page.locator("#exportPreview")).to_contain_text("hawk3")
@@ -107,6 +123,18 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
         expect(
             tray.locator(f'.browse-stack-member[data-id="{photo_id}"]')
         ).to_have_class("browse-stack-member selected")
+
+    page.evaluate("() => setSelectionWildlifeExcluded(true)")
+    page.wait_for_function(
+        """ids => ids.every(function(id) {
+          var photo = findBrowsePhoto(id);
+          return photo && photo.wildlife_excluded;
+        })""",
+        arg=burst_ids,
+    )
+    expect(tray.locator(".no-wildlife-badge")).to_have_count(3)
+    page.evaluate("() => setSelectionWildlifeExcluded(false)")
+    expect(tray.locator(".no-wildlife-badge")).to_have_count(0)
 
     page.locator("#batchBar button", has_text="★5").click()
     page.wait_for_function(

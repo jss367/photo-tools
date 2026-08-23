@@ -8681,10 +8681,13 @@ async function setSelectionWildlifeExcluded(excluded) {
     });
   } catch (e) { return; }
   var changed = new Set((data && data.photo_ids) || ids);
-  photos.forEach(function(photo) {
-    if (changed.has(photo.id)) photo.wildlife_excluded = excluded ? 1 : 0;
+  changed.forEach(function(photoId) {
+    var photo = findBrowsePhoto(photoId);
+    if (photo) photo.wildlife_excluded = excluded ? 1 : 0;
   });
-  refreshGridCards(ids);
+  var changedIds = Array.from(changed);
+  refreshGridCards(changedIds);
+  refreshExpandedBrowseStackMembers(changedIds);
   // The selection may have changed while the batch request was in flight.
   // Refresh the current selection so this completion cannot supersede a
   // newer state request with counts and actions for the old photo ids.
@@ -11516,6 +11519,10 @@ document.addEventListener('contextmenu', function(e) {
   if (ids.length === 1 && ids[0] === pid && selectedPhotoId !== pid) {
     selectedPhotoId = pid;
     selectedIndex = photos.findIndex(function(p) { return p.id === pid; });
+    if (selectedIndex < 0) {
+      var coverId = browseStackCoverIdForPhoto(pid);
+      selectedIndex = photos.findIndex(function(p) { return p.id === coverId; });
+    }
     loadDetail(pid);
   }
   refreshCardSelectionVisuals();

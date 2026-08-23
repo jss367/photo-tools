@@ -618,6 +618,12 @@ def test_optional_files_snapshot_records_present_label_descriptions(tmp_path):
     }
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows blocks os.replace() over a file that is still open, so "
+           "the mid-read atomic-republish race this test simulates cannot "
+           "occur on Windows.",
+)
 def test_snapshot_ignores_a_republish_that_lands_after_the_read(tmp_path):
     """The snapshot must describe the bytes this instance parsed, not the
     file sitting at the path once construction moves on.

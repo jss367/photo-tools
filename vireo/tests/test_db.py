@@ -25452,22 +25452,27 @@ def _stacked_vs_unstacked_order(db, sort):
     return stacked_ids, expected_ids, cover_by_member
 
 
-def _sharpness_sort_db(tmp_path, specs):
-    """Seed photos from ``(filename, sharpness, burst_id)`` triples."""
+def _metric_sort_db(tmp_path, column, specs):
+    """Seed photos from ``(filename, value, burst_id)`` triples on ``column``."""
     db, fid = _filter_db(tmp_path)
     ids = {}
-    for filename, sharpness, burst_id in specs:
+    for filename, value, burst_id in specs:
         photo_id = db.add_photo(
             folder_id=fid, filename=filename, extension=".jpg",
             file_size=1, file_mtime=1.0,
         )
         ids[filename] = photo_id
         db.conn.execute(
-            "UPDATE photos SET sharpness = ?, burst_id = ? WHERE id = ?",
-            (sharpness, burst_id, photo_id),
+            f"UPDATE photos SET {column} = ?, burst_id = ? WHERE id = ?",
+            (value, burst_id, photo_id),
         )
     db.conn.commit()
     return db, ids
+
+
+def _sharpness_sort_db(tmp_path, specs):
+    """Seed photos from ``(filename, sharpness, burst_id)`` triples."""
+    return _metric_sort_db(tmp_path, "sharpness", specs)
 
 
 def test_browse_stack_sharpness_asc_null_stack_uses_filename_tiebreak(tmp_path):
@@ -25544,6 +25549,110 @@ def test_browse_stack_sharpness_asc_scored_stacks_keep_softest_first(tmp_path):
     assert stacked_ids[0] == cover_of[ids["unscored-single.jpg"]]
     assert stacked_ids.index(cover_of[ids["soft-burst-1.jpg"]]) < stacked_ids.index(
         cover_of[ids["sharp-burst-1.jpg"]])
+
+
+# Each entry is (sort, column, specs). Every fixture holds a two-photo burst
+# whose leading member under that sort ties with a single, and whose *other*
+# member owns the earlier filename. Reading the tie-break from a whole-stack
+# MIN(filename) therefore lends the stack a filename it does not have at that
+# rank and jumps it ahead of the single.
+_STACK_TIEBREAK_CASES = [
+    ("date", "timestamp", [
+        ("a-burst.jpg", "2024-01-02 00:00:00", "shared-burst"),
+        ("z-burst.jpg", "2024-01-01 00:00:00", "shared-burst"),
+        ("m-single.jpg", "2024-01-01 00:00:00", None),
+    ]),
+    ("date_desc", "timestamp", [
+        ("a-burst.jpg", "2024-01-01 00:00:00", "shared-burst"),
+        ("z-burst.jpg", "2024-01-02 00:00:00", "shared-burst"),
+        ("m-single.jpg", "2024-01-02 00:00:00", None),
+    ]),
+    ("rating", "rating", [
+        ("a-burst.jpg", 1, "shared-burst"),
+        ("z-burst.jpg", 5, "shared-burst"),
+        ("m-single.jpg", 5, None),
+    ]),
+    ("sharpness", "sharpness", [
+        ("a-burst.jpg", 0.2, "shared-burst"),
+        ("z-burst.jpg", 0.9, "shared-burst"),
+        ("m-single.jpg", 0.9, None),
+    ]),
+    ("sharpness_asc", "sharpness", [
+        ("a-burst.jpg", 0.9, "shared-burst"),
+        ("z-burst.jpg", 0.2, "shared-burst"),
+        ("m-single.jpg", 0.2, None),
+    ]),
+    ("quality", "quality_score", [
+        ("a-burst.jpg", 0.2, "shared-burst"),
+        ("z-burst.jpg", 0.9, "shared-burst"),
+        ("m-single.jpg", 0.9, None),
+    ]),
+]
+
+
+@pytest.mark.parametrize(
+    "sort,column,specs", _STACK_TIEBREAK_CASES,
+    ids=[case[0] for case in _STACK_TIEBREAK_CASES],
+)
+def test_browse_stack_tiebreak_comes_from_the_leading_member(
+        tmp_path, sort, column, specs):
+    """Every aggregate sort must break ties on the member it ranks by.
+
+    A burst of a.jpg rated 1 and z.jpg rated 5 sits behind a single m.jpg
+    rated 5 when Stacks is off, because m.jpg beats z.jpg on filename.
+    Combining MAX(rating) with a whole-stack MIN(filename) sorts the burst as
+    (5, "a.jpg") and moves it ahead — the grid and stack-aware Select-all
+    order then change simply because Stacks was toggled (Codex P2 on
+    PR #1561).
+    """
+    db, ids = _metric_sort_db(tmp_path, column, specs)
+
+    stacked_ids, expected_ids, cover_of = _stacked_vs_unstacked_order(db, sort)
+
+    assert stacked_ids == expected_ids
+    # The single ties with the burst's leading member and wins on filename,
+    # so it stays in front of the whole stack.
+    assert stacked_ids.index(cover_of[ids["m-single.jpg"]]) < stacked_ids.index(
+        cover_of[ids["a-burst.jpg"]])
+
+
+@pytest.mark.parametrize(
+    "sort,column,specs", _STACK_TIEBREAK_CASES,
+    ids=[case[0] for case in _STACK_TIEBREAK_CASES],
+)
+def test_browse_stack_tiebreak_keeps_the_stack_first_when_it_wins(
+        tmp_path, sort, column, specs):
+    """Mirror image: renaming the single so it loses the tie must not flip.
+
+    Without this direction the test above would also pass on a rule that
+    merely reverses the bug instead of honouring the filename order.
+    """
+    renamed = [
+        ("zz-single.jpg" if filename == "m-single.jpg" else filename,
+         value, burst_id)
+        for filename, value, burst_id in specs
+    ]
+    db, ids = _metric_sort_db(tmp_path, column, renamed)
+
+    stacked_ids, expected_ids, cover_of = _stacked_vs_unstacked_order(db, sort)
+
+    assert stacked_ids == expected_ids
+    assert stacked_ids.index(cover_of[ids["a-burst.jpg"]]) < stacked_ids.index(
+        cover_of[ids["zz-single.jpg"]])
+
+
+@pytest.mark.parametrize("sort", ["name", "name_desc"])
+def test_browse_stack_name_sorts_mirror_unstacked_order(tmp_path, sort):
+    """Filename sorts stay in lockstep with the unstacked list too."""
+    db, ids = _metric_sort_db(tmp_path, "sharpness", [
+        ("a-burst.jpg", 0.2, "shared-burst"),
+        ("z-burst.jpg", 0.9, "shared-burst"),
+        ("m-single.jpg", 0.9, None),
+    ])
+
+    stacked_ids, expected_ids, _ = _stacked_vs_unstacked_order(db, sort)
+
+    assert stacked_ids == expected_ids
 
 
 def test_get_filter_field_values_counts_respect_rules(tmp_path):

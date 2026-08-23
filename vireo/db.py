@@ -23084,47 +23084,111 @@ class Database:
         id ASC
     """
 
-    _STACK_SORT_ORDERS = {
-        "date": (
-            "_stack_min_timestamp IS NULL, _stack_min_timestamp ASC, "
-            "_stack_min_filename ASC, id ASC"
-        ),
-        "date_desc": (
-            "_stack_max_timestamp IS NULL, _stack_max_timestamp DESC, "
-            "_stack_min_filename ASC, id ASC"
-        ),
-        "name": "_stack_min_filename ASC, id ASC",
-        "name_desc": "_stack_max_filename DESC, id ASC",
-        "rating": (
-            "_stack_max_rating IS NULL, _stack_max_rating DESC, "
-            "_stack_min_filename ASC, id ASC"
-        ),
-        "sharpness": (
-            "_stack_max_sharpness DESC, _stack_min_filename ASC, id ASC"
-        ),
-        # Mirrors the unstacked key `p.sharpness ASC, p.filename ASC`:
-        # SQLite sorts NULL first, so unscored logical items lead and
-        # then fall through to the same filename tie-breaker.
-        "sharpness_asc": (
-            "_stack_softest_sharpness ASC, _stack_min_filename ASC, id ASC"
-        ),
-        "quality": (
-            "_stack_max_quality DESC, _stack_min_filename ASC, id ASC"
-        ),
+    # Every stacked sort places a stack exactly where its *leading member* —
+    # the member that would come first in the unstacked list — sits, so
+    # toggling Stacks never reorders anything.
+    #
+    # ``member`` is the unstacked ORDER BY (see the identical ``sort_map`` in
+    # query_photos / query_photos_for_rules / query_photo_ids) applied inside
+    # the stack, so FIRST_VALUE over it yields that leading member; ``key`` is
+    # the column the primary term reads; ``order`` re-applies the same
+    # comparator to the leading member's values.
+    #
+    # Aggregating each term independently is what breaks: MAX(rating) with
+    # MIN(filename) reads two different members, so a burst of a.jpg rated 1
+    # and z.jpg rated 5 sorts as (5, "a.jpg") and jumps ahead of a single
+    # m.jpg rated 5 that outranks z.jpg with Stacks off. An order that
+    # silently depends on the Stacks toggle is exactly the hidden behaviour
+    # CORE_PHILOSOPHY's "no black boxes" rule forbids in a culling workflow
+    # (Codex P2 on PR #1561).
+    _STACK_SORT_SPECS = {
+        "date": {
+            "member": "timestamp IS NULL, timestamp ASC, filename ASC, id ASC",
+            "key": "timestamp",
+            "order": (
+                "_stack_lead_key IS NULL, _stack_lead_key ASC, "
+                "_stack_lead_filename ASC, _stack_lead_id ASC"
+            ),
+        },
+        "date_desc": {
+            "member": "timestamp IS NULL, timestamp DESC, filename ASC, id ASC",
+            "key": "timestamp",
+            "order": (
+                "_stack_lead_key IS NULL, _stack_lead_key DESC, "
+                "_stack_lead_filename ASC, _stack_lead_id ASC"
+            ),
+        },
+        "name": {
+            "member": "filename ASC, id ASC",
+            "key": "filename",
+            "order": "_stack_lead_filename ASC, _stack_lead_id ASC",
+        },
+        "name_desc": {
+            "member": "filename DESC, id ASC",
+            "key": "filename",
+            "order": "_stack_lead_filename DESC, _stack_lead_id ASC",
+        },
+        "rating": {
+            "member": "rating DESC, filename ASC, id ASC",
+            "key": "rating",
+            "order": (
+                "_stack_lead_key DESC, _stack_lead_filename ASC, "
+                "_stack_lead_id ASC"
+            ),
+        },
+        "sharpness": {
+            "member": "sharpness DESC, filename ASC, id ASC",
+            "key": "sharpness",
+            "order": (
+                "_stack_lead_key DESC, _stack_lead_filename ASC, "
+                "_stack_lead_id ASC"
+            ),
+        },
+        # Softest-first treats a stack as only as sharp as its softest
+        # member, and a stack holding any unscored member is itself unscored
+        # — both fall out of the leading-member rule for free, because
+        # SQLite's ASC sorts NULL first and the smallest score next.
+        "sharpness_asc": {
+            "member": "sharpness ASC, filename ASC, id ASC",
+            "key": "sharpness",
+            "order": (
+                "_stack_lead_key ASC, _stack_lead_filename ASC, "
+                "_stack_lead_id ASC"
+            ),
+        },
+        "quality": {
+            "member": "quality_score DESC, filename ASC, id ASC",
+            "key": "quality_score",
+            "order": (
+                "_stack_lead_key DESC, _stack_lead_filename ASC, "
+                "_stack_lead_id ASC"
+            ),
+        },
     }
 
-    def _stack_sort_clause(self, sort):
-        return self._STACK_SORT_ORDERS.get(sort, self._STACK_SORT_ORDERS["date"])
+    def _stack_sort_spec(self, sort):
+        return self._STACK_SORT_SPECS.get(sort, self._STACK_SORT_SPECS["date"])
 
-    def _ranked_stack_query(self, rules, collection_id=None, folder_id=None):
+    def _stack_sort_clause(self, sort):
+        return self._stack_sort_spec(sort)["order"]
+
+    def _ranked_stack_query(self, rules, sort="date", collection_id=None,
+                            folder_id=None):
         """Return the CTE + ``ranked`` window-function block shared by every
         stack-projected query. Callers append their own outer SELECT (with
         ORDER BY and optional LIMIT/OFFSET).
+
+        ``sort`` selects which member each stack's ``_stack_lead_*`` columns
+        are read from, so it must match the ``_stack_sort_clause(sort)`` the
+        caller orders by.
         """
         ctes, params = self._browse_stack_query_parts(
             rules, collection_id=collection_id, folder_id=folder_id,
         )
         cover_order = self._STACK_COVER_ORDER
+        spec = self._stack_sort_spec(sort)
+        member_order = spec["member"]
+        lead_key = spec["key"]
         ranked = ctes + f"""
             , ranked AS (
                 SELECT keyed.*,
@@ -23139,31 +23203,20 @@ class Database:
                            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
                        )
                            AS _browse_stack_member_ids,
-                       MIN(timestamp) OVER (PARTITION BY _stack_key)
-                           AS _stack_min_timestamp,
-                       MAX(timestamp) OVER (PARTITION BY _stack_key)
-                           AS _stack_max_timestamp,
-                       MIN(filename) OVER (PARTITION BY _stack_key)
-                           AS _stack_min_filename,
-                       MAX(filename) OVER (PARTITION BY _stack_key)
-                           AS _stack_max_filename,
-                       MAX(rating) OVER (PARTITION BY _stack_key)
-                           AS _stack_max_rating,
-                       MAX(sharpness) OVER (PARTITION BY _stack_key)
-                           AS _stack_max_sharpness,
-                       -- Softest-first treats a stack as only as sharp as
-                       -- its softest member, and a stack holding any unscored
-                       -- member is itself unscored. MIN() alone silently drops
-                       -- the NULL, which both buries the unscored frame behind
-                       -- scored singles and lets the surviving minimum beat the
-                       -- filename tie-breaker between two unscored items.
-                       CASE
-                         WHEN MAX(sharpness IS NULL)
-                              OVER (PARTITION BY _stack_key) = 1 THEN NULL
-                         ELSE MIN(sharpness) OVER (PARTITION BY _stack_key)
-                       END AS _stack_softest_sharpness,
-                       MAX(quality_score) OVER (PARTITION BY _stack_key)
-                           AS _stack_max_quality
+                       -- The whole sort key is read off one member: the one
+                       -- the unstacked list would show first. Per-term
+                       -- aggregates (MAX(rating) beside MIN(filename)) mix
+                       -- members and move stacks that the unstacked list
+                       -- ranks lower. See _STACK_SORT_SPECS.
+                       FIRST_VALUE({lead_key}) OVER (
+                           PARTITION BY _stack_key ORDER BY {member_order}
+                       ) AS _stack_lead_key,
+                       FIRST_VALUE(filename) OVER (
+                           PARTITION BY _stack_key ORDER BY {member_order}
+                       ) AS _stack_lead_filename,
+                       FIRST_VALUE(id) OVER (
+                           PARTITION BY _stack_key ORDER BY {member_order}
+                       ) AS _stack_lead_id
                 FROM keyed
             )
         """
@@ -23179,7 +23232,7 @@ class Database:
         retain the ordinary photo-list shape.
         """
         ranked, params = self._ranked_stack_query(
-            rules, collection_id=collection_id, folder_id=folder_id,
+            rules, sort=sort, collection_id=collection_id, folder_id=folder_id,
         )
         order = self._stack_sort_clause(sort)
         page = max(1, page)
@@ -23214,7 +23267,7 @@ class Database:
         exposes as ``browse_stack.photo_ids``. Singles carry themselves.
         """
         ranked, params = self._ranked_stack_query(
-            rules, collection_id=collection_id, folder_id=folder_id,
+            rules, sort=sort, collection_id=collection_id, folder_id=folder_id,
         )
         order = self._stack_sort_clause(sort)
         query = ranked + f"""

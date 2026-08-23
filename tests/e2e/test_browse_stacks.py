@@ -1103,6 +1103,174 @@ def test_export_preview_resolves_unloaded_stack_member(live_server, page):
     page.locator("#exportOverlay button", has_text="Cancel").click()
 
 
+def test_color_label_chunk_failure_marks_nothing_fetched(live_server, page):
+    """A failed chunk must never leave ids marked as definitively fetched.
+
+    ``colorLabelsFetched`` is what lets the batch inspector read a missing
+    entry as "no colour set" rather than "not asked yet", so a partly
+    fetched id set must not be marked. Both failure shapes the transport can
+    produce are covered: ``Vireo.api.json`` throws on any non-2xx (an
+    ``{"error": ...}`` body is turned into a rejection, never returned), and
+    resolves to null on an empty body.
+    """
+    page.goto(f"{live_server['url']}/browse")
+    expect(page.locator("#grid > .grid-card")).to_have_count(5)
+
+    outcome = page.evaluate(
+        """async () => {
+          var ids = [];
+          for (var i = 1; i <= 501; i++) ids.push(i);
+          var originalSafeFetch = safeFetch;
+          var results = {};
+          async function run(secondChunk) {
+            colorLabels = {};
+            colorLabelsFetched = new Set();
+            safeFetch = function(url) {
+              if (url.indexOf('/api/photos/color_labels') !== 0) {
+                return originalSafeFetch.apply(this, arguments);
+              }
+              var match = /[?&]ids=([^&]*)/.exec(url);
+              var first = match[1].split(',')[0];
+              if (first === '1') {
+                var ok = {};
+                ok[first] = 'red';
+                return Promise.resolve(ok);
+              }
+              return secondChunk();
+            };
+            try {
+              await fetchColorLabels(ids);
+            } catch (err) {
+              // A rejected chunk propagates; the caller's follow-up is
+              // skipped, which is the fail-closed outcome under test.
+            } finally {
+              safeFetch = originalSafeFetch;
+            }
+            return {
+              fetchedFirst: colorLabelsFetched.has(1),
+              fetchedLast: colorLabelsFetched.has(501),
+              labelFirst: colorLabels['1'] === undefined ? null : colorLabels['1'],
+              strayErrorKey: Object.prototype.hasOwnProperty.call(colorLabels, 'error'),
+            };
+          }
+          results.rejected = await run(function() {
+            // What the transport really does with a {"error": ...} body.
+            var error = new Error('Internal server error');
+            error.status = 500;
+            error.body = {error: 'Internal server error'};
+            return Promise.reject(error);
+          });
+          results.empty = await run(function() { return Promise.resolve(null); });
+          return results;
+        }"""
+    )
+
+    for shape in ("rejected", "empty"):
+        # Neither the succeeded chunk nor the failed one is marked: the
+        # inspector keeps saying "not loaded" instead of "no colour".
+        assert outcome[shape]["fetchedFirst"] is False, shape
+        assert outcome[shape]["fetchedLast"] is False, shape
+        assert outcome[shape]["labelFirst"] is None, shape
+        # And no error payload is merged in as if it were a photo's colour.
+        assert outcome[shape]["strayErrorKey"] is False, shape
+
+
+def test_export_preview_ignores_response_from_a_closed_modal(live_server, page):
+    """A pending preview fetch must not repaint the next modal session.
+
+    ``openExportModal`` drops ``_exportPreviewPhotos`` so a renamed photo
+    cannot be previewed from a stale entry, but closing the modal does not
+    cancel a request already in flight. Left unstamped, that response lands
+    after the reopen, refills the cache that was just cleared, and shows the
+    pre-rename filename the clearing existed to remove — and its surviving
+    in-flight marker stops the new session from asking for itself
+    (CodeRabbit on PR #1561).
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'export-preview-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator("#grid > .grid-card")).to_have_count(3)
+
+    outcome = page.evaluate(
+        r"""async (photoId) => {
+          var originalSafeFetch = safeFetch;
+          var pending = [];
+          safeFetch = function(url) {
+            if (/^\/api\/photos\/\d+$/.test(url)) {
+              var settle;
+              var promise = new Promise(function(resolve) { settle = resolve; });
+              pending.push({url: url, resolve: settle});
+              return promise;
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          var tick = function() {
+            return new Promise(function(resolve) { setTimeout(resolve, 0); });
+          };
+          var previewText = function() {
+            return document.getElementById('exportPreview').textContent;
+          };
+          try {
+            openExportModal([photoId]);
+            await tick();
+            var firstSessionFetches = pending.length;
+            closeExportModal();
+            openExportModal([photoId]);
+            await tick();
+            var fetchesAfterReopen = pending.length;
+            // The first session's response finally arrives.
+            pending[0].resolve({
+              id: photoId, filename: 'renamed-before.jpg',
+              timestamp: null, species: [],
+            });
+            await tick();
+            await tick();
+            var afterStale = previewText();
+            // The reopened session's own request resolves normally.
+            if (pending.length > 1) {
+              pending[1].resolve({
+                id: photoId, filename: 'hawk1.jpg',
+                timestamp: null, species: [],
+              });
+              await tick();
+              await tick();
+            }
+            return {
+              firstSessionFetches: firstSessionFetches,
+              fetchesAfterReopen: fetchesAfterReopen,
+              afterStale: afterStale,
+              afterFresh: previewText(),
+            };
+          } finally {
+            safeFetch = originalSafeFetch;
+            closeExportModal();
+          }
+        }""",
+        burst_ids[0],
+    )
+
+    # The superseded response never reaches the preview...
+    assert "renamed-before" not in outcome["afterStale"]
+    assert "loading" in outcome["afterStale"]
+    # ...and the current session's own response still does.
+    assert outcome["afterFresh"] == "Preview: hawk1.jpg"
+    assert outcome["firstSessionFetches"] == 1
+    # The reopened modal asks for itself instead of adopting the orphan.
+    assert outcome["fetchesAfterReopen"] == 2
+
+
 def test_select_all_matching_puts_stack_cover_first_outside_collections(
     live_server, page
 ):

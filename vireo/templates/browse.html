@@ -12561,6 +12561,16 @@ function openExportModal(photoIds) {
   // particular, the lightbox menu exports the displayed photo even when the
   // Browse grid has a different single- or multi-photo selection behind it.
   _exportPhotoIds = activeIds;
+  // Drop on-demand preview hydration from the previous open so a rename (or
+  // a photo that has since left the workspace) can't be previewed from a
+  // stale cache. Requests still in flight are dropped with it: they carry
+  // the superseded generation and are ignored on arrival, so this session
+  // refetches instead of waiting on (and trusting) their payload. Reset both
+  // maps here — before the control resets below, which fire change handlers
+  // that repaint the preview — so a request this session starts is still
+  // tracked afterwards and cannot be issued twice.
+  _exportPreviewPhotos = {};
+  _exportPreviewFetches = {};
   document.getElementById('exportSubmitBtn').textContent = 'Export ' + activeIds.length + ' photo' + (activeIds.length === 1 ? '' : 's');
   document.getElementById('exportSubmitBtn').disabled = false;
   document.getElementById('exportPreset').value = 'original-jpg';
@@ -12578,10 +12588,6 @@ function openExportModal(photoIds) {
   // Re-applies the last-used preset (saved or built-in) over the defaults
   // and view preferences restored above; async but near-instant locally.
   VireoExportPresets.modalOpened();
-  // Drop on-demand preview hydration from the previous open so a rename
-  // (or a photo that has since left the workspace) can't be previewed from
-  // a stale cache.
-  _exportPreviewPhotos = {};
   updateExportPreview();
 }
 
@@ -12737,22 +12743,37 @@ function hydrateExportPreviewPhoto(photoId) {
   if (photoId == null) return;
   var key = String(photoId);
   if (_exportPreviewFetches[key]) return;
-  _exportPreviewFetches[key] = safeFetch('/api/photos/' + photoId, {}, { toast: false })
+  // Closing the modal does not cancel a fetch already in flight. Without a
+  // generation stamp, that response lands after the next open and writes the
+  // cache openExportModal just cleared, repainting the reopened modal with
+  // the pre-rename name the clearing existed to drop — and because the
+  // pending entry also survives in _exportPreviewFetches, the new session
+  // would never issue its own request. exportRequestGeneration is the
+  // modal's existing request token (bumped on open, close, and export), so
+  // stamp against it rather than adding a second counter.
+  var generation = exportRequestGeneration;
+  var request = safeFetch('/api/photos/' + photoId, {}, { toast: false })
     .then(function(photo) {
+      if (generation !== exportRequestGeneration) return;
       _exportPreviewPhotos[key] = (photo && photo.id != null) ? photo : null;
     })
     .catch(function() {
+      if (generation !== exportRequestGeneration) return;
       _exportPreviewPhotos[key] = null;
     })
     .then(function() {
-      delete _exportPreviewFetches[key];
+      // Only clear the in-flight marker this call installed: a superseded
+      // session must not drop the current session's pending request.
+      if (_exportPreviewFetches[key] === request) delete _exportPreviewFetches[key];
+      if (generation !== exportRequestGeneration) return;
       // Only repaint while the modal is still open; a closed modal has
       // already dropped _exportPhotoIds and would preview a stale id.
       if (document.getElementById('exportOverlay').classList.contains('open')) {
         updateExportPreview();
       }
     });
-  return _exportPreviewFetches[key];
+  _exportPreviewFetches[key] = request;
+  return request;
 }
 
 function updateExportPreview() {

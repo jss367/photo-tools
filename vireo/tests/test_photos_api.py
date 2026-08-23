@@ -11030,6 +11030,47 @@ def test_api_photos_query_basic(app_and_db):
     assert [p["filename"] for p in data["photos"]] == ["bird3.jpg"]
     # species attachment matches /api/photos behavior
     assert "species" in data["photos"][0]
+    assert "browse_stack" not in data["photos"][0]
+
+
+def test_api_photos_query_browse_stacks(app_and_db):
+    app, db = app_and_db
+    listed = db.get_photos(sort="name")
+    first, second = listed[0]["id"], listed[1]["id"]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'processed-burst' WHERE id IN (?, ?)",
+            (first, second),
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (second,),
+        )
+
+    client = app.test_client()
+    response = client.post("/api/photos/query", json={
+        "rules": [], "sort": "name", "stacks": True,
+    })
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["total"] == 2
+    assert data["underlying_total"] == 3
+    stack = next(photo for photo in data["photos"] if photo["browse_stack"])
+    single = next(photo for photo in data["photos"] if not photo["browse_stack"])
+    assert stack["id"] == second
+    assert stack["browse_stack"] == {
+        "kind": "burst", "count": 2, "photo_ids": [first, second],
+    }
+    assert not any(key.startswith("_") for key in stack)
+    assert single["browse_stack"] is None
+
+    # Selection deliberately stays photo-based even while the grid is
+    # projected into stacks.
+    ids_only = client.post("/api/photos/query", json={
+        "rules": [], "sort": "name", "stacks": True, "ids_only": True,
+    }).get_json()
+    assert ids_only["total"] == 3
+    assert set(ids_only["ids"]) == {photo["id"] for photo in listed}
 
 
 def test_api_photos_query_group_tree_and_paging(app_and_db):
@@ -11079,6 +11120,9 @@ def test_api_photos_query_validation(app_and_db, monkeypatch):
     }).status_code == 400
     assert client.post('/api/photos/query', json={
         "rules": [], "sort": {"col": "date"},
+    }).status_code == 400
+    assert client.post('/api/photos/query', json={
+        "rules": [], "stacks": "yes",
     }).status_code == 400
     # A group whose ``rules`` key is ``null`` (or any non-list) must land as
     # a 400 from ``_validate_node``. Before the guard, the active-model

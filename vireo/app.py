@@ -5875,6 +5875,54 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             p["edit_recipe"] = recipe_map.get(p["id"])
         return photo_dicts
 
+    def _prepare_browse_photo_dicts(db, photos, stack_items=None):
+        """Normalize photo rows and attach optional Browse stack summaries."""
+        photo_dicts = [dict(photo) for photo in photos]
+        stacks_by_cover = {
+            item["cover_id"]: item for item in (stack_items or [])
+        }
+        for photo in photo_dicts:
+            projected = (
+                stack_items is not None
+                or "_browse_stack_kind" in photo
+            )
+            kind = photo.pop("_browse_stack_kind", None)
+            raw_count = photo.pop("_browse_stack_count", None)
+            raw_ids = photo.pop("_browse_stack_member_ids", None)
+            # Strip every SQL-only stack helper before the response is
+            # serialized. Their names and values are implementation details;
+            # Browse consumes only the stable summary below.
+            for key in list(photo):
+                if key.startswith("_"):
+                    photo.pop(key, None)
+            item = stacks_by_cover.get(photo.get("id"))
+            if item is not None:
+                kind = item.get("kind")
+                member_ids = list(item.get("member_ids") or [])
+            else:
+                member_ids = []
+                if raw_ids:
+                    member_ids = [
+                        int(value) for value in str(raw_ids).split(",") if value
+                    ]
+            count = len(member_ids) if member_ids else int(raw_count or 1)
+            if projected:
+                photo["browse_stack"] = (
+                    {
+                        "kind": kind,
+                        "count": count,
+                        "photo_ids": member_ids,
+                    }
+                    if kind and count >= 2
+                    else None
+                )
+        _attach_location_statuses(db, photo_dicts)
+        _attach_species(db, photo_dicts)
+        _attach_species_representatives(db, photo_dicts)
+        _attach_detections(db, photo_dicts)
+        _attach_edit_recipes(db, photo_dicts)
+        return photo_dicts
+
     def _attach_nested_edit_recipes(db, payload):
         """Attach edit recipes to nested photo-like dicts in an API payload."""
         refs = []
@@ -6153,6 +6201,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         folder_id = request.args.get("folder_id", None, type=int)
         collection_id = request.args.get("collection_id", None, type=int)
         focus_photo_id = request.args.get("focus_photo_id", None, type=int)
+        # A focused deep link needs the requested photo itself to be a grid
+        # item. If it is a hidden member of a stack, stack pagination cannot
+        # express its position, so focused loads deliberately use ordinary
+        # photo rows; the user can re-enable stacks after the handoff.
+        stacks = _request_bool_arg("stacks") and focus_photo_id is None
 
         # Keep the combined first-paint payload on one SQLite read snapshot.
         # Independent SELECT snapshots can straddle a background folder-health
@@ -6210,31 +6263,46 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if visual_first_paint:
             photos = []
             total = 0
+            underlying_total = 0
             focus_index = None
             focus_page = page
         else:
             try:
-                photos = db.get_photos(
-                    folder_id=folder_id,
-                    collection_id=collection_id,
-                    page=page,
-                    per_page=per_page,
-                    sort=sort,
-                )
+                if stacks:
+                    photos = db.query_browse_stacks(
+                        [], folder_id=folder_id, collection_id=collection_id,
+                        page=page, per_page=per_page, sort=sort,
+                    )
+                    total = db.count_browse_stacks(
+                        [], folder_id=folder_id, collection_id=collection_id,
+                    )
+                    underlying_total = db.count_photos_for_rules(
+                        [], folder_id=folder_id, collection_id=collection_id,
+                    )
+                else:
+                    photos = db.get_photos(
+                        folder_id=folder_id,
+                        collection_id=collection_id,
+                        page=page,
+                        per_page=per_page,
+                        sort=sort,
+                    )
             except ValueError as exc:
                 db.conn.rollback()
                 return json_error(str(exc), 400)
-            if not any([folder_id, collection_id]):
-                total = db.count_photos()
-            else:
-                try:
-                    total = db.count_filtered_photos(
-                        folder_id=folder_id,
-                        collection_id=collection_id,
-                    )
-                except ValueError as exc:
-                    db.conn.rollback()
-                    return json_error(str(exc), 400)
+            if not stacks:
+                if not any([folder_id, collection_id]):
+                    total = db.count_photos()
+                else:
+                    try:
+                        total = db.count_filtered_photos(
+                            folder_id=folder_id,
+                            collection_id=collection_id,
+                        )
+                    except ValueError as exc:
+                        db.conn.rollback()
+                        return json_error(str(exc), 400)
+                underlying_total = total
             # Photo deep links need the target's position in the exact sort
             # order used by this first paint. Returning the zero-based index
             # and its bounded page from this read snapshot avoids probing
@@ -6295,12 +6363,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         keywords = db.get_keyword_tree()
         collections = db.get_collections()
 
-        photo_dicts = [dict(p) for p in photos]
-        _attach_location_statuses(db, photo_dicts)
-        _attach_species(db, photo_dicts)
-        _attach_species_representatives(db, photo_dicts)
-        _attach_detections(db, photo_dicts)
-        _attach_edit_recipes(db, photo_dicts)
+        photo_dicts = _prepare_browse_photo_dicts(db, photos)
         collection_dicts = []
         for c in collections:
             d = dict(c)
@@ -6339,26 +6402,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
             collection_dicts.append(d)
 
-        response = jsonify(
-            {
-                "photos": photo_dicts,
-                "total": total,
-                "page": page,
-                "per_page": per_page,
-                "folders": [dict(f) for f in folders],
-                "keywords": [dict(k) for k in keywords],
-                "collections": collection_dicts,
-                "missing_folder_ids": missing_folder_ids,
-                "folder_health_version": folder_health_version,
-                "focus_index": focus_index,
-                "focus_page": focus_page,
-                # The workspace this tree was scoped to. Browse pins it to
-                # the destructive folder-removal call so a cross-tab
-                # workspace switch between render and click cannot redirect
-                # the DELETE at another workspace.
-                "active_workspace_id": db._ws_id(),
-            }
-        )
+        response_payload = {
+            "photos": photo_dicts,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "folders": [dict(f) for f in folders],
+            "keywords": [dict(k) for k in keywords],
+            "collections": collection_dicts,
+            "missing_folder_ids": missing_folder_ids,
+            "folder_health_version": folder_health_version,
+            "focus_index": focus_index,
+            "focus_page": focus_page,
+            # The workspace this tree was scoped to. Browse pins it to
+            # the destructive folder-removal call so a cross-tab
+            # workspace switch between render and click cannot redirect
+            # the DELETE at another workspace.
+            "active_workspace_id": db._ws_id(),
+        }
+        if stacks:
+            response_payload["underlying_total"] = underlying_total
+        response = jsonify(response_payload)
         # End the read transaction after every value in the response has been
         # materialized. rollback() is intentional: this endpoint is read-only
         # and it releases the snapshot without implying a write commit.
@@ -7977,6 +8041,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         page = payload.get("page", 1)
         per_page = payload.get("per_page", 50)
         sort = payload.get("sort", "date")
+        stacks = payload.get("stacks", False)
         if not isinstance(page, int) or isinstance(page, bool) or page < 1:
             return json_error("page must be a positive integer", 400)
         if not isinstance(per_page, int) or isinstance(per_page, bool) or per_page < 1:
@@ -7986,6 +8051,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # (not ValueError) and bypass the 400 handler below.
         if not isinstance(sort, str):
             return json_error("sort must be a string", 400)
+        if not isinstance(stacks, bool):
+            return json_error("stacks must be a boolean", 400)
         per_page = min(per_page, _MAX_PER_PAGE)
         collection_id = payload.get("collection_id")
         if collection_id is not None and (
@@ -8030,28 +8097,38 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 if payload.get("ids_only"):
                     return jsonify({"ids": ordered_ids, "total": len(ordered_ids),
                                     "visual": visual_info})
+                stack_items = (
+                    db.collapse_browse_stack_photo_ids(ordered_ids)
+                    if stacks else None
+                )
+                logical_ids = (
+                    [item["cover_id"] for item in stack_items]
+                    if stack_items is not None else ordered_ids
+                )
                 start = (page - 1) * per_page
-                page_ids = ordered_ids[start:start + per_page]
+                page_ids = logical_ids[start:start + per_page]
                 photos_map = db.get_photos_by_ids(page_ids)
-                photo_dicts = [
-                    dict(photos_map[pid]) for pid in page_ids if pid in photos_map
-                ]
+                page_stack_items = (
+                    stack_items[start:start + per_page]
+                    if stack_items is not None else None
+                )
+                photo_dicts = _prepare_browse_photo_dicts(
+                    db,
+                    [photos_map[pid] for pid in page_ids if pid in photos_map],
+                    stack_items=page_stack_items,
+                )
                 for entry in photo_dicts:
                     entry["similarity"] = sims_by_pid.get(entry["id"])
-                _attach_location_statuses(db, photo_dicts)
-                _attach_species(db, photo_dicts)
-                _attach_species_representatives(db, photo_dicts)
-                _attach_detections(db, photo_dicts)
-                _attach_edit_recipes(db, photo_dicts)
-                return jsonify(
-                    {
-                        "photos": photo_dicts,
-                        "total": len(ordered_ids),
-                        "page": page,
-                        "per_page": per_page,
-                        "visual": visual_info,
-                    }
-                )
+                response = {
+                    "photos": photo_dicts,
+                    "total": len(logical_ids),
+                    "page": page,
+                    "per_page": per_page,
+                    "visual": visual_info,
+                }
+                if stacks:
+                    response["underlying_total"] = len(ordered_ids)
+                return jsonify(response)
             # Unhealthy: fall through to metadata-only results with the
             # status attached so the UI can say why — never silently zero.
 
@@ -8069,19 +8146,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 payload_out["visual"] = visual_info
             return jsonify(payload_out)
         try:
-            photos = db.query_photos(rules, sort=sort, page=page, per_page=per_page,
-                                     collection_id=collection_id, folder_id=folder_id)
-            total = db.count_photos_for_rules(rules, collection_id=collection_id,
-                                              folder_id=folder_id)
+            underlying_total = db.count_photos_for_rules(
+                rules, collection_id=collection_id, folder_id=folder_id,
+            )
+            if stacks:
+                photos = db.query_browse_stacks(
+                    rules, sort=sort, page=page, per_page=per_page,
+                    collection_id=collection_id, folder_id=folder_id,
+                )
+                total = db.count_browse_stacks(
+                    rules, collection_id=collection_id, folder_id=folder_id,
+                )
+            else:
+                photos = db.query_photos(
+                    rules, sort=sort, page=page, per_page=per_page,
+                    collection_id=collection_id, folder_id=folder_id,
+                )
+                total = underlying_total
         except ValueError as exc:
             return json_error(str(exc), 400)
 
-        photo_dicts = [dict(p) for p in photos]
-        _attach_location_statuses(db, photo_dicts)
-        _attach_species(db, photo_dicts)
-        _attach_species_representatives(db, photo_dicts)
-        _attach_detections(db, photo_dicts)
-        _attach_edit_recipes(db, photo_dicts)
+        photo_dicts = _prepare_browse_photo_dicts(db, photos)
 
         response = {
             "photos": photo_dicts,
@@ -8089,6 +8174,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "page": page,
             "per_page": per_page,
         }
+        if stacks:
+            response["underlying_total"] = underlying_total
         if visual_info is not None:
             response["visual"] = visual_info
         return jsonify(response)
@@ -8411,6 +8498,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         _attach_species(db, photos)
         _attach_species_representatives(db, photos)
         _attach_detections(db, photos)
+        _attach_edit_recipes(db, photos)
         return jsonify({"photos": photos})
 
     @app.route("/api/capture-time/preview", methods=["POST"])
@@ -13982,32 +14070,40 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         page = request.args.get("page", 1, type=int)
         default_per_page = cfg.load().get("photos_per_page", 50)
         per_page = max(1, min(request.args.get("per_page", default_per_page, type=int), _MAX_PER_PAGE))
+        sort = request.args.get("sort", "date")
+        stacks = _request_bool_arg("stacks")
         # If the saved rules can't be resolved (e.g. an unknown field/op left
         # over from an older schema), surface a 400 instead of a 500 so
         # callers can render a real error — this is the same collection state
         # that /api/collections flags with count_error=True.
         try:
-            photos = db.get_collection_photos(collection_id, page=page, per_page=per_page)
-            total = db.count_collection_photos(collection_id)
+            underlying_total = db.count_collection_photos(collection_id)
+            if stacks:
+                photos = db.query_browse_stacks(
+                    [], collection_id=collection_id, sort=sort,
+                    page=page, per_page=per_page,
+                )
+                total = db.count_browse_stacks([], collection_id=collection_id)
+            else:
+                photos = db.get_collection_photos(
+                    collection_id, page=page, per_page=per_page,
+                )
+                total = underlying_total
         except ValueError as e:
             app.logger.exception(
                 "Collection %s has unresolvable rules", collection_id
             )
             return json_error(f"collection rules cannot be resolved: {e}", 400)
-        photo_dicts = [dict(p) for p in photos]
-        _attach_location_statuses(db, photo_dicts)
-        _attach_species(db, photo_dicts)
-        _attach_species_representatives(db, photo_dicts)
-        _attach_detections(db, photo_dicts)
-        _attach_edit_recipes(db, photo_dicts)
-        return jsonify(
-            {
-                "photos": photo_dicts,
-                "page": page,
-                "per_page": per_page,
-                "total": total,
-            }
-        )
+        photo_dicts = _prepare_browse_photo_dicts(db, photos)
+        response = {
+            "photos": photo_dicts,
+            "page": page,
+            "per_page": per_page,
+            "total": total,
+        }
+        if stacks:
+            response["underlying_total"] = underlying_total
+        return jsonify(response)
 
     @app.route("/api/collections/<int:collection_id>/photo-ids")
     def api_collection_photo_ids(collection_id):

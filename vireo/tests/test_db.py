@@ -25064,6 +25064,67 @@ def test_query_photos_sort_and_paging(tmp_path):
     assert [r["filename"] for r in rows] == ['b.jpg', 'c.jpg']
 
 
+def test_query_browse_stacks_collapses_duplicates_and_bursts(tmp_path):
+    db, fid = _filter_db(tmp_path)
+    ids = {}
+    for name in (
+        "duplicate-a.jpg", "duplicate-best.jpg", "overlap-single.jpg",
+        "burst-a.jpg", "burst-best.jpg", "single.jpg",
+    ):
+        ids[name] = db.add_photo(
+            folder_id=fid, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+
+    db.conn.execute(
+        "UPDATE photos SET file_hash = 'same-bytes', burst_id = 'overlap' "
+        "WHERE id IN (?, ?)",
+        (ids["duplicate-a.jpg"], ids["duplicate-best.jpg"]),
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id = 'overlap' WHERE id = ?",
+        (ids["overlap-single.jpg"],),
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id = 'burst-2' WHERE id IN (?, ?)",
+        (ids["burst-a.jpg"], ids["burst-best.jpg"]),
+    )
+    db.conn.execute(
+        "UPDATE photos SET quality_score = 0.95 WHERE id IN (?, ?)",
+        (ids["duplicate-best.jpg"], ids["burst-best.jpg"]),
+    )
+    db.conn.commit()
+
+    rows = [dict(row) for row in db.query_browse_stacks([], sort="name")]
+    assert db.count_browse_stacks([]) == 4
+    grouped = {
+        row["_browse_stack_kind"]: row
+        for row in rows if row["_browse_stack_kind"]
+    }
+    assert grouped["duplicate"]["id"] == ids["duplicate-best.jpg"]
+    assert set(map(int, grouped["duplicate"]["_browse_stack_member_ids"].split(","))) == {
+        ids["duplicate-a.jpg"], ids["duplicate-best.jpg"],
+    }
+    assert grouped["burst"]["id"] == ids["burst-best.jpg"]
+    assert set(map(int, grouped["burst"]["_browse_stack_member_ids"].split(","))) == {
+        ids["burst-a.jpg"], ids["burst-best.jpg"],
+    }
+    # The duplicate group claims its members first, so a third photo sharing
+    # one member's burst does not become a one-photo pseudo-stack.
+    overlap = next(row for row in rows if row["id"] == ids["overlap-single.jpg"])
+    assert overlap["_browse_stack_kind"] is None
+
+    # Filters apply before projection. Once only one burst member matches,
+    # it returns as an ordinary result rather than dragging hidden members in.
+    db.update_photo_rating(ids["burst-best.jpg"], 5)
+    filtered = db.query_browse_stacks([
+        {"field": "rating", "op": ">=", "value": 5},
+    ])
+    assert len(filtered) == 1
+    assert filtered[0]["id"] == ids["burst-best.jpg"]
+    assert filtered[0]["_browse_stack_kind"] is None
+
+
 def test_get_filter_field_values_counts_respect_rules(tmp_path):
     import pytest
     db, fid = _filter_db(tmp_path)

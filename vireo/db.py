@@ -22987,6 +22987,240 @@ class Database:
         """
         return self.conn.execute(query, [*params, per_page, offset]).fetchall()
 
+    def _browse_stack_query_parts(self, rules, collection_id=None, folder_id=None):
+        """Build the scoped CTE shared by stacked Browse list/count queries.
+
+        Stacks are a presentation of the current result set, not durable
+        catalog state: filters apply to members first, then exact duplicates
+        and processed bursts collapse only when at least two matching photos
+        remain. Exact duplicates claim their members before bursts so one
+        photo can never appear in two Browse items.
+        """
+        folder_join, join_clause, where, params = self._build_query_from_rules(rules)
+        where, params = self._append_collection_restriction(
+            collection_id, where, params,
+        )
+        where, params = self._append_folder_restriction(folder_id, where, params)
+        pcols = ", ".join(f"p.{c.strip()}" for c in self.PHOTO_COLS.split(","))
+        ctes = f"""
+            WITH scoped AS (
+                SELECT DISTINCT {pcols}, p.burst_id AS _stack_burst_id,
+                       p.file_hash AS _stack_file_hash
+                FROM photos p
+                {folder_join}
+                {join_clause}
+                {where}
+            ), duplicate_counts AS (
+                SELECT scoped.*,
+                       CASE WHEN NULLIF(_stack_file_hash, '') IS NULL THEN 0 ELSE
+                           COUNT(*) OVER (PARTITION BY _stack_file_hash)
+                       END AS _duplicate_count
+                FROM scoped
+            ), stack_counts AS (
+                SELECT duplicate_counts.*,
+                       CASE WHEN NULLIF(_stack_burst_id, '') IS NULL THEN 0 ELSE
+                           SUM(CASE WHEN _duplicate_count < 2 THEN 1 ELSE 0 END)
+                           OVER (PARTITION BY _stack_burst_id)
+                       END AS _burst_count
+                FROM duplicate_counts
+            ), keyed AS (
+                SELECT stack_counts.*,
+                       CASE
+                         WHEN _duplicate_count >= 2
+                           THEN 'duplicate:' || _stack_file_hash
+                         WHEN _duplicate_count < 2 AND _burst_count >= 2
+                           THEN 'burst:' || _stack_burst_id
+                         ELSE 'photo:' || id
+                       END AS _stack_key,
+                       CASE
+                         WHEN _duplicate_count >= 2 THEN 'duplicate'
+                         WHEN _duplicate_count < 2 AND _burst_count >= 2 THEN 'burst'
+                         ELSE NULL
+                       END AS _stack_kind
+                FROM stack_counts
+            )
+        """
+        return ctes, params
+
+    def query_browse_stacks(self, rules, sort="date", page=1, per_page=50,
+                            collection_id=None, folder_id=None):
+        """Return one representative row per exact-duplicate or burst stack.
+
+        The returned rows have three private columns consumed by the HTTP
+        layer: ``_browse_stack_kind``, ``_browse_stack_count``, and
+        ``_browse_stack_member_ids``. Singles carry a null kind and otherwise
+        retain the ordinary photo-list shape.
+        """
+        ctes, params = self._browse_stack_query_parts(
+            rules, collection_id=collection_id, folder_id=folder_id,
+        )
+        cover_order = """
+            CASE COALESCE(flag, 'none')
+              WHEN 'flagged' THEN 2 WHEN 'none' THEN 1 ELSE 0 END DESC,
+            quality_score IS NULL, quality_score DESC,
+            subject_sharpness IS NULL, subject_sharpness DESC,
+            sharpness IS NULL, sharpness DESC,
+            rating IS NULL, rating DESC,
+            (COALESCE(width, 0) * COALESCE(height, 0)) DESC,
+            COALESCE(file_size, 0) DESC,
+            id ASC
+        """
+        order = {
+            "date": (
+                "_stack_min_timestamp IS NULL, _stack_min_timestamp ASC, "
+                "_stack_min_filename ASC, id ASC"
+            ),
+            "date_desc": (
+                "_stack_max_timestamp IS NULL, _stack_max_timestamp DESC, "
+                "_stack_min_filename ASC, id ASC"
+            ),
+            "name": "_stack_min_filename ASC, id ASC",
+            "name_desc": "_stack_max_filename DESC, id ASC",
+            "rating": "_stack_max_rating DESC, _stack_min_filename ASC, id ASC",
+            "sharpness": "_stack_max_sharpness DESC, _stack_min_filename ASC, id ASC",
+            "sharpness_asc": "_stack_min_sharpness ASC, _stack_min_filename ASC, id ASC",
+            "quality": "_stack_max_quality DESC, _stack_min_filename ASC, id ASC",
+        }.get(sort, "_stack_min_timestamp IS NULL, _stack_min_timestamp ASC, id ASC")
+        page = max(1, page)
+        offset = (page - 1) * per_page
+        query = ctes + f"""
+            , ranked AS (
+                SELECT keyed.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY _stack_key ORDER BY {cover_order}
+                       ) AS _stack_cover_rank,
+                       COUNT(*) OVER (PARTITION BY _stack_key)
+                           AS _browse_stack_count,
+                       GROUP_CONCAT(id) OVER (
+                           PARTITION BY _stack_key
+                           ORDER BY timestamp IS NULL, timestamp, filename, id
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                       )
+                           AS _browse_stack_member_ids,
+                       MIN(timestamp) OVER (PARTITION BY _stack_key)
+                           AS _stack_min_timestamp,
+                       MAX(timestamp) OVER (PARTITION BY _stack_key)
+                           AS _stack_max_timestamp,
+                       MIN(filename) OVER (PARTITION BY _stack_key)
+                           AS _stack_min_filename,
+                       MAX(filename) OVER (PARTITION BY _stack_key)
+                           AS _stack_max_filename,
+                       MAX(COALESCE(rating, 0)) OVER (PARTITION BY _stack_key)
+                           AS _stack_max_rating,
+                       MAX(sharpness) OVER (PARTITION BY _stack_key)
+                           AS _stack_max_sharpness,
+                       MIN(sharpness) OVER (PARTITION BY _stack_key)
+                           AS _stack_min_sharpness,
+                       MAX(quality_score) OVER (PARTITION BY _stack_key)
+                           AS _stack_max_quality
+                FROM keyed
+            )
+            SELECT ranked.*,
+                   _stack_kind AS _browse_stack_kind
+            FROM ranked
+            WHERE _stack_cover_rank = 1
+            ORDER BY {order}
+            LIMIT ? OFFSET ?
+        """
+        return self.conn.execute(query, [*params, per_page, offset]).fetchall()
+
+    def count_browse_stacks(self, rules, collection_id=None, folder_id=None):
+        """Count logical Browse items after stack projection."""
+        ctes, params = self._browse_stack_query_parts(
+            rules, collection_id=collection_id, folder_id=folder_id,
+        )
+        row = self.conn.execute(
+            ctes + " SELECT COUNT(DISTINCT _stack_key) AS n FROM keyed",
+            params,
+        ).fetchone()
+        return int(row["n"] or 0)
+
+    def collapse_browse_stack_photo_ids(self, photo_ids):
+        """Collapse an already ordered ID result, preserving group order.
+
+        Visual search has already materialized its relevance-ordered IDs, so
+        re-running the metadata SQL would lose that order. This bounded helper
+        applies the same duplicate-first overlap rule in Python and selects a
+        quality-ranked cover for each logical item.
+        """
+        ordered_ids = list(dict.fromkeys(photo_ids or []))
+        if not ordered_ids:
+            return []
+        rows_by_id = {}
+        columns = (
+            "id, file_hash, burst_id, flag, quality_score, subject_sharpness, "
+            "sharpness, rating, width, height, file_size"
+        )
+        for chunk in _chunks(ordered_ids):
+            placeholders = ",".join("?" * len(chunk))
+            for row in self.conn.execute(
+                f"SELECT {columns} FROM photos WHERE id IN ({placeholders})",
+                list(chunk),
+            ).fetchall():
+                rows_by_id[row["id"]] = row
+
+        duplicate_counts = {}
+        for pid in ordered_ids:
+            row = rows_by_id.get(pid)
+            file_hash = row["file_hash"] if row else None
+            if file_hash:
+                duplicate_counts[file_hash] = duplicate_counts.get(file_hash, 0) + 1
+        burst_counts = {}
+        for pid in ordered_ids:
+            row = rows_by_id.get(pid)
+            if not row:
+                continue
+            file_hash = row["file_hash"]
+            if file_hash and duplicate_counts.get(file_hash, 0) >= 2:
+                continue
+            burst_id = row["burst_id"]
+            if burst_id:
+                burst_counts[burst_id] = burst_counts.get(burst_id, 0) + 1
+
+        groups = {}
+        group_order = []
+        for pid in ordered_ids:
+            row = rows_by_id.get(pid)
+            if not row:
+                continue
+            file_hash = row["file_hash"]
+            burst_id = row["burst_id"]
+            if file_hash and duplicate_counts.get(file_hash, 0) >= 2:
+                key = ("duplicate", file_hash)
+            elif burst_id and burst_counts.get(burst_id, 0) >= 2:
+                key = ("burst", burst_id)
+            else:
+                key = (None, pid)
+            if key not in groups:
+                groups[key] = []
+                group_order.append(key)
+            groups[key].append(pid)
+
+        def cover_score(pid):
+            row = rows_by_id[pid]
+            flag_rank = {"flagged": 2, "none": 1, None: 1}.get(row["flag"], 0)
+            return (
+                flag_rank,
+                row["quality_score"] if row["quality_score"] is not None else float("-inf"),
+                row["subject_sharpness"] if row["subject_sharpness"] is not None else float("-inf"),
+                row["sharpness"] if row["sharpness"] is not None else float("-inf"),
+                row["rating"] if row["rating"] is not None else 0,
+                (row["width"] or 0) * (row["height"] or 0),
+                row["file_size"] or 0,
+                -pid,
+            )
+
+        items = []
+        for key in group_order:
+            member_ids = groups[key]
+            cover_id = max(member_ids, key=cover_score)
+            items.append({
+                "cover_id": cover_id,
+                "kind": key[0],
+                "member_ids": member_ids,
+            })
+        return items
+
     # (display_expr, group_expr) for suggest-capable columns.
     # ``group_expr`` folds the value the same way the corresponding filter
     # matches it — camera/lens rules use ``LOWER(col) = LOWER(?)`` so their

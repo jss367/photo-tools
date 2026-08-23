@@ -240,6 +240,16 @@ body.sidebar-resizing {
 .browse-view-controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
 .browse-view-controls input[type=text] { background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-secondary); border-radius: 4px; padding: 5px 10px; font-size: 12px; flex: 1; min-width: 200px; }
 .browse-view-controls select { background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-secondary); border-radius: 4px; padding: 5px 8px; font-size: 12px; }
+.browse-stack-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+}
+.browse-stack-toggle input { accent-color: var(--accent); }
 .filter-bar {
   background: var(--bg-primary);
   padding: 10px 20px;
@@ -334,6 +344,13 @@ body.sidebar-resizing {
 }
 .grid-card:hover { transform: translateY(-1px); border-color: var(--accent); }
 .grid-card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.grid-card.has-browse-stack {
+  box-shadow: 3px 3px 0 var(--bg-tertiary), 6px 6px 0 var(--border-primary);
+  margin: 0 6px 6px 0;
+}
+.grid-card.has-browse-stack.selected {
+  box-shadow: 0 0 0 1px var(--accent), 3px 3px 0 var(--bg-tertiary), 6px 6px 0 var(--border-primary);
+}
 .grid-card-img-wrap {
   position: relative;
   width: 100%;
@@ -376,6 +393,84 @@ body.sidebar-resizing {
   border-radius: 3px;
   pointer-events: none;
 }
+.browse-stack-badge {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid color-mix(in srgb, white 25%, transparent);
+  border-radius: 999px;
+  padding: 3px 7px;
+  background: color-mix(in srgb, var(--bg-primary) 88%, transparent);
+  color: var(--text-primary);
+  box-shadow: 0 1px 5px color-mix(in srgb, black 45%, transparent);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.browse-stack-badge:hover,
+.browse-stack-badge[aria-expanded="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.grid-card.has-browse-stack .clip-score-badge { top: 34px; }
+.browse-stack-tray {
+  grid-column: 1 / -1;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border-secondary);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  box-shadow: 0 8px 24px color-mix(in srgb, black 18%, transparent);
+}
+.browse-stack-tray-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.browse-stack-tray-title { color: var(--text-primary); font-size: 12px; font-weight: 700; }
+.browse-stack-tray-subtitle { color: var(--text-ghost); font-size: 11px; margin-left: 6px; font-weight: 400; }
+.browse-stack-tray-actions { display: flex; align-items: center; gap: 6px; }
+.browse-stack-tray-actions button {
+  border: 1px solid var(--border-secondary);
+  border-radius: 4px;
+  padding: 4px 8px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.browse-stack-tray-actions button:hover { border-color: var(--accent); color: var(--accent); }
+.browse-stack-members {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(180px, 100%), 1fr));
+  gap: 10px;
+}
+.browse-stack-member {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border-primary);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  cursor: pointer;
+}
+.browse-stack-member:hover { border-color: var(--accent); }
+.browse-stack-member.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.browse-stack-member .grid-card-info { min-width: 0; }
+.browse-stack-loading, .browse-stack-error {
+  padding: 18px;
+  color: var(--text-ghost);
+  font-size: 12px;
+  text-align: center;
+}
+.browse-stack-error { color: var(--danger); }
 .representative-badge {
   position: absolute;
   top: 6px;
@@ -1748,6 +1843,12 @@ body.sidebar-resizing {
                  oninput="updateThumbSize(this.value)">
           <span style="font-size:10px;color:var(--text-faint);">&#9638;</span>
         </label>
+        <label class="browse-stack-toggle" title="Collapse exact duplicates and processed bursts">
+          <input type="checkbox" id="browseStacksToggle"
+                 data-view-preference="vireo.browse.stacks"
+                 onchange="toggleBrowseStacks()">
+          <span>Stacks</span>
+        </label>
         <button id="detBoxToggle" onclick="toggleDetectionBoxes()" title="Show/hide detection boxes"
                 style="background:var(--bg-tertiary);color:var(--text-muted);border:1px solid var(--border-secondary);border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer;">
           &#9634; Boxes
@@ -1988,7 +2089,7 @@ body.sidebar-resizing {
     <!-- Photo Detail (shown when a photo is selected) -->
     <div class="detail-content" id="detailContent">
       <button class="detail-close" onclick="closeDetail()">&times;</button>
-      <img class="detail-preview single-only" id="detailImg" src="" alt="" style="cursor:pointer;" onclick="openLightbox(window._detailPhotoId, document.getElementById('detailFilename').textContent, photos)">
+      <img class="detail-preview single-only" id="detailImg" src="" alt="" style="cursor:pointer;" onclick="openLightbox(window._detailPhotoId, document.getElementById('detailFilename').textContent, browsePhotoNavigationList(window._detailPhotoId))">
       <div class="detail-filename single-only" id="detailFilename"></div>
       <button class="detail-source-control single-only" id="detailSourceControl" type="button" onclick="event.stopPropagation(); vireoTogglePairSource(window._detailPhotoId);"></button>
 
@@ -2251,6 +2352,7 @@ window.GOOGLE_MAPS_PREFER_ENGLISH = true;
 /* ---------- State ---------- */
 var photos = [];
 var totalPhotos = 0;
+var totalUnderlyingPhotos = 0;
 var currentPage = 1;
 var perPage = 50;
 var loading = false;
@@ -2266,6 +2368,16 @@ var selectedIndex = -1;
 var anchorRestoreEpoch = 0;
 var anchorScanDepth = 0;
 var selectedPhotos = new Set(); // multi-select
+var expandedBrowseStacks = new Set();
+var browseStackMembers = {};
+var browseStackErrors = {};
+
+function setBrowseTotals(data) {
+  totalPhotos = Number(data && data.total) || 0;
+  totalUnderlyingPhotos = data && data.underlying_total != null
+    ? Number(data.underlying_total) || 0
+    : totalPhotos;
+}
 var selectionKeywordRequestSeq = 0;
 var selectionKeywordKey = '';
 var selectionKeywordMissingById = {};
@@ -2954,8 +3066,30 @@ function renderCardInfo(p) {
   return infoHtml;
 }
 
+function browseStacksEnabled() {
+  var toggle = document.getElementById('browseStacksToggle');
+  return !!(toggle && toggle.checked);
+}
+
+function browseStackLabel(kind) {
+  return kind === 'duplicate' ? 'Exact duplicates' : 'Burst';
+}
+
+function renderBrowseStackBadge(p) {
+  var stack = p && p.browse_stack;
+  if (!stack || stack.count < 2) return '';
+  var label = browseStackLabel(stack.kind, stack.count);
+  var expanded = expandedBrowseStacks.has(p.id);
+  return '<button type="button" class="browse-stack-badge" '
+    + 'aria-expanded="' + (expanded ? 'true' : 'false') + '" '
+    + 'title="' + escapeAttr(label + ' · ' + stack.count + ' photos') + '" '
+    + 'onclick="toggleBrowseStack(event,' + p.id + ')">'
+    + '<span aria-hidden="true">&#9638;</span>' + stack.count + '</button>';
+}
+
 function renderPhotoCard(p, idx) {
   var selectedClass = (p.id === selectedPhotoId || selectedPhotos.has(p.id)) ? ' selected' : '';
+  var stackClass = p.browse_stack ? ' has-browse-stack' : '';
   var isRawJpegPair = typeof window.vireoPhotoIsRawJpegPair === 'function'
     ? window.vireoPhotoIsRawJpegPair(p)
     : false;
@@ -3012,9 +3146,10 @@ function renderPhotoCard(p, idx) {
   }
 
   var thumbUrl = window.vireoThumbnailUrl ? window.vireoThumbnailUrl(p) : '/thumbnails/' + p.id + '.jpg';
-  return '<div class="grid-card' + selectedClass + '" data-id="' + p.id + '" data-idx="' + idx + '" data-filename="' + escapeAttr(p.filename) + '" onclick="selectPhoto(event,' + p.id + ',' + idx + ')">' +
+  return '<div class="grid-card' + stackClass + selectedClass + '" data-id="' + p.id + '" data-idx="' + idx + '" data-filename="' + escapeAttr(p.filename) + '" onclick="selectPhoto(event,' + p.id + ',' + idx + ')">' +
     '<div class="grid-card-img-wrap">' +
       '<img src="' + escapeAttr(thumbUrl) + '" loading="lazy" decoding="async" alt="' + escapeAttr(p.filename) + '">' +
+      renderBrowseStackBadge(p) +
       clipBadge +
       boxHtml +
       inatBadge +
@@ -3027,6 +3162,196 @@ function renderPhotoCard(p, idx) {
       renderCardInfo(p) +
     '</div>' +
   '</div>';
+}
+
+function renderBrowseStackMember(p, coverId) {
+  var selectedClass = (p.id === selectedPhotoId || selectedPhotos.has(p.id)) ? ' selected' : '';
+  if (typeof window.vireoRememberPhotoPair === 'function') {
+    window.vireoRememberPhotoPair(p);
+  }
+  if (
+    typeof window.vireoRememberPhotoEditRecipe === 'function' &&
+    Object.prototype.hasOwnProperty.call(p, 'edit_recipe')
+  ) {
+    window.vireoRememberPhotoEditRecipe(p.id, p.edit_recipe, {
+      skipIfLocallyWritten: true,
+    });
+  }
+  var thumbUrl = window.vireoThumbnailUrl
+    ? window.vireoThumbnailUrl(p)
+    : '/thumbnails/' + p.id + '.jpg';
+  return '<div class="browse-stack-member' + selectedClass + '" '
+    + 'data-id="' + p.id + '" data-filename="' + escapeAttr(p.filename) + '" '
+    + 'onclick="selectBrowseStackMember(event,' + p.id + ',' + coverId + ')" '
+    + 'ondblclick="openBrowseStackMember(event,' + p.id + ',' + coverId + ')">'
+    + '<div class="grid-card-img-wrap">'
+    + '<img src="' + escapeAttr(thumbUrl) + '" loading="lazy" decoding="async" alt="' + escapeAttr(p.filename) + '">'
+    + (inatSubmitted[String(p.id)] ? '<span class="inat-badge">iNat</span>' : '')
+    + (p.wildlife_excluded ? '<span class="no-wildlife-badge">No Wildlife</span>' : '')
+    + (p.is_species_representative ? '<span class="representative-badge">Representative</span>' : '')
+    + (cardFields.indexOf('species') === -1 ? renderSpeciesBadges(p.species, false) : '')
+    + '</div><div class="grid-card-info">' + renderCardInfo(p) + '</div></div>';
+}
+
+function renderBrowseStackTray(cover) {
+  var stack = cover.browse_stack;
+  var members = browseStackMembers[String(cover.id)];
+  var error = browseStackErrors[String(cover.id)];
+  var label = browseStackLabel(stack.kind, stack.count);
+  var body = '<div class="browse-stack-loading">Loading stack…</div>';
+  if (error) {
+    body = '<div class="browse-stack-error">' + escapeHtml(error) + '</div>';
+  } else if (Array.isArray(members)) {
+    body = '<div class="browse-stack-members">' + members.map(function(member) {
+      return renderBrowseStackMember(member, cover.id);
+    }).join('') + '</div>';
+  }
+  var reviewLabel = stack.kind === 'burst' ? 'Review burst' : 'Compare';
+  return '<div class="browse-stack-tray" data-stack-cover-id="' + cover.id + '">'
+    + '<div class="browse-stack-tray-header"><div>'
+    + '<span class="browse-stack-tray-title">' + escapeHtml(label) + '</span>'
+    + '<span class="browse-stack-tray-subtitle">' + stack.count + ' photos</span>'
+    + '</div><div class="browse-stack-tray-actions">'
+    + '<button type="button" onclick="selectBrowseStackAll(event,' + cover.id + ')">Select all</button>'
+    + '<button type="button" onclick="reviewBrowseStack(event,' + cover.id + ')">' + reviewLabel + '</button>'
+    + '<button type="button" aria-label="Collapse stack" title="Collapse" onclick="toggleBrowseStack(event,' + cover.id + ')">&#10005;</button>'
+    + '</div></div>' + body + '</div>';
+}
+
+function insertBrowseStackTray(coverId) {
+  var oldTray = document.querySelector('.browse-stack-tray[data-stack-cover-id="' + coverId + '"]');
+  if (oldTray) oldTray.remove();
+  if (!expandedBrowseStacks.has(coverId)) return;
+  var cover = photos.find(function(photo) { return photo.id === coverId; });
+  var card = document.querySelector('.grid-card[data-id="' + coverId + '"]');
+  if (!cover || !cover.browse_stack || !card) return;
+  card.insertAdjacentHTML('afterend', renderBrowseStackTray(cover));
+  var tray = document.querySelector('.browse-stack-tray[data-stack-cover-id="' + coverId + '"]');
+  refreshColorLabelControlsIn(tray);
+  refreshCardSelectionVisuals();
+}
+
+function restoreExpandedBrowseStacks() {
+  Array.from(expandedBrowseStacks).forEach(insertBrowseStackTray);
+}
+
+function refreshExpandedBrowseStackMembers(photoIds) {
+  var wanted = new Set((photoIds || []).map(Number));
+  Object.keys(browseStackMembers).forEach(function(coverId) {
+    var members = browseStackMembers[coverId] || [];
+    if (members.some(function(member) { return wanted.has(member.id); })) {
+      insertBrowseStackTray(Number(coverId));
+    }
+  });
+}
+
+function browsePhotoNavigationList(photoId) {
+  if (photos.some(function(photo) { return photo.id === photoId; })) return photos;
+  var stackIds = Object.keys(browseStackMembers);
+  for (var i = 0; i < stackIds.length; i++) {
+    var members = browseStackMembers[stackIds[i]] || [];
+    if (members.some(function(photo) { return photo.id === photoId; })) {
+      return members;
+    }
+  }
+  return photos;
+}
+
+async function toggleBrowseStack(event, coverId) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  var cover = photos.find(function(photo) { return photo.id === coverId; });
+  if (!cover || !cover.browse_stack) return;
+  var badge = document.querySelector('.grid-card[data-id="' + coverId + '"] .browse-stack-badge');
+  if (expandedBrowseStacks.has(coverId)) {
+    expandedBrowseStacks.delete(coverId);
+    var tray = document.querySelector('.browse-stack-tray[data-stack-cover-id="' + coverId + '"]');
+    if (tray) tray.remove();
+    if (badge) badge.setAttribute('aria-expanded', 'false');
+    return;
+  }
+
+  expandedBrowseStacks.add(coverId);
+  if (badge) badge.setAttribute('aria-expanded', 'true');
+  insertBrowseStackTray(coverId);
+  var cacheKey = String(coverId);
+  if (browseStackMembers[cacheKey] || browseStackErrors[cacheKey]) return;
+  var memberIds = cover.browse_stack.photo_ids || [];
+  if (memberIds.length > 500) {
+    browseStackErrors[cacheKey] = 'This stack is too large to expand in Browse.';
+    insertBrowseStackTray(coverId);
+    return;
+  }
+  var windowIsCurrent = observeBrowseWindow();
+  try {
+    var data = await safeFetch('/api/photos/by-ids', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({photo_ids: memberIds}),
+    });
+    if (!windowIsCurrent()) return;
+    browseStackMembers[cacheKey] = data.photos || [];
+    insertBrowseStackTray(coverId);
+    var loadedIds = browseStackMembers[cacheKey].map(function(photo) { return photo.id; });
+    loadInatStatus(loadedIds).then(function() {
+      if (windowIsCurrent() && expandedBrowseStacks.has(coverId)) insertBrowseStackTray(coverId);
+    });
+    fetchColorLabels(loadedIds).then(function() {
+      if (windowIsCurrent() && expandedBrowseStacks.has(coverId)) insertBrowseStackTray(coverId);
+    });
+  } catch (error) {
+    if (!windowIsCurrent()) return;
+    browseStackErrors[cacheKey] = 'Could not load this stack.';
+    insertBrowseStackTray(coverId);
+  }
+}
+
+function selectBrowseStackMember(event, photoId, coverId) {
+  if (event) event.stopPropagation();
+  var coverIndex = photos.findIndex(function(photo) { return photo.id === coverId; });
+  selectPhoto({
+    shiftKey: false,
+    metaKey: !!(event && event.metaKey),
+    ctrlKey: !!(event && event.ctrlKey),
+  }, photoId, coverIndex);
+}
+
+function selectBrowseStackAll(event, coverId) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  var cover = photos.find(function(photo) { return photo.id === coverId; });
+  if (!cover || !cover.browse_stack) return;
+  anchorRestoreEpoch++;
+  selectedPhotoId = null;
+  selectedIndex = photos.findIndex(function(photo) { return photo.id === coverId; });
+  selectedPhotos = new Set(cover.browse_stack.photo_ids || []);
+  hideDetailPanel();
+  refreshCardSelectionVisuals();
+  updateBatchBar();
+}
+
+function reviewBrowseStack(event, coverId) {
+  selectBrowseStackAll(event, coverId);
+  var cover = photos.find(function(photo) { return photo.id === coverId; });
+  if (cover && cover.browse_stack && cover.browse_stack.kind === 'duplicate') {
+    openBrowseCompare();
+  } else {
+    openSelectedInBurstReview();
+  }
+}
+
+function openBrowseStackMember(event, photoId, coverId) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  var members = browseStackMembers[String(coverId)] || [];
+  var photo = members.find(function(member) { return member.id === photoId; });
+  openLightbox(photoId, photo ? photo.filename : '', members);
 }
 
 document.addEventListener('lightbox:renderchanged', function(e) {
@@ -3353,6 +3678,7 @@ async function bootstrapBrowse() {
     // scope-only (Phase 5 removed its legacy filter params).
     var initParams = new URLSearchParams();
     initParams.set('sort', document.getElementById('sortSelect').value);
+    if (browseStacksEnabled()) initParams.set('stacks', '1');
     if (activeFolderId) initParams.set('folder_id', activeFolderId);
     // Collection-only deep links keep their historical endpoint behavior,
     // while Dashboard links opt into composable filters via dashboard_scope.
@@ -3409,7 +3735,7 @@ async function bootstrapBrowse() {
       if (bootstrapWindowIsCurrent()) {
         // Populate everything from a single response
         photos = data.photos || [];
-        totalPhotos = data.total || 0;
+        setBrowseTotals(data);
         currentPage = 2; // next page to load
         earliestPage = 1; // bootstrap always starts at the top of the dataset
         if (photos.length >= totalPhotos) allLoaded = true;
@@ -3510,7 +3836,7 @@ async function bootstrapBrowse() {
       // ever running through resetAndLoad, so the grid didn't match the
       // visible chips until the user edited them (Codex review r3624766665).
       var scopeChanged = browseScopeGen !== bootstrapScopeGen;
-      VireoFilter.setResultTotal(totalPhotos);
+      VireoFilter.setResultTotal(totalUnderlyingPhotos);
       // Collection deep links must open showing exactly that collection \u2014
       // whether plain (?collection_id=..., historical endpoint behavior) or
       // dashboard-scoped (?dashboard_scope=1&collection_id=..., composable).
@@ -5322,6 +5648,9 @@ async function resetAndLoad(options) {
   var anchor = preserveAnchor ? captureSelectedPhotoAnchor() : null;
   var restoreEpoch = anchor ? ++anchorRestoreEpoch : null;
   browseDatasetReady = false;
+  expandedBrowseStacks.clear();
+  browseStackMembers = {};
+  browseStackErrors = {};
   photos = [];
   currentPage = 1;
   allLoaded = false;
@@ -5463,6 +5792,8 @@ function buildBrowsePageRequest(page, requestPerPage) {
     var cparams = new URLSearchParams();
     cparams.set('page', page);
     cparams.set('per_page', requestPerPage);
+    cparams.set('sort', document.getElementById('sortSelect').value);
+    if (browseStacksEnabled()) cparams.set('stacks', '1');
     return {
       url: '/api/collections/' + activeCollectionId + '/photos?' + cparams.toString(),
       options: {},
@@ -5474,6 +5805,7 @@ function buildBrowsePageRequest(page, requestPerPage) {
     sort: document.getElementById('sortSelect').value,
     page: page,
     per_page: requestPerPage,
+    stacks: browseStacksEnabled(),
   };
   var visual = window.VireoFilter && VireoFilter.getVisual ? VireoFilter.getVisual() : null;
   if (visual) body.visual = visual;
@@ -5507,8 +5839,8 @@ async function prependPreviousPhotos(options) {
     });
     if (!windowIsCurrent()) return null;
 
-    totalPhotos = data.total;
-    if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalPhotos);
+    setBrowseTotals(data);
+    if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalUnderlyingPhotos);
     if (window.VireoFilter && VireoFilter.setVisualInfo) {
       VireoFilter.setVisualInfo(data.visual || null);
     }
@@ -5618,8 +5950,8 @@ async function loadPhotos(options) {
   try {
     var data = await safeFetch(request.url, request.options);
     if (!windowIsCurrent()) return null;  // grid was reset mid-flight; drop stale response
-    totalPhotos = data.total;
-    if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalPhotos);
+    setBrowseTotals(data);
+    if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalUnderlyingPhotos);
     if (window.VireoFilter && VireoFilter.setVisualInfo) {
       VireoFilter.setVisualInfo(data.visual || null);
     }
@@ -5954,6 +6286,10 @@ function applyFilters() {
   reloadBrowseResults();
 }
 
+function toggleBrowseStacks() {
+  resetAndLoad({preserveCollection: true});
+}
+
 function updateFilterSummary() {
   updateScrollPosition();
 }
@@ -5986,14 +6322,25 @@ function reloadBrowseResults(options) {
 function updateScrollPosition() {
   var el = document.getElementById('filterSummary');
   var positionOffset = loadedWindowOffset();
+  var resultLabel = function(position) {
+    if (browseStacksEnabled()) {
+      return position + ' of ' + totalPhotos.toLocaleString() + ' items · '
+        + totalUnderlyingPhotos.toLocaleString() + ' photos';
+    }
+    return position + ' of ' + totalPhotos.toLocaleString();
+  };
   if (photos.length === 0) {
-    el.textContent = totalPhotos + ' photos';
+    el.textContent = browseStacksEnabled()
+      ? totalPhotos.toLocaleString() + ' items · ' + totalUnderlyingPhotos.toLocaleString() + ' photos'
+      : totalPhotos.toLocaleString() + ' photos';
     return;
   }
   // Find which cards are visible in the viewport
   var cards = document.querySelectorAll('.grid-card');
   if (cards.length === 0) {
-    el.textContent = totalPhotos + ' photos';
+    el.textContent = browseStacksEnabled()
+      ? totalPhotos.toLocaleString() + ' items · ' + totalUnderlyingPhotos.toLocaleString() + ' photos'
+      : totalPhotos.toLocaleString() + ' photos';
     return;
   }
   var container = document.getElementById('gridContainer');
@@ -6015,7 +6362,7 @@ function updateScrollPosition() {
       1,
       Math.min(representedPhotos, Math.round(frac * representedPhotos))
     );
-    el.textContent = '≈' + approx.toLocaleString() + ' of ' + totalPhotos.toLocaleString();
+    el.textContent = resultLabel('≈' + approx.toLocaleString());
     return;
   }
 
@@ -6033,8 +6380,9 @@ function updateScrollPosition() {
       break;
     }
   }
-  el.textContent = (positionOffset + first) + '–' +
-    (positionOffset + last) + ' of ' + totalPhotos.toLocaleString();
+  el.textContent = resultLabel(
+    (positionOffset + first) + '–' + (positionOffset + last)
+  );
 }
 
 /* ---------- iNaturalist ---------- */
@@ -6086,6 +6434,7 @@ function renderGrid() {
   grid.innerHTML = html;
   updateGridTail();
   refreshColorLabelControlsIn(grid);
+  restoreExpandedBrowseStacks();
 }
 
 /* ---------- Grid dblclick delegation (XSS-safe) ---------- */
@@ -6098,13 +6447,30 @@ document.getElementById('grid').addEventListener('dblclick', function(e) {
 });
 
 function getBrowseShortcutPhoto() {
-  var idx = -1;
   if (selectedPhotoId != null) {
-    idx = photos.findIndex(function(p) { return p.id === selectedPhotoId; });
+    var selected = findBrowsePhoto(selectedPhotoId);
+    if (selected) {
+      return {
+        photo: selected,
+        index: selectedIndex,
+        navigationPhotos: browsePhotoNavigationList(selectedPhotoId),
+      };
+    }
   }
-  if (idx < 0 && selectedPhotos.size > 0) {
-    idx = photos.findIndex(function(p) { return selectedPhotos.has(p.id); });
+  if (selectedPhotos.size > 0) {
+    var selectedIds = Array.from(selectedPhotos);
+    for (var selectedOffset = 0; selectedOffset < selectedIds.length; selectedOffset++) {
+      var selectedMember = findBrowsePhoto(selectedIds[selectedOffset]);
+      if (selectedMember) {
+        return {
+          photo: selectedMember,
+          index: selectedIndex,
+          navigationPhotos: browsePhotoNavigationList(selectedMember.id),
+        };
+      }
+    }
   }
+  var idx = -1;
   if (idx < 0 && selectedIndex >= 0 && photos[selectedIndex]) {
     idx = selectedIndex;
   }
@@ -6112,13 +6478,13 @@ function getBrowseShortcutPhoto() {
     idx = 0;
   }
   if (idx < 0 || !photos[idx]) return null;
-  return { photo: photos[idx], index: idx };
+  return { photo: photos[idx], index: idx, navigationPhotos: photos };
 }
 
 function openBrowseShortcutPhoto(fullscreen) {
   var item = getBrowseShortcutPhoto();
   if (!item) return false;
-  openLightbox(item.photo.id, item.photo.filename || '', photos);
+  openLightbox(item.photo.id, item.photo.filename || '', item.navigationPhotos);
   if (fullscreen && typeof requestLightboxFullscreen === 'function') {
     requestLightboxFullscreen();
   }
@@ -6382,10 +6748,7 @@ function selectPhoto(e, id, idx) {
   }
 
   // Update highlights
-  document.querySelectorAll('.grid-card').forEach(function(el) {
-    var cardId = parseInt(el.dataset.id);
-    el.classList.toggle('selected', cardId === selectedPhotoId || selectedPhotos.has(cardId));
-  });
+  refreshCardSelectionVisuals();
 
   updateBatchBar();
 }
@@ -7103,7 +7466,16 @@ function browseComparePaneFromEvent(e) {
 })();
 
 function findBrowsePhoto(id) {
-  return photos.find(function(p) { return p.id === id; }) || null;
+  var topLevel = photos.find(function(p) { return p.id === id; });
+  if (topLevel) return topLevel;
+  var coverIds = Object.keys(browseStackMembers);
+  for (var i = 0; i < coverIds.length; i++) {
+    var member = (browseStackMembers[coverIds[i]] || []).find(function(p) {
+      return p.id === id;
+    });
+    if (member) return member;
+  }
+  return null;
 }
 
 async function getBrowseComparePhoto(id) {
@@ -8478,7 +8850,7 @@ function batchDelete() {
   if (ids.length === 0) return;
   var companionCount = 0;
   ids.forEach(function(id) {
-    var p = photos.find(function(x) { return x.id === id; });
+    var p = findBrowsePhoto(id);
     if (p && p.companion_path) companionCount++;
   });
   showDeleteDialog(ids, companionCount, function(data) {
@@ -8488,8 +8860,22 @@ function batchDelete() {
     // the next reload.
     var retained = new Set((data && data.failed_photo_ids) || []);
     var deletedSet = new Set(ids.filter(function(id) { return !retained.has(id); }));
+    // Removing one member can dissolve a stack or change its representative,
+    // so the logical item count cannot be updated arithmetically. Reload the
+    // current scope from the authoritative projection.
+    if (browseStacksEnabled()) {
+      selectedPhotos.clear();
+      selectedPhotoId = null;
+      selectedIndex = -1;
+      updateBatchBar();
+      resetAndLoad({preserveCollection: true});
+      loadSummary();
+      refreshBrowseSidebarCounts();
+      return;
+    }
     photos = photos.filter(function(p) { return !deletedSet.has(p.id); });
     totalPhotos = Math.max(0, totalPhotos - (data.deleted || 0));
+    totalUnderlyingPhotos = Math.max(0, totalUnderlyingPhotos - (data.deleted || 0));
     selectedPhotos = new Set(Array.from(selectedPhotos).filter(function(id) {
       return !deletedSet.has(id);
     }));
@@ -8883,7 +9269,7 @@ function clearSelection() {
   // batch inspector — clicking it would apply A's EXIF place to every
   // selected photo. Codex P2 on PR #1097 (17:04Z follow-up).
   window._detailPhotoId = null;
-  document.querySelectorAll('.grid-card').forEach(function(el) {
+  document.querySelectorAll('.grid-card, .browse-stack-member').forEach(function(el) {
     el.classList.remove('selected');
   });
   // If the detail panel is still open after clearing, its actions (setFlag,
@@ -9273,10 +9659,7 @@ function closeDetail() {
   // actions with no visible indicator — e.g. click A -> cmd-click B -> cmd-click
   // B drops the set to {A}, and closing detail would otherwise show "1 selected"
   // in the bar against an unhighlighted photo.
-  document.querySelectorAll('.grid-card').forEach(function(el) {
-    var cardId = parseInt(el.dataset.id);
-    el.classList.toggle('selected', selectedPhotos.has(cardId));
-  });
+  refreshCardSelectionVisuals();
   updateBatchBar();
   loadSummary();
 }
@@ -10677,9 +11060,10 @@ async function setRatingFor(photoId, rating) {
       body: JSON.stringify({photo_ids: [photoId], rating: rating}),
     });
   } catch(e) { return; }
-  var p = photos.find(function(x) { return x.id === photoId; });
+  var p = findBrowsePhoto(photoId);
   if (p) p.rating = rating;
   refreshGridCards([photoId]);
+  refreshExpandedBrowseStackMembers([photoId]);
   scheduleCollectionCountsRefresh();
   _refreshInspectorAfterSinglePhotoEdit(photoId, function() { loadDetail(photoId); });
   refreshPendingSyncBanner();
@@ -10692,10 +11076,11 @@ async function setFlagFor(photoId, flag) {
       body: JSON.stringify({photo_ids: [photoId], flag: flag}),
     });
   } catch(e) { return false; }
-  var p = photos.find(function(x) { return x.id === photoId; });
+  var p = findBrowsePhoto(photoId);
   if (p) p.flag = flag;
   _clearRepresentativeStateIfIneligible(photoId, flag);
   refreshGridCards([photoId]);
+  refreshExpandedBrowseStackMembers([photoId]);
   _refreshInspectorAfterSinglePhotoEdit(photoId, function() { updateDetailFlagButtons(flag); });
   scheduleCollectionCountsRefresh();
   return true;
@@ -10713,6 +11098,7 @@ async function setColorLabelFor(photoId, color) {
   else delete colorLabels[photoId];
   colorLabelsFetched.add(photoId);
   refreshGridCards([photoId]);
+  refreshExpandedBrowseStackMembers([photoId]);
   _refreshInspectorAfterSinglePhotoEdit(photoId, updateDetailColors);
   scheduleCollectionCountsRefresh();
 }
@@ -10780,7 +11166,7 @@ async function copyPhotoPaths(photoIds) {
 // of selectPhoto(); factored out so the context-menu handler can coerce
 // selection without paying the full selectPhoto side-effects.
 function refreshCardSelectionVisuals() {
-  document.querySelectorAll('.grid-card').forEach(function(el) {
+  document.querySelectorAll('.grid-card, .browse-stack-member').forEach(function(el) {
     var cardId = parseInt(el.dataset.id, 10);
     el.classList.toggle('selected', cardId === selectedPhotoId || selectedPhotos.has(cardId));
   });
@@ -10790,8 +11176,9 @@ function refreshCardSelectionVisuals() {
 // lightbox. Hand off the current grid's ordered list so the editor can offer
 // Prev/Next, mirroring the lightbox "Edit Photo" handoff.
 function openPhotoEditor(photoId) {
+  var navigationPhotos = browsePhotoNavigationList(photoId);
   if (window.vireoEditNav) {
-    window.vireoEditNav.setList(photos, photoId);
+    window.vireoEditNav.setList(navigationPhotos, photoId);
     window.vireoEditNav.setLastPhoto(photoId);
   }
   window.location.href = '/edit/' + photoId;
@@ -10896,7 +11283,7 @@ function buildPhotoContextMenu(photoIds, contextPhotoId) {
     showFetchFallback: true,
   })).concat(window.buildSpeciesRepresentativeMenuItems(photoIds, {
     getPhoto: function(id) {
-      return photos.find(function(p) { return p.id === id; });
+      return findBrowsePhoto(id);
     },
   })).concat([
     { label: 'Adjust Capture Time\u2026', onClick: function() { openCaptureTimeModal(); } },
@@ -10925,7 +11312,7 @@ function openBatchMoreMenu(btn) {
 // Document-level delegation: grids re-render on sort/filter/scroll, so
 // per-card listeners would go stale.
 document.addEventListener('contextmenu', function(e) {
-  var card = e.target.closest('.grid-card');
+  var card = e.target.closest('.grid-card, .browse-stack-member');
   if (!card || !card.dataset.id) return;
   // Ignore right-clicks that came from inside the lightbox or a modal; this
   // handler owns only grid-card context menus. Modal right-clicks are either
@@ -11378,6 +11765,10 @@ document.addEventListener('contextmenu', function(e) {
 // last rendered rather than deep-link forever (Codex review r3686778061).
 var _DEEP_LINK_MAX_RETRIES = 5;
 async function _runPhotoDeepLink(photoId) {
+  // A focused deep link must expose the requested photo as a top-level card.
+  // Disable stacks for this view so its later lazy pages use the same shape.
+  var stackToggle = document.getElementById('browseStacksToggle');
+  if (stackToggle) stackToggle.checked = false;
   // Snapshot the health-refresh generation BEFORE any await. If a
   // vireo:folder-health-changed event fires while this loader is awaiting
   // /api/photos/<id> or its folder-scoped /api/browse/init,
@@ -11508,7 +11899,7 @@ async function _runPhotoDeepLink(photoId) {
       renderCollectionList(initData.collections || []);
       loadCollectionCounts();
       photos = initData.photos || [];
-      totalPhotos = initData.total || 0;
+      setBrowseTotals(initData);
       var focusPage = parseInt(initData.focus_page, 10);
       var hasFocusPage = Number.isInteger(focusPage) && focusPage >= 1;
       earliestPage = hasFocusPage ? focusPage : 1;
@@ -11582,7 +11973,7 @@ async function _runPhotoDeepLink(photoId) {
           };
         },
       }).then(function() {
-        VireoFilter.setResultTotal(totalPhotos);
+        VireoFilter.setResultTotal(totalUnderlyingPhotos);
         if (VireoFilter.hasFilters()) VireoFilter.clearAll(true);
       }).catch(function() {});
     }

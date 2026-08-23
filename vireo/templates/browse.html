@@ -7149,7 +7149,13 @@ async function selectAllMatchingPhotos() {
   var url;
   var fetchOpts = {};
   if (activeCollectionId && !dashboardCollectionScope) {
-    url = '/api/collections/' + activeCollectionId + '/photo-ids';
+    // Mirror the grid's sort so the selection's first photo — which drives
+    // Best Batch seed, burst-review order, and export preview — matches the
+    // first visible card even when the collection is sorted by name, rating,
+    // sharpness, or quality (Codex P2 on PR #1561).
+    var idsParams = new URLSearchParams();
+    idsParams.set('sort', document.getElementById('sortSelect').value);
+    url = '/api/collections/' + activeCollectionId + '/photo-ids?' + idsParams.toString();
   } else {
     url = '/api/photos/query';
     var idsBody = {
@@ -12653,6 +12659,22 @@ function updateExportPreview() {
   // outside Browse's currently loaded page. Their metadata remains available
   // through the lightbox cache/list after the viewer closes for this modal.
   if (!photo && typeof _lbPhotoData === 'function') photo = _lbPhotoData(firstId);
+  // Select-all-matching with Stacks enabled populates selectedPhotos with
+  // every underlying member id, but browseStackMembers is only hydrated for
+  // trays the user has expanded. A non-cover member id from an unexpanded
+  // stack is absent from findBrowsePhoto and the lightbox cache — fall back
+  // to the stack's loaded cover so the preview shows a real filename instead
+  // of blanking (Codex P2 on PR #1561).
+  if (!photo) {
+    for (var i = 0; i < photos.length; i++) {
+      var cover = photos[i];
+      var stack = cover && cover.browse_stack;
+      if (stack && (stack.photo_ids || []).indexOf(firstId) !== -1) {
+        photo = cover;
+        break;
+      }
+    }
+  }
   if (!photo) { document.getElementById('exportPreview').textContent = ''; return; }
   var stem = photo.filename.replace(/\.[^.]+$/, '');
   var ts = photo.timestamp || '';

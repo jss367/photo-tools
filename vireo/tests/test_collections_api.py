@@ -159,6 +159,49 @@ def test_collection_photo_ids_returns_all_matching_ids(app_and_db):
     assert data["total"] == len(expected)
 
 
+def test_collection_photo_ids_honors_sort_query(app_and_db):
+    """``/photo-ids`` mirrors the grid sort so Select-all-matching's first ID
+    matches the first visible card — Best Batch seed, burst-review order, and
+    export preview all read that first entry (Codex P2 on PR #1561).
+    """
+    app, db = app_and_db
+    _clear_default_collections(app, db)
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/collections",
+        json={
+            "name": "All",
+            "rules": [{"field": "rating", "op": ">=", "value": 0}],
+        },
+    )
+    assert resp.status_code == 200
+    collection_id = resp.get_json()["id"]
+
+    for sort in ("date", "rating", "name", "name_desc"):
+        grid = [
+            p["id"]
+            for p in db.get_collection_photos(collection_id, per_page=999999, sort=sort)
+        ]
+        resp = client.get(
+            f"/api/collections/{collection_id}/photo-ids?sort={sort}"
+        )
+        assert resp.status_code == 200
+        assert resp.get_json()["photo_ids"] == grid, (
+            f"sort={sort}: /photo-ids drifted from the grid"
+        )
+
+    resp_default = client.get(f"/api/collections/{collection_id}/photo-ids")
+    resp_date = client.get(f"/api/collections/{collection_id}/photo-ids?sort=date")
+    assert resp_default.get_json()["photo_ids"] == resp_date.get_json()["photo_ids"]
+
+    resp_bogus = client.get(
+        f"/api/collections/{collection_id}/photo-ids?sort=not-a-sort"
+    )
+    assert resp_bogus.status_code == 200
+    assert resp_bogus.get_json()["photo_ids"] == resp_date.get_json()["photo_ids"]
+
+
 def test_delete_collection(app_and_db):
     """DELETE /api/collections/<id> removes it."""
     app, db = app_and_db

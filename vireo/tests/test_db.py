@@ -892,6 +892,49 @@ def test_collection_photos_date_sort_puts_missing_timestamps_last(tmp_path):
     assert db.get_collection_photo_ids(cid) == [p['id'] for p in photos]
 
 
+def test_collection_photo_ids_honors_sort(tmp_path):
+    """get_collection_photo_ids applies the same sort as get_collection_photos.
+
+    Regression for the Select-all-matching path used by Best Batch seed,
+    burst-review order, and export preview: a date-only order here picks a
+    different first photo than the grid whenever the collection is sorted by
+    name/rating/sharpness/quality (Codex P2 on PR #1561).
+    """
+    import json
+
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder('/photos', name='photos')
+    p_a = db.add_photo(folder_id=fid, filename='a.jpg', extension='.jpg',
+                       file_size=100, file_mtime=1.0,
+                       timestamp='2024-06-01T00:00:00')
+    p_b = db.add_photo(folder_id=fid, filename='b.jpg', extension='.jpg',
+                       file_size=100, file_mtime=1.0,
+                       timestamp='2024-01-01T00:00:00')
+    p_c = db.add_photo(folder_id=fid, filename='c.jpg', extension='.jpg',
+                       file_size=100, file_mtime=1.0,
+                       timestamp='2024-03-01T00:00:00')
+    db.update_photo_rating(p_a, 2)
+    db.update_photo_rating(p_b, 5)
+    db.update_photo_rating(p_c, 4)
+
+    rules = [{"field": "rating", "op": ">=", "value": 0}]
+    cid = db.add_collection('All', json.dumps(rules))
+
+    assert db.get_collection_photo_ids(cid) == [p_b, p_c, p_a]
+    assert db.get_collection_photo_ids(cid, sort="date") == [p_b, p_c, p_a]
+    assert db.get_collection_photo_ids(cid, sort="rating") == [p_b, p_c, p_a]
+    assert db.get_collection_photo_ids(cid, sort="name") == [p_a, p_b, p_c]
+    assert db.get_collection_photo_ids(cid, sort="name_desc") == [p_c, p_b, p_a]
+
+    for sort in ("date", "rating", "name", "name_desc"):
+        ids = db.get_collection_photo_ids(cid, sort=sort)
+        grid = [p['id'] for p in db.get_collection_photos(cid, per_page=999999, sort=sort)]
+        assert ids == grid, f"sort={sort}: photo-ids and grid diverged"
+
+
 def test_collection_photos_keyword_rule(tmp_path):
     """get_collection_photos filters by keyword contains rule."""
     import json

@@ -14120,13 +14120,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     @app.route("/api/collections/<int:collection_id>/photo-ids")
     def api_collection_photo_ids(collection_id):
-        """Return every photo ID matching a collection."""
+        """Return every photo ID matching a collection.
+
+        Accepts ``sort`` so Select-all-matching keeps the same insertion
+        order the grid shows — Best Batch seed, burst-review order, and
+        export preview all read the first ``selectedPhotos`` entry, and
+        a date-only ordering here would pick a different photo whenever
+        the grid is sorted by name/rating/sharpness/quality (Codex P2 on
+        PR #1561).
+        """
         db = _get_db()
         err = _reject_visual_collection(db, collection_id)
         if err is not None:
             return err
+        sort = request.args.get("sort", "date")
         try:
-            photo_ids = db.get_collection_photo_ids(collection_id)
+            photo_ids = db.get_collection_photo_ids(collection_id, sort=sort)
         except ValueError as e:
             app.logger.exception(
                 "Collection %s has unresolvable rules", collection_id

@@ -10484,6 +10484,18 @@ def test_missing_folder_hidden_from_collection(tmp_path):
     assert len(photos) == 1
     assert photos[0]["filename"] == "visible.jpg"
 
+    # Logical collection membership survives a temporarily offline folder.
+    # Browse/action callers keep the accessible-only default above, while
+    # inventory-facing counts and the opt-in offline grid use this view.
+    assert db.count_collection_photos(
+        coll_id, include_offline_folders=True,
+    ) == 2
+    inventory = db.get_collection_photos(
+        coll_id, include_offline_folders=True,
+    )
+    status_by_name = {p["filename"]: p["folder_status"] for p in inventory}
+    assert status_by_name == {"visible.jpg": "ok", "hidden.jpg": "missing"}
+
 
 # -- Move rules --
 

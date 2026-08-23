@@ -4532,7 +4532,14 @@ function populateReviewScopeCollections(collections) {
       opt.textContent = c.name + ' (visual — open in Browse)';
       opt.title = 'Visual collections can only be used from Browse, where the filter bar resolves the visual-search clause.';
     } else {
-      var count = c.photo_count != null ? ' (' + c.photo_count + ')' : '';
+      var available = c.available_photo_count != null
+        ? c.available_photo_count
+        : c.photo_count;
+      var offline = Number(c.offline_photo_count || 0);
+      var count = available != null
+        ? ' (' + available + ' available' +
+          (offline ? ', ' + offline + ' offline' : '') + ')'
+        : '';
       opt.textContent = c.name + count;
     }
     sel.appendChild(opt);

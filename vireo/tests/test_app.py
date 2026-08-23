@@ -15733,9 +15733,11 @@ def test_browse_init_flags_degraded_without_counting(app_and_db, monkeypatch):
     # flag from rule validation alone, with actual counts left to the
     # client's async /api/collections call.
     def boom(self, _cid):
-        raise sqlite3.OperationalError("count_collection_photos should not run on browse init")
+        raise sqlite3.OperationalError(
+            "count_collection_photo_availability should not run on browse init"
+        )
 
-    monkeypatch.setattr(Database, "count_collection_photos", boom)
+    monkeypatch.setattr(Database, "count_collection_photo_availability", boom)
 
     resp = client.get("/api/browse/init")
     assert resp.status_code == 200
@@ -15792,7 +15794,7 @@ def test_collections_list_surfaces_non_rule_failures(app_and_db, monkeypatch):
     def boom(self, _cid):
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(Database, "count_collection_photos", boom)
+    monkeypatch.setattr(Database, "count_collection_photo_availability", boom)
 
     resp = client.get("/api/collections")
     # Not a 200 with count_error — a real 5xx so the incident is visible.

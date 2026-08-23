@@ -10,6 +10,8 @@ Seed data (conftest): 3 hawk photos in /photos/park, 2 robins in
 /photos/yard; hawk1 has rating 4 and the Red-tailed Hawk species keyword.
 """
 
+from playwright.sync_api import expect
+
 
 def _total(page):
     return int(page.inner_text(".vf-total strong").replace(",", ""))
@@ -245,6 +247,51 @@ def test_deep_link_replay_yields_to_sidebar_click(live_server, page):
     # have reopened deep_link_id after B's queued open bailed as stale.
     page.wait_for_timeout(200)
     assert page.evaluate("openedCollectionId") == clicked_id
+
+
+def test_collection_count_and_optional_grid_keep_offline_members(live_server, page):
+    """Collections retain offline members while Browse keeps them read-only."""
+    db = live_server["db"]
+    offline_folder = live_server["data"]["folders"][1]
+    offline_ids = set(live_server["data"]["photos"][3:])
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?",
+        (offline_folder,),
+    )
+    db.conn.commit()
+    collection_id = next(
+        c["id"] for c in db.get_collections() if c["name"] == "All Photos"
+    )
+
+    page.goto(live_server["url"] + "/browse")
+    row = page.locator(
+        f'#collectionList .tree-item[data-collection-id="{collection_id}"]'
+    )
+    expect(row.locator(".count")).to_contain_text("5")
+    expect(row.locator(".collection-offline-count")).to_have_text("· 2 offline")
+
+    row.click()
+    notice = page.locator("#offlineCollectionNotice")
+    expect(notice).to_be_visible(timeout=5000)
+    expect(page.locator("#offlineCollectionText")).to_have_text(
+        "3 of 5 photos available · 2 offline (hidden)"
+    )
+    expect(page.locator("#grid .grid-card")).to_have_count(3)
+
+    page.locator("#offlineCollectionToggle").click()
+    expect(page.locator("#grid .grid-card")).to_have_count(5)
+    expect(page.locator("#grid .grid-card.offline")).to_have_count(2)
+    assert set(page.locator("#grid .grid-card.offline").evaluate_all(
+        "cards => cards.map(card => Number(card.dataset.id))"
+    )) == offline_ids
+    expect(page.locator("#grid .grid-card.offline img")).to_have_count(0)
+
+    # Select all remains an operational action over accessible photos only.
+    page.evaluate("selectAllMatchingPhotos()")
+    page.wait_for_function("selectedPhotos.size === 3")
+    assert set(page.evaluate("Array.from(selectedPhotos)")) == (
+        set(live_server["data"]["photos"]) - offline_ids
+    )
 
 
 def test_pending_keyword_click_supersedes_deep_link_collection(live_server, page):

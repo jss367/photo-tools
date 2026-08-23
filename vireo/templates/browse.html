@@ -3087,6 +3087,34 @@ function renderBrowseStackBadge(p) {
     + '<span aria-hidden="true">&#9638;</span>' + stack.count + '</button>';
 }
 
+function renderDetectionBoxes(p) {
+  // Shared by renderPhotoCard and renderBrowseStackMember so overlays and their
+  // orientation/RAW-pair hiding stay identical between covers and expanded stack
+  // members; toggleDetectionBoxes() rerenders through both paths.
+  if (!showDetectionBoxes || !Array.isArray(p.detections)) return '';
+  var isRawJpegPair = typeof window.vireoPhotoIsRawJpegPair === 'function'
+    ? window.vireoPhotoIsRawJpegPair(p)
+    : false;
+  var pairSource = _vireoPairSource(p.id) || 'jpeg';
+  var hideDetectionOverlays = (
+    (isRawJpegPair && pairSource === 'jpeg') ||
+    (
+      typeof window.vireoPhotoHasOrientationEdit === 'function' &&
+      window.vireoPhotoHasOrientationEdit(p.id)
+    )
+  );
+  var html = '';
+  p.detections.forEach(function(d) {
+    if (d == null || d.x == null) return;
+    var conf = (d.confidence != null) ? Math.round(d.confidence * 100) + '%' : '';
+    var cat = (d.category && d.category !== 'animal') ? escapeHtml(d.category) + ' ' : '';
+    html += '<div class="det-box" data-photo-id="' + p.id + '" style="' + (hideDetectionOverlays ? 'display:none;' : '') + 'left:' + (d.x * 100) + '%;top:' + (d.y * 100) + '%;width:' + (d.w * 100) + '%;height:' + (d.h * 100) + '%;">' +
+      ((cat || conf) ? '<span class="det-box-label">' + cat + conf + '</span>' : '') +
+    '</div>';
+  });
+  return html;
+}
+
 function renderPhotoCard(p, idx) {
   var selectedClass = (p.id === selectedPhotoId || selectedPhotos.has(p.id)) ? ' selected' : '';
   var stackClass = p.browse_stack ? ' has-browse-stack' : '';
@@ -3105,26 +3133,8 @@ function renderPhotoCard(p, idx) {
       skipIfLocallyWritten: true,
     });
   }
-  var hideDetectionOverlays = (
-    (isRawJpegPair && pairSource === 'jpeg') ||
-    (
-      typeof window.vireoPhotoHasOrientationEdit === 'function' &&
-      window.vireoPhotoHasOrientationEdit(p.id)
-    )
-  );
 
-  // Detection box overlays — render one per detection in the photo
-  var boxHtml = '';
-  if (showDetectionBoxes && Array.isArray(p.detections)) {
-    p.detections.forEach(function(d) {
-      if (d == null || d.x == null) return;
-      var conf = (d.confidence != null) ? Math.round(d.confidence * 100) + '%' : '';
-      var cat = (d.category && d.category !== 'animal') ? escapeHtml(d.category) + ' ' : '';
-      boxHtml += '<div class="det-box" data-photo-id="' + p.id + '" style="' + (hideDetectionOverlays ? 'display:none;' : '') + 'left:' + (d.x * 100) + '%;top:' + (d.y * 100) + '%;width:' + (d.w * 100) + '%;height:' + (d.h * 100) + '%;">' +
-        ((cat || conf) ? '<span class="det-box-label">' + cat + conf + '</span>' : '') +
-      '</div>';
-    });
-  }
+  var boxHtml = renderDetectionBoxes(p);
 
   var clipBadge = '';
   if (p._similarity !== undefined) {
@@ -3186,6 +3196,7 @@ function renderBrowseStackMember(p, coverId) {
     + 'ondblclick="openBrowseStackMember(event,' + p.id + ',' + coverId + ')">'
     + '<div class="grid-card-img-wrap">'
     + '<img src="' + escapeAttr(thumbUrl) + '" loading="lazy" decoding="async" alt="' + escapeAttr(p.filename) + '">'
+    + renderDetectionBoxes(p)
     + (inatSubmitted[String(p.id)] ? '<span class="inat-badge">iNat</span>' : '')
     + (p.wildlife_excluded ? '<span class="no-wildlife-badge">No Wildlife</span>' : '')
     + (p.is_species_representative ? '<span class="representative-badge">Representative</span>' : '')

@@ -2474,6 +2474,98 @@ def test_ensure_label_descriptions_drops_truncated_file_when_offline(
     assert not target.exists()
 
 
+def test_ensure_label_descriptions_keeps_a_concurrently_repaired_file(
+    tmp_path, monkeypatch
+):
+    """A valid file published between inspection and removal must survive.
+
+    This heal runs on a background thread and can overlap the Settings
+    Repair job. The sequence Codex flagged: the heal reads a torn target,
+    Repair atomically publishes a good one, and the heal's later
+    existence check unlinks the *repaired* file. With every fetch path
+    then failing, timm_classifier records the generation as ``failed``
+    and suppresses further heals — a valid repair destroyed and the
+    install stuck on raw scientific names until reinstall or restart.
+    """
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+    target.write_text('{"Bubulcus ibis": "Cattle Eg')  # torn write
+    repaired = {"Bubulcus ibis": "Cattle Egret, Bird"}
+
+    real_read = models.read_label_descriptions
+    reads = []
+
+    def _racing_read(path):
+        result = real_read(path)
+        reads.append(path)
+        if len(reads) == 1:
+            # Settings Repair publishes a valid mapping the instant
+            # after the heal inspected the torn one. os.replace is how
+            # every publish path lands, so the swap is atomic.
+            staged = tmp_path / "label_descriptions.json.repair"
+            staged.write_text(json.dumps(repaired))
+            os.replace(staged, target)
+        return result
+
+    def _boom(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(models, "read_label_descriptions", _racing_read)
+    monkeypatch.setattr(models, "_download_optional_files", _boom)
+    monkeypatch.setattr(models, "_load_upstream_timm_config", _boom)
+
+    result = models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    )
+
+    assert target.exists(), "the concurrent repair's file was deleted"
+    assert json.loads(target.read_text()) == repaired
+    # The file is usable now, so the heal is done — reporting False would
+    # record a `failed` verdict for a generation that is actually healed.
+    assert result is True
+
+
+def test_ensure_label_descriptions_leaves_a_changed_torn_file_alone(
+    tmp_path, monkeypatch
+):
+    """A torn file replaced by a *different* torn file is left in place.
+
+    We only delete the artifact we inspected. Anything else belongs to a
+    writer we did not observe, and the recovery paths below stage and
+    replace regardless — so keeping it costs nothing and cannot clobber
+    a publish in flight. The next heal pass re-inspects it.
+    """
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+    target.write_text('{"Bubulcus ibis": "Cattle Eg')
+
+    real_read = models.read_label_descriptions
+    reads = []
+
+    def _racing_read(path):
+        result = real_read(path)
+        reads.append(path)
+        if len(reads) == 1:
+            staged = tmp_path / "label_descriptions.json.other"
+            staged.write_text('{"Ardea ibis": "Western Cattle Egr')
+            os.replace(staged, target)
+        return result
+
+    def _boom(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(models, "read_label_descriptions", _racing_read)
+    monkeypatch.setattr(models, "_download_optional_files", _boom)
+    monkeypatch.setattr(models, "_load_upstream_timm_config", _boom)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is False
+    assert target.read_text() == '{"Ardea ibis": "Western Cattle Egr'
+
+
 def test_load_label_descriptions_returns_none_for_broken_files(tmp_path):
     """None means 'heal it'; a parsed dict (even empty) means 'usable'."""
     import models

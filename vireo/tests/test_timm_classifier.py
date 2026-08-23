@@ -1119,3 +1119,45 @@ def test_taxonomy_without_common_name_falls_back_to_label(tmp_path):
         )
 
     assert clf._resolve_common_name("Sturnus vulgaris") == "European Starling"
+
+
+def test_instance_exposes_the_consumed_label_descriptions_identity(tmp_path):
+    """The instance carries a *portable* identity for the mapping it
+    read, alongside the local stat tuple.
+
+    ``optional_files_snapshot`` keys this process's classifier cache and
+    is meaningless on another machine. Runs published to the portable
+    computation cache need a content identity instead, taken from the
+    same consumed mapping — see
+    ``computation_cache.with_consumed_label_descriptions``.
+    """
+    from computation_cache import (
+        NO_LABEL_DESCRIPTIONS,
+        label_descriptions_identity,
+    )
+    from timm_classifier import TimmClassifier
+
+    descs = {"Bubulcus ibis": "Cattle Egret, Bird"}
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+
+    _reset_heal_state()
+    _make_model_dir(tmp_path, label_descriptions=descs)
+    with patch("timm_classifier._MODELS_ROOT", str(tmp_path)), \
+         patch("timm_classifier.onnx_runtime.create_session",
+               return_value=_make_fake_session()):
+        clf = TimmClassifier(model_str)
+    assert clf.label_descriptions_identity == label_descriptions_identity(descs)
+
+    # Absent (pre-heal) collapses to the sentinel, so a pre-heal run
+    # never hashes to the same identity as a post-heal one.
+    _reset_heal_state()
+    other = tmp_path / "second"
+    model_dir = _make_model_dir(other)
+    (model_dir / "label_descriptions.json").unlink()
+    with patch("timm_classifier._MODELS_ROOT", str(other)), \
+         patch("timm_classifier.onnx_runtime.create_session",
+               return_value=_make_fake_session()), \
+         patch("models.ensure_timm_label_descriptions", return_value=False):
+        pre_heal = TimmClassifier(model_str)
+    assert pre_heal.label_descriptions_identity == NO_LABEL_DESCRIPTIONS
+    assert pre_heal.label_descriptions_identity != clf.label_descriptions_identity

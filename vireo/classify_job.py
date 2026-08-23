@@ -3145,6 +3145,22 @@ def run_classify_job(
             summary=effective_name,
         )
 
+        # Restamp the portable model identity with the
+        # label_descriptions.json this classifier actually consumed.
+        # ``classifier_model_identity`` above probed the disk before the
+        # classifier was built, and TimmClassifier's background heal
+        # publishes that file during normal operation — so the probe can
+        # disagree with what the instance read in either direction. Runs
+        # published below must carry the mapping that produced their
+        # species names; otherwise a pre-heal run is recorded under the
+        # post-heal identity and every later cache check accepts it,
+        # skipping the reclassify that replaces raw binomials.
+        from computation_cache import with_consumed_label_descriptions
+        classifier_identity = with_consumed_label_descriptions(
+            classifier_identity, clf,
+        )
+        job["_classifier_model_identity"] = classifier_identity
+
         # Classifier init succeeded — now it's safe to start the
         # reclassify purge for any failure before this point would leave
         # the cache intact (see comment at the top of this function).

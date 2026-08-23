@@ -7472,3 +7472,176 @@ def test_run_classify_job_reconciles_group_metadata_on_reuse(
         "group metadata should be stamped by the reused-cache finalize path"
     )
     assert len(group_ids) == 1, "both frames should share one burst group"
+
+
+def test_pre_heal_classifier_run_does_not_satisfy_cache(tmp_path):
+    """A run recorded before label_descriptions.json landed must not be
+    treated as an exact match once the file is there.
+
+    TimmClassifier heals a missing label_descriptions.json on a
+    background thread during ordinary operation, and that mapping is
+    what turns a raw class id into the common name stored on a
+    prediction. Every other identity axis — required files, pinned
+    revision, label set, taxonomy, synonym map, detector runtime — is
+    unchanged across the heal, so keying only on those let the pre-heal
+    run compare equal to a post-heal one: `_all_photos_cache_satisfied`
+    reported the collection as already classified and the reclassify
+    that replaces the scientific names never ran (Codex #1560 P2).
+    """
+    from classify_job import _all_photos_cache_satisfied
+    from computation_cache import (
+        classifier_model_identity,
+        classifier_runtime_fingerprint,
+        runtime_fingerprint,
+        source_input,
+    )
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detector_runtime = runtime_fingerprint({
+        "type": "detection", "model": "megadetector-v6",
+        "weights_sha256": "2" * 64, "pipeline": "detector-v1",
+    })
+    _input, det_input_fp = source_input(
+        "0" * 64, "vireo-detector-source-v1",
+    )
+    det_id = db.write_detection_batch(
+        pid, "megadetector-v6",
+        [{"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+          "confidence": 0.9, "category": "animal"}],
+        runtime_fingerprint=detector_runtime,
+        input_fingerprint=det_input_fp,
+    )[0]
+
+    labels_full = "5" * 64
+    labels_short = labels_full[:12]
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.onnx").write_bytes(b"exact model bytes")
+    active_model = {
+        "id": "timm-inat21-eva02-l",
+        "model_str": "hf-hub:timm/eva02-test",
+        "model_type": "timm",
+        "weights_path": str(model_dir),
+        "files": ["model.onnx"],
+        "optional_files": ["label_descriptions.json"],
+        "source": "custom",
+    }
+
+    # Pre-heal: the optional mapping has not been fetched yet.
+    pre_heal_identity = classifier_model_identity(active_model)
+    pre_heal_runtime = classifier_runtime_fingerprint(
+        pre_heal_identity, labels_full, detector_runtime,
+        taxonomy_identity="1" * 64,
+    )
+    assert pre_heal_runtime is not None
+
+    # The background heal publishes the mapping.
+    (model_dir / "label_descriptions.json").write_text(
+        json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}),
+    )
+    post_heal_identity = classifier_model_identity(active_model)
+    post_heal_runtime = classifier_runtime_fingerprint(
+        post_heal_identity, labels_full, detector_runtime,
+        taxonomy_identity="1" * 64,
+    )
+    assert post_heal_runtime is not None
+    assert post_heal_runtime != pre_heal_runtime
+
+    db.conn.execute(
+        """INSERT INTO classifier_runs
+             (detection_id, classifier_model, labels_fingerprint,
+              runtime_fingerprint, prediction_count)
+           VALUES (?, ?, ?, ?, ?)""",
+        (det_id, "timm-inat21", labels_short, pre_heal_runtime, 1),
+    )
+    db.add_prediction(
+        det_id, species="Bubulcus ibis", confidence=0.9, model="timm-inat21",
+        labels_fingerprint=labels_short,
+    )
+    db.conn.commit()
+
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="timm-inat21",
+        labels_fingerprint=labels_short,
+        model_identity=post_heal_identity,
+        labels_fingerprint_full=labels_full,
+        taxonomy_identity="1" * 64,
+    ) is False
+
+    # A run recorded against the healed mapping is still reused, so this
+    # is a staleness gate and not a blanket cache disable.
+    db.conn.execute(
+        "UPDATE classifier_runs SET runtime_fingerprint = ? "
+        "WHERE detection_id = ?",
+        (post_heal_runtime, det_id),
+    )
+    db.conn.commit()
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="timm-inat21",
+        labels_fingerprint=labels_short,
+        model_identity=post_heal_identity,
+        labels_fingerprint_full=labels_full,
+        taxonomy_identity="1" * 64,
+    ) is True
+
+
+def test_classifier_identity_uses_the_mapping_the_instance_consumed(tmp_path):
+    """Publication must be stamped with what the classifier read, not a
+    fresh disk probe.
+
+    The heal thread starts at classifier construction and can publish
+    label_descriptions.json while the job is still running. If the run
+    were stamped from a probe taken at publish time, this pre-heal run
+    would be recorded under the post-heal identity — and then every
+    later cache check would accept it as an exact match, permanently
+    skipping the reclassify that replaces its raw binomials.
+    """
+    from computation_cache import (
+        classifier_model_identity,
+        with_consumed_label_descriptions,
+    )
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.onnx").write_bytes(b"exact model bytes")
+    active_model = {
+        "id": "timm-inat21-eva02-l",
+        "model_str": "hf-hub:timm/eva02-test",
+        "model_type": "timm",
+        "weights_path": str(model_dir),
+        "files": ["model.onnx"],
+        "optional_files": ["label_descriptions.json"],
+        "source": "custom",
+    }
+
+    class _PreHealClassifier:
+        # Built before the file landed, so it emits scientific names.
+        label_descriptions_identity = "no-label-descriptions"
+
+    # The heal lands between construction and this probe.
+    (model_dir / "label_descriptions.json").write_text(
+        json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}),
+    )
+    probed = classifier_model_identity(active_model)
+    assert probed["label_descriptions_identity"] != "no-label-descriptions"
+
+    stamped = with_consumed_label_descriptions(probed, _PreHealClassifier())
+    assert stamped["label_descriptions_identity"] == "no-label-descriptions"
+    assert stamped != probed
+    # The probe result is not mutated in place — other callers keep theirs.
+    assert probed["label_descriptions_identity"] != "no-label-descriptions"
+
+    # A classifier that exposes nothing (bioclip, doubles) leaves the
+    # probed value untouched.
+    class _NoSnapshot:
+        pass
+
+    assert with_consumed_label_descriptions(probed, _NoSnapshot()) == probed

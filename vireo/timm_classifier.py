@@ -209,6 +209,17 @@ class TimmClassifier:
             "label_descriptions.json": label_desc_state,
         }
 
+        # Portable content identity of the same consumed mapping.
+        # ``optional_files_snapshot`` is a local (size, mtime_ns) stat
+        # tuple — fine for keying this process's classifier cache, but
+        # meaningless on another machine. Runs published to the portable
+        # computation cache are stamped with *this* value instead (see
+        # ``computation_cache.with_consumed_label_descriptions``), so a
+        # run recorded before the background heal supplies the file is
+        # never mistaken for a post-heal run whose species names differ.
+        from computation_cache import label_descriptions_identity
+        self.label_descriptions_identity = label_descriptions_identity(descs)
+
         # Spawn the heal off the startup path — the network probes can
         # take a full HF timeout when offline, and classifier construction
         # runs per classify job. This instance proceeds with the taxonomy

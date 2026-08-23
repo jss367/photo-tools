@@ -1239,15 +1239,39 @@ def ensure_timm_label_descriptions(model_dir, model_str, progress_callback=None)
     afterwards.
     """
     target = os.path.join(model_dir, "label_descriptions.json")
-    if label_descriptions_usable(target):
+    descs, inspected = read_label_descriptions(target)
+    if descs is not None:
         return True
 
-    # Present but unparseable — a torn write from an earlier build or a
-    # killed process. Drop it so the paths below can republish; leaving
-    # it would make existence suppress the heal forever.
-    if os.path.exists(target):
-        with contextlib.suppress(OSError):
-            os.unlink(target)
+    # Present but unparseable when we looked — a torn write from an
+    # earlier build or a killed process. Drop it so `list_models` stops
+    # reporting the optional file as installed (its check is
+    # existence-based) and stops hiding the Repair affordance.
+    #
+    # Only when it is still the artifact we inspected, though. This heal
+    # runs on a background thread and can overlap the Settings Repair
+    # job, which publishes a *valid* label_descriptions.json with
+    # os.replace. Unlinking unconditionally would delete that good
+    # repair, and if our own repository/config fetches below then fail
+    # we would record the generation as `failed` and suppress every
+    # later heal — the exact "user must restart Vireo" state this whole
+    # path exists to avoid.
+    #
+    # ``inspected is None`` means the file was absent (or unstat-able),
+    # so there is nothing to drop.
+    if inspected is not None:
+        recheck, current = read_label_descriptions(target)
+        if recheck is not None:
+            # Someone published a usable mapping between our read and
+            # now. The repair already happened; report success and, above
+            # all, do not delete it.
+            return True
+        if current is not None and current == inspected:
+            with contextlib.suppress(OSError):
+                os.unlink(target)
+        # Otherwise the file changed since we inspected it. Leave it for
+        # the next heal pass to re-inspect: both recovery paths below
+        # stage-and-replace, so keeping it costs nothing this round.
 
     km = next(
         (m for m in KNOWN_MODELS if m.get("model_str") == model_str), None

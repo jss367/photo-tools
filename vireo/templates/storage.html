@@ -28,6 +28,7 @@ body { padding-bottom: 36px; }
   font-size: 9px; font-weight: 600; letter-spacing: .02em;
 }
 .stat-kind.safe { color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.stat-kind.managed { color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, transparent); }
 .stat-kind.download { color: var(--warning); background: color-mix(in srgb, var(--warning) 15%, transparent); }
 .stat-kind.keep { color: var(--text-dim); background: var(--bg-secondary); }
 .storage-health {
@@ -143,6 +144,7 @@ body { padding-bottom: 36px; }
     <div id="storageLocations"></div>
     <div class="storage-legend">
       <span class="stat-kind safe">Safe to clear</span> regenerates automatically &nbsp;
+      <span class="stat-kind managed">Quota managed</span> removes oldest files over its limit &nbsp;
       <span class="stat-kind download">Download again</span> can be restored from its source &nbsp;
       <span class="stat-kind keep">Keep</span> contains catalog or original data
     </div>
@@ -192,6 +194,23 @@ body { padding-bottom: 36px; }
       </div>
       <div id="previewCacheStatus" style="font-size:12px;color:var(--text-dim);margin-top:10px;">Loading...</div>
       <div id="previewCacheWarning" class="storage-note" style="display:none;margin-top:10px;"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Working Copies</div>
+      <div class="setting-row" style="align-items:flex-start;">
+        <div class="setting-label">Storage limit<small>Maximum space for edit-quality JPEGs generated from RAW files. Oldest files are removed first.</small></div>
+        <div class="setting-control">
+          <input type="number" id="cfgWorkingCopyCacheMaxGb" min="0" step="1" value="20"
+                 style="width:96px;background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-secondary);border-radius:4px;padding:4px 8px;font-size:13px;text-align:center;"
+                 onchange="saveStorageConfig()">
+          <span style="font-size:13px;color:var(--text-dim);">GB</span>
+        </div>
+      </div>
+      <div id="workingCopyCacheStatus" style="font-size:12px;color:var(--text-dim);margin-top:10px;">Loading...</div>
+      <div class="storage-note" style="margin-top:10px;">
+        Set the limit to 0 to keep no working copies. Removed copies stay out of the startup backfill and Vireo falls back to the original photo.
+      </div>
     </div>
 
     <div class="section">
@@ -300,6 +319,8 @@ async function loadStorageConfig() {
     document.getElementById('cfgPreviewQualityVal').textContent = pq;
     document.getElementById('cfgPreviewCacheMaxMb').value =
       cfg.preview_cache_max_mb != null ? cfg.preview_cache_max_mb : 20480;
+    document.getElementById('cfgWorkingCopyCacheMaxGb').value =
+      (cfg.working_copy_cache_max_mb != null ? cfg.working_copy_cache_max_mb : 20480) / 1024;
   } catch(e) {}
 }
 
@@ -315,9 +336,11 @@ function saveStorageConfig() {
           thumbnail_quality: parseInt(document.getElementById('cfgThumbQuality').value, 10) || 85,
           preview_quality: parseInt(document.getElementById('cfgPreviewQuality').value, 10) || 90,
           preview_cache_max_mb: Math.max(0, parseInt(document.getElementById('cfgPreviewCacheMaxMb').value, 10) || 0),
+          working_copy_cache_max_mb: Math.max(0, Math.round((parseFloat(document.getElementById('cfgWorkingCopyCacheMaxGb').value) || 0) * 1024)),
         }),
       });
       loadPreviewCacheStatus();
+      loadStoragePanel();
     } catch(e) {}
   }, 250);
 }
@@ -368,14 +391,23 @@ async function loadStoragePanel() {
       ? 'Clear safe caches · ' + storageFormatBytes(s.reclaimable)
       : 'Safe caches are empty';
 
+    var working = s.working_copies || {count: 0, size: 0, quota_bytes: 0};
+    var workingFileWord = working.count === 1 ? 'file' : 'files';
+    document.getElementById('workingCopyCacheStatus').textContent =
+      'Current: ' + storageFormatBytes(working.size) + ' / ' +
+      storageFormatBytes(working.quota_bytes) + ' (' +
+      working.count.toLocaleString() + ' ' + workingFileWord + ')';
+
     var categories = [
       {name: 'Database', size: s.database.size, type: null, kind: 'keep', kindLabel: 'Keep'},
       {name: 'Thumbnails', size: s.thumbnails.size, count: s.thumbnails.count, type: 'thumbnails', kind: 'safe', kindLabel: 'Safe to clear'},
       {name: 'Previews', size: s.previews.size, count: s.previews.count, type: 'previews', kind: 'safe', kindLabel: 'Safe to clear'},
+      {name: 'Working Copies', size: s.working_copies.size, count: s.working_copies.count, type: null, kind: 'managed', kindLabel: 'Quota managed'},
       {name: 'Label Embeddings', size: s.embeddings.size, count: s.embeddings.count, type: 'embeddings', kind: 'safe', kindLabel: 'Safe to clear'},
       {name: 'Models', size: s.models.size, type: null, kind: 'download', kindLabel: 'Download again', settings: true},
       {name: 'Hugging Face Cache', size: s.hf_cache.size, type: null, kind: 'download', kindLabel: 'Download again', settings: true},
       {name: 'Offline Originals', size: s.offline_originals.size, count: s.offline_originals.count, type: null, kind: 'keep', kindLabel: 'Keep'},
+      {name: 'Other Vireo Data', size: s.other.size, type: null, kind: 'keep', kindLabel: 'Keep'},
     ];
     _storageSummary = {};
 

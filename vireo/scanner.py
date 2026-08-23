@@ -1010,6 +1010,7 @@ def _invalidate_derived_caches(db, vireo_dir, photo_id, thumb_cache_dir=None):
     # not be permanently locked out by a stale failure record.
     db.conn.execute(
         "UPDATE photos SET working_copy_path = NULL,"
+        " working_copy_evicted_mtime = NULL,"
         " working_copy_failed_at = NULL,"
         " working_copy_failed_mtime = NULL,"
         " working_copy_failed_source = NULL"
@@ -1217,6 +1218,9 @@ def _working_copy_candidate_predicate(wc_max_size, alias=""):
     where = (
         f"{p}working_copy_path IS NULL"
         f" AND ({p}extension IN ({placeholders}){jpeg_clause})"
+        f" AND ({p}working_copy_evicted_mtime IS NULL"
+        f"      OR ({p}file_mtime IS NOT NULL"
+        f"          AND {p}working_copy_evicted_mtime != {p}file_mtime))"
         f" AND ({p}working_copy_failed_at IS NULL"
         f"      OR {p}working_copy_failed_mtime IS NULL"
         f"      OR {p}file_mtime IS NULL"
@@ -1238,6 +1242,14 @@ def working_copy_backfill_candidate_count(db):
 
     user_cfg = cfg.load()
     wc_max_size = user_cfg.get("working_copy_max_size", 4096)
+    try:
+        wc_cache_max_mb = int(
+            user_cfg.get("working_copy_cache_max_mb", 20480)
+        )
+    except (TypeError, ValueError):
+        wc_cache_max_mb = 20480
+    if wc_cache_max_mb <= 0:
+        return 0
     where, params = _working_copy_candidate_predicate(wc_max_size)
     return db.conn.execute(
         f"SELECT COUNT(*) FROM photos WHERE {where}", params
@@ -1297,6 +1309,17 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
     user_cfg = cfg.load()
     wc_max_size = user_cfg.get("working_copy_max_size", 4096)
     wc_quality = user_cfg.get("working_copy_quality", 92)
+    # A zero-byte quota is an explicit "keep no working copies" setting.
+    # Skip RAW decoding entirely instead of generating a JPEG only for the
+    # quota pass below to delete it immediately.
+    try:
+        wc_cache_max_mb = int(
+            user_cfg.get("working_copy_cache_max_mb", 20480)
+        )
+    except (TypeError, ValueError):
+        wc_cache_max_mb = 20480
+    if wc_cache_max_mb <= 0:
+        return
 
     # Candidate criteria (NULL working_copy_path + RAW or oversized JPEG +
     # not blocked by a stale failure marker) is shared with the startup gate
@@ -1654,6 +1677,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 # paths back through the unsupported RAW decode and 500.
                 db.conn.execute(
                     "UPDATE photos SET working_copy_path=?,"
+                    " working_copy_evicted_mtime=NULL,"
                     " working_copy_failed_at=datetime('now'),"
                     " working_copy_failed_mtime=?,"
                     " working_copy_failed_source='source'"
@@ -1663,6 +1687,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             else:
                 db.conn.execute(
                     "UPDATE photos SET working_copy_path=?,"
+                    " working_copy_evicted_mtime=NULL,"
                     " working_copy_failed_at=NULL,"
                     " working_copy_failed_mtime=NULL,"
                     " working_copy_failed_source=NULL"
@@ -1692,6 +1717,19 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
         commit_with_retry(db.conn)
 
         _emit_working_copy_progress(i)
+
+    # A scan/import may add a large batch at once. Enforce once after the
+    # batch so the quota stays a hard steady-state ceiling without rescanning
+    # the working directory after every generated file.
+    try:
+        from working_copy_cache import evict_if_over_quota
+
+        evict_if_over_quota(db, vireo_dir)
+    except Exception:
+        # The working copies themselves are valid even if quota maintenance
+        # hits a transient filesystem/database error. Keep the scan result and
+        # retry enforcement at startup or on the next config/cache write.
+        log.exception("Working-copy quota enforcement failed")
 
 
 def backfill_working_copies(db, vireo_dir, progress_callback=None,

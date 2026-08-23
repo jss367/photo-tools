@@ -824,7 +824,9 @@ def test_storage_page_has_health_cleanup_and_location_controls(app_and_db):
         b'storageFreeSize', b'storageReclaimableSize', b'clearSafeCaches',
         b'openStorageFolder', b'refreshStoragePage', b'Safe to clear',
         b'Download again', b'cannot currently be reclaimed separately',
-        b'loadMasksCard(s && s.masks)',
+        b'loadMasksCard(s && s.masks)', b'cfgWorkingCopyCacheMaxGb',
+        b"{name: 'Working Copies'", b'Oldest files are removed first',
+        b"{name: 'Other Vireo Data'",
     ):
         assert marker in page.data
     assert page.data.count(b"{name: 'Database'") == 1
@@ -857,9 +859,11 @@ def test_api_storage_reports_volume_reclaimable_and_masks(
     )
     assert data["total"] == sum([
         data["database"]["size"], data["thumbnails"]["size"],
-        data["previews"]["size"], data["embeddings"]["size"],
+        data["previews"]["size"], data["working_copies"]["size"],
+        data["embeddings"]["size"],
         data["models"]["size"], data["hf_cache"]["size"],
         data["offline_originals"]["size"], data["masks"]["size"],
+        data["other"]["size"],
     ])
     assert data["storage_root"] == str(tmp_path)
     assert data["locations"]
@@ -867,6 +871,82 @@ def test_api_storage_reports_volume_reclaimable_and_masks(
     assert all(volume["name"] for volume in data["volumes"])
     assert all(volume["free"] >= 0 for volume in data["volumes"])
     assert all(volume["capacity"] > 0 for volume in data["volumes"])
+
+
+def test_api_storage_includes_working_copies(app_and_db, tmp_path):
+    """Working copies appear in both their category and the managed total."""
+    app, db = app_and_db
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    payload = b"working-copy"
+    (working_dir / "1.jpg").write_bytes(payload)
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path='working/1.jpg' WHERE id=1"
+    )
+    db.conn.commit()
+
+    data = app.test_client().get('/api/storage').get_json()
+
+    assert data["working_copies"] == {
+        "count": 1,
+        "path": str(working_dir),
+        "quota_bytes": 20480 * 1024 * 1024,
+        "size": len(payload),
+    }
+    assert data["total"] >= len(payload)
+
+
+def test_api_storage_counts_unclassified_vireo_root_files_as_other(
+    app_and_db, tmp_path,
+):
+    app, _ = app_and_db
+    before = app.test_client().get('/api/storage').get_json()
+    payload = b"taxonomy-or-log-data"
+    (tmp_path / "unclassified-vireo-data.bin").write_bytes(payload)
+
+    after = app.test_client().get('/api/storage').get_json()
+
+    assert after["other"]["path"] == str(tmp_path)
+    assert after["other"]["size"] - before["other"]["size"] == len(payload)
+    assert after["total"] - before["total"] == len(payload)
+
+
+def test_config_update_immediately_enforces_working_copy_quota(
+    app_and_db, tmp_path,
+):
+    app, db = app_and_db
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    path = working_dir / "1.jpg"
+    path.write_bytes(b"working-copy")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path='working/1.jpg' WHERE id=1"
+    )
+    db.conn.commit()
+
+    response = app.test_client().post(
+        "/api/config", json={"working_copy_cache_max_mb": 0},
+    )
+
+    assert response.status_code == 200
+    assert not path.exists()
+    row = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime "
+        "FROM photos WHERE id=1"
+    ).fetchone()
+    assert row["working_copy_path"] is None
+    assert row["working_copy_evicted_mtime"] == 1.0
+
+    # Raising the ceiling releases the deliberate-eviction marker so the
+    # next scan/startup backfill may use the newly available space.
+    response = app.test_client().post(
+        "/api/config", json={"working_copy_cache_max_mb": 1},
+    )
+    assert response.status_code == 200
+    row = db.conn.execute(
+        "SELECT working_copy_evicted_mtime FROM photos WHERE id=1"
+    ).fetchone()
+    assert row["working_copy_evicted_mtime"] is None
 
 
 def test_api_storage_reports_each_backing_volume(

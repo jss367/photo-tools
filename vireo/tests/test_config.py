@@ -125,6 +125,7 @@ def test_working_copy_defaults(tmp_path, monkeypatch):
     config = cfg.load()
     assert config["working_copy_max_size"] == 4096
     assert config["working_copy_quality"] == 92
+    assert config["working_copy_cache_max_mb"] == 20480
 
 
 def test_preview_cache_max_mb_default():

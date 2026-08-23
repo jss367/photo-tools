@@ -131,6 +131,10 @@ from web.photo_review import create_photo_review_blueprint
 from web.system import system_blueprint
 from web.workspaces import create_workspace_blueprint
 from werkzeug.exceptions import BadRequest
+from working_copy_cache import (
+    evict_if_over_quota as evict_working_copy_cache_if_over_quota,
+)
+from working_copy_cache import working_copy_stats
 from xmp import read_sync_preview_metadata
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -3659,6 +3663,24 @@ def _enforce_preview_cache_quota_at_startup(app):
             pass
 
 
+def _enforce_working_copy_cache_quota_at_startup(app):
+    """Apply the persistent working-copy ceiling before startup backfill.
+
+    Quota eviction records a source-mtime marker on each removed row. Running
+    this before the deferred backfill timer is what prevents startup from
+    immediately regenerating files that were deliberately removed.
+    """
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    db = Database(app.config["DB_PATH"])
+    try:
+        evict_working_copy_cache_if_over_quota(db, vireo_dir)
+    finally:
+        try:
+            db.conn.close()
+        except Exception:
+            pass
+
+
 def _collection_accepts_manual_photos(rules):
     """Return True when collection rules are static photo-id membership only."""
     if isinstance(rules, list):
@@ -4111,6 +4133,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     _migrate_edit_math_render_caches(app)
     _migrate_unedited_raw_preview_sources(app)
     _enforce_preview_cache_quota_at_startup(app)
+    _enforce_working_copy_cache_quota_at_startup(app)
 
     # Request timing middleware — logs slow requests and user actions
     @app.before_request
@@ -19539,6 +19562,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # save and silently overwrite a recently-saved schema value.
         with _settings_write_lock:
             current = cfg.load()
+            try:
+                previous_working_copy_quota = int(
+                    current.get("working_copy_cache_max_mb", 20480)
+                )
+            except (TypeError, ValueError):
+                previous_working_copy_quota = 20480
 
             # Handle keyboard_shortcuts with validation
             if "keyboard_shortcuts" in body:
@@ -19624,6 +19653,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             elif "HF_TOKEN" in os.environ:
                 del os.environ["HF_TOKEN"]
             cfg.save(current)
+            try:
+                current_working_copy_quota = int(
+                    current.get("working_copy_cache_max_mb", 20480)
+                )
+            except (TypeError, ValueError):
+                current_working_copy_quota = 20480
+            if current_working_copy_quota > previous_working_copy_quota:
+                # Raising the ceiling makes quota-evicted rows eligible for
+                # the normal scan/startup backfill again. It does not perform
+                # expensive RAW decoding in this settings request; the next
+                # scoped scan or startup backfill fills the new space.
+                quota_db = _get_db()
+                quota_db.conn.execute(
+                    "UPDATE photos SET working_copy_evicted_mtime=NULL "
+                    "WHERE working_copy_evicted_mtime IS NOT NULL"
+                )
+                commit_with_retry(quota_db.conn)
             if "inat_token" in body:
                 _advance_inat_token_generation()
             # If the user shrunk the preview cache quota, evict immediately to the
@@ -19631,6 +19677,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # already under quota, so always safe to call.
             vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
             evict_preview_cache_if_over_quota(_get_db(), vireo_dir)
+            evict_working_copy_cache_if_over_quota(_get_db(), vireo_dir)
         return jsonify({"ok": True})
 
     @app.route("/api/settings/schema")
@@ -20932,7 +20979,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if os.path.isdir(path):
                 for dirpath, dirnames, filenames in os.walk(path):
                     for f in filenames:
-                        total += os.path.getsize(os.path.join(dirpath, f))
+                        try:
+                            total += os.path.getsize(os.path.join(dirpath, f))
+                        except OSError:
+                            # Cache eviction and generation can race a storage
+                            # refresh. A disappearing file should make this
+                            # snapshot slightly stale, not fail the endpoint.
+                            continue
             return total
 
         db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
@@ -20941,6 +20994,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             os.path.dirname(app.config["THUMB_CACHE_DIR"]), "previews"
         )
         preview = _dir_stats(preview_dir)
+        working = working_copy_stats(
+            os.path.dirname(app.config["THUMB_CACHE_DIR"])
+        )
         emb = _dir_stats(EMB_CACHE_DIR)
         models_size = _dir_size_recursive(DEFAULT_MODELS_DIR)
         db = _get_db()
@@ -20950,6 +21006,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         ).fetchone()
         masks = _storage_masks_data(db)
         masks_size = masks["total_bytes"]
+        storage_root = os.path.dirname(app.config["THUMB_CACHE_DIR"])
 
         # HuggingFace cache — only count Vireo-relevant models
         hf_cache = os.path.expanduser("~/.cache/huggingface/hub")
@@ -20970,19 +21027,39 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         }
                     )
 
-        total = (
-            db_size
-            + thumb["size"]
-            + preview["size"]
-            + emb["size"]
-            + models_size
-            + hf_size
-            + offline_size
-            + masks_size
-        )
-        reclaimable = thumb["size"] + preview["size"] + emb["size"]
+        # The named categories historically missed valid Vireo-managed files
+        # such as taxonomy.json, SQLite WAL/backups, logs, and display-source
+        # renders under originals/. Count the whole generated-storage root and
+        # expose the difference as "other" so the headline matches disk usage
+        # without pretending those files are safe cache-clear candidates.
+        storage_root_size = _dir_size_recursive(storage_root)
 
-        storage_root = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+        def _is_within(path, root):
+            try:
+                return os.path.commonpath(
+                    [os.path.abspath(path), os.path.abspath(root)]
+                ) == os.path.abspath(root)
+            except (OSError, ValueError):
+                return False
+
+        named_storage = [
+            (db_path, db_size),
+            (thumb["path"], thumb["size"]),
+            (preview["path"], preview["size"]),
+            (working["path"], working["size"]),
+            (EMB_CACHE_DIR, emb["size"]),
+            (DEFAULT_MODELS_DIR, models_size),
+            (os.path.join(storage_root, "offline"), offline_size),
+            (masks["path"], masks_size),
+            (hf_cache, hf_size),
+        ]
+        named_inside_root = sum(
+            size for path, size in named_storage
+            if _is_within(path, storage_root)
+        )
+        other_size = max(0, storage_root_size - named_inside_root)
+        total = sum(size for _path, size in named_storage) + other_size
+        reclaimable = thumb["size"] + preview["size"] + emb["size"]
 
         def _volume_for_path(path):
             usage_path = os.path.abspath(path)
@@ -21022,7 +21099,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             ("catalog", "Catalog and masks", os.path.dirname(db_path)),
             (
                 "generated",
-                "Thumbnails, previews, and offline originals",
+                "Thumbnails, previews, working copies, and offline originals",
                 storage_root,
             ),
         ]
@@ -21065,6 +21142,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "database": {"size": db_size, "path": db_path},
                 "thumbnails": thumb,
                 "previews": preview,
+                "working_copies": working,
+                "other": {"size": other_size, "path": storage_root},
                 "embeddings": emb,
                 "models": {"size": models_size, "path": DEFAULT_MODELS_DIR},
                 "hf_cache": {"size": hf_size, "path": hf_cache, "models": hf_models},

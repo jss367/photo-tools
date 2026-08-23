@@ -21594,6 +21594,78 @@ def test_id_conflicts_labels_fall_back_to_the_raw_prediction(app_and_db):
     assert signal["model_disagreement_label"] == "Mystery Beast vs Other Beast"
 
 
+def test_compare_canonical_key_collapses_hierarchy_aliases(app_and_db, tmp_path):
+    """Two spellings the DB already calls one species share one key.
+
+    Codex P2 (app.py:16954). ``resolve_species_display_name`` collapses a
+    hierarchy alias onto its root keyword ("Desert Verdin" -> "Verdin"),
+    and ``compare_prediction_to_keywords`` is fed that resolved name — so
+    the keyword comparison treats both models as naming the same species.
+    The identity key's text fallback took the *raw* prediction, so when
+    the taxonomy indexes neither spelling the page reported a model
+    disagreement its own keyword column contradicted.
+    """
+    from unittest.mock import patch
+
+    import taxonomy as tax_mod
+
+    app, db = app_and_db
+    photo_id = db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 1"
+    ).fetchone()["id"]
+
+    # A root ``Verdin`` species keyword with a linked hierarchy leaf
+    # ``Desert Verdin`` under it — the shape resolve_species_display_name
+    # canonicalizes through.
+    db.conn.execute(
+        "INSERT INTO taxa (id, name, rank) VALUES (555, 'Auriparus flaviceps', 'species')"
+    )
+    root_id = db.conn.execute(
+        "INSERT INTO keywords (name, parent_id, is_species, type, taxon_id) "
+        "VALUES ('Verdin', NULL, 1, 'taxonomy', 555)"
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO keywords (name, parent_id, is_species, type, taxon_id) "
+        "VALUES ('Desert Verdin', ?, 1, 'taxonomy', 555)",
+        (root_id,),
+    )
+    db.conn.commit()
+    assert db.resolve_species_display_name("Desert Verdin") == "Verdin", (
+        "sanity: the DB resolver collapses the alias onto its root"
+    )
+
+    det_id = db.save_detections(photo_id, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="MDV6")[0]
+    db.add_prediction(det_id, "Desert Verdin", 1.0, "model-a")
+    db.add_prediction(det_id, "Verdin", 0.9, "model-b")
+    cid = db.add_collection(
+        "Aliases", json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+
+    # Taxonomy that indexes neither spelling — the text-fallback path.
+    tax_path = tmp_path / "taxonomy.json"
+    tax_path.write_text(json.dumps(
+        {"taxa_by_common": {}, "taxa_by_scientific": {}}
+    ))
+    with patch(
+        "taxonomy.load_local_taxonomy",
+        return_value=tax_mod.Taxonomy(str(tax_path)),
+    ):
+        resp = app.test_client().get(
+            f"/api/predictions/compare?collection_id={cid}"
+        )
+
+    assert resp.status_code == 200
+    preds = resp.get_json()["photos"][0]["predictions"]
+    assert preds["model-a"][0]["canonical_species"] == "verdin"
+    assert (
+        preds["model-a"][0]["canonical_species"]
+        == preds["model-b"][0]["canonical_species"]
+    ), "an alias and its root keyword must not read as a model disagreement"
+
+
 def test_compare_payload_carries_canonical_species(app_and_db, tmp_path):
     """Predictions naming the same taxon differently (common name vs an
     outdated binomial) share one canonical_species key so the ID Conflicts

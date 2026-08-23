@@ -16933,23 +16933,32 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         edit_recipes_by_photo = db.get_photo_edit_recipes(photo_ids)
         taxonomy = load_local_taxonomy()
 
-        def canonical_species_key(*names):
+        def canonical_species_key(raw_species, db_species):
             """One identity key per taxon, however a model spelled it.
 
             Different models name the same taxon differently ("Western
             Cattle-Egret" vs the outdated binomial "Bubulcus ibis"), and
             the ID Conflicts page must not read that as a model
             disagreement. Resolve each candidate name through the taxonomy
-            (synonym-aware) to a taxon id; when nothing resolves, fall
-            back to the first name's normalized text so identical strings
-            still group together.
+            (synonym-aware) to a taxon id.
+
+            When nothing resolves — no local taxonomy, or neither
+            spelling indexed — fall back to normalized text, preferring
+            ``db_species``. That is ``resolve_species_display_name``'s
+            output, which collapses a hierarchy alias onto its root
+            keyword ("Desert Verdin" -> "Verdin"); the keyword comparison
+            right above already treats those as one species, so keying
+            off the raw spelling here would report a disagreement the
+            rest of the page contradicts. Casing is irrelevant to the
+            key, so the resolver's case-convention last resort cannot
+            leak through this path.
             """
-            for candidate in names:
+            for candidate in (raw_species, db_species):
                 if candidate and taxonomy is not None:
                     taxon = taxonomy.lookup(candidate)
                     if taxon and taxon.get("taxon_id") is not None:
                         return f"taxon:{taxon['taxon_id']}"
-            for candidate in names:
+            for candidate in (db_species, raw_species):
                 if candidate:
                     return str(candidate).strip().lower()
             return ""

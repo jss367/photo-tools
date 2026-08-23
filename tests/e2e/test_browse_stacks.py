@@ -588,3 +588,82 @@ def test_concurrent_stack_hydration_uses_newest_request(live_server, page):
         "currentCoverId": burst_ids[0],
         "gridHasPromotedCover": True,
     }
+
+
+def test_shift_range_from_stack_member_keeps_selection_honest(live_server, page):
+    """A Shift-range anchored on an expanded member must not retarget actions.
+
+    Clicking a hidden stack member anchors selectedIndex on the *cover's* grid
+    slot. Shift-clicking another card then built a range that contained the
+    cover but not the focused member, while the member's card kept rendering
+    as selected — so the batch bar, Export and Delete acted on a photo the
+    user could see was not the highlighted one.
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    other_ids = live_server["data"]["photos"][3:]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'shift-range-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator("#grid > .grid-card")).to_have_count(3)
+
+    stack_card = page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')
+    stack_card.locator(".browse-stack-badge").click()
+    tray = page.locator(
+        f'.browse-stack-tray[data-stack-cover-id="{burst_ids[1]}"]'
+    )
+    expect(tray.locator(".browse-stack-member")).to_have_count(3)
+
+    hidden_member = tray.locator(
+        f'.browse-stack-member[data-id="{burst_ids[2]}"]'
+    )
+    hidden_member.click()
+    expect(hidden_member).to_have_class("browse-stack-member selected")
+
+    page.locator(f'.grid-card[data-id="{other_ids[-1]}"]').click(
+        modifiers=["Shift"]
+    )
+
+    selection_state = page.evaluate(
+        """() => {
+          function ids(nodes) {
+            return Array.from(new Set(Array.from(nodes).map(function(el) {
+              return parseInt(el.dataset.id, 10);
+            }))).sort(function(a, b) { return a - b; });
+          }
+          return {
+            active: getActiveSelection().slice().sort(function(a, b) { return a - b; }),
+            highlighted: ids(document.querySelectorAll(
+              '.grid-card.selected, .browse-stack-member.selected'
+            )),
+          };
+        }"""
+    )
+    # What is highlighted is exactly what a batch action would target.
+    assert selection_state["active"] == selection_state["highlighted"]
+    # And the member the user actually clicked is still one of them.
+    assert burst_ids[2] in selection_state["active"]
+    expect(hidden_member).to_have_class("browse-stack-member selected")
+    expect(page.locator("#batchCount")).to_have_text(
+        str(len(selection_state["active"])) + " selected"
+    )
+
+    # The export modal snapshots the active selection, so the focused member
+    # has to survive into the job the user actually confirms.
+    page.locator("#batchBar button", has_text="Export").click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    export_ids = page.evaluate(
+        "() => (_exportPhotoIds || getActiveSelection()).slice()"
+    )
+    assert sorted(export_ids) == selection_state["active"]
+    page.locator("#exportOverlay button", has_text="Cancel").click()

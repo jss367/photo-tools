@@ -6960,6 +6960,17 @@ function selectPhoto(e, id, idx) {
     for (var i = start; i <= end; i++) {
       if (photos[i]) selectedPhotos.add(photos[i].id);
     }
+    // The anchor of a range is always part of that range. Usually it is
+    // photos[selectedIndex] and the loop already covered it, but a focused
+    // expanded-stack member is not in the top-level photos array at all:
+    // selectBrowseStackMember() anchors selectedIndex on the member's *cover*
+    // grid slot. Without this the loop adds the cover and the intervening
+    // cards while the member keeps painting "selected" off selectedPhotoId,
+    // yet getActiveSelection() prefers the now-nonempty set and drops it —
+    // Export/Delete would silently act on the cover the user never focused.
+    // Fold the anchor in so the highlighted set and the acted-on set cannot
+    // disagree. Codex P2 on PR #1561.
+    if (selectedPhotoId != null) selectedPhotos.add(selectedPhotoId);
   } else if (e.metaKey || e.ctrlKey) {
     // Cmd/Ctrl-click: toggle in selection. Fold the focused photo into the
     // set so batch operations include it (otherwise the highlighted

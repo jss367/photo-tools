@@ -21490,3 +21490,15 @@ def test_compare_payload_carries_canonical_species(app_and_db, tmp_path):
     # Unresolvable names fall back to normalized text so same-string
     # predictions still group together.
     assert canonical_c == "mystery beast"
+
+    # Every prediction that resolved to a taxon carries the taxonomy's
+    # preferred display name — regardless of which raw string the model
+    # persisted — so the ID Conflicts page's consensus group name does not
+    # depend on which model happened to be visited first.
+    display_a = preds["model-a"][0]["canonical_display"]
+    display_b = preds["model-b"][0]["canonical_display"]
+    display_c = preds["model-c"][0]["canonical_display"]
+    assert display_a == "Western Cattle-Egret"
+    assert display_b == "Western Cattle-Egret"
+    # Unresolvable names keep their raw form as a safe display fallback.
+    assert display_c == "Mystery Beast"

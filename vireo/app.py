@@ -16954,6 +16954,33 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     return str(candidate).strip().lower()
             return ""
 
+        def canonical_display_name(*names):
+            """Taxonomy-preferred display name that travels with each prediction.
+
+            The ID Conflicts page groups predictions by ``canonical_species``,
+            but the group's *displayed* name would otherwise be whichever raw
+            prediction the first (alphabetical) model happened to store — so
+            a persisted outdated binomial like "Bubulcus ibis" leaks into the
+            consensus and multi-subject summaries even though the server
+            resolved the taxon. Return the taxonomy's preferred common name
+            (falling back to the current scientific name) whenever any
+            candidate resolves; otherwise fall back to the first non-empty
+            raw candidate so the field is always safe to display.
+            """
+            for candidate in names:
+                if candidate and taxonomy is not None:
+                    taxon = taxonomy.lookup(candidate)
+                    if taxon and taxon.get("taxon_id") is not None:
+                        return (
+                            taxon.get("common_name")
+                            or taxon.get("scientific_name")
+                            or str(candidate).strip()
+                        )
+            for candidate in names:
+                if candidate:
+                    return str(candidate).strip()
+            return ""
+
         def summarize_photo(row):
             row_keys = row.keys()
             def row_bool(key):
@@ -17060,6 +17087,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "detection_id": d["detection_id"],
                 "species": d["species"],
                 "canonical_species": canonical_species_key(
+                    d["species"], comparison_prediction,
+                ),
+                "canonical_display": canonical_display_name(
                     d["species"], comparison_prediction,
                 ),
                 "confidence": d["confidence"],

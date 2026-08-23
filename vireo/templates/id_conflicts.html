@@ -1072,7 +1072,21 @@ function subjectSignal(subject, photoId, subjectIndex) {
     var best = bestSubjectPredictionForModel(subject, model);
     if (!best) return;
     var conf = best.confidence || 0;
-    topPreds.push({model: model, species: best.species || '', identity: predictionIdentity(best), confidence: conf, pred: best});
+    topPreds.push({
+      model: model,
+      species: best.species || '',
+      // Server-resolved display name: the taxonomy's preferred common
+      // (or current scientific) name for this prediction's taxon. Falls
+      // back to the raw species when nothing resolves. Consensus groups
+      // key on this so the group's displayed name doesn't depend on
+      // which model was visited first — otherwise a persisted outdated
+      // binomial like "Bubulcus ibis" would leak into the summary even
+      // though a later model called it "Western Cattle-Egret".
+      display: best.canonical_display || best.species || '',
+      identity: predictionIdentity(best),
+      confidence: conf,
+      pred: best,
+    });
     maxConfidence = Math.max(maxConfidence, conf);
     minConfidence = minConfidence === null ? conf : Math.min(minConfidence, conf);
   });
@@ -1080,7 +1094,12 @@ function subjectSignal(subject, photoId, subjectIndex) {
   var speciesGroups = {};
   topPreds.forEach(function(item) {
     var key = item.identity;
-    if (!speciesGroups[key]) speciesGroups[key] = {species: item.species, count: 0, confidence: 0};
+    if (!speciesGroups[key]) {
+      speciesGroups[key] = {species: item.display, count: 0, confidence: 0};
+    } else if (!speciesGroups[key].species && item.display) {
+      // First member had an empty display; adopt the first non-empty one.
+      speciesGroups[key].species = item.display;
+    }
     speciesGroups[key].count += 1;
     speciesGroups[key].confidence += item.confidence;
   });

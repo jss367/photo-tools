@@ -525,6 +525,30 @@ def register_model(model_id, name, model_str, weights_path, description=""):
     _save_config(config)
 
 
+def _needs_atomic_publish(filename):
+    """True if `filename` must be published via a temp copy + os.replace.
+
+    Only the small JSON metadata files need this. They can be read by
+    another thread or process *while* a download or self-heal is writing
+    them — the background label_descriptions heal racing a
+    TimmClassifier init is the concrete case — so a reader must see
+    either the whole file or no file at all, never a torn one.
+
+    Deliberately NOT applied to the weight artifacts (.onnx, .onnx.data,
+    .npy). shutil.copy2 is a real byte copy on Windows and Linux (only
+    APFS clones cheaply), so staging those would put a second full-size
+    copy beside a model that is already on disk: a Repair of the 3.9 GB
+    BioCLIP-2.5 fetching one optional metadata file would transiently
+    need ~7.8 GB and can fail with ENOSPC where it previously fit.
+    Nothing reads weights concurrently with a download — an ONNX session
+    opens them once at classifier init, after the download has returned.
+
+    Suffix-based rather than a size threshold on purpose: the rule stays
+    legible and doesn't silently change behaviour as models grow.
+    """
+    return filename.endswith(".json")
+
+
 def _hf_download_with_retry(repo_id, filename, local_dir,
                             subfolder=None, progress_callback=None,
                             revision=None):
@@ -627,25 +651,44 @@ def _hf_download_with_retry(repo_id, filename, local_dir,
             # as a connection failure.
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
             if cached_path != dest_path:
-                # Publish atomically. copy2 straight onto dest_path makes
-                # the destination visible while it is still being written,
-                # so a concurrent reader (e.g. the background
-                # label_descriptions heal racing a TimmClassifier init)
-                # can json.load a torn file, and a process exit mid-copy
-                # leaves a truncated file whose mere existence suppresses
-                # future repairs. Copy beside it, then os.replace (atomic
-                # on POSIX and Windows) so readers only ever see the whole
-                # file or no file.
-                tmp_path = (
-                    f"{dest_path}.part-{os.getpid()}-{threading.get_ident()}"
-                )
-                try:
-                    shutil.copy2(cached_path, tmp_path)
-                    os.replace(tmp_path, dest_path)
-                except BaseException:
-                    with contextlib.suppress(OSError):
-                        os.unlink(tmp_path)
-                    raise
+                if _needs_atomic_publish(filename):
+                    # Publish atomically. copy2 straight onto dest_path
+                    # makes the destination visible while it is still
+                    # being written, so a concurrent reader (e.g. the
+                    # background label_descriptions heal racing a
+                    # TimmClassifier init) can json.load a torn file, and
+                    # a process exit mid-copy leaves a truncated file
+                    # whose mere existence suppresses future repairs.
+                    # Copy beside it, then os.replace (atomic on POSIX
+                    # and Windows) so readers only ever see the whole
+                    # file or no file. Cheap here: these are small
+                    # metadata files — see _needs_atomic_publish for why
+                    # the multi-GB weight artifacts must not do this.
+                    tmp_path = (
+                        f"{dest_path}.part-"
+                        f"{os.getpid()}-{threading.get_ident()}"
+                    )
+                    try:
+                        shutil.copy2(cached_path, tmp_path)
+                        os.replace(tmp_path, dest_path)
+                    except BaseException:
+                        with contextlib.suppress(OSError):
+                            os.unlink(tmp_path)
+                        raise
+                else:
+                    # Weights: copy straight into place so a download
+                    # never needs 2x the model size on disk. A failed
+                    # copy still leaves nothing behind — copy2 has
+                    # already truncated any previous copy, so the
+                    # half-written remains are worthless and would only
+                    # look like a healthy artifact to the next
+                    # completeness check.
+                    try:
+                        shutil.copy2(cached_path, dest_path)
+                    except BaseException:
+                        with contextlib.suppress(OSError):
+                            os.unlink(dest_path)
+                        raise
 
             if from_cache:
                 size_mb = os.path.getsize(dest_path) / 1024 / 1024
@@ -921,7 +964,33 @@ def _download_and_verify_file(
     .verify_failed sentinel write so a corrupt optional file doesn't flip
     the whole model's state to 'incomplete'. The caller is expected to
     delete the local file on failure.
+
+    A file that is already on disk and already matches its expected
+    SHA256 is left alone: no download, no copy, no rewrite.
     """
+    local_path = os.path.join(model_dir, filename)
+
+    # Repair calls download_model for the whole manifest even when it only
+    # needs one file (e.g. the newly optional label_descriptions.json).
+    # Re-fetching a 3.9 GB weight blob that is already byte-for-byte
+    # correct costs a full copy out of the HF cache for no benefit, so
+    # hash what's on disk first and skip whatever already passes.
+    # Only possible when HF gave us an expected hash — without one we
+    # can't tell "correct" from "corrupt", so those still get downloaded.
+    pre_sha = expected_hashes.get(filename)
+    if (
+        pre_sha is not None
+        and os.path.isfile(local_path)
+        and model_verify.sha256_file(local_path) == pre_sha
+    ):
+        log.info(
+            "%s already present and matches expected SHA256 — "
+            "skipping download", filename,
+        )
+        if progress_callback:
+            progress_callback(f"{filename} already verified, skipping")
+        return
+
     attempts = 0
     while True:
         _hf_download_with_retry(
@@ -938,7 +1007,6 @@ def _download_and_verify_file(
             # Not an LFS file — HF didn't give us a hash, so we can't verify.
             return
 
-        local_path = os.path.join(model_dir, filename)
         actual_sha = model_verify.sha256_file(local_path)
         if actual_sha == expected_sha:
             return
@@ -1135,14 +1203,14 @@ def ensure_timm_label_descriptions(model_dir, model_str, progress_callback=None)
     )
     if km and "label_descriptions.json" in (km.get("optional_files") or []):
         # _download_optional_files writes each file to
-        # os.path.join(model_dir, filename), and the underlying shutil.copy2
-        # is not atomic — the destination becomes visible while it is still
-        # being written. Two concurrent classifier inits could then see a
-        # partial file (isfile succeeds, json.load fails), and a process
-        # exit mid-copy would leave a truncated file that the next heal's
-        # existence check would treat as already healed. Download into a
-        # scratch subdir on the same filesystem and os.replace onto the
-        # published target atomically.
+        # os.path.join(model_dir, filename). _hf_download_with_retry
+        # already publishes .json artifacts atomically, so the target
+        # can't be seen half-written — but "complete" is not the same as
+        # "usable": HF can hand back a file that is itself truncated, and
+        # its mere existence at the published path would make every later
+        # heal's check treat it as already healed. Download into a scratch
+        # subdir on the same filesystem, validate, and only then
+        # os.replace onto the published target.
         scratch_dir = tempfile.mkdtemp(
             prefix=".label_desc_heal_", dir=model_dir,
         )

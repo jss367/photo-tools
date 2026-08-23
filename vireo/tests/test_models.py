@@ -2514,9 +2514,14 @@ def test_hf_download_publishes_file_atomically(tmp_path, monkeypatch):
     ]
 
 
-def test_hf_download_cleans_up_temp_on_copy_failure(tmp_path, monkeypatch):
+def test_hf_download_cleans_up_partial_weights_on_copy_failure(
+    tmp_path, monkeypatch
+):
     """A failed copy leaves neither a temp file nor a partial destination,
-    so the retry loop starts from a clean slate."""
+    so the retry loop starts from a clean slate.
+
+    Weights are copied straight into place (no staging), so the thing
+    that must be cleaned up here is the truncated destination itself."""
     import shutil as _shutil
 
     import huggingface_hub
@@ -2554,3 +2559,255 @@ def test_hf_download_cleans_up_temp_on_copy_failure(tmp_path, monkeypatch):
         )
 
     assert list(dest_dir.iterdir()) == []
+
+
+def test_hf_download_streams_weights_without_temp_copy(tmp_path, monkeypatch):
+    """Multi-GB weight artifacts must NOT be staged through a temp copy.
+
+    copy2 is a real byte copy on Windows and Linux (only APFS clones), so
+    staging would put a second full-size copy of a 3.9 GB model beside the
+    one already on disk and can fail with ENOSPC on a Repair that
+    previously fit. Nothing reads weights concurrently with a download, so
+    there is nothing to protect against."""
+    import shutil as _shutil
+
+    import huggingface_hub
+    import models
+
+    dest_dir = tmp_path / "model"
+    dest_dir.mkdir()
+
+    real_copy2 = _shutil.copy2
+    seen = []
+
+    def _spy_copy2(src, dst):
+        seen.append(str(dst))
+        return real_copy2(src, dst)
+
+    monkeypatch.setattr(models.shutil, "copy2", _spy_copy2)
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda **kw: None,
+    )
+
+    for name, blob in (
+        ("model.onnx", b"graph"),
+        ("model.onnx.data", b"weights" * 100),
+        ("tol_embeddings.npy", b"vectors" * 100),
+    ):
+        cached = tmp_path / "cache" / name
+        cached.parent.mkdir(exist_ok=True)
+        cached.write_bytes(blob)
+        monkeypatch.setattr(
+            huggingface_hub, "hf_hub_download",
+            lambda _p=str(cached), **kw: _p,
+        )
+
+        seen.clear()
+        out = models._hf_download_with_retry(
+            models.ONNX_REPO, name, str(dest_dir),
+        )
+
+        final = dest_dir / name
+        assert out == str(final)
+        # Copied straight to the final path — no second full-size copy.
+        assert seen == [str(final)], f"{name} was staged through {seen}"
+        assert final.read_bytes() == blob
+
+    # And no staging turds of any kind were left behind.
+    assert not [p.name for p in dest_dir.iterdir() if ".part-" in p.name]
+
+
+def test_hf_download_stages_metadata_through_temp(tmp_path, monkeypatch):
+    """The flip side: the small JSON metadata files a classifier can read
+    mid-heal are still staged and os.replace'd into place."""
+    import shutil as _shutil
+
+    import huggingface_hub
+    import models
+
+    dest_dir = tmp_path / "model"
+    dest_dir.mkdir()
+
+    real_copy2 = _shutil.copy2
+    seen = []
+
+    def _spy_copy2(src, dst):
+        seen.append(str(dst))
+        return real_copy2(src, dst)
+
+    monkeypatch.setattr(models.shutil, "copy2", _spy_copy2)
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda **kw: None,
+    )
+
+    for name in ("label_descriptions.json", "class_names.json",
+                 "config.json", "tokenizer.json", "tol_classes.json"):
+        cached = tmp_path / "cache" / name
+        cached.parent.mkdir(exist_ok=True)
+        cached.write_text(json.dumps({"k": name}))
+        monkeypatch.setattr(
+            huggingface_hub, "hf_hub_download",
+            lambda _p=str(cached), **kw: _p,
+        )
+
+        seen.clear()
+        out = models._hf_download_with_retry(
+            models.ONNX_REPO, name, str(dest_dir),
+        )
+
+        final = dest_dir / name
+        assert out == str(final)
+        assert seen and seen[0] != str(final), f"{name} was not staged"
+        assert seen[0].startswith(str(final) + ".part-")
+        assert json.loads(final.read_text()) == {"k": name}
+
+    assert not [p.name for p in dest_dir.iterdir() if ".part-" in p.name]
+
+
+def test_hf_download_cleans_up_temp_on_metadata_copy_failure(
+    tmp_path, monkeypatch
+):
+    """A failed metadata copy leaves the temp behind for nobody: no
+    `.part-` file, and no destination invented out of a partial write."""
+    import shutil as _shutil
+
+    import huggingface_hub
+    import models
+
+    cached = tmp_path / "cache" / "label_descriptions.json"
+    cached.parent.mkdir()
+    cached.write_text(json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}))
+
+    dest_dir = tmp_path / "model"
+    dest_dir.mkdir()
+
+    monkeypatch.setattr(
+        huggingface_hub, "hf_hub_download", lambda **kw: str(cached),
+    )
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda **kw: None,
+    )
+
+    real_copy2 = _shutil.copy2
+
+    def _partial_then_fail(src, dst):
+        real_copy2(src, dst)
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(models.shutil, "copy2", _partial_then_fail)
+    import time as _time_mod
+    monkeypatch.setattr(_time_mod, "sleep", lambda s: None)
+
+    with pytest.raises(RuntimeError):
+        models._hf_download_with_retry(
+            models.ONNX_REPO, "label_descriptions.json", str(dest_dir),
+        )
+
+    assert list(dest_dir.iterdir()) == []
+
+
+def test_download_model_skips_already_verified_files(tmp_path, monkeypatch):
+    """Repair calls download_model for the whole manifest even when only
+    one file is missing. Files already on disk whose SHA256 matches must
+    not be re-fetched — otherwise repairing a 3.9 GB model to pick up one
+    small optional file re-copies the weights for nothing."""
+    import hashlib
+
+    import model_verify
+    models, model_dir = _patch_download_model_env(tmp_path, monkeypatch)
+
+    contents = {
+        "image_encoder.onnx": b"graph-i" * 100,
+        "image_encoder.onnx.data": b"weights-i" * 1000,
+        "text_encoder.onnx": b"graph-t" * 100,
+        "text_encoder.onnx.data": b"weights-t" * 1000,
+        "tokenizer.json": b"{}",
+        "config.json": b"{}",
+    }
+    expected = {
+        name: hashlib.sha256(data).hexdigest()
+        for name, data in contents.items()
+    }
+
+    # Everything is already installed and correct except config.json,
+    # which is the one file this "Repair" actually needs to fetch.
+    model_dir.mkdir(parents=True)
+    for name, data in contents.items():
+        if name != "config.json":
+            (model_dir / name).write_bytes(data)
+
+    downloaded = []
+
+    def fake_download(repo_id, filename, local_dir, subfolder=None,
+                      progress_callback=None, revision=None):
+        downloaded.append(filename)
+        dest = os.path.join(local_dir, filename)
+        with open(dest, "wb") as f:
+            f.write(contents[filename])
+        return dest
+
+    monkeypatch.setattr(models, "_hf_download_with_retry", fake_download)
+    monkeypatch.setattr(
+        model_verify,
+        "fetch_expected_hashes",
+        lambda subdir, revision="main": expected,
+    )
+
+    models.download_model("bioclip-vit-b-16")
+
+    assert downloaded == ["config.json"]
+    # The untouched files are still intact.
+    for name, data in contents.items():
+        assert (model_dir / name).read_bytes() == data
+
+
+def test_download_model_still_refetches_corrupt_files(tmp_path, monkeypatch):
+    """The skip is hash-gated, not existence-gated: a file that is present
+    but wrong is still re-downloaded, so Repair keeps repairing."""
+    import hashlib
+
+    import model_verify
+    models, model_dir = _patch_download_model_env(tmp_path, monkeypatch)
+
+    contents = {
+        "image_encoder.onnx": b"graph-i" * 100,
+        "image_encoder.onnx.data": b"weights-i" * 1000,
+        "text_encoder.onnx": b"graph-t" * 100,
+        "text_encoder.onnx.data": b"weights-t" * 1000,
+        "tokenizer.json": b"{}",
+        "config.json": b"{}",
+    }
+    expected = {
+        name: hashlib.sha256(data).hexdigest()
+        for name, data in contents.items()
+    }
+
+    model_dir.mkdir(parents=True)
+    for name, data in contents.items():
+        (model_dir / name).write_bytes(data)
+    # One artifact got truncated on disk.
+    (model_dir / "image_encoder.onnx.data").write_bytes(b"trunc")
+
+    downloaded = []
+
+    def fake_download(repo_id, filename, local_dir, subfolder=None,
+                      progress_callback=None, revision=None):
+        downloaded.append(filename)
+        dest = os.path.join(local_dir, filename)
+        with open(dest, "wb") as f:
+            f.write(contents[filename])
+        return dest
+
+    monkeypatch.setattr(models, "_hf_download_with_retry", fake_download)
+    monkeypatch.setattr(
+        model_verify,
+        "fetch_expected_hashes",
+        lambda subdir, revision="main": expected,
+    )
+
+    models.download_model("bioclip-vit-b-16")
+
+    assert downloaded == ["image_encoder.onnx.data"]
+    assert (model_dir / "image_encoder.onnx.data").read_bytes() == (
+        contents["image_encoder.onnx.data"]
+    )

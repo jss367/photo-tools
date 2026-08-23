@@ -3245,6 +3245,71 @@ function refreshExpandedBrowseStackMembers(photoIds) {
   });
 }
 
+function browseStackFlagRank(flag) {
+  if (flag === 'flagged') return 2;
+  if (flag == null || flag === 'none') return 1;
+  return 0;
+}
+
+function browseStackCoverCompare(a, b) {
+  var descending = [
+    [browseStackFlagRank(a.flag), browseStackFlagRank(b.flag)],
+    [a.quality_score, b.quality_score],
+    [a.subject_sharpness, b.subject_sharpness],
+    [a.sharpness, b.sharpness],
+    [a.rating == null ? 0 : a.rating, b.rating == null ? 0 : b.rating],
+    [(a.width || 0) * (a.height || 0), (b.width || 0) * (b.height || 0)],
+    [a.file_size || 0, b.file_size || 0],
+  ];
+  for (var i = 0; i < descending.length; i++) {
+    var av = descending[i][0];
+    var bv = descending[i][1];
+    if (av == null) av = -Infinity;
+    if (bv == null) bv = -Infinity;
+    if (av !== bv) return bv - av;
+  }
+  return a.id - b.id;
+}
+
+function reconcileBrowseStackCovers(photoIds) {
+  var wanted = new Set((photoIds || []).map(Number));
+  var changed = false;
+  Object.keys(browseStackMembers).forEach(function(oldKey) {
+    var members = browseStackMembers[oldKey] || [];
+    if (!members.some(function(member) { return wanted.has(member.id); })) return;
+    var oldCoverId = Number(oldKey);
+    var oldIndex = photos.findIndex(function(photo) { return photo.id === oldCoverId; });
+    if (oldIndex < 0 || !members.length) return;
+    var newCover = members.slice().sort(browseStackCoverCompare)[0];
+    if (!newCover || newCover.id === oldCoverId) return;
+
+    var oldCover = photos[oldIndex];
+    var stack = oldCover.browse_stack;
+    oldCover.browse_stack = null;
+    newCover.browse_stack = stack;
+    photos[oldIndex] = newCover;
+
+    var newKey = String(newCover.id);
+    browseStackMembers[newKey] = members;
+    delete browseStackMembers[oldKey];
+    if (Object.prototype.hasOwnProperty.call(browseStackErrors, oldKey)) {
+      browseStackErrors[newKey] = browseStackErrors[oldKey];
+      delete browseStackErrors[oldKey];
+    }
+    if (expandedBrowseStacks.delete(oldCoverId)) {
+      expandedBrowseStacks.add(newCover.id);
+    }
+    if (selectedPhotoId != null && members.some(function(member) {
+      return member.id === selectedPhotoId;
+    })) {
+      selectedIndex = oldIndex;
+    }
+    changed = true;
+  });
+  if (changed) renderGrid();
+  return changed;
+}
+
 function browsePhotoNavigationList(photoId) {
   // Prefer an expanded stack's member list even for its cover, which also
   // exists in the top-level grid. Opening that cover from the tray should
@@ -7050,6 +7115,7 @@ async function applyBestBatchPickOnly() {
   } catch(e) { return; }
   var p = findBrowsePhoto(bestId);
   if (p) p.flag = 'flagged';
+  reconcileBrowseStackCovers([bestId]);
   refreshGridCards([bestId]);
   refreshExpandedBrowseStackMembers([bestId]);
   _refreshBatchInspectorIfActive();
@@ -7076,6 +7142,7 @@ async function applyBestBatchPickAndReject() {
     if (p) p.flag = flag;
     _clearRepresentativeStateIfIneligible(id, flag);
   });
+  reconcileBrowseStackCovers(touchedIds);
   refreshGridCards(touchedIds);
   refreshExpandedBrowseStackMembers(touchedIds);
   _refreshBatchInspectorIfActive();
@@ -8670,6 +8737,7 @@ async function batchSetRating(rating) {
     var p = findBrowsePhoto(id);
     if (p) p.rating = rating;
   });
+  reconcileBrowseStackCovers(ids);
   refreshGridCards(ids);
   refreshExpandedBrowseStackMembers(ids);
   _refreshBatchInspectorIfActive();
@@ -8826,6 +8894,7 @@ async function batchSetFlag(flag) {
     if (p) p.flag = flag;
     _clearRepresentativeStateIfIneligible(id, flag);
   });
+  reconcileBrowseStackCovers(ids);
   refreshGridCards(ids);
   refreshExpandedBrowseStackMembers(ids);
   if (selectedPhotoId != null && ids.indexOf(selectedPhotoId) !== -1) {
@@ -9816,6 +9885,7 @@ async function setRating(photoId, rating) {
     // set on a hidden member updates the tray-cached row instead of vanishing.
     var p = findBrowsePhoto(photoId);
     if (p) p.rating = rating;
+    reconcileBrowseStackCovers([photoId]);
     refreshGridCards([photoId]);
     refreshExpandedBrowseStackMembers([photoId]);
     scheduleCollectionCountsRefresh();
@@ -9847,6 +9917,7 @@ async function setFlag(flag) {
     var p = findBrowsePhoto(photoId);
     if (p) p.flag = flag;
     _clearRepresentativeStateIfIneligible(photoId, flag);
+    reconcileBrowseStackCovers([photoId]);
     refreshGridCards([photoId]);
     refreshExpandedBrowseStackMembers([photoId]);
     if (selectedPhotoId === photoId) updateDetailFlagButtons(flag);
@@ -11137,6 +11208,7 @@ async function setRatingFor(photoId, rating) {
   } catch(e) { return; }
   var p = findBrowsePhoto(photoId);
   if (p) p.rating = rating;
+  reconcileBrowseStackCovers([photoId]);
   refreshGridCards([photoId]);
   refreshExpandedBrowseStackMembers([photoId]);
   scheduleCollectionCountsRefresh();
@@ -11154,6 +11226,7 @@ async function setFlagFor(photoId, flag) {
   var p = findBrowsePhoto(photoId);
   if (p) p.flag = flag;
   _clearRepresentativeStateIfIneligible(photoId, flag);
+  reconcileBrowseStackCovers([photoId]);
   refreshGridCards([photoId]);
   refreshExpandedBrowseStackMembers([photoId]);
   _refreshInspectorAfterSinglePhotoEdit(photoId, function() { updateDetailFlagButtons(flag); });
@@ -12303,7 +12376,7 @@ function updateExportPreview() {
   if (!template) { document.getElementById('exportPreview').textContent = ''; return; }
   // Use first selected photo for preview
   var firstId = (_exportPhotoIds || getActiveSelection())[0];
-  var photo = photos.find(function(p) { return p.id === firstId; });
+  var photo = findBrowsePhoto(firstId);
   // Find Similar and other shared-lightbox entry points can display photos
   // outside Browse's currently loaded page. Their metadata remains available
   // through the lightbox cache/list after the viewer closes for this modal.

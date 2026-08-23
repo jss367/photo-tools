@@ -82,6 +82,11 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
     expect(page.locator("#batchCount")).to_have_text("1 selected")
     expect(page.locator("#detailFilename")).to_have_text("hawk3.jpg")
 
+    page.locator("#batchBar button", has_text="Export").click()
+    expect(page.locator("#exportOverlay")).to_have_class("modal-overlay open")
+    expect(page.locator("#exportPreview")).to_contain_text("hawk3")
+    page.locator("#exportOverlay button", has_text="Cancel").click()
+
     tray.get_by_role("button", name="Collapse stack").click()
     expect(tray).to_be_hidden()
     page.wait_for_function(
@@ -140,6 +145,13 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
         arg=burst_ids,
     )
     expect(page.locator("#flagMixed")).to_be_visible()
+    new_cover = page.locator(f'.grid-card[data-id="{burst_ids[0]}"]')
+    expect(new_cover).to_be_visible()
+    expect(new_cover.locator(".browse-stack-badge")).to_have_text("▦3")
+    expect(page.locator(
+        f'.browse-stack-tray[data-stack-cover-id="{burst_ids[0]}"]'
+    )).to_be_visible()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_have_count(0)
 
     # Stacks is a presentation preference, so it survives a return to Browse.
     page.reload()

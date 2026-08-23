@@ -6962,6 +6962,124 @@ def test_all_photos_cache_satisfied_rejects_stale_classifier_runtime(tmp_path):
     ) is True
 
 
+def test_all_photos_cache_satisfied_rejects_pre_synonym_classifier_runtime(
+    tmp_path, monkeypatch,
+):
+    """A run recorded before the scientific-name synonym map shipped must
+    not satisfy the cache once the map is installed.
+
+    The map changes what the classifier emits for outdated binomials
+    ("Bubulcus ibis" -> the current "Ardea ibis" taxon, with its common
+    name and full hierarchy), so a pre-synonym run and a post-synonym run
+    are semantically different output for the same model, labels,
+    taxonomy and detector runtime. If the runtime identity ignored the
+    map, this join would report the collection as already classified and
+    the reclassify that replaces the raw binomials would be skipped
+    (Codex #1560 P2).
+    """
+    import taxonomy as tax_mod
+    from classify_job import _all_photos_cache_satisfied
+    from computation_cache import (
+        classifier_model_identity,
+        classifier_runtime_fingerprint,
+        runtime_fingerprint,
+        source_input,
+    )
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detector_runtime = runtime_fingerprint({
+        "type": "detection", "model": "megadetector-v6",
+        "weights_sha256": "2" * 64, "pipeline": "detector-v1",
+    })
+    _input, det_input_fp = source_input(
+        "0" * 64, "vireo-detector-source-v1",
+    )
+    det_id = db.write_detection_batch(
+        pid, "megadetector-v6",
+        [{"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+          "confidence": 0.9, "category": "animal"}],
+        runtime_fingerprint=detector_runtime,
+        input_fingerprint=det_input_fp,
+    )[0]
+
+    labels_full = "5" * 64
+    labels_short = labels_full[:12]
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "image_encoder.onnx").write_bytes(b"exact model bytes")
+    identity = classifier_model_identity({
+        "id": "bioclip-test",
+        "model_str": "ViT-test",
+        "model_type": "bioclip",
+        "weights_path": str(model_dir),
+        "files": ["image_encoder.onnx"],
+        "source": "custom",
+    })
+
+    # The runtime an install with NO synonym map would have recorded.
+    monkeypatch.setattr(tax_mod, "_SCIENTIFIC_SYNONYMS", {})
+    pre_synonym_runtime = classifier_runtime_fingerprint(
+        identity, labels_full, detector_runtime, taxonomy_identity="1" * 64,
+    )
+    assert pre_synonym_runtime is not None
+
+    # Now the map ships. Same model, labels, taxonomy and detector.
+    monkeypatch.setattr(
+        tax_mod, "_SCIENTIFIC_SYNONYMS", {"bubulcus ibis": "Ardea ibis"},
+    )
+    post_synonym_runtime = classifier_runtime_fingerprint(
+        identity, labels_full, detector_runtime, taxonomy_identity="1" * 64,
+    )
+    assert post_synonym_runtime is not None
+    assert post_synonym_runtime != pre_synonym_runtime
+
+    db.conn.execute(
+        """INSERT INTO classifier_runs
+             (detection_id, classifier_model, labels_fingerprint,
+              runtime_fingerprint, prediction_count)
+           VALUES (?, ?, ?, ?, ?)""",
+        (det_id, "BioCLIP", labels_short, pre_synonym_runtime, 1),
+    )
+    db.add_prediction(
+        det_id, species="Bubulcus ibis", confidence=0.9, model="BioCLIP",
+        labels_fingerprint=labels_short,
+    )
+    db.conn.commit()
+
+    # The pre-synonym row must NOT satisfy the cache now that the map is
+    # present — otherwise classify short-circuits and the raw binomial
+    # stays on screen.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint=labels_short,
+        model_identity=identity, labels_fingerprint_full=labels_full,
+        taxonomy_identity="1" * 64,
+    ) is False
+
+    # A row recorded with the current map is still accepted, so this is a
+    # staleness gate and not a blanket cache disable.
+    db.conn.execute(
+        "UPDATE classifier_runs SET runtime_fingerprint = ? "
+        "WHERE detection_id = ?",
+        (post_synonym_runtime, det_id),
+    )
+    db.conn.commit()
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint=labels_short,
+        model_identity=identity, labels_fingerprint_full=labels_full,
+        taxonomy_identity="1" * 64,
+    ) is True
+
+
 def test_finalize_cached_only_respects_workspace_detector_threshold(
     tmp_path, monkeypatch,
 ):

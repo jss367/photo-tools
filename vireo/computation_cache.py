@@ -276,6 +276,27 @@ def local_taxonomy_identity():
     return taxonomy_identity(tax)
 
 
+def local_synonyms_identity():
+    """Identity of the packaged scientific-name synonym map, or a sentinel.
+
+    Folded into every classifier runtime fingerprint (see
+    ``classifier_runtime_fingerprint``). Read from the local install and
+    not passed in by callers, for the same reason the taxonomy axis only
+    ever accepts the *local* identity: an artifact enriched against a
+    different synonym map is a semantic mismatch, and a caller that
+    forgot to thread the value through would silently reopen the stale
+    match this exists to close.
+    """
+    try:
+        from taxonomy import scientific_synonyms_identity
+    except ImportError:
+        return "no-synonyms"
+    try:
+        return scientific_synonyms_identity()
+    except Exception:
+        return "no-synonyms"
+
+
 def classifier_runtime_fingerprint(
     model_identity, labels_fingerprint_full, detector_runtime,
     taxonomy_identity="no-tax",
@@ -295,7 +316,17 @@ def classifier_runtime_fingerprint(
         "detector_runtime_fingerprint": detector_runtime,
         "input_recipe": "vireo-classifier-crops-v1",
         "preprocess": "model-config-owned-v1",
-        "output_enrichment": {"taxonomy_identity": taxonomy_identity},
+        # Output enrichment covers everything that turns a raw class id
+        # into the species/hierarchy stored on a prediction: taxonomy.json
+        # AND the packaged scientific-name synonym map that resolves
+        # outdated binomials before that lookup. Omitting the synonym map
+        # would let a run recorded before the map shipped compare equal to
+        # one made after it, so the cache would skip the reclassify that
+        # replaces raw binomials with current names (Codex #1560 P2).
+        "output_enrichment": {
+            "taxonomy_identity": taxonomy_identity,
+            "scientific_synonyms_identity": local_synonyms_identity(),
+        },
         "comparison_policy": "provider-tolerance-experimental-v1",
     })
 

@@ -3462,3 +3462,38 @@ def test_shipped_synonym_data_is_well_formed():
         assert old != current.lower(), old
     assert synonyms["bubulcus ibis"] == "Ardea ibis"
     assert synonyms["phalacrocorax brasilianus"] == "Nannopterum brasilianum"
+
+
+def test_scientific_synonyms_identity_tracks_map_content(monkeypatch):
+    """The identity changes with the map and is stable for equal maps.
+
+    ``computation_cache.classifier_runtime_fingerprint`` folds this into
+    every classifier run's identity, so it has to move when the map does
+    (otherwise a pre-synonym run compares equal to a post-synonym one)
+    and stay put when it doesn't (otherwise every run looks stale).
+    """
+    import taxonomy as tax_mod
+
+    monkeypatch.setattr(tax_mod, "_SCIENTIFIC_SYNONYMS", {})
+    empty = tax_mod.scientific_synonyms_identity()
+    assert empty == "no-synonyms"
+
+    monkeypatch.setattr(
+        tax_mod, "_SCIENTIFIC_SYNONYMS", {"bubulcus ibis": "Ardea ibis"},
+    )
+    one = tax_mod.scientific_synonyms_identity()
+    assert one != empty
+    assert len(one) == 64
+
+    # Same content, different dict object -> same identity.
+    monkeypatch.setattr(
+        tax_mod, "_SCIENTIFIC_SYNONYMS", {"bubulcus ibis": "Ardea ibis"},
+    )
+    assert tax_mod.scientific_synonyms_identity() == one
+
+    monkeypatch.setattr(
+        tax_mod, "_SCIENTIFIC_SYNONYMS",
+        {"bubulcus ibis": "Ardea ibis",
+         "phalacrocorax brasilianus": "Nannopterum brasilianum"},
+    )
+    assert tax_mod.scientific_synonyms_identity() != one

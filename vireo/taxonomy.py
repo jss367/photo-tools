@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import csv
 import gzip
+import hashlib
 import io
 import json
 import logging
@@ -59,6 +60,8 @@ SCIENTIFIC_SYNONYMS_PATH = os.path.join(
 )
 _SCIENTIFIC_SYNONYMS = None
 _scientific_synonyms_lock = threading.Lock()
+# (loaded map object, digest) — see scientific_synonyms_identity().
+_SCIENTIFIC_SYNONYMS_IDENTITY = None
 
 
 def load_scientific_synonyms():
@@ -86,6 +89,42 @@ def load_scientific_synonyms():
             loaded = {}
         _SCIENTIFIC_SYNONYMS = loaded
     return _SCIENTIFIC_SYNONYMS
+
+
+def scientific_synonyms_identity():
+    """Content identity of the synonym map actually backing lookups.
+
+    ``Taxonomy.lookup`` falls back to this map, so the map is part of
+    what a classifier run *means*: the same model and taxonomy.json can
+    emit "Bubulcus ibis" with no map installed and "Cattle Egret" (plus
+    the full hierarchy) once it is. Anything that identifies a run's
+    output enrichment therefore has to include this alongside the
+    taxonomy digest, or a pre-synonym run compares equal to a
+    post-synonym one and the cache skips the work that would fix the
+    raw binomials (Codex #1560 P2).
+
+    Derived from the loaded mapping rather than the file bytes so the
+    identity describes what lookups will actually use: a missing or
+    malformed file loads as ``{}`` and yields the ``"no-synonyms"``
+    sentinel, which is exactly the no-enrichment case. Memoized against
+    the loaded map object, so it recomputes if the map is reloaded or
+    replaced (tests monkeypatch it) but costs nothing on the hot path.
+    """
+    global _SCIENTIFIC_SYNONYMS_IDENTITY
+    synonyms = load_scientific_synonyms()
+    cached = _SCIENTIFIC_SYNONYMS_IDENTITY
+    if cached is not None and cached[0] is synonyms:
+        return cached[1]
+    if not synonyms:
+        digest = "no-synonyms"
+    else:
+        payload = json.dumps(
+            {str(k).lower(): str(v) for k, v in synonyms.items()},
+            sort_keys=True, separators=(",", ":"),
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    _SCIENTIFIC_SYNONYMS_IDENTITY = (synonyms, digest)
+    return digest
 
 
 # `Content-Range: bytes */<total>` — the header a 416 response uses to tell

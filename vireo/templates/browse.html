@@ -8611,13 +8611,18 @@ document.addEventListener('vireo:edit-history-changed', function() {
   // Card badges move with the same edits, so refresh the loaded grid rows too.
   // `skipPanels` because the sidebar refresh below is the broader one: without
   // it the prediction panels would be fetched twice per undo.
+  //
+  // Undo/redo also reverses rating and flag edits, and those two fields are
+  // inputs to browseStackCoverCompare — reversing one can hand a collapsed
+  // stack back to a different cover. Unlike every in-page rating/flag path
+  // there is no mutation site here to apply the reversal locally, so the
+  // refresh below copies both fields from the server and reconciles the
+  // covers of whichever stacks actually moved. `reportFailure` because a
+  // failed refresh here means the server reversed an edit the grid is still
+  // showing: silence would make Undo look like a no-op.
   var loadedIds = loadedBrowsePhotoIds();
   if (loadedIds.length) {
-    _refreshBrowseKeywordState(loadedIds, {skipPanels: true});
-    // A rating/flag/color-label undo/redo touches the same fields the stack
-    // cover comparator reads. Refresh those on loaded rows and reconcile
-    // representatives so the demoted cover doesn't linger.
-    _refreshBrowseCoverAffectingState(loadedIds);
+    _refreshBrowseKeywordState(loadedIds, {skipPanels: true, reportFailure: true});
   }
   refreshBrowseSidebarPanels();
 });
@@ -9278,6 +9283,16 @@ function _keywordNameFromCache(keywordId) {
 // badges render from the separate `photos` cache populated by /api/photos.
 // Refresh the loaded rows from the authoritative batch endpoint after every
 // keyword mutation so taxonomy badges and representative state cannot drift.
+//
+// Rating and flag ride along for the one caller that has no other way to learn
+// them: undo/redo writes on the server and then announces, so nothing applied
+// the reversal to the local rows. They are also the only two edit-reversible
+// inputs to browseStackCoverCompare, so a stale copy does not just mis-render a
+// badge — it leaves a collapsed stack led by a photo the database no longer
+// ranks first. Rather than gate that behind a flag, the rows that actually
+// moved are recorded and only their stacks are reconciled: keyword callers see
+// no rating/flag change and so pay nothing, while any future caller gets the
+// cover fixed for free instead of silently drifting.
 async function _refreshBrowseKeywordState(photoIds, opts) {
   opts = opts || {};
   // Species keywords are exactly the input the prediction panels' ambiguity
@@ -9295,6 +9310,10 @@ async function _refreshBrowseKeywordState(photoIds, opts) {
   if (!ids.length) return;
 
   var refreshed = [];
+  // Photos whose rating or flag actually moved, i.e. whose stack's cover may
+  // need recomputing. Kept separate from `refreshed` so an undo of a keyword
+  // edit does not rehydrate every collapsed stack on the page.
+  var coverRankChanged = [];
   try {
     for (var offset = 0; offset < ids.length; offset += 500) {
       var data = await safeFetch('/api/photos/by-ids', {
@@ -9311,60 +9330,44 @@ async function _refreshBrowseKeywordState(photoIds, opts) {
           ? updated.species_representatives
           : local.life_list;
         local.is_species_representative = !!updated.is_species_representative;
+        var nextRating = updated.rating === undefined ? null : updated.rating;
+        var nextFlag = updated.flag === undefined ? null : updated.flag;
+        var localRating = local.rating === undefined ? null : local.rating;
+        // `browseStackFlagRank` folds null and 'none' together, which is also
+        // how the card badge renders them, so neither a cover nor a badge can
+        // change between those two spellings.
+        if (localRating !== nextRating
+            || browseStackFlagRank(local.flag) !== browseStackFlagRank(nextFlag)) {
+          coverRankChanged.push(updated.id);
+        }
+        local.rating = nextRating;
+        local.flag = nextFlag;
         refreshed.push(updated.id);
       });
     }
   } catch (e) {
     // The keyword save already succeeded; a later page reload remains a safe
-    // fallback if this non-critical card refresh is interrupted.
+    // fallback if this non-critical card refresh is interrupted. Undo/redo is
+    // the exception and passes `reportFailure`: there the server has already
+    // reversed an edit the grid is still displaying, so staying quiet would
+    // present a working Undo as a no-op.
+    if (opts.reportFailure) {
+      showToast(
+        'Could not refresh the grid after that undo — cards may still show the '
+        + 'previous ratings, flags and stack covers. Reload the page to be sure.',
+        'warning'
+      );
+    }
   }
+  // Before the card repaints below, for the reason batchSetFlag orders it this
+  // way: a promotion replaces the top-level row, and renderGrid() has to have
+  // put the new cover in place before individual cards are refreshed. Failed
+  // hydrations inside here report themselves with the '!' recheck marker.
+  if (coverRankChanged.length) await reconcileBrowseStackCovers(coverRankChanged);
   if (refreshed.length) {
     refreshGridCards(refreshed);
     refreshExpandedBrowseStackMembers(refreshed);
   }
-}
-
-// Undo/redo is the one mutation source Browse cannot route through its own
-// per-field call sites — the navbar writes then announces. _refreshBrowseKeywordState
-// covers species/representative drift, but rating/flag/color-label reverts also
-// change the fields browseStackCoverCompare reads, so a demoted stack cover
-// would keep painting until another cover-affecting edit or reload without an
-// explicit reconcile here.
-async function _refreshBrowseCoverAffectingState(photoIds) {
-  if (!Array.isArray(photoIds) || !photoIds.length) return;
-  var ids = Array.from(new Set(photoIds)).filter(function(id) {
-    return !!findBrowsePhoto(id);
-  });
-  if (!ids.length) return;
-  var refreshed = [];
-  try {
-    for (var offset = 0; offset < ids.length; offset += 500) {
-      var data = await safeFetch('/api/photos/by-ids', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({photo_ids: ids.slice(offset, offset + 500)}),
-      }, {toast: false});
-      (data.photos || []).forEach(function(updated) {
-        var local = findBrowsePhoto(updated.id);
-        if (!local) return;
-        local.rating = updated.rating;
-        local.flag = updated.flag;
-        local.color_label = updated.color_label;
-        local.quality_score = updated.quality_score;
-        local.subject_sharpness = updated.subject_sharpness;
-        local.sharpness = updated.sharpness;
-        refreshed.push(updated.id);
-      });
-    }
-  } catch (e) {
-    // The undo/redo already succeeded server-side; a later page reload remains
-    // a safe fallback if this refresh is interrupted.
-    return;
-  }
-  if (!refreshed.length) return;
-  refreshGridCards(refreshed);
-  refreshExpandedBrowseStackMembers(refreshed);
-  await reconcileBrowseStackCovers(refreshed);
 }
 
 // Server-side eligibility requires the photo to still carry the species

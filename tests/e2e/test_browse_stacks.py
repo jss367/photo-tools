@@ -1056,92 +1056,6 @@ def test_unresolvable_cover_hydration_is_reported_and_recoverable(live_server, p
     assert page.evaluate("id => browseStackCoverRecheck.has(id)", burst_ids[1]) is False
 
 
-def test_navbar_undo_redo_reconciles_stack_covers(live_server, page):
-    """Navbar undo/redo of a cover-affecting edit must reconcile stack covers.
-
-    ``vireo:edit-history-changed`` used to only route through
-    ``_refreshBrowseKeywordState`` (species/representative fields) and
-    ``refreshBrowseSidebarPanels``. A rating/flag/color-label undo therefore
-    left ratings and flags on the loaded rows in their post-edit state and
-    never called ``reconcileBrowseStackCovers``, so a demoted cover kept
-    painting even though the server had reversed the edit.
-    """
-    db = live_server["db"]
-    burst_ids = live_server["data"]["photos"][:3]
-    with db.conn:
-        db.conn.execute(
-            "UPDATE photos SET burst_id = 'undo-cover-reconcile-burst' "
-            "WHERE id IN (?, ?, ?)",
-            burst_ids,
-        )
-        db.conn.execute(
-            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
-            (burst_ids[1],),
-        )
-
-    page.goto(f"{live_server['url']}/browse")
-    page.locator("#browseStacksToggle").check()
-    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
-
-    # Simulate the state the server holds after an undo: the previously demoted
-    # frame is now the higher-quality one, so the local representative should
-    # move to it once the event handler refreshes and reconciles.
-    with db.conn:
-        db.conn.execute(
-            "UPDATE photos SET quality_score = 0.10 WHERE id = ?",
-            (burst_ids[1],),
-        )
-        db.conn.execute(
-            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
-            (burst_ids[0],),
-        )
-
-    outcome = page.evaluate(
-        """async ids => {
-          var coverIdBefore = ids[1];
-          var promotedId = ids[0];
-          var reconcileCalls = [];
-          var originalReconcile = window.reconcileBrowseStackCovers;
-          window.reconcileBrowseStackCovers = function(list) {
-            reconcileCalls.push(Array.from(list || []));
-            return originalReconcile.apply(this, arguments);
-          };
-          try {
-            document.dispatchEvent(new CustomEvent('vireo:edit-history-changed', {
-              detail: {operation: 'undo'},
-            }));
-            // Let both fetches (keyword state + cover-affecting state) resolve
-            // and the trailing reconcile complete.
-            for (var i = 0; i < 40; i++) {
-              await new Promise(function(resolve) { setTimeout(resolve, 25); });
-              if (photos.some(function(p) { return p.id === promotedId && p.browse_stack; })) {
-                break;
-              }
-            }
-            var cover = photos.find(function(p) { return p.browse_stack; });
-            return {
-              coverId: cover ? cover.id : null,
-              coverIdBefore: coverIdBefore,
-              demotedStillHasStack: photos.some(function(p) {
-                return p.id === coverIdBefore && p.browse_stack;
-              }),
-              reconcileCalled: reconcileCalls.length > 0,
-              reconcileIncludedLoaded: reconcileCalls.some(function(list) {
-                return list.indexOf(promotedId) !== -1;
-              }),
-            };
-          } finally {
-            window.reconcileBrowseStackCovers = originalReconcile;
-          }
-        }""",
-        burst_ids,
-    )
-    assert outcome["reconcileCalled"] is True
-    assert outcome["reconcileIncludedLoaded"] is True
-    assert outcome["coverId"] == burst_ids[0]
-    assert outcome["demotedStillHasStack"] is False
-
-
 def test_expanding_stack_over_500_chunks_by_ids_requests(live_server, page):
     """A stack with more than 500 members must be expandable.
 
@@ -1697,3 +1611,87 @@ def test_stack_metadata_lookups_chunk_their_get_urls(live_server, page):
     assert outcome["colorLabels"] == ["red", "red"]
     assert outcome["fetchedFirst"] is True
     assert outcome["fetchedLast"] is True
+
+
+def test_navbar_undo_restores_stack_cover_and_member_state(live_server, page):
+    """Navbar undo of a cover-changing flag edit must reverse it on screen.
+
+    The navbar's Undo button writes to the database and then announces
+    ``vireo:edit-history-changed``; Browse's listener refreshed only the
+    species/representative fields, so the reverted flag stayed in the cached
+    member objects and the promoted photo stayed on top of the stack. The
+    server had reversed the edit and the grid still showed the post-edit
+    state — Undo looked like a no-op (Codex P2 on PR #1561).
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'navbar-undo-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
+
+    # Flagging a hidden member outranks the quality-picked cover, so the
+    # edit promotes it and caches the stack's members.
+    assert page.evaluate("id => setFlagFor(id, 'flagged')", burst_ids[0]) is True
+    expect(
+        page.locator(f'.grid-card[data-id="{burst_ids[0]}"] .browse-stack-badge')
+    ).to_be_visible()
+
+    # The navbar Undo button: writes, then announces.
+    page.evaluate("() => doUndo()")
+
+    # The demoted cover comes back, because the flag that promoted the other
+    # member is gone from the database.
+    expect(
+        page.locator(f'.grid-card[data-id="{burst_ids[1]}"] .browse-stack-badge')
+    ).to_be_visible()
+    expect(
+        page.locator(f'.grid-card[data-id="{burst_ids[0]}"]')
+    ).to_have_count(0)
+
+    # ...and the cached member the undo reverted no longer claims to be
+    # flagged, so a later reconciliation cannot re-promote it.
+    page.wait_for_function(
+        """id => {
+          var member = findBrowsePhoto(id);
+          return !!member && (member.flag == null || member.flag === 'none');
+        }""",
+        arg=burst_ids[0],
+    )
+    assert page.evaluate(
+        """ids => {
+          var members = browseStackMembers[String(ids[1])] || [];
+          return members.map(function(m) { return m.id; }).sort(function(a, b) {
+            return a - b;
+          });
+        }""",
+        burst_ids,
+    ) == sorted(burst_ids)
+    # No silent staleness marker left behind by the reconciliation.
+    assert page.evaluate(
+        "ids => ids.some(id => browseStackCoverRecheck.has(id))", burst_ids
+    ) is False
+
+    # Ratings are the other reversible cover input and travel the same path:
+    # an undo has to put the cached member's value back too, or the next
+    # reconciliation ranks the stack on a rating the database no longer holds.
+    before = page.evaluate("id => findBrowsePhoto(id).rating", burst_ids[2])
+    page.evaluate("id => setRatingFor(id, 4)", burst_ids[2])
+    page.wait_for_function(
+        "id => findBrowsePhoto(id).rating === 4", arg=burst_ids[2]
+    )
+    page.evaluate("() => doUndo()")
+    page.wait_for_function(
+        """args => findBrowsePhoto(args[0]).rating === args[1]""",
+        arg=[burst_ids[2], before],
+    )

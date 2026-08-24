@@ -38904,12 +38904,26 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     # the 1:1 display cache when a trusted full-res copy is
                     # already available, and mark the RAW retry so later
                     # requests take the fast fallback path.
-                    with contextlib.suppress(OSError):
-                        os.unlink(wc_abs)
-                    _record_working_copy_failure(
-                        db, photo, source_for_extraction,
-                    )
-                    return send_file(trusted_wc_path, mimetype="image/jpeg")
+                    #
+                    # Hold the publication guard through ``send_file`` so a
+                    # concurrent quota reduction cannot unlink the fallback
+                    # between validation and open — mirrors the guarded
+                    # cache-hit returns above. If the trusted copy was
+                    # already evicted, keep the undersized display cache
+                    # rather than destroying it and 500ing: falling through
+                    # serves ``wc_abs`` via ``_serve_generated_original``,
+                    # and the retry mark is redundant when there is no
+                    # trusted fallback for a later request to take.
+                    with working_copy_publication_guard():
+                        if os.path.isfile(trusted_wc_path):
+                            with contextlib.suppress(OSError):
+                                os.unlink(wc_abs)
+                            _record_working_copy_failure(
+                                db, photo, source_for_extraction,
+                            )
+                            return send_file(
+                                trusted_wc_path, mimetype="image/jpeg",
+                            )
             return _serve_generated_original(tmp_path, uw, uh)
 
         # extract_working_copy failed on a RAW source: try the full-res
@@ -38997,7 +39011,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # Source/offline bytes are unavailable. A working copy is less
                 # faithful to the camera rendition, but remains the best usable
                 # full-resolution fallback and preserves offline behavior.
-                return send_file(trusted_wc_path, mimetype="image/jpeg")
+                #
+                # Hold the publication guard through ``send_file`` so a
+                # concurrent quota reduction cannot unlink the fallback
+                # between validation and open — mirrors the guarded returns
+                # above. If it was evicted mid-flight, fall through to the
+                # 500 rather than raising inside ``send_file``.
+                with working_copy_publication_guard():
+                    if os.path.isfile(trusted_wc_path):
+                        return send_file(
+                            trusted_wc_path, mimetype="image/jpeg",
+                        )
             return "Could not load image", 500
         if primary_is_raw:
             cache_path = display_cache_path

@@ -3240,10 +3240,8 @@ def test_edit_preview_retries_original_when_working_copy_is_evicted(
     def evicting_load(path, *args, **kwargs):
         loaded_paths.append(os.path.abspath(path))
         if os.path.abspath(path) == os.path.abspath(wc_path):
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.unlink(wc_path)
-            except FileNotFoundError:
-                pass
             return None
         return real_load_image(path, *args, **kwargs)
 

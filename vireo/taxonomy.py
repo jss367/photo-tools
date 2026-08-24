@@ -82,9 +82,17 @@ def load_scientific_synonyms():
             if not isinstance(loaded, dict):
                 raise ValueError("synonym file is not a JSON object")
         except (OSError, ValueError) as e:
+            # Loud enough to diagnose, not fatal: name the path and the
+            # likeliest cause. An empty map disables the whole synonym fix
+            # (raw binomials and false model disagreements come back) with
+            # no other symptom, so a bare "unavailable" is a black box.
             log.warning(
-                "Scientific-name synonyms unavailable (%s); outdated "
-                "binomials will not resolve.", e,
+                "Scientific-name synonyms unavailable at %s (%s); outdated "
+                "binomials such as 'Bubulcus ibis' will not resolve to their "
+                "current names. In an installed build this means the data "
+                "file was not packaged — check [tool.setuptools.package-data] "
+                "in pyproject.toml.",
+                SCIENTIFIC_SYNONYMS_PATH, e,
             )
             loaded = {}
         _SCIENTIFIC_SYNONYMS = loaded

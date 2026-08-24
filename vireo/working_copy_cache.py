@@ -41,6 +41,13 @@ def working_copy_publication_guard():
 
 def _file_identity(st):
     """Return the fields that distinguish an atomically replaced file."""
+    if os.name == "nt":
+        # Windows may expose different st_dev/st_ino values for the same file
+        # through DirEntry.stat() and os.stat() (notably on Python 3.14),
+        # which would make every candidate look replaced and disable quota
+        # eviction. An atomic replacement changes creation time and normally
+        # mtime as well; pair both with size for a stable Windows fingerprint.
+        return (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 

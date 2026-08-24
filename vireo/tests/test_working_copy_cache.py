@@ -1,4 +1,5 @@
 import os
+from types import SimpleNamespace
 
 
 def _seed_working_copies(tmp_path, sizes):
@@ -33,6 +34,22 @@ def _seed_working_copies(tmp_path, sizes):
         photo_ids.append(photo_id)
     db.conn.commit()
     return db, working_dir, photo_ids
+
+
+def test_windows_identity_ignores_unstable_device_and_inode(monkeypatch):
+    import working_copy_cache
+
+    monkeypatch.setattr(working_copy_cache.os, "name", "nt")
+    sampled = SimpleNamespace(
+        st_dev=0, st_ino=0, st_size=123, st_mtime_ns=456, st_ctime_ns=789,
+    )
+    rechecked = SimpleNamespace(
+        st_dev=7, st_ino=99, st_size=123, st_mtime_ns=456, st_ctime_ns=789,
+    )
+
+    assert working_copy_cache._file_identity(sampled) == (
+        working_copy_cache._file_identity(rechecked)
+    )
 
 
 def test_evicts_oldest_working_copies_and_marks_catalog_rows(tmp_path):

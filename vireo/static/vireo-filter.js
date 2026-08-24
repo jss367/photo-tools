@@ -1142,6 +1142,7 @@
       });
     }
     $('.vf-clear').addEventListener('click', () => {
+      if (!hasUserFilters() && !state.muted) return;
       // Kill any pending live-search debounce so it can't silently reinstate
       // the just-typed text after "Filters cleared" (Codex review r3791783342).
       cancelQuickSearchTimer();
@@ -1154,6 +1155,9 @@
       toast('Filters cleared', true);
     });
     $('.vf-clear-rules').addEventListener('click', () => {
+      // This control stays visible in the popover even when no filters are
+      // active. Avoid turning that no-op into a full page reload.
+      if (!hasUserFilters() && !state.muted) return;
       cancelQuickSearchTimer();
       mutate(() => {
         state.root = { mode: 'all', rules: [] };
@@ -1674,6 +1678,7 @@
         if (state.ready) render();
         return;
       }
+      if (!hasUserFilters() && !state.muted) return;
       mutate(() => {
         state.root = { mode: 'all', rules: [] };
         state.muted = false;

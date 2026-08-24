@@ -520,9 +520,9 @@ def test_clear_cancels_pending_live_search_debounce(live_server, page):
     _wait_total(page, 5)
 
 
-@pytest.mark.parametrize("clear_selector", [".vf-clear", ".vf-clear-rules"])
+@pytest.mark.parametrize("clear_action", ["top", "popover", "api"])
 def test_clearing_filters_keeps_selected_photo_in_place(
-    live_server, page, clear_selector
+    live_server, page, clear_action
 ):
     """Clear-all widens the grid around the current photo without resetting it."""
     _open_browse(page, live_server)
@@ -545,9 +545,13 @@ def test_clearing_filters_keeps_selected_photo_in_place(
         selected_id,
     )
 
-    if clear_selector == ".vf-clear-rules":
+    if clear_action == "popover":
         page.click(".vf-filters-btn")
-    page.click(clear_selector)
+        page.click(".vf-clear-rules")
+    elif clear_action == "api":
+        page.evaluate("VireoFilter.clearAll()")
+    else:
+        page.click(".vf-clear")
     page.wait_for_function(
         "(id) => photos.length === 5 && selectedPhotoId === id",
         arg=selected_id,
@@ -565,6 +569,26 @@ def test_clearing_filters_keeps_selected_photo_in_place(
         selected_id,
     )
     assert abs(top_after - top_before) < 4
+
+
+@pytest.mark.parametrize("clear_action", ["popover", "api"])
+def test_clear_without_filters_does_not_reload(live_server, page, clear_action):
+    """Always-available clear controls are inert when there is nothing to clear."""
+    _open_browse(page, live_server)
+    selected = page.locator(".grid-card").last
+    selected.click()
+    selected_id = int(selected.get_attribute("data-id"))
+    epoch_before = page.evaluate("loadEpoch")
+
+    if clear_action == "popover":
+        page.click(".vf-filters-btn")
+        page.click(".vf-clear-rules")
+    else:
+        page.evaluate("VireoFilter.clearAll()")
+
+    assert page.evaluate("loadEpoch") == epoch_before
+    assert page.evaluate("selectedPhotoId") == selected_id
+    expect(selected).to_have_class("grid-card selected")
 
 
 def test_pause_resume_with_backslash(live_server, page):

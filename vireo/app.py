@@ -38475,6 +38475,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 working_copy_budget > 0
                 and generated_size <= working_copy_budget
             )
+            preserve_existing_copy = bool(
+                not cacheable
+                and photo["working_copy_path"]
+                and os.path.isfile(
+                    os.path.join(vireo_dir, photo["working_copy_path"]),
+                )
+            )
 
             def _commit_generated_original(*, tracked):
                 if tracked:
@@ -38537,7 +38544,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # zero quota (or one smaller than this single rendition)
                 # must not turn that response into a persistent cache
                 # entry.
-                _commit_generated_original(tracked=False)
+                # A transient full-resolution response must not orphan an
+                # existing capped working copy that remains useful to
+                # previews/edits/exports and still counts toward the quota.
+                _commit_generated_original(tracked=preserve_existing_copy)
 
             if cacheable:
                 # The on-demand route is also a cache writer. Apply the same

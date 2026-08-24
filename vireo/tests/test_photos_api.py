@@ -2855,6 +2855,73 @@ def test_original_upgrades_capped_working_copy_to_full_res(app_and_db, tmp_path)
         assert max(served.size) == 6000
 
 
+def test_transient_full_original_preserves_capped_working_copy(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """An over-quota full rendition must not orphan a useful capped copy."""
+    import config as cfg
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    working_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), color=(10, 20, 30)).save(
+        working_path, "JPEG",
+    )
+    capped_bytes = open(working_path, "rb").read()
+
+    source_dir = tmp_path / "transient-full-source"
+    source_dir.mkdir()
+    source_path = source_dir / "source.tiff"
+    Image.new("RGB", (1200, 900), color=(40, 50, 60)).save(
+        source_path, "TIFF",
+    )
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='source.tiff', extension='.tiff', width=1200,
+               height=900, working_copy_path=?
+           WHERE id=?""",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+    cfg.set("working_copy_cache_max_mb", 1)
+
+    def oversized_extract(_source, output, **_kwargs):
+        Image.new("RGB", (1200, 900), color=(40, 50, 60)).save(
+            output, "JPEG",
+        )
+        with open(output, "ab") as handle:
+            handle.write(b"x" * (1024 * 1024))
+        return True
+
+    monkeypatch.setattr(
+        image_loader, "extract_working_copy", oversized_extract,
+    )
+
+    response = app.test_client().get(f"/photos/{photo_id}/original")
+
+    assert response.status_code == 200
+    assert response.data
+    response.close()
+    assert open(working_path, "rb").read() == capped_bytes
+    row = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime "
+        "FROM photos WHERE id=?",
+        (photo_id,),
+    ).fetchone()
+    assert row["working_copy_path"] == f"working/{photo_id}.jpg"
+    assert row["working_copy_evicted_mtime"] is None
+
+
 def test_original_serves_post_upgrade_working_copy_without_reextracting(app_and_db, tmp_path):
     """After the on-demand upgrade overwrites wc at full-res, subsequent
     requests must serve the upgraded wc directly — not loop into another

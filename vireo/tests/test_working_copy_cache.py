@@ -388,6 +388,8 @@ def test_sweep_abandoned_render_tempfiles_removes_orphans(tmp_path):
     orphan_a.write_bytes(b"partial write")
     orphan_b = working_dir / ".99.render.deadbeef.jpg.tmp"
     orphan_b.write_bytes(b"another orphan")
+    scanner_orphan = working_dir / ".42.jpg.cafebabe.jpg.tmp"
+    scanner_orphan.write_bytes(b"scanner partial write")
     unrelated = working_dir / "leftover.tmp"
     unrelated.write_bytes(b"unrelated non-render tempfile")
     nested = working_dir / "nested"
@@ -398,6 +400,7 @@ def test_sweep_abandoned_render_tempfiles_removes_orphans(tmp_path):
     assert canonical.exists()
     assert not orphan_a.exists()
     assert not orphan_b.exists()
+    assert not scanner_orphan.exists()
     assert unrelated.exists()
     assert nested.exists()
 

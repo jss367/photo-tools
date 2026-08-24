@@ -51,8 +51,8 @@ def _file_identity(st):
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
-def _is_private_render_tempfile(name):
-    """Return True for the on-demand extractor's private tempfiles.
+def _is_private_working_tempfile(name):
+    """Return True for known scanner/on-demand private tempfiles.
 
     ``vireo/app.py`` writes each on-demand working copy into a private
     ``.<photo_id>.render.*.jpg.tmp`` file before atomically publishing it to
@@ -61,11 +61,14 @@ def _is_private_render_tempfile(name):
     remove it because it never matches a catalog row — lets an orphan
     permanently consume the working-copy budget.
     """
-    return (
-        name.startswith(".")
-        and ".render." in name
-        and name.endswith(".jpg.tmp")
-    )
+    if not name.startswith(".") or not name.endswith(".jpg.tmp"):
+        return False
+    body = name[1:-len(".jpg.tmp")]
+    for marker in (".render.", ".jpg."):
+        photo_id, separator, nonce = body.partition(marker)
+        if separator and photo_id.isdigit() and nonce:
+            return True
+    return False
 
 
 def sweep_abandoned_render_tempfiles(vireo_dir):
@@ -90,7 +93,7 @@ def sweep_abandoned_render_tempfiles(vireo_dir):
                         continue
                 except OSError:
                     continue
-                if not _is_private_render_tempfile(entry.name):
+                if not _is_private_working_tempfile(entry.name):
                     continue
                 try:
                     os.remove(entry.path)
@@ -138,7 +141,7 @@ def working_copy_stats(vireo_dir, quota_mb=None):
                     try:
                         if not entry.is_file():
                             continue
-                        if _is_private_render_tempfile(entry.name):
+                        if _is_private_working_tempfile(entry.name):
                             continue
                         total += entry.stat().st_size
                         count += 1
@@ -200,7 +203,7 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
                     try:
                         if not entry.is_file():
                             continue
-                        if _is_private_render_tempfile(entry.name):
+                        if _is_private_working_tempfile(entry.name):
                             # A leftover on-demand extractor tempfile that
                             # eviction cannot reclaim (no catalog row keys off
                             # this name). Counting it toward ``total`` would

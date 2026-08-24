@@ -1353,7 +1353,12 @@ def _stub_extractor(monkeypatch, outcome):
 
     def fake_extract(source_path, output_path, max_size=4096, quality=92, **_kwargs):
         calls.append((str(source_path), str(output_path)))
-        return outcome(str(source_path))
+        ok = outcome(str(source_path))
+        if ok:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, "wb") as f:
+                f.write(b"jpeg-bytes")
+        return ok
 
     monkeypatch.setattr(scanner, "extract_working_copy", fake_extract)
     return calls
@@ -2058,7 +2063,12 @@ def test_wc_extraction_deferred_to_after_last_batch(tmp_path, monkeypatch):
         calls.append(str(source_path))
         # Simulate a RAW decode failure so the companion fallback path
         # is exercised — the reason deferral matters at all.
-        return not str(source_path).lower().endswith(".nef")
+        ok = not str(source_path).lower().endswith(".nef")
+        if ok:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, "wb") as f:
+                f.write(b"jpeg-bytes")
+        return ok
 
     monkeypatch.setattr(scanner, "extract_working_copy", fake_extract)
 

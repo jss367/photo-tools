@@ -436,6 +436,70 @@ def test_evict_reclaims_numeric_canonical_file_without_photo_row(tmp_path):
         db.close()
 
 
+def test_evict_does_not_mark_reused_photo_id(tmp_path, monkeypatch):
+    """A delete/re-import before the writer lock invalidates the pass."""
+    import working_copy_cache
+    from db import Database
+
+    db, working_dir, photo_ids = _seed_working_copies(
+        tmp_path, [700_000, 700_000],
+    )
+    reused_id = photo_ids[-1]
+    reused_path = working_dir / f"{reused_id}.jpg"
+    real_begin = working_copy_cache._begin_stable_eviction_transaction
+    lifecycle_db = Database(str(tmp_path / "vireo.db"))
+    lifecycle_changed = False
+
+    def replace_photo_before_lock(candidate_db, expected_data_version):
+        nonlocal lifecycle_changed
+        if not lifecycle_changed:
+            lifecycle_changed = True
+            old_row = lifecycle_db.conn.execute(
+                "SELECT folder_id FROM photos WHERE id=?", (reused_id,),
+            ).fetchone()
+            lifecycle_db.conn.execute(
+                "DELETE FROM photos WHERE id=?", (reused_id,),
+            )
+            lifecycle_db.conn.execute(
+                "INSERT INTO photos "
+                "(folder_id, filename, extension, file_size, file_mtime, "
+                "width, height) VALUES (?, ?, '.nef', 10000, 999, 6000, "
+                "4000)",
+                (old_row["folder_id"], "replacement.NEF"),
+            )
+            assert lifecycle_db.conn.execute(
+                "SELECT last_insert_rowid()"
+            ).fetchone()[0] == reused_id
+            lifecycle_db.conn.commit()
+            reused_path.write_bytes(b"new photo bytes")
+        return real_begin(candidate_db, expected_data_version)
+
+    monkeypatch.setattr(
+        working_copy_cache,
+        "_begin_stable_eviction_transaction",
+        replace_photo_before_lock,
+    )
+    try:
+        result = working_copy_cache.evict_if_over_quota(
+            db, str(tmp_path), quota_mb=1,
+        )
+
+        assert lifecycle_changed
+        assert result["evicted"] == 0
+        assert reused_path.read_bytes() == b"new photo bytes"
+        row = db.conn.execute(
+            "SELECT filename, working_copy_path, working_copy_evicted_mtime "
+            "FROM photos WHERE id=?",
+            (reused_id,),
+        ).fetchone()
+        assert row["filename"] == "replacement.NEF"
+        assert row["working_copy_path"] is None
+        assert row["working_copy_evicted_mtime"] is None
+    finally:
+        lifecycle_db.close()
+        db.close()
+
+
 def test_evict_reconciles_tracked_row_when_file_is_missing(tmp_path):
     """A tracked row with no on-disk file — a leftover from a prior eviction
     whose DB commit failed after the unlinks — must be reset to NULL so

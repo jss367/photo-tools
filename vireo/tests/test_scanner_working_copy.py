@@ -1405,3 +1405,80 @@ def test_capacity_deferred_rows_do_not_retrigger_backfill(tmp_path, monkeypatch)
         assert working_copy_backfill_candidate_count(db) > 0
     finally:
         db.close()
+
+
+def test_oversized_copy_does_not_defer_later_fitting_candidate(
+    tmp_path, monkeypatch,
+):
+    """An individually oversized rendition must not stop the batch.
+
+    The incremental quota pass removes a generated file larger than the
+    entire budget. Its reclaimed bytes must not count toward the batch stop,
+    or every later candidate is marked capacity-deferred even when it fits.
+    """
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        folder_id = db.add_folder(str(folder))
+        oversized_source = folder / "oversized.jpg"
+        fitting_source = folder / "fitting.jpg"
+        _make_jpeg(str(oversized_source), 2000, 1500)
+        _make_jpeg(str(fitting_source), 2000, 1500)
+        oversized_id = _photo_id_of_file(
+            db, folder_id, oversized_source.name, oversized_source,
+        )
+        fitting_id = _photo_id_of_file(
+            db, folder_id, fitting_source.name, fitting_source,
+        )
+
+        generated_sources = []
+
+        def sized_extract(source, output, **_kwargs):
+            generated_sources.append(os.path.basename(source))
+            size = (
+                1024 * 1024 + 1
+                if os.path.basename(source) == oversized_source.name
+                else 128 * 1024
+            )
+            with open(output, "wb") as handle:
+                handle.truncate(size)
+            return True
+
+        monkeypatch.setattr(scanner, "extract_working_copy", sized_extract)
+
+        scanner._extract_working_copies(db, str(vireo_dir))
+
+        assert generated_sources == [
+            oversized_source.name,
+            fitting_source.name,
+        ]
+        assert not (working_dir / f"{oversized_id}.jpg").exists()
+        assert (working_dir / f"{fitting_id}.jpg").exists()
+        fitting_row = db.conn.execute(
+            "SELECT working_copy_path, working_copy_evicted_mtime "
+            "FROM photos WHERE id=?",
+            (fitting_id,),
+        ).fetchone()
+        assert fitting_row["working_copy_path"] == (
+            f"working/{fitting_id}.jpg"
+        )
+        assert fitting_row["working_copy_evicted_mtime"] is None
+    finally:
+        db.close()

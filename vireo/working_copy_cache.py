@@ -51,6 +51,27 @@ def _file_identity(st):
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
+def _begin_stable_eviction_transaction(db, expected_data_version):
+    """Lock catalog writers and confirm the eviction snapshot is current.
+
+    SQLite can reuse the highest ``INTEGER PRIMARY KEY`` after a delete. If a
+    photo is deleted and re-imported between our candidate scan and catalog
+    UPDATE, an id-only predicate can stamp the old photo's eviction marker on
+    the new row. ``BEGIN IMMEDIATE`` excludes row lifecycle writes through the
+    unlink/update window; ``data_version`` detects any commit that won the
+    race before the lock was acquired so this pass can leave the new row and
+    its file untouched.
+    """
+    db.conn.execute("BEGIN IMMEDIATE")
+    current_data_version = db.conn.execute(
+        "PRAGMA data_version"
+    ).fetchone()[0]
+    if current_data_version == expected_data_version:
+        return True
+    db.conn.rollback()
+    return False
+
+
 def _is_private_working_tempfile(name):
     """Return True for known scanner/on-demand private tempfiles.
 
@@ -189,6 +210,9 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
         }
 
     with _eviction_lock:
+        catalog_data_version = db.conn.execute(
+            "PRAGMA data_version"
+        ).fetchone()[0]
         rows = db.conn.execute(
             "SELECT id, working_copy_path, file_mtime FROM photos "
         ).fetchall()
@@ -325,6 +349,18 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
                 "quota_bytes": max_bytes,
             }
 
+        if not _begin_stable_eviction_transaction(
+            db, catalog_data_version,
+        ):
+            log.info(
+                "Working-copy quota eviction deferred because the catalog "
+                "changed during candidate selection"
+            )
+            return {
+                "evicted": 0, "freed_bytes": 0, "remaining_bytes": total,
+                "quota_bytes": max_bytes,
+            }
+
         evicted = []
         freed_bytes = 0
         for (
@@ -366,8 +402,8 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
                 "OR working_copy_path=?)",
                 (photo_id, expected_rel),
             )
+        commit_with_retry(db.conn)
         if evicted:
-            commit_with_retry(db.conn)
             log.info(
                 "Working-copy quota eviction: removed %d files, freed %.1f MB",
                 len(evicted), freed_bytes / 1024 / 1024,

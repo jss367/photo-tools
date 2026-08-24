@@ -2922,6 +2922,98 @@ def test_transient_full_original_preserves_capped_working_copy(
     assert row["working_copy_evicted_mtime"] is None
 
 
+def test_transient_full_original_does_not_restore_concurrently_evicted_copy(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Preservation rechecks the capped copy under the eviction guard."""
+    import app as app_module
+    import config as cfg
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    working_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), color=(10, 20, 30)).save(
+        working_path, "JPEG",
+    )
+
+    source_dir = tmp_path / "concurrent-eviction-source"
+    source_dir.mkdir()
+    source_path = source_dir / "source.tiff"
+    Image.new("RGB", (1200, 900), color=(40, 50, 60)).save(
+        source_path, "TIFF",
+    )
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='source.tiff', extension='.tiff', width=1200,
+               height=900, working_copy_path=?
+           WHERE id=?""",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+    cfg.set("working_copy_cache_max_mb", 1)
+
+    def oversized_extract(_source, output, **_kwargs):
+        Image.new("RGB", (1200, 900), color=(40, 50, 60)).save(
+            output, "JPEG",
+        )
+        with open(output, "ab") as handle:
+            handle.write(b"x" * (1024 * 1024))
+        return True
+
+    monkeypatch.setattr(
+        image_loader, "extract_working_copy", oversized_extract,
+    )
+    real_guard = app_module.working_copy_publication_guard
+    eviction_simulated = False
+
+    @contextlib.contextmanager
+    def evict_before_preservation_check():
+        nonlocal eviction_simulated
+        if not eviction_simulated:
+            eviction_simulated = True
+            os.unlink(working_path)
+            db.conn.execute(
+                "UPDATE photos SET working_copy_path=NULL, "
+                "working_copy_evicted_mtime=COALESCE(file_mtime, -1) "
+                "WHERE id=?",
+                (photo_id,),
+            )
+            db.conn.commit()
+        with real_guard():
+            yield
+
+    monkeypatch.setattr(
+        app_module,
+        "working_copy_publication_guard",
+        evict_before_preservation_check,
+    )
+
+    response = app.test_client().get(f"/photos/{photo_id}/original")
+
+    assert response.status_code == 200
+    assert response.data
+    response.close()
+    assert eviction_simulated
+    assert not os.path.exists(working_path)
+    row = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime "
+        "FROM photos WHERE id=?",
+        (photo_id,),
+    ).fetchone()
+    assert row["working_copy_path"] is None
+    assert row["working_copy_evicted_mtime"] is not None
+
+
 def test_original_serves_post_upgrade_working_copy_without_reextracting(app_and_db, tmp_path):
     """After the on-demand upgrade overwrites wc at full-res, subsequent
     requests must serve the upgraded wc directly — not loop into another

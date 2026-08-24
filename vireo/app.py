@@ -38479,14 +38479,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 working_copy_budget > 0
                 and generated_size <= working_copy_budget
             )
-            preserve_existing_copy = bool(
-                not cacheable
-                and photo["working_copy_path"]
-                and os.path.isfile(
-                    os.path.join(vireo_dir, photo["working_copy_path"]),
-                )
-            )
-
             def _commit_generated_original(*, tracked):
                 if tracked:
                     updates = [
@@ -38551,7 +38543,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # A transient full-resolution response must not orphan an
                 # existing capped working copy that remains useful to
                 # previews/edits/exports and still counts toward the quota.
-                _commit_generated_original(tracked=preserve_existing_copy)
+                # Revalidate both its catalog row and file while holding the
+                # publication/eviction lock. The request's ``photo`` snapshot
+                # may predate a concurrent eviction; restoring that stale
+                # path would point consumers at a file that no longer exists.
+                with working_copy_publication_guard():
+                    current_row = db.conn.execute(
+                        "SELECT working_copy_path FROM photos WHERE id=?",
+                        (photo_id,),
+                    ).fetchone()
+                    preserve_existing_copy = bool(
+                        current_row
+                        and current_row["working_copy_path"] == wc_rel
+                        and os.path.isfile(wc_abs)
+                    )
+                    _commit_generated_original(
+                        tracked=preserve_existing_copy,
+                    )
 
             if cacheable:
                 # The on-demand route is also a cache writer. Apply the same

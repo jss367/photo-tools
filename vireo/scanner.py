@@ -1462,7 +1462,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
         1024, min(quota_bytes // 4, 512 * 1024 * 1024),
     )
     new_bytes_since_enforce = 0
-    cumulative_new_bytes = 0
+    retained_new_files = {}
     stop_after_current = False
 
     # Commit per row so the writer lock is released between iterations.
@@ -1754,7 +1754,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             except OSError:
                 new_bytes = 0
             new_bytes_since_enforce += new_bytes
-            cumulative_new_bytes += new_bytes
+            retained_new_files[wc_abs] = new_bytes
 
             if new_bytes_since_enforce >= incremental_threshold:
                 try:
@@ -1764,11 +1764,25 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                         "Working-copy quota enforcement failed mid-batch"
                     )
                 new_bytes_since_enforce = 0
+                # Quota enforcement may have immediately reclaimed this
+                # rendition (for example, when a single JPEG is larger than
+                # the whole budget) or an earlier file from this batch. Only
+                # retained bytes should move the batch toward its stop point;
+                # otherwise one oversized file defers every later candidate,
+                # including copies that would fit in the cache.
+                retained_new_files = {
+                    path: size
+                    for path, size in retained_new_files.items()
+                    if os.path.isfile(path)
+                }
 
             # Once this batch alone has produced a full quota's worth of new
             # working copies, further generation would only displace files we
             # just wrote. Stop cleanly instead of churning disk.
-            if quota_bytes > 0 and cumulative_new_bytes >= quota_bytes:
+            if (
+                quota_bytes > 0
+                and sum(retained_new_files.values()) >= quota_bytes
+            ):
                 stop_after_current = True
 
         if stop_after_current:

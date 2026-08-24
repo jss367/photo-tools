@@ -951,6 +951,55 @@ def test_export_falls_back_to_original_when_working_copy_evicted(
     assert os.path.isfile(os.path.join(env["dest"], "bird1.jpg"))
 
 
+def test_export_falls_back_when_working_copy_evicted_before_isfile_check(
+    export_env, monkeypatch,
+):
+    """Eviction that hits the microsecond window between
+    _select_export_source and the pre-loop isfile check must not drop the
+    photo — the primary source is still on disk and can satisfy the export.
+    """
+    import export as export_module
+
+    env = export_env
+    db = env["db"]
+    working_dir = os.path.join(env["vireo_dir"], "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_rel = f"working/{env['p1']}.jpg"
+    wc_path = os.path.join(working_dir, f"{env['p1']}.jpg")
+    Image.new("RGB", (800, 600), color="green").save(
+        wc_path, "JPEG", quality=95,
+    )
+    db.conn.execute(
+        "UPDATE photos SET width=800, height=600, working_copy_path=? WHERE id=?",
+        (wc_rel, env["p1"]),
+    )
+    db.conn.commit()
+
+    original_select = export_module._select_export_source
+
+    def selecting_then_evicting(**kwargs):
+        selected = original_select(**kwargs)
+        if selected and os.path.abspath(selected) == os.path.abspath(wc_path):
+            os.unlink(wc_path)
+        return selected
+
+    monkeypatch.setattr(
+        export_module, "_select_export_source", selecting_then_evicting,
+    )
+
+    result = export_photos(
+        db=db,
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "max_size": 400},
+    )
+
+    assert result["errors"] == [], result
+    assert result["exported"] == 1
+    assert os.path.isfile(os.path.join(env["dest"], "bird1.jpg"))
+
+
 def test_export_does_not_retry_when_working_copy_still_present(
     export_env, monkeypatch,
 ):

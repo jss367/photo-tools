@@ -172,6 +172,36 @@ def test_evict_ignores_private_render_tempfiles(tmp_path):
         db.close()
 
 
+def test_evict_sweeps_stale_render_tempfiles(tmp_path):
+    """Old orphaned render tempfiles are reclaimed so bytes cannot leak.
+
+    Excluding them from accounting protects working copies from being
+    evicted for scratch space, but the disk bytes are still real. A
+    process kill during on-demand extraction can otherwise accumulate
+    tempfiles indefinitely.
+    """
+    import time
+
+    from working_copy_cache import (
+        _RENDER_TEMP_SWEEP_SECONDS,
+        evict_if_over_quota,
+    )
+
+    db, working_dir, photo_ids = _seed_working_copies(tmp_path, [500_000])
+    orphan = working_dir / f".{photo_ids[0]}.render.dead.jpg.tmp"
+    orphan.write_bytes(b"x" * 800_000)
+    stale_mtime = time.time() - _RENDER_TEMP_SWEEP_SECONDS - 60
+    os.utime(orphan, (stale_mtime, stale_mtime))
+    try:
+        evict_if_over_quota(db, str(tmp_path), quota_mb=1)
+
+        # Old orphan reclaimed; the published working copy is preserved.
+        assert not orphan.exists()
+        assert (working_dir / f"{photo_ids[0]}.jpg").exists()
+    finally:
+        db.close()
+
+
 def test_evict_does_not_clear_concurrently_replaced_working_copy(
     tmp_path, monkeypatch,
 ):

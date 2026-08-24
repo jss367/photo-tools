@@ -22,6 +22,12 @@ log = logging.getLogger(__name__)
 
 DEFAULT_QUOTA_MB = 20 * 1024
 _UNTRACKED_WRITE_GRACE_SECONDS = 60
+# Sweep abandoned render tempfiles after this many seconds. On-demand
+# extraction takes seconds; anything older is orphaned by a crash/kill.
+# Excluding the tempfile from quota accounting stops it from displacing
+# valid working copies, but the bytes still consume real disk — sweep so
+# they cannot accumulate indefinitely.
+_RENDER_TEMP_SWEEP_SECONDS = 60 * 60
 _eviction_lock = threading.Lock()
 
 
@@ -120,6 +126,9 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None):
         ).fetchall()
         files = {}
         total = 0
+        stale_temp_cutoff_ns = (
+            time.time_ns() - _RENDER_TEMP_SWEEP_SECONDS * 1_000_000_000
+        )
         try:
             with os.scandir(working_dir) as directory_entries:
                 for entry in directory_entries:
@@ -132,6 +141,24 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None):
                             # this name). Counting it toward ``total`` would
                             # force eviction to churn real working copies to
                             # stay under quota while the orphan lingered.
+                            # Old enough to be a crash orphan? Reclaim the
+                            # disk bytes so an interrupted producer cannot
+                            # leak indefinitely; recent ones may still hold
+                            # an active writer fd.
+                            try:
+                                st = entry.stat()
+                            except OSError:
+                                continue
+                            if st.st_mtime_ns <= stale_temp_cutoff_ns:
+                                try:
+                                    os.remove(entry.path)
+                                except FileNotFoundError:
+                                    pass
+                                except OSError as exc:
+                                    log.warning(
+                                        "Failed to remove stale render "
+                                        "tempfile %s: %s", entry.path, exc,
+                                    )
                             continue
                         st = entry.stat()
                     except OSError as exc:

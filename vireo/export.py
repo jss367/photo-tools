@@ -502,6 +502,23 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
             output_ext=output_ext,
             exif_data=exif_data,
         )
+        if source_path and not os.path.isfile(source_path):
+            # A working copy can be evicted between _select_export_source
+            # returning and this pre-loop existence check (concurrent
+            # scanner/on-demand write, a config-driven quota shrink).
+            # Fall back to the primary source so a photo whose original
+            # is on disk is never dropped as "source file missing" merely
+            # because its resized-export shortcut vanished mid-flight.
+            fallback = _fallback_source_after_wc_eviction(
+                source_path, photo, folder_path, vireo_dir,
+            )
+            if fallback:
+                log.info(
+                    "Working copy %s evicted before export of %s; using "
+                    "primary source %s",
+                    source_path, photo["filename"], fallback,
+                )
+                source_path = fallback
         if not source_path or not os.path.isfile(source_path):
             errors.append(f"{photo['filename']}: source file missing")
             if progress_cb:

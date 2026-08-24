@@ -38405,6 +38405,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 and generated_size <= working_copy_budget
             )
             if cacheable:
+                # Open the file BEFORE we commit the row that makes ``wc_abs``
+                # visible to concurrent eviction passes. A peer thread that
+                # runs ``evict_if_over_quota`` between the commit here and
+                # the open below can select this just-written file as the
+                # oldest and unlink it before Flask ever has an fd on it,
+                # turning a successful render into a 500. Opening first:
+                # POSIX keeps the bytes readable through an unlink; Windows
+                # makes the open fd itself prevent unlink so eviction of
+                # this specific file just no-ops.
+                try:
+                    rendition_fh = open(wc_abs, "rb")  # noqa: SIM115 — closed by send_file's response
+                except OSError:
+                    log.exception(
+                        "Failed to open just-written working copy %s",
+                        wc_abs,
+                    )
+                    return "Could not load image", 500
                 updates = [
                     "working_copy_path=?",
                     "working_copy_evicted_mtime=NULL",
@@ -38431,24 +38448,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             if cacheable:
                 # The on-demand route is also a cache writer. Apply the same
-                # oldest-first ceiling as scanner/backfill generation.
-                #
-                # Open the file BEFORE the eviction pass so a concurrent
-                # eviction (this call's own, or a peer request writing a
-                # different working copy at the same time) that unlinks
-                # ``wc_abs`` before Flask has streamed the response body
-                # cannot turn the successful render into a 500. On POSIX
-                # an already-open fd keeps the file data readable after
-                # ``os.remove``; on Windows the fd itself prevents the
-                # unlink and eviction of this specific file just no-ops.
-                try:
-                    rendition_fh = open(wc_abs, "rb")  # noqa: SIM115 — closed by send_file's response
-                except OSError:
-                    log.exception(
-                        "Failed to open just-written working copy %s",
-                        wc_abs,
-                    )
-                    return "Could not load image", 500
+                # oldest-first ceiling as scanner/backfill generation. The
+                # open fd above pins the rendition against this call's own
+                # enforcement pass too.
                 response = send_file(rendition_fh, mimetype="image/jpeg")
                 try:
                     evict_working_copy_cache_if_over_quota(db, vireo_dir)

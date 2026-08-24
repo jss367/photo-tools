@@ -3303,6 +3303,61 @@ def test_edit_preview_retries_original_when_working_copy_is_evicted(
     assert os.path.abspath(original_path) in loaded_paths
 
 
+def test_original_cache_hit_survives_working_copy_eviction_race(
+    client_with_photo, monkeypatch,
+):
+    """/photos/<id>/original must still succeed when quota eviction unlinks
+    the trusted working copy after the trusted-path check validated it but
+    before send_file streams its bytes. The other consumer paths (crop,
+    edit-preview, thumbnail, preview materializer, export) already recover
+    from this race; the /original cache-hit branch remained the only
+    unprotected 500."""
+    import app as app_module
+    from PIL import Image
+
+    app, db, pid = client_with_photo
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{pid}.jpg")
+    Image.new("RGB", (800, 600), color=(180, 0, 0)).save(wc_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{pid}.jpg", pid),
+    )
+    db.conn.commit()
+
+    # Simulate the race: after _trusted_full_res_working_copy_path opens
+    # the working copy to read its dimensions, quota eviction unlinks the
+    # file before send_file can stream it. Hooking the dimension helper
+    # keeps the trusted-path validation succeeding — the PIL context
+    # manager still holds a fd for the size read — while removing the
+    # canonical path so the fix's own open() must fall through.
+    real_size = app_module._image_size_after_exif_orientation
+    dropped_paths = []
+
+    def evicting_size(img):
+        filename = getattr(img, "filename", None)
+        if filename and os.path.abspath(filename) == os.path.abspath(wc_path):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(wc_path)
+                dropped_paths.append(os.path.abspath(filename))
+        return real_size(img)
+
+    monkeypatch.setattr(
+        app_module, "_image_size_after_exif_orientation", evicting_size,
+    )
+
+    response = app.test_client().get(f"/photos/{pid}/original")
+
+    assert response.status_code == 200
+    assert response.data
+    # Eviction actually ran between validation and send; the response was
+    # served by falling back to the on-demand extraction from the original.
+    assert dropped_paths == [os.path.abspath(wc_path)]
+
+
 # ---- Preview cache (LRU) tests ----
 
 

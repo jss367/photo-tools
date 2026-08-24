@@ -1143,6 +1143,64 @@ def test_settings_global_delete_restores_default_and_clears_evictions(
     assert "working_copy_cache_max_mb" not in raw
 
 
+def test_settings_patch_skips_working_copy_eviction_for_unrelated_writes(
+    app_and_db, monkeypatch,
+):
+    """Unrelated settings writes must not trigger a full working-copy scan.
+
+    ``evict_if_over_quota`` selects every photo row and scans every file in
+    working/ while holding the publication lock. Running it on every
+    settings write — token, keyboard-shortcut, model, etc. — blocks the
+    request and every active working-copy publisher on a large catalog
+    even though the quota did not change. Startup enforcement and the
+    incremental cache-writer passes already cover the other paths where
+    an over-quota state can arise, so the settings handler only needs to
+    enforce a genuine capacity reduction.
+    """
+    import app as app_module
+
+    app, _ = app_and_db
+    calls = []
+
+    def spy_evict(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {
+            "evicted": 0, "freed_bytes": 0, "remaining_bytes": 0,
+            "quota_bytes": 0,
+        }
+
+    monkeypatch.setattr(
+        app_module, "evict_working_copy_cache_if_over_quota", spy_evict,
+    )
+
+    # A token write must not run the working-copy eviction pass — the
+    # quota is unchanged, so a full scan would just block the request.
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "hf_token", "value": "hf-abc-123"},
+    )
+    assert response.status_code == 200
+    assert calls == []
+
+    # Raising the quota also skips the pass: only a lower ceiling can make
+    # working-copy usage exceed the new limit.
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "working_copy_cache_max_mb", "value": 40960},
+    )
+    assert response.status_code == 200
+    assert calls == []
+
+    # Lowering the quota must still trigger a pass — regressions here
+    # would defeat the on-save enforcement the Storage UI advertises.
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "working_copy_cache_max_mb", "value": 1024},
+    )
+    assert response.status_code == 200
+    assert len(calls) == 1
+
+
 def test_quota_raise_reenables_evicted_companion_backed_copy(app_and_db):
     """A known-good companion rendition can regenerate immediately."""
     import config as cfg

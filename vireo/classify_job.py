@@ -2882,6 +2882,36 @@ def run_classify_job(
         )
 
         cache_taxonomy_identity = _peek_tax_identity()
+
+        # Re-arm any pending background self-heal before the cached-only
+        # shortcut returns. The shortcut below skips classifier acquisition
+        # entirely, so ``acquire_cached_classifier``'s ``notify_reuse``
+        # hook — the only place the timm ``label_descriptions.json``
+        # bounded-retry state machine fires from cache hits — never runs
+        # on such jobs. Without this, an installation whose first heal
+        # failed during a transient outage would stay ``failed`` for the
+        # rest of the process's life whenever every job's photos are
+        # already cached, leaking raw scientific names indefinitely.
+        # The helper checks the file itself and no-ops when the mapping
+        # is already usable or the state machine is in-flight/backing off,
+        # so calling it here is cheap on healthy installs.
+        if peek_model and peek_model.get("model_type") == "timm":
+            _heal_model_str = peek_model.get("model_str")
+            _heal_model_dir = peek_model.get("weights_path")
+            if _heal_model_str and _heal_model_dir:
+                try:
+                    from timm_classifier import (
+                        rearm_pending_label_desc_heal,
+                    )
+                    rearm_pending_label_desc_heal(
+                        _heal_model_str, _heal_model_dir,
+                    )
+                except Exception:
+                    log.info(
+                        "Re-arming label_descriptions heal for %s failed",
+                        _heal_model_str, exc_info=True,
+                    )
+
         if not params.reclassify and _all_photos_cache_satisfied(
             thread_db, [p["id"] for p in photos],
             classifier_model=desired_classifier_model,

@@ -7145,6 +7145,132 @@ def test_finalize_cached_only_respects_workspace_detector_threshold(
     assert result["already_classified"] == 1
 
 
+def test_cached_only_shortcut_rearms_timm_label_desc_heal(
+    tmp_path, monkeypatch,
+):
+    """A cached-only classify job must still fire the timm
+    label_descriptions self-heal, otherwise a hot cache stops the
+    bounded-retry state machine from ever running again.
+
+    Before the fix, the only paths that drove the state machine were
+    ``TimmClassifier.__init__`` (cache-miss construction) and
+    ``acquire_cached_classifier``'s ``notify_reuse`` hook (cache-hit
+    acquire). ``_all_photos_cache_satisfied``'s shortcut returns
+    *without* acquiring a classifier at all, so on a long-lived process
+    that only ever runs cached-only jobs, a first-probe failure during
+    an outage would leave the installation stuck on ``failed`` for the
+    rest of its life — even after connectivity recovered.
+    """
+    import classify_job as classify_job_mod
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(pid, [{
+        "box": {"x": 0, "y": 0, "w": 1, "h": 1},
+        "confidence": 0.9, "category": "animal",
+    }], detector_model="megadetector-v6")[0]
+    db.add_prediction(
+        det_id, species="Western Cattle-Egret", confidence=0.9,
+        model="timm-inat21", labels_fingerprint="fp-cached",
+    )
+    db.record_classifier_run(
+        det_id, "timm-inat21", "fp-cached", prediction_count=1,
+    )
+    coll_id = db.add_collection(
+        "c", json.dumps([{"field": "photo_ids", "value": [pid]}]),
+    )
+
+    model_dir = tmp_path / "timm-inat21-eva02-l"
+    model_dir.mkdir()
+    (model_dir / "model.onnx").write_bytes(b"onnx bytes")
+    model_str = "hf-hub:timm/eva02-test"
+    fake_timm_model = {
+        "id": "timm-inat21-eva02-l",
+        "name": "timm-inat21",
+        "model_str": model_str,
+        "model_type": "timm",
+        "weights_path": str(model_dir),
+        "downloaded": True,
+        "files": ["model.onnx"],
+        "optional_files": ["label_descriptions.json"],
+        "source": "custom",
+    }
+    monkeypatch.setattr(
+        classify_job_mod, "get_models", lambda: [fake_timm_model],
+    )
+    monkeypatch.setattr(classify_job_mod, "get_active_labels", lambda: [])
+    monkeypatch.setattr(
+        classify_job_mod, "get_active_model", lambda: fake_timm_model,
+    )
+
+    calls = []
+
+    def _spy_rearm(mstr, mdir):
+        calls.append((mstr, mdir))
+        return None
+
+    import timm_classifier as tc
+    monkeypatch.setattr(tc, "rearm_pending_label_desc_heal", _spy_rearm)
+
+    # Force the cached-only shortcut deterministically. The rearm hook
+    # is wired to fire *before* this predicate is checked, so a True
+    # return here proves the ordering is right without needing every
+    # identity axis to align.
+    finalize_called = []
+
+    def _fake_all_cache_satisfied(*a, **kw):
+        # Rearm must already have fired by the time we get here.
+        assert calls, (
+            "rearm_pending_label_desc_heal must fire before "
+            "_all_photos_cache_satisfied is consulted"
+        )
+        return True
+
+    def _fake_finalize(*a, **kw):
+        finalize_called.append(True)
+        return {"already_classified": 1, "failed": 0, "classified": 0}
+
+    monkeypatch.setattr(
+        classify_job_mod, "_all_photos_cache_satisfied",
+        _fake_all_cache_satisfied,
+    )
+    monkeypatch.setattr(
+        classify_job_mod, "_finalize_cached_only", _fake_finalize,
+    )
+
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None, labels_file=None,
+        model_id="timm-inat21-eva02-l", model_name=None,
+        grouping_window=0, similarity_threshold=0.99,
+        reclassify=False,
+    )
+    run_classify_job(_make_job(), FakeRunner(), db_path, ws, params)
+
+    assert finalize_called, (
+        "the cached-only shortcut should have been taken so this test "
+        "exercises the same branch the fix targets"
+    )
+
+    assert calls == [(model_str, str(model_dir))], (
+        "the cached-only shortcut must re-arm the timm label-descriptions "
+        "heal before returning; otherwise a transient outage on the first "
+        "probe strands the installation for the life of the process"
+    )
+
+
 def test_finalize_cached_only_includes_zero_confidence_full_image_anchor(
     tmp_path, monkeypatch,
 ):

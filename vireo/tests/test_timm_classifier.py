@@ -1407,6 +1407,82 @@ def test_notify_reuse_rearms_heal_when_snapshot_says_absent(tmp_path):
     )
 
 
+def test_rearm_pending_label_desc_heal_spawns_when_file_missing(tmp_path):
+    """``rearm_pending_label_desc_heal`` exists so paths that never build
+    or acquire a classifier — notably ``classify_job``'s cached-only
+    shortcut — can still drive the bounded-retry state machine. When the
+    file is missing, it must actually spawn a heal, otherwise a hot cache
+    on a long-lived process would leave the installation stuck on the
+    first-probe verdict for the rest of its life.
+    """
+    from timm_classifier import rearm_pending_label_desc_heal
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch(
+        "models.ensure_timm_label_descriptions",
+        side_effect=lambda dir_arg, mstr, progress_callback=None: (
+            open(
+                os.path.join(dir_arg, "label_descriptions.json"), "w",
+            ).write(json.dumps({"Sturnus vulgaris": "European Starling, Bird"}))
+            or True
+        ),
+    ):
+        thread = rearm_pending_label_desc_heal(model_str, str(model_dir))
+        assert thread is not None
+        thread.join(timeout=5)
+
+    assert (model_dir / "label_descriptions.json").exists()
+
+
+def test_rearm_pending_label_desc_heal_noops_when_file_usable(tmp_path):
+    """The helper must be cheap to call on healthy installs — the
+    cached-only path invokes it on every classify job, so a missing-
+    file check-before-spawn is what keeps it a no-op when the mapping
+    is already present.
+    """
+    from timm_classifier import rearm_pending_label_desc_heal
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    with patch("models.ensure_timm_label_descriptions") as ensure:
+        thread = rearm_pending_label_desc_heal(model_str, str(model_dir))
+
+    assert thread is None
+    assert not ensure.called
+
+
+def test_rearm_pending_label_desc_heal_respects_backoff(tmp_path):
+    """After the burst of immediate attempts is spent, the helper must
+    defer to the same backoff schedule ``_spawn_label_desc_heal`` uses.
+    Otherwise the cached-only path could hammer HF on every classify job
+    once the ``_HEAL_MAX_ATTEMPTS`` bucket was drained by an outage."""
+    import timm_classifier as tc
+    from timm_classifier import rearm_pending_label_desc_heal
+
+    _reset_heal_state()
+    model_dir = _make_model_dir(tmp_path)
+    (model_dir / "label_descriptions.json").unlink()
+
+    model_str = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+    heal_key = (model_str, tc._installation_generation(str(model_dir)))
+    with tc._HEAL_LOCK:
+        tc._HEAL_STATE[heal_key] = "failed"
+        tc._HEAL_ATTEMPTS[heal_key] = tc._HEAL_MAX_ATTEMPTS
+        tc._HEAL_RETRY_AT[heal_key] = time.monotonic() + 3600
+
+    with patch("models.ensure_timm_label_descriptions") as ensure:
+        thread = rearm_pending_label_desc_heal(model_str, str(model_dir))
+
+    assert thread is None
+    assert not ensure.called
+
+
 def test_notify_reuse_does_nothing_when_snapshot_captured_the_file(tmp_path):
     """When the classifier was constructed with a valid
     ``label_descriptions.json``, ``notify_reuse`` must not spawn another

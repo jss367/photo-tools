@@ -138,6 +138,37 @@ def _installation_generation(model_dir):
     )
 
 
+def rearm_pending_label_desc_heal(model_str, model_dir):
+    """Re-attempt a background heal from paths that never build a classifier.
+
+    The bounded-retry state machine in ``_spawn_label_desc_heal`` normally
+    fires from ``TimmClassifier.__init__`` (first construction) and from
+    ``TimmClassifier.notify_reuse`` (later cache-hit acquires via
+    ``acquire_cached_classifier``). Both paths require the classifier to
+    be acquired. ``classify_job._all_photos_cache_satisfied``'s cached-
+    only shortcut returns without any classifier acquisition, so on a
+    long-lived process that only ever runs cached-only jobs, a heal that
+    failed during a transient outage would stay ``failed`` for the rest
+    of the process's life and connectivity coming back would never
+    trigger a retry. This function lets such paths exercise the same
+    state machine directly, without loading the ONNX session.
+
+    No-ops when ``label_descriptions.json`` already contains a usable
+    mapping (nothing to heal) or when the state machine judges the
+    installation to be in-flight, done, or inside a backoff window.
+    Returns the spawned Thread when a heal was started, else None.
+    """
+    label_desc_path = os.path.join(model_dir, "label_descriptions.json")
+    try:
+        import models as _models_mod
+        descs = _models_mod.load_label_descriptions(label_desc_path)
+    except Exception:
+        descs = None
+    if descs is not None:
+        return None
+    return _spawn_label_desc_heal(model_dir, model_str)
+
+
 def _spawn_label_desc_heal(model_dir, model_str):
     """Best-effort async heal of a missing label_descriptions.json.
 

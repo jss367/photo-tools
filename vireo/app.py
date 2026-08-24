@@ -38286,42 +38286,53 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
 
         def _extract_original_copy(source_path):
-            output_path = wc_abs
-            tmp_path = None
-            if primary_is_raw:
-                fd, tmp_path = tempfile.mkstemp(
-                    prefix=f".{photo_id}.display.",
-                    suffix=".jpg.tmp",
-                    dir=os.path.dirname(wc_abs),
-                )
-                os.close(fd)
-                output_path = tmp_path
+            # Always extract into a private tempfile before publishing to
+            # ``wc_abs``. When several requests miss the cache at once
+            # (single-flight waiters wake as new producers after the first
+            # producer moves its rendition aside), each producer writes its
+            # own bytes to a distinct path and only the atomic ``os.replace``
+            # ever touches ``wc_abs``. Without this, ``extract_working_copy``
+            # writes directly to ``wc_abs`` in every producer and the
+            # concurrent ``img.save`` calls can interleave into a truncated
+            # file — the next ``PIL.Image.open(wc_abs)`` in this route then
+            # 500s. The RAW branch already did the tempfile dance; the
+            # non-RAW branch now does it too.
+            output_dir = os.path.dirname(wc_abs)
+            os.makedirs(output_dir, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=f".{photo_id}.render.",
+                suffix=".jpg.tmp",
+                dir=output_dir,
+            )
+            os.close(fd)
             try:
                 extracted = extract_working_copy(
                     source_path,
-                    output_path,
+                    tmp_path,
                     max_size=0,
                     quality=quality,
                     raw_decode=extraction_decode,
                 )
-                if extracted and tmp_path:
+                if extracted:
                     os.replace(tmp_path, wc_abs)
                     tmp_path = None
-                    # The display cache-hit check compares against
-                    # ``max(mtime(image_path), mtime(companion))``.
-                    # Leaving wall-clock mtime here fails that check
-                    # whenever either live source has a future mtime
-                    # (clock skew, archives that preserve future
-                    # timestamps), and every request re-decodes the RAW
-                    # and companion. Peg to the same max the check
-                    # consults. Use ``raw_source_path`` — the RAW resolved
-                    # before the has_current_raw_failure branch rewrote
-                    # ``image_path`` to the companion — so a newer RAW
-                    # mtime doesn't fail the gate and re-extract on every
-                    # hit.
-                    _peg_display_cache_mtime(
-                        wc_abs, (raw_source_path, companion_for_extraction),
-                    )
+                    if primary_is_raw:
+                        # The display cache-hit check compares against
+                        # ``max(mtime(image_path), mtime(companion))``.
+                        # Leaving wall-clock mtime here fails that check
+                        # whenever either live source has a future mtime
+                        # (clock skew, archives that preserve future
+                        # timestamps), and every request re-decodes the RAW
+                        # and companion. Peg to the same max the check
+                        # consults. Use ``raw_source_path`` — the RAW resolved
+                        # before the has_current_raw_failure branch rewrote
+                        # ``image_path`` to the companion — so a newer RAW
+                        # mtime doesn't fail the gate and re-extract on every
+                        # hit.
+                        _peg_display_cache_mtime(
+                            wc_abs,
+                            (raw_source_path, companion_for_extraction),
+                        )
                 return extracted
             finally:
                 if tmp_path:
@@ -38369,7 +38380,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if cacheable:
                 # The on-demand route is also a cache writer. Apply the same
                 # oldest-first ceiling as scanner/backfill generation.
-                response = send_file(wc_abs, mimetype="image/jpeg")
+                #
+                # Open the file BEFORE the eviction pass so a concurrent
+                # eviction (this call's own, or a peer request writing a
+                # different working copy at the same time) that unlinks
+                # ``wc_abs`` before Flask has streamed the response body
+                # cannot turn the successful render into a 500. On POSIX
+                # an already-open fd keeps the file data readable after
+                # ``os.remove``; on Windows the fd itself prevents the
+                # unlink and eviction of this specific file just no-ops.
+                try:
+                    rendition_fh = open(wc_abs, "rb")  # noqa: SIM115 — closed by send_file's response
+                except OSError:
+                    log.exception(
+                        "Failed to open just-written working copy %s",
+                        wc_abs,
+                    )
+                    return "Could not load image", 500
+                response = send_file(rendition_fh, mimetype="image/jpeg")
                 try:
                     evict_working_copy_cache_if_over_quota(db, vireo_dir)
                 except Exception:
@@ -38382,31 +38410,46 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     )
                 return response
 
-            # Move the one-shot rendition out of the managed working-copy
-            # directory before returning. A streaming response removes this
-            # unique file in ``finally`` even when the client disconnects;
-            # unlike ``call_on_close``, that cleanup survives the outer
-            # single-flight response wrapping used by this route.
-            transient_dir = os.path.join(vireo_dir, "originals")
-            os.makedirs(transient_dir, exist_ok=True)
-            fd, transient_path = tempfile.mkstemp(
-                prefix=f".{photo_id}.transient.",
-                suffix=".jpg",
-                dir=transient_dir,
-            )
-            os.close(fd)
-            os.replace(wc_abs, transient_path)
+            # Non-cacheable rendition: serve the bytes we just wrote, but
+            # do not leave a persistent cache entry behind.
+            #
+            # Open the file BEFORE unlinking it so that (a) a concurrent
+            # peer that also hit this branch and already moved/removed
+            # wc_abs cannot turn this response into a 500, and (b)
+            # single-flight waiters that wake immediately after this
+            # producer returns cannot see this transient file at wc_abs —
+            # they miss the cache and freshly re-extract into their own
+            # tempfile (via ``_extract_original_copy`` above), rather than
+            # racing PIL.Image.open / os.replace against a peer that is
+            # still holding this same rendition open. On POSIX the open fd
+            # keeps the data readable after ``os.unlink``; on Windows the
+            # unlink is best-effort and a lingering wc_abs is picked up as
+            # a legacy file by ``evict_if_over_quota`` on its next pass.
+            #
+            # The generator's ``finally`` closes the fd — reliably, even on
+            # client disconnect and even through the outer single-flight
+            # response wrapping used by this route, where ``call_on_close``
+            # is not preserved end-to-end.
+            try:
+                rendition_fh = open(wc_abs, "rb")  # noqa: SIM115 — closed by _stream_rendition's finally
+            except OSError:
+                log.exception(
+                    "Failed to open just-written non-cacheable "
+                    "rendition %s", wc_abs,
+                )
+                return "Could not load image", 500
+            with contextlib.suppress(OSError):
+                os.unlink(wc_abs)
 
-            def _stream_transient():
+            def _stream_rendition():
                 try:
-                    with open(transient_path, "rb") as rendition:
-                        while chunk := rendition.read(1024 * 1024):
-                            yield chunk
+                    while chunk := rendition_fh.read(1024 * 1024):
+                        yield chunk
                 finally:
-                    with contextlib.suppress(OSError):
-                        os.unlink(transient_path)
+                    with contextlib.suppress(Exception):
+                        rendition_fh.close()
 
-            return Response(_stream_transient(), mimetype="image/jpeg")
+            return Response(_stream_rendition(), mimetype="image/jpeg")
 
         if _extract_original_copy(source_for_extraction):
             # Update DB so future requests are fast; also backfill

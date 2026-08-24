@@ -1144,6 +1144,75 @@ def test_export_edited_raw_uses_working_copy_when_source_missing(export_env):
         assert img.size == (300, 400)
 
 
+def test_export_pins_working_copy_decode_when_source_missing(
+    export_env, monkeypatch,
+):
+    """Offline resized exports pin their only local source through decode."""
+    import working_copy_cache
+
+    env = export_env
+    db = env["db"]
+    working_dir = os.path.join(env["vireo_dir"], "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_rel = f"working/{env['p1']}.jpg"
+    wc_abs = os.path.join(env["vireo_dir"], wc_rel)
+    Image.new("RGB", (800, 600), color="red").save(
+        wc_abs, "JPEG", quality=95,
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='offline.NEF', extension='.nef',
+               working_copy_path=?, companion_path=NULL,
+               width=800, height=600
+           WHERE id=?""",
+        (wc_rel, env["p1"]),
+    )
+    db.conn.commit()
+    db.set_photo_edit_recipe(env["p1"], {"rotation": 90})
+
+    real_load_image = export_mod.load_image
+    held_during_decode = False
+
+    def probing_load_image(path, *args, **kwargs):
+        nonlocal held_during_decode
+        if os.path.abspath(path) == os.path.abspath(wc_abs):
+            probe = {"acquired": None}
+
+            def try_evict_lock():
+                acquired = working_copy_cache._eviction_lock.acquire(
+                    blocking=False,
+                )
+                probe["acquired"] = acquired
+                if acquired:
+                    working_copy_cache._eviction_lock.release()
+
+            thread = threading.Thread(target=try_evict_lock)
+            thread.start()
+            thread.join()
+            held_during_decode = probe["acquired"] is False
+        return real_load_image(path, *args, **kwargs)
+
+    monkeypatch.setattr(export_mod, "load_image", probing_load_image)
+
+    result = export_photos(
+        db=db,
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={
+            "naming_template": "{original}",
+            "max_size": 400,
+        },
+    )
+
+    assert result["exported"] == 1
+    assert result["errors"] == []
+    assert held_during_decode, (
+        "offline export must prevent quota eviction until the working copy "
+        "has been decoded"
+    )
+
+
 def test_export_edited_raw_uses_working_copy_when_folder_missing(export_env):
     """Missing-folder RAW exports may still use a sufficient local working copy."""
     env = export_env

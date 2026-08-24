@@ -37689,81 +37689,112 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # the editor's 100% zoom requests a native-resolution render, and
             # short-circuiting to a 4096-capped working copy would silently
             # serve half-resolution pixels as "1:1".
-            source_recipe = recipe
-            if not recipe:
-                from render_source import working_copy_satisfies_recipe_render
-                undersized_wc = photo["working_copy_path"] and (
-                    not working_copy_satisfies_recipe_render(
-                        photo, recipe, size, vireo_dir,
+            original_abs = os.path.join(
+                folder_row["path"], photo["filename"],
+            )
+
+            def _select_and_load_source():
+                source_recipe = recipe
+                if not recipe:
+                    from render_source import working_copy_satisfies_recipe_render
+
+                    undersized_wc = photo["working_copy_path"] and (
+                        not working_copy_satisfies_recipe_render(
+                            photo, recipe, size, vireo_dir,
+                        )
+                    )
+                    if request.args.get("analysis") == "1" or undersized_wc:
+                        source_recipe = {"version": SCHEMA_VERSION}
+                canonical, using_working_copy = _recipe_render_source(
+                    photo, source_recipe, size, vireo_dir,
+                    {folder_row["id"]: folder_row["path"]},
+                )
+                selected_ext = os.path.splitext(canonical)[1].lower()
+                source_failure_current = (
+                    not using_working_copy
+                    and selected_ext in RAW_EXTENSIONS
+                    and _has_current_working_copy_failure(
+                        photo,
+                        vireo_dir,
+                        trust_existing_working_copy=False,
+                        live_source_path=canonical,
+                        folder_path=folder_row["path"],
                     )
                 )
-                if request.args.get("analysis") == "1" or undersized_wc:
-                    source_recipe = {"version": SCHEMA_VERSION}
-            canonical, using_working_copy = _recipe_render_source(
-                photo, source_recipe, size, vireo_dir,
-                {folder_row["id"]: folder_row["path"]},
-            )
-            selected_ext = os.path.splitext(canonical)[1].lower()
-            if (
-                not using_working_copy
-                and selected_ext in RAW_EXTENSIONS
-                and _has_current_working_copy_failure(
-                    photo,
-                    vireo_dir,
-                    trust_existing_working_copy=False,
-                    live_source_path=canonical,
-                    folder_path=folder_row["path"],
+                raw_decode = (
+                    RAW_DECODE_PRESERVE_HIGHLIGHTS
+                    if selected_ext in RAW_EXTENSIONS
+                    else None
                 )
-            ):
+                load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
+                # A cropped output needs more source pixels than its requested
+                # long edge. Scale the source request by the crop ratio, then
+                # let the recipe renderer crop and cap the result to ``size``.
+                # At 100% this naturally reaches the full source and stays
+                # truly 1:1 without forcing a native decode for every fitted
+                # slider update.
+                native_dims = _recipe_source_dimensions(photo)
+                load_max_size = size
+                if apply_crop and recipe.get("crop"):
+                    selected_dims = native_dims
+                    try:
+                        from PIL import Image as _PILImage
+
+                        with _PILImage.open(canonical) as selected_image:
+                            candidate_dims = _image_size_after_exif_orientation(
+                                selected_image,
+                            )
+                        if all(candidate_dims):
+                            selected_dims = candidate_dims
+                    except Exception:
+                        # Some RAW formats cannot be opened by Pillow. Their
+                        # stored native dimensions remain the best available
+                        # decode bound.
+                        pass
+                    if all(selected_dims):
+                        selected_source_long = max(selected_dims)
+                        rendered_long = rendered_recipe_long_edge(
+                            selected_dims[0], selected_dims[1], recipe,
+                        )
+                        if rendered_long > 0:
+                            load_max_size = min(
+                                selected_source_long,
+                                int(math.ceil(
+                                    size * selected_source_long / rendered_long
+                                )),
+                            )
+                    else:
+                        load_max_size = None
+                img = None
+                if not source_failure_current:
+                    img = load_image(
+                        canonical, max_size=load_max_size, **load_kwargs,
+                    )
+                return (
+                    canonical, using_working_copy, selected_ext,
+                    load_max_size, native_dims, img, source_failure_current,
+                )
+
+            # If the original volume is offline, the working copy is the only
+            # local edit source. Hold the publication/eviction guard from
+            # source selection through Pillow decode so quota enforcement
+            # cannot unlink it in the exists/open window. Once load_image
+            # returns, the decoded PIL image no longer depends on the path.
+            source_guard = contextlib.nullcontext()
+            if photo["working_copy_path"] and not os.path.exists(original_abs):
+                source_guard = working_copy_publication_guard()
+            with source_guard:
+                (
+                    canonical, using_working_copy, selected_ext,
+                    load_max_size, native_dims, img, source_failure_current,
+                ) = _select_and_load_source()
+            if source_failure_current:
                 log.info(
                     "Skipping edit-preview generation for photo %s; RAW "
                     "working-copy extraction already failed for current source mtime",
                     photo_id,
                 )
                 return "Could not load image", 500
-            raw_decode = (
-                RAW_DECODE_PRESERVE_HIGHLIGHTS
-                if selected_ext in RAW_EXTENSIONS
-                else None
-            )
-            load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
-            # A cropped output needs more source pixels than its requested
-            # long edge. Scale the source request by the crop ratio, then let
-            # the recipe renderer crop and cap the result to ``size``. At
-            # 100% this naturally reaches the full source and stays truly 1:1
-            # without forcing a native decode for every fitted slider update.
-            native_dims = _recipe_source_dimensions(photo)
-            load_max_size = size
-            if apply_crop and recipe.get("crop"):
-                selected_dims = native_dims
-                try:
-                    from PIL import Image as _PILImage
-
-                    with _PILImage.open(canonical) as selected_image:
-                        candidate_dims = _image_size_after_exif_orientation(
-                            selected_image,
-                        )
-                    if all(candidate_dims):
-                        selected_dims = candidate_dims
-                except Exception:
-                    # Some RAW formats cannot be opened by Pillow. Their stored
-                    # native dimensions remain the best available decode bound.
-                    pass
-                if all(selected_dims):
-                    selected_source_long = max(selected_dims)
-                    rendered_long = rendered_recipe_long_edge(
-                        selected_dims[0], selected_dims[1], recipe,
-                    )
-                    if rendered_long > 0:
-                        load_max_size = min(
-                            selected_source_long,
-                            int(math.ceil(
-                                size * selected_source_long / rendered_long
-                            )),
-                        )
-                else:
-                    load_max_size = None
-            img = load_image(canonical, max_size=load_max_size, **load_kwargs)
             if img is None and using_working_copy:
                 # Quota enforcement can unlink the selected working copy
                 # after _recipe_render_source returned but before
@@ -37771,9 +37802,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # otherwise healthy edit preview does not become a
                 # transient 500 during eviction; mirrors the crop and
                 # preview materializer recovery paths.
-                original_abs = os.path.join(
-                    folder_row["path"], photo["filename"],
-                )
                 original_ext = os.path.splitext(original_abs)[1].lower()
                 original_is_raw = original_ext in RAW_EXTENSIONS
                 original_failure_current = (

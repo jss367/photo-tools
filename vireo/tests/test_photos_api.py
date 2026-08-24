@@ -3393,6 +3393,84 @@ def test_edit_preview_retries_original_when_working_copy_is_evicted(
     assert os.path.abspath(original_path) in loaded_paths
 
 
+def test_edit_preview_pins_working_copy_when_original_is_offline(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """The only local edit source stays pinned through selection and decode."""
+    import app as app_module
+    import image_loader
+    import working_copy_cache
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    pid = photo["id"]
+    offline_dir = tmp_path / "offline-edit-originals"
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(offline_dir), photo["folder_id"]),
+    )
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{pid}.jpg")
+    Image.new("RGB", (1200, 800), color=(180, 0, 0)).save(wc_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET width=1200, height=800, working_copy_path=? "
+        "WHERE id=?",
+        (f"working/{pid}.jpg", pid),
+    )
+    db.conn.commit()
+    db.set_photo_edit_recipe(pid, {"rotation": 90})
+
+    real_guard = app_module.working_copy_publication_guard
+    guard_entered = False
+
+    @contextlib.contextmanager
+    def tracking_guard():
+        nonlocal guard_entered
+        guard_entered = True
+        with real_guard():
+            yield
+
+    real_load_image = image_loader.load_image
+    held_during_decode = False
+
+    def probing_load_image(path, *args, **kwargs):
+        nonlocal held_during_decode
+        if os.path.abspath(path) == os.path.abspath(wc_path):
+            probe = {"acquired": None}
+
+            def try_evict_lock():
+                acquired = working_copy_cache._eviction_lock.acquire(
+                    blocking=False,
+                )
+                probe["acquired"] = acquired
+                if acquired:
+                    working_copy_cache._eviction_lock.release()
+
+            thread = threading.Thread(target=try_evict_lock)
+            thread.start()
+            thread.join()
+            held_during_decode = probe["acquired"] is False
+        return real_load_image(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        app_module, "working_copy_publication_guard", tracking_guard,
+    )
+    monkeypatch.setattr(image_loader, "load_image", probing_load_image)
+
+    response = app.test_client().get(f"/photos/{pid}/edit-preview?size=1920")
+
+    assert response.status_code == 200
+    assert guard_entered
+    assert held_during_decode, (
+        "offline edit-preview must prevent quota eviction until the working "
+        "copy has been decoded"
+    )
+
+
 def test_original_cache_hit_survives_working_copy_eviction_race(
     client_with_photo, monkeypatch,
 ):

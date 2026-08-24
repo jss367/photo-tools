@@ -1695,3 +1695,162 @@ def test_navbar_undo_restores_stack_cover_and_member_state(live_server, page):
         """args => findBrowsePhoto(args[0]).rating === args[1]""",
         arg=[burst_ids[2], before],
     )
+
+
+def test_keyword_edit_on_unloaded_members_invalidates_pending_expansion(
+    live_server, page
+):
+    """A keyword edit that reaches only unloaded members must still invalidate.
+
+    The tray offers "Select all" while it is still loading, so "Add to N" can
+    touch members that exist in neither ``photos`` nor ``browseStackMembers``.
+    ``_refreshBrowseKeywordState`` narrowed its ids to rows it could repaint
+    before doing any invalidation, so when every touched member was unloaded it
+    returned early and the pre-edit expansion response installed members
+    without the species the user had just added (Codex P2 on PR #1561).
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'unloaded-keyword-expansion-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
+
+    outcome = page.evaluate(
+        """async ids => {
+          var coverId = ids[1];
+          var hiddenId = ids[0];
+          var originalSafeFetch = safeFetch;
+          var byIdsOptions = {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({photo_ids: ids}),
+          };
+          var preEdit = await originalSafeFetch('/api/photos/by-ids', byIdsOptions);
+          var stalePayload = JSON.parse(JSON.stringify(preEdit));
+          stalePayload.photos.forEach(function(photo) {
+            photo.filename = 'PRE-EDIT.jpg';
+          });
+          var release = null;
+          safeFetch = function(url) {
+            if (url === '/api/photos/by-ids' && !release) {
+              return new Promise(function(resolve) { release = resolve; });
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            var expansion = toggleBrowseStack(null, coverId);
+            while (!release) {
+              await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            }
+            // The hidden member is loaded nowhere yet, so this call has no
+            // local row to patch — but the edit still committed, and the
+            // response in flight predates it.
+            var loadedNowhere = findBrowsePhoto(hiddenId) === null;
+            await _refreshBrowseKeywordState([hiddenId]);
+            release(stalePayload);
+            await expansion;
+            return {
+              loadedNowhere: loadedNowhere,
+              filenames: (browseStackMembers[String(coverId)] || []).map(
+                function(photo) { return photo.filename; }
+              ).sort(),
+              error: browseStackErrors[String(coverId)] || null,
+            };
+          } finally {
+            safeFetch = originalSafeFetch;
+          }
+        }""",
+        burst_ids,
+    )
+    assert outcome["loadedNowhere"] is True
+    assert outcome["error"] is None
+    assert "PRE-EDIT.jpg" not in outcome["filenames"]
+    assert outcome["filenames"] == ["hawk1.jpg", "hawk2.jpg", "hawk3.jpg"]
+
+
+def test_keyword_edit_on_unloaded_members_invalidates_pending_hydration(
+    live_server, page
+):
+    """The same narrowing hid pre-edit rows from a pending cover hydration.
+
+    ``reconcileBrowseStackCovers`` hydrates an uncached collapsed stack after a
+    rating or flag edit. A keyword edit landing on one of that stack's members
+    while the hydration is in flight has no local row to patch either, so the
+    pre-edit payload used to be cached as the stack's members.
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'unloaded-keyword-hydration-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
+
+    outcome = page.evaluate(
+        """async ids => {
+          var coverId = ids[1];
+          var hiddenId = ids[0];
+          var originalSafeFetch = safeFetch;
+          var byIdsOptions = {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({photo_ids: ids}),
+          };
+          var preEdit = await originalSafeFetch('/api/photos/by-ids', byIdsOptions);
+          var stalePayload = JSON.parse(JSON.stringify(preEdit));
+          stalePayload.photos.forEach(function(photo) {
+            photo.filename = 'PRE-EDIT.jpg';
+          });
+          var release = null;
+          safeFetch = function(url) {
+            if (url === '/api/photos/by-ids' && !release) {
+              return new Promise(function(resolve) { release = resolve; });
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            var hydration = reconcileBrowseStackCovers([hiddenId]);
+            while (!release) {
+              await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            }
+            var loadedNowhere = findBrowsePhoto(hiddenId) === null;
+            await _refreshBrowseKeywordState([hiddenId]);
+            release(stalePayload);
+            await hydration;
+            return {
+              loadedNowhere: loadedNowhere,
+              filenames: (browseStackMembers[String(coverId)] || []).map(
+                function(photo) { return photo.filename; }
+              ).sort(),
+              recheck: browseStackCoverRecheck.has(coverId),
+            };
+          } finally {
+            safeFetch = originalSafeFetch;
+          }
+        }""",
+        burst_ids,
+    )
+    assert outcome["loadedNowhere"] is True
+    assert "PRE-EDIT.jpg" not in outcome["filenames"]
+    assert outcome["filenames"] == ["hawk1.jpg", "hawk2.jpg", "hawk3.jpg"]
+    assert outcome["recheck"] is False

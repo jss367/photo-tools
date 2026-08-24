@@ -9304,12 +9304,16 @@ async function _refreshBrowseKeywordState(photoIds, opts) {
   // otherwise fetch the prediction panels twice.
   if (!opts.skipPanels) refreshPredictionPanels(opts);
   if (!Array.isArray(photoIds) || !photoIds.length) return;
-  // Mark pending stack expansion/hydration requests as stale using the full
-  // mutation set, not just rows we can refresh locally. Select all matching
-  // while a stack tray still says "Loading stack…" can touch only hidden
-  // members that findBrowsePhoto() cannot see yet; the pre-edit /api/photos/by-ids
-  // response then has no local rows to overwrite here but would still land in
-  // browseStackMembers and paint pre-edit badges until reload.
+  // Invalidate from the full id list, before it is narrowed below to the rows
+  // this function can actually repaint. A stack tray offers "Select all" while
+  // it is still loading, so a keyword edit can land on members that are in
+  // neither `photos` nor `browseStackMembers` yet — exactly the members an
+  // in-flight expansion or cover hydration is about to cache from a pre-edit
+  // response. Narrowing first dropped those ids, and when every touched member
+  // was unloaded the early return below skipped invalidation entirely, letting
+  // the pre-edit payload install members missing the species the user had just
+  // added. The trailing refreshExpandedBrowseStackMembers() marks again for the
+  // rows it repaints; marking is idempotent.
   markBrowseStackExpansionsStale(photoIds);
   markBrowseStackHydrationsStale(photoIds);
   var ids = Array.from(new Set(photoIds)).filter(function(id) {

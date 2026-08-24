@@ -1407,6 +1407,92 @@ def test_capacity_deferred_rows_do_not_retrigger_backfill(tmp_path, monkeypatch)
         db.close()
 
 
+def test_capacity_deferral_does_not_mark_reused_photo_id(
+    tmp_path, monkeypatch,
+):
+    """A delete/re-import during a long backfill keeps the new row eligible.
+
+    ``photos.id`` can reuse the highest deleted rowid. The capacity stop must
+    therefore validate the candidate identity captured before extraction,
+    rather than stamping whichever row happens to own that id later.
+    """
+    import config as cfg
+    import scanner
+    import working_copy_cache
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        folder_id = db.add_folder(str(folder))
+        photo_ids = []
+        for index in range(3):
+            source = folder / f"candidate-{index}.jpg"
+            _make_jpeg(str(source), 2000, 1500)
+            photo_ids.append(
+                _photo_id_of_file(db, folder_id, source.name, source)
+            )
+
+        def sized_extract(_source, output, **_kwargs):
+            os.makedirs(os.path.dirname(output), exist_ok=True)
+            with open(output, "wb") as handle:
+                handle.truncate(600_000)
+            return True
+
+        monkeypatch.setattr(scanner, "extract_working_copy", sized_extract)
+
+        real_evict = working_copy_cache.evict_if_over_quota
+        eviction_calls = 0
+        replacement_id = None
+
+        def replace_pending_row_after_second_eviction(*args, **kwargs):
+            nonlocal eviction_calls, replacement_id
+            result = real_evict(*args, **kwargs)
+            eviction_calls += 1
+            if eviction_calls == 2:
+                pending_id = photo_ids[-1]
+                db.conn.execute("DELETE FROM photos WHERE id=?", (pending_id,))
+                db.conn.commit()
+                replacement_id = db.add_photo(
+                    folder_id, "replacement.jpg", ".jpg",
+                    file_size=321, file_mtime=999.0,
+                    width=2000, height=1500,
+                )
+                assert replacement_id == pending_id
+            return result
+
+        monkeypatch.setattr(
+            working_copy_cache,
+            "evict_if_over_quota",
+            replace_pending_row_after_second_eviction,
+        )
+
+        scanner._extract_working_copies(db, str(vireo_dir))
+
+        assert replacement_id == photo_ids[-1]
+        replacement = db.conn.execute(
+            "SELECT working_copy_path, working_copy_evicted_mtime "
+            "FROM photos WHERE id=?",
+            (replacement_id,),
+        ).fetchone()
+        assert replacement["working_copy_path"] is None
+        assert replacement["working_copy_evicted_mtime"] is None
+        assert scanner.working_copy_backfill_candidate_count(db) == 1
+    finally:
+        db.close()
+
+
 def test_oversized_copy_does_not_defer_later_fitting_candidate(
     tmp_path, monkeypatch,
 ):

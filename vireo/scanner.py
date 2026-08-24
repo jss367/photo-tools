@@ -1403,7 +1403,8 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
 
     rows = db.conn.execute(
         f"""
-        SELECT p.id, p.filename, p.companion_path, p.working_copy_path,
+        SELECT p.id, p.folder_id, p.filename, p.companion_path,
+               p.working_copy_path,
                p.extension, p.width, p.height, p.exif_data, p.file_mtime,
                p.file_size,
                f.path AS folder_path
@@ -1905,13 +1906,27 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             # already clears this marker when the user raises the ceiling,
             # and the candidate predicate treats a file_mtime change as an
             # escape hatch so a rewritten source retries automatically.
-            deferred_ids = [(row["id"],) for row in rows[i:]]
-            if deferred_ids:
+            # ``photos.id`` is not AUTOINCREMENT, so deleting the highest-ID
+            # pending row while this long-running batch is decoding can let a
+            # re-import reuse that id. Carry the source identity captured by
+            # the candidate snapshot through both writes; an id-only UPDATE
+            # would otherwise stamp the replacement row's current mtime as
+            # evicted and suppress its startup backfill.
+            deferred_rows = [
+                (
+                    row["file_mtime"], row["id"], row["folder_id"],
+                    row["filename"], row["file_size"], row["file_mtime"],
+                )
+                for row in rows[i:]
+            ]
+            if deferred_rows:
                 db.conn.executemany(
                     "UPDATE photos SET"
-                    " working_copy_evicted_mtime=COALESCE(file_mtime, -1)"
-                    " WHERE id=? AND working_copy_path IS NULL",
-                    deferred_ids,
+                    " working_copy_evicted_mtime=COALESCE(?, -1)"
+                    " WHERE id=? AND folder_id=? AND filename=?"
+                    " AND file_size IS ? AND file_mtime IS ?"
+                    " AND working_copy_path IS NULL",
+                    deferred_rows,
                 )
                 commit_with_retry(db.conn)
 
@@ -1931,10 +1946,21 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     and sum(retained_new_files.values())
                     < refreshed_quota_bytes
                 ):
+                    deferred_marker_rows = [
+                        (
+                            row["id"], row["folder_id"], row["filename"],
+                            row["file_size"], row["file_mtime"],
+                            row["file_mtime"],
+                        )
+                        for row in rows[i:]
+                    ]
                     db.conn.executemany(
                         "UPDATE photos SET working_copy_evicted_mtime=NULL "
-                        "WHERE id=? AND working_copy_path IS NULL",
-                        deferred_ids,
+                        "WHERE id=? AND folder_id=? AND filename=?"
+                        " AND file_size IS ? AND file_mtime IS ?"
+                        " AND working_copy_path IS NULL"
+                        " AND working_copy_evicted_mtime IS COALESCE(?, -1)",
+                        deferred_marker_rows,
                     )
                     commit_with_retry(db.conn)
                     wc_cache_max_mb = refreshed_quota_mb

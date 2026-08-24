@@ -1656,6 +1656,51 @@ def test_unrelated_folder_health_change_preserves_leaf_selection(
     expect(page.locator(".grid-card")).to_have_count(3)
 
 
+def test_folder_health_refresh_drops_selection_when_photo_goes_offline(
+    live_server, page, tmp_path
+):
+    """An offline placeholder cannot retain the pre-refresh selection."""
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        [(str(park), folder_ids[0]), (str(yard), folder_ids[1])],
+    )
+    db.conn.commit()
+    collection_id = next(
+        collection["id"]
+        for collection in db.get_collections()
+        if collection["name"] == "All Photos"
+    )
+    target_id = live_server["data"]["photos"][3]
+
+    page.goto(f"{live_server['url']}/browse?collection_id={collection_id}")
+    target = page.locator(f'.grid-card[data-id="{target_id}"]')
+    target.wait_for(state="visible")
+    target.click()
+    page.wait_for_function("id => selectedPhotoId === id", arg=target_id)
+
+    # Keep offline collection members in the next health-driven reload. The
+    # selected yard photo then remains rendered, but only as a placeholder.
+    page.evaluate("showOfflineCollectionPhotos = true")
+    yard.rmdir()
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/folders/check-health")
+    ):
+        page.evaluate("openMissingFoldersModal()")
+    page.evaluate("() => window._activeFolderHealthRefresh")
+
+    expect(target).to_have_class("grid-card offline")
+    assert page.evaluate("selectedPhotoId") is None
+    assert page.evaluate("selectedIndex") == -1
+    assert page.evaluate("selectedPhotos.size") == 0
+    expect(page.locator("#detailContent")).not_to_have_class("visible")
+
+
 def test_health_refresh_skips_stale_reset_when_load_folders_fails(
     live_server, page, tmp_path
 ):

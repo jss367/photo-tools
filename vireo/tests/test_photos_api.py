@@ -3198,6 +3198,64 @@ def test_crop_preview_retries_original_when_working_copy_is_evicted(
     ]
 
 
+def test_edit_preview_retries_original_when_working_copy_is_evicted(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Eviction between source selection and edit-preview decode must not 500."""
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    pid = photo["id"]
+    photo_dir = tmp_path / "edit-race-originals"
+    photo_dir.mkdir()
+    original_path = photo_dir / photo["filename"]
+    Image.new("RGB", (1200, 800), color=(0, 180, 0)).save(
+        original_path, "JPEG",
+    )
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(photo_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        "UPDATE photos SET width=1200, height=800 WHERE id=?",
+        (pid,),
+    )
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{pid}.jpg")
+    Image.new("RGB", (1200, 800), color=(180, 0, 0)).save(wc_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{pid}.jpg", pid),
+    )
+    db.conn.commit()
+
+    real_load_image = image_loader.load_image
+    loaded_paths = []
+
+    def evicting_load(path, *args, **kwargs):
+        loaded_paths.append(os.path.abspath(path))
+        if os.path.abspath(path) == os.path.abspath(wc_path):
+            try:
+                os.unlink(wc_path)
+            except FileNotFoundError:
+                pass
+            return None
+        return real_load_image(path, *args, **kwargs)
+
+    monkeypatch.setattr(image_loader, "load_image", evicting_load)
+
+    response = app.test_client().get(f"/photos/{pid}/edit-preview?size=1920")
+
+    assert response.status_code == 200
+    assert os.path.abspath(wc_path) in loaded_paths
+    assert os.path.abspath(original_path) in loaded_paths
+
+
 # ---- Preview cache (LRU) tests ----
 
 

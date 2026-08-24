@@ -37610,6 +37610,51 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 else:
                     load_max_size = None
             img = load_image(canonical, max_size=load_max_size, **load_kwargs)
+            if img is None and using_working_copy:
+                # Quota enforcement can unlink the selected working copy
+                # after _recipe_render_source returned but before
+                # load_image opens it. Retry the original source once so an
+                # otherwise healthy edit preview does not become a
+                # transient 500 during eviction; mirrors the crop and
+                # preview materializer recovery paths.
+                original_abs = os.path.join(
+                    folder_row["path"], photo["filename"],
+                )
+                original_ext = os.path.splitext(original_abs)[1].lower()
+                original_is_raw = original_ext in RAW_EXTENSIONS
+                original_failure_current = (
+                    original_is_raw
+                    and _has_current_working_copy_failure(
+                        photo,
+                        vireo_dir,
+                        trust_existing_working_copy=False,
+                        live_source_path=original_abs,
+                        folder_path=folder_row["path"],
+                    )
+                )
+                if (
+                    os.path.abspath(original_abs)
+                    != os.path.abspath(canonical)
+                    and os.path.isfile(original_abs)
+                    and not original_failure_current
+                ):
+                    fallback_raw_decode = (
+                        RAW_DECODE_PRESERVE_HIGHLIGHTS
+                        if original_is_raw else None
+                    )
+                    fallback_kwargs = (
+                        {"raw_decode": fallback_raw_decode}
+                        if fallback_raw_decode else {}
+                    )
+                    img = load_image(
+                        original_abs,
+                        max_size=load_max_size,
+                        **fallback_kwargs,
+                    )
+                    if img is not None:
+                        canonical = original_abs
+                        selected_ext = original_ext
+                        using_working_copy = False
             if (
                 img is not None
                 and selected_ext in RAW_EXTENSIONS

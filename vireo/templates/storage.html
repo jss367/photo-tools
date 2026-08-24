@@ -204,8 +204,10 @@ body { padding-bottom: 36px; }
           <input type="number" id="cfgWorkingCopyCacheMaxGb" min="0" step="1" value="20"
                  aria-label="Working-copy storage limit in GB"
                  style="width:96px;background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-secondary);border-radius:4px;padding:4px 8px;font-size:13px;text-align:center;"
-                 onchange="saveStorageConfig()">
+                 oninput="updateWorkingCopyLimitState()">
           <span style="font-size:13px;color:var(--text-dim);">GB</span>
+          <button id="applyWorkingCopyLimitBtn" class="btn-secondary"
+                  onclick="applyWorkingCopyLimit()" disabled>Apply</button>
         </div>
       </div>
       <div id="workingCopyCacheStatus" style="font-size:12px;color:var(--text-dim);margin-top:10px;">Loading...</div>
@@ -231,6 +233,25 @@ body { padding-bottom: 36px; }
       <button id="clearCacheBtn" class="btn-secondary" onclick="clearEmbeddingCache()" style="display:none;margin-left:auto;">Clear cache</button>
     </div>
     <div id="matrixContent"><span style="color:var(--text-ghost);font-size:13px;">Loading...</span></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="workingCopyLimitModal"
+     role="dialog" aria-modal="true" aria-labelledby="workingCopyLimitModalTitle"
+     onclick="if(event.target===this)closeWorkingCopyLimitModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="workingCopyLimitModalTitle">Lower working-copy storage limit?</h3>
+      <button class="modal-close" aria-label="Close" onclick="closeWorkingCopyLimitModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-desc" id="workingCopyLimitModalDesc"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" onclick="closeWorkingCopyLimitModal()">Cancel</button>
+      <button class="btn-danger" id="confirmWorkingCopyLimitBtn"
+              onclick="confirmWorkingCopyLimit()">Lower limit and remove copies</button>
+    </div>
   </div>
 </div>
 
@@ -305,6 +326,9 @@ refreshStoragePage();
 loadStorageConfig();
 
 var _storageSaveTimer = null;
+var _committedWorkingCopyQuotaMb = 20480;
+var _workingCopySizeBytes = 0;
+var _pendingWorkingCopyQuotaMb = null;
 
 async function loadStorageConfig() {
   try {
@@ -320,30 +344,117 @@ async function loadStorageConfig() {
     document.getElementById('cfgPreviewQualityVal').textContent = pq;
     document.getElementById('cfgPreviewCacheMaxMb').value =
       cfg.preview_cache_max_mb != null ? cfg.preview_cache_max_mb : 20480;
+    _committedWorkingCopyQuotaMb =
+      cfg.working_copy_cache_max_mb != null ? cfg.working_copy_cache_max_mb : 20480;
     document.getElementById('cfgWorkingCopyCacheMaxGb').value =
-      (cfg.working_copy_cache_max_mb != null ? cfg.working_copy_cache_max_mb : 20480) / 1024;
+      _committedWorkingCopyQuotaMb / 1024;
+    updateWorkingCopyLimitState();
   } catch(e) {}
+}
+
+function readWorkingCopyQuotaMb() {
+  var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
+  var gb = Number(input.value);
+  if (!Number.isFinite(gb) || gb < 0 || input.value.trim() === '') return null;
+  return Math.round(gb * 1024);
+}
+
+function updateWorkingCopyLimitState() {
+  var quotaMb = readWorkingCopyQuotaMb();
+  var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
+  var applyBtn = document.getElementById('applyWorkingCopyLimitBtn');
+  var valid = quotaMb != null;
+  input.setAttribute('aria-invalid', valid ? 'false' : 'true');
+  applyBtn.disabled = !valid || quotaMb === _committedWorkingCopyQuotaMb;
+}
+
+function storageConfigPayload(workingCopyQuotaMb) {
+  return {
+    thumbnail_size: parseInt(document.getElementById('cfgThumbSize').value, 10) || 400,
+    thumbnail_quality: parseInt(document.getElementById('cfgThumbQuality').value, 10) || 85,
+    preview_quality: parseInt(document.getElementById('cfgPreviewQuality').value, 10) || 90,
+    preview_cache_max_mb: Math.max(0, parseInt(document.getElementById('cfgPreviewCacheMaxMb').value, 10) || 0),
+    working_copy_cache_max_mb: workingCopyQuotaMb,
+  };
+}
+
+async function postStorageConfig(workingCopyQuotaMb) {
+  await safeFetch('/api/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(storageConfigPayload(workingCopyQuotaMb)),
+  });
 }
 
 function saveStorageConfig() {
   clearTimeout(_storageSaveTimer);
   _storageSaveTimer = setTimeout(async function() {
     try {
-      await safeFetch('/api/config', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          thumbnail_size: parseInt(document.getElementById('cfgThumbSize').value, 10) || 400,
-          thumbnail_quality: parseInt(document.getElementById('cfgThumbQuality').value, 10) || 85,
-          preview_quality: parseInt(document.getElementById('cfgPreviewQuality').value, 10) || 90,
-          preview_cache_max_mb: Math.max(0, parseInt(document.getElementById('cfgPreviewCacheMaxMb').value, 10) || 0),
-          working_copy_cache_max_mb: Math.max(0, Math.round((parseFloat(document.getElementById('cfgWorkingCopyCacheMaxGb').value) || 0) * 1024)),
-        }),
-      });
+      await postStorageConfig(_committedWorkingCopyQuotaMb);
       loadPreviewCacheStatus();
       loadStoragePanel();
     } catch(e) {}
   }, 250);
+}
+
+function applyWorkingCopyLimit() {
+  var quotaMb = readWorkingCopyQuotaMb();
+  if (quotaMb == null) {
+    showToast('Enter a valid working-copy storage limit', 'error');
+    return;
+  }
+  if (quotaMb === _committedWorkingCopyQuotaMb) return;
+
+  var quotaBytes = quotaMb * 1024 * 1024;
+  if (quotaBytes < _workingCopySizeBytes) {
+    _pendingWorkingCopyQuotaMb = quotaMb;
+    var removalBytes = _workingCopySizeBytes - quotaBytes;
+    var newLimit = storageFormatBytes(quotaBytes);
+    document.getElementById('workingCopyLimitModalDesc').textContent =
+      'Lowering the limit to ' + newLimit + ' will remove approximately ' +
+      storageFormatBytes(removalBytes) + ' of the oldest generated working copies. ' +
+      'Your original photos will not be deleted. Vireo will use the originals when a working copy is unavailable.';
+    document.getElementById('workingCopyLimitModal').classList.add('open');
+    document.getElementById('confirmWorkingCopyLimitBtn').focus();
+    return;
+  }
+
+  commitWorkingCopyLimit(quotaMb);
+}
+
+function closeWorkingCopyLimitModal() {
+  document.getElementById('workingCopyLimitModal').classList.remove('open');
+  _pendingWorkingCopyQuotaMb = null;
+  document.getElementById('applyWorkingCopyLimitBtn').focus();
+}
+
+function confirmWorkingCopyLimit() {
+  var quotaMb = _pendingWorkingCopyQuotaMb;
+  document.getElementById('workingCopyLimitModal').classList.remove('open');
+  _pendingWorkingCopyQuotaMb = null;
+  if (quotaMb != null) commitWorkingCopyLimit(quotaMb);
+}
+
+async function commitWorkingCopyLimit(quotaMb) {
+  clearTimeout(_storageSaveTimer);
+  var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
+  var applyBtn = document.getElementById('applyWorkingCopyLimitBtn');
+  input.disabled = true;
+  applyBtn.disabled = true;
+  applyBtn.textContent = 'Applying…';
+  try {
+    await postStorageConfig(quotaMb);
+    _committedWorkingCopyQuotaMb = quotaMb;
+    input.value = quotaMb / 1024;
+    showToast('Working-copy storage limit updated', 'success');
+    await refreshStoragePage();
+  } catch(e) {
+    showToast('Could not update working-copy storage limit', 'error');
+  } finally {
+    input.disabled = false;
+    applyBtn.textContent = 'Apply';
+    updateWorkingCopyLimitState();
+  }
 }
 
 async function loadStoragePanel() {
@@ -393,6 +504,7 @@ async function loadStoragePanel() {
       : 'Safe caches are empty';
 
     var working = s.working_copies || {count: 0, size: 0, quota_bytes: 0};
+    _workingCopySizeBytes = working.size || 0;
     var workingFileWord = working.count === 1 ? 'file' : 'files';
     document.getElementById('workingCopyCacheStatus').textContent =
       'Current: ' + storageFormatBytes(working.size) + ' / ' +

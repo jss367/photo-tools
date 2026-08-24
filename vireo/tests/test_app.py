@@ -833,6 +833,28 @@ def test_storage_page_has_health_cleanup_and_location_controls(app_and_db):
     assert page.data.count(b"{name: 'Database'") == 1
 
 
+def test_storage_page_confirms_destructive_working_copy_quota_reduction(
+    app_and_db,
+):
+    """Quota input stays pending until Apply and explains cache eviction."""
+    app, _ = app_and_db
+    page = app.test_client().get('/storage')
+
+    assert page.status_code == 200
+    assert b'oninput="updateWorkingCopyLimitState()"' in page.data
+    assert b'onchange="saveStorageConfig()"' not in page.data.split(
+        b'id="cfgWorkingCopyCacheMaxGb"', 1,
+    )[1].split(b'</div>', 1)[0]
+    for marker in (
+        b'applyWorkingCopyLimitBtn',
+        b'Lower working-copy storage limit?',
+        b'Lower limit and remove copies',
+        b'Your original photos will not be deleted',
+        b'working_copy_cache_max_mb: workingCopyQuotaMb',
+    ):
+        assert marker in page.data
+
+
 def test_api_storage_includes_offline_originals(app_and_db):
     """Storage totals include Vireo-managed offline originals."""
     app, _ = app_and_db

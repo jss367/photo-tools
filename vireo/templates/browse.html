@@ -9304,6 +9304,14 @@ async function _refreshBrowseKeywordState(photoIds, opts) {
   // otherwise fetch the prediction panels twice.
   if (!opts.skipPanels) refreshPredictionPanels(opts);
   if (!Array.isArray(photoIds) || !photoIds.length) return;
+  // Mark pending stack expansion/hydration requests as stale using the full
+  // mutation set, not just rows we can refresh locally. Select all matching
+  // while a stack tray still says "Loading stack…" can touch only hidden
+  // members that findBrowsePhoto() cannot see yet; the pre-edit /api/photos/by-ids
+  // response then has no local rows to overwrite here but would still land in
+  // browseStackMembers and paint pre-edit badges until reload.
+  markBrowseStackExpansionsStale(photoIds);
+  markBrowseStackHydrationsStale(photoIds);
   var ids = Array.from(new Set(photoIds)).filter(function(id) {
     return !!findBrowsePhoto(id);
   });

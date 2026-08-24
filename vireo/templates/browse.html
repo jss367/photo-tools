@@ -3385,12 +3385,34 @@ async function reconcileBrowseStackCovers(photoIds) {
     };
     try {
       var hydratedMembers = [];
+      // Retry transient failures a few times with backoff so a one-off network
+      // hiccup does not abandon reconciliation and leave the stale cover in
+      // place until another cover-affecting edit or a manual reload.
       for (var offset = 0; offset < memberIds.length; offset += 500) {
-        var data = await safeFetch('/api/photos/by-ids', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({photo_ids: memberIds.slice(offset, offset + 500)}),
-        }, {toast: false});
+        var chunk = memberIds.slice(offset, offset + 500);
+        var data = null;
+        var lastError = null;
+        for (var attempt = 0; attempt < 3; attempt++) {
+          try {
+            data = await safeFetch('/api/photos/by-ids', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({photo_ids: chunk}),
+            }, {toast: false});
+            lastError = null;
+            break;
+          } catch (fetchErr) {
+            lastError = fetchErr;
+            if (!windowIsCurrent()) return false;
+            if (attempt < 2) {
+              await new Promise(function(resolve) {
+                setTimeout(resolve, 200 * Math.pow(2, attempt));
+              });
+              if (!windowIsCurrent()) return false;
+            }
+          }
+        }
+        if (lastError) throw lastError;
         if (!windowIsCurrent()) return false;
         hydratedMembers = hydratedMembers.concat(data.photos || []);
       }
@@ -3425,6 +3447,15 @@ async function reconcileBrowseStackCovers(photoIds) {
       var errorRecord = browseStackHydrationRequests[uncachedKey];
       if (errorRecord && errorRecord.seq === hydrationSeq) {
         delete browseStackHydrationRequests[uncachedKey];
+      }
+      // After retries have been exhausted, the mutation has already succeeded
+      // server-side but this cover cannot be reconciled locally. Trigger an
+      // authoritative reload so the promoted cover replaces the demoted one
+      // instead of persisting until another cover-affecting edit or manual
+      // refresh. Guard against re-entrant reloads: skip when the window has
+      // already moved on.
+      if (windowIsCurrent()) {
+        reloadBrowseResults();
       }
       return false;
     }

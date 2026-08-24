@@ -592,6 +592,31 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
             )
             load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
             img = load_image(source_path, max_size=load_max_size, **load_kwargs)
+            if img is None:
+                fallback_source = _fallback_source_after_wc_eviction(
+                    source_path, photo, folder_path, vireo_dir,
+                )
+                if fallback_source:
+                    log.info(
+                        "Working copy for %s vanished mid-export; "
+                        "falling back to original %s",
+                        photo["filename"], fallback_source,
+                    )
+                    source_path = fallback_source
+                    source_is_raw = (
+                        os.path.splitext(source_path)[1].lower()
+                        in RAW_EXTENSIONS
+                    )
+                    raw_decode = (
+                        RAW_DECODE_PRESERVE_HIGHLIGHTS
+                        if recipe and source_is_raw else None
+                    )
+                    load_kwargs = (
+                        {"raw_decode": raw_decode} if raw_decode else {}
+                    )
+                    img = load_image(
+                        source_path, max_size=load_max_size, **load_kwargs,
+                    )
             if source_is_raw:
                 # RAW decode either failed outright (`img is None`) or
                 # silently fell back to the embedded JPEG. ``_load_raw``
@@ -1649,6 +1674,35 @@ def _companion_can_satisfy_export(
     if comp_render_w + 1 >= required_w and comp_render_h + 1 >= required_h:
         return companion
     return None
+
+
+def _fallback_source_after_wc_eviction(
+    source_path, photo, folder_path, vireo_dir,
+):
+    """Return the original path when a working-copy source vanished mid-export.
+
+    Quota eviction can unlink ``working/<id>.jpg`` between
+    ``_select_export_source`` and ``load_image``, turning an otherwise valid
+    export into a "failed to load image" error. When the failed source is a
+    working copy that is now missing (as opposed to a corrupt-but-present
+    file), fall back to the photo's original file so the export still
+    succeeds.
+    """
+    if not vireo_dir or not folder_path:
+        return None
+    working_root = os.path.join(os.path.abspath(vireo_dir), "working")
+    try:
+        abs_source = os.path.abspath(source_path)
+    except (TypeError, ValueError):
+        return None
+    if not abs_source.startswith(working_root + os.sep):
+        return None
+    if os.path.isfile(source_path):
+        return None
+    fallback = os.path.join(folder_path, photo["filename"])
+    if not fallback or not os.path.isfile(fallback):
+        return None
+    return fallback
 
 
 def _resolve_source(photo, vireo_dir, folders, use_working_copy=False):

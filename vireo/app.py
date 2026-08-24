@@ -21243,6 +21243,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 f"{db_path}-shm",
                 f"{db_path}-journal",
             ])
+            # Schema migrations retain one full catalog snapshot beside the
+            # database as ``<db>.pre-v<N>.bak``. In a split custom-thumbnail
+            # layout the catalog parent is deliberately not recursed, so add
+            # only this exact Vireo-owned filename pattern rather than
+            # sweeping unrelated siblings into the Storage total.
+            backup_name_re = re.compile(
+                re.escape(os.path.basename(db_path))
+                + r"\.pre-v\d+\.bak\Z"
+            )
+            try:
+                with os.scandir(catalog_root) as entries:
+                    auxiliary_paths.extend(
+                        entry.path
+                        for entry in entries
+                        if entry.is_file()
+                        and backup_name_re.fullmatch(entry.name)
+                    )
+            except OSError:
+                pass
             other_size = 0
             for path in auxiliary_paths:
                 try:

@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+from pathlib import Path
 
 from wait import wait_for_job_via_client
 
@@ -914,7 +915,7 @@ def test_api_storage_counts_unclassified_vireo_root_files_as_other(
 def test_api_storage_custom_thumb_dir_ignores_unrelated_siblings(
     app_and_db, tmp_path,
 ):
-    app, _ = app_and_db
+    app, db = app_and_db
     shared_root = tmp_path / "shared-volume"
     custom_thumbs = shared_root / "thumbs"
     custom_thumbs.mkdir(parents=True)
@@ -965,6 +966,20 @@ def test_api_storage_custom_thumb_dir_ignores_unrelated_siblings(
         == len(staged)
     )
     assert after_staging["total"] - after_owned["total"] == len(staged)
+
+    # Migration backups remain beside the catalog, not below the custom
+    # generated-data root. Count the exact retained schema-backup pattern
+    # without broadening accounting to arbitrary catalog siblings.
+    migration_backup = Path(f"{db._db_path}.pre-v999.bak")
+    backup_payload = b"pre-migration-catalog-snapshot"
+    migration_backup.write_bytes(backup_payload)
+    Path(f"{db._db_path}.pre-vbad.bak").write_bytes(b"unrelated-lookalike")
+    after_backup = app.test_client().get("/api/storage").get_json()
+    assert (
+        after_backup["other"]["size"] - after_staging["other"]["size"]
+        == len(backup_payload)
+    )
+    assert after_backup["total"] - after_staging["total"] == len(backup_payload)
 
 
 def test_startup_sweeps_abandoned_transient_originals(app_and_db, tmp_path):

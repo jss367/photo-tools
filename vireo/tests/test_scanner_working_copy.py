@@ -1545,3 +1545,114 @@ def test_backfill_adopts_quota_increase_before_deferring_rows(
         assert all(row["working_copy_evicted_mtime"] is None for row in rows)
     finally:
         db.close()
+
+
+def test_batch_stops_when_quota_rotates_fitting_working_copies(
+    tmp_path, monkeypatch,
+):
+    """One-for-one eviction of fitting copies stops further decoding."""
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    (vireo_dir / "working").mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        folder_id = db.add_folder(str(folder))
+        for index in range(8):
+            source = folder / f"candidate-{index}.jpg"
+            _make_jpeg(str(source), 2000, 1500)
+            _photo_id_of_file(db, folder_id, source.name, source)
+
+        generated = 0
+
+        def fitting_extract(_source, output, **_kwargs):
+            nonlocal generated
+            generated += 1
+            with open(output, "wb") as handle:
+                handle.truncate(600_000)
+            return True
+
+        monkeypatch.setattr(scanner, "extract_working_copy", fitting_extract)
+
+        scanner._extract_working_copies(db, str(vireo_dir))
+
+        assert generated == 2
+        assert scanner.working_copy_backfill_candidate_count(db) == 0
+        on_disk = list((vireo_dir / "working").glob("*.jpg"))
+        assert len(on_disk) == 1
+        assert on_disk[0].stat().st_size == 600_000
+    finally:
+        db.close()
+
+
+def test_scanner_does_not_track_copy_evicted_before_catalog_commit(
+    tmp_path, monkeypatch,
+):
+    """A lost publication cannot leave a stale working_copy_path."""
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    source = folder / "candidate.jpg"
+    _make_jpeg(str(source), 2000, 1500)
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    (vireo_dir / "working").mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        folder_id = db.add_folder(str(folder))
+        photo_id = _photo_id_of_file(
+            db, folder_id, source.name, source,
+        )
+
+        def publish_then_lose(_source, output, **_kwargs):
+            with open(output, "wb") as handle:
+                handle.write(b"published")
+            os.unlink(output)
+            db.conn.execute(
+                "UPDATE photos SET working_copy_path=NULL, "
+                "working_copy_evicted_mtime=COALESCE(file_mtime, -1) "
+                "WHERE id=?",
+                (photo_id,),
+            )
+            db.conn.commit()
+            return True
+
+        monkeypatch.setattr(
+            scanner, "extract_working_copy", publish_then_lose,
+        )
+
+        scanner._extract_working_copies(db, str(vireo_dir))
+
+        row = db.conn.execute(
+            "SELECT working_copy_path, working_copy_evicted_mtime "
+            "FROM photos WHERE id=?",
+            (photo_id,),
+        ).fetchone()
+        assert row["working_copy_path"] is None
+        assert row["working_copy_evicted_mtime"] is not None
+    finally:
+        db.close()

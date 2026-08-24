@@ -1706,33 +1706,44 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     publication_guard=working_copy_publication_guard,
                 )
             raw_failed_then_companion = ok
+        publication_lost = False
         if ok:
-            if raw_failed_then_companion:
-                # The companion-derived working copy is usable, but request
-                # paths still need to know the RAW itself failed: edited RAW
-                # render paths (preview/edit-preview/original/export) gate
-                # companion selection in _recipe_render_source on a present
-                # "source" failure marker. Clearing it here would push those
-                # paths back through the unsupported RAW decode and 500.
-                db.conn.execute(
-                    "UPDATE photos SET working_copy_path=?,"
-                    " working_copy_evicted_mtime=NULL,"
-                    " working_copy_failed_at=datetime('now'),"
-                    " working_copy_failed_mtime=?,"
-                    " working_copy_failed_source='source'"
-                    " WHERE id=?",
-                    (wc_rel, row["file_mtime"], row["id"]),
-                )
-            else:
-                db.conn.execute(
-                    "UPDATE photos SET working_copy_path=?,"
-                    " working_copy_evicted_mtime=NULL,"
-                    " working_copy_failed_at=NULL,"
-                    " working_copy_failed_mtime=NULL,"
-                    " working_copy_failed_source=NULL"
-                    " WHERE id=?",
-                    (wc_rel, row["id"]),
-                )
+            # ``extract_working_copy`` guards its atomic replace, but its
+            # guard ends before returning. A competing job may already have
+            # committed the same canonical path, allowing quota eviction to
+            # delete our replacement in that narrow gap. Reacquire the same
+            # guard, revalidate the published file, and hold it through the
+            # catalog commit so eviction can never leave a non-NULL path
+            # pointing at bytes it removed before this job committed.
+            with working_copy_publication_guard():
+                if not os.path.isfile(wc_abs):
+                    publication_lost = True
+                elif raw_failed_then_companion:
+                    # The companion-derived working copy is usable, but
+                    # request paths still need to know the RAW itself failed:
+                    # edited RAW render paths gate companion selection on a
+                    # present "source" failure marker.
+                    db.conn.execute(
+                        "UPDATE photos SET working_copy_path=?,"
+                        " working_copy_evicted_mtime=NULL,"
+                        " working_copy_failed_at=datetime('now'),"
+                        " working_copy_failed_mtime=?,"
+                        " working_copy_failed_source='source'"
+                        " WHERE id=?",
+                        (wc_rel, row["file_mtime"], row["id"]),
+                    )
+                else:
+                    db.conn.execute(
+                        "UPDATE photos SET working_copy_path=?,"
+                        " working_copy_evicted_mtime=NULL,"
+                        " working_copy_failed_at=NULL,"
+                        " working_copy_failed_mtime=NULL,"
+                        " working_copy_failed_source=NULL"
+                        " WHERE id=?",
+                        (wc_rel, row["id"]),
+                    )
+                if not publication_lost:
+                    commit_with_retry(db.conn)
         else:
             # Mark failure gated on current file_mtime so a future content
             # change (mtime bump) clears the gate and we retry. The
@@ -1753,7 +1764,16 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 " WHERE id=?",
                 (row["file_mtime"], failure_source, row["id"]),
             )
-        commit_with_retry(db.conn)
+            commit_with_retry(db.conn)
+
+        if publication_lost:
+            log.info(
+                "Working copy for photo %s was evicted before its catalog "
+                "commit; leaving the eviction marker intact",
+                row["id"],
+            )
+            _emit_working_copy_progress(i)
+            continue
 
         _emit_working_copy_progress(i)
 
@@ -1769,6 +1789,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             retained_new_files[wc_abs] = new_bytes
 
             if new_bytes_since_enforce >= incremental_threshold:
+                retained_before_enforce = set(retained_new_files)
                 try:
                     evict_if_over_quota(db, vireo_dir)
                 except Exception:
@@ -1787,12 +1808,25 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     for path, size in retained_new_files.items()
                     if os.path.isfile(path)
                 }
+                # Once enforcement removes an earlier fitting rendition from
+                # this same batch to keep the current one, retained capacity
+                # has started rotating rather than growing. Continuing would
+                # decode every remaining RAW only to evict another result.
+                # Do not treat removal of only the current file as rotation:
+                # that is the individually-oversized case, where later
+                # candidates may still fit and must remain eligible.
+                removed_batch_files = (
+                    retained_before_enforce - set(retained_new_files)
+                )
+                if any(path != wc_abs for path in removed_batch_files):
+                    stop_after_current = True
 
             # Once this batch alone has produced a full quota's worth of new
             # working copies, further generation would only displace files we
             # just wrote. Stop cleanly instead of churning disk.
             if (
-                quota_bytes > 0
+                not stop_after_current
+                and quota_bytes > 0
                 and sum(retained_new_files.values()) >= quota_bytes
             ):
                 stop_after_current = True

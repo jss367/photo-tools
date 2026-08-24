@@ -1309,6 +1309,15 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
     user_cfg = cfg.load()
     wc_max_size = user_cfg.get("working_copy_max_size", 4096)
     wc_quality = user_cfg.get("working_copy_quality", 92)
+
+    def _configured_quota_mb():
+        try:
+            return int(
+                cfg.load().get("working_copy_cache_max_mb", 20480)
+            )
+        except (TypeError, ValueError):
+            return 20480
+
     # A zero-byte quota is an explicit "keep no working copies" setting.
     # Skip RAW decoding entirely instead of generating a JPEG only for the
     # quota pass below to delete it immediately.
@@ -1458,9 +1467,12 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
     # so it doesn't run for every file on a small budget and doesn't defer
     # eviction past ~2% of the ceiling on a large one. The 1 KB floor is only
     # a safety net for tests with a near-zero quota.
-    incremental_threshold = max(
-        1024, min(quota_bytes // 4, 512 * 1024 * 1024),
-    )
+    def _incremental_threshold(limit_bytes):
+        return max(
+            1024, min(limit_bytes // 4, 512 * 1024 * 1024),
+        )
+
+    incremental_threshold = _incremental_threshold(quota_bytes)
     new_bytes_since_enforce = 0
     retained_new_files = {}
     stop_after_current = False
@@ -1786,6 +1798,23 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 stop_after_current = True
 
         if stop_after_current:
+            # A settings write may raise the ceiling while this slow batch is
+            # decoding. Adopt the latest value before marking the remaining
+            # rows as capacity-deferred; otherwise the settings handler can
+            # clear old eviction markers and this stale batch can recreate
+            # them afterward, suppressing startup backfill indefinitely.
+            latest_quota_mb = _configured_quota_mb()
+            if latest_quota_mb != wc_cache_max_mb:
+                wc_cache_max_mb = latest_quota_mb
+                quota_bytes = max(0, wc_cache_max_mb) * 1024 * 1024
+                incremental_threshold = _incremental_threshold(quota_bytes)
+                stop_after_current = (
+                    quota_bytes <= 0
+                    or sum(retained_new_files.values()) >= quota_bytes
+                )
+                if not stop_after_current:
+                    continue
+
             log.info(
                 "Working-copy batch reached quota (%d MB) after %d of %d "
                 "candidates; deferring the rest to a later pass",
@@ -1809,6 +1838,36 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     deferred_ids,
                 )
                 commit_with_retry(db.conn)
+
+                # Close the remaining save/side-effect race: if the config
+                # increased after the check above but before this commit, the
+                # settings handler may already have performed its one-time
+                # marker clear. Re-read after committing and undo only this
+                # pass's deferred markers when the new capacity can hold more
+                # of the batch. If the save happens after this read, its own
+                # side effect clears them instead.
+                refreshed_quota_mb = _configured_quota_mb()
+                refreshed_quota_bytes = (
+                    max(0, refreshed_quota_mb) * 1024 * 1024
+                )
+                if (
+                    refreshed_quota_mb > wc_cache_max_mb
+                    and sum(retained_new_files.values())
+                    < refreshed_quota_bytes
+                ):
+                    db.conn.executemany(
+                        "UPDATE photos SET working_copy_evicted_mtime=NULL "
+                        "WHERE id=? AND working_copy_path IS NULL",
+                        deferred_ids,
+                    )
+                    commit_with_retry(db.conn)
+                    wc_cache_max_mb = refreshed_quota_mb
+                    quota_bytes = refreshed_quota_bytes
+                    incremental_threshold = _incremental_threshold(
+                        quota_bytes,
+                    )
+                    stop_after_current = False
+                    continue
             break
 
     # A scan/import may add a large batch at once. Enforce once after the

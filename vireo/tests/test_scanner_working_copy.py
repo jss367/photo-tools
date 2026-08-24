@@ -1482,3 +1482,66 @@ def test_oversized_copy_does_not_defer_later_fitting_candidate(
         assert fitting_row["working_copy_evicted_mtime"] is None
     finally:
         db.close()
+
+
+def test_backfill_adopts_quota_increase_before_deferring_rows(
+    tmp_path, monkeypatch,
+):
+    """A mid-batch quota raise cannot leave stale deferred markers."""
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    (vireo_dir / "working").mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        folder_id = db.add_folder(str(folder))
+        photo_ids = []
+        for index in range(3):
+            source = folder / f"candidate-{index}.jpg"
+            _make_jpeg(str(source), 2000, 1500)
+            photo_ids.append(
+                _photo_id_of_file(
+                    db, folder_id, source.name, source,
+                )
+            )
+
+        generated = 0
+
+        def extract_and_raise_quota(_source, output, **_kwargs):
+            nonlocal generated
+            generated += 1
+            with open(output, "wb") as handle:
+                handle.truncate(600_000)
+            if generated == 2:
+                cfg.set("working_copy_cache_max_mb", 2)
+            return True
+
+        monkeypatch.setattr(
+            scanner, "extract_working_copy", extract_and_raise_quota,
+        )
+
+        scanner._extract_working_copies(db, str(vireo_dir))
+
+        assert generated == 3
+        rows = db.conn.execute(
+            "SELECT working_copy_path, working_copy_evicted_mtime "
+            "FROM photos WHERE id IN (?, ?, ?) ORDER BY id",
+            photo_ids,
+        ).fetchall()
+        assert all(row["working_copy_path"] for row in rows)
+        assert all(row["working_copy_evicted_mtime"] is None for row in rows)
+    finally:
+        db.close()

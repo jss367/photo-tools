@@ -32820,6 +32820,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # at scan time).
         import config as cfg
         from thumbnails import (
+            _retry_thumbnail_after_working_copy_eviction,
             _retry_thumbnail_with_working_copy,
             generate_thumbnail,
         )
@@ -32914,6 +32915,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 ),
                 cache_name=cache_filename,
             )
+            if not result and _using_working_copy:
+                result, source = (
+                    _retry_thumbnail_after_working_copy_eviction(
+                        photo,
+                        source,
+                        thumb_dir,
+                        thumb_size,
+                        cfg.load().get("thumbnail_quality", 85),
+                        render_recipe,
+                        folder_row["path"],
+                        vireo_dir,
+                        cache_name=cache_filename,
+                    )
+                )
             if (
                 not result
                 and os.path.splitext(source)[1].lower() in RAW_EXTENSIONS

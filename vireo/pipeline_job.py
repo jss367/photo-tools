@@ -3444,7 +3444,11 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             runner.update_step(job["id"], "thumbnails", status="running")
             _update_stages(runner, job["id"], stages)
             try:
-                from thumbnails import generate_thumbnail
+                from thumbnails import (
+                    _is_working_copy_source,
+                    _retry_thumbnail_after_working_copy_eviction,
+                    generate_thumbnail,
+                )
 
                 thread_db = Database(db_path)
                 thread_db.set_active_workspace(workspace_id)
@@ -3567,6 +3571,27 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             **raw_decode_kwargs,
                             **min_size_kwargs,
                         )
+                        if (
+                            result_path is None
+                            and detail_photo is not None
+                            and _is_working_copy_source(
+                                detail_photo,
+                                photo_path,
+                                effective_vireo_dir,
+                            )
+                        ):
+                            result_path, photo_path = (
+                                _retry_thumbnail_after_working_copy_eviction(
+                                    detail_photo,
+                                    photo_path,
+                                    cache_dir,
+                                    thumb_size,
+                                    85,
+                                    recipe,
+                                    folders.get(detail_photo["folder_id"]),
+                                    effective_vireo_dir,
+                                )
+                            )
                         if (
                             result_path is None
                             and detail_photo is not None
@@ -3700,6 +3725,27 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 **raw_decode_kwargs,
                                 **min_size_kwargs,
                             )
+                            if (
+                                result_path is None
+                                and detail_photo is not None
+                                and _is_working_copy_source(
+                                    detail_photo,
+                                    photo_path,
+                                    effective_vireo_dir,
+                                )
+                            ):
+                                result_path, photo_path = (
+                                    _retry_thumbnail_after_working_copy_eviction(
+                                        detail_photo,
+                                        photo_path,
+                                        cache_dir,
+                                        thumb_size,
+                                        85,
+                                        recipe,
+                                        folder_path,
+                                        effective_vireo_dir,
+                                    )
+                                )
                             if (
                                 result_path is None
                                 and os.path.splitext(photo_path)[1].lower() in _RAW_EXTENSIONS

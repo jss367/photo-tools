@@ -29,7 +29,11 @@ _UNTRACKED_WRITE_GRACE_SECONDS = 60
 # valid working copies, but the bytes still consume real disk — sweep so
 # they cannot accumulate indefinitely.
 _RENDER_TEMP_SWEEP_SECONDS = 60 * 60
-_eviction_lock = threading.Lock()
+# Publication paths may need to run quota enforcement before releasing the
+# guard (for example, when a settings write lowers the ceiling while a slow
+# RAW decode is in flight). Keep that nested enforcement serialized with
+# other publishers without deadlocking the current thread.
+_eviction_lock = threading.RLock()
 
 
 @contextmanager

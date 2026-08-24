@@ -15,6 +15,7 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 
 from db import commit_with_retry
 
@@ -29,6 +30,18 @@ _UNTRACKED_WRITE_GRACE_SECONDS = 60
 # they cannot accumulate indefinitely.
 _RENDER_TEMP_SWEEP_SECONDS = 60 * 60
 _eviction_lock = threading.Lock()
+
+
+@contextmanager
+def working_copy_publication_guard():
+    """Serialize canonical publication with quota scan/delete passes."""
+    with _eviction_lock:
+        yield
+
+
+def _file_identity(st):
+    """Return the fields that distinguish an atomically replaced file."""
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
 def _is_private_render_tempfile(name):
@@ -237,7 +250,9 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
                     # unlinks). Reconcile so scanner backfill can regenerate
                     # this row instead of skipping it forever because
                     # working_copy_path is non-NULL.
-                    stale_tracked_ids.append(row["id"])
+                    stale_tracked_ids.append(
+                        (row["id"], os.path.join(working_dir, f"{row['id']}.jpg"))
+                    )
                 continue
             path, st = file_entry
             if (
@@ -251,16 +266,28 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
                 # can be active yet — the file is safe to reclaim.
                 continue
             entries.append(
-                (st.st_mtime_ns, row["id"], st.st_size, path, expected_rel)
+                (
+                    st.st_mtime_ns, row["id"], st.st_size, path,
+                    expected_rel, _file_identity(st),
+                )
             )
 
         if stale_tracked_ids:
+            # A publisher may have replaced a file after the directory scan
+            # observed it missing. Revalidate while holding the same lock
+            # used by canonical publication before clearing the catalog row.
+            still_missing = [
+                (pid, f"working/{pid}.jpg")
+                for pid, path in stale_tracked_ids
+                if not os.path.exists(path)
+            ]
             db.conn.executemany(
                 "UPDATE photos SET working_copy_path=NULL "
                 "WHERE id=? AND working_copy_path=?",
-                [(pid, f"working/{pid}.jpg") for pid in stale_tracked_ids],
+                still_missing,
             )
-            commit_with_retry(db.conn)
+            if still_missing:
+                commit_with_retry(db.conn)
 
         if total <= max_bytes:
             return {
@@ -270,10 +297,17 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
 
         evicted = []
         freed_bytes = 0
-        for _mtime_ns, photo_id, size, path, expected_rel in sorted(entries):
+        for (
+            _mtime_ns, photo_id, size, path, expected_rel, sampled_identity,
+        ) in sorted(entries):
             if total <= max_bytes:
                 break
             try:
+                if _file_identity(os.stat(path)) != sampled_identity:
+                    # Atomic publication replaced the sampled candidate after
+                    # the scan. Never unlink or account that new rendition as
+                    # though it were the older file selected for eviction.
+                    continue
                 os.remove(path)
             except FileNotFoundError:
                 pass

@@ -1713,6 +1713,16 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     (wc_rel, row["id"]),
                 )
         else:
+            # ``extract_working_copy`` may have opened ``wc_abs`` and written
+            # a partial JPEG before an encoder or filesystem error made it
+            # return False.  The row is intentionally left untracked below,
+            # so quota eviction's concurrent-writer grace would otherwise
+            # preserve those corrupt bytes for at least the rest of this
+            # batch (and a batch of failures could exceed the quota).  A
+            # failed producer owns this canonical destination; remove it
+            # immediately before recording the failure marker.
+            with contextlib.suppress(OSError):
+                os.unlink(wc_abs)
             # Mark failure gated on current file_mtime so a future content
             # change (mtime bump) clears the gate and we retry. The
             # ``working_copy_failed_at`` timestamp also expires the gate

@@ -134,7 +134,11 @@ from werkzeug.exceptions import BadRequest
 from working_copy_cache import (
     evict_if_over_quota as evict_working_copy_cache_if_over_quota,
 )
-from working_copy_cache import working_copy_quota_bytes, working_copy_stats
+from working_copy_cache import (
+    working_copy_publication_guard,
+    working_copy_quota_bytes,
+    working_copy_stats,
+)
 from xmp import read_sync_preview_metadata
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -36925,10 +36929,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # Try working copy first, fall back to original
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
         image_path = None
+        using_working_copy = False
         if photo["working_copy_path"]:
             wc = os.path.join(vireo_dir, photo["working_copy_path"])
             if os.path.exists(wc):
                 image_path = wc
+                using_working_copy = True
         if image_path is None:
             folder = db.conn.execute(
                 "SELECT path FROM folders WHERE id=?", (photo["folder_id"],)
@@ -36938,6 +36944,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             image_path = os.path.join(folder["path"], photo["filename"])
 
         img = load_image(image_path, max_size=None)
+        if img is None and using_working_copy:
+            # Quota enforcement can unlink the working copy after the
+            # existence check above but before Pillow opens it. Re-resolve
+            # the primary source once so an otherwise healthy crop request
+            # does not become a transient 500 during eviction.
+            folder = db.conn.execute(
+                "SELECT path FROM folders WHERE id=?", (photo["folder_id"],)
+            ).fetchone()
+            original_path = (
+                os.path.join(folder["path"], photo["filename"])
+                if folder else None
+            )
+            if original_path and os.path.isfile(original_path):
+                img = load_image(original_path, max_size=None)
         if img is None:
             return "Could not load image", 500
 
@@ -38443,6 +38463,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 working_copy_budget > 0
                 and generated_size <= working_copy_budget
             )
+
+            def _commit_generated_original(*, tracked):
+                if tracked:
+                    updates = [
+                        "working_copy_path=?",
+                        "working_copy_evicted_mtime=NULL",
+                    ]
+                    params = [wc_rel]
+                else:
+                    updates = [
+                        "working_copy_path=NULL",
+                        "working_copy_evicted_mtime=COALESCE(file_mtime, -1)",
+                    ]
+                    params = []
+                if not photo["width"] or not photo["height"]:
+                    updates.extend(["width=?", "height=?"])
+                    params.extend([uw, uh])
+                params.append(photo_id)
+                db.conn.execute(
+                    f"UPDATE photos SET {', '.join(updates)} WHERE id=?",
+                    params,
+                )
+                db.conn.commit()
+
             if cacheable:
                 # Publish first, then open the file BEFORE we commit the row
                 # that makes ``wc_abs`` visible to concurrent eviction
@@ -38454,20 +38498,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # readable through an unlink; Windows makes the open fd
                 # itself prevent unlink so eviction of this specific file
                 # just no-ops.
-                _publish_extraction(tmp_path)
-                try:
-                    rendition_fh = open(wc_abs, "rb")  # noqa: SIM115 — closed by send_file's response
-                except OSError:
-                    log.exception(
-                        "Failed to open just-written working copy %s",
-                        wc_abs,
-                    )
-                    return "Could not load image", 500
-                updates = [
-                    "working_copy_path=?",
-                    "working_copy_evicted_mtime=NULL",
-                ]
-                params = [wc_rel]
+                with working_copy_publication_guard():
+                    _publish_extraction(tmp_path)
+                    try:
+                        rendition_fh = open(wc_abs, "rb")  # noqa: SIM115 — closed by send_file's response
+                    except OSError:
+                        log.exception(
+                            "Failed to open just-written working copy %s",
+                            wc_abs,
+                        )
+                        return "Could not load image", 500
+                    _commit_generated_original(tracked=True)
             else:
                 # Non-cacheable: keep the rendition in ``tmp_path`` (a
                 # per-request private tempfile) and never publish to
@@ -38484,20 +38525,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # zero quota (or one smaller than this single rendition)
                 # must not turn that response into a persistent cache
                 # entry.
-                updates = [
-                    "working_copy_path=NULL",
-                    "working_copy_evicted_mtime=COALESCE(file_mtime, -1)",
-                ]
-                params = []
-            if not photo["width"] or not photo["height"]:
-                updates.extend(["width=?", "height=?"])
-                params.extend([uw, uh])
-            params.append(photo_id)
-            db.conn.execute(
-                f"UPDATE photos SET {', '.join(updates)} WHERE id=?",
-                params,
-            )
-            db.conn.commit()
+                _commit_generated_original(tracked=False)
 
             if cacheable:
                 # The on-demand route is also a cache writer. Apply the same

@@ -6,6 +6,7 @@ import threading
 import time
 import types
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -2185,6 +2186,114 @@ def test_concurrent_original_cache_misses_extract_once(
     assert os.path.getsize(display_path) > 0
 
 
+def test_concurrent_noncacheable_original_waiters_use_private_renditions(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """Zero-quota TIFF waiters must not move one shared canonical path."""
+    import app as app_module
+    import config as cfg
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    source_dir = tmp_path / "concurrent-transient-originals"
+    source_dir.mkdir()
+    source_path = source_dir / "source.tiff"
+    Image.new("RGB", (800, 600), color=(90, 120, 150)).save(
+        source_path, "TIFF",
+    )
+    source_mtime = os.path.getmtime(source_path)
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='source.tiff', extension='.tiff', width=800,
+               height=600, file_size=?, file_mtime=?,
+               working_copy_path=NULL, working_copy_evicted_mtime=?
+           WHERE id=?""",
+        (os.path.getsize(source_path), source_mtime, source_mtime, photo_id),
+    )
+    db.conn.commit()
+    cfg.set("working_copy_cache_max_mb", 0)
+
+    producer_started = threading.Event()
+    release_producer = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    def coordinated_extract(_source, output, **_kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            producer_started.set()
+            assert release_producer.wait(timeout=5)
+        Image.new("RGB", (800, 600), color=(90, 120, 150)).save(
+            output, "JPEG",
+        )
+        return True
+
+    monkeypatch.setattr(
+        image_loader, "extract_working_copy", coordinated_extract,
+    )
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    canonical = os.path.abspath(
+        os.path.join(vireo_dir, "working", f"{photo_id}.jpg"),
+    )
+    real_replace = app_module.os.replace
+    waiter_move_barrier = threading.Barrier(2)
+    transient_move_count = 0
+
+    def synchronized_replace(source, destination):
+        nonlocal transient_move_count
+        if (
+            os.path.abspath(source) == canonical
+            and ".transient." in os.path.basename(destination)
+        ):
+            with calls_lock:
+                transient_move_count += 1
+                move_number = transient_move_count
+            # The first move belongs to the producer. If waiters still share
+            # ``canonical``, force their later moves to collide; private
+            # per-request renditions never enter this branch.
+            if move_number > 1:
+                waiter_move_barrier.wait(timeout=5)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(app_module.os, "replace", synchronized_replace)
+
+    def request_original():
+        with app.test_client() as client:
+            response = client.get(f"/photos/{photo_id}/original")
+            return response.status_code, response.data
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        first = executor.submit(request_original)
+        assert producer_started.wait(timeout=5)
+        second = executor.submit(request_original)
+        third = executor.submit(request_original)
+        time.sleep(0.1)
+        assert calls == 1
+        release_producer.set()
+        results = [
+            first.result(timeout=10),
+            second.result(timeout=10),
+            third.result(timeout=10),
+        ]
+
+    assert all(status == 200 and data for status, data in results)
+    assert calls == 3
+    assert not os.path.exists(canonical)
+    originals_dir = os.path.join(vireo_dir, "originals")
+    assert not list(Path(originals_dir).glob(f".{photo_id}.transient.*.jpg"))
+
+
 def test_failed_original_flight_releases_waiters_and_allows_retry(
     app_and_db, monkeypatch, tmp_path,
 ):
@@ -2876,6 +2985,58 @@ def test_crop_preview_falls_back_to_original(app_and_db, tmp_path):
     resp = client.get(f"/photos/{pid}/crop")
     assert resp.status_code == 200
     assert resp.content_type == "image/jpeg"
+
+
+def test_crop_preview_retries_original_when_working_copy_is_evicted(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Eviction between source selection and decode must not return 500."""
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    pid = photo["id"]
+    photo_dir = tmp_path / "crop-race-originals"
+    photo_dir.mkdir()
+    original_path = photo_dir / photo["filename"]
+    Image.new("RGB", (1200, 800), color=(0, 180, 0)).save(
+        original_path, "JPEG",
+    )
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(photo_dir), photo["folder_id"]),
+    )
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{pid}.jpg")
+    Image.new("RGB", (1200, 800), color=(180, 0, 0)).save(wc_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{pid}.jpg", pid),
+    )
+    db.conn.commit()
+
+    real_load_image = image_loader.load_image
+    loaded_paths = []
+
+    def evicting_load(path, *args, **kwargs):
+        loaded_paths.append(os.path.abspath(path))
+        if os.path.abspath(path) == os.path.abspath(wc_path):
+            os.unlink(wc_path)
+            return None
+        return real_load_image(path, *args, **kwargs)
+
+    monkeypatch.setattr(image_loader, "load_image", evicting_load)
+
+    response = app.test_client().get(f"/photos/{pid}/crop")
+
+    assert response.status_code == 200
+    assert loaded_paths == [
+        os.path.abspath(wc_path), os.path.abspath(original_path),
+    ]
 
 
 # ---- Preview cache (LRU) tests ----

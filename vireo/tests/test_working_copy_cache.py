@@ -243,6 +243,46 @@ def test_evict_does_not_clear_concurrently_replaced_working_copy(
         db.close()
 
 
+def test_evict_does_not_unlink_replacement_published_after_scan(
+    tmp_path, monkeypatch,
+):
+    """An atomic replacement after sampling is not the selected victim."""
+    import working_copy_cache
+
+    db, working_dir, photo_ids = _seed_working_copies(tmp_path, [700_000])
+    photo_id = photo_ids[0]
+    victim = working_dir / f"{photo_id}.jpg"
+    replacement = working_dir / ".replacement.jpg"
+    replacement.write_bytes(b"new" * 100_000)
+    real_stat = working_copy_cache.os.stat
+    replaced = False
+
+    def replace_before_identity_check(path, *args, **kwargs):
+        nonlocal replaced
+        if os.path.abspath(path) == os.path.abspath(victim) and not replaced:
+            replaced = True
+            os.replace(replacement, victim)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        working_copy_cache.os, "stat", replace_before_identity_check,
+    )
+    try:
+        result = working_copy_cache.evict_if_over_quota(
+            db, str(tmp_path), quota_mb=0,
+        )
+
+        assert replaced
+        assert result["evicted"] == 0
+        assert victim.read_bytes().startswith(b"new")
+        row = db.conn.execute(
+            "SELECT working_copy_path FROM photos WHERE id=?", (photo_id,),
+        ).fetchone()
+        assert row["working_copy_path"] == f"working/{photo_id}.jpg"
+    finally:
+        db.close()
+
+
 def test_evicts_legacy_canonical_file_without_catalog_path(tmp_path):
     from working_copy_cache import evict_if_over_quota
 
@@ -378,6 +418,46 @@ def test_evict_reconciles_tracked_row_when_file_is_missing(tmp_path):
         assert row["working_copy_evicted_mtime"] is None
         # The row now looks like a normal backfill candidate again.
         assert working_copy_backfill_candidate_count(db) == 1
+    finally:
+        db.close()
+
+
+def test_reconcile_rechecks_missing_file_before_clearing_row(
+    tmp_path, monkeypatch,
+):
+    """A replacement published after the scan remains tracked."""
+    import working_copy_cache
+
+    db, working_dir, photo_ids = _seed_working_copies(tmp_path, [500_000])
+    photo_id = photo_ids[0]
+    path = working_dir / f"{photo_id}.jpg"
+    path.unlink()
+    real_exists = working_copy_cache.os.path.exists
+    republished = False
+
+    def republish_before_reconcile(candidate):
+        nonlocal republished
+        if os.path.abspath(candidate) == os.path.abspath(path) and not republished:
+            republished = True
+            path.write_bytes(b"replacement")
+            return True
+        return real_exists(candidate)
+
+    monkeypatch.setattr(
+        working_copy_cache.os.path, "exists", republish_before_reconcile,
+    )
+    try:
+        result = working_copy_cache.evict_if_over_quota(
+            db, str(tmp_path), quota_mb=1,
+        )
+
+        assert republished
+        assert result["evicted"] == 0
+        assert path.is_file()
+        row = db.conn.execute(
+            "SELECT working_copy_path FROM photos WHERE id=?", (photo_id,),
+        ).fetchone()
+        assert row["working_copy_path"] == f"working/{photo_id}.jpg"
     finally:
         db.close()
 

@@ -123,6 +123,45 @@ def render_preview_bytes(
     load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
     img = load_image(canonical, max_size=load_max_size, **load_kwargs)
 
+    if img is None and using_working_copy and not pair_source_path:
+        # The working copy may be evicted after source selection but before
+        # ``load_image`` opens it. Retry the primary source once when it is
+        # usable, mirroring export/crop recovery instead of surfacing a
+        # PreviewMaterializationError for a benign quota race.
+        original_abs = os.path.join(folder_path, photo["filename"])
+        original_ext = os.path.splitext(original_abs)[1].lower()
+        original_is_raw = original_ext in RAW_EXTENSIONS
+        original_failure_current = original_is_raw and (
+            has_current_working_copy_failure(
+                photo,
+                vireo_dir,
+                trust_existing_working_copy=False,
+                live_source_path=original_abs,
+                folder_path=folder_path,
+            )
+        )
+        if (
+            os.path.abspath(original_abs) != os.path.abspath(canonical)
+            and os.path.isfile(original_abs)
+            and not original_failure_current
+        ):
+            fallback_raw_decode = (
+                RAW_DECODE_PRESERVE_HIGHLIGHTS
+                if original_is_raw and (recipe or pair_source == "raw")
+                else None
+            )
+            fallback_kwargs = (
+                {"raw_decode": fallback_raw_decode}
+                if fallback_raw_decode else {}
+            )
+            img = load_image(
+                original_abs, max_size=load_max_size, **fallback_kwargs,
+            )
+            if img is not None:
+                canonical = original_abs
+                selected_ext = original_ext
+                using_working_copy = False
+
     if (
         img is not None
         and selected_ext in RAW_EXTENSIONS

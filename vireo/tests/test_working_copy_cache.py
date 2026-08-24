@@ -175,6 +175,36 @@ def test_recent_untracked_working_copy_gets_writer_grace(tmp_path):
         db.close()
 
 
+def test_evict_reconciles_tracked_row_when_file_is_missing(tmp_path):
+    """A tracked row with no on-disk file — a leftover from a prior eviction
+    whose DB commit failed after the unlinks — must be reset to NULL so
+    scanner backfill can regenerate it instead of skipping it forever."""
+    from scanner import working_copy_backfill_candidate_count
+    from working_copy_cache import evict_if_over_quota
+
+    db, working_dir, photo_ids = _seed_working_copies(tmp_path, [500_000])
+    try:
+        # Row still claims a working copy, but the file has been removed
+        # out from under it.
+        (working_dir / f"{photo_ids[0]}.jpg").unlink()
+
+        result = evict_if_over_quota(db, str(tmp_path), quota_mb=1)
+
+        assert result["evicted"] == 0
+        row = db.conn.execute(
+            "SELECT working_copy_path, working_copy_evicted_mtime "
+            "FROM photos WHERE id=?",
+            (photo_ids[0],),
+        ).fetchone()
+        assert row["working_copy_path"] is None
+        # No eviction marker: this is reconciliation, not a quota decision.
+        assert row["working_copy_evicted_mtime"] is None
+        # The row now looks like a normal backfill candidate again.
+        assert working_copy_backfill_candidate_count(db) == 1
+    finally:
+        db.close()
+
+
 def test_zero_quota_skips_working_copy_generation(
     tmp_path, monkeypatch,
 ):

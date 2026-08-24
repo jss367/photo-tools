@@ -118,6 +118,7 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None):
         untracked_cutoff_ns = (
             time.time_ns() - _UNTRACKED_WRITE_GRACE_SECONDS * 1_000_000_000
         )
+        stale_tracked_ids = []
         for row in rows:
             expected_rel = f"working/{row['id']}.jpg"
             tracked = row["working_copy_path"] == expected_rel
@@ -127,6 +128,13 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None):
                 continue
             file_entry = files.get(f"{row['id']}.jpg")
             if file_entry is None:
+                if tracked:
+                    # A prior eviction unlinked the file but lost its DB
+                    # transition (typically a commit failure after the
+                    # unlinks). Reconcile so scanner backfill can regenerate
+                    # this row instead of skipping it forever because
+                    # working_copy_path is non-NULL.
+                    stale_tracked_ids.append(row["id"])
                 continue
             path, st = file_entry
             if not tracked and st.st_mtime_ns > untracked_cutoff_ns:
@@ -136,6 +144,14 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None):
             entries.append(
                 (st.st_mtime_ns, row["id"], st.st_size, path, expected_rel)
             )
+
+        if stale_tracked_ids:
+            db.conn.executemany(
+                "UPDATE photos SET working_copy_path=NULL "
+                "WHERE id=? AND working_copy_path=?",
+                [(pid, f"working/{pid}.jpg") for pid in stale_tracked_ids],
+            )
+            commit_with_retry(db.conn)
 
         if total <= max_bytes:
             return {

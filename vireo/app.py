@@ -38410,36 +38410,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     )
                 return response
 
-            # Non-cacheable rendition: serve the bytes we just wrote, but
-            # do not leave a persistent cache entry behind.
-            #
-            # Open the file BEFORE unlinking it so that (a) a concurrent
-            # peer that also hit this branch and already moved/removed
-            # wc_abs cannot turn this response into a 500, and (b)
-            # single-flight waiters that wake immediately after this
-            # producer returns cannot see this transient file at wc_abs —
-            # they miss the cache and freshly re-extract into their own
-            # tempfile (via ``_extract_original_copy`` above), rather than
-            # racing PIL.Image.open / os.replace against a peer that is
-            # still holding this same rendition open. On POSIX the open fd
-            # keeps the data readable after ``os.unlink``; on Windows the
-            # unlink is best-effort and a lingering wc_abs is picked up as
-            # a legacy file by ``evict_if_over_quota`` on its next pass.
-            #
-            # The generator's ``finally`` closes the fd — reliably, even on
-            # client disconnect and even through the outer single-flight
-            # response wrapping used by this route, where ``call_on_close``
-            # is not preserved end-to-end.
+            # Non-cacheable rendition: move the atomically published file to
+            # a private one-shot path before the single-flight producer
+            # returns. Waiters therefore see no canonical cache hit, while
+            # Windows can delete the private file after its response handle
+            # closes (unlinking an open file is not supported there).
+            transient_dir = os.path.join(vireo_dir, "originals")
+            os.makedirs(transient_dir, exist_ok=True)
+            fd, transient_path = tempfile.mkstemp(
+                prefix=f".{photo_id}.transient.",
+                suffix=".jpg",
+                dir=transient_dir,
+            )
+            os.close(fd)
+            os.replace(wc_abs, transient_path)
             try:
-                rendition_fh = open(wc_abs, "rb")  # noqa: SIM115 — closed by _stream_rendition's finally
+                rendition_fh = open(transient_path, "rb")  # noqa: SIM115 — closed by _stream_rendition's finally
             except OSError:
                 log.exception(
                     "Failed to open just-written non-cacheable "
-                    "rendition %s", wc_abs,
+                    "rendition %s", transient_path,
                 )
+                with contextlib.suppress(OSError):
+                    os.unlink(transient_path)
                 return "Could not load image", 500
-            with contextlib.suppress(OSError):
-                os.unlink(wc_abs)
 
             def _stream_rendition():
                 try:
@@ -38448,6 +38442,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 finally:
                     with contextlib.suppress(Exception):
                         rendition_fh.close()
+                    with contextlib.suppress(OSError):
+                        os.unlink(transient_path)
 
             return Response(_stream_rendition(), mimetype="image/jpeg")
 

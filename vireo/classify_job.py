@@ -357,9 +357,15 @@ def _all_photos_cache_satisfied(
     ``_finalize_cached_only`` on stale results — the ordinary
     ``_classify_photos`` gate would reject that mismatch via
     ``_runtime_aware_run_keys``.  ``runtime_fingerprint = 'legacy'``
-    stays accepted for pre-portable rows, and manually reviewed rows
+    stays accepted for pre-portable rows, EXCEPT that an unreviewed
+    legacy row for a timm classifier is dropped once
+    ``label_descriptions.json`` has transitioned from missing to present:
+    that mapping is what turns a raw class id into the stored common
+    name, so a pre-heal legacy row's species is stale relative to what
+    a run made today would emit (Codex #1560 P2). Manually reviewed rows
     (real accept/reject decisions, not auto-match) remain authoritative
-    across runtime changes until an explicit reclassify.
+    across runtime changes — including that enrichment change — until an
+    explicit reclassify.
 
     A classifier_run row is only counted as covered when at least one
     matching ``predictions`` row exists.  Local jobs write classifier_runs
@@ -419,10 +425,41 @@ def _all_photos_cache_satisfied(
     runtime_clause = ""
     runtime_args = []
     if expected_runtimes:
+        # Grandfather ``runtime_fingerprint = 'legacy'`` for pre-portable
+        # rows, EXCEPT when the classifier is timm and its
+        # ``label_descriptions.json`` enrichment has since transitioned
+        # from missing to present. That mapping is what turns a raw
+        # class id into the stored common name, so an unreviewed legacy
+        # timm row's species is stale relative to what a run made today
+        # would emit ("Bubulcus ibis" -> "Western Cattle-Egret"); keeping
+        # the exception would leave the scientific names indefinitely
+        # unless the user asked for a forced reclassify (Codex #1560 P2).
+        # The manual-review branch below still authorizes such rows —
+        # an explicit accept/reject is authoritative across enrichment
+        # changes, matching the runtime-change pin exception.
+        accept_legacy = True
+        if isinstance(model_identity, dict) and (
+            model_identity.get("model_type") == "timm"
+        ):
+            from computation_cache import (
+                LABEL_DESCRIPTIONS_IDENTITY_KEY,
+                NO_LABEL_DESCRIPTIONS,
+            )
+            current_ld_identity = model_identity.get(
+                LABEL_DESCRIPTIONS_IDENTITY_KEY,
+            )
+            if (
+                current_ld_identity
+                and current_ld_identity != NO_LABEL_DESCRIPTIONS
+            ):
+                accept_legacy = False
+        legacy_clause = (
+            " OR cr.runtime_fingerprint = 'legacy'" if accept_legacy else ""
+        )
         placeholders = ",".join("?" for _ in expected_runtimes)
         runtime_clause = (
             f" AND (cr.runtime_fingerprint IN ({placeholders})"
-            " OR cr.runtime_fingerprint = 'legacy'"
+            f"{legacy_clause}"
             " OR EXISTS (SELECT 1 FROM predictions p"
             " JOIN prediction_review pr ON pr.prediction_id = p.id"
             " WHERE p.detection_id = cr.detection_id"

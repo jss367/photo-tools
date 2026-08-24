@@ -7719,6 +7719,214 @@ def test_pre_heal_classifier_run_does_not_satisfy_cache(tmp_path):
     ) is True
 
 
+def test_all_photos_cache_satisfied_excludes_unreviewed_legacy_timm_after_heal(
+    tmp_path,
+):
+    """A legacy classifier_run for a timm model whose
+    ``label_descriptions.json`` has since transitioned from missing to
+    present must not satisfy the cache unless it was manually reviewed.
+
+    ``_all_photos_cache_satisfied`` grandfathers ``runtime_fingerprint
+    = 'legacy'`` for pre-portable rows across ordinary runtime axis
+    changes. That exception cannot survive the label-descriptions heal
+    though: the mapping is what turns a raw class id into the stored
+    common name, so an unreviewed legacy row's species is stale
+    relative to what a run made today would emit ("Bubulcus ibis" ->
+    "Western Cattle-Egret"). The manual-review branch still authorizes
+    such rows across the enrichment change, matching the runtime-change
+    pin exception (Codex #1560 P2).
+    """
+    from classify_job import _all_photos_cache_satisfied
+    from computation_cache import (
+        classifier_model_identity,
+        runtime_fingerprint,
+        source_input,
+    )
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detector_runtime = runtime_fingerprint({
+        "type": "detection", "model": "megadetector-v6",
+        "weights_sha256": "2" * 64, "pipeline": "detector-v1",
+    })
+    _input, det_input_fp = source_input(
+        "0" * 64, "vireo-detector-source-v1",
+    )
+    det_id = db.write_detection_batch(
+        pid, "megadetector-v6",
+        [{"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+          "confidence": 0.9, "category": "animal"}],
+        runtime_fingerprint=detector_runtime,
+        input_fingerprint=det_input_fp,
+    )[0]
+
+    labels_full = "5" * 64
+    labels_short = labels_full[:12]
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.onnx").write_bytes(b"exact model bytes")
+    active_model = {
+        "id": "timm-inat21-eva02-l",
+        "model_str": "hf-hub:timm/eva02-test",
+        "model_type": "timm",
+        "weights_path": str(model_dir),
+        "files": ["model.onnx"],
+        "optional_files": ["label_descriptions.json"],
+        "source": "custom",
+    }
+
+    # A legacy classifier_run (predates portable runtime tracking).
+    db.conn.execute(
+        """INSERT INTO classifier_runs
+             (detection_id, classifier_model, labels_fingerprint,
+              runtime_fingerprint, prediction_count)
+           VALUES (?, ?, ?, ?, ?)""",
+        (det_id, "timm-inat21", labels_short, "legacy", 1),
+    )
+    db.add_prediction(
+        det_id, species="Bubulcus ibis", confidence=0.9,
+        model="timm-inat21", labels_fingerprint=labels_short,
+    )
+    db.conn.commit()
+
+    pre_heal_identity = classifier_model_identity(active_model)
+    assert (
+        pre_heal_identity["label_descriptions_identity"]
+        == "no-label-descriptions"
+    )
+
+    # Pre-heal: enrichment absent, the legacy row is grandfathered.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="timm-inat21",
+        labels_fingerprint=labels_short,
+        model_identity=pre_heal_identity,
+        labels_fingerprint_full=labels_full,
+        taxonomy_identity="1" * 64,
+    ) is True
+
+    # The heal publishes the mapping.
+    (model_dir / "label_descriptions.json").write_text(
+        json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}),
+    )
+    post_heal_identity = classifier_model_identity(active_model)
+    assert (
+        post_heal_identity["label_descriptions_identity"]
+        != "no-label-descriptions"
+    )
+
+    # Post-heal: the unreviewed legacy row must no longer satisfy the
+    # cache — a fresh run would rewrite the raw binomial.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="timm-inat21",
+        labels_fingerprint=labels_short,
+        model_identity=post_heal_identity,
+        labels_fingerprint_full=labels_full,
+        taxonomy_identity="1" * 64,
+    ) is False
+
+    # A manual accept/reject on the same row keeps it authoritative
+    # across the enrichment change, matching the runtime-change pin
+    # exception (auto-match reviews do not count).
+    pred_row = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?",
+        (det_id,),
+    ).fetchone()
+    db.conn.execute(
+        """INSERT INTO prediction_review
+             (prediction_id, workspace_id, status, reviewed_at, individual)
+           VALUES (?, ?, 'accepted', datetime('now'), 'user-choice')""",
+        (pred_row["id"], ws),
+    )
+    db.conn.commit()
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="timm-inat21",
+        labels_fingerprint=labels_short,
+        model_identity=post_heal_identity,
+        labels_fingerprint_full=labels_full,
+        taxonomy_identity="1" * 64,
+    ) is True
+
+
+def test_all_photos_cache_satisfied_still_grandfathers_legacy_bioclip(tmp_path):
+    """The post-heal legacy exclusion is timm-specific.
+
+    Non-timm classifiers (bioclip, test doubles) do not carry a
+    ``label_descriptions_identity`` axis and therefore cannot experience
+    the missing-to-present enrichment transition. Their legacy rows
+    must keep being grandfathered as before.
+    """
+    from classify_job import _all_photos_cache_satisfied
+    from computation_cache import (
+        classifier_model_identity,
+        runtime_fingerprint,
+        source_input,
+    )
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detector_runtime = runtime_fingerprint({
+        "type": "detection", "model": "megadetector-v6",
+        "weights_sha256": "2" * 64, "pipeline": "detector-v1",
+    })
+    _input, det_input_fp = source_input(
+        "0" * 64, "vireo-detector-source-v1",
+    )
+    det_id = db.write_detection_batch(
+        pid, "megadetector-v6",
+        [{"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+          "confidence": 0.9, "category": "animal"}],
+        runtime_fingerprint=detector_runtime,
+        input_fingerprint=det_input_fp,
+    )[0]
+
+    labels_full = "5" * 64
+    labels_short = labels_full[:12]
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "image_encoder.onnx").write_bytes(b"exact model bytes")
+    identity = classifier_model_identity({
+        "id": "bioclip-test",
+        "model_str": "ViT-test",
+        "model_type": "bioclip",
+        "weights_path": str(model_dir),
+        "files": ["image_encoder.onnx"],
+        "source": "custom",
+    })
+    assert "label_descriptions_identity" not in identity
+
+    db.conn.execute(
+        """INSERT INTO classifier_runs
+             (detection_id, classifier_model, labels_fingerprint,
+              runtime_fingerprint, prediction_count)
+           VALUES (?, ?, ?, ?, ?)""",
+        (det_id, "BioCLIP", labels_short, "legacy", 1),
+    )
+    db.add_prediction(
+        det_id, species="Robin", confidence=0.9, model="BioCLIP",
+        labels_fingerprint=labels_short,
+    )
+    db.conn.commit()
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint=labels_short,
+        model_identity=identity, labels_fingerprint_full=labels_full,
+    ) is True
+
+
 def test_classifier_identity_uses_the_mapping_the_instance_consumed(tmp_path):
     """Publication must be stamped with what the classifier read, not a
     fresh disk probe.

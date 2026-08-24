@@ -22815,12 +22815,25 @@ class Database:
 
         return folder_join, "", where, params
 
+    def _collection_sort_clause(self, sort):
+        return {
+            "date": _PHOTO_DATE_ASC_ORDER,
+            "date_desc": _PHOTO_DATE_DESC_ORDER,
+            "name": "p.filename ASC, p.id ASC",
+            "name_desc": "p.filename DESC, p.id ASC",
+            "rating": "p.rating DESC, p.filename ASC, p.id ASC",
+            "sharpness": "p.sharpness DESC, p.filename ASC, p.id ASC",
+            "sharpness_asc": "p.sharpness ASC, p.filename ASC, p.id ASC",
+            "quality": "p.quality_score DESC, p.filename ASC, p.id ASC",
+        }.get(sort, _PHOTO_DATE_ASC_ORDER)
+
     def get_collection_photos(
         self,
         collection_id,
         page=1,
         per_page=50,
         photo_ids=None,
+        sort="date",
         include_offline_folders=False,
     ):
         """Build SQL from collection rules and return matching photos.
@@ -22855,6 +22868,8 @@ class Database:
         offset = (page - 1) * per_page
         params.extend([per_page, offset])
 
+        order = self._collection_sort_clause(sort)
+
         pcols = ", ".join(f"p.{c.strip()}" for c in self.PHOTO_COLS.split(","))
         if include_offline_folders:
             pcols += ", f.status AS folder_status"
@@ -22863,24 +22878,33 @@ class Database:
             {folder_join}
             {join_clause}
             {where}
-            ORDER BY {_PHOTO_DATE_ASC_ORDER}
+            ORDER BY {order}
             LIMIT ? OFFSET ?
         """
         return self.conn.execute(query, params).fetchall()
 
-    def get_collection_photo_ids(self, collection_id):
-        """Return all photo IDs matching a collection in display order."""
+    def get_collection_photo_ids(self, collection_id, sort="date"):
+        """Return all photo IDs matching a collection in display order.
+
+        ``sort`` mirrors ``get_collection_photos`` so the ``/photo-ids``
+        endpoint that drives ``selectedPhotos`` insertion order for
+        Select-all-matching stays aligned with the grid the user sees —
+        without this, Best Batch seed, burst-review order, and export
+        preview would start from the date-ordered first photo even when
+        the grid is sorted by name, rating, sharpness, or quality.
+        """
         parts = self._build_collection_query(collection_id)
         if parts is None:
             return []
 
         folder_join, join_clause, where, params = parts
+        order = self._collection_sort_clause(sort)
         query = f"""
             SELECT DISTINCT p.id FROM photos p
             {folder_join}
             {join_clause}
             {where}
-            ORDER BY {_PHOTO_DATE_ASC_ORDER}
+            ORDER BY {order}
         """
         return [row["id"] for row in self.conn.execute(query, params).fetchall()]
 
@@ -23096,6 +23120,458 @@ class Database:
             LIMIT ? OFFSET ?
         """
         return self.conn.execute(query, [*params, per_page, offset]).fetchall()
+
+    def _browse_stack_query_parts(self, rules, collection_id=None, folder_id=None,
+                                  include_offline_folders=False):
+        """Build the scoped CTE shared by stacked Browse list/count queries.
+
+        Stacks are a presentation of the current result set, not durable
+        catalog state: filters apply to members first, then exact duplicates
+        and camera bursts collapse only when at least two matching photos
+        remain. Exact duplicates claim their members before bursts so one
+        photo can never appear in two Browse items.
+
+        "Camera burst" here means photos that share an EXIF ImageUniqueID —
+        the only value the scanner writes to ``photos.burst_id`` (see
+        ``scanner.py``). The pipeline's time/embedding-derived burst groups
+        live in ``pipeline_results_ws*.json`` and are not persisted to
+        ``burst_id``, so they intentionally do not participate in Browse
+        stacking today; the pipeline review page is where users see those.
+
+        ``include_offline_folders`` is the opt-in offline collection view
+        (PR #1563). Photos whose folder is offline are *shown* — they render
+        as read-only placeholders — but they never join a stack: each one
+        keeps its own ``photo:<id>`` key and is left out of every duplicate /
+        burst tally. Two reasons, both about not lying to the user:
+
+        * A stack's cover is its only interactive card, and
+          ``_STACK_COVER_ORDER`` ranks on quality alone. An offline member
+          could win the cover and turn a stack holding perfectly reachable
+          frames into a dead placeholder.
+        * The stack badge reads as "N photos here to cull". Counting frames
+          the user cannot rate, flag, or delete would make that count a
+          proxy rather than an answer (CORE_PHILOSOPHY, "no black boxes").
+        """
+        folder_join, join_clause, where, params = self._build_query_from_rules(
+            rules, include_offline_folders=include_offline_folders,
+        )
+        where, params = self._append_collection_restriction(
+            collection_id, where, params,
+            include_offline_folders=include_offline_folders,
+        )
+        where, params = self._append_folder_restriction(folder_id, where, params)
+        pcols = ", ".join(f"p.{c.strip()}" for c in self.PHOTO_COLS.split(","))
+        if include_offline_folders:
+            pcols += ", f.status AS folder_status"
+            offline_expr = (
+                "CASE WHEN f.status IN ('ok', 'partial') THEN 0 ELSE 1 END"
+            )
+        else:
+            offline_expr = "0"
+        ctes = f"""
+            WITH scoped AS (
+                SELECT DISTINCT {pcols}, p.burst_id AS _stack_burst_id,
+                       p.file_hash AS _stack_file_hash,
+                       {offline_expr} AS _stack_offline
+                FROM photos p
+                {folder_join}
+                {join_clause}
+                {where}
+            ), duplicate_counts AS (
+                SELECT scoped.*,
+                       CASE WHEN _stack_offline = 1
+                                 OR NULLIF(_stack_file_hash, '') IS NULL THEN 0 ELSE
+                           SUM(CASE WHEN _stack_offline = 0 THEN 1 ELSE 0 END)
+                           OVER (PARTITION BY _stack_file_hash)
+                       END AS _duplicate_count
+                FROM scoped
+            ), stack_counts AS (
+                SELECT duplicate_counts.*,
+                       CASE WHEN _stack_offline = 1
+                                 OR NULLIF(_stack_burst_id, '') IS NULL THEN 0 ELSE
+                           SUM(CASE WHEN _duplicate_count < 2 AND _stack_offline = 0
+                                    THEN 1 ELSE 0 END)
+                           OVER (PARTITION BY _stack_burst_id)
+                       END AS _burst_count
+                FROM duplicate_counts
+            ), keyed AS (
+                SELECT stack_counts.*,
+                       CASE
+                         WHEN _duplicate_count >= 2
+                           THEN 'duplicate:' || _stack_file_hash
+                         WHEN _duplicate_count < 2 AND _burst_count >= 2
+                           THEN 'burst:' || _stack_burst_id
+                         ELSE 'photo:' || id
+                       END AS _stack_key,
+                       CASE
+                         WHEN _duplicate_count >= 2 THEN 'duplicate'
+                         WHEN _duplicate_count < 2 AND _burst_count >= 2 THEN 'burst'
+                         ELSE NULL
+                       END AS _stack_kind
+                FROM stack_counts
+            )
+        """
+        return ctes, params
+
+    _STACK_COVER_ORDER = """
+        CASE COALESCE(flag, 'none')
+          WHEN 'flagged' THEN 2 WHEN 'none' THEN 1 ELSE 0 END DESC,
+        quality_score IS NULL, quality_score DESC,
+        subject_sharpness IS NULL, subject_sharpness DESC,
+        sharpness IS NULL, sharpness DESC,
+        rating IS NULL, rating DESC,
+        (COALESCE(width, 0) * COALESCE(height, 0)) DESC,
+        COALESCE(file_size, 0) DESC,
+        id ASC
+    """
+
+    # Every stacked sort places a stack exactly where its *leading member* —
+    # the member that would come first in the unstacked list — sits, so
+    # toggling Stacks never reorders anything.
+    #
+    # ``member`` is the unstacked ORDER BY (see the identical ``sort_map`` in
+    # query_photos / query_photos_for_rules / query_photo_ids) applied inside
+    # the stack, so FIRST_VALUE over it yields that leading member; ``key`` is
+    # the column the primary term reads; ``order`` re-applies the same
+    # comparator to the leading member's values.
+    #
+    # Aggregating each term independently is what breaks: MAX(rating) with
+    # MIN(filename) reads two different members, so a burst of a.jpg rated 1
+    # and z.jpg rated 5 sorts as (5, "a.jpg") and jumps ahead of a single
+    # m.jpg rated 5 that outranks z.jpg with Stacks off. An order that
+    # silently depends on the Stacks toggle is exactly the hidden behaviour
+    # CORE_PHILOSOPHY's "no black boxes" rule forbids in a culling workflow
+    # (Codex P2 on PR #1561).
+    _STACK_SORT_SPECS = {
+        "date": {
+            "member": "timestamp IS NULL, timestamp ASC, filename ASC, id ASC",
+            "key": "timestamp",
+            "order": (
+                "_stack_lead_key IS NULL, _stack_lead_key ASC, "
+                "_stack_lead_filename ASC, _stack_lead_id ASC"
+            ),
+        },
+        "date_desc": {
+            "member": "timestamp IS NULL, timestamp DESC, filename ASC, id ASC",
+            "key": "timestamp",
+            "order": (
+                "_stack_lead_key IS NULL, _stack_lead_key DESC, "
+                "_stack_lead_filename ASC, _stack_lead_id ASC"
+            ),
+        },
+        "name": {
+            "member": "filename ASC, id ASC",
+            "key": "filename",
+            "order": "_stack_lead_filename ASC, _stack_lead_id ASC",
+        },
+        "name_desc": {
+            "member": "filename DESC, id ASC",
+            "key": "filename",
+            "order": "_stack_lead_filename DESC, _stack_lead_id ASC",
+        },
+        "rating": {
+            "member": "rating DESC, filename ASC, id ASC",
+            "key": "rating",
+            "order": (
+                "_stack_lead_key DESC, _stack_lead_filename ASC, "
+                "_stack_lead_id ASC"
+            ),
+        },
+        "sharpness": {
+            "member": "sharpness DESC, filename ASC, id ASC",
+            "key": "sharpness",
+            "order": (
+                "_stack_lead_key DESC, _stack_lead_filename ASC, "
+                "_stack_lead_id ASC"
+            ),
+        },
+        # Softest-first treats a stack as only as sharp as its softest
+        # member, and a stack holding any unscored member is itself unscored
+        # — both fall out of the leading-member rule for free, because
+        # SQLite's ASC sorts NULL first and the smallest score next.
+        "sharpness_asc": {
+            "member": "sharpness ASC, filename ASC, id ASC",
+            "key": "sharpness",
+            "order": (
+                "_stack_lead_key ASC, _stack_lead_filename ASC, "
+                "_stack_lead_id ASC"
+            ),
+        },
+        "quality": {
+            "member": "quality_score DESC, filename ASC, id ASC",
+            "key": "quality_score",
+            "order": (
+                "_stack_lead_key DESC, _stack_lead_filename ASC, "
+                "_stack_lead_id ASC"
+            ),
+        },
+    }
+
+    def _stack_sort_spec(self, sort):
+        return self._STACK_SORT_SPECS.get(sort, self._STACK_SORT_SPECS["date"])
+
+    def _stack_sort_clause(self, sort):
+        return self._stack_sort_spec(sort)["order"]
+
+    def _ranked_stack_query(self, rules, sort="date", collection_id=None,
+                            folder_id=None, include_offline_folders=False):
+        """Return the CTE + ``ranked`` window-function block shared by every
+        stack-projected query. Callers append their own outer SELECT (with
+        ORDER BY and optional LIMIT/OFFSET).
+
+        ``sort`` selects which member each stack's ``_stack_lead_*`` columns
+        are read from, so it must match the ``_stack_sort_clause(sort)`` the
+        caller orders by.
+        """
+        ctes, params = self._browse_stack_query_parts(
+            rules, collection_id=collection_id, folder_id=folder_id,
+            include_offline_folders=include_offline_folders,
+        )
+        cover_order = self._STACK_COVER_ORDER
+        spec = self._stack_sort_spec(sort)
+        member_order = spec["member"]
+        lead_key = spec["key"]
+        ranked = ctes + f"""
+            , ranked AS (
+                SELECT keyed.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY _stack_key ORDER BY {cover_order}
+                       ) AS _stack_cover_rank,
+                       COUNT(*) OVER (PARTITION BY _stack_key)
+                           AS _browse_stack_count,
+                       GROUP_CONCAT(id) OVER (
+                           PARTITION BY _stack_key
+                           ORDER BY timestamp IS NULL, timestamp, filename, id
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                       )
+                           AS _browse_stack_member_ids,
+                       -- The whole sort key is read off one member: the one
+                       -- the unstacked list would show first. Per-term
+                       -- aggregates (MAX(rating) beside MIN(filename)) mix
+                       -- members and move stacks that the unstacked list
+                       -- ranks lower. See _STACK_SORT_SPECS.
+                       FIRST_VALUE({lead_key}) OVER (
+                           PARTITION BY _stack_key ORDER BY {member_order}
+                       ) AS _stack_lead_key,
+                       FIRST_VALUE(filename) OVER (
+                           PARTITION BY _stack_key ORDER BY {member_order}
+                       ) AS _stack_lead_filename,
+                       FIRST_VALUE(id) OVER (
+                           PARTITION BY _stack_key ORDER BY {member_order}
+                       ) AS _stack_lead_id
+                FROM keyed
+            )
+        """
+        return ranked, params
+
+    def query_browse_stacks(self, rules, sort="date", page=1, per_page=50,
+                            collection_id=None, folder_id=None,
+                            include_offline_folders=False):
+        """Return one representative row per exact-duplicate or burst stack.
+
+        The returned rows have three private columns consumed by the HTTP
+        layer: ``_browse_stack_kind``, ``_browse_stack_count``, and
+        ``_browse_stack_member_ids``. Singles carry a null kind and otherwise
+        retain the ordinary photo-list shape.
+        """
+        ranked, params = self._ranked_stack_query(
+            rules, sort=sort, collection_id=collection_id, folder_id=folder_id,
+            include_offline_folders=include_offline_folders,
+        )
+        order = self._stack_sort_clause(sort)
+        page = max(1, page)
+        offset = (page - 1) * per_page
+        query = ranked + f"""
+            SELECT ranked.*,
+                   _stack_kind AS _browse_stack_kind
+            FROM ranked
+            WHERE _stack_cover_rank = 1
+            ORDER BY {order}
+            LIMIT ? OFFSET ?
+        """
+        return self.conn.execute(query, [*params, per_page, offset]).fetchall()
+
+    def count_browse_stacks(self, rules, collection_id=None, folder_id=None,
+                            include_offline_folders=False):
+        """Count logical Browse items after stack projection."""
+        ctes, params = self._browse_stack_query_parts(
+            rules, collection_id=collection_id, folder_id=folder_id,
+            include_offline_folders=include_offline_folders,
+        )
+        row = self.conn.execute(
+            ctes + " SELECT COUNT(DISTINCT _stack_key) AS n FROM keyed",
+            params,
+        ).fetchone()
+        return int(row["n"] or 0)
+
+    def _stacked_photo_ids(self, rules, sort="date",
+                           collection_id=None, folder_id=None):
+        """Shared cover-first stacked ID projection used by every select-all
+        endpoint that honors Stacks. For each stack (in the same order
+        ``query_browse_stacks`` places covers) emits the cover ID first, then
+        the remaining member IDs in the intra-stack order the projection
+        exposes as ``browse_stack.photo_ids``. Singles carry themselves.
+        """
+        ranked, params = self._ranked_stack_query(
+            rules, sort=sort, collection_id=collection_id, folder_id=folder_id,
+        )
+        order = self._stack_sort_clause(sort)
+        query = ranked + f"""
+            SELECT id, _browse_stack_member_ids
+            FROM ranked
+            WHERE _stack_cover_rank = 1
+            ORDER BY {order}
+        """
+        photo_ids = []
+        for row in self.conn.execute(query, params).fetchall():
+            cover_id = row["id"]
+            raw = row["_browse_stack_member_ids"]
+            member_ids = (
+                [int(value) for value in str(raw).split(",") if value]
+                if raw
+                else [cover_id]
+            )
+            # Cover first, then the intra-stack order minus the cover — the
+            # same shape ``browse_stack.photo_ids`` carries in the paginated
+            # /photos response, so the client's first selected id is always
+            # the visible top-level card.
+            seen = {cover_id}
+            photo_ids.append(cover_id)
+            for member_id in member_ids:
+                if member_id in seen:
+                    continue
+                photo_ids.append(member_id)
+                seen.add(member_id)
+        return photo_ids
+
+    def get_collection_photo_ids_stacked(self, collection_id, sort="date"):
+        """Return every photo ID matching a collection, in stack-projected
+        order. See ``_stacked_photo_ids``.
+
+        Without this, Select-all-matching with Stacks enabled would seed
+        Best Batch, Burst Review, and the export-preview filename from a
+        hidden member whenever a stack's quality-ranked cover isn't its
+        earliest member under the selected sort (Codex P2 on PR #1561).
+        """
+        return self._stacked_photo_ids(
+            [], sort=sort, collection_id=collection_id,
+        )
+
+    def query_photo_ids_stacked(self, rules, sort="date",
+                                collection_id=None, folder_id=None):
+        """Return every photo ID matching a universal-filter rule tree, in
+        stack-projected order — the rules analog of
+        ``get_collection_photo_ids_stacked``.
+
+        Without this, Select-all-matching with Stacks enabled in the
+        workspace, folder, dashboard-collection, or unsaved-filter paths
+        would seed Best Batch, Burst Review, and the export-preview filename
+        from a hidden member whenever a stack's quality-ranked cover isn't
+        its earliest member under the selected sort (Codex P2 on PR #1561).
+        """
+        return self._stacked_photo_ids(
+            rules, sort=sort, collection_id=collection_id, folder_id=folder_id,
+        )
+
+    def collapse_browse_stack_photo_ids(self, photo_ids, standalone_ids=None):
+        """Collapse an already ordered ID result, preserving group order.
+
+        Visual search has already materialized its relevance-ordered IDs, so
+        re-running the metadata SQL would lose that order. This bounded helper
+        applies the same duplicate-first overlap rule in Python and selects a
+        quality-ranked cover for each logical item.
+
+        ``standalone_ids`` are photos that must never join a stack — the
+        offline members of the opt-in offline collection view. They keep
+        their place in the relevance order as their own single-photo item,
+        and are left out of every duplicate / burst tally, matching the SQL
+        projection in ``_browse_stack_query_parts``.
+        """
+        standalone = set(standalone_ids or ())
+        ordered_ids = list(dict.fromkeys(photo_ids or []))
+        if not ordered_ids:
+            return []
+        rows_by_id = {}
+        columns = (
+            "id, file_hash, burst_id, flag, quality_score, subject_sharpness, "
+            "sharpness, rating, width, height, file_size"
+        )
+        for chunk in _chunks(ordered_ids):
+            placeholders = ",".join("?" * len(chunk))
+            for row in self.conn.execute(
+                f"SELECT {columns} FROM photos WHERE id IN ({placeholders})",
+                list(chunk),
+            ).fetchall():
+                rows_by_id[row["id"]] = row
+
+        duplicate_counts = {}
+        for pid in ordered_ids:
+            if pid in standalone:
+                continue
+            row = rows_by_id.get(pid)
+            file_hash = row["file_hash"] if row else None
+            if file_hash:
+                duplicate_counts[file_hash] = duplicate_counts.get(file_hash, 0) + 1
+        burst_counts = {}
+        for pid in ordered_ids:
+            if pid in standalone:
+                continue
+            row = rows_by_id.get(pid)
+            if not row:
+                continue
+            file_hash = row["file_hash"]
+            if file_hash and duplicate_counts.get(file_hash, 0) >= 2:
+                continue
+            burst_id = row["burst_id"]
+            if burst_id:
+                burst_counts[burst_id] = burst_counts.get(burst_id, 0) + 1
+
+        groups = {}
+        group_order = []
+        for pid in ordered_ids:
+            row = rows_by_id.get(pid)
+            if not row:
+                continue
+            file_hash = row["file_hash"]
+            burst_id = row["burst_id"]
+            if pid in standalone:
+                key = (None, pid)
+            elif file_hash and duplicate_counts.get(file_hash, 0) >= 2:
+                key = ("duplicate", file_hash)
+            elif burst_id and burst_counts.get(burst_id, 0) >= 2:
+                key = ("burst", burst_id)
+            else:
+                key = (None, pid)
+            if key not in groups:
+                groups[key] = []
+                group_order.append(key)
+            groups[key].append(pid)
+
+        def cover_score(pid):
+            row = rows_by_id[pid]
+            flag_rank = {"flagged": 2, "none": 1, None: 1}.get(row["flag"], 0)
+            return (
+                flag_rank,
+                row["quality_score"] if row["quality_score"] is not None else float("-inf"),
+                row["subject_sharpness"] if row["subject_sharpness"] is not None else float("-inf"),
+                row["sharpness"] if row["sharpness"] is not None else float("-inf"),
+                row["rating"] is not None,
+                row["rating"] if row["rating"] is not None else 0,
+                (row["width"] or 0) * (row["height"] or 0),
+                row["file_size"] or 0,
+                -pid,
+            )
+
+        items = []
+        for key in group_order:
+            member_ids = groups[key]
+            cover_id = max(member_ids, key=cover_score)
+            items.append({
+                "cover_id": cover_id,
+                "kind": key[0],
+                "member_ids": member_ids,
+            })
+        return items
 
     # (display_expr, group_expr) for suggest-capable columns.
     # ``group_expr`` folds the value the same way the corresponding filter

@@ -20293,13 +20293,29 @@ def test_browse_sidebar_panels_refresh_on_undo_and_redo(app_and_db):
     app, _ = app_and_db
     client = app.test_client()
     html = client.get("/browse").get_data(as_text=True)
-    listener_at = html.find(
-        "document.addEventListener('vireo:edit-history-changed'"
+    # Scoped to the handler itself rather than a fixed character count: the
+    # listener's own comments explain why each refresh is there, and a
+    # character budget silently turns into "the comment got longer" failures.
+    handler = _browse_js_function_body(
+        html, "document.addEventListener('vireo:edit-history-changed'"
     )
-    assert listener_at != -1, "Browse must listen for undo/redo"
-    handler = html[listener_at: listener_at + 700]
     assert "refreshBrowseSidebarPanels(" in handler, (
         "undo/redo must repaint the whole sidebar, not one panel"
+    )
+    # Undo/redo also reverses ratings and flags, which are inputs to the stack
+    # cover comparison. Nothing else applies that reversal to the loaded rows,
+    # so the refresh this handler runs has to carry both fields and reconcile
+    # the covers they rank — otherwise the grid keeps showing a representative
+    # the database no longer picks and Undo reads as a no-op.
+    assert "_refreshBrowseKeywordState(" in handler
+    refresh = _browse_js_function_body(
+        html, "async function _refreshBrowseKeywordState(",
+    )
+    assert "local.rating = " in refresh and "local.flag = " in refresh, (
+        "undo/redo has no other path to apply a reverted rating or flag"
+    )
+    assert "reconcileBrowseStackCovers(" in refresh, (
+        "a reverted rating or flag can hand the stack back to another cover"
     )
     body = _browse_js_function_body(
         html, "function refreshBrowseSidebarPanels(",

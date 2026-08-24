@@ -892,6 +892,216 @@ def test_collection_photos_date_sort_puts_missing_timestamps_last(tmp_path):
     assert db.get_collection_photo_ids(cid) == [p['id'] for p in photos]
 
 
+def test_collection_photo_ids_honors_sort(tmp_path):
+    """get_collection_photo_ids applies the same sort as get_collection_photos.
+
+    Regression for the Select-all-matching path used by Best Batch seed,
+    burst-review order, and export preview: a date-only order here picks a
+    different first photo than the grid whenever the collection is sorted by
+    name/rating/sharpness/quality (Codex P2 on PR #1561).
+    """
+    import json
+
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder('/photos', name='photos')
+    p_a = db.add_photo(folder_id=fid, filename='a.jpg', extension='.jpg',
+                       file_size=100, file_mtime=1.0,
+                       timestamp='2024-06-01T00:00:00')
+    p_b = db.add_photo(folder_id=fid, filename='b.jpg', extension='.jpg',
+                       file_size=100, file_mtime=1.0,
+                       timestamp='2024-01-01T00:00:00')
+    p_c = db.add_photo(folder_id=fid, filename='c.jpg', extension='.jpg',
+                       file_size=100, file_mtime=1.0,
+                       timestamp='2024-03-01T00:00:00')
+    db.update_photo_rating(p_a, 2)
+    db.update_photo_rating(p_b, 5)
+    db.update_photo_rating(p_c, 4)
+
+    rules = [{"field": "rating", "op": ">=", "value": 0}]
+    cid = db.add_collection('All', json.dumps(rules))
+
+    assert db.get_collection_photo_ids(cid) == [p_b, p_c, p_a]
+    assert db.get_collection_photo_ids(cid, sort="date") == [p_b, p_c, p_a]
+    assert db.get_collection_photo_ids(cid, sort="rating") == [p_b, p_c, p_a]
+    assert db.get_collection_photo_ids(cid, sort="name") == [p_a, p_b, p_c]
+    assert db.get_collection_photo_ids(cid, sort="name_desc") == [p_c, p_b, p_a]
+
+    for sort in ("date", "rating", "name", "name_desc"):
+        ids = db.get_collection_photo_ids(cid, sort=sort)
+        grid = [p['id'] for p in db.get_collection_photos(cid, per_page=999999, sort=sort)]
+        assert ids == grid, f"sort={sort}: photo-ids and grid diverged"
+
+
+def test_collection_photo_ids_stacked_puts_cover_before_hidden_members(tmp_path):
+    """``get_collection_photo_ids_stacked`` emits each stack cover before its
+    hidden members and singles in stack-projected order — mirroring the
+    Stacks-enabled grid the user sees.
+
+    Regression for Codex P2 on PR #1561: without this, Select-all-matching
+    would seed Best Batch, Burst Review, and the export-preview filename
+    from a hidden burst frame whenever the quality-ranked cover isn't the
+    stack's earliest member under the selected sort.
+    """
+    import json
+
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder('/photos', name='photos')
+    # Burst pair where the earlier-named member is the low-quality frame and
+    # a later-named member is the quality-ranked cover. Under sort=name the
+    # unstacked ordering would insert the low-quality frame first; the
+    # stack-projected list must invert that so the visible cover leads.
+    burst_soft = db.add_photo(
+        folder_id=fid, filename='burst-a.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+        timestamp='2024-01-01T00:00:00',
+    )
+    burst_cover = db.add_photo(
+        folder_id=fid, filename='burst-b.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+        timestamp='2024-01-02T00:00:00',
+    )
+    single_later = db.add_photo(
+        folder_id=fid, filename='zebra.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+        timestamp='2024-06-01T00:00:00',
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id='burst-1', quality_score=0.1 WHERE id=?",
+        (burst_soft,),
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id='burst-1', quality_score=0.95 WHERE id=?",
+        (burst_cover,),
+    )
+    db.conn.commit()
+
+    rules = [{"field": "rating", "op": ">=", "value": 0}]
+    cid = db.add_collection('All', json.dumps(rules))
+
+    # Baseline: without projection the low-quality burst frame leads under
+    # sort=name, so Select-all-matching would seed from a hidden member.
+    assert db.get_collection_photo_ids(cid, sort='name') == [
+        burst_soft, burst_cover, single_later,
+    ]
+
+    # Stack-projected: the burst cover leads, then its hidden member, then
+    # the single — matching the paginated /photos response the user sees.
+    stacked = db.get_collection_photo_ids_stacked(cid, sort='name')
+    assert stacked == [burst_cover, burst_soft, single_later]
+
+    # The stack projection also agrees with the paginated grid's first item
+    # for every supported sort — that first id is what drives Best Batch
+    # seed, burst-review order, and export preview.
+    for sort in ('date', 'name', 'name_desc', 'rating', 'quality'):
+        stacked = db.get_collection_photo_ids_stacked(cid, sort=sort)
+        grid = db.query_browse_stacks(
+            [], collection_id=cid, sort=sort, per_page=99,
+        )
+        first_visible = grid[0]['id']
+        assert stacked[0] == first_visible, (
+            f"sort={sort}: first stacked id != first visible card"
+        )
+        # And every visible cover appears in the flattened list.
+        assert set(row['id'] for row in grid) <= set(stacked)
+
+
+def test_query_photo_ids_stacked_puts_cover_before_hidden_members(tmp_path):
+    """``query_photo_ids_stacked`` is the rules analog of
+    ``get_collection_photo_ids_stacked``: it emits each stack's cover
+    before its hidden members, mirroring the Stacks-enabled grid.
+
+    Regression for Codex P2 on PR #1561 (browse.html:7160): without this
+    the workspace/folder/dashboard-collection/unsaved-filter Select-all
+    paths would seed Best Batch and burst-review from a hidden burst
+    frame whenever the quality-ranked cover wasn't the earliest member
+    under the selected sort.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder('/photos', name='photos')
+    burst_soft = db.add_photo(
+        folder_id=fid, filename='burst-a.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+        timestamp='2024-01-01T00:00:00',
+    )
+    burst_cover = db.add_photo(
+        folder_id=fid, filename='burst-b.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+        timestamp='2024-01-02T00:00:00',
+    )
+    single_later = db.add_photo(
+        folder_id=fid, filename='zebra.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0,
+        timestamp='2024-06-01T00:00:00',
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id='burst-1', quality_score=0.1 WHERE id=?",
+        (burst_soft,),
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id='burst-1', quality_score=0.95 WHERE id=?",
+        (burst_cover,),
+    )
+    db.conn.commit()
+
+    rules = [{"field": "rating", "op": ">=", "value": 0}]
+
+    # Baseline: unstacked returns the raw member order under sort=name.
+    assert db.query_photo_ids(rules, sort='name') == [
+        burst_soft, burst_cover, single_later,
+    ]
+
+    # Stack-projected: the burst cover leads, then its hidden member, then
+    # the single — matching what the Stacks-enabled grid shows.
+    stacked = db.query_photo_ids_stacked(rules, sort='name')
+    assert stacked == [burst_cover, burst_soft, single_later]
+
+    # And every supported sort's first id agrees with the first visible
+    # card the paginated grid would show.
+    for sort in ('date', 'name', 'name_desc', 'rating', 'quality'):
+        stacked = db.query_photo_ids_stacked(rules, sort=sort)
+        grid = db.query_browse_stacks(rules, sort=sort, per_page=99)
+        first_visible = grid[0]['id']
+        assert stacked[0] == first_visible, (
+            f"sort={sort}: first stacked id != first visible card"
+        )
+        assert set(row['id'] for row in grid) <= set(stacked)
+
+
+def test_query_photo_ids_stacked_folder_scoped(tmp_path):
+    """``query_photo_ids_stacked`` restricts to the requested folder — the
+    Stacks-enabled folder Select-all path relies on it (Codex P2 on
+    PR #1561).
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid_a = db.add_folder('/photos/a', name='a')
+    fid_b = db.add_folder('/photos/b', name='b')
+    in_a = db.add_photo(
+        folder_id=fid_a, filename='in-a.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0, timestamp='2024-01-01T00:00:00',
+    )
+    in_b = db.add_photo(
+        folder_id=fid_b, filename='in-b.jpg', extension='.jpg',
+        file_size=100, file_mtime=1.0, timestamp='2024-01-02T00:00:00',
+    )
+
+    only_a = db.query_photo_ids_stacked([], folder_id=fid_a)
+    only_b = db.query_photo_ids_stacked([], folder_id=fid_b)
+    assert only_a == [in_a]
+    assert only_b == [in_b]
+
+
 def test_collection_photos_keyword_rule(tmp_path):
     """get_collection_photos filters by keyword contains rule."""
     import json
@@ -25074,6 +25284,387 @@ def test_query_photos_sort_and_paging(tmp_path):
     assert [r["filename"] for r in rows] == ['c.jpg']
     rows = db.query_photos([{"field": "rating", "op": ">=", "value": 3}], sort="name")
     assert [r["filename"] for r in rows] == ['b.jpg', 'c.jpg']
+
+
+def test_query_browse_stacks_collapses_duplicates_and_bursts(tmp_path):
+    db, fid = _filter_db(tmp_path)
+    ids = {}
+    for name in (
+        "duplicate-a.jpg", "duplicate-best.jpg", "overlap-single.jpg",
+        "burst-a.jpg", "burst-best.jpg", "single.jpg",
+    ):
+        ids[name] = db.add_photo(
+            folder_id=fid, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+
+    db.conn.execute(
+        "UPDATE photos SET file_hash = 'same-bytes', burst_id = 'overlap' "
+        "WHERE id IN (?, ?)",
+        (ids["duplicate-a.jpg"], ids["duplicate-best.jpg"]),
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id = 'overlap' WHERE id = ?",
+        (ids["overlap-single.jpg"],),
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id = 'burst-2' WHERE id IN (?, ?)",
+        (ids["burst-a.jpg"], ids["burst-best.jpg"]),
+    )
+    db.conn.execute(
+        "UPDATE photos SET quality_score = 0.95 WHERE id IN (?, ?)",
+        (ids["duplicate-best.jpg"], ids["burst-best.jpg"]),
+    )
+    db.conn.commit()
+
+    rows = [dict(row) for row in db.query_browse_stacks([], sort="name")]
+    assert db.count_browse_stacks([]) == 4
+    grouped = {
+        row["_browse_stack_kind"]: row
+        for row in rows if row["_browse_stack_kind"]
+    }
+    assert grouped["duplicate"]["id"] == ids["duplicate-best.jpg"]
+    assert set(map(int, grouped["duplicate"]["_browse_stack_member_ids"].split(","))) == {
+        ids["duplicate-a.jpg"], ids["duplicate-best.jpg"],
+    }
+    assert grouped["burst"]["id"] == ids["burst-best.jpg"]
+    assert set(map(int, grouped["burst"]["_browse_stack_member_ids"].split(","))) == {
+        ids["burst-a.jpg"], ids["burst-best.jpg"],
+    }
+    # The duplicate group claims its members first, so a third photo sharing
+    # one member's burst does not become a one-photo pseudo-stack.
+    overlap = next(row for row in rows if row["id"] == ids["overlap-single.jpg"])
+    assert overlap["_browse_stack_kind"] is None
+
+    # Filters apply before projection. Once only one burst member matches,
+    # it returns as an ordinary result rather than dragging hidden members in.
+    db.update_photo_rating(ids["burst-best.jpg"], 5)
+    filtered = db.query_browse_stacks([
+        {"field": "rating", "op": ">=", "value": 5},
+    ])
+    assert len(filtered) == 1
+    assert filtered[0]["id"] == ids["burst-best.jpg"]
+    assert filtered[0]["_browse_stack_kind"] is None
+
+
+def test_visual_stack_cover_prefers_zero_rating_over_null(tmp_path):
+    db, fid = _filter_db(tmp_path)
+    zero_id = db.add_photo(
+        folder_id=fid, filename="zero.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0,
+    )
+    null_id = db.add_photo(
+        folder_id=fid, filename="null.jpg", extension=".jpg",
+        file_size=999, file_mtime=1.0,
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id = 'visual-burst', rating = 0, "
+        "width = 1, height = 1 WHERE id = ?",
+        (zero_id,),
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id = 'visual-burst', rating = NULL, "
+        "width = 999, height = 999 WHERE id = ?",
+        (null_id,),
+    )
+    db.conn.commit()
+
+    items = db.collapse_browse_stack_photo_ids([null_id, zero_id])
+
+    assert items == [{
+        "cover_id": zero_id,
+        "kind": "burst",
+        "member_ids": [null_id, zero_id],
+    }]
+
+
+def test_browse_stack_rating_sort_puts_zero_before_null(tmp_path):
+    db, fid = _filter_db(tmp_path)
+    unrated_id = db.add_photo(
+        folder_id=fid, filename="a-unrated.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0,
+    )
+    zero_id = db.add_photo(
+        folder_id=fid, filename="z-zero.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0,
+    )
+    db.conn.execute("UPDATE photos SET rating = NULL WHERE id = ?", (unrated_id,))
+    db.conn.execute("UPDATE photos SET rating = 0 WHERE id = ?", (zero_id,))
+    db.conn.commit()
+
+    rows = db.query_browse_stacks([], sort="rating")
+
+    assert [row["id"] for row in rows] == [zero_id, unrated_id]
+
+
+def test_browse_stack_sharpness_asc_preserves_null_member(tmp_path):
+    # Softest-first must treat a stack containing any unscored member as
+    # unscored — mirroring how sharpness_asc places an unscored single at
+    # the head — otherwise MIN(sharpness) ignores the NULL and Stacks
+    # silently buries the unscored frame behind scored singles.
+    db, fid = _filter_db(tmp_path)
+    stack_null_id = db.add_photo(
+        folder_id=fid, filename="burst-a.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0,
+    )
+    stack_scored_id = db.add_photo(
+        folder_id=fid, filename="burst-b.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0,
+    )
+    scored_single_id = db.add_photo(
+        folder_id=fid, filename="single-scored.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0,
+    )
+    db.conn.execute(
+        "UPDATE photos SET burst_id = 'shared-burst' WHERE id IN (?, ?)",
+        (stack_null_id, stack_scored_id),
+    )
+    db.conn.execute(
+        "UPDATE photos SET sharpness = NULL WHERE id = ?", (stack_null_id,))
+    db.conn.execute(
+        "UPDATE photos SET sharpness = 0.9 WHERE id = ?", (stack_scored_id,))
+    db.conn.execute(
+        "UPDATE photos SET sharpness = 0.5 WHERE id = ?", (scored_single_id,))
+    db.conn.commit()
+
+    rows = db.query_browse_stacks([], sort="sharpness_asc")
+    ids = [row["id"] for row in rows]
+
+    # The stack sits ahead of the scored single because one of its members
+    # has no sharpness score.
+    assert ids.index(stack_scored_id) < ids.index(scored_single_id)
+
+
+def _stacked_vs_unstacked_order(db, sort):
+    """Return ``(stacked_ids, expected_ids)`` for a Browse sort.
+
+    "Stacked ordering agrees with unstacked ordering" means each logical
+    item appears in the same relative position its first-appearing member
+    occupies in the ordinary photo query. Softest-first is a culling sort:
+    a frame that moves simply because Stacks was toggled is exactly the
+    kind of hidden behaviour CORE_PHILOSOPHY's "no black boxes" rule
+    forbids, so the two views must not disagree.
+    """
+    rows = db.query_browse_stacks([], sort=sort)
+    stacked_ids = [row["id"] for row in rows]
+    cover_by_member = {}
+    for row in rows:
+        raw = row["_browse_stack_member_ids"]
+        member_ids = (
+            [int(part) for part in str(raw).split(",") if part]
+            if raw else [row["id"]]
+        )
+        for member_id in member_ids:
+            cover_by_member[member_id] = row["id"]
+    expected_ids = []
+    for photo in db.query_photos([], sort=sort):
+        cover_id = cover_by_member.get(photo["id"], photo["id"])
+        if cover_id not in expected_ids:
+            expected_ids.append(cover_id)
+    return stacked_ids, expected_ids, cover_by_member
+
+
+def _metric_sort_db(tmp_path, column, specs):
+    """Seed photos from ``(filename, value, burst_id)`` triples on ``column``."""
+    db, fid = _filter_db(tmp_path)
+    ids = {}
+    for filename, value, burst_id in specs:
+        photo_id = db.add_photo(
+            folder_id=fid, filename=filename, extension=".jpg",
+            file_size=1, file_mtime=1.0,
+        )
+        ids[filename] = photo_id
+        db.conn.execute(
+            f"UPDATE photos SET {column} = ?, burst_id = ? WHERE id = ?",
+            (value, burst_id, photo_id),
+        )
+    db.conn.commit()
+    return db, ids
+
+
+def _sharpness_sort_db(tmp_path, specs):
+    """Seed photos from ``(filename, sharpness, burst_id)`` triples."""
+    return _metric_sort_db(tmp_path, "sharpness", specs)
+
+
+def test_browse_stack_sharpness_asc_null_stack_uses_filename_tiebreak(tmp_path):
+    # A burst holding NULL + 0.9 and a lone unscored single are both
+    # "unscored" for softest-first, so the filename tie-breaker must decide
+    # them exactly as it does unstacked. Ordering by MIN(sharpness) instead
+    # compares 0.9 against NULL and always parks the single first.
+    db, ids = _sharpness_sort_db(tmp_path, [
+        ("a-burst-1.jpg", None, "shared-burst"),
+        ("a-burst-2.jpg", 0.9, "shared-burst"),
+        ("z-single.jpg", None, None),
+    ])
+
+    stacked_ids, expected_ids, cover_of = _stacked_vs_unstacked_order(
+        db, "sharpness_asc")
+
+    # The burst's min filename sorts before the single's, so the burst leads.
+    assert stacked_ids == expected_ids
+    assert stacked_ids.index(cover_of[ids["a-burst-1.jpg"]]) < stacked_ids.index(
+        cover_of[ids["z-single.jpg"]])
+
+
+def test_browse_stack_sharpness_asc_null_stack_tiebreak_respects_order(tmp_path):
+    # Same shape with the filenames swapped: the single now sorts first.
+    # Without this direction the previous test could pass on a rule that
+    # merely reverses the bug rather than honouring the filename order.
+    db, ids = _sharpness_sort_db(tmp_path, [
+        ("m-burst-1.jpg", None, "shared-burst"),
+        ("m-burst-2.jpg", 0.9, "shared-burst"),
+        ("a-single.jpg", None, None),
+    ])
+
+    stacked_ids, expected_ids, cover_of = _stacked_vs_unstacked_order(
+        db, "sharpness_asc")
+
+    assert stacked_ids == expected_ids
+    assert stacked_ids.index(cover_of[ids["a-single.jpg"]]) < stacked_ids.index(
+        cover_of[ids["m-burst-1.jpg"]])
+
+
+def test_browse_stack_sharpness_asc_null_member_stack_leads_scored_single(tmp_path):
+    # A stack containing an unscored member ranks as unscored, so it stays
+    # ahead of every scored single just as its unscored member does when
+    # Stacks is off.
+    db, ids = _sharpness_sort_db(tmp_path, [
+        ("burst-a.jpg", None, "shared-burst"),
+        ("burst-b.jpg", 0.9, "shared-burst"),
+        ("single-scored.jpg", 0.5, None),
+    ])
+
+    stacked_ids, expected_ids, cover_of = _stacked_vs_unstacked_order(
+        db, "sharpness_asc")
+
+    assert stacked_ids == expected_ids
+    assert stacked_ids.index(cover_of[ids["burst-a.jpg"]]) < stacked_ids.index(
+        cover_of[ids["single-scored.jpg"]])
+
+
+def test_browse_stack_sharpness_asc_scored_stacks_keep_softest_first(tmp_path):
+    # Fully scored stacks still order by their softest member, and scored
+    # items stay behind every unscored one.
+    db, ids = _sharpness_sort_db(tmp_path, [
+        ("sharp-burst-1.jpg", 0.8, "sharp-burst"),
+        ("sharp-burst-2.jpg", 0.7, "sharp-burst"),
+        ("soft-burst-1.jpg", 0.3, "soft-burst"),
+        ("soft-burst-2.jpg", 0.6, "soft-burst"),
+        ("unscored-single.jpg", None, None),
+    ])
+
+    stacked_ids, expected_ids, cover_of = _stacked_vs_unstacked_order(
+        db, "sharpness_asc")
+
+    assert stacked_ids == expected_ids
+    assert stacked_ids[0] == cover_of[ids["unscored-single.jpg"]]
+    assert stacked_ids.index(cover_of[ids["soft-burst-1.jpg"]]) < stacked_ids.index(
+        cover_of[ids["sharp-burst-1.jpg"]])
+
+
+# Each entry is (sort, column, specs). Every fixture holds a two-photo burst
+# whose leading member under that sort ties with a single, and whose *other*
+# member owns the earlier filename. Reading the tie-break from a whole-stack
+# MIN(filename) therefore lends the stack a filename it does not have at that
+# rank and jumps it ahead of the single.
+_STACK_TIEBREAK_CASES = [
+    ("date", "timestamp", [
+        ("a-burst.jpg", "2024-01-02 00:00:00", "shared-burst"),
+        ("z-burst.jpg", "2024-01-01 00:00:00", "shared-burst"),
+        ("m-single.jpg", "2024-01-01 00:00:00", None),
+    ]),
+    ("date_desc", "timestamp", [
+        ("a-burst.jpg", "2024-01-01 00:00:00", "shared-burst"),
+        ("z-burst.jpg", "2024-01-02 00:00:00", "shared-burst"),
+        ("m-single.jpg", "2024-01-02 00:00:00", None),
+    ]),
+    ("rating", "rating", [
+        ("a-burst.jpg", 1, "shared-burst"),
+        ("z-burst.jpg", 5, "shared-burst"),
+        ("m-single.jpg", 5, None),
+    ]),
+    ("sharpness", "sharpness", [
+        ("a-burst.jpg", 0.2, "shared-burst"),
+        ("z-burst.jpg", 0.9, "shared-burst"),
+        ("m-single.jpg", 0.9, None),
+    ]),
+    ("sharpness_asc", "sharpness", [
+        ("a-burst.jpg", 0.9, "shared-burst"),
+        ("z-burst.jpg", 0.2, "shared-burst"),
+        ("m-single.jpg", 0.2, None),
+    ]),
+    ("quality", "quality_score", [
+        ("a-burst.jpg", 0.2, "shared-burst"),
+        ("z-burst.jpg", 0.9, "shared-burst"),
+        ("m-single.jpg", 0.9, None),
+    ]),
+]
+
+
+@pytest.mark.parametrize(
+    "sort,column,specs", _STACK_TIEBREAK_CASES,
+    ids=[case[0] for case in _STACK_TIEBREAK_CASES],
+)
+def test_browse_stack_tiebreak_comes_from_the_leading_member(
+        tmp_path, sort, column, specs):
+    """Every aggregate sort must break ties on the member it ranks by.
+
+    A burst of a.jpg rated 1 and z.jpg rated 5 sits behind a single m.jpg
+    rated 5 when Stacks is off, because m.jpg beats z.jpg on filename.
+    Combining MAX(rating) with a whole-stack MIN(filename) sorts the burst as
+    (5, "a.jpg") and moves it ahead — the grid and stack-aware Select-all
+    order then change simply because Stacks was toggled (Codex P2 on
+    PR #1561).
+    """
+    db, ids = _metric_sort_db(tmp_path, column, specs)
+
+    stacked_ids, expected_ids, cover_of = _stacked_vs_unstacked_order(db, sort)
+
+    assert stacked_ids == expected_ids
+    # The single ties with the burst's leading member and wins on filename,
+    # so it stays in front of the whole stack.
+    assert stacked_ids.index(cover_of[ids["m-single.jpg"]]) < stacked_ids.index(
+        cover_of[ids["a-burst.jpg"]])
+
+
+@pytest.mark.parametrize(
+    "sort,column,specs", _STACK_TIEBREAK_CASES,
+    ids=[case[0] for case in _STACK_TIEBREAK_CASES],
+)
+def test_browse_stack_tiebreak_keeps_the_stack_first_when_it_wins(
+        tmp_path, sort, column, specs):
+    """Mirror image: renaming the single so it loses the tie must not flip.
+
+    Without this direction the test above would also pass on a rule that
+    merely reverses the bug instead of honouring the filename order.
+    """
+    renamed = [
+        ("zz-single.jpg" if filename == "m-single.jpg" else filename,
+         value, burst_id)
+        for filename, value, burst_id in specs
+    ]
+    db, ids = _metric_sort_db(tmp_path, column, renamed)
+
+    stacked_ids, expected_ids, cover_of = _stacked_vs_unstacked_order(db, sort)
+
+    assert stacked_ids == expected_ids
+    assert stacked_ids.index(cover_of[ids["a-burst.jpg"]]) < stacked_ids.index(
+        cover_of[ids["zz-single.jpg"]])
+
+
+@pytest.mark.parametrize("sort", ["name", "name_desc"])
+def test_browse_stack_name_sorts_mirror_unstacked_order(tmp_path, sort):
+    """Filename sorts stay in lockstep with the unstacked list too."""
+    db, ids = _metric_sort_db(tmp_path, "sharpness", [
+        ("a-burst.jpg", 0.2, "shared-burst"),
+        ("z-burst.jpg", 0.9, "shared-burst"),
+        ("m-single.jpg", 0.9, None),
+    ])
+
+    stacked_ids, expected_ids, _ = _stacked_vs_unstacked_order(db, sort)
+
+    assert stacked_ids == expected_ids
 
 
 def test_get_filter_field_values_counts_respect_rules(tmp_path):

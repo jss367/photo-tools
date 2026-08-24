@@ -244,6 +244,16 @@ body.sidebar-resizing {
 .browse-view-controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
 .browse-view-controls input[type=text] { background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-secondary); border-radius: 4px; padding: 5px 10px; font-size: 12px; flex: 1; min-width: 200px; }
 .browse-view-controls select { background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-secondary); border-radius: 4px; padding: 5px 8px; font-size: 12px; }
+.browse-stack-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+}
+.browse-stack-toggle input { accent-color: var(--accent); }
 .filter-bar {
   background: var(--bg-primary);
   padding: 10px 20px;
@@ -338,6 +348,13 @@ body.sidebar-resizing {
 }
 .grid-card:hover { transform: translateY(-1px); border-color: var(--accent); }
 .grid-card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.grid-card.has-browse-stack {
+  box-shadow: 3px 3px 0 var(--bg-tertiary), 6px 6px 0 var(--border-primary);
+  margin: 0 6px 6px 0;
+}
+.grid-card.has-browse-stack.selected {
+  box-shadow: 0 0 0 1px var(--accent), 3px 3px 0 var(--bg-tertiary), 6px 6px 0 var(--border-primary);
+}
 .grid-card.offline {
   cursor: default;
   opacity: 0.78;
@@ -422,6 +439,91 @@ body.sidebar-resizing {
   border-radius: 3px;
   pointer-events: none;
 }
+.browse-stack-badge {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid color-mix(in srgb, white 25%, transparent);
+  border-radius: 999px;
+  padding: 3px 7px;
+  background: color-mix(in srgb, var(--bg-primary) 88%, transparent);
+  color: var(--text-primary);
+  box-shadow: 0 1px 5px color-mix(in srgb, black 45%, transparent);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.browse-stack-badge:hover,
+.browse-stack-badge[aria-expanded="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.browse-stack-badge.needs-recheck {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+.browse-stack-recheck {
+  font-weight: 700;
+}
+.grid-card.has-browse-stack .clip-score-badge { top: 34px; }
+.browse-stack-tray {
+  grid-column: 1 / -1;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border-secondary);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  box-shadow: 0 8px 24px color-mix(in srgb, black 18%, transparent);
+}
+.browse-stack-tray-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.browse-stack-tray-title { color: var(--text-primary); font-size: 12px; font-weight: 700; }
+.browse-stack-tray-subtitle { color: var(--text-ghost); font-size: 11px; margin-left: 6px; font-weight: 400; }
+.browse-stack-tray-actions { display: flex; align-items: center; gap: 6px; }
+.browse-stack-tray-actions button {
+  border: 1px solid var(--border-secondary);
+  border-radius: 4px;
+  padding: 4px 8px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.browse-stack-tray-actions button:hover { border-color: var(--accent); color: var(--accent); }
+.browse-stack-members {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(180px, 100%), 1fr));
+  gap: 10px;
+}
+.browse-stack-member {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border-primary);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  cursor: pointer;
+}
+.browse-stack-member:hover { border-color: var(--accent); }
+.browse-stack-member.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.browse-stack-member .grid-card-info { min-width: 0; }
+.browse-stack-loading, .browse-stack-error {
+  padding: 18px;
+  color: var(--text-ghost);
+  font-size: 12px;
+  text-align: center;
+}
+.browse-stack-error { color: var(--danger); }
 .representative-badge {
   position: absolute;
   top: 6px;
@@ -1794,6 +1896,12 @@ body.sidebar-resizing {
                  oninput="updateThumbSize(this.value)">
           <span style="font-size:10px;color:var(--text-faint);">&#9638;</span>
         </label>
+        <label class="browse-stack-toggle" title="Collapse exact duplicates and camera bursts (photos sharing an EXIF burst id)">
+          <input type="checkbox" id="browseStacksToggle"
+                 data-view-preference="vireo.browse.stacks"
+                 onchange="toggleBrowseStacks()">
+          <span>Stacks</span>
+        </label>
         <button id="detBoxToggle" onclick="toggleDetectionBoxes()" title="Show/hide detection boxes"
                 style="background:var(--bg-tertiary);color:var(--text-muted);border:1px solid var(--border-secondary);border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer;">
           &#9634; Boxes
@@ -2040,7 +2148,7 @@ body.sidebar-resizing {
     <!-- Photo Detail (shown when a photo is selected) -->
     <div class="detail-content" id="detailContent">
       <button class="detail-close" onclick="closeDetail()">&times;</button>
-      <img class="detail-preview single-only" id="detailImg" src="" alt="" style="cursor:pointer;" onclick="openLightbox(window._detailPhotoId, document.getElementById('detailFilename').textContent, availableBrowsePhotos())">
+      <img class="detail-preview single-only" id="detailImg" src="" alt="" style="cursor:pointer;" onclick="openLightbox(window._detailPhotoId, document.getElementById('detailFilename').textContent, browsePhotoNavigationList(window._detailPhotoId))">
       <div class="detail-filename single-only" id="detailFilename"></div>
       <button class="detail-source-control single-only" id="detailSourceControl" type="button" onclick="event.stopPropagation(); vireoTogglePairSource(window._detailPhotoId);"></button>
 
@@ -2303,6 +2411,7 @@ window.GOOGLE_MAPS_PREFER_ENGLISH = true;
 /* ---------- State ---------- */
 var photos = [];
 var totalPhotos = 0;
+var totalUnderlyingPhotos = 0;
 var currentPage = 1;
 var perPage = 50;
 var loading = false;
@@ -2318,6 +2427,61 @@ var selectedIndex = -1;
 var anchorRestoreEpoch = 0;
 var anchorScanDepth = 0;
 var selectedPhotos = new Set(); // multi-select
+var expandedBrowseStacks = new Set();
+var browseStackMembers = {};
+var browseStackErrors = {};
+var browseStackHydrationSeq = 0;
+// In-flight cover hydrations, keyed by cover id: {seq, memberIds, stale}.
+// Same invalidation contract as browseStackExpansionRequests below (a mutation
+// marks any request whose members it just changed), but a different ownership
+// rule: only one hydration may own a cover key at a time, so `seq` lets a newer
+// reconciliation supersede an older one's response instead of both caching.
+var browseStackHydrationRequests = {};
+// Cover ids whose reconciliation could not finish (the members never loaded).
+// The grid is still showing the pre-edit cover for these stacks, so the badge
+// says so and expanding one re-runs the reconciliation from the loaded members.
+var browseStackCoverRecheck = new Set();
+// In-flight stack expansions, keyed by cover id: {memberIds, stale}.
+// A tray's header offers "Select all" the moment it opens, so a stack-wide
+// edit can be applied while its members are still loading. Those members are
+// not in `photos` and not yet in `browseStackMembers`, so findBrowsePhoto()
+// cannot patch them — the edit has nowhere to land. Installing the response
+// that was already in flight would then repaint pre-edit values in the tray
+// and its badges, silently contradicting the edit the user just confirmed.
+// markBrowseStackExpansionsStale() flags such a request so toggleBrowseStack
+// discards it and refetches instead of guessing at the post-edit state.
+//
+// Each cacheKey stores a list, not a single request: collapsing does not
+// cancel an in-flight expansion, and a subsequent re-expand starts a new
+// attempt. Tracking every pending request means a mid-flight edit reaches
+// all of them, so an untracked earlier response cannot cache pre-edit
+// members while only the newest request was marked stale. Codex P2 on
+// PR #1561.
+var browseStackExpansionRequests = {};
+
+function _pushBrowseStackExpansionRequest(cacheKey, request) {
+  var list = browseStackExpansionRequests[cacheKey];
+  if (!list) {
+    list = [];
+    browseStackExpansionRequests[cacheKey] = list;
+  }
+  list.push(request);
+}
+
+function _removeBrowseStackExpansionRequest(cacheKey, request) {
+  var list = browseStackExpansionRequests[cacheKey];
+  if (!list) return;
+  var idx = list.indexOf(request);
+  if (idx >= 0) list.splice(idx, 1);
+  if (!list.length) delete browseStackExpansionRequests[cacheKey];
+}
+
+function setBrowseTotals(data) {
+  totalPhotos = Number(data && data.total) || 0;
+  totalUnderlyingPhotos = data && data.underlying_total != null
+    ? Number(data.underlying_total) || 0
+    : totalPhotos;
+}
 var selectionKeywordRequestSeq = 0;
 var selectionKeywordKey = '';
 var selectionKeywordMissingById = {};
@@ -3014,8 +3178,83 @@ function renderCardInfo(p) {
   return infoHtml;
 }
 
+function browseStacksEnabled() {
+  var toggle = document.getElementById('browseStacksToggle');
+  return !!(toggle && toggle.checked);
+}
+
+function browseStackLabel(kind) {
+  return kind === 'duplicate' ? 'Exact duplicates' : 'Burst';
+}
+
+function renderBrowseStackBadge(p) {
+  var stack = p && p.browse_stack;
+  if (!stack || stack.count < 2) return '';
+  var label = browseStackLabel(stack.kind, stack.count);
+  var expanded = expandedBrowseStacks.has(p.id);
+  // A cover reconciliation that could not load this stack's members leaves the
+  // pre-edit cover on screen. Say that on the badge itself: the toast that
+  // reported it is long gone by the time the user looks back at the grid.
+  var needsRecheck = browseStackCoverRecheck.has(p.id);
+  var title = label + ' · ' + stack.count + ' photos';
+  if (needsRecheck) {
+    title += ' · cover may be out of date after a recent edit — expand to refresh';
+  }
+  return '<button type="button" class="browse-stack-badge'
+    + (needsRecheck ? ' needs-recheck' : '') + '" '
+    + 'aria-expanded="' + (expanded ? 'true' : 'false') + '" '
+    + 'title="' + escapeAttr(title) + '" '
+    + 'onclick="toggleBrowseStack(event,' + p.id + ')">'
+    + '<span aria-hidden="true">&#9638;</span>' + stack.count
+    + (needsRecheck ? '<span class="browse-stack-recheck" aria-hidden="true">!</span>' : '')
+    + '</button>';
+}
+
+// Repaints just the stack badge for one cover. refreshGridCards() rewrites card
+// info and overlay badges but not the stack badge, and renderGrid() is far too
+// heavy to run for a marker change on a single card.
+function refreshBrowseStackBadge(coverId) {
+  var card = document.querySelector('.grid-card[data-id="' + coverId + '"]');
+  if (!card) return;
+  var badge = card.querySelector('.browse-stack-badge');
+  var photo = photos.find(function(item) { return item.id === coverId; });
+  if (!badge || !photo) return;
+  badge.outerHTML = renderBrowseStackBadge(photo);
+}
+
+function renderDetectionBoxes(p) {
+  // Shared by renderPhotoCard and renderBrowseStackMember so overlays and their
+  // orientation/RAW-pair hiding stay identical between covers and expanded stack
+  // members; toggleDetectionBoxes() rerenders through both paths.
+  if (!showDetectionBoxes || !Array.isArray(p.detections)) return '';
+  var isRawJpegPair = typeof window.vireoPhotoIsRawJpegPair === 'function'
+    ? window.vireoPhotoIsRawJpegPair(p)
+    : false;
+  var pairSource = _vireoPairSource(p.id) || 'jpeg';
+  var hideDetectionOverlays = (
+    (isRawJpegPair && pairSource === 'jpeg') ||
+    (
+      typeof window.vireoPhotoHasOrientationEdit === 'function' &&
+      window.vireoPhotoHasOrientationEdit(p.id)
+    )
+  );
+  var html = '';
+  p.detections.forEach(function(d) {
+    if (d == null || d.x == null) return;
+    var conf = (d.confidence != null) ? Math.round(d.confidence * 100) + '%' : '';
+    var cat = (d.category && d.category !== 'animal') ? escapeHtml(d.category) + ' ' : '';
+    html += '<div class="det-box" data-photo-id="' + p.id + '" style="' + (hideDetectionOverlays ? 'display:none;' : '') + 'left:' + (d.x * 100) + '%;top:' + (d.y * 100) + '%;width:' + (d.w * 100) + '%;height:' + (d.h * 100) + '%;">' +
+      ((cat || conf) ? '<span class="det-box-label">' + cat + conf + '</span>' : '') +
+    '</div>';
+  });
+  return html;
+}
+
 function renderPhotoCard(p, idx) {
   var selectedClass = (p.id === selectedPhotoId || selectedPhotos.has(p.id)) ? ' selected' : '';
+  // Offline members render first and unconditionally: they are read-only
+  // placeholders with no thumbnail, and the server never lets one join a
+  // stack, so there is no stack chrome to preserve here.
   var isOffline = p.folder_status &&
     p.folder_status !== 'ok' && p.folder_status !== 'partial';
   if (isOffline) {
@@ -3031,6 +3270,7 @@ function renderPhotoCard(p, idx) {
       '<div class="grid-card-info">' + renderCardInfo(p) + '</div>' +
     '</div>';
   }
+  var stackClass = p.browse_stack ? ' has-browse-stack' : '';
   var isRawJpegPair = typeof window.vireoPhotoIsRawJpegPair === 'function'
     ? window.vireoPhotoIsRawJpegPair(p)
     : false;
@@ -3046,26 +3286,8 @@ function renderPhotoCard(p, idx) {
       skipIfLocallyWritten: true,
     });
   }
-  var hideDetectionOverlays = (
-    (isRawJpegPair && pairSource === 'jpeg') ||
-    (
-      typeof window.vireoPhotoHasOrientationEdit === 'function' &&
-      window.vireoPhotoHasOrientationEdit(p.id)
-    )
-  );
 
-  // Detection box overlays — render one per detection in the photo
-  var boxHtml = '';
-  if (showDetectionBoxes && Array.isArray(p.detections)) {
-    p.detections.forEach(function(d) {
-      if (d == null || d.x == null) return;
-      var conf = (d.confidence != null) ? Math.round(d.confidence * 100) + '%' : '';
-      var cat = (d.category && d.category !== 'animal') ? escapeHtml(d.category) + ' ' : '';
-      boxHtml += '<div class="det-box" data-photo-id="' + p.id + '" style="' + (hideDetectionOverlays ? 'display:none;' : '') + 'left:' + (d.x * 100) + '%;top:' + (d.y * 100) + '%;width:' + (d.w * 100) + '%;height:' + (d.h * 100) + '%;">' +
-        ((cat || conf) ? '<span class="det-box-label">' + cat + conf + '</span>' : '') +
-      '</div>';
-    });
-  }
+  var boxHtml = renderDetectionBoxes(p);
 
   var clipBadge = '';
   if (p._similarity !== undefined) {
@@ -3087,9 +3309,10 @@ function renderPhotoCard(p, idx) {
   }
 
   var thumbUrl = window.vireoThumbnailUrl ? window.vireoThumbnailUrl(p) : '/thumbnails/' + p.id + '.jpg';
-  return '<div class="grid-card' + selectedClass + '" data-id="' + p.id + '" data-idx="' + idx + '" data-filename="' + escapeAttr(p.filename) + '" onclick="selectPhoto(event,' + p.id + ',' + idx + ')">' +
+  return '<div class="grid-card' + stackClass + selectedClass + '" data-id="' + p.id + '" data-idx="' + idx + '" data-filename="' + escapeAttr(p.filename) + '" onclick="selectPhoto(event,' + p.id + ',' + idx + ')">' +
     '<div class="grid-card-img-wrap">' +
       '<img src="' + escapeAttr(thumbUrl) + '" loading="lazy" decoding="async" alt="' + escapeAttr(p.filename) + '">' +
+      renderBrowseStackBadge(p) +
       clipBadge +
       boxHtml +
       inatBadge +
@@ -3102,6 +3325,626 @@ function renderPhotoCard(p, idx) {
       renderCardInfo(p) +
     '</div>' +
   '</div>';
+}
+
+function renderBrowseStackMember(p, coverId) {
+  var selectedClass = (p.id === selectedPhotoId || selectedPhotos.has(p.id)) ? ' selected' : '';
+  if (typeof window.vireoRememberPhotoPair === 'function') {
+    window.vireoRememberPhotoPair(p);
+  }
+  if (
+    typeof window.vireoRememberPhotoEditRecipe === 'function' &&
+    Object.prototype.hasOwnProperty.call(p, 'edit_recipe')
+  ) {
+    window.vireoRememberPhotoEditRecipe(p.id, p.edit_recipe, {
+      skipIfLocallyWritten: true,
+    });
+  }
+  var thumbUrl = window.vireoThumbnailUrl
+    ? window.vireoThumbnailUrl(p)
+    : '/thumbnails/' + p.id + '.jpg';
+  return '<div class="browse-stack-member' + selectedClass + '" '
+    + 'data-id="' + p.id + '" data-filename="' + escapeAttr(p.filename) + '" '
+    + 'onclick="selectBrowseStackMember(event,' + p.id + ',' + coverId + ')" '
+    + 'ondblclick="openBrowseStackMember(event,' + p.id + ',' + coverId + ')">'
+    + '<div class="grid-card-img-wrap">'
+    + '<img src="' + escapeAttr(thumbUrl) + '" loading="lazy" decoding="async" alt="' + escapeAttr(p.filename) + '">'
+    + renderDetectionBoxes(p)
+    + (inatSubmitted[String(p.id)] ? '<span class="inat-badge">iNat</span>' : '')
+    + (p.wildlife_excluded ? '<span class="no-wildlife-badge">No Wildlife</span>' : '')
+    + (p.is_species_representative ? '<span class="representative-badge">Representative</span>' : '')
+    + (cardFields.indexOf('species') === -1 ? renderSpeciesBadges(p.species, false) : '')
+    + '</div><div class="grid-card-info">' + renderCardInfo(p) + '</div></div>';
+}
+
+function renderBrowseStackTray(cover) {
+  var stack = cover.browse_stack;
+  var members = browseStackMembers[String(cover.id)];
+  var error = browseStackErrors[String(cover.id)];
+  var label = browseStackLabel(stack.kind, stack.count);
+  var body = '<div class="browse-stack-loading">Loading stack…</div>';
+  if (error) {
+    body = '<div class="browse-stack-error">' + escapeHtml(error) + '</div>';
+  } else if (Array.isArray(members)) {
+    body = '<div class="browse-stack-members">' + members.map(function(member) {
+      return renderBrowseStackMember(member, cover.id);
+    }).join('') + '</div>';
+  }
+  var reviewLabel = stack.kind === 'burst' ? 'Review burst' : 'Compare';
+  return '<div class="browse-stack-tray" data-stack-cover-id="' + cover.id + '">'
+    + '<div class="browse-stack-tray-header"><div>'
+    + '<span class="browse-stack-tray-title">' + escapeHtml(label) + '</span>'
+    + '<span class="browse-stack-tray-subtitle">' + stack.count + ' photos</span>'
+    + '</div><div class="browse-stack-tray-actions">'
+    + '<button type="button" onclick="selectBrowseStackAll(event,' + cover.id + ')">Select all</button>'
+    + '<button type="button" onclick="reviewBrowseStack(event,' + cover.id + ')">' + reviewLabel + '</button>'
+    + '<button type="button" aria-label="Collapse stack" title="Collapse" onclick="toggleBrowseStack(event,' + cover.id + ')">&#10005;</button>'
+    + '</div></div>' + body + '</div>';
+}
+
+function insertBrowseStackTray(coverId) {
+  var oldTray = document.querySelector('.browse-stack-tray[data-stack-cover-id="' + coverId + '"]');
+  if (oldTray) oldTray.remove();
+  if (!expandedBrowseStacks.has(coverId)) return;
+  var cover = photos.find(function(photo) { return photo.id === coverId; });
+  var card = document.querySelector('.grid-card[data-id="' + coverId + '"]');
+  if (!cover || !cover.browse_stack || !card) return;
+  card.insertAdjacentHTML('afterend', renderBrowseStackTray(cover));
+  var tray = document.querySelector('.browse-stack-tray[data-stack-cover-id="' + coverId + '"]');
+  refreshColorLabelControlsIn(tray);
+  refreshCardSelectionVisuals();
+}
+
+function restoreExpandedBrowseStacks() {
+  Array.from(expandedBrowseStacks).forEach(insertBrowseStackTray);
+}
+
+// Every mutation path reports the photo ids whose local state it just changed
+// (see refreshExpandedBrowseStackMembers / reconcileBrowseStackCovers callers).
+// Any stack expansion still in flight fetched those photos before the edit
+// committed, so its payload is pre-edit for exactly the members the mutation
+// could not reach. Mark it rather than trying to replay the mutation onto the
+// response: the set of fields an edit can touch keeps growing, and a refetch
+// is correct for all of them without per-field bookkeeping.
+function markBrowseStackExpansionsStale(photoIds) {
+  var wanted = (photoIds || []).map(Number);
+  if (!wanted.length) return;
+  Object.keys(browseStackExpansionRequests).forEach(function(cacheKey) {
+    var requests = browseStackExpansionRequests[cacheKey] || [];
+    requests.forEach(function(request) {
+      if (!request || request.stale) return;
+      request.stale = wanted.some(function(id) { return request.memberIds.has(id); });
+    });
+  });
+}
+
+// A cover-hydration response captured its members before this mutation ran, so
+// on any overlap its payload is pre-edit and must never reach browseStackMembers.
+// Mark rather than delete: the hydration exists to recompute a cover after an
+// edit that already committed, so dropping it silently would leave the demoted
+// cover on screen. The flag makes reconcileBrowseStackCovers discard the
+// in-flight response and refetch the post-edit members instead.
+// reconcileBrowseStackCovers only supersedes hydrations it starts itself, so
+// mutation paths that don't call it (wildlife, keyword, metadata edits) rely on
+// this to invalidate a matching in-flight request.
+function markBrowseStackHydrationsStale(photoIds) {
+  var wanted = (photoIds || []).map(Number);
+  if (!wanted.length) return;
+  Object.keys(browseStackHydrationRequests).forEach(function(cacheKey) {
+    var record = browseStackHydrationRequests[cacheKey];
+    if (!record || !record.memberIds || record.stale) return;
+    record.stale = wanted.some(function(id) { return record.memberIds.has(id); });
+  });
+}
+
+function refreshExpandedBrowseStackMembers(photoIds) {
+  var wanted = new Set((photoIds || []).map(Number));
+  markBrowseStackExpansionsStale(photoIds);
+  markBrowseStackHydrationsStale(photoIds);
+  Object.keys(browseStackMembers).forEach(function(coverId) {
+    var members = browseStackMembers[coverId] || [];
+    if (members.some(function(member) { return wanted.has(member.id); })) {
+      insertBrowseStackTray(Number(coverId));
+    }
+  });
+}
+
+function browseStackFlagRank(flag) {
+  if (flag === 'flagged') return 2;
+  if (flag == null || flag === 'none') return 1;
+  return 0;
+}
+
+function browseStackCoverCompare(a, b) {
+  var descending = [
+    [browseStackFlagRank(a.flag), browseStackFlagRank(b.flag)],
+    [a.quality_score, b.quality_score],
+    [a.subject_sharpness, b.subject_sharpness],
+    [a.sharpness, b.sharpness],
+    [a.rating == null ? 0 : 1, b.rating == null ? 0 : 1],
+    [a.rating == null ? 0 : a.rating, b.rating == null ? 0 : b.rating],
+    [(a.width || 0) * (a.height || 0), (b.width || 0) * (b.height || 0)],
+    [a.file_size || 0, b.file_size || 0],
+  ];
+  for (var i = 0; i < descending.length; i++) {
+    var av = descending[i][0];
+    var bv = descending[i][1];
+    if (av == null) av = -Infinity;
+    if (bv == null) bv = -Infinity;
+    if (av !== bv) return bv - av;
+  }
+  return a.id - b.id;
+}
+
+// Bounded only as a safety net, mirroring toggleBrowseStack: a stale retry has
+// to be provoked by an edit that already finished its own server round trip, so
+// this cannot spin on its own, and a failure retry needs a fresh transport
+// error each time. The cap stops either from becoming an unbounded refetch loop.
+var MAX_BROWSE_STACK_HYDRATION_ATTEMPTS = 3;
+
+// Loads a collapsed stack's members so reconcileBrowseStackCovers can recompute
+// its cover. Returns:
+//   'hydrated'   — members are in browseStackMembers, cover can be recomputed
+//   'superseded' — a newer request owns this key; it will do the work
+//   'window'     — the dataset was replaced; abandon reconciliation entirely
+//   'unresolved' — retries exhausted; the grid still shows the pre-edit cover
+// 'unresolved' is never silent: the caller flags the stack for recheck and tells
+// the user, because the mutation that asked for this reconciliation succeeded.
+async function hydrateBrowseStackCoverMembers(cover, windowIsCurrent) {
+  var cacheKey = String(cover.id);
+  var memberIds = (cover.browse_stack && cover.browse_stack.photo_ids) || [];
+  for (var attempt = 1; attempt <= MAX_BROWSE_STACK_HYDRATION_ATTEMPTS; attempt++) {
+    var hydrationSeq = ++browseStackHydrationSeq;
+    browseStackHydrationRequests[cacheKey] = {
+      seq: hydrationSeq,
+      stale: false,
+      memberIds: new Set(memberIds.map(Number)),
+    };
+    var hydratedMembers = [];
+    try {
+      for (var offset = 0; offset < memberIds.length; offset += 500) {
+        var data = await safeFetch('/api/photos/by-ids', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({photo_ids: memberIds.slice(offset, offset + 500)}),
+        }, {toast: false});
+        if (!windowIsCurrent()) return 'window';
+        hydratedMembers = hydratedMembers.concat(data.photos || []);
+      }
+    } catch (e) {
+      var errorRecord = browseStackHydrationRequests[cacheKey];
+      if (errorRecord && errorRecord.seq === hydrationSeq) {
+        delete browseStackHydrationRequests[cacheKey];
+      }
+      if (!windowIsCurrent()) return 'window';
+      // The edit itself already committed on the server. Retry the read rather
+      // than abandoning the cover recomputation it asked for. Back off between
+      // attempts so a server that is briefly unreachable gets time to recover
+      // instead of being hit three times inside a few milliseconds.
+      if (attempt < MAX_BROWSE_STACK_HYDRATION_ATTEMPTS) {
+        await new Promise(function(resolve) {
+          setTimeout(resolve, 200 * Math.pow(2, attempt - 1));
+        });
+        if (!windowIsCurrent()) return 'window';
+        continue;
+      }
+      return 'unresolved';
+    }
+    // Overlapping edits may hydrate the same collapsed stack. Request order
+    // tracks mutation freshness, so only the newest request may cache even when
+    // an older response happens to arrive first.
+    var currentRecord = browseStackHydrationRequests[cacheKey];
+    if (!currentRecord || currentRecord.seq !== hydrationSeq) return 'superseded';
+    if (currentRecord.stale) {
+      // A generic member edit (wildlife, keyword, metadata) landed while this
+      // response was in flight, so it holds pre-edit rows for members that had
+      // no cache entry to patch. Never cache that; refetch the post-edit truth.
+      delete browseStackHydrationRequests[cacheKey];
+      if (attempt < MAX_BROWSE_STACK_HYDRATION_ATTEMPTS) continue;
+      return 'unresolved';
+    }
+    delete browseStackHydrationRequests[cacheKey];
+    // Expansion can also hydrate this key while reconciliation is in flight;
+    // and another response may already have promoted a replacement.
+    if (browseStackMembers[cacheKey] || !cover.browse_stack
+        || !photos.some(function(photo) {
+          return photo === cover && photo.id === cover.id;
+        })) {
+      return 'superseded';
+    }
+    var stack = cover.browse_stack;
+    var similarity = cover.similarity;
+    var clientSimilarity = cover._similarity;
+    browseStackMembers[cacheKey] = hydratedMembers.map(function(member) {
+      if (member.id !== cover.id) return member;
+      Object.assign(cover, member);
+      cover.browse_stack = stack;
+      if (similarity !== undefined) cover.similarity = similarity;
+      if (clientSimilarity !== undefined) cover._similarity = clientSimilarity;
+      return cover;
+    });
+    return 'hydrated';
+  }
+  return 'unresolved';
+}
+
+async function reconcileBrowseStackCovers(photoIds) {
+  var wanted = new Set((photoIds || []).map(Number));
+  // Callers run this straight after applying the edit locally, before the
+  // trailing refreshExpandedBrowseStackMembers(). Marking here too closes the
+  // window in which this function's own awaits would let a stale expansion
+  // response land unflagged.
+  markBrowseStackExpansionsStale(photoIds);
+  var windowIsCurrent = observeBrowseWindow();
+  var focusedReplacementId = null;
+  var refreshFocusedDetail = false;
+  var uncachedCovers = photos.filter(function(photo) {
+    if (!photo.browse_stack || browseStackMembers[String(photo.id)]) return false;
+    return wanted.has(photo.id) || (photo.browse_stack.photo_ids || []).some(function(id) {
+      return wanted.has(id);
+    });
+  });
+  var unresolvedCovers = [];
+  for (var h = 0; h < uncachedCovers.length; h++) {
+    var status = await hydrateBrowseStackCoverMembers(uncachedCovers[h], windowIsCurrent);
+    // The dataset under us was replaced; whoever owns the new window will
+    // paint authoritative covers, so there is nothing stale to report.
+    if (status === 'window') return false;
+    if (status === 'unresolved') unresolvedCovers.push(uncachedCovers[h].id);
+    // Members are loaded, so the cover below is recomputed from the full stack:
+    // any earlier recheck marker on this cover is now satisfied.
+    if (status === 'hydrated') browseStackCoverRecheck.delete(uncachedCovers[h].id);
+  }
+  unresolvedCovers.forEach(function(coverId) { browseStackCoverRecheck.add(coverId); });
+
+  var changed = false;
+  Object.keys(browseStackMembers).forEach(function(oldKey) {
+    var members = browseStackMembers[oldKey] || [];
+    if (!members.some(function(member) { return wanted.has(member.id); })) return;
+    var oldCoverId = Number(oldKey);
+    var oldIndex = photos.findIndex(function(photo) { return photo.id === oldCoverId; });
+    if (oldIndex < 0 || !members.length) return;
+    var newCover = members.slice().sort(browseStackCoverCompare)[0];
+    if (!newCover || newCover.id === oldCoverId) return;
+
+    var oldCover = photos[oldIndex];
+    var stack = oldCover.browse_stack;
+    oldCover.browse_stack = null;
+    newCover.browse_stack = stack;
+    if (oldCover.similarity !== undefined) newCover.similarity = oldCover.similarity;
+    if (oldCover._similarity !== undefined) newCover._similarity = oldCover._similarity;
+    photos[oldIndex] = newCover;
+
+    var newKey = String(newCover.id);
+    browseStackMembers[newKey] = members;
+    delete browseStackMembers[oldKey];
+    if (Object.prototype.hasOwnProperty.call(browseStackErrors, oldKey)) {
+      browseStackErrors[newKey] = browseStackErrors[oldKey];
+      delete browseStackErrors[oldKey];
+    }
+    // The cover was just recomputed from the whole member list, so a recheck
+    // marker left over from an earlier failed hydration no longer applies.
+    browseStackCoverRecheck.delete(oldCoverId);
+    if (expandedBrowseStacks.delete(oldCoverId)) {
+      expandedBrowseStacks.add(newCover.id);
+    }
+    if (selectedPhotoId != null && members.some(function(member) {
+      return member.id === selectedPhotoId;
+    })) {
+      selectedIndex = oldIndex;
+      // The demoted cover is gone from the top-level photos array. Grid
+      // selection and preview navigation both look it up there and would
+      // otherwise land on an unselected card with an index of -1 in the
+      // navigation list. Hand focus to the newly promoted cover, which now
+      // occupies that grid slot.
+      if (selectedPhotoId === oldCoverId && selectedPhotos.size === 0) {
+        selectedPhotoId = newCover.id;
+        focusedReplacementId = newCover.id;
+        refreshFocusedDetail = document.getElementById('detailContent').classList.contains('visible');
+      }
+    }
+    changed = true;
+  });
+  if (changed) renderGrid();
+  if (unresolvedCovers.length) {
+    // The edit committed on the server but its cover recomputation did not, so
+    // the grid is knowingly showing a photo the stack may no longer lead with.
+    // Say so instead of leaving a silently wrong representative on screen, and
+    // mark the stacks so the notice survives the toast.
+    unresolvedCovers.forEach(refreshBrowseStackBadge);
+    var one = unresolvedCovers.length === 1;
+    showToast(
+      'Could not reload ' + (one ? 'a stack' : unresolvedCovers.length + ' stacks')
+      + ' after that edit — ' + (one ? 'its cover' : 'their covers')
+      + ' may still show the previous top photo. Expand '
+      + (one ? 'the stack' : 'a stack') + ' marked “!” to refresh it.',
+      'warning'
+    );
+  }
+  // Keep the inspector bound to the same visible grid focus. Call this after
+  // renderGrid() so the promoted cover and its tray are already in place when
+  // the async detail response paints.
+  if (focusedReplacementId != null && refreshFocusedDetail) {
+    loadDetail(focusedReplacementId);
+  }
+  return changed;
+}
+
+function browsePhotoNavigationList(photoId) {
+  // Prefer an expanded stack's member list even for its cover, which also
+  // exists in the top-level grid. Opening that cover from the tray should
+  // navigate to its neighboring frames, not to the next stack cover.
+  var stackIds = Object.keys(browseStackMembers);
+  for (var i = 0; i < stackIds.length; i++) {
+    if (!expandedBrowseStacks.has(Number(stackIds[i]))) continue;
+    var members = browseStackMembers[stackIds[i]] || [];
+    if (members.some(function(photo) { return photo.id === photoId; })) {
+      return members;
+    }
+  }
+  // No stack owns this photo, so navigation falls back to the top-level
+  // grid list. Offline placeholders are not viewable, so the lightbox gets
+  // the available-only projection of it (see ``availableBrowsePhotos``).
+  return availableBrowsePhotos();
+}
+
+// True for either shape ``browsePhotoNavigationList`` returns as its
+// top-level fallback: ``photos`` itself, or the available-only list used
+// while offline collection members are shown.
+function browseNavigationListIsTopLevel(list) {
+  return list === photos || list === browseAvailableLightboxPhotos;
+}
+
+function browseStackCoverIdForPhoto(photoId) {
+  var stackIds = Object.keys(browseStackMembers);
+  for (var i = 0; i < stackIds.length; i++) {
+    if ((browseStackMembers[stackIds[i]] || []).some(function(photo) {
+      return photo.id === photoId;
+    })) {
+      return Number(stackIds[i]);
+    }
+  }
+  return null;
+}
+
+function loadedBrowsePhotoIds() {
+  var ids = new Set(photos.map(function(photo) { return photo.id; }));
+  Object.keys(browseStackMembers).forEach(function(coverId) {
+    (browseStackMembers[coverId] || []).forEach(function(photo) {
+      ids.add(photo.id);
+    });
+  });
+  return Array.from(ids);
+}
+
+async function toggleBrowseStack(event, coverId) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  var cover = photos.find(function(photo) { return photo.id === coverId; });
+  if (!cover || !cover.browse_stack) return;
+  var badge = document.querySelector('.grid-card[data-id="' + coverId + '"] .browse-stack-badge');
+  if (expandedBrowseStacks.has(coverId)) {
+    var members = browseStackMembers[String(coverId)] || [];
+    var selectedHiddenMember = selectedPhotoId !== coverId && members.some(function(member) {
+      return member.id === selectedPhotoId;
+    });
+    // A stack-wide Select all clears selectedPhotoId but leaves every member
+    // ID in selectedPhotos. Once the tray collapses, hidden members are gone
+    // from the navigation list, so a preview shortcut would fall through to
+    // the first hidden member and yield a 0/N lightbox. Detect that case so
+    // we can re-pin focus to the visible cover after removing the tray.
+    var batchHasHiddenMembers = selectedPhotoId == null && selectedPhotos.size > 0
+      && members.some(function(member) {
+        return member.id !== coverId && selectedPhotos.has(member.id);
+      });
+    expandedBrowseStacks.delete(coverId);
+    var tray = document.querySelector('.browse-stack-tray[data-stack-cover-id="' + coverId + '"]');
+    if (tray) tray.remove();
+    if (badge) badge.setAttribute('aria-expanded', 'false');
+    // A collapsed tray cannot keep a single-photo focus on one of its hidden
+    // members: grid/lightbox navigation now uses the top-level cover list.
+    // Hand that focus back to the visible cover while retaining the warm
+    // member cache for a cheap re-expand and for batch state reconciliation.
+    if (selectedHiddenMember) {
+      var coverIndex = photos.findIndex(function(photo) { return photo.id === coverId; });
+      if (selectedPhotos.size > 0) {
+        // Keep the exact multi-selection intact. The focused hidden member is
+        // still an active batch target, and getBrowseShortcutPhoto maps that
+        // focus to the collapsed cover solely for preview/navigation.
+        selectedIndex = coverIndex;
+        refreshCardSelectionVisuals();
+      } else {
+        selectPhoto({shiftKey: false, metaKey: false, ctrlKey: false}, coverId, coverIndex);
+      }
+    } else if (batchHasHiddenMembers) {
+      // Preserve the batch (Select all) selection but pin single-photo focus
+      // to the visible cover so preview shortcuts, keyboard navigation, and
+      // the grid caret all resolve inside the top-level cover list.
+      selectedPhotoId = coverId;
+      selectedIndex = photos.findIndex(function(photo) { return photo.id === coverId; });
+      refreshCardSelectionVisuals();
+    }
+    return;
+  }
+
+  expandedBrowseStacks.add(coverId);
+  if (badge) badge.setAttribute('aria-expanded', 'true');
+  insertBrowseStackTray(coverId);
+  var cacheKey = String(coverId);
+  if (browseStackMembers[cacheKey]) return;
+  // Errors are presentation state, not a durable cache result. Re-expanding
+  // after collapse retries a transient failure instead of pinning the stack
+  // to its first failed request until the whole Browse dataset reloads.
+  delete browseStackErrors[cacheKey];
+  insertBrowseStackTray(coverId);
+  var memberIds = cover.browse_stack.photo_ids || [];
+  var windowIsCurrent = observeBrowseWindow();
+  function coverStillOwnsSlot() {
+    // A cover-changing edit can hydrate and promote this stack while the
+    // expansion request is in flight. The dataset epoch stays current in
+    // that case, so also verify the captured cover still owns this grid slot
+    // before writing its old cache key.
+    return windowIsCurrent() && !!cover.browse_stack && photos.some(function(photo) {
+      return photo === cover && photo.id === coverId;
+    });
+  }
+  // Bounded only as a safety net: every retry has to be provoked by an edit
+  // that already completed its own server round trip, so this cannot spin on
+  // its own. The cap stops a future marking bug from becoming a refetch loop.
+  var MAX_EXPANSION_ATTEMPTS = 4;
+  for (var attempt = 1; attempt <= MAX_EXPANSION_ATTEMPTS; attempt++) {
+    var request = {memberIds: new Set(memberIds.map(Number)), stale: false};
+    _pushBrowseStackExpansionRequest(cacheKey, request);
+    var hydrated = [];
+    var abortedForRace = false;
+    try {
+      // /api/photos/by-ids caps each POST at 500 ids. Cover reconciliation
+      // already chunks in 500-id slices for the same reason; do the same
+      // here so an exact-duplicate or burst stack with more than 500 members
+      // is still expandable instead of surfacing a permanent "too large"
+      // error on its badge.
+      for (var offset = 0; offset < memberIds.length; offset += 500) {
+        var data = await safeFetch('/api/photos/by-ids', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({photo_ids: memberIds.slice(offset, offset + 500)}),
+        });
+        if (!coverStillOwnsSlot()) {
+          // The captured cover no longer owns this grid slot (a promotion
+          // landed between chunks). Drop the request bookkeeping and let
+          // whoever hydrates the new cover own the tray from here.
+          _removeBrowseStackExpansionRequest(cacheKey, request);
+          abortedForRace = true;
+          break;
+        }
+        if (request.stale || browseStackMembers[cacheKey]) {
+          // An edit or a fresher hydration landed mid-chunk. Stop fetching
+          // the rest of the stack and let the outer loop's stale / cache
+          // branches decide what to do; the partial payload is worthless
+          // for painting either way.
+          break;
+        }
+        hydrated = hydrated.concat(data.photos || []);
+      }
+    } catch (error) {
+      _removeBrowseStackExpansionRequest(cacheKey, request);
+      if (!coverStillOwnsSlot()) return;
+      browseStackErrors[cacheKey] = 'Could not load this stack.';
+      insertBrowseStackTray(coverId);
+      return;
+    }
+    if (abortedForRace) return;
+    _removeBrowseStackExpansionRequest(cacheKey, request);
+    if (!coverStillOwnsSlot()) return;
+    if (browseStackMembers[cacheKey]) {
+      // Cover reconciliation hydrated this key while we were in flight. It
+      // issued its fetch after the edit that triggered it, so its cache is
+      // strictly fresher than this response — keep it and just finish the
+      // metadata passes below.
+      break;
+    }
+    if (request.stale) {
+      // An edit landed while this response was in flight, and its hidden
+      // members had no cache entry to be patched in — so this payload holds
+      // pre-edit values for them. Never paint that: the tray keeps saying
+      // "Loading stack…" while we go fetch the post-edit truth.
+      if (attempt < MAX_EXPANSION_ATTEMPTS) continue;
+      browseStackErrors[cacheKey] =
+        'This stack kept changing while it loaded. Collapse and expand it to see current state.';
+      insertBrowseStackTray(coverId);
+      return;
+    }
+    // Reuse the top-level cover object inside the member cache. The cover is
+    // rendered in both places; sharing one object keeps rating/flag/keyword/
+    // wildlife/location mutations from updating the grid copy while leaving
+    // a stale duplicate in the expanded tray.
+    browseStackMembers[cacheKey] = hydrated.map(function(photo) {
+      return photo.id === coverId ? cover : photo;
+    });
+    break;
+  }
+  insertBrowseStackTray(coverId);
+  var loadedIds = (browseStackMembers[cacheKey] || []).map(function(photo) {
+    return photo.id;
+  });
+  if (!loadedIds.length) return;
+  if (browseStackCoverRecheck.delete(coverId)) {
+    // An earlier edit's cover reconciliation could not load these members, so
+    // the grid has been showing a possibly-demoted cover ever since. The
+    // members are cached now, so recompute the cover from them — expanding is
+    // the recovery the badge marker promised. Members are cached, so this
+    // reconciliation issues no requests and cannot fail.
+    await reconcileBrowseStackCovers(loadedIds);
+    // Promotion moves the cache under a new key and re-renders the grid.
+    var recheckedCoverId = browseStackCoverIdForPhoto(coverId);
+    if (recheckedCoverId != null) insertBrowseStackTray(recheckedCoverId);
+  }
+  function refreshCurrentStackTray() {
+    if (!windowIsCurrent()) return;
+    // Rating/flag edits can promote another member while either metadata
+    // request is in flight. Resolve the current cache key through the old
+    // cover (which remains a member) instead of testing the captured key.
+    var currentCoverId = browseStackCoverIdForPhoto(coverId);
+    if (currentCoverId != null && expandedBrowseStacks.has(currentCoverId)) {
+      insertBrowseStackTray(currentCoverId);
+    }
+  }
+  loadInatStatus(loadedIds).then(refreshCurrentStackTray);
+  fetchColorLabels(loadedIds).then(refreshCurrentStackTray);
+}
+
+function selectBrowseStackMember(event, photoId, coverId) {
+  if (event) event.stopPropagation();
+  var coverIndex = photos.findIndex(function(photo) { return photo.id === coverId; });
+  // Pass shiftKey through so a top-level anchor + Shift-click on a hidden
+  // member range-selects instead of dropping the modifier (symmetric with
+  // the reverse direction: member anchor + Shift-click on a top-level
+  // card). selectPhoto's shift branch folds the click target into the
+  // resulting range so the hidden member always ends up in the selection.
+  // Codex P2 on PR #1561.
+  selectPhoto({
+    shiftKey: !!(event && event.shiftKey),
+    metaKey: !!(event && event.metaKey),
+    ctrlKey: !!(event && event.ctrlKey),
+  }, photoId, coverIndex);
+}
+
+function selectBrowseStackAll(event, coverId) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  var cover = photos.find(function(photo) { return photo.id === coverId; });
+  if (!cover || !cover.browse_stack) return;
+  anchorRestoreEpoch++;
+  selectedPhotoId = null;
+  selectedIndex = photos.findIndex(function(photo) { return photo.id === coverId; });
+  selectedPhotos = new Set(cover.browse_stack.photo_ids || []);
+  hideDetailPanel();
+  refreshCardSelectionVisuals();
+  updateBatchBar();
+}
+
+function reviewBrowseStack(event, coverId) {
+  selectBrowseStackAll(event, coverId);
+  var cover = photos.find(function(photo) { return photo.id === coverId; });
+  if (cover && cover.browse_stack && cover.browse_stack.kind === 'duplicate') {
+    openBrowseCompare();
+  } else {
+    openSelectedInBurstReview();
+  }
+}
+
+function openBrowseStackMember(event, photoId, coverId) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  var members = browseStackMembers[String(coverId)] || [];
+  var photo = members.find(function(member) { return member.id === photoId; });
+  openLightbox(photoId, photo ? photo.filename : '', members);
 }
 
 document.addEventListener('lightbox:renderchanged', function(e) {
@@ -3117,7 +3960,10 @@ document.addEventListener('lightbox:renderchanged', function(e) {
         window.vireoPhotoHasOrientationEdit(id)
       )
     );
-    document.querySelectorAll('.grid-card[data-id="' + id + '"] .det-box').forEach(function(box) {
+    document.querySelectorAll(
+      '.grid-card[data-id="' + id + '"] .det-box, ' +
+      '.browse-stack-member[data-id="' + id + '"] .det-box'
+    ).forEach(function(box) {
       box.style.display = hideDetectionOverlays ? 'none' : '';
     });
   });
@@ -3264,7 +4110,9 @@ document.addEventListener('lifelist:changed', function(e) {
   var photoId = detail.photoId;
   if (!species || !photoId) return;
   var changed = [];
-  photos.forEach(function(p) {
+  loadedBrowsePhotoIds().forEach(function(id) {
+    var p = findBrowsePhoto(id);
+    if (!p) return;
     var entries = Array.isArray(p.life_list) ? p.life_list : [];
     var touched = false;
     entries.forEach(function(entry) {
@@ -3290,7 +4138,10 @@ document.addEventListener('lifelist:changed', function(e) {
     }
     if (touched) changed.push(p.id);
   });
-  if (changed.length) refreshGridCards(changed);
+  if (changed.length) {
+    refreshGridCards(changed);
+    refreshExpandedBrowseStackMembers(changed);
+  }
 });
 
 function getGridCard(photoId) {
@@ -3430,6 +4281,7 @@ async function bootstrapBrowse() {
     // scope-only (Phase 5 removed its legacy filter params).
     var initParams = new URLSearchParams();
     initParams.set('sort', document.getElementById('sortSelect').value);
+    if (browseStacksEnabled()) initParams.set('stacks', '1');
     if (activeFolderId) initParams.set('folder_id', activeFolderId);
     // Collection-only deep links keep their historical endpoint behavior,
     // while Dashboard links opt into composable filters via dashboard_scope.
@@ -3486,7 +4338,7 @@ async function bootstrapBrowse() {
       if (bootstrapWindowIsCurrent()) {
         // Populate everything from a single response
         photos = data.photos || [];
-        totalPhotos = data.total || 0;
+        setBrowseTotals(data);
         currentPage = 2; // next page to load
         earliestPage = 1; // bootstrap always starts at the top of the dataset
         if (photos.length >= totalPhotos) allLoaded = true;
@@ -3588,7 +4440,7 @@ async function bootstrapBrowse() {
       // ever running through resetAndLoad, so the grid didn't match the
       // visible chips until the user edited them (Codex review r3624766665).
       var scopeChanged = browseScopeGen !== bootstrapScopeGen;
-      VireoFilter.setResultTotal(totalPhotos);
+      VireoFilter.setResultTotal(totalUnderlyingPhotos);
       // Collection deep links must open showing exactly that collection \u2014
       // whether plain (?collection_id=..., historical endpoint behavior) or
       // dashboard-scoped (?dashboard_scope=1&collection_id=..., composable).
@@ -4506,8 +5358,18 @@ function updateOfflineCollectionState(data) {
     clearOfflineCollectionState();
     return;
   }
-  collectionInventoryTotal = Number(data.inventory_total || data.total || 0);
-  collectionAvailableTotal = Number(data.available_total || data.total || 0);
+  // These are photo counts. ``data.total`` is the logical item count, which
+  // Stacks collapses, so fall back through ``underlying_total`` first —
+  // otherwise a stacked view would report "N of M photos" in stacks.
+  var photoTotal = data.underlying_total != null
+    ? Number(data.underlying_total) || 0
+    : Number(data.total) || 0;
+  collectionInventoryTotal = data.inventory_total != null
+    ? Number(data.inventory_total) || 0
+    : photoTotal;
+  collectionAvailableTotal = data.available_total != null
+    ? Number(data.available_total) || 0
+    : photoTotal;
   collectionOfflineTotal = Number(data.offline_total || 0);
   // Visual collections intentionally skip sidebar counts until their prompt
   // is resolved. Once opened, promote the resolved membership into the same
@@ -5497,6 +6359,12 @@ async function resetAndLoad(options) {
   var anchor = preserveAnchor ? captureSelectedPhotoAnchor() : null;
   var restoreEpoch = anchor ? ++anchorRestoreEpoch : null;
   browseDatasetReady = false;
+  expandedBrowseStacks.clear();
+  browseStackMembers = {};
+  browseStackErrors = {};
+  browseStackHydrationRequests = {};
+  browseStackExpansionRequests = {};
+  browseStackCoverRecheck.clear();
   photos = [];
   currentPage = 1;
   allLoaded = false;
@@ -5650,6 +6518,8 @@ function buildBrowsePageRequest(page, requestPerPage) {
     var cparams = new URLSearchParams();
     cparams.set('page', page);
     cparams.set('per_page', requestPerPage);
+    cparams.set('sort', document.getElementById('sortSelect').value);
+    if (browseStacksEnabled()) cparams.set('stacks', '1');
     return {
       url: '/api/collections/' + activeCollectionId + '/photos?' + cparams.toString(),
       options: {},
@@ -5661,6 +6531,7 @@ function buildBrowsePageRequest(page, requestPerPage) {
     sort: document.getElementById('sortSelect').value,
     page: page,
     per_page: requestPerPage,
+    stacks: browseStacksEnabled(),
   };
   if (hasCollectionAvailabilityScope()) {
     body.include_availability = true;
@@ -5698,8 +6569,8 @@ async function prependPreviousPhotos(options) {
     });
     if (!windowIsCurrent()) return null;
 
-    totalPhotos = data.total;
-    if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalPhotos);
+    setBrowseTotals(data);
+    if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalUnderlyingPhotos);
     if (window.VireoFilter && VireoFilter.setVisualInfo) {
       VireoFilter.setVisualInfo(data.visual || null);
     }
@@ -5810,9 +6681,12 @@ async function loadPhotos(options) {
   try {
     var data = await safeFetch(request.url, request.options);
     if (!windowIsCurrent()) return null;  // grid was reset mid-flight; drop stale response
-    totalPhotos = data.total;
+    setBrowseTotals(data);
+    // Availability totals are photo counts, so they are read from the same
+    // response that feeds ``totalUnderlyingPhotos`` — never from the
+    // stack-collapsed ``data.total``.
     updateOfflineCollectionState(data);
-    if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalPhotos);
+    if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalUnderlyingPhotos);
     if (window.VireoFilter && VireoFilter.setVisualInfo) {
       VireoFilter.setVisualInfo(data.visual || null);
     }
@@ -6148,6 +7022,10 @@ function applyFilters() {
   reloadBrowseResults();
 }
 
+function toggleBrowseStacks() {
+  resetAndLoad({preserveCollection: true});
+}
+
 function updateFilterSummary() {
   updateScrollPosition();
 }
@@ -6180,14 +7058,25 @@ function reloadBrowseResults(options) {
 function updateScrollPosition() {
   var el = document.getElementById('filterSummary');
   var positionOffset = loadedWindowOffset();
+  var resultLabel = function(position) {
+    if (browseStacksEnabled()) {
+      return position + ' of ' + totalPhotos.toLocaleString() + ' items · '
+        + totalUnderlyingPhotos.toLocaleString() + ' photos';
+    }
+    return position + ' of ' + totalPhotos.toLocaleString();
+  };
   if (photos.length === 0) {
-    el.textContent = totalPhotos + ' photos';
+    el.textContent = browseStacksEnabled()
+      ? totalPhotos.toLocaleString() + ' items · ' + totalUnderlyingPhotos.toLocaleString() + ' photos'
+      : totalPhotos.toLocaleString() + ' photos';
     return;
   }
   // Find which cards are visible in the viewport
   var cards = document.querySelectorAll('.grid-card');
   if (cards.length === 0) {
-    el.textContent = totalPhotos + ' photos';
+    el.textContent = browseStacksEnabled()
+      ? totalPhotos.toLocaleString() + ' items · ' + totalUnderlyingPhotos.toLocaleString() + ' photos'
+      : totalPhotos.toLocaleString() + ' photos';
     return;
   }
   var container = document.getElementById('gridContainer');
@@ -6209,7 +7098,7 @@ function updateScrollPosition() {
       1,
       Math.min(representedPhotos, Math.round(frac * representedPhotos))
     );
-    el.textContent = '≈' + approx.toLocaleString() + ' of ' + totalPhotos.toLocaleString();
+    el.textContent = resultLabel('≈' + approx.toLocaleString());
     return;
   }
 
@@ -6227,17 +7116,29 @@ function updateScrollPosition() {
       break;
     }
   }
-  el.textContent = (positionOffset + first) + '–' +
-    (positionOffset + last) + ' of ' + totalPhotos.toLocaleString();
+  el.textContent = resultLabel(
+    (positionOffset + first) + '–' + (positionOffset + last)
+  );
 }
 
 /* ---------- iNaturalist ---------- */
 async function loadInatStatus(photoIds) {
   if (photoIds.length === 0) return;
   try {
-    var data = await safeFetch('/api/inat/submissions?photo_ids=' + photoIds.join(','), {}, { toast: false });
-    if (!data.error) {
-      for (var k in data) inatSubmitted[k] = true;
+    // Chunk the GET URL so oversized stacks (or any large id set) don't
+    // exceed the browser/proxy/server request-target limit and drop the
+    // whole page's iNaturalist badges when a stack expansion hydrates a
+    // large member list (Codex P2 on PR #1561). Matches the 500-id cap
+    // the /api/photos/by-ids stack-expansion path already uses.
+    for (var offset = 0; offset < photoIds.length; offset += 500) {
+      var chunk = photoIds.slice(offset, offset + 500);
+      var data = await safeFetch(
+        '/api/inat/submissions?photo_ids=' + chunk.join(','),
+        {}, { toast: false },
+      );
+      if (data && !data.error) {
+        for (var k in data) inatSubmitted[k] = true;
+      }
     }
   } catch(e) {}
 }
@@ -6280,6 +7181,7 @@ function renderGrid() {
   grid.innerHTML = html;
   updateGridTail();
   refreshColorLabelControlsIn(grid);
+  restoreExpandedBrowseStacks();
 }
 
 /* ---------- Grid dblclick delegation (XSS-safe) ---------- */
@@ -6288,6 +7190,9 @@ document.getElementById('grid').addEventListener('dblclick', function(e) {
   if (!card || card.classList.contains('offline')) return;
   var id = parseInt(card.dataset.id, 10);
   var filename = card.dataset.filename || '';
+  // Top-level grid cards navigate the grid, matching pre-stacks behaviour;
+  // an expanded stack's members live in ``.browse-stack-member`` cards and
+  // open against their own member list instead.
   openLightbox(id, filename, availableBrowsePhotos());
 });
 
@@ -6321,13 +7226,46 @@ function availableBrowsePhotos() {
 }
 
 function getBrowseShortcutPhoto() {
-  var idx = -1;
   if (selectedPhotoId != null) {
-    idx = photos.findIndex(function(p) { return p.id === selectedPhotoId; });
+    var selected = findBrowsePhoto(selectedPhotoId);
+    if (selected) {
+      var selectedNavigation = browsePhotoNavigationList(selectedPhotoId);
+      if (browseNavigationListIsTopLevel(selectedNavigation) && !photos.some(function(photo) {
+        return photo.id === selectedPhotoId;
+      })) {
+        var selectedCoverId = browseStackCoverIdForPhoto(selectedPhotoId);
+        var selectedCover = photos.find(function(photo) { return photo.id === selectedCoverId; });
+        if (selectedCover) selected = selectedCover;
+      }
+      return {
+        photo: selected,
+        index: selectedIndex,
+        navigationPhotos: selectedNavigation,
+      };
+    }
   }
-  if (idx < 0 && selectedPhotos.size > 0) {
-    idx = photos.findIndex(function(p) { return selectedPhotos.has(p.id); });
+  if (selectedPhotos.size > 0) {
+    var selectedIds = Array.from(selectedPhotos);
+    for (var selectedOffset = 0; selectedOffset < selectedIds.length; selectedOffset++) {
+      var selectedMember = findBrowsePhoto(selectedIds[selectedOffset]);
+      if (selectedMember) {
+        var memberNavigation = browsePhotoNavigationList(selectedMember.id);
+        if (browseNavigationListIsTopLevel(memberNavigation) && !photos.some(function(photo) {
+          return photo.id === selectedMember.id;
+        })) {
+          var memberCoverId = browseStackCoverIdForPhoto(selectedMember.id);
+          var memberCover = photos.find(function(photo) { return photo.id === memberCoverId; });
+          if (memberCover) selectedMember = memberCover;
+        }
+        return {
+          photo: selectedMember,
+          index: selectedIndex,
+          navigationPhotos: memberNavigation,
+        };
+      }
+    }
   }
+  var idx = -1;
   if (idx < 0 && selectedIndex >= 0 && photos[selectedIndex]) {
     idx = selectedIndex;
   }
@@ -6338,13 +7276,17 @@ function getBrowseShortcutPhoto() {
     });
   }
   if (idx < 0 || !photos[idx]) return null;
-  return { photo: photos[idx], index: idx };
+  return {
+    photo: photos[idx],
+    index: idx,
+    navigationPhotos: availableBrowsePhotos(),
+  };
 }
 
 function openBrowseShortcutPhoto(fullscreen) {
   var item = getBrowseShortcutPhoto();
   if (!item) return false;
-  openLightbox(item.photo.id, item.photo.filename || '', availableBrowsePhotos());
+  openLightbox(item.photo.id, item.photo.filename || '', item.navigationPhotos);
   if (fullscreen && typeof requestLightboxFullscreen === 'function') {
     requestLightboxFullscreen();
   }
@@ -6373,8 +7315,7 @@ var browseLightboxSession = 0;
 function browseLightboxOwnsLoadedWindow() {
   return (
     typeof window._lightboxPhotoList !== 'undefined' &&
-    (window._lightboxPhotoList === photos ||
-     window._lightboxPhotoList === browseAvailableLightboxPhotos) &&
+    browseNavigationListIsTopLevel(window._lightboxPhotoList) &&
     typeof window._lightboxCurrentId !== 'undefined' &&
     window._lightboxCurrentId != null
   );
@@ -6567,6 +7508,24 @@ function selectPhoto(e, id, idx) {
         selectedPhotos.add(photos[i].id);
       }
     }
+    // The anchor of a range is always part of that range. Usually it is
+    // photos[selectedIndex] and the loop already covered it, but a focused
+    // expanded-stack member is not in the top-level photos array at all:
+    // selectBrowseStackMember() anchors selectedIndex on the member's *cover*
+    // grid slot. Without this the loop adds the cover and the intervening
+    // cards while the member keeps painting "selected" off selectedPhotoId,
+    // yet getActiveSelection() prefers the now-nonempty set and drops it —
+    // Export/Delete would silently act on the cover the user never focused.
+    // Fold the anchor in so the highlighted set and the acted-on set cannot
+    // disagree. Codex P2 on PR #1561.
+    if (selectedPhotoId != null) selectedPhotos.add(selectedPhotoId);
+    // Same reasoning for the shift-click *target*: usually id === photos[idx].id
+    // and the loop already added it, but selectBrowseStackMember() passes the
+    // hidden member's id with the cover's grid slot as idx — so the loop can
+    // only reach the cover. Fold the target in so a Shift-click on a hidden
+    // stack member always ends up in the resulting range. Codex P2 on
+    // PR #1561.
+    selectedPhotos.add(id);
   } else if (e.metaKey || e.ctrlKey) {
     // Cmd/Ctrl-click: toggle in selection. Fold the focused photo into the
     // set so batch operations include it (otherwise the highlighted
@@ -6621,10 +7580,7 @@ function selectPhoto(e, id, idx) {
   }
 
   // Update highlights
-  document.querySelectorAll('.grid-card').forEach(function(el) {
-    var cardId = parseInt(el.dataset.id);
-    el.classList.toggle('selected', cardId === selectedPhotoId || selectedPhotos.has(cardId));
-  });
+  refreshCardSelectionVisuals();
 
   updateBatchBar();
 }
@@ -6653,7 +7609,16 @@ async function selectAllMatchingPhotos() {
   var url;
   var fetchOpts = {};
   if (activeCollectionId && !dashboardCollectionScope) {
-    url = '/api/collections/' + activeCollectionId + '/photo-ids';
+    // Mirror the grid's sort AND its Stacks projection so the selection's
+    // first photo — which drives Best Batch seed, burst-review order, and
+    // export preview — matches the first visible card even when the
+    // collection is sorted by name/rating/sharpness/quality or when a
+    // stack's quality-ranked cover isn't the earliest member under the
+    // sort (Codex P2 on PR #1561).
+    var idsParams = new URLSearchParams();
+    idsParams.set('sort', document.getElementById('sortSelect').value);
+    if (browseStacksEnabled()) idsParams.set('stacks', 'true');
+    url = '/api/collections/' + activeCollectionId + '/photo-ids?' + idsParams.toString();
   } else {
     url = '/api/photos/query';
     var idsBody = {
@@ -6661,6 +7626,14 @@ async function selectAllMatchingPhotos() {
       sort: document.getElementById('sortSelect').value,
       ids_only: true,
     };
+    // Mirror the grid's Stacks projection on the general query path as
+    // well — workspace, folder, dashboard-collection, unsaved-filter,
+    // and visual-search Select-all now share the same cover-first
+    // projection so Best Batch, burst-review, and export preview start
+    // from the visible first card even when a stack's quality-ranked
+    // cover isn't the earliest member under the selected sort (Codex
+    // P2 on PR #1561).
+    if (browseStacksEnabled()) idsBody.stacks = true;
     var idsVisual = window.VireoFilter && VireoFilter.getVisual ? VireoFilter.getVisual() : null;
     if (idsVisual) idsBody.visual = idsVisual;
     if (activeFolderId) idsBody.folder_id = activeFolderId;
@@ -6881,9 +7854,12 @@ async function applyBestBatchPickOnly() {
       body: JSON.stringify({photo_ids: [bestId], flag: 'flagged'}),
     });
   } catch(e) { return; }
-  var p = photos.find(function(x) { return x.id === bestId; });
+  var p = findBrowsePhoto(bestId);
   if (p) p.flag = 'flagged';
+  await reconcileBrowseStackCovers([bestId]);
   refreshGridCards([bestId]);
+  refreshExpandedBrowseStackMembers([bestId]);
+  _refreshBatchInspectorIfActive();
   scheduleCollectionCountsRefresh();
   showUndoToast();
   showToast('Flagged best photo.', 'success');
@@ -6900,11 +7876,17 @@ async function applyBestBatchPickAndReject() {
       body: JSON.stringify({best_photo_id: bestId, reject_photo_ids: rejectIds}),
     });
   } catch(e) { return; }
-  [bestId].concat(rejectIds).forEach(function(id) {
-    var p = photos.find(function(x) { return x.id === id; });
-    if (p) p.flag = id === bestId ? 'flagged' : 'rejected';
+  var touchedIds = [bestId].concat(rejectIds);
+  touchedIds.forEach(function(id) {
+    var p = findBrowsePhoto(id);
+    var flag = id === bestId ? 'flagged' : 'rejected';
+    if (p) p.flag = flag;
+    _clearRepresentativeStateIfIneligible(id, flag);
   });
-  refreshGridCards([bestId].concat(rejectIds));
+  await reconcileBrowseStackCovers(touchedIds);
+  refreshGridCards(touchedIds);
+  refreshExpandedBrowseStackMembers(touchedIds);
+  _refreshBatchInspectorIfActive();
   scheduleCollectionCountsRefresh();
   showUndoToast();
   showToast('Applied best-batch flags.', 'success');
@@ -7342,7 +8324,16 @@ function browseComparePaneFromEvent(e) {
 })();
 
 function findBrowsePhoto(id) {
-  return photos.find(function(p) { return p.id === id; }) || null;
+  var topLevel = photos.find(function(p) { return p.id === id; });
+  if (topLevel) return topLevel;
+  var coverIds = Object.keys(browseStackMembers);
+  for (var i = 0; i < coverIds.length; i++) {
+    var member = (browseStackMembers[coverIds[i]] || []).find(function(p) {
+      return p.id === id;
+    });
+    if (member) return member;
+  }
+  return null;
 }
 
 async function getBrowseComparePhoto(id) {
@@ -7891,8 +8882,19 @@ document.addEventListener('vireo:edit-history-changed', function() {
   // Card badges move with the same edits, so refresh the loaded grid rows too.
   // `skipPanels` because the sidebar refresh below is the broader one: without
   // it the prediction panels would be fetched twice per undo.
-  var loadedIds = photos.map(function(photo) { return photo.id; });
-  if (loadedIds.length) _refreshBrowseKeywordState(loadedIds, {skipPanels: true});
+  //
+  // Undo/redo also reverses rating and flag edits, and those two fields are
+  // inputs to browseStackCoverCompare — reversing one can hand a collapsed
+  // stack back to a different cover. Unlike every in-page rating/flag path
+  // there is no mutation site here to apply the reversal locally, so the
+  // refresh below copies both fields from the server and reconciles the
+  // covers of whichever stacks actually moved. `reportFailure` because a
+  // failed refresh here means the server reversed an edit the grid is still
+  // showing: silence would make Undo look like a no-op.
+  var loadedIds = loadedBrowsePhotoIds();
+  if (loadedIds.length) {
+    _refreshBrowseKeywordState(loadedIds, {skipPanels: true, reportFailure: true});
+  }
   refreshBrowseSidebarPanels();
 });
 
@@ -8396,10 +9398,13 @@ async function setSelectionWildlifeExcluded(excluded) {
     });
   } catch (e) { return; }
   var changed = new Set((data && data.photo_ids) || ids);
-  photos.forEach(function(photo) {
-    if (changed.has(photo.id)) photo.wildlife_excluded = excluded ? 1 : 0;
+  changed.forEach(function(photoId) {
+    var photo = findBrowsePhoto(photoId);
+    if (photo) photo.wildlife_excluded = excluded ? 1 : 0;
   });
-  refreshGridCards(ids);
+  var changedIds = Array.from(changed);
+  refreshGridCards(changedIds);
+  refreshExpandedBrowseStackMembers(changedIds);
   // The selection may have changed while the batch request was in flight.
   // Refresh the current selection so this completion cannot supersede a
   // newer state request with counts and actions for the old photo ids.
@@ -8484,10 +9489,12 @@ async function batchSetRating(rating) {
     });
   } catch(e) { return; }
   ids.forEach(function(id) {
-    var p = photos.find(function(x) { return x.id === id; });
+    var p = findBrowsePhoto(id);
     if (p) p.rating = rating;
   });
+  await reconcileBrowseStackCovers(ids);
   refreshGridCards(ids);
+  refreshExpandedBrowseStackMembers(ids);
   _refreshBatchInspectorIfActive();
   scheduleCollectionCountsRefresh();
   refreshPendingSyncBanner();
@@ -8503,7 +9510,7 @@ async function batchSetRating(rating) {
 // until the page reloads rather than lighting up incorrectly.
 function _clearRepresentativeStateIfIneligible(photoId, flag) {
   if (flag !== 'rejected') return;
-  var p = photos.find(function(x) { return x.id === photoId; });
+  var p = findBrowsePhoto(photoId);
   if (!p) return;
   if (p.is_species_representative) p.is_species_representative = false;
   if (Array.isArray(p.life_list)) {
@@ -8547,6 +9554,16 @@ function _keywordNameFromCache(keywordId) {
 // badges render from the separate `photos` cache populated by /api/photos.
 // Refresh the loaded rows from the authoritative batch endpoint after every
 // keyword mutation so taxonomy badges and representative state cannot drift.
+//
+// Rating and flag ride along for the one caller that has no other way to learn
+// them: undo/redo writes on the server and then announces, so nothing applied
+// the reversal to the local rows. They are also the only two edit-reversible
+// inputs to browseStackCoverCompare, so a stale copy does not just mis-render a
+// badge — it leaves a collapsed stack led by a photo the database no longer
+// ranks first. Rather than gate that behind a flag, the rows that actually
+// moved are recorded and only their stacks are reconciled: keyword callers see
+// no rating/flag change and so pay nothing, while any future caller gets the
+// cover fixed for free instead of silently drifting.
 async function _refreshBrowseKeywordState(photoIds, opts) {
   opts = opts || {};
   // Species keywords are exactly the input the prediction panels' ambiguity
@@ -8558,13 +9575,28 @@ async function _refreshBrowseKeywordState(photoIds, opts) {
   // otherwise fetch the prediction panels twice.
   if (!opts.skipPanels) refreshPredictionPanels(opts);
   if (!Array.isArray(photoIds) || !photoIds.length) return;
-  var loadedIds = new Set(photos.map(function(photo) { return photo.id; }));
+  // Invalidate from the full id list, before it is narrowed below to the rows
+  // this function can actually repaint. A stack tray offers "Select all" while
+  // it is still loading, so a keyword edit can land on members that are in
+  // neither `photos` nor `browseStackMembers` yet — exactly the members an
+  // in-flight expansion or cover hydration is about to cache from a pre-edit
+  // response. Narrowing first dropped those ids, and when every touched member
+  // was unloaded the early return below skipped invalidation entirely, letting
+  // the pre-edit payload install members missing the species the user had just
+  // added. The trailing refreshExpandedBrowseStackMembers() marks again for the
+  // rows it repaints; marking is idempotent.
+  markBrowseStackExpansionsStale(photoIds);
+  markBrowseStackHydrationsStale(photoIds);
   var ids = Array.from(new Set(photoIds)).filter(function(id) {
-    return loadedIds.has(id);
+    return !!findBrowsePhoto(id);
   });
   if (!ids.length) return;
 
   var refreshed = [];
+  // Photos whose rating or flag actually moved, i.e. whose stack's cover may
+  // need recomputing. Kept separate from `refreshed` so an undo of a keyword
+  // edit does not rehydrate every collapsed stack on the page.
+  var coverRankChanged = [];
   try {
     for (var offset = 0; offset < ids.length; offset += 500) {
       var data = await safeFetch('/api/photos/by-ids', {
@@ -8573,7 +9605,7 @@ async function _refreshBrowseKeywordState(photoIds, opts) {
         body: JSON.stringify({photo_ids: ids.slice(offset, offset + 500)}),
       }, {toast: false});
       (data.photos || []).forEach(function(updated) {
-        var local = photos.find(function(photo) { return photo.id === updated.id; });
+        var local = findBrowsePhoto(updated.id);
         if (!local) return;
         local.species = Array.isArray(updated.species) ? updated.species : [];
         local.life_list = Array.isArray(updated.life_list) ? updated.life_list : [];
@@ -8581,14 +9613,44 @@ async function _refreshBrowseKeywordState(photoIds, opts) {
           ? updated.species_representatives
           : local.life_list;
         local.is_species_representative = !!updated.is_species_representative;
+        var nextRating = updated.rating === undefined ? null : updated.rating;
+        var nextFlag = updated.flag === undefined ? null : updated.flag;
+        var localRating = local.rating === undefined ? null : local.rating;
+        // `browseStackFlagRank` folds null and 'none' together, which is also
+        // how the card badge renders them, so neither a cover nor a badge can
+        // change between those two spellings.
+        if (localRating !== nextRating
+            || browseStackFlagRank(local.flag) !== browseStackFlagRank(nextFlag)) {
+          coverRankChanged.push(updated.id);
+        }
+        local.rating = nextRating;
+        local.flag = nextFlag;
         refreshed.push(updated.id);
       });
     }
   } catch (e) {
     // The keyword save already succeeded; a later page reload remains a safe
-    // fallback if this non-critical card refresh is interrupted.
+    // fallback if this non-critical card refresh is interrupted. Undo/redo is
+    // the exception and passes `reportFailure`: there the server has already
+    // reversed an edit the grid is still displaying, so staying quiet would
+    // present a working Undo as a no-op.
+    if (opts.reportFailure) {
+      showToast(
+        'Could not refresh the grid after that undo — cards may still show the '
+        + 'previous ratings, flags and stack covers. Reload the page to be sure.',
+        'warning'
+      );
+    }
   }
-  if (refreshed.length) refreshGridCards(refreshed);
+  // Before the card repaints below, for the reason batchSetFlag orders it this
+  // way: a promotion replaces the top-level row, and renderGrid() has to have
+  // put the new cover in place before individual cards are refreshed. Failed
+  // hydrations inside here report themselves with the '!' recheck marker.
+  if (coverRankChanged.length) await reconcileBrowseStackCovers(coverRankChanged);
+  if (refreshed.length) {
+    refreshGridCards(refreshed);
+    refreshExpandedBrowseStackMembers(refreshed);
+  }
 }
 
 // Server-side eligibility requires the photo to still carry the species
@@ -8605,7 +9667,7 @@ function _clearRepresentativeStateAfterKeywordRemoval(photoIds, keywordName) {
   if (!keywordName) return;
   var touched = [];
   photoIds.forEach(function(id) {
-    var p = photos.find(function(x) { return x.id === id; });
+    var p = findBrowsePhoto(id);
     if (!p || !Array.isArray(p.life_list)) return;
     var next = p.life_list.filter(function(entry) {
       return !entry || entry.species !== keywordName;
@@ -8621,7 +9683,10 @@ function _clearRepresentativeStateAfterKeywordRemoval(photoIds, keywordName) {
       touched.push(id);
     }
   });
-  if (touched.length) refreshGridCards(touched);
+  if (touched.length) {
+    refreshGridCards(touched);
+    refreshExpandedBrowseStackMembers(touched);
+  }
 }
 
 async function batchSetFlag(flag) {
@@ -8633,11 +9698,13 @@ async function batchSetFlag(flag) {
     });
   } catch(e) { return; }
   ids.forEach(function(id) {
-    var p = photos.find(function(x) { return x.id === id; });
+    var p = findBrowsePhoto(id);
     if (p) p.flag = flag;
     _clearRepresentativeStateIfIneligible(id, flag);
   });
+  await reconcileBrowseStackCovers(ids);
   refreshGridCards(ids);
+  refreshExpandedBrowseStackMembers(ids);
   if (selectedPhotoId != null && ids.indexOf(selectedPhotoId) !== -1) {
     updateDetailFlagButtons(flag);
   }
@@ -8662,6 +9729,7 @@ async function batchSetColorLabel(color) {
     colorLabelsFetched.add(id);
   });
   refreshGridCards(ids);
+  refreshExpandedBrowseStackMembers(ids);
   _refreshBatchInspectorIfActive();
   scheduleCollectionCountsRefresh();
   showUndoToast();
@@ -8717,7 +9785,7 @@ function batchDelete() {
   if (ids.length === 0) return;
   var companionCount = 0;
   ids.forEach(function(id) {
-    var p = photos.find(function(x) { return x.id === id; });
+    var p = findBrowsePhoto(id);
     if (p && p.companion_path) companionCount++;
   });
   showDeleteDialog(ids, companionCount, function(data) {
@@ -8727,8 +9795,22 @@ function batchDelete() {
     // the next reload.
     var retained = new Set((data && data.failed_photo_ids) || []);
     var deletedSet = new Set(ids.filter(function(id) { return !retained.has(id); }));
+    // Removing one member can dissolve a stack or change its representative,
+    // so the logical item count cannot be updated arithmetically. Reload the
+    // current scope from the authoritative projection.
+    if (browseStacksEnabled()) {
+      selectedPhotos.clear();
+      selectedPhotoId = null;
+      selectedIndex = -1;
+      updateBatchBar();
+      resetAndLoad({preserveCollection: true});
+      loadSummary();
+      refreshBrowseSidebarCounts();
+      return;
+    }
     photos = photos.filter(function(p) { return !deletedSet.has(p.id); });
     totalPhotos = Math.max(0, totalPhotos - (data.deleted || 0));
+    totalUnderlyingPhotos = Math.max(0, totalUnderlyingPhotos - (data.deleted || 0));
     selectedPhotos = new Set(Array.from(selectedPhotos).filter(function(id) {
       return !deletedSet.has(id);
     }));
@@ -9122,7 +10204,7 @@ function clearSelection() {
   // batch inspector — clicking it would apply A's EXIF place to every
   // selected photo. Codex P2 on PR #1097 (17:04Z follow-up).
   window._detailPhotoId = null;
-  document.querySelectorAll('.grid-card').forEach(function(el) {
+  document.querySelectorAll('.grid-card, .browse-stack-member').forEach(function(el) {
     el.classList.remove('selected');
   });
   // If the detail panel is still open after clearing, its actions (setFlag,
@@ -9512,10 +10594,7 @@ function closeDetail() {
   // actions with no visible indicator — e.g. click A -> cmd-click B -> cmd-click
   // B drops the set to {A}, and closing detail would otherwise show "1 selected"
   // in the bar against an unhighlighted photo.
-  document.querySelectorAll('.grid-card').forEach(function(el) {
-    var cardId = parseInt(el.dataset.id);
-    el.classList.toggle('selected', selectedPhotos.has(cardId));
-  });
+  refreshCardSelectionVisuals();
   updateBatchBar();
   loadSummary();
 }
@@ -9609,10 +10688,14 @@ async function setRating(photoId, rating) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ rating: rating }),
     });
-    // Update local state
-    var p = photos.find(function(x) { return x.id === photoId; });
+    // Update local state — findBrowsePhoto looks in the top-level `photos`
+    // array AND in any expanded stack tray's `browseStackMembers`, so a rating
+    // set on a hidden member updates the tray-cached row instead of vanishing.
+    var p = findBrowsePhoto(photoId);
     if (p) p.rating = rating;
+    await reconcileBrowseStackCovers([photoId]);
     refreshGridCards([photoId]);
+    refreshExpandedBrowseStackMembers([photoId]);
     scheduleCollectionCountsRefresh();
     loadDetail(photoId);
     refreshPendingSyncBanner();
@@ -9639,10 +10722,12 @@ async function setFlag(flag) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ flag: flag }),
     });
-    var p = photos.find(function(x) { return x.id === photoId; });
+    var p = findBrowsePhoto(photoId);
     if (p) p.flag = flag;
     _clearRepresentativeStateIfIneligible(photoId, flag);
+    await reconcileBrowseStackCovers([photoId]);
     refreshGridCards([photoId]);
+    refreshExpandedBrowseStackMembers([photoId]);
     if (selectedPhotoId === photoId) updateDetailFlagButtons(flag);
     scheduleCollectionCountsRefresh();
   } catch(e) {}
@@ -9665,9 +10750,10 @@ async function setWildlifeExcludedFor(photoId, excluded) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ excluded: excluded }),
   }, { toast: false });
-  var p = photos.find(function(x) { return x.id === photoId; });
+  var p = findBrowsePhoto(photoId);
   if (p) p.wildlife_excluded = excluded ? 1 : 0;
   renderGrid();
+  refreshExpandedBrowseStackMembers([photoId]);
   if (selectedPhotoId === photoId) loadDetail(photoId);
   showUndoToast();
 }
@@ -9675,7 +10761,13 @@ window.setWildlifeExcludedFor = setWildlifeExcludedFor;
 
 async function toggleDetailWildlifeExcluded() {
   if (!selectedPhotoId) return;
-  var p = photos.find(function(x) { return x.id === selectedPhotoId; });
+  // Read the current value via findBrowsePhoto so a stack member that lives
+  // only in browseStackMembers (not the top-level photos array) still yields
+  // its true wildlife_excluded state. photos.find() would return undefined for
+  // hidden members and always send excluded=true — clicking "Include Wildlife
+  // Classification" on an already-excluded member would silently re-exclude
+  // it instead of including it.
+  var p = findBrowsePhoto(selectedPhotoId);
   var current = p ? !!p.wildlife_excluded : false;
   try {
     await setWildlifeExcludedFor(selectedPhotoId, !current);
@@ -9685,22 +10777,36 @@ async function toggleDetailWildlifeExcluded() {
 async function fetchColorLabels(photoIds) {
   if (!photoIds.length) return;
   var gen = colorLabelGen;
-  var data = await safeFetch('/api/photos/color_labels?ids=' + photoIds.join(','), {}, { toast: false });
-  if (data) {
-    // Only clear stale entries if no local edits happened during the fetch
-    if (colorLabelGen === gen) {
-      photoIds.forEach(function(id) { delete colorLabels[id]; });
-    }
-    for (var id in data) colorLabels[id] = data[id];
-    // Mark every requested id as fetched — an absent id in `data` means "no
-    // color set" now that we've asked, so the batch inspector can trust
-    // colorLabels[id] === undefined for these ids as a definite value.
-    photoIds.forEach(function(id) { colorLabelsFetched.add(id); });
-    // A batch selection that included any of these ids may have rendered as
-    // unanimous no-colour with no Mixed marker; refresh it now that we can
-    // trust the state.
-    _refreshBatchInspectorIfActive();
+  // Chunk the GET URL so oversized stacks (or any large id set) don't
+  // exceed the browser/proxy/server request-target limit and drop the
+  // whole page's color labels when a stack expansion hydrates a large
+  // member list (Codex P2 on PR #1561). Matches the 500-id cap the
+  // /api/photos/by-ids stack-expansion path already uses.
+  var combined = {};
+  var chunkFailed = false;
+  for (var offset = 0; offset < photoIds.length; offset += 500) {
+    var chunk = photoIds.slice(offset, offset + 500);
+    var data = await safeFetch(
+      '/api/photos/color_labels?ids=' + chunk.join(','),
+      {}, { toast: false },
+    );
+    if (!data) { chunkFailed = true; break; }
+    for (var id in data) combined[id] = data[id];
   }
+  if (chunkFailed) return;
+  // Only clear stale entries if no local edits happened during the fetch
+  if (colorLabelGen === gen) {
+    photoIds.forEach(function(id) { delete colorLabels[id]; });
+  }
+  for (var pid in combined) colorLabels[pid] = combined[pid];
+  // Mark every requested id as fetched — an absent id in `combined` means
+  // "no color set" now that we've asked, so the batch inspector can trust
+  // colorLabels[id] === undefined for these ids as a definite value.
+  photoIds.forEach(function(id) { colorLabelsFetched.add(id); });
+  // A batch selection that included any of these ids may have rendered as
+  // unanimous no-colour with no Mixed marker; refresh it now that we can
+  // trust the state.
+  _refreshBatchInspectorIfActive();
 }
 
 async function setColorLabel(color) {
@@ -9732,6 +10838,7 @@ async function setColorLabel(color) {
   colorLabelsFetched.add(photoId);
   if (selectedPhotoId === photoId) updateDetailColors();
   refreshGridCards([photoId]);
+  refreshExpandedBrowseStackMembers([photoId]);
   scheduleCollectionCountsRefresh();
 }
 
@@ -9768,13 +10875,13 @@ function _batchUnanimous(ids, get) {
 
 function _batchRatingState(ids) {
   return _batchUnanimous(ids, function(id) {
-    var p = photos.find(function(x) { return x.id === id; });
+    var p = findBrowsePhoto(id);
     return p ? (p.rating || 0) : 0;
   });
 }
 function _batchFlagState(ids) {
   return _batchUnanimous(ids, function(id) {
-    var p = photos.find(function(x) { return x.id === id; });
+    var p = findBrowsePhoto(id);
     return p ? (p.flag || 'none') : 'none';
   });
 }
@@ -9788,7 +10895,7 @@ function _batchColorState(ids) {
 // asserting a shared value we can't actually verify.
 function _batchAllLoaded(ids) {
   return ids.every(function(id) {
-    return photos.some(function(p) { return p.id === id; });
+    return !!findBrowsePhoto(id);
   });
 }
 
@@ -9812,7 +10919,7 @@ function renderBatchInspector(ids, opts) {
     } else {
       var counts = {exif: 0, assigned: 0, none: 0};
       ids.forEach(function(id) {
-        var p = photos.find(function(photo) { return photo.id === id; });
+        var p = findBrowsePhoto(id);
         var status = p && counts[p.location_status] != null ? p.location_status : 'none';
         counts[status]++;
       });
@@ -10130,8 +11237,9 @@ async function _afterLocationMutation(photoIds, detailPhotoId) {
     return;
   }
   if (photoIds && photoIds.length) {
-    var loadedIds = new Set(photos.map(function(photo) { return photo.id; }));
-    var idsToRefresh = photoIds.filter(function(id) { return loadedIds.has(id); });
+    var idsToRefresh = photoIds.filter(function(id) {
+      return !!findBrowsePhoto(id);
+    });
     try {
       for (var offset = 0; offset < idsToRefresh.length; offset += 500) {
         var statusData = await safeFetch('/api/photos/by-ids', {
@@ -10140,12 +11248,13 @@ async function _afterLocationMutation(photoIds, detailPhotoId) {
           body: JSON.stringify({photo_ids: idsToRefresh.slice(offset, offset + 500)})
         }, {toast: false});
         (statusData.photos || []).forEach(function(updated) {
-          var local = photos.find(function(photo) { return photo.id === updated.id; });
+          var local = findBrowsePhoto(updated.id);
           if (local) local.location_status = updated.location_status || 'none';
         });
       }
     } catch (e) {}
     refreshGridCards(idsToRefresh);
+    refreshExpandedBrowseStackMembers(idsToRefresh);
   }
   // If a multi-selection is still active, keep the batch inspector rendered.
   // Falling through to loadDetail(anchor) would strip .batch-mode and rewire
@@ -10648,7 +11757,7 @@ async function setKeywordType(kwId, newType, el) {
     // disagreements, so the prediction panels move too — _refreshBrowseKeyword
     // State repaints them, except where loadDetail below already will.
     await _refreshBrowseKeywordState(
-      photos.map(function(photo) { return photo.id; }),
+      loadedBrowsePhotoIds(),
       { skipDetail: !!selectedPhotoId },
     );
     if (selectedPhotoId) loadDetail(selectedPhotoId);
@@ -10876,7 +11985,11 @@ document.addEventListener('lightbox:closed', function(event) {
   // batch. Preserve that batch instead of replacing it with the viewed photo.
   if (photoId == null || selectedPhotos.size > 0) return;
   var idx = photos.findIndex(function(photo) { return photo.id === photoId; });
-  if (idx < 0) return;
+  if (idx < 0) {
+    var coverId = browseStackCoverIdForPhoto(photoId);
+    idx = photos.findIndex(function(photo) { return photo.id === coverId; });
+  }
+  if (idx < 0 || !findBrowsePhoto(photoId)) return;
   // Skip `selectPhoto` when the focused photo is already the one being
   // returned to: it calls `loadDetail`, which refetches and rerenders the
   // detail panel and would silently discard an unsubmitted `#locationInput`
@@ -10924,9 +12037,11 @@ async function setRatingFor(photoId, rating) {
       body: JSON.stringify({photo_ids: [photoId], rating: rating}),
     });
   } catch(e) { return; }
-  var p = photos.find(function(x) { return x.id === photoId; });
+  var p = findBrowsePhoto(photoId);
   if (p) p.rating = rating;
+  await reconcileBrowseStackCovers([photoId]);
   refreshGridCards([photoId]);
+  refreshExpandedBrowseStackMembers([photoId]);
   scheduleCollectionCountsRefresh();
   _refreshInspectorAfterSinglePhotoEdit(photoId, function() { loadDetail(photoId); });
   refreshPendingSyncBanner();
@@ -10939,10 +12054,12 @@ async function setFlagFor(photoId, flag) {
       body: JSON.stringify({photo_ids: [photoId], flag: flag}),
     });
   } catch(e) { return false; }
-  var p = photos.find(function(x) { return x.id === photoId; });
+  var p = findBrowsePhoto(photoId);
   if (p) p.flag = flag;
   _clearRepresentativeStateIfIneligible(photoId, flag);
+  await reconcileBrowseStackCovers([photoId]);
   refreshGridCards([photoId]);
+  refreshExpandedBrowseStackMembers([photoId]);
   _refreshInspectorAfterSinglePhotoEdit(photoId, function() { updateDetailFlagButtons(flag); });
   scheduleCollectionCountsRefresh();
   return true;
@@ -10960,6 +12077,7 @@ async function setColorLabelFor(photoId, color) {
   else delete colorLabels[photoId];
   colorLabelsFetched.add(photoId);
   refreshGridCards([photoId]);
+  refreshExpandedBrowseStackMembers([photoId]);
   _refreshInspectorAfterSinglePhotoEdit(photoId, updateDetailColors);
   scheduleCollectionCountsRefresh();
 }
@@ -11027,7 +12145,7 @@ async function copyPhotoPaths(photoIds) {
 // of selectPhoto(); factored out so the context-menu handler can coerce
 // selection without paying the full selectPhoto side-effects.
 function refreshCardSelectionVisuals() {
-  document.querySelectorAll('.grid-card').forEach(function(el) {
+  document.querySelectorAll('.grid-card, .browse-stack-member').forEach(function(el) {
     var cardId = parseInt(el.dataset.id, 10);
     el.classList.toggle('selected', cardId === selectedPhotoId || selectedPhotos.has(cardId));
   });
@@ -11037,8 +12155,9 @@ function refreshCardSelectionVisuals() {
 // lightbox. Hand off the current grid's ordered list so the editor can offer
 // Prev/Next, mirroring the lightbox "Edit Photo" handoff.
 function openPhotoEditor(photoId) {
+  var navigationPhotos = browsePhotoNavigationList(photoId);
   if (window.vireoEditNav) {
-    window.vireoEditNav.setList(photos, photoId);
+    window.vireoEditNav.setList(navigationPhotos, photoId);
     window.vireoEditNav.setLastPhoto(photoId);
   }
   window.location.href = '/edit/' + photoId;
@@ -11143,7 +12262,7 @@ function buildPhotoContextMenu(photoIds, contextPhotoId) {
     showFetchFallback: true,
   })).concat(window.buildSpeciesRepresentativeMenuItems(photoIds, {
     getPhoto: function(id) {
-      return photos.find(function(p) { return p.id === id; });
+      return findBrowsePhoto(id);
     },
   })).concat([
     { label: 'Adjust Capture Time\u2026', onClick: function() { openCaptureTimeModal(); } },
@@ -11172,7 +12291,7 @@ function openBatchMoreMenu(btn) {
 // Document-level delegation: grids re-render on sort/filter/scroll, so
 // per-card listeners would go stale.
 document.addEventListener('contextmenu', function(e) {
-  var card = e.target.closest('.grid-card');
+  var card = e.target.closest('.grid-card, .browse-stack-member');
   if (!card || !card.dataset.id) return;
   // Ignore right-clicks that came from inside the lightbox or a modal; this
   // handler owns only grid-card context menus. Modal right-clicks are either
@@ -11194,6 +12313,10 @@ document.addEventListener('contextmenu', function(e) {
   if (ids.length === 1 && ids[0] === pid && selectedPhotoId !== pid) {
     selectedPhotoId = pid;
     selectedIndex = photos.findIndex(function(p) { return p.id === pid; });
+    if (selectedIndex < 0) {
+      var coverId = browseStackCoverIdForPhoto(pid);
+      selectedIndex = photos.findIndex(function(p) { return p.id === coverId; });
+    }
     loadDetail(pid);
   }
   refreshCardSelectionVisuals();
@@ -11626,6 +12749,10 @@ document.addEventListener('contextmenu', function(e) {
 // last rendered rather than deep-link forever (Codex review r3686778061).
 var _DEEP_LINK_MAX_RETRIES = 5;
 async function _runPhotoDeepLink(photoId) {
+  // A focused deep link must expose the requested photo as a top-level card.
+  // Disable stacks for this view so its later lazy pages use the same shape.
+  var stackToggle = document.getElementById('browseStacksToggle');
+  if (stackToggle) stackToggle.checked = false;
   // Snapshot the health-refresh generation BEFORE any await. If a
   // vireo:folder-health-changed event fires while this loader is awaiting
   // /api/photos/<id> or its folder-scoped /api/browse/init,
@@ -11756,7 +12883,7 @@ async function _runPhotoDeepLink(photoId) {
       renderCollectionList(initData.collections || []);
       loadCollectionCounts();
       photos = initData.photos || [];
-      totalPhotos = initData.total || 0;
+      setBrowseTotals(initData);
       var focusPage = parseInt(initData.focus_page, 10);
       var hasFocusPage = Number.isInteger(focusPage) && focusPage >= 1;
       earliestPage = hasFocusPage ? focusPage : 1;
@@ -11830,7 +12957,7 @@ async function _runPhotoDeepLink(photoId) {
           };
         },
       }).then(function() {
-        VireoFilter.setResultTotal(totalPhotos);
+        VireoFilter.setResultTotal(totalUnderlyingPhotos);
         if (VireoFilter.hasFilters()) VireoFilter.clearAll(true);
       }).catch(function() {});
     }
@@ -11923,6 +13050,16 @@ function openExportModal(photoIds) {
   // particular, the lightbox menu exports the displayed photo even when the
   // Browse grid has a different single- or multi-photo selection behind it.
   _exportPhotoIds = activeIds;
+  // Drop on-demand preview hydration from the previous open so a rename (or
+  // a photo that has since left the workspace) can't be previewed from a
+  // stale cache. Requests still in flight are dropped with it: they carry
+  // the superseded generation and are ignored on arrival, so this session
+  // refetches instead of waiting on (and trusting) their payload. Reset both
+  // maps here — before the control resets below, which fire change handlers
+  // that repaint the preview — so a request this session starts is still
+  // tracked afterwards and cannot be issued twice.
+  _exportPreviewPhotos = {};
+  _exportPreviewFetches = {};
   document.getElementById('exportSubmitBtn').textContent = 'Export ' + activeIds.length + ' photo' + (activeIds.length === 1 ? '' : 's');
   document.getElementById('exportSubmitBtn').disabled = false;
   document.getElementById('exportPreset').value = 'original-jpg';
@@ -12080,17 +13217,88 @@ function markExportCustom() {
   document.getElementById('exportPreset').value = 'custom';
 }
 
+// Photos fetched on demand for the export preview, keyed by id (null means
+// "asked, and the server could not resolve it"). The preview names the first
+// file the export will write, so when that photo is not in the grid, an
+// expanded stack tray, or the lightbox cache, it has to be resolved rather
+// than substituted. /api/photos/<id> returns the same species-rank keyword
+// list the export worker names files with, so the preview matches the file
+// on disk. Cleared each time the modal opens so a renamed photo cannot show
+// a stale name (Codex P2 on PR #1561).
+var _exportPreviewPhotos = {};
+var _exportPreviewFetches = {};
+
+function hydrateExportPreviewPhoto(photoId) {
+  if (photoId == null) return;
+  var key = String(photoId);
+  if (_exportPreviewFetches[key]) return;
+  // Closing the modal does not cancel a fetch already in flight. Without a
+  // generation stamp, that response lands after the next open and writes the
+  // cache openExportModal just cleared, repainting the reopened modal with
+  // the pre-rename name the clearing existed to drop — and because the
+  // pending entry also survives in _exportPreviewFetches, the new session
+  // would never issue its own request. exportRequestGeneration is the
+  // modal's existing request token (bumped on open, close, and export), so
+  // stamp against it rather than adding a second counter.
+  var generation = exportRequestGeneration;
+  var request = safeFetch('/api/photos/' + photoId, {}, { toast: false })
+    .then(function(photo) {
+      if (generation !== exportRequestGeneration) return;
+      _exportPreviewPhotos[key] = (photo && photo.id != null) ? photo : null;
+    })
+    .catch(function() {
+      if (generation !== exportRequestGeneration) return;
+      _exportPreviewPhotos[key] = null;
+    })
+    .then(function() {
+      // Only clear the in-flight marker this call installed: a superseded
+      // session must not drop the current session's pending request.
+      if (_exportPreviewFetches[key] === request) delete _exportPreviewFetches[key];
+      if (generation !== exportRequestGeneration) return;
+      // Only repaint while the modal is still open; a closed modal has
+      // already dropped _exportPhotoIds and would preview a stale id.
+      if (document.getElementById('exportOverlay').classList.contains('open')) {
+        updateExportPreview();
+      }
+    });
+  _exportPreviewFetches[key] = request;
+  return request;
+}
+
 function updateExportPreview() {
   var template = document.getElementById('exportTemplate').value;
   if (!template) { document.getElementById('exportPreview').textContent = ''; return; }
   // Use first selected photo for preview
   var firstId = (_exportPhotoIds || getActiveSelection())[0];
-  var photo = photos.find(function(p) { return p.id === firstId; });
+  if (firstId == null) { document.getElementById('exportPreview').textContent = ''; return; }
+  var photo = findBrowsePhoto(firstId);
   // Find Similar and other shared-lightbox entry points can display photos
   // outside Browse's currently loaded page. Their metadata remains available
   // through the lightbox cache/list after the viewer closes for this modal.
   if (!photo && typeof _lbPhotoData === 'function') photo = _lbPhotoData(firstId);
-  if (!photo) { document.getElementById('exportPreview').textContent = ''; return; }
+  // Select-all-matching with Stacks enabled puts every underlying member id
+  // in selectedPhotos, but browseStackMembers only carries trays the user
+  // expanded — and the selection spans pages the grid never loaded. So the
+  // first id is often absent from findBrowsePhoto and the lightbox cache.
+  // Resolve that photo from the server rather than previewing a stand-in:
+  // rendering the stack's loaded cover here would assert a filename the
+  // export will never write, which is exactly the kind of plausible-looking
+  // proxy CORE_PHILOSOPHY forbids (Codex P2 on PR #1561).
+  if (!photo && Object.prototype.hasOwnProperty.call(_exportPreviewPhotos, String(firstId))) {
+    photo = _exportPreviewPhotos[String(firstId)];
+    if (!photo) {
+      document.getElementById('exportPreview').textContent =
+        'Preview unavailable: could not load photo ' + firstId + '.';
+      return;
+    }
+  }
+  if (!photo) {
+    hydrateExportPreviewPhoto(firstId);
+    document.getElementById('exportPreview').textContent =
+      'Preview: loading photo ' + firstId + '\u2026';
+    return;
+  }
+  if (!photo.filename) { document.getElementById('exportPreview').textContent = ''; return; }
   var stem = photo.filename.replace(/\.[^.]+$/, '');
   var ts = photo.timestamp || '';
   var datePart = ts ? ts.substring(0, 10) : 'unknown-date';

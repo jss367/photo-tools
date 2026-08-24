@@ -192,7 +192,18 @@ def test_contended_cold_load_wait_records_owner_timing():
     """
     import resource_ledger
 
-    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    # Deterministic clock injected into the ledger so the recorded
+    # elapsed for the contended wait is bounded from below by a real,
+    # known interval — independent of OS scheduling. Windows CI has
+    # produced spurious wait_seconds=0.0 under this assertion when the
+    # test relied on a fixed real-time sleep to guarantee the waiter
+    # was blocked long enough for time.monotonic() to advance.
+    clock_value = [0.0]
+
+    def fake_clock():
+        return clock_value[0]
+
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2, clock=fake_clock)
     previous = resource_ledger._set_resource_ledger_for_tests(ledger)
     try:
         cache = ModelCache(idle_secs=60)
@@ -235,10 +246,25 @@ def test_contended_cold_load_wait_records_owner_timing():
 
         tw = threading.Thread(target=waiter)
         tw.start()
-        # Give the waiter time to attempt the non-blocking acquire, fail,
-        # and enter the tracked-wait branch (blocking acquire on
-        # load_lock). Then release the producer so the waiter unblocks.
-        time.sleep(0.15)
+        # Poll owner_timing until the waiter has entered the tracked-wait
+        # branch. A fixed sleep here would race on a slow Windows runner:
+        # either release_load fires before the waiter blocks (uncontended
+        # acquire, no ledger entry) or the waiter's wait_timing.started_at
+        # is captured after we would advance the clock, both of which turn
+        # into a spurious zero-wait recording.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if ledger.owner_timing("waiter-job")["wait_count"] >= 1:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail(
+                "waiter never entered the tracked-wait branch within 2s",
+            )
+        # Advance the injected clock now that started_at has been
+        # captured. When _record_wait_locked fires on the waiter's context
+        # exit, elapsed() sees 0.25s regardless of scheduling latency.
+        clock_value[0] += 0.25
         release_load.set()
 
         assert producer_done.wait(timeout=2.0)

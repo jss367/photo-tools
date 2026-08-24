@@ -21448,3 +21448,456 @@ def test_browse_reject_reporter_names_workspace_detach_skips(app_and_db):
     # cannot drift back apart on this one signal.
     accept_body = _browse_js_function_body(html, "function _reportSkippedAccepts(")
     assert "skipped_out_of_workspace" in accept_body
+
+
+_ID_CONFLICTS_SIGNAL_STUB = """
+var signalCache = new Map();
+var compareData = null;
+var __models = [];
+function visibleModels() { return __models; }
+function effectivePredictionCategory(pred) { return pred.category || 'match'; }
+"""
+
+_ID_CONFLICTS_SIGNAL_DRIVER = """
+var input = JSON.parse(process.argv[2]);
+__models = input.models;
+signalCache = new Map();
+var signal = photoSignal(input.photo);
+process.stdout.write(JSON.stringify({
+  consensus_species: signal.consensus_species,
+  consensus_count: signal.consensus_count,
+  consensus_label: signal.consensus_label,
+  model_disagreement_label: signal.model_disagreement_label,
+}));
+"""
+
+
+def _run_id_conflicts_photo_signal(html, payload):
+    """Run ID Conflicts' real ``photoSignal`` against a payload.
+
+    Slices the page's own signal code (``desc`` through ``photoSignal``)
+    so the user-visible label strings are produced by production JS, not
+    reimplemented here. ``CATEGORY_ORDER`` is sliced in from its
+    definition rather than stubbed, so category priority stays honest.
+    """
+    import json as _json
+
+    cat_start = html.find("var CATEGORY_ORDER = {")
+    cat_end = html.find("function ", cat_start)
+    start = html.find("function desc(a, b)")
+    end = html.find("function signalSummary(")
+    assert cat_start != -1 and start != -1 and end > start, (
+        "id_conflicts.html's signal code could not be located"
+    )
+    source = "\n".join([
+        _ID_CONFLICTS_SIGNAL_STUB, html[cat_start:cat_end], html[start:end],
+        _ID_CONFLICTS_SIGNAL_DRIVER,
+    ])
+    return _run_node(source, [_json.dumps(payload)])
+
+
+def _egret_prediction(species, confidence, display="Western Cattle-Egret"):
+    pred = {
+        "species": species, "canonical_species": "taxon:1",
+        "confidence": confidence, "status": "pending", "category": "match",
+    }
+    if display:
+        pred["canonical_display"] = display
+    return pred
+
+
+def _one_subject_photo(predictions):
+    return {
+        "photo_id": 1,
+        "subjects": [{
+            "detection_id": 7, "kind": "detected",
+            "box": {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
+            "predictions": predictions,
+        }],
+    }
+
+
+def test_id_conflicts_consensus_label_uses_the_taxon_display_name(app_and_db):
+    """The consensus note names the taxon, not whichever model was first.
+
+    Codex P2 (id_conflicts.html:1083). ``canonical_species`` already
+    grouped an outdated binomial ("Bubulcus ibis") with a later model's
+    "Western Cattle-Egret" as agreement, but the group took its display
+    name from the first prediction it saw — so the note and the
+    multi-subject summary kept showing the scientific name, and model
+    ordering decided whether the leak appeared. Asserting the payload
+    field alone would not catch that; this drives the page's real
+    ``photoSignal`` and reads the string a user sees.
+    """
+    app, _ = app_and_db
+    html = app.test_client().get("/id-conflicts").get_data(as_text=True)
+
+    def photo(first, second):
+        return _one_subject_photo({
+            "model-a": [_egret_prediction(first, 0.9)],
+            "model-b": [_egret_prediction(second, 0.8)],
+        })
+
+    models = ["model-a", "model-b"]
+    binomial_first = _run_id_conflicts_photo_signal(html, {
+        "models": models,
+        "photo": photo("Bubulcus ibis", "Western Cattle-Egret"),
+    })
+    common_first = _run_id_conflicts_photo_signal(html, {
+        "models": models,
+        "photo": photo("Western Cattle-Egret", "Bubulcus ibis"),
+    })
+
+    assert binomial_first["consensus_count"] == 2
+    assert binomial_first["consensus_species"] == "Western Cattle-Egret", (
+        "the group label must come from the taxon, not from the "
+        "first-visited model's raw prediction"
+    )
+    assert binomial_first["consensus_label"] == (
+        "2 models agree on Western Cattle-Egret"
+    )
+    # And it cannot depend on which model happens to sort first.
+    assert common_first["consensus_label"] == binomial_first["consensus_label"]
+
+
+def test_id_conflicts_disagreement_label_uses_the_taxon_display_name(
+    app_and_db,
+):
+    """"Models disagree" names both taxa, not the raw stored strings.
+
+    Same leak as the consensus group, one line over: the disagreement
+    note and the pill tooltip render the pair directly, so a persisted
+    "Bubulcus ibis" shows there even though the server resolved it.
+    """
+    app, _ = app_and_db
+    html = app.test_client().get("/id-conflicts").get_data(as_text=True)
+
+    signal = _run_id_conflicts_photo_signal(html, {
+        "models": ["model-a", "model-b"],
+        "photo": _one_subject_photo({
+            "model-a": [_egret_prediction("Bubulcus ibis", 0.9)],
+            "model-b": [{
+                "species": "Blue Jay", "canonical_species": "taxon:2",
+                "canonical_display": "Blue Jay", "confidence": 0.8,
+                "status": "pending", "category": "match",
+            }],
+        }),
+    })
+    assert signal["model_disagreement_label"] == (
+        "Western Cattle-Egret vs Blue Jay"
+    )
+
+
+def test_id_conflicts_labels_fall_back_to_the_raw_prediction(app_and_db):
+    """Predictions without ``canonical_display`` (nothing resolved, or an
+    older cached response) still get a label — the raw prediction."""
+    app, _ = app_and_db
+    html = app.test_client().get("/id-conflicts").get_data(as_text=True)
+
+    signal = _run_id_conflicts_photo_signal(html, {
+        "models": ["model-a", "model-b"],
+        "photo": _one_subject_photo({
+            "model-a": [{
+                "species": "Mystery Beast",
+                "canonical_species": "mystery beast",
+                "confidence": 0.9, "status": "pending", "category": "new",
+            }],
+            "model-b": [{
+                "species": "Other Beast", "canonical_species": "other beast",
+                "confidence": 0.8, "status": "pending", "category": "new",
+            }],
+        }),
+    })
+    assert signal["consensus_species"] == "Mystery Beast"
+    assert signal["model_disagreement_label"] == "Mystery Beast vs Other Beast"
+
+
+def test_compare_canonical_key_collapses_hierarchy_aliases(app_and_db, tmp_path):
+    """Two spellings the DB already calls one species share one key.
+
+    Codex P2 (app.py:16954). ``resolve_species_display_name`` collapses a
+    hierarchy alias onto its root keyword ("Desert Verdin" -> "Verdin"),
+    and ``compare_prediction_to_keywords`` is fed that resolved name — so
+    the keyword comparison treats both models as naming the same species.
+    The identity key's text fallback took the *raw* prediction, so when
+    the taxonomy indexes neither spelling the page reported a model
+    disagreement its own keyword column contradicted.
+    """
+    from unittest.mock import patch
+
+    import taxonomy as tax_mod
+
+    app, db = app_and_db
+    photo_id = db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 1"
+    ).fetchone()["id"]
+
+    # A root ``Verdin`` species keyword with a linked hierarchy leaf
+    # ``Desert Verdin`` under it — the shape resolve_species_display_name
+    # canonicalizes through.
+    db.conn.execute(
+        "INSERT INTO taxa (id, name, rank) VALUES (555, 'Auriparus flaviceps', 'species')"
+    )
+    root_id = db.conn.execute(
+        "INSERT INTO keywords (name, parent_id, is_species, type, taxon_id) "
+        "VALUES ('Verdin', NULL, 1, 'taxonomy', 555)"
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO keywords (name, parent_id, is_species, type, taxon_id) "
+        "VALUES ('Desert Verdin', ?, 1, 'taxonomy', 555)",
+        (root_id,),
+    )
+    db.conn.commit()
+    assert db.resolve_species_display_name("Desert Verdin") == "Verdin", (
+        "sanity: the DB resolver collapses the alias onto its root"
+    )
+
+    det_id = db.save_detections(photo_id, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="MDV6")[0]
+    db.add_prediction(det_id, "Desert Verdin", 1.0, "model-a")
+    db.add_prediction(det_id, "Verdin", 0.9, "model-b")
+    cid = db.add_collection(
+        "Aliases", json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+
+    # Taxonomy that indexes neither spelling — the text-fallback path.
+    tax_path = tmp_path / "taxonomy.json"
+    tax_path.write_text(json.dumps(
+        {"taxa_by_common": {}, "taxa_by_scientific": {}}
+    ))
+    with patch(
+        "taxonomy.load_local_taxonomy",
+        return_value=tax_mod.Taxonomy(str(tax_path)),
+    ):
+        resp = app.test_client().get(
+            f"/api/predictions/compare?collection_id={cid}"
+        )
+
+    assert resp.status_code == 200
+    preds = resp.get_json()["photos"][0]["predictions"]
+    assert preds["model-a"][0]["canonical_species"] == "verdin"
+    assert (
+        preds["model-a"][0]["canonical_species"]
+        == preds["model-b"][0]["canonical_species"]
+    ), "an alias and its root keyword must not read as a model disagreement"
+
+
+def test_compare_payload_carries_canonical_species(app_and_db, tmp_path):
+    """Predictions naming the same taxon differently (common name vs an
+    outdated binomial) share one canonical_species key so the ID Conflicts
+    page can group them as agreement instead of a false model conflict."""
+    from unittest.mock import patch
+
+    import taxonomy as tax_mod
+
+    app, db = app_and_db
+    photo_id = db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 1"
+    ).fetchone()["id"]
+    det_id = db.save_detections(photo_id, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="MDV6")[0]
+    db.add_prediction(det_id, "Western Cattle-Egret", 1.0, "model-a")
+    db.add_prediction(det_id, "Bubulcus ibis", 0.9, "model-b")
+    db.add_prediction(det_id, "Mystery Beast", 0.5, "model-c")
+    cid = db.add_collection(
+        "Canonical", json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+
+    entry = {
+        "taxon_id": 1289388,
+        "scientific_name": "Ardea ibis",
+        "common_name": "Western Cattle-Egret",
+        "rank": "species",
+        "lineage_names": ["Animalia", "Chordata", "Aves", "Pelecaniformes",
+                          "Ardeidae", "Ardea", "Ardea ibis"],
+        "lineage_ranks": ["kingdom", "phylum", "class", "order", "family",
+                          "genus", "species"],
+    }
+    tax_path = tmp_path / "taxonomy.json"
+    tax_path.write_text(json.dumps({
+        "taxa_by_common": {"western cattle-egret": entry},
+        "taxa_by_scientific": {"ardea ibis": entry},
+    }))
+    with patch.object(
+        tax_mod, "_SCIENTIFIC_SYNONYMS", {"bubulcus ibis": "Ardea ibis"},
+    ), patch(
+        "taxonomy.load_local_taxonomy",
+        return_value=tax_mod.Taxonomy(str(tax_path)),
+    ):
+        resp = app.test_client().get(
+            f"/api/predictions/compare?collection_id={cid}"
+        )
+
+    assert resp.status_code == 200
+    preds = resp.get_json()["photos"][0]["predictions"]
+    canonical_a = preds["model-a"][0]["canonical_species"]
+    canonical_b = preds["model-b"][0]["canonical_species"]
+    canonical_c = preds["model-c"][0]["canonical_species"]
+    assert canonical_a == canonical_b
+    assert canonical_a == "taxon:1289388"
+    # Unresolvable names fall back to normalized text so same-string
+    # predictions still group together.
+    assert canonical_c == "mystery beast"
+
+    # Every prediction that resolved to a taxon carries the taxonomy's
+    # preferred display name — regardless of which raw string the model
+    # persisted — so the ID Conflicts page's consensus group name does not
+    # depend on which model happened to be visited first.
+    display_a = preds["model-a"][0]["canonical_display"]
+    display_b = preds["model-b"][0]["canonical_display"]
+    display_c = preds["model-c"][0]["canonical_display"]
+    assert display_a == "Western Cattle-Egret"
+    assert display_b == "Western Cattle-Egret"
+    # Unresolvable names keep their raw form as a safe display fallback.
+    assert display_c == "Mystery Beast"
+
+
+def test_compare_canonical_display_prefers_db_canonical_for_aliases(
+    app_and_db, tmp_path,
+):
+    """A hierarchy alias's group displays under the DB-canonical root name.
+
+    Codex P2 follow-up (app.py:17103). ``canonical_species_key`` collapses
+    an alias prediction (``Desert Verdin``) and a root prediction
+    (``Verdin``) into one identity, but ``canonical_display_name`` used to
+    return the *first non-empty raw* candidate. Since the frontend adopts
+    the first group member's display, the consensus label ended up
+    depending on alphabetical model order — ``Desert Verdin`` if the alias
+    model was visited first, ``Verdin`` otherwise. The alias prediction's
+    display must pick up the DB-canonical root so the group's name is
+    stable however the models sort.
+    """
+    from unittest.mock import patch
+
+    import taxonomy as tax_mod
+
+    app, db = app_and_db
+    photo_id = db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 1"
+    ).fetchone()["id"]
+    db.conn.execute(
+        "INSERT INTO taxa (id, name, rank) "
+        "VALUES (556, 'Auriparus flaviceps', 'species')"
+    )
+    root_id = db.conn.execute(
+        "INSERT INTO keywords (name, parent_id, is_species, type, taxon_id) "
+        "VALUES ('Verdin', NULL, 1, 'taxonomy', 556)"
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO keywords (name, parent_id, is_species, type, taxon_id) "
+        "VALUES ('Desert Verdin', ?, 1, 'taxonomy', 556)",
+        (root_id,),
+    )
+    db.conn.commit()
+    assert db.resolve_species_display_name("Desert Verdin") == "Verdin", (
+        "sanity: the DB resolver collapses the alias onto its root"
+    )
+    det_id = db.save_detections(photo_id, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="MDV6")[0]
+    db.add_prediction(det_id, "Desert Verdin", 1.0, "model-a")
+    db.add_prediction(det_id, "Verdin", 0.9, "model-b")
+    # A third model that spells the root keyword in its own casing. The
+    # catalog holds "Verdin", so that is the spelling the group must show —
+    # a label that flips case with model sort order is the same
+    # order-dependence in miniature.
+    db.add_prediction(det_id, "verdin", 0.8, "model-c")
+    cid = db.add_collection(
+        "AliasDisplay",
+        json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+    tax_path = tmp_path / "taxonomy.json"
+    tax_path.write_text(json.dumps(
+        {"taxa_by_common": {}, "taxa_by_scientific": {}}
+    ))
+    with patch(
+        "taxonomy.load_local_taxonomy",
+        return_value=tax_mod.Taxonomy(str(tax_path)),
+    ):
+        resp = app.test_client().get(
+            f"/api/predictions/compare?collection_id={cid}"
+        )
+    assert resp.status_code == 200
+    preds = resp.get_json()["photos"][0]["predictions"]
+    assert preds["model-a"][0]["canonical_species"] == "verdin"
+    assert (
+        preds["model-a"][0]["canonical_species"]
+        == preds["model-b"][0]["canonical_species"]
+    )
+    # The alias prediction now advertises the DB-canonical root as its
+    # display, so a group seeded by that prediction still names the taxon
+    # "Verdin" — not "Desert Verdin", not whichever model sorts first.
+    assert preds["model-a"][0]["canonical_display"] == "Verdin"
+    assert preds["model-b"][0]["canonical_display"] == "Verdin"
+    assert preds["model-c"][0]["canonical_display"] == "Verdin"
+
+
+def test_compare_canonical_display_keeps_raw_when_only_case_differs(
+    app_and_db, tmp_path,
+):
+    """An unresolved binomial keeps the model's own spelling.
+
+    ``resolve_species_display_name``'s last resort applies the keyword-case
+    convention when no keyword row and no linked taxon match. For a Latin
+    binomial the DB has never seen, that rewrites ``Bubulcus ibis`` to
+    ``Bubulcus Ibis`` under a title-case convention — a spelling neither the
+    model nor the catalog ever held. The compare endpoint therefore feeds
+    the display the ``apply_case_convention=False`` resolution, which stops
+    before that last resort, so the model's own spelling survives even
+    though the display otherwise prefers the DB-canonical name.
+    """
+    from unittest.mock import patch
+
+    import taxonomy as tax_mod
+
+    app, db = app_and_db
+    # Seed enough title-case species keywords for
+    # detect_keyword_case_convention to pick Title Case (needs >= 3 rows
+    # with multiple words); then predict a lowercase-genus binomial the DB
+    # has never seen — resolve_species_display_name will rewrite it to
+    # ``Bubulcus Ibis``.
+    db.add_keyword("Blue Jay", is_species=True)
+    db.add_keyword("Great Cormorant", is_species=True)
+    db.add_keyword("Cattle Egret", is_species=True)
+    resolved = db.resolve_species_display_name("Bubulcus ibis")
+    assert resolved == "Bubulcus Ibis", (
+        f"sanity: title-case convention should re-case the binomial "
+        f"(got {resolved!r})"
+    )
+    photo_id = db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 1"
+    ).fetchone()["id"]
+    det_id = db.save_detections(photo_id, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="MDV6")[0]
+    db.add_prediction(det_id, "Bubulcus ibis", 1.0, "model-a")
+    cid = db.add_collection(
+        "CaseFallback",
+        json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+    tax_path = tmp_path / "taxonomy.json"
+    tax_path.write_text(json.dumps(
+        {"taxa_by_common": {}, "taxa_by_scientific": {}}
+    ))
+    with patch(
+        "taxonomy.load_local_taxonomy",
+        return_value=tax_mod.Taxonomy(str(tax_path)),
+    ):
+        resp = app.test_client().get(
+            f"/api/predictions/compare?collection_id={cid}"
+        )
+    assert resp.status_code == 200
+    preds = resp.get_json()["photos"][0]["predictions"]
+    # Not "Bubulcus Ibis": nothing was stored under this name, so the
+    # display resolution had nothing to canonicalize to and handed back the
+    # model's own spelling.
+    assert preds["model-a"][0]["canonical_display"] == "Bubulcus ibis"
+    # The keyword comparison still uses the case-applying resolution, since
+    # that is the spelling add_keyword would land on.
+    assert db.resolve_species_display_name("Bubulcus ibis") == "Bubulcus Ibis"

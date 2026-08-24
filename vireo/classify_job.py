@@ -357,9 +357,15 @@ def _all_photos_cache_satisfied(
     ``_finalize_cached_only`` on stale results — the ordinary
     ``_classify_photos`` gate would reject that mismatch via
     ``_runtime_aware_run_keys``.  ``runtime_fingerprint = 'legacy'``
-    stays accepted for pre-portable rows, and manually reviewed rows
+    stays accepted for pre-portable rows, EXCEPT that an unreviewed
+    legacy row for a timm classifier is dropped once
+    ``label_descriptions.json`` has transitioned from missing to present:
+    that mapping is what turns a raw class id into the stored common
+    name, so a pre-heal legacy row's species is stale relative to what
+    a run made today would emit (Codex #1560 P2). Manually reviewed rows
     (real accept/reject decisions, not auto-match) remain authoritative
-    across runtime changes until an explicit reclassify.
+    across runtime changes — including that enrichment change — until an
+    explicit reclassify.
 
     A classifier_run row is only counted as covered when at least one
     matching ``predictions`` row exists.  Local jobs write classifier_runs
@@ -419,10 +425,41 @@ def _all_photos_cache_satisfied(
     runtime_clause = ""
     runtime_args = []
     if expected_runtimes:
+        # Grandfather ``runtime_fingerprint = 'legacy'`` for pre-portable
+        # rows, EXCEPT when the classifier is timm and its
+        # ``label_descriptions.json`` enrichment has since transitioned
+        # from missing to present. That mapping is what turns a raw
+        # class id into the stored common name, so an unreviewed legacy
+        # timm row's species is stale relative to what a run made today
+        # would emit ("Bubulcus ibis" -> "Western Cattle-Egret"); keeping
+        # the exception would leave the scientific names indefinitely
+        # unless the user asked for a forced reclassify (Codex #1560 P2).
+        # The manual-review branch below still authorizes such rows —
+        # an explicit accept/reject is authoritative across enrichment
+        # changes, matching the runtime-change pin exception.
+        accept_legacy = True
+        if isinstance(model_identity, dict) and (
+            model_identity.get("model_type") == "timm"
+        ):
+            from computation_cache import (
+                LABEL_DESCRIPTIONS_IDENTITY_KEY,
+                NO_LABEL_DESCRIPTIONS,
+            )
+            current_ld_identity = model_identity.get(
+                LABEL_DESCRIPTIONS_IDENTITY_KEY,
+            )
+            if (
+                current_ld_identity
+                and current_ld_identity != NO_LABEL_DESCRIPTIONS
+            ):
+                accept_legacy = False
+        legacy_clause = (
+            " OR cr.runtime_fingerprint = 'legacy'" if accept_legacy else ""
+        )
         placeholders = ",".join("?" for _ in expected_runtimes)
         runtime_clause = (
             f" AND (cr.runtime_fingerprint IN ({placeholders})"
-            " OR cr.runtime_fingerprint = 'legacy'"
+            f"{legacy_clause}"
             " OR EXISTS (SELECT 1 FROM predictions p"
             " JOIN prediction_review pr ON pr.prediction_id = p.id"
             " WHERE p.detection_id = cr.detection_id"
@@ -2882,6 +2919,36 @@ def run_classify_job(
         )
 
         cache_taxonomy_identity = _peek_tax_identity()
+
+        # Re-arm any pending background self-heal before the cached-only
+        # shortcut returns. The shortcut below skips classifier acquisition
+        # entirely, so ``acquire_cached_classifier``'s ``notify_reuse``
+        # hook — the only place the timm ``label_descriptions.json``
+        # bounded-retry state machine fires from cache hits — never runs
+        # on such jobs. Without this, an installation whose first heal
+        # failed during a transient outage would stay ``failed`` for the
+        # rest of the process's life whenever every job's photos are
+        # already cached, leaking raw scientific names indefinitely.
+        # The helper checks the file itself and no-ops when the mapping
+        # is already usable or the state machine is in-flight/backing off,
+        # so calling it here is cheap on healthy installs.
+        if peek_model and peek_model.get("model_type") == "timm":
+            _heal_model_str = peek_model.get("model_str")
+            _heal_model_dir = peek_model.get("weights_path")
+            if _heal_model_str and _heal_model_dir:
+                try:
+                    from timm_classifier import (
+                        rearm_pending_label_desc_heal,
+                    )
+                    rearm_pending_label_desc_heal(
+                        _heal_model_str, _heal_model_dir,
+                    )
+                except Exception:
+                    log.info(
+                        "Re-arming label_descriptions heal for %s failed",
+                        _heal_model_str, exc_info=True,
+                    )
+
         if not params.reclassify and _all_photos_cache_satisfied(
             thread_db, [p["id"] for p in photos],
             classifier_model=desired_classifier_model,
@@ -3144,6 +3211,22 @@ def run_classify_job(
             job["id"], "load_model", status="completed",
             summary=effective_name,
         )
+
+        # Restamp the portable model identity with the
+        # label_descriptions.json this classifier actually consumed.
+        # ``classifier_model_identity`` above probed the disk before the
+        # classifier was built, and TimmClassifier's background heal
+        # publishes that file during normal operation — so the probe can
+        # disagree with what the instance read in either direction. Runs
+        # published below must carry the mapping that produced their
+        # species names; otherwise a pre-heal run is recorded under the
+        # post-heal identity and every later cache check accepts it,
+        # skipping the reclassify that replaces raw binomials.
+        from computation_cache import with_consumed_label_descriptions
+        classifier_identity = with_consumed_label_descriptions(
+            classifier_identity, clf,
+        )
+        job["_classifier_model_identity"] = classifier_identity
 
         # Classifier init succeeded — now it's safe to start the
         # reclassify purge for any failure before this point would leave

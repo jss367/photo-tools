@@ -172,8 +172,108 @@ def full_image_runtime_fingerprint():
     })
 
 
+LABEL_DESCRIPTIONS_FILE = "label_descriptions.json"
+LABEL_DESCRIPTIONS_IDENTITY_KEY = "label_descriptions_identity"
+NO_LABEL_DESCRIPTIONS = "no-label-descriptions"
+
+
+def label_descriptions_identity(descs):
+    """Portable content identity for a consumed label-descriptions mapping.
+
+    ``None`` (absent, or present but unusable) collapses to
+    ``"no-label-descriptions"`` — the classifier ran without the mapping
+    either way. A parsed mapping hashes to the SHA-256 of its canonical
+    JSON, so a mapping that gains entries produces a different identity.
+
+    Hashed from the parsed content, not the file bytes, because the heal
+    has two sources that produce the same mapping in different encodings:
+    ``label_descriptions.json`` as published in the ONNX repo, and the
+    copy ``ensure_timm_label_descriptions`` derives from the upstream
+    timm ``config.json`` with ``json.dump``. Two installs that healed
+    from different sources hold semantically identical mappings and must
+    agree, or every cross-install artifact would look stale.
+    """
+    if not isinstance(descs, dict):
+        return NO_LABEL_DESCRIPTIONS
+    return fingerprint({"label_descriptions": descs})
+
+
+def _declares_label_descriptions(active_model):
+    return LABEL_DESCRIPTIONS_FILE in (
+        (active_model.get("optional_files") or []) if
+        isinstance(active_model, dict) else []
+    )
+
+
+def local_label_descriptions_identity(active_model):
+    """Identity of the label-descriptions artifact installed right now.
+
+    The disk-probe counterpart to reading the identity off a constructed
+    classifier (see ``with_consumed_label_descriptions``). Used by the
+    cache-check and quarantine paths, which ask "would a run made on
+    this install today produce that runtime?" — and a run made today
+    would read whatever is on disk today.
+    """
+    if not _declares_label_descriptions(active_model):
+        return NO_LABEL_DESCRIPTIONS
+    weights_path = active_model.get("weights_path")
+    if not weights_path:
+        return NO_LABEL_DESCRIPTIONS
+    try:
+        from models import read_label_descriptions
+
+        descs, _signature = read_label_descriptions(
+            os.path.join(weights_path, LABEL_DESCRIPTIONS_FILE),
+        )
+    except Exception:
+        return NO_LABEL_DESCRIPTIONS
+    return label_descriptions_identity(descs)
+
+
+def with_consumed_label_descriptions(identity, classifier):
+    """Restamp ``identity`` with the mapping ``classifier`` actually read.
+
+    ``classifier_model_identity`` probes the disk, but TimmClassifier
+    spawns a background ``label_descriptions.json`` heal that publishes
+    the file *during normal operation* — it can land between that probe
+    and the classifier's own read, or between the read and the moment a
+    run is published. A run must be stamped with the mapping that
+    produced its species names: stamp a pre-heal run with the post-heal
+    identity and every later cache check treats it as an exact match, so
+    the reclassify that replaces raw binomials with common names never
+    runs (Codex #1560 P2).
+
+    Classifiers that expose no ``label_descriptions_identity`` (bioclip,
+    test doubles) leave the probed value alone.
+    """
+    if not isinstance(identity, dict):
+        return identity
+    if LABEL_DESCRIPTIONS_IDENTITY_KEY not in identity:
+        return identity
+    consumed = getattr(classifier, "label_descriptions_identity", None)
+    if not isinstance(consumed, str) or not consumed:
+        return identity
+    if consumed == identity[LABEL_DESCRIPTIONS_IDENTITY_KEY]:
+        return identity
+    restamped = dict(identity)
+    restamped[LABEL_DESCRIPTIONS_IDENTITY_KEY] = consumed
+    return restamped
+
+
 def classifier_model_identity(active_model):
-    """Resolve immutable classifier files without including local paths."""
+    """Resolve immutable classifier files without including local paths.
+
+    Declared *optional* files are covered too, but only through
+    ``LABEL_DESCRIPTIONS_IDENTITY_KEY``: timm's
+    ``label_descriptions.json`` is what turns a raw class id into the
+    common name stored on a prediction, so a run made before it landed
+    is semantically different output from a run made after — even though
+    every required file, the pinned revision and the label set are
+    identical. Keying only on required files let a pre-heal run compare
+    equal to a post-heal one, so the cache accepted it and the
+    scientific names stayed on screen until a forced reclassify
+    (Codex #1560 P2).
+    """
     if not isinstance(active_model, dict):
         return None
     weights_path = active_model.get("weights_path")
@@ -193,6 +293,15 @@ def classifier_model_identity(active_model):
         "model_type": active_model.get("model_type", "bioclip"),
         "declared_files": sorted(declared),
     }
+    # Added before every return below, including the pinned-revision
+    # short-circuit: the revision pins the *required* artifacts, and
+    # label_descriptions.json is fetched separately (Repair, or the
+    # classifier's background heal), so a pinned install's identity is
+    # not complete without it.
+    if _declares_label_descriptions(active_model):
+        identity[LABEL_DESCRIPTIONS_IDENTITY_KEY] = (
+            local_label_descriptions_identity(active_model)
+        )
     if revision:
         identity["immutable_upstream_revision"] = revision
         return identity
@@ -276,6 +385,27 @@ def local_taxonomy_identity():
     return taxonomy_identity(tax)
 
 
+def local_synonyms_identity():
+    """Identity of the packaged scientific-name synonym map, or a sentinel.
+
+    Folded into every classifier runtime fingerprint (see
+    ``classifier_runtime_fingerprint``). Read from the local install and
+    not passed in by callers, for the same reason the taxonomy axis only
+    ever accepts the *local* identity: an artifact enriched against a
+    different synonym map is a semantic mismatch, and a caller that
+    forgot to thread the value through would silently reopen the stale
+    match this exists to close.
+    """
+    try:
+        from taxonomy import scientific_synonyms_identity
+    except ImportError:
+        return "no-synonyms"
+    try:
+        return scientific_synonyms_identity()
+    except Exception:
+        return "no-synonyms"
+
+
 def classifier_runtime_fingerprint(
     model_identity, labels_fingerprint_full, detector_runtime,
     taxonomy_identity="no-tax",
@@ -295,7 +425,17 @@ def classifier_runtime_fingerprint(
         "detector_runtime_fingerprint": detector_runtime,
         "input_recipe": "vireo-classifier-crops-v1",
         "preprocess": "model-config-owned-v1",
-        "output_enrichment": {"taxonomy_identity": taxonomy_identity},
+        # Output enrichment covers everything that turns a raw class id
+        # into the species/hierarchy stored on a prediction: taxonomy.json
+        # AND the packaged scientific-name synonym map that resolves
+        # outdated binomials before that lookup. Omitting the synonym map
+        # would let a run recorded before the map shipped compare equal to
+        # one made after it, so the cache would skip the reclassify that
+        # replaces raw binomials with current names (Codex #1560 P2).
+        "output_enrichment": {
+            "taxonomy_identity": taxonomy_identity,
+            "scientific_synonyms_identity": local_synonyms_identity(),
+        },
         "comparison_policy": "provider-tolerance-experimental-v1",
     })
 

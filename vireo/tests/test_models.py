@@ -9,6 +9,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
@@ -2177,3 +2179,1207 @@ def test_tree_of_life_ready_false_when_model_dir_missing():
     assert tree_of_life_ready(
         "hf-hub:imageomics/bioclip-2.5-vith14", ""
     ) is False
+
+
+# ---------------------------------------------------------------------------
+# ensure_timm_label_descriptions — self-heal for installs that predate the
+# label_descriptions.json export (they show raw scientific names in the UI)
+# ---------------------------------------------------------------------------
+
+_TIMM_MODEL_STR = "hf-hub:timm/eva02_large_patch14_clip_336.merged2b_ft_inat21"
+
+
+def test_read_label_descriptions_signature_describes_the_bytes_read(tmp_path):
+    """The returned signature identifies the file this call actually
+    read, not whatever is at the path afterwards.
+
+    TimmClassifier caches by this signature, so it has to survive an
+    atomic republish (Repair, self-heal) landing right after the read.
+    A path stat taken after the read would describe the replacement and
+    stamp the instance with an identity for bytes it never saw — the
+    cache would then hand that stale instance to later classify jobs.
+    """
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+    target.write_text(json.dumps({"Sturnus vulgaris": "European Starling, Bird"}))
+    before = target.stat()
+
+    descs, signature = models.read_label_descriptions(str(target))
+
+    # Someone republishes different labels the instant after the read.
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text(json.dumps({
+        "Sturnus vulgaris": "Common Starling, Bird",
+        "Turdus migratorius": "American Robin, Bird",
+    }))
+    os.replace(replacement, target)
+    after = target.stat()
+
+    assert descs == {"Sturnus vulgaris": "European Starling, Bird"}
+    assert signature == (before.st_size, int(before.st_mtime_ns))
+    assert signature != (after.st_size, int(after.st_mtime_ns))
+
+
+def test_read_label_descriptions_reports_absent_and_unusable(tmp_path):
+    """Absent has no signature at all; unusable-but-present keeps the
+    mapping at None (heal it) — matching load_label_descriptions."""
+    import models
+
+    missing = tmp_path / "label_descriptions.json"
+    assert models.read_label_descriptions(str(missing)) == (None, None)
+
+    missing.write_text('{"Sturnus vulgaris": "European Star')
+    descs, signature = models.read_label_descriptions(str(missing))
+    assert descs is None
+    assert signature is not None
+    assert models.load_label_descriptions(str(missing)) is None
+
+
+def test_ensure_label_descriptions_noop_when_present(tmp_path, monkeypatch):
+    """An existing file short-circuits — no network calls at all."""
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+    target.write_text(json.dumps({"Sturnus vulgaris": "European Starling, Bird"}))
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("network path must not run when file exists")
+
+    monkeypatch.setattr(models, "_download_optional_files", _boom)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is True
+    # File untouched
+    assert json.loads(target.read_text()) == {
+        "Sturnus vulgaris": "European Starling, Bird"
+    }
+
+
+def test_ensure_label_descriptions_via_onnx_repo(tmp_path, monkeypatch):
+    """First preference: the vireo ONNX repo's optional-file download."""
+    import models
+
+    def _fake_optional(filenames, model_dir, hf_subdir, *args, **kwargs):
+        assert filenames == ["label_descriptions.json"]
+        assert hf_subdir == "timm-eva02-large-inat21"
+        with open(os.path.join(model_dir, "label_descriptions.json"), "w") as f:
+            json.dump({"Bubulcus ibis": "Cattle Egret, Bird"}, f)
+
+    monkeypatch.setattr(models, "_download_optional_files", _fake_optional)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is True
+    with open(tmp_path / "label_descriptions.json") as f:
+        assert json.load(f) == {"Bubulcus ibis": "Cattle Egret, Bird"}
+
+
+def test_ensure_label_descriptions_derives_from_upstream_config(
+    tmp_path, monkeypatch
+):
+    """When the ONNX repo doesn't have the file, derive it from the
+    upstream timm repo's config.json, which embeds label_descriptions."""
+    import models
+
+    monkeypatch.setattr(
+        models, "_download_optional_files", lambda *a, **k: None
+    )
+
+    upstream = tmp_path / "upstream-config.json"
+    upstream.write_text(json.dumps({
+        "architecture": "eva02_large_patch14_clip_336",
+        "label_names": ["Bubulcus ibis"],
+        "label_descriptions": {"Bubulcus ibis": "Cattle Egret, Bird"},
+    }))
+
+    monkeypatch.setattr(
+        models, "_load_upstream_timm_config",
+        lambda model_str: json.loads(upstream.read_text()),
+    )
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    assert models.ensure_timm_label_descriptions(
+        str(model_dir), _TIMM_MODEL_STR
+    ) is True
+    with open(model_dir / "label_descriptions.json") as f:
+        # Only the descriptions mapping is written, not the whole config
+        assert json.load(f) == {"Bubulcus ibis": "Cattle Egret, Bird"}
+
+
+def test_ensure_label_descriptions_upstream_missing_key(tmp_path, monkeypatch):
+    """An upstream config without label_descriptions fails gracefully."""
+    import models
+
+    monkeypatch.setattr(
+        models, "_download_optional_files", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        models, "_load_upstream_timm_config",
+        lambda model_str: {"architecture": "eva02"},
+    )
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is False
+    assert not (tmp_path / "label_descriptions.json").exists()
+
+
+def test_ensure_label_descriptions_survives_network_failure(
+    tmp_path, monkeypatch
+):
+    """Total network failure returns False without raising or leaving
+    partial files — the classifier keeps working with taxonomy fallback."""
+    import models
+
+    def _boom(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(models, "_download_optional_files", _boom)
+    monkeypatch.setattr(models, "_load_upstream_timm_config", _boom)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is False
+    assert not (tmp_path / "label_descriptions.json").exists()
+
+
+def test_ensure_label_descriptions_via_onnx_repo_publishes_atomically(
+    tmp_path, monkeypatch
+):
+    """The ONNX-repo path routes the download through a scratch subdir
+    and os.replace()s onto the published target, so readers never see a
+    partial file at the target path and a process exit mid-copy cannot
+    leave a truncated file that suppresses future heals."""
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+
+    def _fake_optional(filenames, model_dir, hf_subdir, *args, **kwargs):
+        # The download must be directed at a scratch subdir of the model
+        # dir, not the model dir itself — that is what keeps the target
+        # invisible while bytes are still being written.
+        assert os.path.dirname(model_dir.rstrip(os.sep)) == str(tmp_path)
+        assert os.path.basename(model_dir).startswith(".label_desc_heal_")
+        assert not target.exists()
+        # Simulate a non-atomic underlying copy: an interrupted transfer
+        # would leave partial bytes at this scratch path, which is safe
+        # because it is not the published target.
+        with open(os.path.join(model_dir, "label_descriptions.json"), "w") as f:
+            json.dump({"Bubulcus ibis": "Cattle Egret, Bird"}, f)
+        assert not target.exists()
+
+    monkeypatch.setattr(models, "_download_optional_files", _fake_optional)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is True
+    assert json.loads(target.read_text()) == {
+        "Bubulcus ibis": "Cattle Egret, Bird"
+    }
+    # Scratch subdir is cleaned up on success.
+    leftovers = [
+        p for p in os.listdir(tmp_path)
+        if p.startswith(".label_desc_heal_")
+    ]
+    assert leftovers == []
+
+
+def test_ensure_label_descriptions_partial_scratch_download_not_published(
+    tmp_path, monkeypatch
+):
+    """When the ONNX-repo download leaves no completed file in the
+    scratch dir (interrupted before finishing), nothing is promoted to
+    the target, so the next heal attempt still runs instead of being
+    short-circuited by a stale partial file."""
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+
+    def _fake_partial(filenames, model_dir, hf_subdir, *args, **kwargs):
+        # Simulate an interrupted download: a .tmp scratch remnant, but
+        # no completed label_descriptions.json in the scratch dir.
+        with open(
+            os.path.join(model_dir, "label_descriptions.json.tmp"), "w",
+        ) as f:
+            f.write("{ partial")
+
+    def _no_upstream(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(models, "_download_optional_files", _fake_partial)
+    monkeypatch.setattr(models, "_load_upstream_timm_config", _no_upstream)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is False
+    assert not target.exists()
+    leftovers = [
+        p for p in os.listdir(tmp_path)
+        if p.startswith(".label_desc_heal_")
+    ]
+    assert leftovers == []
+
+
+def test_ensure_label_descriptions_reheals_truncated_file(
+    tmp_path, monkeypatch
+):
+    """A present-but-unparseable file must not suppress the heal.
+
+    A process killed mid-write leaves a truncated label_descriptions.json.
+    If existence alone gated the repair, that install would leak raw
+    scientific names forever (Vireo self-heals broken state instead of
+    asking the user to delete files)."""
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+    # Truncated mid-write: passes os.path.isfile, fails json.load.
+    target.write_text('{"Bubulcus ibis": "Cattle Eg')
+
+    def _fake_optional(filenames, model_dir, hf_subdir, *args, **kwargs):
+        with open(os.path.join(model_dir, "label_descriptions.json"), "w") as f:
+            json.dump({"Bubulcus ibis": "Cattle Egret, Bird"}, f)
+
+    monkeypatch.setattr(models, "_download_optional_files", _fake_optional)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is True
+    assert json.loads(target.read_text()) == {
+        "Bubulcus ibis": "Cattle Egret, Bird"
+    }
+
+
+def test_ensure_label_descriptions_drops_truncated_file_when_offline(
+    tmp_path, monkeypatch
+):
+    """The torn file is removed even when every repair path fails, so the
+    next process retries instead of json.load-ing garbage."""
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+    target.write_text('{"Bubulcus ibis": "Cattle Eg')
+
+    def _boom(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(models, "_download_optional_files", _boom)
+    monkeypatch.setattr(models, "_load_upstream_timm_config", _boom)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is False
+    assert not target.exists()
+
+
+def test_ensure_label_descriptions_keeps_a_concurrently_repaired_file(
+    tmp_path, monkeypatch
+):
+    """A valid file published between inspection and removal must survive.
+
+    This heal runs on a background thread and can overlap the Settings
+    Repair job. The sequence Codex flagged: the heal reads a torn target,
+    Repair atomically publishes a good one, and the heal's later
+    existence check unlinks the *repaired* file. With every fetch path
+    then failing, timm_classifier records the generation as ``failed``
+    and suppresses further heals — a valid repair destroyed and the
+    install stuck on raw scientific names until reinstall or restart.
+    """
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+    target.write_text('{"Bubulcus ibis": "Cattle Eg')  # torn write
+    repaired = {"Bubulcus ibis": "Cattle Egret, Bird"}
+
+    real_read = models.read_label_descriptions
+    reads = []
+
+    def _racing_read(path):
+        result = real_read(path)
+        reads.append(path)
+        if len(reads) == 1:
+            # Settings Repair publishes a valid mapping the instant
+            # after the heal inspected the torn one. os.replace is how
+            # every publish path lands, so the swap is atomic.
+            staged = tmp_path / "label_descriptions.json.repair"
+            staged.write_text(json.dumps(repaired))
+            os.replace(staged, target)
+        return result
+
+    def _boom(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(models, "read_label_descriptions", _racing_read)
+    monkeypatch.setattr(models, "_download_optional_files", _boom)
+    monkeypatch.setattr(models, "_load_upstream_timm_config", _boom)
+
+    result = models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    )
+
+    assert target.exists(), "the concurrent repair's file was deleted"
+    assert json.loads(target.read_text()) == repaired
+    # The file is usable now, so the heal is done — reporting False would
+    # record a `failed` verdict for a generation that is actually healed.
+    assert result is True
+
+
+def test_ensure_label_descriptions_leaves_a_changed_torn_file_alone(
+    tmp_path, monkeypatch
+):
+    """A torn file replaced by a *different* torn file is left in place.
+
+    We only delete the artifact we inspected. Anything else belongs to a
+    writer we did not observe, and the recovery paths below stage and
+    replace regardless — so keeping it costs nothing and cannot clobber
+    a publish in flight. The next heal pass re-inspects it.
+    """
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+    target.write_text('{"Bubulcus ibis": "Cattle Eg')
+
+    real_read = models.read_label_descriptions
+    reads = []
+
+    def _racing_read(path):
+        result = real_read(path)
+        reads.append(path)
+        if len(reads) == 1:
+            staged = tmp_path / "label_descriptions.json.other"
+            staged.write_text('{"Ardea ibis": "Western Cattle Egr')
+            os.replace(staged, target)
+        return result
+
+    def _boom(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(models, "read_label_descriptions", _racing_read)
+    monkeypatch.setattr(models, "_download_optional_files", _boom)
+    monkeypatch.setattr(models, "_load_upstream_timm_config", _boom)
+
+    assert models.ensure_timm_label_descriptions(
+        str(tmp_path), _TIMM_MODEL_STR
+    ) is False
+    assert target.read_text() == '{"Ardea ibis": "Western Cattle Egr'
+
+
+def test_download_optional_files_preserves_pre_existing_on_transient_failure(
+    monkeypatch, tmp_path,
+):
+    """A Repair that hits a transient network error while re-fetching an
+    already-installed optional JSON must not delete the working copy.
+
+    The atomic-publish path in _hf_download_with_retry leaves the
+    destination intact when its ``copy2`` stage fails; the outer catch in
+    ``_download_optional_files`` used to unconditionally unlink
+    ``local_path`` afterwards, turning a working ``label_descriptions.json``
+    into a missing one on any transient blip. The pre/post signature
+    check must keep the pre-existing file when nothing was published.
+    """
+    import models
+
+    hf_subdir = "timm-eva02-large-inat21"
+    filename = "label_descriptions.json"
+    pre_existing = tmp_path / filename
+    pre_existing.write_text(
+        json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}),
+    )
+    pre_signature = models._path_signature(str(pre_existing))
+
+    def _fake_list_repo_files(repo_id, revision=None):
+        return [f"{hf_subdir}/{filename}"]
+
+    monkeypatch.setattr(
+        "huggingface_hub.list_repo_files", _fake_list_repo_files,
+    )
+
+    def _flaky_download(**kwargs):
+        raise RuntimeError("transient network failure")
+
+    monkeypatch.setattr(
+        models, "_download_and_verify_file", _flaky_download,
+    )
+
+    models._download_optional_files(
+        [filename], str(tmp_path), hf_subdir,
+        expected_hashes={}, revision=None, progress_callback=None,
+    )
+
+    assert pre_existing.exists(), (
+        "a transient RuntimeError during optional-file refresh must not "
+        "delete the previously installed copy"
+    )
+    assert models._path_signature(str(pre_existing)) == pre_signature, (
+        "the pre-existing file must be untouched, not replaced"
+    )
+    assert json.loads(pre_existing.read_text()) == {
+        "Bubulcus ibis": "Cattle Egret, Bird",
+    }
+
+
+def test_download_optional_files_removes_replacement_that_failed_verification(
+    monkeypatch, tmp_path,
+):
+    """If the download actually replaced the destination with a corrupt
+    file (VerifyError after atomic publish), the outer catch must remove
+    the corrupt replacement — not preserve it as if it were the good
+    pre-existing artifact."""
+    import model_verify
+    import models
+
+    hf_subdir = "timm-eva02-large-inat21"
+    filename = "label_descriptions.json"
+    pre_existing = tmp_path / filename
+    pre_existing.write_text(
+        json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}),
+    )
+
+    def _fake_list_repo_files(repo_id, revision=None):
+        return [f"{hf_subdir}/{filename}"]
+
+    monkeypatch.setattr(
+        "huggingface_hub.list_repo_files", _fake_list_repo_files,
+    )
+
+    def _publishes_then_fails(**kwargs):
+        # Atomic publish landed a new file, but verification decided it
+        # is corrupt. Simulate by rewriting the destination and raising.
+        local_path = os.path.join(kwargs["model_dir"], kwargs["filename"])
+        with open(local_path, "w") as f:
+            f.write("corrupt-payload")
+        # Force a fresh mtime/inode so the pre/post signature comparison
+        # sees the file as replaced even on filesystems with low mtime
+        # resolution.
+        os.utime(local_path, ns=(0, 0))
+        raise model_verify.VerifyError("corrupt after 3 attempts")
+
+    monkeypatch.setattr(
+        models, "_download_and_verify_file", _publishes_then_fails,
+    )
+
+    models._download_optional_files(
+        [filename], str(tmp_path), hf_subdir,
+        expected_hashes={}, revision=None, progress_callback=None,
+    )
+
+    assert not pre_existing.exists(), (
+        "a corrupt replacement must not be left on disk masquerading as "
+        "the pre-existing usable file"
+    )
+
+
+def test_load_label_descriptions_returns_none_for_broken_files(tmp_path):
+    """None means 'heal it'; a parsed dict (even empty) means 'usable'."""
+    import models
+
+    missing = tmp_path / "nope.json"
+    assert models.load_label_descriptions(str(missing)) is None
+    assert models.label_descriptions_usable(str(missing)) is False
+
+    torn = tmp_path / "torn.json"
+    torn.write_text('{"Bubulcus ibis": "Cattle Eg')
+    assert models.load_label_descriptions(str(torn)) is None
+
+    empty_file = tmp_path / "empty.json"
+    empty_file.write_text("")
+    assert models.load_label_descriptions(str(empty_file)) is None
+
+    not_a_dict = tmp_path / "list.json"
+    not_a_dict.write_text("[1, 2, 3]")
+    assert models.load_label_descriptions(str(not_a_dict)) is None
+
+    # An empty mapping is a complete document, not a broken one.
+    empty_map = tmp_path / "empty-map.json"
+    empty_map.write_text("{}")
+    assert models.load_label_descriptions(str(empty_map)) == {}
+    assert models.label_descriptions_usable(str(empty_map)) is True
+
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}))
+    assert models.load_label_descriptions(str(good)) == {
+        "Bubulcus ibis": "Cattle Egret, Bird"
+    }
+
+
+def test_label_descriptions_with_non_string_values_are_unusable(tmp_path):
+    """A JSON object whose values are not all strings must read as
+    "heal it", not as a usable mapping.
+
+    The classifier builds its common-name map with ``desc.rsplit(", ", 1)``.
+    A null, number, or list value parses fine as JSON, so it used to pass
+    the usable gate — then raised AttributeError/TypeError during
+    TimmClassifier construction and aborted the classify job. Worse, the
+    heal path would never repair it: the file parses, so "already
+    healed" was the verdict forever. Same "existence suppresses repair"
+    hazard as a torn write; treat a schema-invalid file the same way.
+
+    Rejected whole rather than filtered: keeping the valid half would
+    mark the artifact healed and leak raw scientific names for every
+    dropped species indefinitely.
+    """
+    import models
+
+    for name, payload in [
+        ("null.json", {"Bubulcus ibis": None}),
+        ("number.json", {"Bubulcus ibis": 42}),
+        ("list.json", {"Bubulcus ibis": ["Cattle Egret", "Bird"]}),
+        ("nested.json", {"Bubulcus ibis": {"common": "Cattle Egret"}}),
+        ("partial.json", {
+            "Bubulcus ibis": "Cattle Egret, Bird",
+            "Sturnus vulgaris": None,
+        }),
+    ]:
+        broken = tmp_path / name
+        broken.write_text(json.dumps(payload))
+        assert models.load_label_descriptions(str(broken)) is None, name
+        assert models.label_descriptions_usable(str(broken)) is False, name
+        # The signature is still reported: the caller consumed a real
+        # file state and must key any cache entry by it.
+        descs, signature = models.read_label_descriptions(str(broken))
+        assert descs is None, name
+        assert signature == (
+            broken.stat().st_size, int(broken.stat().st_mtime_ns),
+        ), name
+
+
+def test_hf_download_publishes_file_atomically(tmp_path, monkeypatch):
+    """The destination must never be visible half-written.
+
+    copy2 straight onto the destination lets a concurrent reader (the
+    background label_descriptions heal racing a TimmClassifier init)
+    json.load a partial file, and a crash mid-copy leaves a truncated
+    file behind. Copy beside it, then os.replace."""
+    import shutil as _shutil
+
+    import huggingface_hub
+    import models
+
+    cached = tmp_path / "cache" / "label_descriptions.json"
+    cached.parent.mkdir()
+    cached.write_text(json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}))
+
+    dest_dir = tmp_path / "model"
+    dest_dir.mkdir()
+    final = dest_dir / "label_descriptions.json"
+
+    monkeypatch.setattr(
+        huggingface_hub, "hf_hub_download", lambda **kw: str(cached),
+    )
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda **kw: None,
+    )
+
+    observed = {}
+    real_copy2 = _shutil.copy2
+
+    def _spy_copy2(src, dst):
+        observed["dst"] = str(dst)
+        # Mid-copy the reader watches `final`; it must not exist yet.
+        observed["final_existed_during_copy"] = final.exists()
+        return real_copy2(src, dst)
+
+    monkeypatch.setattr(models.shutil, "copy2", _spy_copy2)
+
+    out = models._hf_download_with_retry(
+        models.ONNX_REPO, "label_descriptions.json", str(dest_dir),
+    )
+
+    assert out == str(final)
+    assert observed["dst"] != str(final)
+    assert observed["final_existed_during_copy"] is False
+    assert json.loads(final.read_text()) == {
+        "Bubulcus ibis": "Cattle Egret, Bird"
+    }
+    # No temp turds left behind.
+    assert sorted(p.name for p in dest_dir.iterdir()) == [
+        "label_descriptions.json"
+    ]
+
+
+def test_hf_download_cleans_up_partial_weights_on_copy_failure(
+    tmp_path, monkeypatch
+):
+    """A failed copy leaves neither a temp file nor a partial destination,
+    so the retry loop starts from a clean slate.
+
+    Weights are copied straight into place (no staging), so the thing
+    that must be cleaned up here is the truncated destination itself."""
+    import shutil as _shutil
+
+    import huggingface_hub
+    import models
+
+    cached = tmp_path / "cache" / "model.onnx"
+    cached.parent.mkdir()
+    cached.write_bytes(b"weights")
+
+    dest_dir = tmp_path / "model"
+    dest_dir.mkdir()
+
+    monkeypatch.setattr(
+        huggingface_hub, "hf_hub_download", lambda **kw: str(cached),
+    )
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda **kw: None,
+    )
+
+    real_copy2 = _shutil.copy2
+
+    def _partial_then_fail(src, dst):
+        # Simulate a disk-full / interrupted copy: bytes land, then boom.
+        real_copy2(src, dst)
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(models.shutil, "copy2", _partial_then_fail)
+    # _hf_download_with_retry sleeps between attempts; don't pay for it.
+    import time as _time_mod
+    monkeypatch.setattr(_time_mod, "sleep", lambda s: None)
+
+    with pytest.raises(RuntimeError):
+        models._hf_download_with_retry(
+            models.ONNX_REPO, "model.onnx", str(dest_dir),
+        )
+
+    assert list(dest_dir.iterdir()) == []
+
+
+def test_hf_download_streams_weights_without_temp_copy(tmp_path, monkeypatch):
+    """Multi-GB weight artifacts must NOT be staged through a temp copy.
+
+    copy2 is a real byte copy on Windows and Linux (only APFS clones), so
+    staging would put a second full-size copy of a 3.9 GB model beside the
+    one already on disk and can fail with ENOSPC on a Repair that
+    previously fit. Nothing reads weights concurrently with a download, so
+    there is nothing to protect against."""
+    import shutil as _shutil
+
+    import huggingface_hub
+    import models
+
+    dest_dir = tmp_path / "model"
+    dest_dir.mkdir()
+
+    real_copy2 = _shutil.copy2
+    seen = []
+
+    def _spy_copy2(src, dst):
+        seen.append(str(dst))
+        return real_copy2(src, dst)
+
+    monkeypatch.setattr(models.shutil, "copy2", _spy_copy2)
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda **kw: None,
+    )
+
+    for name, blob in (
+        ("model.onnx", b"graph"),
+        ("model.onnx.data", b"weights" * 100),
+        ("tol_embeddings.npy", b"vectors" * 100),
+    ):
+        cached = tmp_path / "cache" / name
+        cached.parent.mkdir(exist_ok=True)
+        cached.write_bytes(blob)
+        monkeypatch.setattr(
+            huggingface_hub, "hf_hub_download",
+            lambda _p=str(cached), **kw: _p,
+        )
+
+        seen.clear()
+        out = models._hf_download_with_retry(
+            models.ONNX_REPO, name, str(dest_dir),
+        )
+
+        final = dest_dir / name
+        assert out == str(final)
+        # Copied straight to the final path — no second full-size copy.
+        assert seen == [str(final)], f"{name} was staged through {seen}"
+        assert final.read_bytes() == blob
+
+    # And no staging turds of any kind were left behind.
+    assert not [p.name for p in dest_dir.iterdir() if ".part-" in p.name]
+
+
+def test_hf_download_stages_metadata_through_temp(tmp_path, monkeypatch):
+    """The flip side: the small JSON metadata files a classifier can read
+    mid-heal are still staged and os.replace'd into place."""
+    import shutil as _shutil
+
+    import huggingface_hub
+    import models
+
+    dest_dir = tmp_path / "model"
+    dest_dir.mkdir()
+
+    real_copy2 = _shutil.copy2
+    seen = []
+
+    def _spy_copy2(src, dst):
+        seen.append(str(dst))
+        return real_copy2(src, dst)
+
+    monkeypatch.setattr(models.shutil, "copy2", _spy_copy2)
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda **kw: None,
+    )
+
+    for name in ("label_descriptions.json", "class_names.json",
+                 "config.json", "tokenizer.json", "tol_classes.json"):
+        cached = tmp_path / "cache" / name
+        cached.parent.mkdir(exist_ok=True)
+        cached.write_text(json.dumps({"k": name}))
+        monkeypatch.setattr(
+            huggingface_hub, "hf_hub_download",
+            lambda _p=str(cached), **kw: _p,
+        )
+
+        seen.clear()
+        out = models._hf_download_with_retry(
+            models.ONNX_REPO, name, str(dest_dir),
+        )
+
+        final = dest_dir / name
+        assert out == str(final)
+        assert seen and seen[0] != str(final), f"{name} was not staged"
+        assert seen[0].startswith(str(final) + ".part-")
+        assert json.loads(final.read_text()) == {"k": name}
+
+    assert not [p.name for p in dest_dir.iterdir() if ".part-" in p.name]
+
+
+def test_hf_download_cleans_up_temp_on_metadata_copy_failure(
+    tmp_path, monkeypatch
+):
+    """A failed metadata copy leaves the temp behind for nobody: no
+    `.part-` file, and no destination invented out of a partial write."""
+    import shutil as _shutil
+
+    import huggingface_hub
+    import models
+
+    cached = tmp_path / "cache" / "label_descriptions.json"
+    cached.parent.mkdir()
+    cached.write_text(json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}))
+
+    dest_dir = tmp_path / "model"
+    dest_dir.mkdir()
+
+    monkeypatch.setattr(
+        huggingface_hub, "hf_hub_download", lambda **kw: str(cached),
+    )
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda **kw: None,
+    )
+
+    real_copy2 = _shutil.copy2
+
+    def _partial_then_fail(src, dst):
+        real_copy2(src, dst)
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(models.shutil, "copy2", _partial_then_fail)
+    import time as _time_mod
+    monkeypatch.setattr(_time_mod, "sleep", lambda s: None)
+
+    with pytest.raises(RuntimeError):
+        models._hf_download_with_retry(
+            models.ONNX_REPO, "label_descriptions.json", str(dest_dir),
+        )
+
+    assert list(dest_dir.iterdir()) == []
+
+
+def test_download_model_skips_already_verified_files(tmp_path, monkeypatch):
+    """Repair calls download_model for the whole manifest even when only
+    one file is missing. Files already on disk whose SHA256 matches must
+    not be re-fetched — otherwise repairing a 3.9 GB model to pick up one
+    small optional file re-copies the weights for nothing."""
+    import hashlib
+
+    import model_verify
+    models, model_dir = _patch_download_model_env(tmp_path, monkeypatch)
+
+    contents = {
+        "image_encoder.onnx": b"graph-i" * 100,
+        "image_encoder.onnx.data": b"weights-i" * 1000,
+        "text_encoder.onnx": b"graph-t" * 100,
+        "text_encoder.onnx.data": b"weights-t" * 1000,
+        "tokenizer.json": b"{}",
+        "config.json": b"{}",
+    }
+    expected = {
+        name: hashlib.sha256(data).hexdigest()
+        for name, data in contents.items()
+    }
+
+    # Everything is already installed and correct except config.json,
+    # which is the one file this "Repair" actually needs to fetch.
+    model_dir.mkdir(parents=True)
+    for name, data in contents.items():
+        if name != "config.json":
+            (model_dir / name).write_bytes(data)
+
+    downloaded = []
+
+    def fake_download(repo_id, filename, local_dir, subfolder=None,
+                      progress_callback=None, revision=None):
+        downloaded.append(filename)
+        dest = os.path.join(local_dir, filename)
+        with open(dest, "wb") as f:
+            f.write(contents[filename])
+        return dest
+
+    monkeypatch.setattr(models, "_hf_download_with_retry", fake_download)
+    monkeypatch.setattr(
+        model_verify,
+        "fetch_expected_hashes",
+        lambda subdir, revision="main": expected,
+    )
+
+    models.download_model("bioclip-vit-b-16")
+
+    assert downloaded == ["config.json"]
+    # The untouched files are still intact.
+    for name, data in contents.items():
+        assert (model_dir / name).read_bytes() == data
+
+
+def test_download_model_still_refetches_corrupt_files(tmp_path, monkeypatch):
+    """The skip is hash-gated, not existence-gated: a file that is present
+    but wrong is still re-downloaded, so Repair keeps repairing."""
+    import hashlib
+
+    import model_verify
+    models, model_dir = _patch_download_model_env(tmp_path, monkeypatch)
+
+    contents = {
+        "image_encoder.onnx": b"graph-i" * 100,
+        "image_encoder.onnx.data": b"weights-i" * 1000,
+        "text_encoder.onnx": b"graph-t" * 100,
+        "text_encoder.onnx.data": b"weights-t" * 1000,
+        "tokenizer.json": b"{}",
+        "config.json": b"{}",
+    }
+    expected = {
+        name: hashlib.sha256(data).hexdigest()
+        for name, data in contents.items()
+    }
+
+    model_dir.mkdir(parents=True)
+    for name, data in contents.items():
+        (model_dir / name).write_bytes(data)
+    # One artifact got truncated on disk.
+    (model_dir / "image_encoder.onnx.data").write_bytes(b"trunc")
+
+    downloaded = []
+
+    def fake_download(repo_id, filename, local_dir, subfolder=None,
+                      progress_callback=None, revision=None):
+        downloaded.append(filename)
+        dest = os.path.join(local_dir, filename)
+        with open(dest, "wb") as f:
+            f.write(contents[filename])
+        return dest
+
+    monkeypatch.setattr(models, "_hf_download_with_retry", fake_download)
+    monkeypatch.setattr(
+        model_verify,
+        "fetch_expected_hashes",
+        lambda subdir, revision="main": expected,
+    )
+
+    models.download_model("bioclip-vit-b-16")
+
+    assert downloaded == ["image_encoder.onnx.data"]
+    assert (model_dir / "image_encoder.onnx.data").read_bytes() == (
+        contents["image_encoder.onnx.data"]
+    )
+
+
+def test_download_model_repairs_label_descriptions_from_upstream(
+    tmp_path, monkeypatch
+):
+    """Repair is the button Settings offers for a missing optional file,
+    so Repair has to be able to fix label_descriptions.json even when our
+    ONNX repo does not carry it yet — the optional loop skips files the
+    repo doesn't have, which would make Repair a permanent no-op and
+    leave predictions showing raw scientific names forever."""
+    import hashlib
+
+    import model_verify
+    models, _ = _patch_download_model_env(tmp_path, monkeypatch)
+    model_dir = tmp_path / "models" / "timm-inat21-eva02-l"
+
+    km = next(
+        m for m in models.KNOWN_MODELS if m["id"] == "timm-inat21-eva02-l"
+    )
+    contents = {name: b"x" * (11 * 1024 * 1024) for name in km["files"]}
+    expected = {
+        name: hashlib.sha256(data).hexdigest()
+        for name, data in contents.items()
+    }
+
+    def fake_download(repo_id, filename, local_dir, subfolder=None,
+                      progress_callback=None, revision=None):
+        dest = os.path.join(local_dir, filename)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(contents.get(filename, b"{}"))
+        return dest
+
+    # The ONNX repo has the required files but not the optional mapping.
+    hf_subdir = km.get("hf_subdir", km["id"])
+    _stub_hf_for_download_tests(
+        monkeypatch,
+        lambda repo_id, revision=None: {
+            f"{hf_subdir}/{n}" for n in km["files"]
+        },
+    )
+    monkeypatch.setattr(models, "_hf_download_with_retry", fake_download)
+    monkeypatch.setattr(
+        model_verify, "fetch_expected_hashes",
+        lambda subdir, revision="main": expected,
+    )
+    monkeypatch.setattr(
+        models, "_load_upstream_timm_config",
+        lambda model_str: {
+            "label_descriptions": {"Bubulcus ibis": "Cattle Egret, Bird"},
+        },
+    )
+
+    models.download_model("timm-inat21-eva02-l")
+
+    healed = model_dir / "label_descriptions.json"
+    assert healed.exists(), (
+        "Repair must fall back to the upstream model config when the ONNX "
+        "repo has no label_descriptions.json"
+    )
+    assert json.loads(healed.read_text()) == {
+        "Bubulcus ibis": "Cattle Egret, Bird"
+    }
+
+
+def test_download_model_clears_a_failed_heal_verdict(tmp_path, monkeypatch):
+    """Repair must also reset the background heal's per-installation
+    state. It skips required artifacts that already verify, so the
+    installation generation the "failed" verdict is keyed to never
+    changes — the verdict would otherwise outlive the repair the user
+    just asked for."""
+    import hashlib
+
+    import model_verify
+    import timm_classifier
+    models, _ = _patch_download_model_env(tmp_path, monkeypatch)
+
+    km = next(
+        m for m in models.KNOWN_MODELS if m["id"] == "timm-inat21-eva02-l"
+    )
+    contents = {name: b"y" * (11 * 1024 * 1024) for name in km["files"]}
+    expected = {
+        name: hashlib.sha256(data).hexdigest()
+        for name, data in contents.items()
+    }
+
+    def fake_download(repo_id, filename, local_dir, subfolder=None,
+                      progress_callback=None, revision=None):
+        dest = os.path.join(local_dir, filename)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(contents.get(filename, b"{}"))
+        return dest
+
+    hf_subdir = km.get("hf_subdir", km["id"])
+    _stub_hf_for_download_tests(
+        monkeypatch,
+        lambda repo_id, revision=None: {
+            f"{hf_subdir}/{n}" for n in km["files"]
+        },
+    )
+    monkeypatch.setattr(models, "_hf_download_with_retry", fake_download)
+    monkeypatch.setattr(
+        model_verify, "fetch_expected_hashes",
+        lambda subdir, revision="main": expected,
+    )
+    monkeypatch.setattr(
+        models, "_load_upstream_timm_config",
+        lambda model_str: {"label_descriptions": {"Bubulcus ibis": "Egret"}},
+    )
+
+    model_str = km["model_str"]
+    stale = (model_str, ("stale-generation",))
+    with timm_classifier._HEAL_LOCK:
+        timm_classifier._HEAL_STATE[stale] = "failed"
+        timm_classifier._HEAL_ATTEMPTS[stale] = timm_classifier._HEAL_MAX_ATTEMPTS
+        timm_classifier._HEAL_RETRY_AT[stale] = float("inf")
+    try:
+        models.download_model("timm-inat21-eva02-l")
+        assert stale not in timm_classifier._HEAL_STATE, (
+            "Repair must clear the failed heal verdict it cannot otherwise "
+            "invalidate"
+        )
+        assert stale not in timm_classifier._HEAL_RETRY_AT
+    finally:
+        with timm_classifier._HEAL_LOCK:
+            timm_classifier._HEAL_STATE.pop(stale, None)
+            timm_classifier._HEAL_ATTEMPTS.pop(stale, None)
+            timm_classifier._HEAL_RETRY_AT.pop(stale, None)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent atomic publication of label_descriptions.json
+# ---------------------------------------------------------------------------
+
+
+def test_staged_sibling_is_unique_per_invocation(tmp_path):
+    """Two writers staging for the same destination must not share a file.
+
+    A fixed "<dest>.tmp" gives concurrent writers one staging inode: one
+    open() truncates what the other is writing, the winner publishes a
+    torn document, and the loser fails because its pathname vanished.
+    """
+    import models
+
+    dest = tmp_path / "label_descriptions.json"
+    with models._staged_sibling(str(dest)) as a:
+        with models._staged_sibling(str(dest)) as b:
+            assert a != b
+            # Same directory, or os.replace stops being atomic.
+            assert os.path.dirname(a) == os.path.dirname(b) == str(tmp_path)
+            # mkstemp already created them, and the descriptor it opened is
+            # closed before the path is handed over: Windows refuses to
+            # os.replace a file anything still holds open.
+            assert os.path.isfile(a) and os.path.isfile(b)
+            with open(a, "w") as f:
+                f.write("a")
+            with open(b, "w") as f:
+                f.write("b")
+        assert not os.path.exists(b)
+    assert not os.path.exists(a)
+
+
+def test_staged_sibling_cleans_up_when_the_writer_fails(tmp_path):
+    """A crashed writer must not litter the model directory."""
+    import models
+
+    dest = tmp_path / "label_descriptions.json"
+    captured = {}
+    with pytest.raises(RuntimeError):
+        with models._staged_sibling(str(dest)) as tmp:
+            captured["tmp"] = tmp
+            with open(tmp, "w") as f:
+                f.write("{ partial")
+            raise RuntimeError("download died")
+    assert not os.path.exists(captured["tmp"])
+    assert list(os.listdir(tmp_path)) == []
+
+
+def test_concurrent_label_description_heals_publish_whole_json(
+    tmp_path, monkeypatch
+):
+    """A background heal and a Settings Repair can hit the upstream-config
+    fallback at the same time — Repair calls ensure_timm_label_descriptions
+    directly — so both are supported concurrent writers. Each must stage to
+    its own file: with a shared "<target>.tmp" one truncates the other's
+    inode, whoever renames first publishes a half-written document, and the
+    loser fails outright because its staging pathname is gone.
+    """
+    import contextlib
+    import threading
+
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+
+    # Deliberately different payloads (and lengths) per writer. If both
+    # wrote identical bytes, an interleaved write into a shared inode
+    # would reassemble into a valid document and hide the bug.
+    payloads = [
+        {f"Genus alpha{i}": f"Alpha Bird {i}, Bird" for i in range(400)},
+        {"Genus beta": "Beta Bird, Bird"},
+    ]
+    handed = []
+    hand_lock = threading.Lock()
+
+    def _fake_upstream(model_str):
+        with hand_lock:
+            idx = len(handed)
+            handed.append(idx)
+        return {"label_descriptions": payloads[idx]}
+
+    # The ONNX repo has no copy of this optional file, which is exactly
+    # the precondition that routes both writers into the fallback.
+    monkeypatch.setattr(
+        models, "_download_optional_files",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(models, "_load_upstream_timm_config", _fake_upstream)
+
+    # Force the two writers to overlap inside the serialization step, the
+    # window where a shared staging file does its damage.
+    barrier = threading.Barrier(2, timeout=10)
+    real_dumps = json.dumps
+
+    def _interleaved_dump(obj, fp, *args, **kwargs):
+        text = real_dumps(obj)
+        half = len(text) // 2
+        fp.write(text[:half])
+        fp.flush()
+        with contextlib.suppress(threading.BrokenBarrierError):
+            barrier.wait()
+        fp.write(text[half:])
+
+    monkeypatch.setattr(models.json, "dump", _interleaved_dump)
+
+    torn_reads = []
+    stop = threading.Event()
+
+    def _reader():
+        while not stop.is_set():
+            try:
+                raw = target.read_bytes()
+            except OSError:
+                continue
+            if not raw:
+                torn_reads.append("")
+                continue
+            try:
+                json.loads(raw.decode())
+            except (ValueError, UnicodeDecodeError):
+                torn_reads.append(raw[:80])
+
+    results = []
+    res_lock = threading.Lock()
+
+    def _heal():
+        ok = models.ensure_timm_label_descriptions(
+            str(tmp_path), _TIMM_MODEL_STR
+        )
+        with res_lock:
+            results.append(ok)
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+    writers = [threading.Thread(target=_heal) for _ in range(2)]
+    for t in writers:
+        t.start()
+    for t in writers:
+        t.join(timeout=30)
+        assert not t.is_alive()
+    stop.set()
+    reader.join(timeout=5)
+
+    # Neither writer may fail because the other took its staging file.
+    assert results == [True, True], f"a concurrent heal failed: {results}"
+    # The published file is one writer's whole document, never a blend.
+    published = json.loads(target.read_text())
+    assert published in payloads
+    # And no reader ever observed a partial/empty target.
+    assert torn_reads == [], f"observed torn label_descriptions.json: {torn_reads[:3]}"
+    # No staging turds left in the model directory.
+    leftovers = [
+        p for p in os.listdir(tmp_path)
+        if p != "label_descriptions.json"
+    ]
+    assert leftovers == [], leftovers

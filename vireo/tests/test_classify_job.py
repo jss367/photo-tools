@@ -6962,6 +6962,124 @@ def test_all_photos_cache_satisfied_rejects_stale_classifier_runtime(tmp_path):
     ) is True
 
 
+def test_all_photos_cache_satisfied_rejects_pre_synonym_classifier_runtime(
+    tmp_path, monkeypatch,
+):
+    """A run recorded before the scientific-name synonym map shipped must
+    not satisfy the cache once the map is installed.
+
+    The map changes what the classifier emits for outdated binomials
+    ("Bubulcus ibis" -> the current "Ardea ibis" taxon, with its common
+    name and full hierarchy), so a pre-synonym run and a post-synonym run
+    are semantically different output for the same model, labels,
+    taxonomy and detector runtime. If the runtime identity ignored the
+    map, this join would report the collection as already classified and
+    the reclassify that replaces the raw binomials would be skipped
+    (Codex #1560 P2).
+    """
+    import taxonomy as tax_mod
+    from classify_job import _all_photos_cache_satisfied
+    from computation_cache import (
+        classifier_model_identity,
+        classifier_runtime_fingerprint,
+        runtime_fingerprint,
+        source_input,
+    )
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detector_runtime = runtime_fingerprint({
+        "type": "detection", "model": "megadetector-v6",
+        "weights_sha256": "2" * 64, "pipeline": "detector-v1",
+    })
+    _input, det_input_fp = source_input(
+        "0" * 64, "vireo-detector-source-v1",
+    )
+    det_id = db.write_detection_batch(
+        pid, "megadetector-v6",
+        [{"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+          "confidence": 0.9, "category": "animal"}],
+        runtime_fingerprint=detector_runtime,
+        input_fingerprint=det_input_fp,
+    )[0]
+
+    labels_full = "5" * 64
+    labels_short = labels_full[:12]
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "image_encoder.onnx").write_bytes(b"exact model bytes")
+    identity = classifier_model_identity({
+        "id": "bioclip-test",
+        "model_str": "ViT-test",
+        "model_type": "bioclip",
+        "weights_path": str(model_dir),
+        "files": ["image_encoder.onnx"],
+        "source": "custom",
+    })
+
+    # The runtime an install with NO synonym map would have recorded.
+    monkeypatch.setattr(tax_mod, "_SCIENTIFIC_SYNONYMS", {})
+    pre_synonym_runtime = classifier_runtime_fingerprint(
+        identity, labels_full, detector_runtime, taxonomy_identity="1" * 64,
+    )
+    assert pre_synonym_runtime is not None
+
+    # Now the map ships. Same model, labels, taxonomy and detector.
+    monkeypatch.setattr(
+        tax_mod, "_SCIENTIFIC_SYNONYMS", {"bubulcus ibis": "Ardea ibis"},
+    )
+    post_synonym_runtime = classifier_runtime_fingerprint(
+        identity, labels_full, detector_runtime, taxonomy_identity="1" * 64,
+    )
+    assert post_synonym_runtime is not None
+    assert post_synonym_runtime != pre_synonym_runtime
+
+    db.conn.execute(
+        """INSERT INTO classifier_runs
+             (detection_id, classifier_model, labels_fingerprint,
+              runtime_fingerprint, prediction_count)
+           VALUES (?, ?, ?, ?, ?)""",
+        (det_id, "BioCLIP", labels_short, pre_synonym_runtime, 1),
+    )
+    db.add_prediction(
+        det_id, species="Bubulcus ibis", confidence=0.9, model="BioCLIP",
+        labels_fingerprint=labels_short,
+    )
+    db.conn.commit()
+
+    # The pre-synonym row must NOT satisfy the cache now that the map is
+    # present — otherwise classify short-circuits and the raw binomial
+    # stays on screen.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint=labels_short,
+        model_identity=identity, labels_fingerprint_full=labels_full,
+        taxonomy_identity="1" * 64,
+    ) is False
+
+    # A row recorded with the current map is still accepted, so this is a
+    # staleness gate and not a blanket cache disable.
+    db.conn.execute(
+        "UPDATE classifier_runs SET runtime_fingerprint = ? "
+        "WHERE detection_id = ?",
+        (post_synonym_runtime, det_id),
+    )
+    db.conn.commit()
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint=labels_short,
+        model_identity=identity, labels_fingerprint_full=labels_full,
+        taxonomy_identity="1" * 64,
+    ) is True
+
+
 def test_finalize_cached_only_respects_workspace_detector_threshold(
     tmp_path, monkeypatch,
 ):
@@ -7025,6 +7143,132 @@ def test_finalize_cached_only_respects_workspace_detector_threshold(
     # Only the above-threshold detection reaches finalization.  Without
     # the workspace threshold the count would be 2.
     assert result["already_classified"] == 1
+
+
+def test_cached_only_shortcut_rearms_timm_label_desc_heal(
+    tmp_path, monkeypatch,
+):
+    """A cached-only classify job must still fire the timm
+    label_descriptions self-heal, otherwise a hot cache stops the
+    bounded-retry state machine from ever running again.
+
+    Before the fix, the only paths that drove the state machine were
+    ``TimmClassifier.__init__`` (cache-miss construction) and
+    ``acquire_cached_classifier``'s ``notify_reuse`` hook (cache-hit
+    acquire). ``_all_photos_cache_satisfied``'s shortcut returns
+    *without* acquiring a classifier at all, so on a long-lived process
+    that only ever runs cached-only jobs, a first-probe failure during
+    an outage would leave the installation stuck on ``failed`` for the
+    rest of its life — even after connectivity recovered.
+    """
+    import classify_job as classify_job_mod
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(pid, [{
+        "box": {"x": 0, "y": 0, "w": 1, "h": 1},
+        "confidence": 0.9, "category": "animal",
+    }], detector_model="megadetector-v6")[0]
+    db.add_prediction(
+        det_id, species="Western Cattle-Egret", confidence=0.9,
+        model="timm-inat21", labels_fingerprint="fp-cached",
+    )
+    db.record_classifier_run(
+        det_id, "timm-inat21", "fp-cached", prediction_count=1,
+    )
+    coll_id = db.add_collection(
+        "c", json.dumps([{"field": "photo_ids", "value": [pid]}]),
+    )
+
+    model_dir = tmp_path / "timm-inat21-eva02-l"
+    model_dir.mkdir()
+    (model_dir / "model.onnx").write_bytes(b"onnx bytes")
+    model_str = "hf-hub:timm/eva02-test"
+    fake_timm_model = {
+        "id": "timm-inat21-eva02-l",
+        "name": "timm-inat21",
+        "model_str": model_str,
+        "model_type": "timm",
+        "weights_path": str(model_dir),
+        "downloaded": True,
+        "files": ["model.onnx"],
+        "optional_files": ["label_descriptions.json"],
+        "source": "custom",
+    }
+    monkeypatch.setattr(
+        classify_job_mod, "get_models", lambda: [fake_timm_model],
+    )
+    monkeypatch.setattr(classify_job_mod, "get_active_labels", lambda: [])
+    monkeypatch.setattr(
+        classify_job_mod, "get_active_model", lambda: fake_timm_model,
+    )
+
+    calls = []
+
+    def _spy_rearm(mstr, mdir):
+        calls.append((mstr, mdir))
+        return None
+
+    import timm_classifier as tc
+    monkeypatch.setattr(tc, "rearm_pending_label_desc_heal", _spy_rearm)
+
+    # Force the cached-only shortcut deterministically. The rearm hook
+    # is wired to fire *before* this predicate is checked, so a True
+    # return here proves the ordering is right without needing every
+    # identity axis to align.
+    finalize_called = []
+
+    def _fake_all_cache_satisfied(*a, **kw):
+        # Rearm must already have fired by the time we get here.
+        assert calls, (
+            "rearm_pending_label_desc_heal must fire before "
+            "_all_photos_cache_satisfied is consulted"
+        )
+        return True
+
+    def _fake_finalize(*a, **kw):
+        finalize_called.append(True)
+        return {"already_classified": 1, "failed": 0, "classified": 0}
+
+    monkeypatch.setattr(
+        classify_job_mod, "_all_photos_cache_satisfied",
+        _fake_all_cache_satisfied,
+    )
+    monkeypatch.setattr(
+        classify_job_mod, "_finalize_cached_only", _fake_finalize,
+    )
+
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None, labels_file=None,
+        model_id="timm-inat21-eva02-l", model_name=None,
+        grouping_window=0, similarity_threshold=0.99,
+        reclassify=False,
+    )
+    run_classify_job(_make_job(), FakeRunner(), db_path, ws, params)
+
+    assert finalize_called, (
+        "the cached-only shortcut should have been taken so this test "
+        "exercises the same branch the fix targets"
+    )
+
+    assert calls == [(model_str, str(model_dir))], (
+        "the cached-only shortcut must re-arm the timm label-descriptions "
+        "heal before returning; otherwise a transient outage on the first "
+        "probe strands the installation for the life of the process"
+    )
 
 
 def test_finalize_cached_only_includes_zero_confidence_full_image_anchor(
@@ -7354,3 +7598,384 @@ def test_run_classify_job_reconciles_group_metadata_on_reuse(
         "group metadata should be stamped by the reused-cache finalize path"
     )
     assert len(group_ids) == 1, "both frames should share one burst group"
+
+
+def test_pre_heal_classifier_run_does_not_satisfy_cache(tmp_path):
+    """A run recorded before label_descriptions.json landed must not be
+    treated as an exact match once the file is there.
+
+    TimmClassifier heals a missing label_descriptions.json on a
+    background thread during ordinary operation, and that mapping is
+    what turns a raw class id into the common name stored on a
+    prediction. Every other identity axis — required files, pinned
+    revision, label set, taxonomy, synonym map, detector runtime — is
+    unchanged across the heal, so keying only on those let the pre-heal
+    run compare equal to a post-heal one: `_all_photos_cache_satisfied`
+    reported the collection as already classified and the reclassify
+    that replaces the scientific names never ran (Codex #1560 P2).
+    """
+    from classify_job import _all_photos_cache_satisfied
+    from computation_cache import (
+        classifier_model_identity,
+        classifier_runtime_fingerprint,
+        runtime_fingerprint,
+        source_input,
+    )
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detector_runtime = runtime_fingerprint({
+        "type": "detection", "model": "megadetector-v6",
+        "weights_sha256": "2" * 64, "pipeline": "detector-v1",
+    })
+    _input, det_input_fp = source_input(
+        "0" * 64, "vireo-detector-source-v1",
+    )
+    det_id = db.write_detection_batch(
+        pid, "megadetector-v6",
+        [{"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+          "confidence": 0.9, "category": "animal"}],
+        runtime_fingerprint=detector_runtime,
+        input_fingerprint=det_input_fp,
+    )[0]
+
+    labels_full = "5" * 64
+    labels_short = labels_full[:12]
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.onnx").write_bytes(b"exact model bytes")
+    active_model = {
+        "id": "timm-inat21-eva02-l",
+        "model_str": "hf-hub:timm/eva02-test",
+        "model_type": "timm",
+        "weights_path": str(model_dir),
+        "files": ["model.onnx"],
+        "optional_files": ["label_descriptions.json"],
+        "source": "custom",
+    }
+
+    # Pre-heal: the optional mapping has not been fetched yet.
+    pre_heal_identity = classifier_model_identity(active_model)
+    pre_heal_runtime = classifier_runtime_fingerprint(
+        pre_heal_identity, labels_full, detector_runtime,
+        taxonomy_identity="1" * 64,
+    )
+    assert pre_heal_runtime is not None
+
+    # The background heal publishes the mapping.
+    (model_dir / "label_descriptions.json").write_text(
+        json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}),
+    )
+    post_heal_identity = classifier_model_identity(active_model)
+    post_heal_runtime = classifier_runtime_fingerprint(
+        post_heal_identity, labels_full, detector_runtime,
+        taxonomy_identity="1" * 64,
+    )
+    assert post_heal_runtime is not None
+    assert post_heal_runtime != pre_heal_runtime
+
+    db.conn.execute(
+        """INSERT INTO classifier_runs
+             (detection_id, classifier_model, labels_fingerprint,
+              runtime_fingerprint, prediction_count)
+           VALUES (?, ?, ?, ?, ?)""",
+        (det_id, "timm-inat21", labels_short, pre_heal_runtime, 1),
+    )
+    db.add_prediction(
+        det_id, species="Bubulcus ibis", confidence=0.9, model="timm-inat21",
+        labels_fingerprint=labels_short,
+    )
+    db.conn.commit()
+
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="timm-inat21",
+        labels_fingerprint=labels_short,
+        model_identity=post_heal_identity,
+        labels_fingerprint_full=labels_full,
+        taxonomy_identity="1" * 64,
+    ) is False
+
+    # A run recorded against the healed mapping is still reused, so this
+    # is a staleness gate and not a blanket cache disable.
+    db.conn.execute(
+        "UPDATE classifier_runs SET runtime_fingerprint = ? "
+        "WHERE detection_id = ?",
+        (post_heal_runtime, det_id),
+    )
+    db.conn.commit()
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="timm-inat21",
+        labels_fingerprint=labels_short,
+        model_identity=post_heal_identity,
+        labels_fingerprint_full=labels_full,
+        taxonomy_identity="1" * 64,
+    ) is True
+
+
+def test_all_photos_cache_satisfied_excludes_unreviewed_legacy_timm_after_heal(
+    tmp_path,
+):
+    """A legacy classifier_run for a timm model whose
+    ``label_descriptions.json`` has since transitioned from missing to
+    present must not satisfy the cache unless it was manually reviewed.
+
+    ``_all_photos_cache_satisfied`` grandfathers ``runtime_fingerprint
+    = 'legacy'`` for pre-portable rows across ordinary runtime axis
+    changes. That exception cannot survive the label-descriptions heal
+    though: the mapping is what turns a raw class id into the stored
+    common name, so an unreviewed legacy row's species is stale
+    relative to what a run made today would emit ("Bubulcus ibis" ->
+    "Western Cattle-Egret"). The manual-review branch still authorizes
+    such rows across the enrichment change, matching the runtime-change
+    pin exception (Codex #1560 P2).
+    """
+    from classify_job import _all_photos_cache_satisfied
+    from computation_cache import (
+        classifier_model_identity,
+        runtime_fingerprint,
+        source_input,
+    )
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detector_runtime = runtime_fingerprint({
+        "type": "detection", "model": "megadetector-v6",
+        "weights_sha256": "2" * 64, "pipeline": "detector-v1",
+    })
+    _input, det_input_fp = source_input(
+        "0" * 64, "vireo-detector-source-v1",
+    )
+    det_id = db.write_detection_batch(
+        pid, "megadetector-v6",
+        [{"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+          "confidence": 0.9, "category": "animal"}],
+        runtime_fingerprint=detector_runtime,
+        input_fingerprint=det_input_fp,
+    )[0]
+
+    labels_full = "5" * 64
+    labels_short = labels_full[:12]
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.onnx").write_bytes(b"exact model bytes")
+    active_model = {
+        "id": "timm-inat21-eva02-l",
+        "model_str": "hf-hub:timm/eva02-test",
+        "model_type": "timm",
+        "weights_path": str(model_dir),
+        "files": ["model.onnx"],
+        "optional_files": ["label_descriptions.json"],
+        "source": "custom",
+    }
+
+    # A legacy classifier_run (predates portable runtime tracking).
+    db.conn.execute(
+        """INSERT INTO classifier_runs
+             (detection_id, classifier_model, labels_fingerprint,
+              runtime_fingerprint, prediction_count)
+           VALUES (?, ?, ?, ?, ?)""",
+        (det_id, "timm-inat21", labels_short, "legacy", 1),
+    )
+    db.add_prediction(
+        det_id, species="Bubulcus ibis", confidence=0.9,
+        model="timm-inat21", labels_fingerprint=labels_short,
+    )
+    db.conn.commit()
+
+    pre_heal_identity = classifier_model_identity(active_model)
+    assert (
+        pre_heal_identity["label_descriptions_identity"]
+        == "no-label-descriptions"
+    )
+
+    # Pre-heal: enrichment absent, the legacy row is grandfathered.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="timm-inat21",
+        labels_fingerprint=labels_short,
+        model_identity=pre_heal_identity,
+        labels_fingerprint_full=labels_full,
+        taxonomy_identity="1" * 64,
+    ) is True
+
+    # The heal publishes the mapping.
+    (model_dir / "label_descriptions.json").write_text(
+        json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}),
+    )
+    post_heal_identity = classifier_model_identity(active_model)
+    assert (
+        post_heal_identity["label_descriptions_identity"]
+        != "no-label-descriptions"
+    )
+
+    # Post-heal: the unreviewed legacy row must no longer satisfy the
+    # cache — a fresh run would rewrite the raw binomial.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="timm-inat21",
+        labels_fingerprint=labels_short,
+        model_identity=post_heal_identity,
+        labels_fingerprint_full=labels_full,
+        taxonomy_identity="1" * 64,
+    ) is False
+
+    # A manual accept/reject on the same row keeps it authoritative
+    # across the enrichment change, matching the runtime-change pin
+    # exception (auto-match reviews do not count).
+    pred_row = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?",
+        (det_id,),
+    ).fetchone()
+    db.conn.execute(
+        """INSERT INTO prediction_review
+             (prediction_id, workspace_id, status, reviewed_at, individual)
+           VALUES (?, ?, 'accepted', datetime('now'), 'user-choice')""",
+        (pred_row["id"], ws),
+    )
+    db.conn.commit()
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="timm-inat21",
+        labels_fingerprint=labels_short,
+        model_identity=post_heal_identity,
+        labels_fingerprint_full=labels_full,
+        taxonomy_identity="1" * 64,
+    ) is True
+
+
+def test_all_photos_cache_satisfied_still_grandfathers_legacy_bioclip(tmp_path):
+    """The post-heal legacy exclusion is timm-specific.
+
+    Non-timm classifiers (bioclip, test doubles) do not carry a
+    ``label_descriptions_identity`` axis and therefore cannot experience
+    the missing-to-present enrichment transition. Their legacy rows
+    must keep being grandfathered as before.
+    """
+    from classify_job import _all_photos_cache_satisfied
+    from computation_cache import (
+        classifier_model_identity,
+        runtime_fingerprint,
+        source_input,
+    )
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detector_runtime = runtime_fingerprint({
+        "type": "detection", "model": "megadetector-v6",
+        "weights_sha256": "2" * 64, "pipeline": "detector-v1",
+    })
+    _input, det_input_fp = source_input(
+        "0" * 64, "vireo-detector-source-v1",
+    )
+    det_id = db.write_detection_batch(
+        pid, "megadetector-v6",
+        [{"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+          "confidence": 0.9, "category": "animal"}],
+        runtime_fingerprint=detector_runtime,
+        input_fingerprint=det_input_fp,
+    )[0]
+
+    labels_full = "5" * 64
+    labels_short = labels_full[:12]
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "image_encoder.onnx").write_bytes(b"exact model bytes")
+    identity = classifier_model_identity({
+        "id": "bioclip-test",
+        "model_str": "ViT-test",
+        "model_type": "bioclip",
+        "weights_path": str(model_dir),
+        "files": ["image_encoder.onnx"],
+        "source": "custom",
+    })
+    assert "label_descriptions_identity" not in identity
+
+    db.conn.execute(
+        """INSERT INTO classifier_runs
+             (detection_id, classifier_model, labels_fingerprint,
+              runtime_fingerprint, prediction_count)
+           VALUES (?, ?, ?, ?, ?)""",
+        (det_id, "BioCLIP", labels_short, "legacy", 1),
+    )
+    db.add_prediction(
+        det_id, species="Robin", confidence=0.9, model="BioCLIP",
+        labels_fingerprint=labels_short,
+    )
+    db.conn.commit()
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint=labels_short,
+        model_identity=identity, labels_fingerprint_full=labels_full,
+    ) is True
+
+
+def test_classifier_identity_uses_the_mapping_the_instance_consumed(tmp_path):
+    """Publication must be stamped with what the classifier read, not a
+    fresh disk probe.
+
+    The heal thread starts at classifier construction and can publish
+    label_descriptions.json while the job is still running. If the run
+    were stamped from a probe taken at publish time, this pre-heal run
+    would be recorded under the post-heal identity — and then every
+    later cache check would accept it as an exact match, permanently
+    skipping the reclassify that replaces its raw binomials.
+    """
+    from computation_cache import (
+        classifier_model_identity,
+        with_consumed_label_descriptions,
+    )
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.onnx").write_bytes(b"exact model bytes")
+    active_model = {
+        "id": "timm-inat21-eva02-l",
+        "model_str": "hf-hub:timm/eva02-test",
+        "model_type": "timm",
+        "weights_path": str(model_dir),
+        "files": ["model.onnx"],
+        "optional_files": ["label_descriptions.json"],
+        "source": "custom",
+    }
+
+    class _PreHealClassifier:
+        # Built before the file landed, so it emits scientific names.
+        label_descriptions_identity = "no-label-descriptions"
+
+    # The heal lands between construction and this probe.
+    (model_dir / "label_descriptions.json").write_text(
+        json.dumps({"Bubulcus ibis": "Cattle Egret, Bird"}),
+    )
+    probed = classifier_model_identity(active_model)
+    assert probed["label_descriptions_identity"] != "no-label-descriptions"
+
+    stamped = with_consumed_label_descriptions(probed, _PreHealClassifier())
+    assert stamped["label_descriptions_identity"] == "no-label-descriptions"
+    assert stamped != probed
+    # The probe result is not mutated in place — other callers keep theirs.
+    assert probed["label_descriptions_identity"] != "no-label-descriptions"
+
+    # A classifier that exposes nothing (bioclip, doubles) leaves the
+    # probed value untouched.
+    class _NoSnapshot:
+        pass
+
+    assert with_consumed_label_descriptions(probed, _NoSnapshot()) == probed

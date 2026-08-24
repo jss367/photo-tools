@@ -586,10 +586,14 @@ def export_timm_eva02(output_dir, opset, validate=False):
     label_descriptions = {}
 
     try:
-        # The model's config may have a label mapping
+        # The model's config may have a label mapping. label_names (scientific
+        # names, index = class id) and label_descriptions ({"Sturnus vulgaris":
+        # "European Starling, Bird"}) are independent keys — extract both, not
+        # either/or: TimmClassifier needs label_descriptions to display common
+        # names instead of raw binomials.
         if hasattr(model, "pretrained_cfg") and "label_names" in model.pretrained_cfg:
             class_names = model.pretrained_cfg["label_names"]
-        elif hasattr(model, "pretrained_cfg") and "label_descriptions" in model.pretrained_cfg:
+        if hasattr(model, "pretrained_cfg") and "label_descriptions" in model.pretrained_cfg:
             label_descriptions = model.pretrained_cfg["label_descriptions"]
 
         # Try to load from the HuggingFace model card

@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 
 import model_verify
 
@@ -523,6 +524,72 @@ def register_model(model_id, name, model_str, weights_path, description=""):
     _save_config(config)
 
 
+def _needs_atomic_publish(filename):
+    """True if `filename` must be published via a temp copy + os.replace.
+
+    Only the small JSON metadata files need this. They can be read by
+    another thread or process *while* a download or self-heal is writing
+    them — the background label_descriptions heal racing a
+    TimmClassifier init is the concrete case — so a reader must see
+    either the whole file or no file at all, never a torn one.
+
+    Deliberately NOT applied to the weight artifacts (.onnx, .onnx.data,
+    .npy). shutil.copy2 is a real byte copy on Windows and Linux (only
+    APFS clones cheaply), so staging those would put a second full-size
+    copy beside a model that is already on disk: a Repair of the 3.9 GB
+    BioCLIP-2.5 fetching one optional metadata file would transiently
+    need ~7.8 GB and can fail with ENOSPC where it previously fit.
+    Nothing reads weights concurrently with a download — an ONNX session
+    opens them once at classifier init, after the download has returned.
+
+    Suffix-based rather than a size threshold on purpose: the rule stays
+    legible and doesn't silently change behaviour as models grow.
+    """
+    return filename.endswith(".json")
+
+
+@contextlib.contextmanager
+def _staged_sibling(dest_path):
+    """Yield a unique staging path beside `dest_path` for atomic publish.
+
+    A fixed ``<dest>.tmp`` name is *shared* by every concurrent writer,
+    which throws away the guarantee the os.replace exists for. The
+    background label_descriptions heal and a Settings Repair are both
+    supported recovery paths and can run at the same time — Repair calls
+    ensure_timm_label_descriptions directly — so both can reach the same
+    staging pathname. One writer's open() then truncates the inode the
+    other is still filling, one of them renames that shared inode onto
+    the target and briefly publishes a partial document, and the loser
+    fails outright because its temporary pathname has disappeared.
+    mkstemp hands each invocation its own inode, so the only thing that
+    overlaps is the os.replace itself, and that is atomic.
+
+    Staged in the destination's own directory so the replace stays within
+    one filesystem (what makes it atomic) — and, for the models dir,
+    so it can't strand a copy on a different volume.
+
+    The descriptor mkstemp opens is closed before the path is yielded:
+    Windows refuses to replace a file that any handle still has open, so
+    every caller must reach os.replace with nothing open on the staging
+    file. Callers here either shutil.copy2 onto the path or open/close it
+    in a ``with`` block, both of which leave no handle behind.
+
+    Removes the staging file if it still exists on exit, so a failed
+    writer never litters the model directory. After a successful
+    os.replace there is nothing left to remove.
+    """
+    fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(dest_path) or ".",
+        prefix=f"{os.path.basename(dest_path)}.part-",
+    )
+    os.close(fd)
+    try:
+        yield tmp_path
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+
+
 def _hf_download_with_retry(repo_id, filename, local_dir,
                             subfolder=None, progress_callback=None,
                             revision=None):
@@ -625,7 +692,39 @@ def _hf_download_with_retry(repo_id, filename, local_dir,
             # as a connection failure.
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
             if cached_path != dest_path:
-                shutil.copy2(cached_path, dest_path)
+                if _needs_atomic_publish(filename):
+                    # Publish atomically. copy2 straight onto dest_path
+                    # makes the destination visible while it is still
+                    # being written, so a concurrent reader (e.g. the
+                    # background label_descriptions heal racing a
+                    # TimmClassifier init) can json.load a torn file, and
+                    # a process exit mid-copy leaves a truncated file
+                    # whose mere existence suppresses future repairs.
+                    # Copy beside it, then os.replace (atomic on POSIX
+                    # and Windows) so readers only ever see the whole
+                    # file or no file. Cheap here: these are small
+                    # metadata files — see _needs_atomic_publish for why
+                    # the multi-GB weight artifacts must not do this.
+                    # The staging name is unique per invocation (see
+                    # _staged_sibling) so two concurrent publishers of the
+                    # same file never share one staging inode.
+                    with _staged_sibling(dest_path) as tmp_path:
+                        shutil.copy2(cached_path, tmp_path)
+                        os.replace(tmp_path, dest_path)
+                else:
+                    # Weights: copy straight into place so a download
+                    # never needs 2x the model size on disk. A failed
+                    # copy still leaves nothing behind — copy2 has
+                    # already truncated any previous copy, so the
+                    # half-written remains are worthless and would only
+                    # look like a healthy artifact to the next
+                    # completeness check.
+                    try:
+                        shutil.copy2(cached_path, dest_path)
+                    except BaseException:
+                        with contextlib.suppress(OSError):
+                            os.unlink(dest_path)
+                        raise
 
             if from_cache:
                 size_mb = os.path.getsize(dest_path) / 1024 / 1024
@@ -845,6 +944,35 @@ def download_model(model_id, progress_callback=None):
             progress_callback=progress_callback,
         )
 
+    # Settings → Models offers Repair as the fix for a model that is
+    # missing its optional files, so Repair has to actually be able to
+    # fix them. For label_descriptions.json (the scientific→common name
+    # mapping) the ONNX repo copy is only one of two sources: when the
+    # repo doesn't carry the file yet, the loop above skips it silently
+    # and Repair would be a permanent no-op. ensure_timm_label_descriptions
+    # also derives the mapping from the upstream timm config, so run it
+    # here — it returns immediately when the file is already usable, and
+    # never raises.
+    model_str = km.get("model_str") or ""
+    if (
+        "label_descriptions.json" in optional_files_list
+        and model_str.startswith("hf-hub:")
+    ):
+        ensure_timm_label_descriptions(
+            model_dir, model_str, progress_callback=progress_callback,
+        )
+        # Repair means "try again". The background heal's per-installation
+        # attempt budget and backoff window are invisible to the user, and
+        # Repair leaves already-verified required artifacts alone, so the
+        # installation generation they are keyed to does not change —
+        # without an explicit reset the button cannot revive a heal that
+        # failed during an outage.
+        try:
+            import timm_classifier
+            timm_classifier.reset_label_desc_heal_state(model_str)
+        except Exception as e:  # pragma: no cover - defensive
+            log.debug("Could not reset label-description heal state: %s", e)
+
     state = _classify_model_state(model_dir, files)
     # "unverified" is an acceptable post-download state: every required file
     # is present, only the cryptographic check was skipped because the HF
@@ -901,7 +1029,33 @@ def _download_and_verify_file(
     .verify_failed sentinel write so a corrupt optional file doesn't flip
     the whole model's state to 'incomplete'. The caller is expected to
     delete the local file on failure.
+
+    A file that is already on disk and already matches its expected
+    SHA256 is left alone: no download, no copy, no rewrite.
     """
+    local_path = os.path.join(model_dir, filename)
+
+    # Repair calls download_model for the whole manifest even when it only
+    # needs one file (e.g. the newly optional label_descriptions.json).
+    # Re-fetching a 3.9 GB weight blob that is already byte-for-byte
+    # correct costs a full copy out of the HF cache for no benefit, so
+    # hash what's on disk first and skip whatever already passes.
+    # Only possible when HF gave us an expected hash — without one we
+    # can't tell "correct" from "corrupt", so those still get downloaded.
+    pre_sha = expected_hashes.get(filename)
+    if (
+        pre_sha is not None
+        and os.path.isfile(local_path)
+        and model_verify.sha256_file(local_path) == pre_sha
+    ):
+        log.info(
+            "%s already present and matches expected SHA256 — "
+            "skipping download", filename,
+        )
+        if progress_callback:
+            progress_callback(f"{filename} already verified, skipping")
+        return
+
     attempts = 0
     while True:
         _hf_download_with_retry(
@@ -918,7 +1072,6 @@ def _download_and_verify_file(
             # Not an LFS file — HF didn't give us a hash, so we can't verify.
             return
 
-        local_path = os.path.join(model_dir, filename)
         actual_sha = model_verify.sha256_file(local_path)
         if actual_sha == expected_sha:
             return
@@ -974,9 +1127,14 @@ def _download_optional_files(
     Uses list_repo_files as a preflight so that optional files not yet
     uploaded to the HF repo are skipped silently without burning the
     retry budget in _hf_download_with_retry on a 404. Any per-file
-    download or verification failure is logged and the local file is
-    removed — required files remain the source of truth for install
-    completeness, so a missing/broken optional never fails the install.
+    download or verification failure is logged; if this invocation
+    published a replacement that then failed verification, the replaced
+    file is removed. A pre-existing usable file is left in place when the
+    failure happened before it was replaced (transient network error or
+    ENOSPC in the atomic staging path) — required files remain the source
+    of truth for install completeness, so a missing/broken optional never
+    fails the install, and a Repair must never turn a working
+    ``label_descriptions.json`` into a missing one just because HF blipped.
     """
     if not filenames:
         return
@@ -1015,6 +1173,8 @@ def _download_optional_files(
             progress_callback(
                 f"Downloading optional {fi + 1}/{len(filenames)}: {filename}",
             )
+        local_path = os.path.join(model_dir, filename)
+        pre_signature = _path_signature(local_path)
         try:
             _download_and_verify_file(
                 filename=filename,
@@ -1026,15 +1186,299 @@ def _download_optional_files(
                 optional=True,
             )
         except (model_verify.VerifyError, RuntimeError) as e:
-            log.warning(
-                "Optional file %s could not be downloaded/verified (%s); "
-                "removing partial file. Model remains usable without it.",
-                filename, e,
-            )
-            local_path = os.path.join(model_dir, filename)
+            post_signature = _path_signature(local_path)
+            if pre_signature is not None and post_signature == pre_signature:
+                # Atomic staging (or the network probe before it) failed
+                # without touching the previously usable destination. Leave
+                # it in place — otherwise a Repair against a flaky network
+                # or a full disk would silently degrade a working install.
+                log.warning(
+                    "Optional file %s could not be refreshed (%s); "
+                    "keeping the previously installed copy at %s.",
+                    filename, e, local_path,
+                )
+            else:
+                log.warning(
+                    "Optional file %s could not be downloaded/verified (%s); "
+                    "removing partial file. Model remains usable without it.",
+                    filename, e,
+                )
+                with contextlib.suppress(OSError):
+                    if os.path.isfile(local_path):
+                        os.unlink(local_path)
+
+
+def _path_signature(path):
+    """``(size, mtime_ns, inode)`` identifying the current on-disk file,
+    or None when it is absent or unstat-able.
+
+    Includes ``st_ino`` because ``os.replace`` swaps the destination inode
+    even when the replacement lands with the same ``(size, mtime_ns)``
+    (``shutil.copy2`` preserves the source's mtime), so an atomic
+    republish is always visible as a change.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_size, int(st.st_mtime_ns), st.st_ino)
+
+
+def _load_upstream_timm_config(model_str):
+    """Fetch the upstream timm repo's config.json for a hf-hub model_str.
+
+    The timm config embeds ``label_descriptions`` ({"Sturnus vulgaris":
+    "European Starling, Bird"}) alongside the label names, so it can
+    reconstruct the common-name mapping even when our ONNX repo predates
+    the label_descriptions.json export.
+    """
+    from huggingface_hub import hf_hub_download
+
+    repo_id = model_str.removeprefix("hf-hub:")
+    config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
+    with open(config_path) as f:
+        return json.load(f)
+
+
+def _open_file_signature(fileobj):
+    """``(size, mtime_ns)`` taken from an already-open file's descriptor.
+
+    Read off the descriptor rather than the path so it describes the
+    bytes this reader actually got, even if the file is atomically
+    republished (Repair, self-heal) a moment later. A path stat taken
+    after the read would describe the *replacement*.
+    """
+    try:
+        st = os.fstat(fileobj.fileno())
+    except OSError:
+        return None
+    return (st.st_size, int(st.st_mtime_ns))
+
+
+def read_label_descriptions(path):
+    """Return ``(mapping_or_None, signature_or_None)``.
+
+    ``signature`` identifies the file state this call actually consumed
+    (see ``_open_file_signature``); None when the file was absent or
+    could not be stat-ed. Callers that cache the parsed result key it by
+    this signature, so an instance is never treated as having read a
+    file that only landed after it read.
+
+    See ``load_label_descriptions`` for the mapping semantics.
+    """
+    signature = None
+    try:
+        with open(path) as f:
+            signature = _open_file_signature(f)
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, None
+    except (OSError, ValueError) as e:
+        log.warning("Unusable %s (%s); will re-heal.", path, e)
+        return None, signature
+    if not isinstance(data, dict):
+        return None, signature
+    if not all(isinstance(v, str) for v in data.values()):
+        # Parseable JSON but the wrong schema: a null/number/list value
+        # would sail past this gate and then blow up on ``.rsplit`` while
+        # the classifier builds its common-name map — and because the file
+        # parses, the heal would never repair it. Same "existence
+        # suppresses repair" hazard as a truncated write, so treat it the
+        # same way and report the file as unusable. Rejected whole rather
+        # than filtered: a half-valid mapping is still a broken artifact,
+        # and silently keeping the good half would mark it healed and
+        # leak scientific names for every dropped entry forever.
+        log.warning(
+            "Unusable %s (non-string description values); will re-heal.",
+            path,
+        )
+        return None, signature
+    return data, signature
+
+
+def load_label_descriptions(path):
+    """Return the {scientific name: description} mapping, or None.
+
+    None means "not usable, heal it": missing, unreadable, not parseable
+    as a JSON object, or a JSON object whose values are not all strings.
+    Existence alone is not enough — a file truncated by a process exit
+    mid-write (or a disk-full write) still passes os.path.isfile but
+    blows up json.load, and a file that parses but carries a null or a
+    list where a description belongs blows up the classifier's
+    ``rsplit`` instead. Vireo repairs broken state itself rather than
+    asking the user to delete files, so every "do I need to heal?" check
+    goes through this.
+
+    An empty mapping is a complete document (the model simply has no
+    common names) and is returned as-is, not treated as broken.
+    """
+    return read_label_descriptions(path)[0]
+
+
+def label_descriptions_usable(path):
+    """True when `path` holds a parseable descriptions mapping."""
+    return load_label_descriptions(path) is not None
+
+
+def ensure_timm_label_descriptions(model_dir, model_str, progress_callback=None):
+    """Self-heal a missing label_descriptions.json for a timm model.
+
+    Installs that predate the label_descriptions.json export resolve
+    common names through taxonomy.json alone; when that lookup misses
+    (e.g. the 2021 class list says "Bubulcus ibis" but the current
+    taxonomy renamed it to "Ardea ibis"), the raw scientific name leaks
+    into predictions and the review UI. Try, in order:
+
+    1. nothing to do — a parseable file already exists
+    2. the vireo ONNX repo's copy (normal optional-file path)
+    3. derive it from the upstream timm repo's config.json, which embeds
+       the same {"Genus species": "Common Name, Category"} mapping
+
+    Best-effort: never raises; returns True when the file exists
+    afterwards.
+    """
+    target = os.path.join(model_dir, "label_descriptions.json")
+    descs, inspected = read_label_descriptions(target)
+    if descs is not None:
+        return True
+
+    # Present but unparseable when we looked — a torn write from an
+    # earlier build or a killed process. Drop it so `list_models` stops
+    # reporting the optional file as installed (its check is
+    # existence-based) and stops hiding the Repair affordance.
+    #
+    # Only when it is still the artifact we inspected, though. This heal
+    # runs on a background thread and can overlap the Settings Repair
+    # job, which publishes a *valid* label_descriptions.json with
+    # os.replace. Unlinking unconditionally would delete that good
+    # repair, and if our own repository/config fetches below then fail
+    # we would record the generation as `failed` and suppress every
+    # later heal — the exact "user must restart Vireo" state this whole
+    # path exists to avoid.
+    #
+    # ``inspected is None`` means the file was absent (or unstat-able),
+    # so there is nothing to drop.
+    if inspected is not None:
+        recheck, current = read_label_descriptions(target)
+        if recheck is not None:
+            # Someone published a usable mapping between our read and
+            # now. The repair already happened; report success and, above
+            # all, do not delete it.
+            return True
+        if current is not None and current == inspected:
             with contextlib.suppress(OSError):
-                if os.path.isfile(local_path):
-                    os.unlink(local_path)
+                os.unlink(target)
+        # Otherwise the file changed since we inspected it. Leave it for
+        # the next heal pass to re-inspect: both recovery paths below
+        # stage-and-replace, so keeping it costs nothing this round.
+
+    km = next(
+        (m for m in KNOWN_MODELS if m.get("model_str") == model_str), None
+    )
+    if km and "label_descriptions.json" in (km.get("optional_files") or []):
+        # _download_optional_files writes each file to
+        # os.path.join(model_dir, filename). _hf_download_with_retry
+        # already publishes .json artifacts atomically, so the target
+        # can't be seen half-written — but "complete" is not the same as
+        # "usable": HF can hand back a file that is itself truncated, and
+        # its mere existence at the published path would make every later
+        # heal's check treat it as already healed. Download into a scratch
+        # subdir on the same filesystem, validate, and only then
+        # os.replace onto the published target.
+        scratch_dir = tempfile.mkdtemp(
+            prefix=".label_desc_heal_", dir=model_dir,
+        )
+        scratch_target = os.path.join(scratch_dir, "label_descriptions.json")
+        try:
+            try:
+                _download_optional_files(
+                    ["label_descriptions.json"], scratch_dir,
+                    km.get("hf_subdir", km["id"]), {}, None, progress_callback,
+                )
+            except Exception as e:
+                log.info(
+                    "Optional label_descriptions.json download failed for %s: %s",
+                    model_str, e,
+                )
+            # Validate before publishing: a scratch file that arrived
+            # truncated or unparseable must not be promoted, or its
+            # existence at `target` would suppress every later repair.
+            if label_descriptions_usable(scratch_target):
+                try:
+                    os.replace(scratch_target, target)
+                except OSError as e:
+                    log.warning(
+                        "Could not publish healed label_descriptions.json "
+                        "for %s: %s", model_str, e,
+                    )
+                else:
+                    log.info(
+                        "Self-healed label_descriptions.json for %s from %s",
+                        model_str, ONNX_REPO,
+                    )
+                    return True
+        finally:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+
+    try:
+        config = _load_upstream_timm_config(model_str)
+    except Exception as e:
+        log.info(
+            "Could not fetch upstream timm config for %s: %s. "
+            "Predictions keep using taxonomy-based common names.",
+            model_str, e,
+        )
+        return False
+
+    descs = config.get("label_descriptions")
+    if not isinstance(descs, dict) or not descs:
+        log.info(
+            "Upstream timm config for %s has no label_descriptions; "
+            "cannot self-heal common names.", model_str,
+        )
+        return False
+
+    # Stage under a name unique to this invocation, never a shared
+    # "<target>.tmp": a background heal and a Settings Repair both reach
+    # this fallback when the ONNX repo has no copy of the file, and a
+    # shared staging inode would let one truncate the other's bytes and
+    # publish a torn document. mkstemp creates the file 0600 and leaves
+    # it that way; ~/.vireo is single-user data, so private is the right
+    # default. The handle is closed before os.replace — Windows will not
+    # replace a file that anything still has open.
+    try:
+        with _staged_sibling(target) as tmp_target:
+            with open(tmp_target, "w") as f:
+                json.dump(descs, f)
+                # Closing only hands the bytes to the page cache; a crash
+                # right after the rename would otherwise expose exactly
+                # the empty/partial target this path exists to prevent.
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_target, target)
+    except OSError as e:
+        # Losing the publish race is not a failure to heal. On Windows two
+        # os.replace calls onto one destination serialize and the loser
+        # gets PermissionError ("Access is denied") even though the file
+        # it wanted is now on disk — see the same handling in
+        # local_masks.snapshot. This is a post-condition check, not a
+        # retry loop: if a usable document is published, this heal's goal
+        # is met and reporting failure would only arm a needless retry.
+        if label_descriptions_usable(target):
+            log.info(
+                "label_descriptions.json for %s was published by a "
+                "concurrent writer while this heal was staging (%s)",
+                model_str, e,
+            )
+            return True
+        log.warning("Could not write %s: %s", target, e)
+        return False
+
+    log.info(
+        "Self-healed label_descriptions.json for %s from upstream timm "
+        "config (%d entries)", model_str, len(descs),
+    )
+    return True
 
 
 def _purge_hf_cache_file(filename, hf_subdir, revision=None):

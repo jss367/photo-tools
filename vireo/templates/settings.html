@@ -3632,7 +3632,15 @@ async function loadModels() {
         html += '<div style="font-size:11px;color:var(--warning);margin-bottom:6px;">Files are present but SHA256 could not be checked against HuggingFace' + reason + '. The model should work; click Retry verification once the network is reachable.</div>';
       } else if (hasMissingOptional) {
         var missingList = missingOptional.map(escapeHtml).join(', ');
-        html += '<div style="font-size:11px;color:var(--warning);margin-bottom:6px;">Optional files not installed: ' + missingList + '. The model works for label-list classification without them; click Repair to fetch them once available on HuggingFace (e.g. to enable Tree of Life mode).</div>';
+        // Be specific about what Repair can actually do for each artifact.
+        // label_descriptions.json has a second source (the upstream model
+        // config), so Repair fixes it now even when our ONNX repo doesn't
+        // carry it yet. The others really do have to land on HuggingFace
+        // first, and saying otherwise would promise a no-op.
+        var optionalHint = missingOptional.indexOf('label_descriptions.json') !== -1
+          ? 'Common names fall back to taxonomy lookups, so some species show their scientific name; click Repair to fetch the mapping — Vireo derives it from the upstream model config if HuggingFace does not carry it yet.'
+          : 'The model works for label-list classification without them; click Repair to fetch them once available on HuggingFace (e.g. to enable Tree of Life mode).';
+        html += '<div style="font-size:11px;color:var(--warning);margin-bottom:6px;">Optional files not installed: ' + missingList + '. ' + optionalHint + '</div>';
       }
       html += '<div style="display:flex;align-items:center;gap:8px;">';
       html += '<span style="font-size:11px;color:' + statusColor + ';">' + statusText + '</span>';

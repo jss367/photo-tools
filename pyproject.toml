@@ -62,6 +62,19 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["vireo*"]
 
+# Non-Python runtime assets. `packages.find` only discovers Python packages,
+# so without this a wheel / non-editable install ships *only* .py files:
+# `load_scientific_synonyms()` silently loads `{}` (outdated binomials such as
+# "Bubulcus ibis" stop resolving and reappear as raw model disagreements), and
+# Flask has no templates or static assets at all. `test_packaging.py` asserts
+# these patterns still cover every tracked asset.
+[tool.setuptools.package-data]
+vireo = [
+    "data/**/*.json",
+    "templates/**/*.html",
+    "static/**/*",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests", "vireo/tests"]
 markers = ["e2e: end-to-end browser tests (require Playwright)"]

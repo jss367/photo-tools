@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import csv
 import gzip
+import hashlib
 import io
 import json
 import logging
@@ -45,6 +46,93 @@ _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 
 class DownloadCancelled(Exception):
     """Raised when should_cancel() asked us to stop."""
+
+
+# Old scientific name (lowercase) -> current accepted scientific name.
+# taxonomy.json indexes only currently-accepted names, but classifier class
+# lists are frozen at training time (iNat21 is 2021 vintage), so renamed taxa
+# ("Bubulcus ibis" -> "Ardea ibis") would otherwise miss every lookup and
+# leak raw binomials into predictions and needless review conflicts. The map
+# ships with the app (scripts/build_taxonomy_synonyms.py regenerates it) and
+# is consulted only after direct lookups miss.
+SCIENTIFIC_SYNONYMS_PATH = os.path.join(
+    os.path.dirname(__file__), "data", "scientific_name_synonyms.json"
+)
+_SCIENTIFIC_SYNONYMS = None
+_scientific_synonyms_lock = threading.Lock()
+# (loaded map object, digest) — see scientific_synonyms_identity().
+_SCIENTIFIC_SYNONYMS_IDENTITY = None
+
+
+def load_scientific_synonyms():
+    """Load the packaged scientific-name synonym map (cached per process).
+
+    Returns {} when the data file is missing or unreadable — synonym
+    resolution is an enhancement, never a load-time failure.
+    """
+    global _SCIENTIFIC_SYNONYMS
+    if _SCIENTIFIC_SYNONYMS is not None:
+        return _SCIENTIFIC_SYNONYMS
+    with _scientific_synonyms_lock:
+        if _SCIENTIFIC_SYNONYMS is not None:
+            return _SCIENTIFIC_SYNONYMS
+        try:
+            with open(SCIENTIFIC_SYNONYMS_PATH) as f:
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                raise ValueError("synonym file is not a JSON object")
+        except (OSError, ValueError) as e:
+            # Loud enough to diagnose, not fatal: name the path and the
+            # likeliest cause. An empty map disables the whole synonym fix
+            # (raw binomials and false model disagreements come back) with
+            # no other symptom, so a bare "unavailable" is a black box.
+            log.warning(
+                "Scientific-name synonyms unavailable at %s (%s); outdated "
+                "binomials such as 'Bubulcus ibis' will not resolve to their "
+                "current names. In an installed build this means the data "
+                "file was not packaged — check [tool.setuptools.package-data] "
+                "in pyproject.toml.",
+                SCIENTIFIC_SYNONYMS_PATH, e,
+            )
+            loaded = {}
+        _SCIENTIFIC_SYNONYMS = loaded
+    return _SCIENTIFIC_SYNONYMS
+
+
+def scientific_synonyms_identity():
+    """Content identity of the synonym map actually backing lookups.
+
+    ``Taxonomy.lookup`` falls back to this map, so the map is part of
+    what a classifier run *means*: the same model and taxonomy.json can
+    emit "Bubulcus ibis" with no map installed and "Cattle Egret" (plus
+    the full hierarchy) once it is. Anything that identifies a run's
+    output enrichment therefore has to include this alongside the
+    taxonomy digest, or a pre-synonym run compares equal to a
+    post-synonym one and the cache skips the work that would fix the
+    raw binomials (Codex #1560 P2).
+
+    Derived from the loaded mapping rather than the file bytes so the
+    identity describes what lookups will actually use: a missing or
+    malformed file loads as ``{}`` and yields the ``"no-synonyms"``
+    sentinel, which is exactly the no-enrichment case. Memoized against
+    the loaded map object, so it recomputes if the map is reloaded or
+    replaced (tests monkeypatch it) but costs nothing on the hot path.
+    """
+    global _SCIENTIFIC_SYNONYMS_IDENTITY
+    synonyms = load_scientific_synonyms()
+    cached = _SCIENTIFIC_SYNONYMS_IDENTITY
+    if cached is not None and cached[0] is synonyms:
+        return cached[1]
+    if not synonyms:
+        digest = "no-synonyms"
+    else:
+        payload = json.dumps(
+            {str(k).lower(): str(v) for k, v in synonyms.items()},
+            sort_keys=True, separators=(",", ":"),
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    _SCIENTIFIC_SYNONYMS_IDENTITY = (synonyms, digest)
+    return digest
 
 
 # `Content-Range: bytes */<total>` — the header a 416 response uses to tell
@@ -884,6 +972,14 @@ class Taxonomy:
         result = self._by_scientific.get(key)
         if result:
             return result
+
+        # Outdated binomial? Resolve through the shipped synonym map
+        # (e.g. "Bubulcus ibis" -> current entry for "Ardea ibis").
+        current_name = load_scientific_synonyms().get(key)
+        if current_name:
+            result = self._by_scientific.get(current_name.lower())
+            if result:
+                return result
 
         # Fuzzy: try normalized lookup (handles hyphens, e.g. "scrub jay" vs "scrub-jay")
         return self._by_common_normalized.get(self._normalize(name))

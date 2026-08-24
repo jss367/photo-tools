@@ -980,6 +980,16 @@ function normalizedSpecies(value) {
   return String(value || '').trim().toLowerCase();
 }
 
+function predictionIdentity(pred) {
+  // The server resolves each prediction to a taxonomy-backed key
+  // (canonical_species), so two models naming the same taxon differently —
+  // "Western Cattle-Egret" vs the outdated binomial "Bubulcus ibis" — group
+  // as agreement instead of a false model conflict. Fall back to normalized
+  // text for payloads without the field.
+  if (pred && pred.canonical_species) return pred.canonical_species;
+  return normalizedSpecies(pred && pred.species);
+}
+
 function usablePrediction(pred) {
   return pred && pred.status !== 'rejected';
 }
@@ -1062,15 +1072,34 @@ function subjectSignal(subject, photoId, subjectIndex) {
     var best = bestSubjectPredictionForModel(subject, model);
     if (!best) return;
     var conf = best.confidence || 0;
-    topPreds.push({model: model, species: best.species || '', confidence: conf, pred: best});
+    topPreds.push({
+      model: model,
+      species: best.species || '',
+      // Server-resolved display name: the taxonomy's preferred common
+      // (or current scientific) name for this prediction's taxon. Falls
+      // back to the raw species when nothing resolves. Consensus groups
+      // key on this so the group's displayed name doesn't depend on
+      // which model was visited first — otherwise a persisted outdated
+      // binomial like "Bubulcus ibis" would leak into the summary even
+      // though a later model called it "Western Cattle-Egret".
+      display: best.canonical_display || best.species || '',
+      identity: predictionIdentity(best),
+      confidence: conf,
+      pred: best,
+    });
     maxConfidence = Math.max(maxConfidence, conf);
     minConfidence = minConfidence === null ? conf : Math.min(minConfidence, conf);
   });
 
   var speciesGroups = {};
   topPreds.forEach(function(item) {
-    var key = normalizedSpecies(item.species);
-    if (!speciesGroups[key]) speciesGroups[key] = {species: item.species, count: 0, confidence: 0};
+    var key = item.identity;
+    if (!speciesGroups[key]) {
+      speciesGroups[key] = {species: item.display, count: 0, confidence: 0};
+    } else if (!speciesGroups[key].species && item.display) {
+      // First member had an empty display; adopt the first non-empty one.
+      speciesGroups[key].species = item.display;
+    }
     speciesGroups[key].count += 1;
     speciesGroups[key].confidence += item.confidence;
   });
@@ -1083,7 +1112,7 @@ function subjectSignal(subject, photoId, subjectIndex) {
   var disagreementScore = 0;
   for (var i = 0; i < topPreds.length; i++) {
     for (var j = i + 1; j < topPreds.length; j++) {
-      if (normalizedSpecies(topPreds[i].species) === normalizedSpecies(topPreds[j].species)) continue;
+      if (topPreds[i].identity === topPreds[j].identity) continue;
       var pairScore = Math.min(topPreds[i].confidence || 0, topPreds[j].confidence || 0) * 100;
       if (!disagreementPair || pairScore > disagreementScore) {
         disagreementPair = [topPreds[i], topPreds[j]];
@@ -1256,9 +1285,11 @@ function photoSignal(photo) {
   var maxConfidence = 0;
   var minConfidence = null;
   var disagreementPair = null;
+  var disagreementSubject = null;
   var modelDisagreementScore = 0;
   var consensusSpecies = '';
   var consensusCount = 0;
+  var consensusSubject = null;
   var maxTopPredictionCount = 0;
   var maxUniqueSpecies = 0;
   var additionalCount = 0;
@@ -1278,10 +1309,12 @@ function photoSignal(photo) {
     if (subjectSignalValue.consensus_count > consensusCount) {
       consensusCount = subjectSignalValue.consensus_count;
       consensusSpecies = subjectSignalValue.consensus_species;
+      consensusSubject = index;
     }
     if (subjectSignalValue.model_disagreement_score > modelDisagreementScore) {
       modelDisagreementScore = subjectSignalValue.model_disagreement_score;
       disagreementPair = subjectSignalValue.model_disagreement_pair;
+      disagreementSubject = index;
     }
     if (status.category === 'additional') additionalCount += 1;
     if (status.category !== 'additional') {
@@ -1306,12 +1339,30 @@ function photoSignal(photo) {
     keyword_support_score: keywordSupportScore,
     consensus_species: consensusSpecies,
     consensus_count: consensusCount,
+    consensus_subject: consensusSubject,
     additional_subject_count: additionalCount,
     max_confidence: maxConfidence,
     min_confidence: minConfidence,
   };
+  // Label rolled-up signals with the subject they came from: the strongest
+  // disagreement and the strongest consensus are often *different* subjects
+  // of the same photo, and an unlabeled "X vs Y · Consensus: Z" reads as a
+  // contradiction.
+  var multiSubject = assessment.subjects.length > 1;
+  var disagreementPrefix = multiSubject && disagreementSubject !== null
+    ? 'Subject ' + (disagreementSubject + 1) + ': ' : '';
   signal.model_disagreement_label = disagreementPair
-    ? disagreementPair[0].species + ' vs ' + disagreementPair[1].species
+    // Same rule as the consensus group: name the taxon, not the raw
+    // string one model persisted. "Bubulcus ibis vs Blue Jay" leaks the
+    // outdated binomial into the disagreement note and pill tooltip
+    // exactly as the consensus label used to.
+    ? disagreementPrefix + (disagreementPair[0].display || disagreementPair[0].species) +
+      ' vs ' + (disagreementPair[1].display || disagreementPair[1].species)
+    : '';
+  signal.consensus_label = consensusCount >= 2 && consensusSpecies
+    ? (multiSubject && consensusSubject !== null
+        ? 'Subject ' + (consensusSubject + 1) + ': ' : '')
+      + consensusCount + ' models agree on ' + consensusSpecies
     : '';
   signal.keyword_disagreement_label = keywordConflictCount
     ? keywordConflictCount + ' model conflict' + (keywordConflictCount === 1 ? '' : 's')
@@ -1345,15 +1396,24 @@ function renderSignalCell(photo) {
       ' additional species suggestion' + (signal.additional_subject_count === 1 ? '' : 's') + '</span>');
   }
   if (signal.model_disagreement_score > 0) {
-    pills.push('<span class="signal-pill hot" title="' + escapeAttr(signal.model_disagreement_label) +
-      '">Models ' + Math.round(signal.model_disagreement_score) + '</span>');
+    // The score is the weaker side's confidence — a disagreement is only as
+    // strong as the least-confident model in the pair.
+    pills.push('<span class="signal-pill hot" title="' + escapeAttr(
+        signal.model_disagreement_label +
+        ' — strength is the less-confident model’s ' +
+        Math.round(signal.model_disagreement_score) + '%') +
+      '">Models disagree ' + Math.round(signal.model_disagreement_score) + '%</span>');
   }
   if (signal.keyword_conflict_count > 0) {
-    pills.push('<span class="signal-pill hot" title="Cumulative confidence from model predictions that conflict with the current species keyword">' +
-      'Keyword ' + Math.round(signal.keyword_conflict_score) + '</span>');
+    pills.push('<span class="signal-pill hot" title="' + escapeAttr(
+        signal.keyword_conflict_count + ' model prediction' +
+        (signal.keyword_conflict_count === 1 ? '' : 's') +
+        ' conflict with the current species keyword (strongest at ' +
+        Math.round((signal.max_keyword_conflict_confidence || 0) * 100) + '%)') +
+      '">' + signal.keyword_conflict_count + ' vs keyword</span>');
   }
   if (signal.consensus_count >= 2) {
-    pills.push('<span class="signal-pill match" title="' + escapeAttr(signal.consensus_species) +
+    pills.push('<span class="signal-pill match" title="' + escapeAttr(signal.consensus_label) +
       '">' + signal.consensus_count + ' agree</span>');
   }
   if (signal.missing_visible_model_count > 0) {
@@ -1369,7 +1429,7 @@ function renderSignalCell(photo) {
       detail.push('Subject ' + (index + 1) + ': ' + status.signal.consensus_species);
     }
   });
-  if (signal.consensus_count >= 2 && signal.consensus_species) detail.push('Consensus: ' + signal.consensus_species);
+  if (signal.consensus_label) detail.push(signal.consensus_label);
   return '<div class="signal-list">' + pills.join('') + '</div>' +
     (detail.length ? '<div class="signal-note">' + escapeHtml(detail.join(' · ')) + '</div>' : '');
 }

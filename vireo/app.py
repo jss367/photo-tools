@@ -17200,6 +17200,113 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         edit_recipes_by_photo = db.get_photo_edit_recipes(photo_ids)
         taxonomy = load_local_taxonomy()
 
+        resolved_name_cache = {}
+
+        def resolved_names(raw_species):
+            """``(comparison_name, stored_name)`` for one raw model label.
+
+            ``resolve_species_display_name``'s last resort scans every
+            species keyword to detect the case convention, and a collection
+            can carry tens of thousands of predictions spread over a handful
+            of distinct labels — memoize per label so that scan happens once
+            each instead of once per prediction.
+
+            The first element is the default resolution the keyword
+            comparison needs: it must agree with the spelling
+            ``add_keyword`` would land on. The second skips the
+            case-convention invention, so it is only ever a spelling some
+            keyword row actually holds or the model's own label — the only
+            two things safe to show a user as a name.
+            """
+            key = raw_species or ""
+            cached = resolved_name_cache.get(key)
+            if cached is None:
+                cached = (
+                    db.resolve_species_display_name(raw_species),
+                    db.resolve_species_display_name(
+                        raw_species, apply_case_convention=False,
+                    ),
+                )
+                resolved_name_cache[key] = cached
+            return cached
+
+        def canonical_species_key(raw_species, db_species):
+            """One identity key per taxon, however a model spelled it.
+
+            Different models name the same taxon differently ("Western
+            Cattle-Egret" vs the outdated binomial "Bubulcus ibis"), and
+            the ID Conflicts page must not read that as a model
+            disagreement. Resolve each candidate name through the taxonomy
+            (synonym-aware) to a taxon id.
+
+            When nothing resolves — no local taxonomy, or neither
+            spelling indexed — fall back to normalized text, preferring
+            ``db_species``. That is ``resolve_species_display_name``'s
+            output, which collapses a hierarchy alias onto its root
+            keyword ("Desert Verdin" -> "Verdin"); the keyword comparison
+            right above already treats those as one species, so keying
+            off the raw spelling here would report a disagreement the
+            rest of the page contradicts. Casing is irrelevant to the
+            key, so the resolver's case-convention last resort cannot
+            leak through this path.
+            """
+            for candidate in (raw_species, db_species):
+                if candidate and taxonomy is not None:
+                    taxon = taxonomy.lookup(candidate)
+                    if taxon and taxon.get("taxon_id") is not None:
+                        return f"taxon:{taxon['taxon_id']}"
+            for candidate in (db_species, raw_species):
+                if candidate:
+                    return str(candidate).strip().lower()
+            return ""
+
+        def canonical_display_name(raw_species, db_species):
+            """Taxonomy-preferred display name that travels with each prediction.
+
+            The ID Conflicts page groups predictions by ``canonical_species``,
+            but the group's *displayed* name would otherwise be whichever raw
+            prediction the first (alphabetical) model happened to store — so
+            a persisted outdated binomial like "Bubulcus ibis" leaks into the
+            consensus and multi-subject summaries even though the server
+            resolved the taxon. Return the taxonomy's preferred common name
+            (falling back to the current scientific name) whenever any
+            candidate resolves.
+
+            When the taxonomy misses, the identity key above falls back to
+            the DB-canonical name, so two models can land in one group while
+            spelling the taxon differently ("Desert Verdin" and its root
+            "Verdin"). Prefer that same name here so the group's label is
+            the taxon the catalog agrees on rather than whichever model
+            sorted first alphabetically.
+
+            ``db_species`` must therefore be the
+            ``apply_case_convention=False`` resolution, which is only ever a
+            spelling some keyword row actually holds or else the caller's
+            own name. The default resolution would instead invent one by
+            applying the catalog's keyword-case convention to a name it has
+            never seen ("Bubulcus ibis" -> "Bubulcus Ibis") — right for
+            predicting where ``add_keyword`` lands, but a spelling neither
+            the model nor the catalog ever said, so it must not reach a
+            user-facing label. Taking the non-inventing resolution makes
+            that path unreachable from here structurally, rather than
+            leaving the display to detect the rewrite after the fact (which
+            cannot tell an invented re-casing from a stored row that differs
+            from the model's spelling only by case).
+            """
+            for candidate in (raw_species, db_species):
+                if candidate and taxonomy is not None:
+                    taxon = taxonomy.lookup(candidate)
+                    if taxon and taxon.get("taxon_id") is not None:
+                        return (
+                            taxon.get("common_name")
+                            or taxon.get("scientific_name")
+                            or str(candidate).strip()
+                        )
+            for candidate in (db_species, raw_species):
+                if candidate:
+                    return str(candidate).strip()
+            return ""
+
         def summarize_photo(row):
             row_keys = row.keys()
             def row_bool(key):
@@ -17295,7 +17402,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # ``"Verdin" != "Desert Verdin"``. Route the prediction label
             # through the same DB-side resolver so it agrees with the
             # canonical species spellings we already returned.
-            comparison_prediction = db.resolve_species_display_name(d["species"])
+            comparison_prediction, stored_prediction = resolved_names(
+                d["species"]
+            )
             comparison = compare_prediction_to_keywords(
                 comparison_prediction,
                 species_by_photo.get(pid, []),
@@ -17305,6 +17414,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "id": d["id"],
                 "detection_id": d["detection_id"],
                 "species": d["species"],
+                "canonical_species": canonical_species_key(
+                    d["species"], comparison_prediction,
+                ),
+                "canonical_display": canonical_display_name(
+                    d["species"], stored_prediction,
+                ),
                 "confidence": d["confidence"],
                 "status": d["status"],
                 "category": comparison["category"],

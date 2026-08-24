@@ -4255,9 +4255,22 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 raise
 
             try:
-                from computation_cache import classifier_model_identity, fingerprint
+                from computation_cache import (
+                    classifier_model_identity,
+                    fingerprint,
+                    with_consumed_label_descriptions,
+                )
 
                 portable_model_identity = classifier_model_identity(active_model)
+                # Stamp the identity with the label_descriptions.json the
+                # constructed classifier actually read, not what the disk
+                # shows now: TimmClassifier's background heal publishes
+                # that file during normal operation and can land between
+                # the classifier's read and this probe. See
+                # computation_cache.with_consumed_label_descriptions.
+                portable_model_identity = with_consumed_label_descriptions(
+                    portable_model_identity, clf,
+                )
                 if fp_full is None and use_tol and portable_model_identity:
                     fp_full = fingerprint({
                         "label_space": "tree-of-life",

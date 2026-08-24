@@ -96,6 +96,16 @@ class _Handle:
         self._value = value
         self._released = False
 
+    @property
+    def value(self):
+        """The loaded value, without entering the context manager.
+
+        Lets callers that wrap ``acquire`` post-process the instance
+        (e.g. ``acquire_cached_classifier`` firing a classifier's
+        ``notify_reuse`` hook) without reaching into ``_value``.
+        """
+        return self._value
+
     def __enter__(self):
         return self._value
 

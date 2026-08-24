@@ -196,6 +196,265 @@ def test_absent_optional_files_do_not_bloat_the_fingerprint(tmp_path):
     assert baseline == with_optional
 
 
+def test_optional_files_snapshot_prevents_pre_heal_instance_reuse(tmp_path):
+    """Regression: an async heal that lands during construction must
+    not rekey the pre-heal classifier under the healed fingerprint.
+
+    Before this fix, ``acquire_cached_classifier``'s ``post_load_key``
+    recomputed the fingerprint from a fresh disk stat, so
+    ``TimmClassifier``'s background ``label_descriptions.json`` heal
+    completing while the ONNX session was still loading would rekey the
+    stale pre-heal instance — the one that had already read the missing
+    file as empty — under the healed fingerprint. Every later acquirer
+    with that same healed fingerprint would then reuse the stale
+    classifier, leaking raw scientific names indefinitely.
+
+    The instance now records the state it actually consumed under
+    ``optional_files_snapshot``; ``post_load_key`` keys the entry by
+    that snapshot so a heal that landed underneath us is invisible to
+    the pre-heal fingerprint, and the next acquire — whose fingerprint
+    includes the healed file — is a cache miss.
+    """
+    import os as _os
+
+    reset_default_cache_for_tests()
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "text_encoder.onnx").write_bytes(b"weights")
+    (model_dir / "config.json").write_bytes(b"config")
+
+    required = ["text_encoder.onnx", "config.json"]
+    optional = ["label_descriptions.json"]
+
+    class _Instance:
+        def __init__(self, consumed_label_desc):
+            # ``None`` -- the optional file was not consumed at
+            # construction (e.g. absent or unparseable when we read
+            # it). A stat tuple -- the file was read successfully.
+            self.optional_files_snapshot = {
+                "label_descriptions.json": consumed_label_desc,
+            }
+
+    def _factory_that_heals_mid_construction():
+        # Simulate: instance reads label_descriptions.json (missing),
+        # then a background heal publishes it before we return.
+        instance = _Instance(None)
+        (model_dir / "label_descriptions.json").write_bytes(b"healed")
+        return instance
+
+    try:
+        pre_heal = acquire_cached_classifier(
+            model_type="timm",
+            model_str="timm-a",
+            weights_path=str(model_dir),
+            labels=["bird"],
+            factory=_factory_that_heals_mid_construction,
+            files=required,
+            optional_files=optional,
+        )
+        try:
+            assert (model_dir / "label_descriptions.json").exists(), (
+                "the fake heal must have published the file"
+            )
+
+            calls = []
+
+            def _second_factory():
+                calls.append(1)
+                stat = _os.stat(model_dir / "label_descriptions.json")
+                return _Instance((stat.st_size, int(stat.st_mtime_ns)))
+
+            post_heal = acquire_cached_classifier(
+                model_type="timm",
+                model_str="timm-a",
+                weights_path=str(model_dir),
+                labels=["bird"],
+                factory=_second_factory,
+                files=required,
+                optional_files=optional,
+            )
+            try:
+                assert calls == [1], (
+                    "post-heal acquire must build a fresh classifier "
+                    "instead of reusing the pre-heal instance keyed by "
+                    "a healed fingerprint it never actually consumed"
+                )
+                assert pre_heal.__enter__() is not post_heal.__enter__()
+            finally:
+                post_heal.release()
+        finally:
+            pre_heal.release()
+    finally:
+        reset_default_cache_for_tests()
+
+
+def test_missing_optional_files_snapshot_falls_back_to_disk(tmp_path):
+    """Classifiers with no ``optional_files_snapshot`` (bioclip and
+    friends without an async heal) keep the disk-based post_load_key
+    behavior — so a Repair that fills in an optional artifact still
+    invalidates the pre-Repair cache entry."""
+    reset_default_cache_for_tests()
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "text_encoder.onnx").write_bytes(b"weights")
+    (model_dir / "config.json").write_bytes(b"config")
+
+    required = ["text_encoder.onnx", "config.json"]
+    optional = ["label_descriptions.json"]
+
+    calls = []
+
+    class _Legacy:
+        pass
+
+    def _factory():
+        calls.append(1)
+        return _Legacy()
+
+    try:
+        first = acquire_cached_classifier(
+            model_type="timm",
+            model_str="timm-a",
+            weights_path=str(model_dir),
+            labels=["bird"],
+            factory=_factory,
+            files=required,
+            optional_files=optional,
+        )
+        # Repair lands the optional artifact between acquires.
+        (model_dir / "label_descriptions.json").write_bytes(b"descriptions")
+        second = acquire_cached_classifier(
+            model_type="timm",
+            model_str="timm-a",
+            weights_path=str(model_dir),
+            labels=["bird"],
+            factory=_factory,
+            files=required,
+            optional_files=optional,
+        )
+        try:
+            assert calls == [1, 1], (
+                "instances without a snapshot fall back to disk-based "
+                "fingerprinting; Repair still invalidates the entry"
+            )
+        finally:
+            second.release()
+        first.release()
+    finally:
+        reset_default_cache_for_tests()
+
+
+def test_acquire_calls_notify_reuse_on_every_acquire(tmp_path):
+    """Regression for the "bounded retry unreachable from cache hits" gap.
+
+    ``TimmClassifier``'s ``label_descriptions.json`` self-heal is
+    spawned from ``__init__``, but the process-wide ``ModelCache``
+    reuses the constructed instance across later classify jobs without
+    re-entering ``__init__``. If the first probe fails while HF is
+    unreachable, no later job would ever re-arm the bounded retry —
+    scientific names would leak indefinitely even after connectivity
+    returns.
+
+    ``acquire_cached_classifier`` now invokes ``instance.notify_reuse()``
+    on every acquire so the classifier's own retry state machine runs
+    from the acquisition path, not just the factory path. This test
+    proves that hook fires on both cache-miss and cache-hit acquires.
+    """
+    reset_default_cache_for_tests()
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "text_encoder.onnx").write_bytes(b"weights")
+    (model_dir / "config.json").write_bytes(b"config")
+
+    required = ["text_encoder.onnx", "config.json"]
+
+    class _Instance:
+        def __init__(self):
+            self.reuse_calls = 0
+
+        def notify_reuse(self):
+            self.reuse_calls += 1
+
+    factory_calls = []
+
+    def _factory():
+        factory_calls.append(1)
+        return _Instance()
+
+    try:
+        first = acquire_cached_classifier(
+            model_type="bioclip",
+            model_str="model-a",
+            weights_path=str(model_dir),
+            labels=["bird"],
+            factory=_factory,
+            files=required,
+        )
+        try:
+            instance = first.__enter__()
+            assert factory_calls == [1]
+            assert instance.reuse_calls == 1, (
+                "notify_reuse must fire on cache miss too"
+            )
+
+            second = acquire_cached_classifier(
+                model_type="bioclip",
+                model_str="model-a",
+                weights_path=str(model_dir),
+                labels=["bird"],
+                factory=_factory,
+                files=required,
+            )
+            try:
+                assert factory_calls == [1], (
+                    "same fingerprint must be a cache hit — the factory "
+                    "does not run a second time"
+                )
+                assert second.__enter__() is instance
+                assert instance.reuse_calls == 2, (
+                    "the hook must also fire on cache hit — otherwise "
+                    "instance-owned bounded retries never re-arm"
+                )
+            finally:
+                second.release()
+        finally:
+            first.release()
+    finally:
+        reset_default_cache_for_tests()
+
+
+def test_acquire_survives_a_notify_reuse_that_raises(tmp_path):
+    """A crashing ``notify_reuse`` on a shared classifier must not brick
+    every acquirer. The hook is best-effort background bookkeeping; it
+    is not on the classify path's data flow, so an exception from it is
+    logged and swallowed."""
+    reset_default_cache_for_tests()
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "text_encoder.onnx").write_bytes(b"weights")
+
+    class _Instance:
+        def notify_reuse(self):
+            raise RuntimeError("hook exploded")
+
+    try:
+        handle = acquire_cached_classifier(
+            model_type="bioclip",
+            model_str="model-a",
+            weights_path=str(model_dir),
+            labels=["bird"],
+            factory=_Instance,
+            files=["text_encoder.onnx"],
+        )
+        try:
+            # The value is still delivered; the hook's failure is isolated.
+            assert isinstance(handle.__enter__(), _Instance)
+        finally:
+            handle.release()
+    finally:
+        reset_default_cache_for_tests()
+
+
 def test_shared_classifier_cache_preserves_authoritative_label_order(tmp_path):
     reset_default_cache_for_tests()
     model_dir = tmp_path / "model"

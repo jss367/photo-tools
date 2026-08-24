@@ -26,7 +26,7 @@ def test_compare_keyword_conflict_filter_includes_non_top_predictions(live_serve
     row = page.locator(f'tr[data-photo-id="{photo_id}"]')
     expect(row).to_be_visible()
     expect(row).to_contain_text("Cooper's Hawk")
-    expect(row.locator(".signal-pill.hot")).to_contain_text("Keyword")
+    expect(row.locator(".signal-pill.hot")).to_contain_text("vs keyword")
 
 
 def test_compare_page_shows_keyword_workflow(live_server, page):

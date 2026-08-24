@@ -3418,25 +3418,26 @@ def test_original_cache_hit_survives_working_copy_eviction_race(
     )
     db.conn.commit()
 
-    # Simulate the race: after _trusted_full_res_working_copy_path opens
-    # the working copy to read its dimensions, quota eviction unlinks the
-    # file before send_file can stream it. Hooking the dimension helper
-    # keeps the trusted-path validation succeeding — the PIL context
-    # manager still holds a fd for the size read — while removing the
-    # canonical path so the fix's own open() must fall through.
-    real_size = app_module._image_size_after_exif_orientation
+    # Simulate the race on entry to the guarded revalidation. At that point
+    # _trusted_full_res_working_copy_path has returned and closed its PIL
+    # handle, but send_file has not opened the path. Deleting while the PIL
+    # handle is still open is not portable: Windows correctly refuses that
+    # unlink, so the guard boundary is the deterministic cross-platform gap.
+    real_guard = app_module.working_copy_publication_guard
     dropped_paths = []
 
-    def evicting_size(img):
-        filename = getattr(img, "filename", None)
-        if filename and os.path.abspath(filename) == os.path.abspath(wc_path):
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(wc_path)
-                dropped_paths.append(os.path.abspath(filename))
-        return real_size(img)
+    @contextlib.contextmanager
+    def evict_before_guarded_open():
+        if not dropped_paths:
+            os.unlink(wc_path)
+            dropped_paths.append(os.path.abspath(wc_path))
+        with real_guard():
+            yield
 
     monkeypatch.setattr(
-        app_module, "_image_size_after_exif_orientation", evicting_size,
+        app_module,
+        "working_copy_publication_guard",
+        evict_before_guarded_open,
     )
 
     response = app.test_client().get(f"/photos/{pid}/original")

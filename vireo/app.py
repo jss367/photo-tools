@@ -3669,11 +3669,22 @@ def _enforce_working_copy_cache_quota_at_startup(app):
     Quota eviction records a source-mtime marker on each removed row. Running
     this before the deferred backfill timer is what prevents startup from
     immediately regenerating files that were deliberately removed.
+
+    Sweeps ``.<id>.render.*.jpg.tmp`` orphans in ``working/`` first so a
+    process kill during a prior on-demand extraction does not permanently
+    consume disk outside the configured ceiling (quota accounting skips these
+    files by design, so the sweep is their only cleanup path). Passes
+    ``startup=True`` so a legacy ``working/<id>.jpg`` whose mtime happens to
+    fall inside the concurrent-writer grace window is still reclaimed on the
+    first pass — no cache writer can be active this early.
     """
+    from working_copy_cache import sweep_abandoned_render_tempfiles
+
     vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    sweep_abandoned_render_tempfiles(vireo_dir)
     db = Database(app.config["DB_PATH"])
     try:
-        evict_working_copy_cache_if_over_quota(db, vireo_dir)
+        evict_working_copy_cache_if_over_quota(db, vireo_dir, startup=True)
     finally:
         try:
             db.conn.close()

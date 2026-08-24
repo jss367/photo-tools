@@ -289,6 +289,69 @@ def test_recent_untracked_working_copy_gets_writer_grace(tmp_path):
         db.close()
 
 
+def test_startup_bypasses_writer_grace_for_legacy_files(tmp_path):
+    """At startup no cache writer can be running, so a legacy
+    ``working/<id>.jpg`` whose mtime happens to fall inside the grace window
+    (recent modify time, or a future-dated timestamp copied from an archive)
+    must still be reclaimed on the first pass — otherwise the file lingers
+    above the ceiling until another restart after the window closes."""
+    from working_copy_cache import evict_if_over_quota
+
+    db, working_dir, photo_ids = _seed_working_copies(tmp_path, [100])
+    photo_id = photo_ids[0]
+    path = working_dir / f"{photo_id}.jpg"
+    os.utime(path, None)  # bump mtime into the grace window
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=NULL WHERE id=?", (photo_id,)
+    )
+    db.conn.commit()
+    try:
+        result = evict_if_over_quota(
+            db, str(tmp_path), quota_mb=0, startup=True,
+        )
+
+        assert result["evicted"] == 1
+        assert result["remaining_bytes"] == 0
+        assert not path.exists()
+    finally:
+        db.close()
+
+
+def test_sweep_abandoned_render_tempfiles_removes_orphans(tmp_path):
+    """A process kill during ``_extract_original_copy`` can leave a
+    ``.<id>.render.*.jpg.tmp`` orphan in ``working/`` that quota accounting
+    intentionally skips. The startup sweep is its only cleanup path."""
+    from working_copy_cache import sweep_abandoned_render_tempfiles
+
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    canonical = working_dir / "42.jpg"
+    canonical.write_bytes(b"canonical bytes")
+    orphan_a = working_dir / ".42.render.abcdef.jpg.tmp"
+    orphan_a.write_bytes(b"partial write")
+    orphan_b = working_dir / ".99.render.deadbeef.jpg.tmp"
+    orphan_b.write_bytes(b"another orphan")
+    unrelated = working_dir / "leftover.tmp"
+    unrelated.write_bytes(b"unrelated non-render tempfile")
+    nested = working_dir / "nested"
+    nested.mkdir()
+
+    sweep_abandoned_render_tempfiles(str(tmp_path))
+
+    assert canonical.exists()
+    assert not orphan_a.exists()
+    assert not orphan_b.exists()
+    assert unrelated.exists()
+    assert nested.exists()
+
+
+def test_sweep_abandoned_render_tempfiles_missing_dir_is_noop(tmp_path):
+    from working_copy_cache import sweep_abandoned_render_tempfiles
+
+    # Should not raise even if ``working/`` was never created.
+    sweep_abandoned_render_tempfiles(str(tmp_path))
+
+
 def test_evict_reconciles_tracked_row_when_file_is_missing(tmp_path):
     """A tracked row with no on-disk file — a leftover from a prior eviction
     whose DB commit failed after the unlinks — must be reset to NULL so

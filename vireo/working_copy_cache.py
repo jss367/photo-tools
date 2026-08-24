@@ -48,6 +48,44 @@ def _is_private_render_tempfile(name):
     )
 
 
+def sweep_abandoned_render_tempfiles(vireo_dir):
+    """Reclaim ``.<id>.render.*.jpg.tmp`` orphans in ``working/``.
+
+    ``_extract_original_copy`` writes each on-demand rendition into a private
+    tempfile before atomically publishing it to ``working/<id>.jpg``. A
+    process kill or crash during that window leaves the tempfile behind.
+    Quota accounting deliberately skips these files (eviction has no catalog
+    row to key off their names, so they would otherwise force real working
+    copies out to stay under quota), which means without a dedicated sweep
+    the orphan can consume disk indefinitely outside the configured ceiling.
+    """
+    working_dir = os.path.join(vireo_dir, "working")
+    if not os.path.isdir(working_dir):
+        return
+    try:
+        with os.scandir(working_dir) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_file():
+                        continue
+                except OSError:
+                    continue
+                if not _is_private_render_tempfile(entry.name):
+                    continue
+                try:
+                    os.remove(entry.path)
+                except OSError as exc:
+                    log.warning(
+                        "Could not remove abandoned render tempfile %s: %s",
+                        entry.path, exc,
+                    )
+    except OSError as exc:
+        log.warning(
+            "Could not scan working directory for render tempfiles %s: %s",
+            working_dir, exc,
+        )
+
+
 def working_copy_quota_bytes(quota_mb=None):
     """Return the configured working-copy budget in bytes."""
     if quota_mb is None:
@@ -99,7 +137,7 @@ def working_copy_stats(vireo_dir, quota_mb=None):
     }
 
 
-def evict_if_over_quota(db, vireo_dir, quota_mb=None):
+def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
     """Delete oldest canonical working copies until usage is within quota.
 
     Legacy Vireo versions wrote ``working/<photo_id>.jpg`` without recording
@@ -109,6 +147,13 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None):
     Unknown files are counted toward usage but never deleted. Files that
     cannot be removed keep their database references so accounting remains
     honest and a later pass can retry.
+
+    ``startup=True`` bypasses the untracked-writer grace: at process start no
+    cache writer can be active yet, so an upgraded install with a legacy
+    ``working/<id>.jpg`` whose mtime is within the grace window (recent modify
+    time, or a future-dated timestamp copied from an archive) can still be
+    reclaimed on the very first quota pass instead of waiting for another
+    restart after the window closes.
 
     Returns a small result payload useful to startup/config callers and tests.
     """
@@ -195,9 +240,15 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None):
                     stale_tracked_ids.append(row["id"])
                 continue
             path, st = file_entry
-            if not tracked and st.st_mtime_ns > untracked_cutoff_ns:
+            if (
+                not tracked
+                and not startup
+                and st.st_mtime_ns > untracked_cutoff_ns
+            ):
                 # This may be an extraction that has published its final path
-                # but has not committed working_copy_path yet.
+                # but has not committed working_copy_path yet. Skipped at
+                # runtime; startup bypasses the grace because no cache writer
+                # can be active yet — the file is safe to reclaim.
                 continue
             entries.append(
                 (st.st_mtime_ns, row["id"], st.st_size, path, expected_rel)

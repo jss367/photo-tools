@@ -21,9 +21,11 @@ RAW strategy:
   the embedded JPEG only when libraw cannot decode the file.
 """
 
+import contextlib
 import io
 import logging
 import os
+import tempfile
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -589,6 +591,8 @@ def extract_working_copy(
     Returns:
         True on success, False on failure
     """
+    img = None
+    tmp_path = None
     try:
         img = load_image(
             source_path,
@@ -597,28 +601,34 @@ def extract_working_copy(
         )
         if img is None:
             return False
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        img.save(output_path, "JPEG", quality=quality)
+        output_dir = os.path.dirname(output_path)
+        os.makedirs(output_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(output_path)}.",
+            suffix=".jpg.tmp",
+            dir=output_dir,
+        )
+        os.close(fd)
+        img.save(tmp_path, "JPEG", quality=quality)
+        os.replace(tmp_path, output_path)
+        tmp_path = None
         return True
     except Exception:
         log.warning("Failed to extract working copy from %s", source_path,
                     exc_info=True)
-        # Remove any partial bytes ``img.save`` wrote before raising.
-        # Leaving them behind counts toward the working-copy quota (working
-        # copy cache eviction excludes files under its 60-second writer
-        # grace) and can look like a valid rendition to callers that only
-        # check for path existence, while ``PIL.Image.open`` on the corrupt
-        # bytes 500s later.
-        try:
-            os.remove(output_path)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            log.warning(
-                "Could not remove partial working-copy output %s after "
-                "extraction failure", output_path, exc_info=True,
-            )
         return False
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                log.warning(
+                    "Could not remove partial working-copy tempfile %s",
+                    tmp_path, exc_info=True,
+                )
+        if img is not None:
+            with contextlib.suppress(Exception):
+                img.close()
 
 
 def _load_raw(path, max_size, raw_decode=RAW_DECODE_JPEG_FIRST):

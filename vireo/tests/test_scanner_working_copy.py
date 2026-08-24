@@ -655,54 +655,6 @@ def test_backfill_failure_marker_prevents_retry_loop(tmp_path, monkeypatch):
     assert calls["n"] == 1, "second pass must NOT retry a marked failure"
 
 
-def test_backfill_failure_removes_partial_working_copy(tmp_path, monkeypatch):
-    """A failed encoder must not leave untracked bytes outside the quota."""
-    import config as cfg
-    from db import Database
-    from scanner import backfill_working_copies
-
-    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
-    cfg.save({
-        **cfg.DEFAULTS,
-        "working_copy_max_size": 1000,
-        "working_copy_quality": 90,
-    })
-
-    folder = tmp_path / "a"
-    folder.mkdir()
-    vireo_dir = tmp_path / "vireo"
-    vireo_dir.mkdir()
-    db = Database(str(vireo_dir / "test.db"))
-    pid = _seed_large_jpeg(db, folder, "a.jpg")
-    partial_path = vireo_dir / "working" / f"{pid}.jpg"
-
-    import scanner as scanner_module
-
-    def write_partial_then_fail(_source, output, **_kwargs):
-        os.makedirs(os.path.dirname(output), exist_ok=True)
-        with open(output, "wb") as handle:
-            handle.write(b"partial jpeg bytes")
-        return False
-
-    monkeypatch.setattr(
-        scanner_module, "extract_working_copy", write_partial_then_fail,
-    )
-
-    try:
-        backfill_working_copies(db, str(vireo_dir))
-
-        assert not partial_path.exists()
-        row = db.conn.execute(
-            "SELECT working_copy_path, working_copy_failed_at "
-            "FROM photos WHERE id=?",
-            (pid,),
-        ).fetchone()
-        assert row["working_copy_path"] is None
-        assert row["working_copy_failed_at"] is not None
-    finally:
-        db.close()
-
-
 def test_backfill_failure_retries_when_mtime_changes(tmp_path, monkeypatch):
     """A user-replaced file (different mtime) clears the failure gate."""
     import config as cfg

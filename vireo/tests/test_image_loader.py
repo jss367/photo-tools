@@ -526,6 +526,34 @@ def test_extract_working_copy_removes_partial_output_on_failure(
     assert not output.exists()
 
 
+def test_extract_working_copy_failure_preserves_concurrent_publication(
+    tmp_path, monkeypatch,
+):
+    """A failed writer cleans only its private tempfile, not output_path."""
+    from image_loader import extract_working_copy
+    from PIL import Image
+
+    source = tmp_path / "photo.jpg"
+    Image.new("RGB", (100, 100), color=(255, 0, 0)).save(source, "JPEG")
+    output = tmp_path / "working" / "42.jpg"
+    output.parent.mkdir()
+    published = b"valid bytes published by another request"
+    output.write_bytes(published)
+
+    def fail_after_writing(_self, fp, *args, **kwargs):
+        with open(fp, "wb") as handle:
+            handle.write(b"partial private bytes")
+        raise OSError("simulated encoder failure")
+
+    monkeypatch.setattr(Image.Image, "save", fail_after_writing)
+
+    result = extract_working_copy(str(source), str(output), max_size=0)
+
+    assert result is False
+    assert output.read_bytes() == published
+    assert not list(output.parent.glob("*.jpg.tmp"))
+
+
 # ── load_working_image tests ──────────────────────────────────────────
 
 

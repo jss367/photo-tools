@@ -3063,6 +3063,96 @@ def test_transient_full_original_does_not_restore_concurrently_evicted_copy(
     assert row["working_copy_evicted_mtime"] is not None
 
 
+def test_transient_original_reloads_quota_raised_during_extraction(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A quota raised mid-extraction must not leave a stale eviction marker."""
+    import app as app_module
+    import config as cfg
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    working_path = os.path.join(working_dir, f"{photo_id}.jpg")
+
+    source_dir = tmp_path / "quota-raise-source"
+    source_dir.mkdir()
+    source_path = source_dir / "source.tiff"
+    Image.new("RGB", (1200, 900), color=(40, 50, 60)).save(
+        source_path, "TIFF",
+    )
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='source.tiff', extension='.tiff', width=1200,
+               height=900, working_copy_path=NULL,
+               working_copy_evicted_mtime=NULL
+           WHERE id=?""",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    # Start with a zero quota so cacheability would default to False if we
+    # kept the request-start snapshot.
+    cfg.set("working_copy_cache_max_mb", 0)
+
+    def small_extract(_source, output, **_kwargs):
+        Image.new("RGB", (1200, 900), color=(40, 50, 60)).save(
+            output, "JPEG",
+        )
+        return True
+
+    monkeypatch.setattr(
+        image_loader, "extract_working_copy", small_extract,
+    )
+
+    real_guard = app_module.working_copy_publication_guard
+    raised = False
+
+    @contextlib.contextmanager
+    def raise_quota_before_publication_guard():
+        nonlocal raised
+        if not raised:
+            raised = True
+            # Simulate a settings-save that raised the quota between the
+            # request-start snapshot and the publication guard's cacheability
+            # check. The route must reload the quota inside the guard and
+            # publish (rather than stamping a fresh eviction marker).
+            cfg.set("working_copy_cache_max_mb", 20480)
+        with real_guard():
+            yield
+
+    monkeypatch.setattr(
+        app_module,
+        "working_copy_publication_guard",
+        raise_quota_before_publication_guard,
+    )
+
+    response = app.test_client().get(f"/photos/{photo_id}/original")
+
+    assert response.status_code == 200
+    assert response.data
+    response.close()
+    assert raised
+
+    row = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime "
+        "FROM photos WHERE id=?",
+        (photo_id,),
+    ).fetchone()
+    assert row["working_copy_path"] == f"working/{photo_id}.jpg"
+    assert row["working_copy_evicted_mtime"] is None
+    assert os.path.isfile(working_path)
+
+
 def test_original_serves_post_upgrade_working_copy_without_reextracting(app_and_db, tmp_path):
     """After the on-demand upgrade overwrites wc at full-res, subsequent
     requests must serve the upgraded wc directly — not loop into another

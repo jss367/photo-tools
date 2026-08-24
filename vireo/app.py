@@ -19850,23 +19850,31 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if current_working_copy_quota > previous_working_copy_quota:
             # The next scoped scan or startup backfill can use the newly
             # available space; settings writes never perform RAW decoding.
-            quota_db.conn.execute(
-                "UPDATE photos SET working_copy_evicted_mtime=NULL, "
-                "working_copy_failed_at=CASE WHEN "
-                "working_copy_failed_source='source' "
-                "AND companion_path IS NOT NULL THEN NULL "
-                "ELSE working_copy_failed_at END, "
-                "working_copy_failed_mtime=CASE WHEN "
-                "working_copy_failed_source='source' "
-                "AND companion_path IS NOT NULL THEN NULL "
-                "ELSE working_copy_failed_mtime END, "
-                "working_copy_failed_source=CASE WHEN "
-                "working_copy_failed_source='source' "
-                "AND companion_path IS NOT NULL THEN NULL "
-                "ELSE working_copy_failed_source END "
-                "WHERE working_copy_evicted_mtime IS NOT NULL"
-            )
-            commit_with_retry(quota_db.conn)
+            # Acquire the publication guard so this clear serializes with
+            # concurrent on-demand extractions that decide cacheability
+            # under the same guard. Without it, an in-flight non-cacheable
+            # commit that reads the still-stale request-start budget could
+            # stamp a fresh ``working_copy_evicted_mtime`` after this
+            # UPDATE runs, leaving the row permanently ineligible for
+            # backfill under the raised ceiling.
+            with working_copy_publication_guard():
+                quota_db.conn.execute(
+                    "UPDATE photos SET working_copy_evicted_mtime=NULL, "
+                    "working_copy_failed_at=CASE WHEN "
+                    "working_copy_failed_source='source' "
+                    "AND companion_path IS NOT NULL THEN NULL "
+                    "ELSE working_copy_failed_at END, "
+                    "working_copy_failed_mtime=CASE WHEN "
+                    "working_copy_failed_source='source' "
+                    "AND companion_path IS NOT NULL THEN NULL "
+                    "ELSE working_copy_failed_mtime END, "
+                    "working_copy_failed_source=CASE WHEN "
+                    "working_copy_failed_source='source' "
+                    "AND companion_path IS NOT NULL THEN NULL "
+                    "ELSE working_copy_failed_source END "
+                    "WHERE working_copy_evicted_mtime IS NOT NULL"
+                )
+                commit_with_retry(quota_db.conn)
 
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
         evict_preview_cache_if_over_quota(quota_db, vireo_dir)
@@ -38441,9 +38449,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             wc_abs = os.path.join(vireo_dir, wc_rel)
         working_copy_config = cfg.load()
         quality = working_copy_config.get("working_copy_quality", 92)
-        working_copy_budget = working_copy_quota_bytes(
-            working_copy_config.get("working_copy_cache_max_mb", 20480)
-        )
 
         # Unedited RAW primaries use their camera-rendered full-size preview
         # when available. Edited renders took the recipe branch above and keep
@@ -38543,14 +38548,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if primary_is_raw:
                 return send_file(wc_abs, mimetype="image/jpeg")
 
-            try:
-                generated_size = os.path.getsize(tmp_path)
-            except OSError:
-                generated_size = working_copy_budget + 1
-            cacheable = (
-                working_copy_budget > 0
-                and generated_size <= working_copy_budget
-            )
             def _commit_generated_original(*, tracked):
                 if tracked:
                     updates = [
@@ -38574,18 +38571,39 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
                 db.conn.commit()
 
-            if cacheable:
-                # Publish first, then open the file BEFORE we commit the row
-                # that makes ``wc_abs`` visible to concurrent eviction
-                # passes. A peer thread that runs ``evict_if_over_quota``
-                # between the commit here and the open below can select
-                # this just-written file as the oldest and unlink it
-                # before Flask ever has an fd on it, turning a successful
-                # render into a 500. Opening first: POSIX keeps the bytes
-                # readable through an unlink; Windows makes the open fd
-                # itself prevent unlink so eviction of this specific file
-                # just no-ops.
-                with working_copy_publication_guard():
+            # Decide cacheability under the publication/eviction guard using
+            # a freshly reloaded quota. If a settings save raised
+            # ``working_copy_cache_max_mb`` while this slow extraction was
+            # encoding, a budget snapshot captured at request start would
+            # be stale: reusing it here would treat a rendition that now
+            # fits as non-cacheable and stamp a new
+            # ``working_copy_evicted_mtime`` after the settings handler
+            # already cleared markers, suppressing backfill for that row
+            # until another quota bump or source-mtime change. Reloading
+            # under the guard also serializes the marker write with the
+            # settings handler's clear (which acquires the same guard when
+            # raising the quota) so a race cannot leave a stale marker.
+            with working_copy_publication_guard():
+                current_budget = working_copy_quota_bytes()
+                try:
+                    generated_size = os.path.getsize(tmp_path)
+                except OSError:
+                    generated_size = current_budget + 1
+                cacheable = (
+                    current_budget > 0
+                    and generated_size <= current_budget
+                )
+                if cacheable:
+                    # Publish first, then open the file BEFORE we commit the
+                    # row that makes ``wc_abs`` visible to concurrent
+                    # eviction passes. A peer thread that runs
+                    # ``evict_if_over_quota`` between the commit here and
+                    # the open below can select this just-written file as
+                    # the oldest and unlink it before Flask ever has an fd
+                    # on it, turning a successful render into a 500.
+                    # Opening first: POSIX keeps the bytes readable through
+                    # an unlink; Windows makes the open fd itself prevent
+                    # unlink so eviction of this specific file just no-ops.
                     _publish_extraction(tmp_path)
                     try:
                         rendition_fh = open(wc_abs, "rb")  # noqa: SIM115 — closed by send_file's response
@@ -38596,30 +38614,31 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         )
                         return "Could not load image", 500
                     _commit_generated_original(tracked=True)
-            else:
-                # Non-cacheable: keep the rendition in ``tmp_path`` (a
-                # per-request private tempfile) and never publish to
-                # ``wc_abs`` at all. Publishing would only invite two races
-                # under a zero or undersized quota: waiters would compete
-                # to move ``wc_abs`` to their own transient location and
-                # every waiter but the winner would ``os.replace(wc_abs,
-                # ...)`` a missing file (500), and a concurrent eviction
-                # pass would see and immediately unlink the "orphan" it
-                # cannot reconcile against any catalog row. The DB still
-                # records ``working_copy_path=NULL`` so future requests
-                # know they must regenerate rather than expect a cache
-                # hit. The response still needs a decoded JPEG, but a
-                # zero quota (or one smaller than this single rendition)
-                # must not turn that response into a persistent cache
-                # entry.
-                # A transient full-resolution response must not orphan an
-                # existing capped working copy that remains useful to
-                # previews/edits/exports and still counts toward the quota.
-                # Revalidate both its catalog row and file while holding the
-                # publication/eviction lock. The request's ``photo`` snapshot
-                # may predate a concurrent eviction; restoring that stale
-                # path would point consumers at a file that no longer exists.
-                with working_copy_publication_guard():
+                else:
+                    # Non-cacheable: keep the rendition in ``tmp_path`` (a
+                    # per-request private tempfile) and never publish to
+                    # ``wc_abs`` at all. Publishing would only invite two
+                    # races under a zero or undersized quota: waiters would
+                    # compete to move ``wc_abs`` to their own transient
+                    # location and every waiter but the winner would
+                    # ``os.replace(wc_abs, ...)`` a missing file (500), and
+                    # a concurrent eviction pass would see and immediately
+                    # unlink the "orphan" it cannot reconcile against any
+                    # catalog row. The DB still records
+                    # ``working_copy_path=NULL`` so future requests know
+                    # they must regenerate rather than expect a cache hit.
+                    # The response still needs a decoded JPEG, but a zero
+                    # quota (or one smaller than this single rendition)
+                    # must not turn that response into a persistent cache
+                    # entry.
+                    # A transient full-resolution response must not orphan
+                    # an existing capped working copy that remains useful
+                    # to previews/edits/exports and still counts toward the
+                    # quota. Revalidate both its catalog row and file while
+                    # holding the publication/eviction lock. The request's
+                    # ``photo`` snapshot may predate a concurrent eviction;
+                    # restoring that stale path would point consumers at a
+                    # file that no longer exists.
                     current_row = db.conn.execute(
                         "SELECT working_copy_path FROM photos WHERE id=?",
                         (photo_id,),

@@ -417,6 +417,13 @@ body.sidebar-resizing {
   border-color: var(--accent);
   color: var(--accent);
 }
+.browse-stack-badge.needs-recheck {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+.browse-stack-recheck {
+  font-weight: 700;
+}
 .grid-card.has-browse-stack .clip-score-badge { top: 34px; }
 .browse-stack-tray {
   grid-column: 1 / -1;
@@ -2372,7 +2379,16 @@ var expandedBrowseStacks = new Set();
 var browseStackMembers = {};
 var browseStackErrors = {};
 var browseStackHydrationSeq = 0;
+// In-flight cover hydrations, keyed by cover id: {seq, memberIds, stale}.
+// Same invalidation contract as browseStackExpansionRequests below (a mutation
+// marks any request whose members it just changed), but a different ownership
+// rule: only one hydration may own a cover key at a time, so `seq` lets a newer
+// reconciliation supersede an older one's response instead of both caching.
 var browseStackHydrationRequests = {};
+// Cover ids whose reconciliation could not finish (the members never loaded).
+// The grid is still showing the pre-edit cover for these stacks, so the badge
+// says so and expanding one re-runs the reconciliation from the loaded members.
+var browseStackCoverRecheck = new Set();
 // In-flight stack expansions, keyed by cover id: {memberIds, stale}.
 // A tray's header offers "Select all" the moment it opens, so a stack-wide
 // edit can be applied while its members are still loading. Those members are
@@ -3116,11 +3132,34 @@ function renderBrowseStackBadge(p) {
   if (!stack || stack.count < 2) return '';
   var label = browseStackLabel(stack.kind, stack.count);
   var expanded = expandedBrowseStacks.has(p.id);
-  return '<button type="button" class="browse-stack-badge" '
+  // A cover reconciliation that could not load this stack's members leaves the
+  // pre-edit cover on screen. Say that on the badge itself: the toast that
+  // reported it is long gone by the time the user looks back at the grid.
+  var needsRecheck = browseStackCoverRecheck.has(p.id);
+  var title = label + ' · ' + stack.count + ' photos';
+  if (needsRecheck) {
+    title += ' · cover may be out of date after a recent edit — expand to refresh';
+  }
+  return '<button type="button" class="browse-stack-badge'
+    + (needsRecheck ? ' needs-recheck' : '') + '" '
     + 'aria-expanded="' + (expanded ? 'true' : 'false') + '" '
-    + 'title="' + escapeAttr(label + ' · ' + stack.count + ' photos') + '" '
+    + 'title="' + escapeAttr(title) + '" '
     + 'onclick="toggleBrowseStack(event,' + p.id + ')">'
-    + '<span aria-hidden="true">&#9638;</span>' + stack.count + '</button>';
+    + '<span aria-hidden="true">&#9638;</span>' + stack.count
+    + (needsRecheck ? '<span class="browse-stack-recheck" aria-hidden="true">!</span>' : '')
+    + '</button>';
+}
+
+// Repaints just the stack badge for one cover. refreshGridCards() rewrites card
+// info and overlay badges but not the stack badge, and renderGrid() is far too
+// heavy to run for a marker change on a single card.
+function refreshBrowseStackBadge(coverId) {
+  var card = document.querySelector('.grid-card[data-id="' + coverId + '"]');
+  if (!card) return;
+  var badge = card.querySelector('.browse-stack-badge');
+  var photo = photos.find(function(item) { return item.id === coverId; });
+  if (!badge || !photo) return;
+  badge.outerHTML = renderBrowseStackBadge(photo);
 }
 
 function renderDetectionBoxes(p) {
@@ -3301,21 +3340,22 @@ function markBrowseStackExpansionsStale(photoIds) {
   });
 }
 
-// A cover-hydration response captured its members before this mutation ran,
-// so on any overlap the pending record must be dropped: the sequence guard
-// then rejects the eventual response and its pre-edit members never land in
-// browseStackMembers. reconcileBrowseStackCovers only supersedes hydrations
-// it starts itself, so mutation paths that don't call it (wildlife, keyword,
-// metadata edits) rely on this to invalidate a matching in-flight request.
+// A cover-hydration response captured its members before this mutation ran, so
+// on any overlap its payload is pre-edit and must never reach browseStackMembers.
+// Mark rather than delete: the hydration exists to recompute a cover after an
+// edit that already committed, so dropping it silently would leave the demoted
+// cover on screen. The flag makes reconcileBrowseStackCovers discard the
+// in-flight response and refetch the post-edit members instead.
+// reconcileBrowseStackCovers only supersedes hydrations it starts itself, so
+// mutation paths that don't call it (wildlife, keyword, metadata edits) rely on
+// this to invalidate a matching in-flight request.
 function markBrowseStackHydrationsStale(photoIds) {
   var wanted = (photoIds || []).map(Number);
   if (!wanted.length) return;
   Object.keys(browseStackHydrationRequests).forEach(function(cacheKey) {
     var record = browseStackHydrationRequests[cacheKey];
-    if (!record || !record.memberIds) return;
-    if (wanted.some(function(id) { return record.memberIds.has(id); })) {
-      delete browseStackHydrationRequests[cacheKey];
-    }
+    if (!record || !record.memberIds || record.stale) return;
+    record.stale = wanted.some(function(id) { return record.memberIds.has(id); });
   });
 }
 
@@ -3358,6 +3398,98 @@ function browseStackCoverCompare(a, b) {
   return a.id - b.id;
 }
 
+// Bounded only as a safety net, mirroring toggleBrowseStack: a stale retry has
+// to be provoked by an edit that already finished its own server round trip, so
+// this cannot spin on its own, and a failure retry needs a fresh transport
+// error each time. The cap stops either from becoming an unbounded refetch loop.
+var MAX_BROWSE_STACK_HYDRATION_ATTEMPTS = 3;
+
+// Loads a collapsed stack's members so reconcileBrowseStackCovers can recompute
+// its cover. Returns:
+//   'hydrated'   — members are in browseStackMembers, cover can be recomputed
+//   'superseded' — a newer request owns this key; it will do the work
+//   'window'     — the dataset was replaced; abandon reconciliation entirely
+//   'unresolved' — retries exhausted; the grid still shows the pre-edit cover
+// 'unresolved' is never silent: the caller flags the stack for recheck and tells
+// the user, because the mutation that asked for this reconciliation succeeded.
+async function hydrateBrowseStackCoverMembers(cover, windowIsCurrent) {
+  var cacheKey = String(cover.id);
+  var memberIds = (cover.browse_stack && cover.browse_stack.photo_ids) || [];
+  for (var attempt = 1; attempt <= MAX_BROWSE_STACK_HYDRATION_ATTEMPTS; attempt++) {
+    var hydrationSeq = ++browseStackHydrationSeq;
+    browseStackHydrationRequests[cacheKey] = {
+      seq: hydrationSeq,
+      stale: false,
+      memberIds: new Set(memberIds.map(Number)),
+    };
+    var hydratedMembers = [];
+    try {
+      for (var offset = 0; offset < memberIds.length; offset += 500) {
+        var data = await safeFetch('/api/photos/by-ids', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({photo_ids: memberIds.slice(offset, offset + 500)}),
+        }, {toast: false});
+        if (!windowIsCurrent()) return 'window';
+        hydratedMembers = hydratedMembers.concat(data.photos || []);
+      }
+    } catch (e) {
+      var errorRecord = browseStackHydrationRequests[cacheKey];
+      if (errorRecord && errorRecord.seq === hydrationSeq) {
+        delete browseStackHydrationRequests[cacheKey];
+      }
+      if (!windowIsCurrent()) return 'window';
+      // The edit itself already committed on the server. Retry the read rather
+      // than abandoning the cover recomputation it asked for. Back off between
+      // attempts so a server that is briefly unreachable gets time to recover
+      // instead of being hit three times inside a few milliseconds.
+      if (attempt < MAX_BROWSE_STACK_HYDRATION_ATTEMPTS) {
+        await new Promise(function(resolve) {
+          setTimeout(resolve, 200 * Math.pow(2, attempt - 1));
+        });
+        if (!windowIsCurrent()) return 'window';
+        continue;
+      }
+      return 'unresolved';
+    }
+    // Overlapping edits may hydrate the same collapsed stack. Request order
+    // tracks mutation freshness, so only the newest request may cache even when
+    // an older response happens to arrive first.
+    var currentRecord = browseStackHydrationRequests[cacheKey];
+    if (!currentRecord || currentRecord.seq !== hydrationSeq) return 'superseded';
+    if (currentRecord.stale) {
+      // A generic member edit (wildlife, keyword, metadata) landed while this
+      // response was in flight, so it holds pre-edit rows for members that had
+      // no cache entry to patch. Never cache that; refetch the post-edit truth.
+      delete browseStackHydrationRequests[cacheKey];
+      if (attempt < MAX_BROWSE_STACK_HYDRATION_ATTEMPTS) continue;
+      return 'unresolved';
+    }
+    delete browseStackHydrationRequests[cacheKey];
+    // Expansion can also hydrate this key while reconciliation is in flight;
+    // and another response may already have promoted a replacement.
+    if (browseStackMembers[cacheKey] || !cover.browse_stack
+        || !photos.some(function(photo) {
+          return photo === cover && photo.id === cover.id;
+        })) {
+      return 'superseded';
+    }
+    var stack = cover.browse_stack;
+    var similarity = cover.similarity;
+    var clientSimilarity = cover._similarity;
+    browseStackMembers[cacheKey] = hydratedMembers.map(function(member) {
+      if (member.id !== cover.id) return member;
+      Object.assign(cover, member);
+      cover.browse_stack = stack;
+      if (similarity !== undefined) cover.similarity = similarity;
+      if (clientSimilarity !== undefined) cover._similarity = clientSimilarity;
+      return cover;
+    });
+    return 'hydrated';
+  }
+  return 'unresolved';
+}
+
 async function reconcileBrowseStackCovers(photoIds) {
   var wanted = new Set((photoIds || []).map(Number));
   // Callers run this straight after applying the edit locally, before the
@@ -3374,92 +3506,18 @@ async function reconcileBrowseStackCovers(photoIds) {
       return wanted.has(id);
     });
   });
+  var unresolvedCovers = [];
   for (var h = 0; h < uncachedCovers.length; h++) {
-    var uncachedCover = uncachedCovers[h];
-    var uncachedKey = String(uncachedCover.id);
-    var hydrationSeq = ++browseStackHydrationSeq;
-    var memberIds = uncachedCover.browse_stack.photo_ids || [];
-    browseStackHydrationRequests[uncachedKey] = {
-      seq: hydrationSeq,
-      memberIds: new Set(memberIds.map(Number)),
-    };
-    try {
-      var hydratedMembers = [];
-      // Retry transient failures a few times with backoff so a one-off network
-      // hiccup does not abandon reconciliation and leave the stale cover in
-      // place until another cover-affecting edit or a manual reload.
-      for (var offset = 0; offset < memberIds.length; offset += 500) {
-        var chunk = memberIds.slice(offset, offset + 500);
-        var data = null;
-        var lastError = null;
-        for (var attempt = 0; attempt < 3; attempt++) {
-          try {
-            data = await safeFetch('/api/photos/by-ids', {
-              method: 'POST',
-              headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({photo_ids: chunk}),
-            }, {toast: false});
-            lastError = null;
-            break;
-          } catch (fetchErr) {
-            lastError = fetchErr;
-            if (!windowIsCurrent()) return false;
-            if (attempt < 2) {
-              await new Promise(function(resolve) {
-                setTimeout(resolve, 200 * Math.pow(2, attempt));
-              });
-              if (!windowIsCurrent()) return false;
-            }
-          }
-        }
-        if (lastError) throw lastError;
-        if (!windowIsCurrent()) return false;
-        hydratedMembers = hydratedMembers.concat(data.photos || []);
-      }
-      // Overlapping edits may hydrate the same collapsed stack. Request order
-      // tracks mutation freshness, so only the newest request may cache even
-      // when an older response happens to arrive first. A generic member edit
-      // routed through refreshExpandedBrowseStackMembers may also drop the
-      // record entirely to discard this pre-edit response.
-      var currentRecord = browseStackHydrationRequests[uncachedKey];
-      if (!currentRecord || currentRecord.seq !== hydrationSeq) continue;
-      delete browseStackHydrationRequests[uncachedKey];
-      // Expansion can also hydrate this key while reconciliation is in flight;
-      // and another response may already have promoted a replacement.
-      if (browseStackMembers[uncachedKey] || !uncachedCover.browse_stack
-          || !photos.some(function(photo) {
-            return photo === uncachedCover && photo.id === uncachedCover.id;
-          })) {
-        continue;
-      }
-      var stack = uncachedCover.browse_stack;
-      var similarity = uncachedCover.similarity;
-      var clientSimilarity = uncachedCover._similarity;
-      browseStackMembers[uncachedKey] = hydratedMembers.map(function(member) {
-        if (member.id !== uncachedCover.id) return member;
-        Object.assign(uncachedCover, member);
-        uncachedCover.browse_stack = stack;
-        if (similarity !== undefined) uncachedCover.similarity = similarity;
-        if (clientSimilarity !== undefined) uncachedCover._similarity = clientSimilarity;
-        return uncachedCover;
-      });
-    } catch (e) {
-      var errorRecord = browseStackHydrationRequests[uncachedKey];
-      if (errorRecord && errorRecord.seq === hydrationSeq) {
-        delete browseStackHydrationRequests[uncachedKey];
-      }
-      // After retries have been exhausted, the mutation has already succeeded
-      // server-side but this cover cannot be reconciled locally. Trigger an
-      // authoritative reload so the promoted cover replaces the demoted one
-      // instead of persisting until another cover-affecting edit or manual
-      // refresh. Guard against re-entrant reloads: skip when the window has
-      // already moved on.
-      if (windowIsCurrent()) {
-        reloadBrowseResults();
-      }
-      return false;
-    }
+    var status = await hydrateBrowseStackCoverMembers(uncachedCovers[h], windowIsCurrent);
+    // The dataset under us was replaced; whoever owns the new window will
+    // paint authoritative covers, so there is nothing stale to report.
+    if (status === 'window') return false;
+    if (status === 'unresolved') unresolvedCovers.push(uncachedCovers[h].id);
+    // Members are loaded, so the cover below is recomputed from the full stack:
+    // any earlier recheck marker on this cover is now satisfied.
+    if (status === 'hydrated') browseStackCoverRecheck.delete(uncachedCovers[h].id);
   }
+  unresolvedCovers.forEach(function(coverId) { browseStackCoverRecheck.add(coverId); });
 
   var changed = false;
   Object.keys(browseStackMembers).forEach(function(oldKey) {
@@ -3486,6 +3544,9 @@ async function reconcileBrowseStackCovers(photoIds) {
       browseStackErrors[newKey] = browseStackErrors[oldKey];
       delete browseStackErrors[oldKey];
     }
+    // The cover was just recomputed from the whole member list, so a recheck
+    // marker left over from an earlier failed hydration no longer applies.
+    browseStackCoverRecheck.delete(oldCoverId);
     if (expandedBrowseStacks.delete(oldCoverId)) {
       expandedBrowseStacks.add(newCover.id);
     }
@@ -3507,6 +3568,21 @@ async function reconcileBrowseStackCovers(photoIds) {
     changed = true;
   });
   if (changed) renderGrid();
+  if (unresolvedCovers.length) {
+    // The edit committed on the server but its cover recomputation did not, so
+    // the grid is knowingly showing a photo the stack may no longer lead with.
+    // Say so instead of leaving a silently wrong representative on screen, and
+    // mark the stacks so the notice survives the toast.
+    unresolvedCovers.forEach(refreshBrowseStackBadge);
+    var one = unresolvedCovers.length === 1;
+    showToast(
+      'Could not reload ' + (one ? 'a stack' : unresolvedCovers.length + ' stacks')
+      + ' after that edit — ' + (one ? 'its cover' : 'their covers')
+      + ' may still show the previous top photo. Expand '
+      + (one ? 'the stack' : 'a stack') + ' marked “!” to refresh it.',
+      'warning'
+    );
+  }
   // Keep the inspector bound to the same visible grid focus. Call this after
   // renderGrid() so the promoted cover and its tray are already in place when
   // the async detail response paints.
@@ -3706,6 +3782,17 @@ async function toggleBrowseStack(event, coverId) {
     return photo.id;
   });
   if (!loadedIds.length) return;
+  if (browseStackCoverRecheck.delete(coverId)) {
+    // An earlier edit's cover reconciliation could not load these members, so
+    // the grid has been showing a possibly-demoted cover ever since. The
+    // members are cached now, so recompute the cover from them — expanding is
+    // the recovery the badge marker promised. Members are cached, so this
+    // reconciliation issues no requests and cannot fail.
+    await reconcileBrowseStackCovers(loadedIds);
+    // Promotion moves the cache under a new key and re-renders the grid.
+    var recheckedCoverId = browseStackCoverIdForPhoto(coverId);
+    if (recheckedCoverId != null) insertBrowseStackTray(recheckedCoverId);
+  }
   function refreshCurrentStackTray() {
     if (!windowIsCurrent()) return;
     // Rating/flag edits can promote another member while either metadata
@@ -6079,6 +6166,7 @@ async function resetAndLoad(options) {
   browseStackErrors = {};
   browseStackHydrationRequests = {};
   browseStackExpansionRequests = {};
+  browseStackCoverRecheck.clear();
   photos = [];
   currentPage = 1;
   allLoaded = false;

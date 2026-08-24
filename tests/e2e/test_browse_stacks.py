@@ -1,3 +1,5 @@
+import re
+
 from playwright.sync_api import expect
 
 
@@ -870,6 +872,12 @@ def test_generic_member_edit_invalidates_pending_cover_hydration(live_server, pa
             body: JSON.stringify({photo_ids: ids}),
           };
           var preEdit = await originalSafeFetch('/api/photos/by-ids', byIdsOptions);
+          // Tag the in-flight payload so a pre-edit row is recognisable if it
+          // ever reaches the cache.
+          var stalePayload = JSON.parse(JSON.stringify(preEdit));
+          stalePayload.photos.forEach(function(photo) {
+            photo.filename = 'PRE-EDIT.jpg';
+          });
           var release = null;
           safeFetch = function(url) {
             if (url === '/api/photos/by-ids' && !release) {
@@ -886,14 +894,18 @@ def test_generic_member_edit_invalidates_pending_cover_hydration(live_server, pa
               await new Promise(function(resolve) { setTimeout(resolve, 0); });
             }
             // Generic member mutation whose only cache-invalidation hook is
-            // refreshExpandedBrowseStackMembers. It must now drop the pending
-            // hydration record so the delayed response cannot land.
+            // refreshExpandedBrowseStackMembers. It must mark the pending
+            // hydration so the delayed response cannot land.
             refreshExpandedBrowseStackMembers([hiddenId]);
-            release(JSON.parse(JSON.stringify(preEdit)));
+            release(stalePayload);
             await hydration;
+            var cached = browseStackMembers[String(coverId)] || [];
             return {
-              cached: browseStackMembers[String(coverId)] || null,
+              filenames: cached.map(function(photo) {
+                return photo.filename;
+              }).sort(),
               error: browseStackErrors[String(coverId)] || null,
+              recheck: browseStackCoverRecheck.has(coverId),
             };
           } finally {
             safeFetch = originalSafeFetch;
@@ -902,7 +914,146 @@ def test_generic_member_edit_invalidates_pending_cover_hydration(live_server, pa
         burst_ids,
     )
     assert outcome["error"] is None
-    assert outcome["cached"] is None
+    # The pre-edit payload never reaches the cache...
+    assert "PRE-EDIT.jpg" not in outcome["filenames"]
+    # ...and the reconciliation is not abandoned either: it refetches the
+    # post-edit members so the cover it exists to recompute still gets one.
+    assert outcome["filenames"] == ["hawk1.jpg", "hawk2.jpg", "hawk3.jpg"]
+    assert outcome["recheck"] is False
+
+
+def test_cover_hydration_retries_transient_by_ids_failure(live_server, page):
+    """A failed hydration must not abandon a reconciliation that was earned.
+
+    The flag edit below already committed on the server. If the follow-up
+    ``/api/photos/by-ids`` fails transiently and reconciliation just returns,
+    the grid keeps showing the demoted cover with no path back short of a
+    reload, because later expanding the stack only fills the member cache
+    without recomputing the cover.
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'hydration-retry-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
+
+    outcome = page.evaluate(
+        """async ids => {
+          var coverId = ids[1];
+          var hiddenId = ids[0];
+          var originalSafeFetch = safeFetch;
+          var failed = 0;
+          safeFetch = function(url) {
+            if (url === '/api/photos/by-ids' && failed < 1) {
+              failed++;
+              return Promise.reject(new Error('transient'));
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            // Flagging a hidden member makes it outrank the quality-picked
+            // cover, so a completed reconciliation must promote it.
+            await setFlagFor(hiddenId, 'flagged');
+            return {
+              failed: failed,
+              coverIds: photos.filter(function(photo) {
+                return !!photo.browse_stack;
+              }).map(function(photo) { return photo.id; }),
+              recheck: browseStackCoverRecheck.has(coverId),
+              toasts: document.getElementById('toastContainer').textContent,
+            };
+          } finally {
+            safeFetch = originalSafeFetch;
+          }
+        }""",
+        burst_ids,
+    )
+    assert outcome["failed"] == 1
+    # The retry succeeded, so the promotion the edit earned actually happened.
+    assert outcome["coverIds"] == [burst_ids[0]]
+    assert outcome["recheck"] is False
+    assert "Could not reload" not in outcome["toasts"]
+
+
+def test_unresolvable_cover_hydration_is_reported_and_recoverable(live_server, page):
+    """When retries are exhausted the stale cover must not be shown silently.
+
+    The mutation committed, so the grid is knowingly displaying a photo the
+    stack may no longer lead with. The user gets told, the badge keeps saying
+    so after the toast fades, and expanding the stack recomputes the cover.
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'hydration-exhausted-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
+
+    outcome = page.evaluate(
+        """async ids => {
+          var coverId = ids[1];
+          var hiddenId = ids[0];
+          var originalSafeFetch = safeFetch;
+          var attempts = 0;
+          safeFetch = function(url) {
+            if (url === '/api/photos/by-ids') {
+              attempts++;
+              return Promise.reject(new Error('offline'));
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            await setFlagFor(hiddenId, 'flagged');
+            return {
+              attempts: attempts,
+              recheck: browseStackCoverRecheck.has(coverId),
+              toasts: document.getElementById('toastContainer').textContent,
+            };
+          } finally {
+            safeFetch = originalSafeFetch;
+          }
+        }""",
+        burst_ids,
+    )
+    assert outcome["attempts"] == 3
+    assert outcome["recheck"] is True
+    assert "Could not reload a stack after that edit" in outcome["toasts"]
+
+    # The badge carries the notice after the toast is gone.
+    badge = page.locator(f'.grid-card[data-id="{burst_ids[1]}"] .browse-stack-badge')
+    expect(badge).to_have_class(re.compile("needs-recheck"))
+    assert "cover may be out of date" in (badge.get_attribute("title") or "")
+
+    # Expanding is the advertised recovery: members load, the cover is
+    # recomputed from them, and the marker clears.
+    badge.click()
+    promoted = page.locator(f'.grid-card[data-id="{burst_ids[0]}"] .browse-stack-badge')
+    expect(promoted).to_be_visible()
+    expect(promoted).not_to_have_class(re.compile("needs-recheck"))
+    tray = page.locator(f'.browse-stack-tray[data-stack-cover-id="{burst_ids[0]}"]')
+    expect(tray.locator(".browse-stack-member")).to_have_count(3)
+    assert page.evaluate("id => browseStackCoverRecheck.has(id)", burst_ids[1]) is False
 
 
 def test_expanding_stack_over_500_chunks_by_ids_requests(live_server, page):

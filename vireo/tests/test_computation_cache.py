@@ -696,10 +696,11 @@ def test_fresh_classifier_run_is_promoted_and_published(tmp_path):
     assert any(item["type"] == "classification" for item in artifacts)
 
 
-def test_working_copy_backed_classifier_run_stays_local_only(tmp_path):
+def test_evicted_working_copy_classifier_run_stays_local_only(tmp_path):
     """A photo with a ``working_copy_path`` was classified from the
     extracted working-copy JPEG (see ``classify_job._prepare_image``
-    when ``vireo_dir`` is set), not from the original bytes. The v1
+    when ``vireo_dir`` is set), not from the original bytes. Even if quota
+    eviction later clears that mutable catalog path, the v1
     input identity carries only ``p.file_hash``, so publishing that run
     would advertise a working-copy-derived prediction as if it came from
     the original — a foreign install (or the same install with a
@@ -739,6 +740,13 @@ def test_working_copy_backed_classifier_run_stays_local_only(tmp_path):
         detection_id, "BioCLIP", labels_short, prediction_count=1,
     )
 
+    # Quota eviction wins after inference but before delayed promotion.
+    source.conn.execute(
+        "UPDATE photos SET working_copy_path = NULL WHERE id = ?",
+        (photo_id,),
+    )
+    source.conn.commit()
+
     model_dir = tmp_path / "model"
     model_dir.mkdir()
     (model_dir / "image_encoder.onnx").write_bytes(b"exact model bytes")
@@ -753,7 +761,7 @@ def test_working_copy_backed_classifier_run_stays_local_only(tmp_path):
     store = ArtifactStore(tmp_path / "store")
     digest = promote_and_publish_classifier_run(
         source, detection_id, "BioCLIP", labels_short,
-        labels_full, identity, store=store,
+        labels_full, identity, store=store, source_is_original=False,
     )
     assert digest is None, (
         "working-copy-backed runs must not publish — pixels differ from "

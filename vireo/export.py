@@ -25,6 +25,7 @@ from render_source import (
 from render_source import (
     recipe_source_dimensions as _recipe_source_dimensions,
 )
+from working_copy_cache import working_copy_publication_guard
 
 log = logging.getLogger(__name__)
 
@@ -489,20 +490,85 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
         folder_path = folders.get(photo["folder_id"], "")
         recipe = edit_recipes.get(pid)
         exif_data = exif_data_map.get(pid)
-        source_path = _select_export_source(
-            photo=photo,
-            folder_path=folder_path,
-            folders=folders,
-            recipe=recipe,
-            max_size=max_size,
-            wc_max=wc_max,
-            vireo_dir=vireo_dir,
-            developed_dir=developed_dir,
-            developed_index=developed_index,
-            output_ext=output_ext,
-            exif_data=exif_data,
+        load_max_size = (
+            None if recipe and recipe.get("crop") else (max_size or None)
         )
-        if not source_path or not os.path.isfile(source_path):
+
+        def _load_selected_source(
+            path, *, _recipe=recipe, _load_max_size=load_max_size,
+        ):
+            is_raw = os.path.splitext(path)[1].lower() in RAW_EXTENSIONS
+            raw_decode = (
+                RAW_DECODE_PRESERVE_HIGHLIGHTS if _recipe and is_raw else None
+            )
+            load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
+            return (
+                load_image(path, max_size=_load_max_size, **load_kwargs),
+                is_raw,
+            )
+
+        original_abs = os.path.join(folder_path, photo["filename"])
+        wc_rel = photo["working_copy_path"]
+        wc_abs = os.path.join(vireo_dir, wc_rel) if wc_rel else None
+        pin_offline_working_copy = bool(
+            wc_abs and not os.path.isfile(original_abs)
+        )
+        source_guard = (
+            working_copy_publication_guard()
+            if pin_offline_working_copy else contextlib.nullcontext()
+        )
+        pinned_img = None
+        pinned_source_is_raw = False
+        pinned_decode_attempted = False
+        with source_guard:
+            source_path = _select_export_source(
+                photo=photo,
+                folder_path=folder_path,
+                folders=folders,
+                recipe=recipe,
+                max_size=max_size,
+                wc_max=wc_max,
+                vireo_dir=vireo_dir,
+                developed_dir=developed_dir,
+                developed_index=developed_index,
+                output_ext=output_ext,
+                exif_data=exif_data,
+            )
+            if source_path and not os.path.isfile(source_path):
+                # A working copy can be evicted between _select_export_source
+                # returning and this pre-loop existence check (concurrent
+                # scanner/on-demand write, a config-driven quota shrink).
+                # Fall back to the primary source so a photo whose original
+                # is on disk is never dropped as "source file missing" merely
+                # because its resized-export shortcut vanished mid-flight.
+                fallback = _fallback_source_after_wc_eviction(
+                    source_path, photo, folder_path, vireo_dir,
+                )
+                if fallback:
+                    log.info(
+                        "Working copy %s evicted before export of %s; using "
+                        "primary source %s",
+                        source_path, photo["filename"], fallback,
+                    )
+                    source_path = fallback
+            if (
+                pin_offline_working_copy
+                and source_path
+                and os.path.abspath(source_path) == os.path.abspath(wc_abs)
+                and os.path.isfile(source_path)
+            ):
+                # The original volume is offline, so retry-to-original cannot
+                # recover if quota eviction wins after source selection. Keep
+                # the working copy pinned through validation and decode; the
+                # resulting PIL image is independent of the path afterward.
+                pinned_decode_attempted = True
+                pinned_img, pinned_source_is_raw = _load_selected_source(
+                    source_path,
+                )
+        if (
+            not source_path
+            or (pinned_img is None and not os.path.isfile(source_path))
+        ):
             errors.append(f"{photo['filename']}: source file missing")
             if progress_cb:
                 progress_cb(i + 1, len(photo_ids), photo["filename"])
@@ -581,17 +647,23 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
         # Load, resize, and save
         claimed_out_path = None
         try:
-            load_max_size = (
-                None if recipe and recipe.get("crop") else (max_size or None)
-            )
-            source_is_raw = (
-                os.path.splitext(source_path)[1].lower() in RAW_EXTENSIONS
-            )
-            raw_decode = (
-                RAW_DECODE_PRESERVE_HIGHLIGHTS if recipe and source_is_raw else None
-            )
-            load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
-            img = load_image(source_path, max_size=load_max_size, **load_kwargs)
+            if pinned_decode_attempted:
+                img = pinned_img
+                source_is_raw = pinned_source_is_raw
+            else:
+                img, source_is_raw = _load_selected_source(source_path)
+            if img is None:
+                fallback_source = _fallback_source_after_wc_eviction(
+                    source_path, photo, folder_path, vireo_dir,
+                )
+                if fallback_source:
+                    log.info(
+                        "Working copy for %s vanished mid-export; "
+                        "falling back to original %s",
+                        photo["filename"], fallback_source,
+                    )
+                    source_path = fallback_source
+                    img, source_is_raw = _load_selected_source(source_path)
             if source_is_raw:
                 # RAW decode either failed outright (`img is None`) or
                 # silently fell back to the embedded JPEG. ``_load_raw``
@@ -1649,6 +1721,35 @@ def _companion_can_satisfy_export(
     if comp_render_w + 1 >= required_w and comp_render_h + 1 >= required_h:
         return companion
     return None
+
+
+def _fallback_source_after_wc_eviction(
+    source_path, photo, folder_path, vireo_dir,
+):
+    """Return the original path when a working-copy source vanished mid-export.
+
+    Quota eviction can unlink ``working/<id>.jpg`` between
+    ``_select_export_source`` and ``load_image``, turning an otherwise valid
+    export into a "failed to load image" error. When the failed source is a
+    working copy that is now missing (as opposed to a corrupt-but-present
+    file), fall back to the photo's original file so the export still
+    succeeds.
+    """
+    if not vireo_dir or not folder_path:
+        return None
+    working_root = os.path.join(os.path.abspath(vireo_dir), "working")
+    try:
+        abs_source = os.path.abspath(source_path)
+    except (TypeError, ValueError):
+        return None
+    if not abs_source.startswith(working_root + os.sep):
+        return None
+    if os.path.isfile(source_path):
+        return None
+    fallback = os.path.join(folder_path, photo["filename"])
+    if not fallback or not os.path.isfile(fallback):
+        return None
+    return fallback
 
 
 def _resolve_source(photo, vireo_dir, folders, use_working_copy=False):

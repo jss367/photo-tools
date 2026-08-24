@@ -1,4 +1,4 @@
-# vireo/tests/test_thumbnails.py
+import contextlib
 import os
 import sys
 from unittest.mock import MagicMock
@@ -1292,6 +1292,53 @@ def test_serve_thumbnail_prefers_working_copy_over_source(tmp_path, monkeypatch)
     )
     assert resp.data[:2] == b"\xff\xd8"
     assert os.path.exists(os.path.join(thumb_dir, f"{pid}.jpg"))
+
+
+def test_serve_thumbnail_retries_original_after_working_copy_eviction(
+    tmp_path, monkeypatch,
+):
+    """Eviction between thumbnail source selection and decode must recover."""
+    import thumbnails
+
+    app, db, pid, thumb_dir = _make_app_with_real_photo(
+        tmp_path, monkeypatch, filename="bird.jpg",
+    )
+    photo = db.get_photo(pid)
+    folder = db.get_folder(photo["folder_id"])
+    original_path = os.path.join(folder["path"], photo["filename"])
+    vireo_dir = os.path.dirname(thumb_dir)
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{pid}.jpg")
+    Image.new("RGB", (800, 600), (20, 180, 20)).save(wc_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{pid}.jpg", pid),
+    )
+    db.conn.commit()
+    db.set_photo_edit_recipe(
+        pid, {"crop": {"x": 0, "y": 0, "w": 0.75, "h": 1}},
+    )
+
+    real_load_image = thumbnails.load_image
+    loaded_paths = []
+
+    def evicting_load(path, *args, **kwargs):
+        loaded_paths.append(os.path.abspath(path))
+        if os.path.abspath(path) == os.path.abspath(wc_path):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(wc_path)
+            return None
+        return real_load_image(path, *args, **kwargs)
+
+    monkeypatch.setattr(thumbnails, "load_image", evicting_load)
+
+    response = app.test_client().get(f"/thumbnails/{pid}.jpg")
+
+    assert response.status_code == 200
+    assert os.path.abspath(wc_path) in loaded_paths
+    assert os.path.abspath(original_path) in loaded_paths
+    assert os.path.isfile(os.path.join(thumb_dir, f"{pid}.jpg"))
 
 
 def test_serve_thumbnail_404s_when_source_is_unreadable(tmp_path, monkeypatch):

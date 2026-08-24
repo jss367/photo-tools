@@ -1099,7 +1099,23 @@ def test_get_snapshot_returns_summary(app_and_db):
     _touch_image(str(folder / "IMG_001.JPG"))
 
     with app.test_client() as client:
-        post = client.post("/api/workspaces/active/new-images/snapshot")
+        # The endpoint returns 202 while the background walk is in flight;
+        # under CI load the fast-path 500ms wait can be exceeded. Poll like a
+        # real client would — matches test_post_snapshot_creates_row_with_current_new_images.
+        import time as _time
+        deadline = _time.monotonic() + 5.0
+        post = None
+        while _time.monotonic() < deadline:
+            post = client.post("/api/workspaces/active/new-images/snapshot")
+            if post.status_code == 200:
+                break
+            assert post.status_code == 202, (
+                f"unexpected status {post.status_code}: {post.get_data(as_text=True)}"
+            )
+            _time.sleep(0.05)
+        assert post is not None and post.status_code == 200, (
+            f"snapshot never converged; last status {post and post.status_code}"
+        )
         snap_id = post.get_json()["snapshot_id"]
 
         resp = client.get(f"/api/workspaces/active/new-images/snapshot/{snap_id}")

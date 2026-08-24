@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+from pathlib import Path
 
 from wait import wait_for_job_via_client
 
@@ -824,7 +825,9 @@ def test_storage_page_has_health_cleanup_and_location_controls(app_and_db):
         b'storageFreeSize', b'storageReclaimableSize', b'clearSafeCaches',
         b'openStorageFolder', b'refreshStoragePage', b'Safe to clear',
         b'Download again', b'cannot currently be reclaimed separately',
-        b'loadMasksCard(s && s.masks)',
+        b'loadMasksCard(s && s.masks)', b'cfgWorkingCopyCacheMaxGb',
+        b"{name: 'Working Copies'", b'Oldest files are removed first',
+        b"{name: 'Other Vireo Data'",
     ):
         assert marker in page.data
     assert page.data.count(b"{name: 'Database'") == 1
@@ -857,9 +860,11 @@ def test_api_storage_reports_volume_reclaimable_and_masks(
     )
     assert data["total"] == sum([
         data["database"]["size"], data["thumbnails"]["size"],
-        data["previews"]["size"], data["embeddings"]["size"],
+        data["previews"]["size"], data["working_copies"]["size"],
+        data["embeddings"]["size"],
         data["models"]["size"], data["hf_cache"]["size"],
         data["offline_originals"]["size"], data["masks"]["size"],
+        data["other"]["size"],
     ])
     assert data["storage_root"] == str(tmp_path)
     assert data["locations"]
@@ -869,6 +874,461 @@ def test_api_storage_reports_volume_reclaimable_and_masks(
     assert all(volume["capacity"] > 0 for volume in data["volumes"])
 
 
+def test_api_storage_includes_working_copies(app_and_db, tmp_path):
+    """Working copies appear in both their category and the managed total."""
+    app, db = app_and_db
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    payload = b"working-copy"
+    (working_dir / "1.jpg").write_bytes(payload)
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path='working/1.jpg' WHERE id=1"
+    )
+    db.conn.commit()
+
+    data = app.test_client().get('/api/storage').get_json()
+
+    assert data["working_copies"] == {
+        "count": 1,
+        "path": str(working_dir),
+        "quota_bytes": 20480 * 1024 * 1024,
+        "size": len(payload),
+    }
+    assert data["total"] >= len(payload)
+
+
+def test_api_storage_counts_unclassified_vireo_root_files_as_other(
+    app_and_db, tmp_path,
+):
+    app, _ = app_and_db
+    before = app.test_client().get('/api/storage').get_json()
+    payload = b"taxonomy-or-log-data"
+    (tmp_path / "unclassified-vireo-data.bin").write_bytes(payload)
+
+    after = app.test_client().get('/api/storage').get_json()
+
+    assert after["other"]["path"] == str(tmp_path)
+    assert after["other"]["size"] - before["other"]["size"] == len(payload)
+    assert after["total"] - before["total"] == len(payload)
+
+
+def test_api_storage_custom_thumb_dir_ignores_unrelated_siblings(
+    app_and_db, tmp_path,
+):
+    app, db = app_and_db
+    shared_root = tmp_path / "shared-volume"
+    custom_thumbs = shared_root / "thumbs"
+    custom_thumbs.mkdir(parents=True)
+    app.config["THUMB_CACHE_DIR"] = str(custom_thumbs)
+
+    before = app.test_client().get("/api/storage").get_json()
+    unrelated = b"not-owned-by-vireo"
+    (shared_root / "unrelated.bin").write_bytes(unrelated)
+    after_unrelated = app.test_client().get("/api/storage").get_json()
+
+    assert after_unrelated["other"]["size"] == before["other"]["size"]
+    assert after_unrelated["total"] == before["total"]
+
+    taxonomy_payload = b"managed-taxonomy-data"
+    (tmp_path / "taxonomy.json").write_bytes(taxonomy_payload)
+    taxonomy_dir = tmp_path / "taxonomy"
+    taxonomy_dir.mkdir()
+    (taxonomy_dir / "index.bin").write_bytes(taxonomy_payload)
+    after_taxonomy = app.test_client().get("/api/storage").get_json()
+
+    assert (
+        after_taxonomy["other"]["size"] - after_unrelated["other"]["size"]
+        == len(taxonomy_payload) * 2
+    )
+
+    originals = shared_root / "originals"
+    originals.mkdir()
+    owned = b"vireo-display-render"
+    (originals / "1.display.jpg").write_bytes(owned)
+    after_owned = app.test_client().get("/api/storage").get_json()
+
+    assert (
+        after_owned["other"]["size"] - after_taxonomy["other"]["size"]
+        == len(owned)
+    )
+    assert after_owned["total"] - after_taxonomy["total"] == len(owned)
+
+    # Staging is Vireo-managed under a custom --thumb-dir too — an omitted
+    # entry in the allowlist would hide potentially very large recovery data
+    # from Storage totals.
+    staging = shared_root / "staging" / "pipeline-abc"
+    staging.mkdir(parents=True)
+    staged = b"pipeline-recovery-data"
+    (staging / "photo.NEF").write_bytes(staged)
+    after_staging = app.test_client().get("/api/storage").get_json()
+    assert (
+        after_staging["other"]["size"] - after_owned["other"]["size"]
+        == len(staged)
+    )
+    assert after_staging["total"] - after_owned["total"] == len(staged)
+
+    # Migration backups remain beside the catalog, not below the custom
+    # generated-data root. Count the exact retained schema-backup pattern
+    # without broadening accounting to arbitrary catalog siblings.
+    migration_backup = Path(f"{db._db_path}.pre-v999.bak")
+    backup_payload = b"pre-migration-catalog-snapshot"
+    migration_backup.write_bytes(backup_payload)
+    Path(f"{db._db_path}.pre-vbad.bak").write_bytes(b"unrelated-lookalike")
+    after_backup = app.test_client().get("/api/storage").get_json()
+    assert (
+        after_backup["other"]["size"] - after_staging["other"]["size"]
+        == len(backup_payload)
+    )
+    assert after_backup["total"] - after_staging["total"] == len(backup_payload)
+
+
+def test_startup_sweeps_abandoned_transient_originals(app_and_db, tmp_path):
+    """A killed process can leave ``.transient.*.jpg`` under ``originals/``.
+
+    Working-copy eviction only scans ``working/``, so those orphans would
+    otherwise accumulate outside the configured quota with no cleanup path.
+    Startup sweeps them explicitly.
+    """
+    from app import _sweep_abandoned_transient_originals
+
+    app, _ = app_and_db
+    originals = tmp_path / "originals"
+    originals.mkdir(exist_ok=True)
+    orphan = originals / ".42.transient.abcdef.jpg"
+    orphan.write_bytes(b"x" * 1024)
+    peer = originals / "1.display.jpg"
+    peer.write_bytes(b"y" * 256)
+
+    _sweep_abandoned_transient_originals(app)
+
+    assert not orphan.exists()
+    # Non-transient files under originals/ are unrelated Vireo state
+    # (display caches, paired-render bytes, etc.) and must be left alone.
+    assert peer.exists()
+
+
+def test_config_update_immediately_enforces_working_copy_quota(
+    app_and_db, tmp_path,
+):
+    app, db = app_and_db
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    path = working_dir / "1.jpg"
+    path.write_bytes(b"working-copy")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path='working/1.jpg' WHERE id=1"
+    )
+    db.conn.commit()
+
+    response = app.test_client().post(
+        "/api/config", json={"working_copy_cache_max_mb": 0},
+    )
+
+    assert response.status_code == 200
+    assert not path.exists()
+    row = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime "
+        "FROM photos WHERE id=1"
+    ).fetchone()
+    assert row["working_copy_path"] is None
+    assert row["working_copy_evicted_mtime"] == 1.0
+
+    # Raising the ceiling releases the deliberate-eviction marker so the
+    # next scan/startup backfill may use the newly available space.
+    response = app.test_client().post(
+        "/api/config", json={"working_copy_cache_max_mb": 1},
+    )
+    assert response.status_code == 200
+    row = db.conn.execute(
+        "SELECT working_copy_evicted_mtime FROM photos WHERE id=1"
+    ).fetchone()
+    assert row["working_copy_evicted_mtime"] is None
+
+
+def test_settings_global_patch_enforces_and_clears_working_copy_quota(
+    app_and_db, tmp_path,
+):
+    """The schema-driven PATCH mirrors the legacy /api/config quota transitions.
+
+    Reducing the quota through PATCH must evict immediately (not wait until
+    the next scan or config save); raising it must clear the per-row
+    eviction marker so scan/backfill can regenerate deferred copies.
+    Without both, the schema-rendered Settings form (which drives this
+    endpoint) is silently a no-op on the working-copy budget.
+    """
+    app, db = app_and_db
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    path = working_dir / "1.jpg"
+    path.write_bytes(b"working-copy")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path='working/1.jpg' WHERE id=1"
+    )
+    db.conn.commit()
+
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "working_copy_cache_max_mb", "value": 0},
+    )
+    assert response.status_code == 200
+    assert not path.exists()
+    row = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime "
+        "FROM photos WHERE id=1"
+    ).fetchone()
+    assert row["working_copy_path"] is None
+    assert row["working_copy_evicted_mtime"] == 1.0
+
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "working_copy_cache_max_mb", "value": 1},
+    )
+    assert response.status_code == 200
+    row = db.conn.execute(
+        "SELECT working_copy_evicted_mtime FROM photos WHERE id=1"
+    ).fetchone()
+    assert row["working_copy_evicted_mtime"] is None
+
+
+def test_unrelated_setting_does_not_scan_working_copy_cache(
+    app_and_db, monkeypatch,
+):
+    """Only an effective quota reduction needs synchronous WC eviction."""
+    import app as app_module
+
+    app, _db = app_and_db
+    calls = []
+    monkeypatch.setattr(
+        app_module,
+        "evict_working_copy_cache_if_over_quota",
+        lambda *_args, **_kwargs: calls.append(True),
+    )
+
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "working_copy_quality", "value": 91},
+    )
+
+    assert response.status_code == 200
+    assert calls == []
+
+
+def test_settings_global_delete_restores_default_and_clears_evictions(
+    app_and_db, tmp_path,
+):
+    """Deleting a shrunk override reverts to the (larger) default quota and
+    must clear the eviction marker — otherwise startup-backfill stays
+    permanently blocked on rows evicted under the smaller value even though
+    the effective quota is now larger."""
+    import config as cfg
+
+    app, db = app_and_db
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    path = working_dir / "1.jpg"
+    path.write_bytes(b"working-copy")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path='working/1.jpg' WHERE id=1"
+    )
+    db.conn.commit()
+
+    # Shrink first via PATCH so an override is in place and eviction runs.
+    app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "working_copy_cache_max_mb", "value": 0},
+    ).close()
+    row = db.conn.execute(
+        "SELECT working_copy_evicted_mtime FROM photos WHERE id=1"
+    ).fetchone()
+    assert row["working_copy_evicted_mtime"] == 1.0
+
+    # Deleting the override reverts to the default (20480 MB) — a raise.
+    response = app.test_client().delete(
+        "/api/settings/global/working_copy_cache_max_mb"
+    )
+    assert response.status_code == 200
+    row = db.conn.execute(
+        "SELECT working_copy_evicted_mtime FROM photos WHERE id=1"
+    ).fetchone()
+    assert row["working_copy_evicted_mtime"] is None
+    # The on-disk config file must no longer carry the override — otherwise
+    # cfg.load() would still merge the shrunk value on top of the defaults.
+    with open(cfg.CONFIG_PATH) as f:
+        raw = json.load(f)
+    assert "working_copy_cache_max_mb" not in raw
+
+
+def test_settings_patch_skips_working_copy_eviction_for_unrelated_writes(
+    app_and_db, monkeypatch,
+):
+    """Unrelated settings writes must not trigger a full working-copy scan.
+
+    ``evict_if_over_quota`` selects every photo row and scans every file in
+    working/ while holding the publication lock. Running it on every
+    settings write — token, keyboard-shortcut, model, etc. — blocks the
+    request and every active working-copy publisher on a large catalog
+    even though the quota did not change. Startup enforcement and the
+    incremental cache-writer passes already cover the other paths where
+    an over-quota state can arise, so the settings handler only needs to
+    enforce a genuine capacity reduction.
+    """
+    import app as app_module
+
+    app, _ = app_and_db
+    calls = []
+
+    def spy_evict(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {
+            "evicted": 0, "freed_bytes": 0, "remaining_bytes": 0,
+            "quota_bytes": 0,
+        }
+
+    monkeypatch.setattr(
+        app_module, "evict_working_copy_cache_if_over_quota", spy_evict,
+    )
+
+    # A token write must not run the working-copy eviction pass — the
+    # quota is unchanged, so a full scan would just block the request.
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "hf_token", "value": "hf-abc-123"},
+    )
+    assert response.status_code == 200
+    assert calls == []
+
+    # Raising the quota also skips the pass: only a lower ceiling can make
+    # working-copy usage exceed the new limit.
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "working_copy_cache_max_mb", "value": 40960},
+    )
+    assert response.status_code == 200
+    assert calls == []
+
+    # Lowering the quota must still trigger a pass — regressions here
+    # would defeat the on-save enforcement the Storage UI advertises.
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "working_copy_cache_max_mb", "value": 1024},
+    )
+    assert response.status_code == 200
+    assert len(calls) == 1
+
+
+def test_quota_raise_reenables_evicted_companion_backed_copy(app_and_db):
+    """A known-good companion rendition can regenerate immediately."""
+    import config as cfg
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    cfg.set("working_copy_cache_max_mb", 0)
+    db.conn.execute(
+        """UPDATE photos
+           SET extension='.nef', companion_path='photo.jpg',
+               working_copy_path=NULL, working_copy_evicted_mtime=file_mtime,
+               working_copy_failed_at=datetime('now'),
+               working_copy_failed_mtime=file_mtime,
+               working_copy_failed_source='source'
+           WHERE id=?""",
+        (photo["id"],),
+    )
+    db.conn.commit()
+
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "working_copy_cache_max_mb", "value": 1},
+    )
+
+    assert response.status_code == 200
+    row = db.conn.execute(
+        """SELECT working_copy_evicted_mtime, working_copy_failed_at,
+                  working_copy_failed_mtime, working_copy_failed_source
+           FROM photos WHERE id=?""",
+        (photo["id"],),
+    ).fetchone()
+    assert row["working_copy_evicted_mtime"] is None
+    assert row["working_copy_failed_at"] is None
+    assert row["working_copy_failed_mtime"] is None
+    assert row["working_copy_failed_source"] is None
+
+
+def test_original_route_enforces_working_copy_quota(
+    client_with_photo, tmp_path,
+):
+    app, db, photo_id = client_with_photo
+    import config as cfg
+    from PIL import Image
+
+    photo = db.get_photo(photo_id)
+    folder = db.conn.execute(
+        "SELECT path FROM folders WHERE id=?", (photo["folder_id"],)
+    ).fetchone()
+    jpeg_path = os.path.join(folder["path"], photo["filename"])
+    tiff_path = os.path.join(folder["path"], "test.tiff")
+    Image.open(jpeg_path).save(tiff_path, "TIFF")
+    os.remove(jpeg_path)
+    source_mtime = os.path.getmtime(tiff_path)
+    db.conn.execute(
+        "UPDATE photos SET filename='test.tiff', extension='.tiff', "
+        "file_size=?, file_mtime=?, working_copy_evicted_mtime=? WHERE id=?",
+        (os.path.getsize(tiff_path), source_mtime, source_mtime, photo_id),
+    )
+
+    old_photo_id = db.add_photo(
+        folder_id=photo["folder_id"], filename="old.tiff", extension=".tiff",
+        file_size=1, file_mtime=1.0, width=800, height=600,
+    )
+    working_dir = tmp_path / "vireo" / "working"
+    working_dir.mkdir()
+    old_path = working_dir / f"{old_photo_id}.jpg"
+    old_path.write_bytes(b"x" * (1024 * 1024))
+    os.utime(old_path, (1, 1))
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{old_photo_id}.jpg", old_photo_id),
+    )
+    db.conn.commit()
+    cfg.set("working_copy_cache_max_mb", 1)
+
+    response = app.test_client().get(f"/photos/{photo_id}/original")
+
+    assert response.status_code == 200
+    assert not old_path.exists()
+    current_path = working_dir / f"{photo_id}.jpg"
+    assert current_path.exists()
+    row = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime "
+        "FROM photos WHERE id=?", (photo_id,),
+    ).fetchone()
+    assert row["working_copy_path"] == f"working/{photo_id}.jpg"
+    assert row["working_copy_evicted_mtime"] is None
+    response.close()
+
+    # A rendition larger than a zero-byte budget is still usable for the
+    # current response, but it must remain untracked and disappear when the
+    # response closes instead of becoming a persistent cache entry.
+    current_path.unlink()
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=NULL, "
+        "working_copy_evicted_mtime=? WHERE id=?",
+        (source_mtime, photo_id),
+    )
+    db.conn.commit()
+    cfg.set("working_copy_cache_max_mb", 0)
+
+    response = app.test_client().get(f"/photos/{photo_id}/original")
+    assert response.status_code == 200
+    assert not current_path.exists()
+    row = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime "
+        "FROM photos WHERE id=?", (photo_id,),
+    ).fetchone()
+    assert row["working_copy_path"] is None
+    assert row["working_copy_evicted_mtime"] == source_mtime
+    assert response.data
+    response.close()
+    assert not list((tmp_path / "vireo" / "originals").glob("*.transient.*"))
 def test_api_storage_reports_each_backing_volume(
     app_and_db, tmp_path, monkeypatch,
 ):

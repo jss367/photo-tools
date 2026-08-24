@@ -3172,6 +3172,35 @@ def test_publish_classifier_runs_promotes_after_predictions_persist(tmp_path):
     assert summary["classifier_runs"] == 1
 
 
+def test_publish_classifier_runs_forwards_captured_input_source(monkeypatch):
+    """Delayed promotion uses preparation-time provenance, not a later row."""
+    import classify_job
+    import computation_cache
+
+    calls = []
+
+    def capture_publish(*_args, **kwargs):
+        calls.append(kwargs["source_is_original"])
+
+    monkeypatch.setattr(
+        computation_cache, "promote_and_publish_classifier_run",
+        capture_publish,
+    )
+
+    classify_job._publish_classifier_runs_for_raw_results(
+        object(),
+        [
+            {"detection_id": 1, "_input_source": "working_copy"},
+            {"detection_id": 2, "_input_source": "original"},
+        ],
+        "BioCLIP", "abc123",
+        labels_fingerprint_full="1" * 64,
+        model_identity={"id": "test"},
+    )
+
+    assert calls == [False, True]
+
+
 def test_all_photos_cache_satisfied_requires_matching_predictions_row(tmp_path):
     """A classifier_runs row with no matching ``predictions`` row is a
     torn write from a crashed local job — ``_record_batch_classifier_runs``
@@ -4169,6 +4198,7 @@ def test_prepare_image_uses_working_copy(tmp_path):
     assert img is not None
     # The result should be thumbnailed to 1024
     assert max(img.size) <= 1024
+    assert img.info["_vireo_input_source"] == "working_copy"
 
 
 def test_prepare_image_falls_back_without_working_copy(tmp_path):
@@ -4198,6 +4228,7 @@ def test_prepare_image_falls_back_without_working_copy(tmp_path):
 
     assert img is not None
     assert max(img.size) <= 1024
+    assert img.info["_vireo_input_source"] == "original"
 
 
 def test_prepare_image_crops_detection_from_working_copy(tmp_path):

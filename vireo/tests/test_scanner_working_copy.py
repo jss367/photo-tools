@@ -1199,3 +1199,607 @@ def test_startup_backfill_does_not_persist_to_history(tmp_path, monkeypatch):
         "SELECT id FROM job_history WHERE type='working_copy_backfill'"
     ).fetchall()
     assert rows == [], "ephemeral job must not persist to history"
+
+
+def _make_noisy_jpeg(path, width, height):
+    """A high-entropy JPEG so extracted working copies stay large enough to
+    exercise the quota tracker (uniform-gray JPEGs compress to a few KB)."""
+    import numpy as np
+
+    rng = np.random.default_rng(1234)
+    arr = rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
+    Image.fromarray(arr, "RGB").save(str(path), "JPEG", quality=95)
+
+
+def _photo_id_of_file(db, folder_id, filename, path):
+    return db.add_photo(
+        folder_id, filename, ".jpg",
+        file_size=os.path.getsize(str(path)),
+        file_mtime=os.path.getmtime(str(path)),
+        width=2000, height=1500,
+    )
+
+
+def test_batch_generation_stops_when_quota_exhausted(tmp_path, monkeypatch):
+    """A single backfill batch cannot generate multiples of the quota.
+
+    Regression: without incremental enforcement, a library much larger than
+    ``working_copy_cache_max_mb`` would produce the entire set of working
+    copies before the post-loop eviction ran, temporarily using far more
+    disk than the configured cap. The loop now stops once cumulative new
+    bytes reach the quota, and the post-loop enforce reclaims to fit.
+    """
+    import config as cfg
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    # A tiny 1 MB quota with noisy JPEGs (~700 KB each at 1000 px q=90) means
+    # two files fill the batch cap; the rest must be deferred.
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+    photo_ids = []
+    for i in range(6):
+        src = folder / f"big-{i}.jpg"
+        _make_noisy_jpeg(src, 2000, 1500)
+        photo_ids.append(
+            _photo_id_of_file(db, folder_id, f"big-{i}.jpg", src)
+        )
+
+    _extract_working_copies(db, str(vireo_dir))
+
+    working_dir = vireo_dir / "working"
+    on_disk = list(working_dir.glob("*.jpg")) if working_dir.exists() else []
+    total_bytes = sum(p.stat().st_size for p in on_disk)
+    quota_bytes = 1 * 1024 * 1024
+    assert total_bytes <= quota_bytes, (
+        f"post-loop enforce must keep on-disk usage within the {quota_bytes} "
+        f"byte quota; observed {total_bytes} bytes across {len(on_disk)} files"
+    )
+    # And the loop must NOT have generated all six files (each ~700 KB).
+    assert len(on_disk) < len(photo_ids), (
+        "batch generation must stop before producing multiples of the quota; "
+        f"produced {len(on_disk)} of {len(photo_ids)} candidates"
+    )
+
+
+def test_incremental_enforcement_bounds_transient_overshoot(tmp_path, monkeypatch):
+    """Mid-batch enforce runs so transient usage stays close to the quota.
+
+    Records every call to ``evict_if_over_quota`` during a batch that
+    generates significantly more than the quota — at least one call must
+    fire before the post-loop enforce so the transient overshoot is
+    bounded.
+    """
+    import config as cfg
+    import working_copy_cache
+    from db import Database
+    from scanner import _extract_working_copies
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(folder))
+    for i in range(4):
+        src = folder / f"big-{i}.jpg"
+        _make_noisy_jpeg(src, 2000, 1500)
+        _photo_id_of_file(db, folder_id, f"big-{i}.jpg", src)
+
+    call_sites = []
+    real_evict = working_copy_cache.evict_if_over_quota
+
+    def tracking_evict(*args, **kwargs):
+        call_sites.append(True)
+        return real_evict(*args, **kwargs)
+
+    # scanner reimports evict_if_over_quota via ``from working_copy_cache
+    # import evict_if_over_quota`` INSIDE _extract_working_copies, so the
+    # local binding resolves against this attribute at call time.
+    monkeypatch.setattr(
+        working_copy_cache, "evict_if_over_quota", tracking_evict,
+    )
+
+    _extract_working_copies(db, str(vireo_dir))
+
+    # Post-loop enforce + at least one incremental enforce = >= 2 calls.
+    assert len(call_sites) >= 2, (
+        f"expected incremental enforcement to fire during a large batch; "
+        f"observed {len(call_sites)} evict_if_over_quota calls"
+    )
+
+
+def test_capacity_deferred_rows_do_not_retrigger_backfill(tmp_path, monkeypatch):
+    """Rows deferred by the quota stop must not re-trigger startup backfill.
+
+    Regression: when ``_extract_working_copies`` breaks out of the loop
+    because cumulative new bytes reached the quota, previously the
+    unprocessed rows still satisfied ``_working_copy_candidate_predicate``.
+    The next launch's startup gate saw a non-zero candidate count and
+    kicked off another backfill, which wrote yet another quota-sized
+    batch only to evict the previous one — churning disk on every
+    restart without ever changing steady-state usage.
+    """
+    import config as cfg
+    from db import Database
+    from scanner import (
+        _extract_working_copies,
+        working_copy_backfill_candidate_count,
+    )
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        folder_id = db.add_folder(str(folder))
+        for i in range(6):
+            src = folder / f"big-{i}.jpg"
+            _make_noisy_jpeg(src, 2000, 1500)
+            _photo_id_of_file(db, folder_id, f"big-{i}.jpg", src)
+
+        _extract_working_copies(db, str(vireo_dir))
+
+        # After the first pass with a 1 MB quota against ~700 KB files, the
+        # loop must have stopped and marked the rest deferred so the startup
+        # gate sees no eligible candidates until the quota or source changes.
+        remaining = working_copy_backfill_candidate_count(db)
+        assert remaining == 0, (
+            "expected capacity-deferred rows to be excluded from the "
+            f"candidate predicate; still {remaining} eligible"
+        )
+
+        # A subsequent run must be a no-op: no additional files decoded,
+        # no additional bytes written on disk (i.e. no churn).
+        working_dir = vireo_dir / "working"
+        before = sorted(
+            (p.name, p.stat().st_mtime_ns, p.stat().st_size)
+            for p in working_dir.glob("*.jpg")
+        )
+        _extract_working_copies(db, str(vireo_dir))
+        after = sorted(
+            (p.name, p.stat().st_mtime_ns, p.stat().st_size)
+            for p in working_dir.glob("*.jpg")
+        )
+        assert after == before, (
+            "second backfill pass must not regenerate any working copy "
+            "while the quota is unchanged (churn regression)"
+        )
+
+        # Raising the quota clears the deferred markers and the deferred rows
+        # become eligible again — the exact escape hatch we want to preserve.
+        db.conn.execute(
+            "UPDATE photos SET working_copy_evicted_mtime=NULL"
+            " WHERE working_copy_path IS NULL"
+        )
+        db.conn.commit()
+        assert working_copy_backfill_candidate_count(db) > 0
+    finally:
+        db.close()
+
+
+def test_capacity_deferral_does_not_mark_reused_photo_id(
+    tmp_path, monkeypatch,
+):
+    """A delete/re-import during a long backfill keeps the new row eligible.
+
+    ``photos.id`` can reuse the highest deleted rowid. The capacity stop must
+    therefore validate the candidate identity captured before extraction,
+    rather than stamping whichever row happens to own that id later.
+    """
+    import config as cfg
+    import scanner
+    import working_copy_cache
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        folder_id = db.add_folder(str(folder))
+        photo_ids = []
+        for index in range(3):
+            source = folder / f"candidate-{index}.jpg"
+            _make_jpeg(str(source), 2000, 1500)
+            photo_ids.append(
+                _photo_id_of_file(db, folder_id, source.name, source)
+            )
+
+        def sized_extract(_source, output, **_kwargs):
+            os.makedirs(os.path.dirname(output), exist_ok=True)
+            with open(output, "wb") as handle:
+                handle.truncate(600_000)
+            return True
+
+        monkeypatch.setattr(scanner, "extract_working_copy", sized_extract)
+
+        real_evict = working_copy_cache.evict_if_over_quota
+        eviction_calls = 0
+        replacement_id = None
+
+        def replace_pending_row_after_second_eviction(*args, **kwargs):
+            nonlocal eviction_calls, replacement_id
+            result = real_evict(*args, **kwargs)
+            eviction_calls += 1
+            if eviction_calls == 2:
+                pending_id = photo_ids[-1]
+                db.conn.execute("DELETE FROM photos WHERE id=?", (pending_id,))
+                db.conn.commit()
+                replacement_id = db.add_photo(
+                    folder_id, "replacement.jpg", ".jpg",
+                    file_size=321, file_mtime=999.0,
+                    width=2000, height=1500,
+                )
+                assert replacement_id == pending_id
+            return result
+
+        monkeypatch.setattr(
+            working_copy_cache,
+            "evict_if_over_quota",
+            replace_pending_row_after_second_eviction,
+        )
+
+        scanner._extract_working_copies(db, str(vireo_dir))
+
+        assert replacement_id == photo_ids[-1]
+        replacement = db.conn.execute(
+            "SELECT working_copy_path, working_copy_evicted_mtime "
+            "FROM photos WHERE id=?",
+            (replacement_id,),
+        ).fetchone()
+        assert replacement["working_copy_path"] is None
+        assert replacement["working_copy_evicted_mtime"] is None
+        assert scanner.working_copy_backfill_candidate_count(db) == 1
+    finally:
+        db.close()
+
+
+def test_oversized_copy_does_not_defer_later_fitting_candidate(
+    tmp_path, monkeypatch,
+):
+    """An individually oversized rendition must not stop the batch.
+
+    The incremental quota pass removes a generated file larger than the
+    entire budget. Its reclaimed bytes must not count toward the batch stop,
+    or every later candidate is marked capacity-deferred even when it fits.
+    """
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    working_dir = vireo_dir / "working"
+    working_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        folder_id = db.add_folder(str(folder))
+        oversized_source = folder / "oversized.jpg"
+        fitting_source = folder / "fitting.jpg"
+        _make_jpeg(str(oversized_source), 2000, 1500)
+        _make_jpeg(str(fitting_source), 2000, 1500)
+        oversized_id = _photo_id_of_file(
+            db, folder_id, oversized_source.name, oversized_source,
+        )
+        fitting_id = _photo_id_of_file(
+            db, folder_id, fitting_source.name, fitting_source,
+        )
+
+        generated_sources = []
+
+        def sized_extract(source, output, **_kwargs):
+            generated_sources.append(os.path.basename(source))
+            size = (
+                1024 * 1024 + 1
+                if os.path.basename(source) == oversized_source.name
+                else 128 * 1024
+            )
+            with open(output, "wb") as handle:
+                handle.truncate(size)
+            return True
+
+        monkeypatch.setattr(scanner, "extract_working_copy", sized_extract)
+
+        scanner._extract_working_copies(db, str(vireo_dir))
+
+        assert generated_sources == [
+            oversized_source.name,
+            fitting_source.name,
+        ]
+        assert not (working_dir / f"{oversized_id}.jpg").exists()
+        assert (working_dir / f"{fitting_id}.jpg").exists()
+        fitting_row = db.conn.execute(
+            "SELECT working_copy_path, working_copy_evicted_mtime "
+            "FROM photos WHERE id=?",
+            (fitting_id,),
+        ).fetchone()
+        assert fitting_row["working_copy_path"] == (
+            f"working/{fitting_id}.jpg"
+        )
+        assert fitting_row["working_copy_evicted_mtime"] is None
+    finally:
+        db.close()
+
+
+def test_backfill_adopts_quota_increase_before_deferring_rows(
+    tmp_path, monkeypatch,
+):
+    """A mid-batch quota raise cannot leave stale deferred markers."""
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    (vireo_dir / "working").mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        folder_id = db.add_folder(str(folder))
+        photo_ids = []
+        for index in range(3):
+            source = folder / f"candidate-{index}.jpg"
+            _make_jpeg(str(source), 2000, 1500)
+            photo_ids.append(
+                _photo_id_of_file(
+                    db, folder_id, source.name, source,
+                )
+            )
+
+        generated = 0
+
+        def extract_and_raise_quota(_source, output, **_kwargs):
+            nonlocal generated
+            generated += 1
+            with open(output, "wb") as handle:
+                handle.truncate(600_000)
+            if generated == 2:
+                cfg.set("working_copy_cache_max_mb", 2)
+            return True
+
+        monkeypatch.setattr(
+            scanner, "extract_working_copy", extract_and_raise_quota,
+        )
+
+        scanner._extract_working_copies(db, str(vireo_dir))
+
+        assert generated == 3
+        rows = db.conn.execute(
+            "SELECT working_copy_path, working_copy_evicted_mtime "
+            "FROM photos WHERE id IN (?, ?, ?) ORDER BY id",
+            photo_ids,
+        ).fetchall()
+        assert all(row["working_copy_path"] for row in rows)
+        assert all(row["working_copy_evicted_mtime"] is None for row in rows)
+    finally:
+        db.close()
+
+
+def test_backfill_enforces_quota_lowered_during_extraction(
+    tmp_path, monkeypatch,
+):
+    """A settings save cannot let an in-flight batch refill the old quota."""
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 10,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        folder_id = db.add_folder(str(folder))
+        photo_ids = []
+        for i in range(2):
+            src = folder / f"big-{i}.jpg"
+            _make_jpeg(str(src), 2000, 1500)
+            photo_ids.append(
+                _photo_id_of_file(db, folder_id, f"big-{i}.jpg", src)
+            )
+
+        generated = 0
+
+        def extract_and_lower_quota(_source, output, **_kwargs):
+            nonlocal generated
+            generated += 1
+            os.makedirs(os.path.dirname(output), exist_ok=True)
+            with open(output, "wb") as handle:
+                handle.truncate(600_000)
+            cfg.set("working_copy_cache_max_mb", 0)
+            return True
+
+        monkeypatch.setattr(
+            scanner, "extract_working_copy", extract_and_lower_quota,
+        )
+
+        scanner._extract_working_copies(db, str(vireo_dir))
+
+        assert generated == 1
+        assert not list((vireo_dir / "working").glob("*.jpg"))
+        rows = db.conn.execute(
+            "SELECT working_copy_path, working_copy_evicted_mtime "
+            "FROM photos WHERE id IN (?, ?) ORDER BY id",
+            photo_ids,
+        ).fetchall()
+        assert all(row["working_copy_path"] is None for row in rows)
+        assert all(row["working_copy_evicted_mtime"] is not None for row in rows)
+    finally:
+        db.close()
+
+
+def test_batch_stops_when_quota_rotates_fitting_working_copies(
+    tmp_path, monkeypatch,
+):
+    """One-for-one eviction of fitting copies stops further decoding."""
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    (vireo_dir / "working").mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        folder_id = db.add_folder(str(folder))
+        for index in range(8):
+            source = folder / f"candidate-{index}.jpg"
+            _make_jpeg(str(source), 2000, 1500)
+            _photo_id_of_file(db, folder_id, source.name, source)
+
+        generated = 0
+
+        def fitting_extract(_source, output, **_kwargs):
+            nonlocal generated
+            generated += 1
+            with open(output, "wb") as handle:
+                handle.truncate(600_000)
+            return True
+
+        monkeypatch.setattr(scanner, "extract_working_copy", fitting_extract)
+
+        scanner._extract_working_copies(db, str(vireo_dir))
+
+        assert generated == 2
+        assert scanner.working_copy_backfill_candidate_count(db) == 0
+        on_disk = list((vireo_dir / "working").glob("*.jpg"))
+        assert len(on_disk) == 1
+        assert on_disk[0].stat().st_size == 600_000
+    finally:
+        db.close()
+
+
+def test_scanner_does_not_track_copy_evicted_before_catalog_commit(
+    tmp_path, monkeypatch,
+):
+    """A lost publication cannot leave a stale working_copy_path."""
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    source = folder / "candidate.jpg"
+    _make_jpeg(str(source), 2000, 1500)
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    (vireo_dir / "working").mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        folder_id = db.add_folder(str(folder))
+        photo_id = _photo_id_of_file(
+            db, folder_id, source.name, source,
+        )
+
+        def publish_then_lose(_source, output, **_kwargs):
+            with open(output, "wb") as handle:
+                handle.write(b"published")
+            os.unlink(output)
+            db.conn.execute(
+                "UPDATE photos SET working_copy_path=NULL, "
+                "working_copy_evicted_mtime=COALESCE(file_mtime, -1) "
+                "WHERE id=?",
+                (photo_id,),
+            )
+            db.conn.commit()
+            return True
+
+        monkeypatch.setattr(
+            scanner, "extract_working_copy", publish_then_lose,
+        )
+
+        scanner._extract_working_copies(db, str(vireo_dir))
+
+        row = db.conn.execute(
+            "SELECT working_copy_path, working_copy_evicted_mtime "
+            "FROM photos WHERE id=?",
+            (photo_id,),
+        ).fetchone()
+        assert row["working_copy_path"] is None
+        assert row["working_copy_evicted_mtime"] is not None
+    finally:
+        db.close()

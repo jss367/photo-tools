@@ -892,6 +892,159 @@ def test_export_cropped_recipe_avoids_undersized_working_copy(export_env):
         assert img.size == (300, 225)
 
 
+def test_export_falls_back_to_original_when_working_copy_evicted(
+    export_env, monkeypatch,
+):
+    """Working-copy sources evicted by quota mid-export retry the original.
+
+    Quota enforcement (concurrent scanner/on-demand writes, config-driven
+    shrinks) can unlink ``working/<id>.jpg`` after ``_select_export_source``
+    picked it but before ``load_image`` opens it. Without a retry the
+    otherwise valid export sporadically records "failed to load image".
+    """
+    import export as export_module
+
+    env = export_env
+    db = env["db"]
+    working_dir = os.path.join(env["vireo_dir"], "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_rel = f"working/{env['p1']}.jpg"
+    wc_path = os.path.join(working_dir, f"{env['p1']}.jpg")
+    Image.new("RGB", (800, 600), color="green").save(wc_path, "JPEG", quality=95)
+    db.conn.execute(
+        "UPDATE photos SET width=800, height=600, working_copy_path=? WHERE id=?",
+        (wc_rel, env["p1"]),
+    )
+    db.conn.commit()
+
+    original_load_image = export_module.load_image
+    load_calls = []
+
+    def evicting_load_image(file_path, max_size=1024, **kwargs):
+        load_calls.append(str(file_path))
+        # Simulate a concurrent quota eviction that unlinks the working
+        # copy between _select_export_source's validation and load_image.
+        if os.path.abspath(str(file_path)) == os.path.abspath(wc_path):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(wc_path)
+            return None
+        return original_load_image(file_path, max_size=max_size, **kwargs)
+
+    monkeypatch.setattr(export_module, "load_image", evicting_load_image)
+
+    result = export_photos(
+        db=db,
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "max_size": 400},
+    )
+
+    assert result["exported"] == 1
+    assert result["errors"] == []
+    # First attempt hits the working copy, then falls back to the original.
+    assert len(load_calls) == 2
+    assert os.path.abspath(load_calls[0]) == os.path.abspath(wc_path)
+    assert os.path.abspath(load_calls[1]) == os.path.abspath(
+        os.path.join(str(env["src"]), "bird1.jpg"),
+    )
+    assert os.path.isfile(os.path.join(env["dest"], "bird1.jpg"))
+
+
+def test_export_falls_back_when_working_copy_evicted_before_isfile_check(
+    export_env, monkeypatch,
+):
+    """Eviction that hits the microsecond window between
+    _select_export_source and the pre-loop isfile check must not drop the
+    photo — the primary source is still on disk and can satisfy the export.
+    """
+    import export as export_module
+
+    env = export_env
+    db = env["db"]
+    working_dir = os.path.join(env["vireo_dir"], "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_rel = f"working/{env['p1']}.jpg"
+    wc_path = os.path.join(working_dir, f"{env['p1']}.jpg")
+    Image.new("RGB", (800, 600), color="green").save(
+        wc_path, "JPEG", quality=95,
+    )
+    db.conn.execute(
+        "UPDATE photos SET width=800, height=600, working_copy_path=? WHERE id=?",
+        (wc_rel, env["p1"]),
+    )
+    db.conn.commit()
+
+    original_select = export_module._select_export_source
+
+    def selecting_then_evicting(**kwargs):
+        selected = original_select(**kwargs)
+        if selected and os.path.abspath(selected) == os.path.abspath(wc_path):
+            os.unlink(wc_path)
+        return selected
+
+    monkeypatch.setattr(
+        export_module, "_select_export_source", selecting_then_evicting,
+    )
+
+    result = export_photos(
+        db=db,
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "max_size": 400},
+    )
+
+    assert result["errors"] == [], result
+    assert result["exported"] == 1
+    assert os.path.isfile(os.path.join(env["dest"], "bird1.jpg"))
+
+
+def test_export_does_not_retry_when_working_copy_still_present(
+    export_env, monkeypatch,
+):
+    """A non-eviction load failure keeps its original "failed to load" error.
+
+    The mid-export fallback must not mask genuine decode failures on
+    working-copy sources that are still on disk.
+    """
+    import export as export_module
+
+    env = export_env
+    db = env["db"]
+    working_dir = os.path.join(env["vireo_dir"], "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_rel = f"working/{env['p1']}.jpg"
+    wc_path = os.path.join(working_dir, f"{env['p1']}.jpg")
+    Image.new("RGB", (800, 600), color="green").save(wc_path, "JPEG", quality=95)
+    db.conn.execute(
+        "UPDATE photos SET width=800, height=600, working_copy_path=? WHERE id=?",
+        (wc_rel, env["p1"]),
+    )
+    db.conn.commit()
+
+    load_calls = []
+
+    def failing_load_image(file_path, max_size=1024, **kwargs):
+        load_calls.append(str(file_path))
+        return None
+
+    monkeypatch.setattr(export_module, "load_image", failing_load_image)
+
+    result = export_photos(
+        db=db,
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={"naming_template": "{original}", "max_size": 400},
+    )
+
+    assert result["exported"] == 0
+    assert any("failed to load image" in err for err in result["errors"])
+    # No fallback attempt because the working copy is still on disk.
+    assert len(load_calls) == 1
+
+
 def test_export_edited_raw_skips_companion_jpeg_substitution(
     export_env, monkeypatch,
 ):
@@ -989,6 +1142,75 @@ def test_export_edited_raw_uses_working_copy_when_source_missing(export_env):
     assert result["errors"] == []
     with Image.open(os.path.join(env["dest"], "offline.jpg")) as img:
         assert img.size == (300, 400)
+
+
+def test_export_pins_working_copy_decode_when_source_missing(
+    export_env, monkeypatch,
+):
+    """Offline resized exports pin their only local source through decode."""
+    import working_copy_cache
+
+    env = export_env
+    db = env["db"]
+    working_dir = os.path.join(env["vireo_dir"], "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_rel = f"working/{env['p1']}.jpg"
+    wc_abs = os.path.join(env["vireo_dir"], wc_rel)
+    Image.new("RGB", (800, 600), color="red").save(
+        wc_abs, "JPEG", quality=95,
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='offline.NEF', extension='.nef',
+               working_copy_path=?, companion_path=NULL,
+               width=800, height=600
+           WHERE id=?""",
+        (wc_rel, env["p1"]),
+    )
+    db.conn.commit()
+    db.set_photo_edit_recipe(env["p1"], {"rotation": 90})
+
+    real_load_image = export_mod.load_image
+    held_during_decode = False
+
+    def probing_load_image(path, *args, **kwargs):
+        nonlocal held_during_decode
+        if os.path.abspath(path) == os.path.abspath(wc_abs):
+            probe = {"acquired": None}
+
+            def try_evict_lock():
+                acquired = working_copy_cache._eviction_lock.acquire(
+                    blocking=False,
+                )
+                probe["acquired"] = acquired
+                if acquired:
+                    working_copy_cache._eviction_lock.release()
+
+            thread = threading.Thread(target=try_evict_lock)
+            thread.start()
+            thread.join()
+            held_during_decode = probe["acquired"] is False
+        return real_load_image(path, *args, **kwargs)
+
+    monkeypatch.setattr(export_mod, "load_image", probing_load_image)
+
+    result = export_photos(
+        db=db,
+        vireo_dir=env["vireo_dir"],
+        photo_ids=[env["p1"]],
+        destination=env["dest"],
+        options={
+            "naming_template": "{original}",
+            "max_size": 400,
+        },
+    )
+
+    assert result["exported"] == 1
+    assert result["errors"] == []
+    assert held_during_decode, (
+        "offline export must prevent quota eviction until the working copy "
+        "has been decoded"
+    )
 
 
 def test_export_edited_raw_uses_working_copy_when_folder_missing(export_env):

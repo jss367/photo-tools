@@ -6,6 +6,7 @@ import threading
 import time
 import types
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -2036,6 +2037,55 @@ def test_original_serves_full_res_working_copy(app_and_db):
     assert resp.status_code == 200
 
 
+def test_original_opens_full_res_working_copy_under_eviction_guard(
+    app_and_db, monkeypatch,
+):
+    """Eviction cannot unlink a selected cache hit before send_file opens it."""
+    import app as app_module
+    import flask
+    from PIL import Image
+
+    app, db = app_and_db
+    pid = db.get_photos()[0]["id"]
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{pid}.jpg")
+    Image.new("RGB", (800, 600)).save(wc_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET width=800, height=600, working_copy_path=? "
+        "WHERE id=?",
+        (f"working/{pid}.jpg", pid),
+    )
+    db.conn.commit()
+
+    real_guard = app_module.working_copy_publication_guard
+    real_send_file = flask.send_file
+    inside_guard = False
+
+    @contextlib.contextmanager
+    def tracking_guard():
+        nonlocal inside_guard
+        with real_guard():
+            inside_guard = True
+            try:
+                yield
+            finally:
+                inside_guard = False
+
+    def guarded_send_file(*args, **kwargs):
+        assert inside_guard, "working-copy send_file must open under the guard"
+        return real_send_file(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "working_copy_publication_guard", tracking_guard)
+    monkeypatch.setattr(flask, "send_file", guarded_send_file)
+
+    response = app.test_client().get(f"/photos/{pid}/original")
+
+    assert response.status_code == 200
+    assert response.data
+
+
 def test_unedited_raw_original_uses_camera_display_cache_not_working_copy(
     app_and_db, monkeypatch, tmp_path,
 ):
@@ -2183,6 +2233,114 @@ def test_concurrent_original_cache_misses_extract_once(
     assert first_result[1] == second_result[1]
     assert calls == 1
     assert os.path.getsize(display_path) > 0
+
+
+def test_concurrent_noncacheable_original_waiters_use_private_renditions(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """Zero-quota TIFF waiters must not move one shared canonical path."""
+    import app as app_module
+    import config as cfg
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    source_dir = tmp_path / "concurrent-transient-originals"
+    source_dir.mkdir()
+    source_path = source_dir / "source.tiff"
+    Image.new("RGB", (800, 600), color=(90, 120, 150)).save(
+        source_path, "TIFF",
+    )
+    source_mtime = os.path.getmtime(source_path)
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='source.tiff', extension='.tiff', width=800,
+               height=600, file_size=?, file_mtime=?,
+               working_copy_path=NULL, working_copy_evicted_mtime=?
+           WHERE id=?""",
+        (os.path.getsize(source_path), source_mtime, source_mtime, photo_id),
+    )
+    db.conn.commit()
+    cfg.set("working_copy_cache_max_mb", 0)
+
+    producer_started = threading.Event()
+    release_producer = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    def coordinated_extract(_source, output, **_kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            producer_started.set()
+            assert release_producer.wait(timeout=5)
+        Image.new("RGB", (800, 600), color=(90, 120, 150)).save(
+            output, "JPEG",
+        )
+        return True
+
+    monkeypatch.setattr(
+        image_loader, "extract_working_copy", coordinated_extract,
+    )
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    canonical = os.path.abspath(
+        os.path.join(vireo_dir, "working", f"{photo_id}.jpg"),
+    )
+    real_replace = app_module.os.replace
+    waiter_move_barrier = threading.Barrier(2)
+    transient_move_count = 0
+
+    def synchronized_replace(source, destination):
+        nonlocal transient_move_count
+        if (
+            os.path.abspath(source) == canonical
+            and ".transient." in os.path.basename(destination)
+        ):
+            with calls_lock:
+                transient_move_count += 1
+                move_number = transient_move_count
+            # The first move belongs to the producer. If waiters still share
+            # ``canonical``, force their later moves to collide; private
+            # per-request renditions never enter this branch.
+            if move_number > 1:
+                waiter_move_barrier.wait(timeout=5)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(app_module.os, "replace", synchronized_replace)
+
+    def request_original():
+        with app.test_client() as client:
+            response = client.get(f"/photos/{photo_id}/original")
+            return response.status_code, response.data
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        first = executor.submit(request_original)
+        assert producer_started.wait(timeout=5)
+        second = executor.submit(request_original)
+        third = executor.submit(request_original)
+        time.sleep(0.1)
+        assert calls == 1
+        release_producer.set()
+        results = [
+            first.result(timeout=10),
+            second.result(timeout=10),
+            third.result(timeout=10),
+        ]
+
+    assert all(status == 200 and data for status, data in results)
+    assert calls == 3
+    assert not os.path.exists(canonical)
+    originals_dir = os.path.join(vireo_dir, "originals")
+    assert not list(Path(originals_dir).glob(f".{photo_id}.transient.*.jpg"))
 
 
 def test_failed_original_flight_releases_waiters_and_allows_retry(
@@ -2746,6 +2904,255 @@ def test_original_upgrades_capped_working_copy_to_full_res(app_and_db, tmp_path)
         assert max(served.size) == 6000
 
 
+def test_transient_full_original_preserves_capped_working_copy(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """An over-quota full rendition must not orphan a useful capped copy."""
+    import config as cfg
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    working_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), color=(10, 20, 30)).save(
+        working_path, "JPEG",
+    )
+    capped_bytes = open(working_path, "rb").read()
+
+    source_dir = tmp_path / "transient-full-source"
+    source_dir.mkdir()
+    source_path = source_dir / "source.tiff"
+    Image.new("RGB", (1200, 900), color=(40, 50, 60)).save(
+        source_path, "TIFF",
+    )
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='source.tiff', extension='.tiff', width=1200,
+               height=900, working_copy_path=?
+           WHERE id=?""",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+    cfg.set("working_copy_cache_max_mb", 1)
+
+    def oversized_extract(_source, output, **_kwargs):
+        Image.new("RGB", (1200, 900), color=(40, 50, 60)).save(
+            output, "JPEG",
+        )
+        with open(output, "ab") as handle:
+            handle.write(b"x" * (1024 * 1024))
+        return True
+
+    monkeypatch.setattr(
+        image_loader, "extract_working_copy", oversized_extract,
+    )
+
+    response = app.test_client().get(f"/photos/{photo_id}/original")
+
+    assert response.status_code == 200
+    assert response.data
+    response.close()
+    assert open(working_path, "rb").read() == capped_bytes
+    row = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime "
+        "FROM photos WHERE id=?",
+        (photo_id,),
+    ).fetchone()
+    assert row["working_copy_path"] == f"working/{photo_id}.jpg"
+    assert row["working_copy_evicted_mtime"] is None
+
+
+def test_transient_full_original_does_not_restore_concurrently_evicted_copy(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Preservation rechecks the capped copy under the eviction guard."""
+    import app as app_module
+    import config as cfg
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    working_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), color=(10, 20, 30)).save(
+        working_path, "JPEG",
+    )
+
+    source_dir = tmp_path / "concurrent-eviction-source"
+    source_dir.mkdir()
+    source_path = source_dir / "source.tiff"
+    Image.new("RGB", (1200, 900), color=(40, 50, 60)).save(
+        source_path, "TIFF",
+    )
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='source.tiff', extension='.tiff', width=1200,
+               height=900, working_copy_path=?
+           WHERE id=?""",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+    cfg.set("working_copy_cache_max_mb", 1)
+
+    def oversized_extract(_source, output, **_kwargs):
+        Image.new("RGB", (1200, 900), color=(40, 50, 60)).save(
+            output, "JPEG",
+        )
+        with open(output, "ab") as handle:
+            handle.write(b"x" * (1024 * 1024))
+        return True
+
+    monkeypatch.setattr(
+        image_loader, "extract_working_copy", oversized_extract,
+    )
+    real_guard = app_module.working_copy_publication_guard
+    eviction_simulated = False
+
+    @contextlib.contextmanager
+    def evict_before_preservation_check():
+        nonlocal eviction_simulated
+        if not eviction_simulated:
+            eviction_simulated = True
+            os.unlink(working_path)
+            db.conn.execute(
+                "UPDATE photos SET working_copy_path=NULL, "
+                "working_copy_evicted_mtime=COALESCE(file_mtime, -1) "
+                "WHERE id=?",
+                (photo_id,),
+            )
+            db.conn.commit()
+        with real_guard():
+            yield
+
+    monkeypatch.setattr(
+        app_module,
+        "working_copy_publication_guard",
+        evict_before_preservation_check,
+    )
+
+    response = app.test_client().get(f"/photos/{photo_id}/original")
+
+    assert response.status_code == 200
+    assert response.data
+    response.close()
+    assert eviction_simulated
+    assert not os.path.exists(working_path)
+    row = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime "
+        "FROM photos WHERE id=?",
+        (photo_id,),
+    ).fetchone()
+    assert row["working_copy_path"] is None
+    assert row["working_copy_evicted_mtime"] is not None
+
+
+def test_transient_original_reloads_quota_raised_during_extraction(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A quota raised mid-extraction must not leave a stale eviction marker."""
+    import app as app_module
+    import config as cfg
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    working_path = os.path.join(working_dir, f"{photo_id}.jpg")
+
+    source_dir = tmp_path / "quota-raise-source"
+    source_dir.mkdir()
+    source_path = source_dir / "source.tiff"
+    Image.new("RGB", (1200, 900), color=(40, 50, 60)).save(
+        source_path, "TIFF",
+    )
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='source.tiff', extension='.tiff', width=1200,
+               height=900, working_copy_path=NULL,
+               working_copy_evicted_mtime=NULL
+           WHERE id=?""",
+        (photo_id,),
+    )
+    db.conn.commit()
+
+    # Start with a zero quota so cacheability would default to False if we
+    # kept the request-start snapshot.
+    cfg.set("working_copy_cache_max_mb", 0)
+
+    def small_extract(_source, output, **_kwargs):
+        Image.new("RGB", (1200, 900), color=(40, 50, 60)).save(
+            output, "JPEG",
+        )
+        return True
+
+    monkeypatch.setattr(
+        image_loader, "extract_working_copy", small_extract,
+    )
+
+    real_guard = app_module.working_copy_publication_guard
+    raised = False
+
+    @contextlib.contextmanager
+    def raise_quota_before_publication_guard():
+        nonlocal raised
+        if not raised:
+            raised = True
+            # Simulate a settings-save that raised the quota between the
+            # request-start snapshot and the publication guard's cacheability
+            # check. The route must reload the quota inside the guard and
+            # publish (rather than stamping a fresh eviction marker).
+            cfg.set("working_copy_cache_max_mb", 20480)
+        with real_guard():
+            yield
+
+    monkeypatch.setattr(
+        app_module,
+        "working_copy_publication_guard",
+        raise_quota_before_publication_guard,
+    )
+
+    response = app.test_client().get(f"/photos/{photo_id}/original")
+
+    assert response.status_code == 200
+    assert response.data
+    response.close()
+    assert raised
+
+    row = db.conn.execute(
+        "SELECT working_copy_path, working_copy_evicted_mtime "
+        "FROM photos WHERE id=?",
+        (photo_id,),
+    ).fetchone()
+    assert row["working_copy_path"] == f"working/{photo_id}.jpg"
+    assert row["working_copy_evicted_mtime"] is None
+    assert os.path.isfile(working_path)
+
+
 def test_original_serves_post_upgrade_working_copy_without_reextracting(app_and_db, tmp_path):
     """After the on-demand upgrade overwrites wc at full-res, subsequent
     requests must serve the upgraded wc directly — not loop into another
@@ -2876,6 +3283,248 @@ def test_crop_preview_falls_back_to_original(app_and_db, tmp_path):
     resp = client.get(f"/photos/{pid}/crop")
     assert resp.status_code == 200
     assert resp.content_type == "image/jpeg"
+
+
+def test_crop_preview_retries_original_when_working_copy_is_evicted(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Eviction between source selection and decode must not return 500."""
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    pid = photo["id"]
+    photo_dir = tmp_path / "crop-race-originals"
+    photo_dir.mkdir()
+    original_path = photo_dir / photo["filename"]
+    Image.new("RGB", (1200, 800), color=(0, 180, 0)).save(
+        original_path, "JPEG",
+    )
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(photo_dir), photo["folder_id"]),
+    )
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{pid}.jpg")
+    Image.new("RGB", (1200, 800), color=(180, 0, 0)).save(wc_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{pid}.jpg", pid),
+    )
+    db.conn.commit()
+
+    real_load_image = image_loader.load_image
+    loaded_paths = []
+
+    def evicting_load(path, *args, **kwargs):
+        loaded_paths.append(os.path.abspath(path))
+        if os.path.abspath(path) == os.path.abspath(wc_path):
+            os.unlink(wc_path)
+            return None
+        return real_load_image(path, *args, **kwargs)
+
+    monkeypatch.setattr(image_loader, "load_image", evicting_load)
+
+    response = app.test_client().get(f"/photos/{pid}/crop")
+
+    assert response.status_code == 200
+    assert loaded_paths == [
+        os.path.abspath(wc_path), os.path.abspath(original_path),
+    ]
+
+
+def test_edit_preview_retries_original_when_working_copy_is_evicted(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Eviction between source selection and edit-preview decode must not 500."""
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    pid = photo["id"]
+    photo_dir = tmp_path / "edit-race-originals"
+    photo_dir.mkdir()
+    original_path = photo_dir / photo["filename"]
+    Image.new("RGB", (1200, 800), color=(0, 180, 0)).save(
+        original_path, "JPEG",
+    )
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(photo_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        "UPDATE photos SET width=1200, height=800 WHERE id=?",
+        (pid,),
+    )
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{pid}.jpg")
+    Image.new("RGB", (1200, 800), color=(180, 0, 0)).save(wc_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{pid}.jpg", pid),
+    )
+    db.conn.commit()
+
+    real_load_image = image_loader.load_image
+    loaded_paths = []
+
+    def evicting_load(path, *args, **kwargs):
+        loaded_paths.append(os.path.abspath(path))
+        if os.path.abspath(path) == os.path.abspath(wc_path):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(wc_path)
+            return None
+        return real_load_image(path, *args, **kwargs)
+
+    monkeypatch.setattr(image_loader, "load_image", evicting_load)
+
+    response = app.test_client().get(f"/photos/{pid}/edit-preview?size=1920")
+
+    assert response.status_code == 200
+    assert os.path.abspath(wc_path) in loaded_paths
+    assert os.path.abspath(original_path) in loaded_paths
+
+
+def test_edit_preview_pins_working_copy_when_original_is_offline(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """The only local edit source stays pinned through selection and decode."""
+    import app as app_module
+    import image_loader
+    import working_copy_cache
+    from PIL import Image
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    pid = photo["id"]
+    offline_dir = tmp_path / "offline-edit-originals"
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(offline_dir), photo["folder_id"]),
+    )
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{pid}.jpg")
+    Image.new("RGB", (1200, 800), color=(180, 0, 0)).save(wc_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET width=1200, height=800, working_copy_path=? "
+        "WHERE id=?",
+        (f"working/{pid}.jpg", pid),
+    )
+    db.conn.commit()
+    db.set_photo_edit_recipe(pid, {"rotation": 90})
+
+    real_guard = app_module.working_copy_publication_guard
+    guard_entered = False
+
+    @contextlib.contextmanager
+    def tracking_guard():
+        nonlocal guard_entered
+        guard_entered = True
+        with real_guard():
+            yield
+
+    real_load_image = image_loader.load_image
+    held_during_decode = False
+
+    def probing_load_image(path, *args, **kwargs):
+        nonlocal held_during_decode
+        if os.path.abspath(path) == os.path.abspath(wc_path):
+            probe = {"acquired": None}
+
+            def try_evict_lock():
+                acquired = working_copy_cache._eviction_lock.acquire(
+                    blocking=False,
+                )
+                probe["acquired"] = acquired
+                if acquired:
+                    working_copy_cache._eviction_lock.release()
+
+            thread = threading.Thread(target=try_evict_lock)
+            thread.start()
+            thread.join()
+            held_during_decode = probe["acquired"] is False
+        return real_load_image(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        app_module, "working_copy_publication_guard", tracking_guard,
+    )
+    monkeypatch.setattr(image_loader, "load_image", probing_load_image)
+
+    response = app.test_client().get(f"/photos/{pid}/edit-preview?size=1920")
+
+    assert response.status_code == 200
+    assert guard_entered
+    assert held_during_decode, (
+        "offline edit-preview must prevent quota eviction until the working "
+        "copy has been decoded"
+    )
+
+
+def test_original_cache_hit_survives_working_copy_eviction_race(
+    client_with_photo, monkeypatch,
+):
+    """/photos/<id>/original must still succeed when quota eviction unlinks
+    the trusted working copy after the trusted-path check validated it but
+    before send_file streams its bytes. The other consumer paths (crop,
+    edit-preview, thumbnail, preview materializer, export) already recover
+    from this race; the /original cache-hit branch remained the only
+    unprotected 500."""
+    import app as app_module
+    from PIL import Image
+
+    app, db, pid = client_with_photo
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{pid}.jpg")
+    Image.new("RGB", (800, 600), color=(180, 0, 0)).save(wc_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path=? WHERE id=?",
+        (f"working/{pid}.jpg", pid),
+    )
+    db.conn.commit()
+
+    # Simulate the race on entry to the guarded revalidation. At that point
+    # _trusted_full_res_working_copy_path has returned and closed its PIL
+    # handle, but send_file has not opened the path. Deleting while the PIL
+    # handle is still open is not portable: Windows correctly refuses that
+    # unlink, so the guard boundary is the deterministic cross-platform gap.
+    real_guard = app_module.working_copy_publication_guard
+    dropped_paths = []
+
+    @contextlib.contextmanager
+    def evict_before_guarded_open():
+        if not dropped_paths:
+            os.unlink(wc_path)
+            dropped_paths.append(os.path.abspath(wc_path))
+        with real_guard():
+            yield
+
+    monkeypatch.setattr(
+        app_module,
+        "working_copy_publication_guard",
+        evict_before_guarded_open,
+    )
+
+    response = app.test_client().get(f"/photos/{pid}/original")
+
+    assert response.status_code == 200
+    assert response.data
+    # Eviction actually ran between validation and send; the response was
+    # served by falling back to the on-demand extraction from the original.
+    assert dropped_paths == [os.path.abspath(wc_path)]
 
 
 # ---- Preview cache (LRU) tests ----

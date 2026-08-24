@@ -1,4 +1,5 @@
 # vireo/tests/test_image_loader.py
+import contextlib
 import io
 import os
 import sys
@@ -486,6 +487,98 @@ def test_extract_working_copy_missing_source_returns_false(tmp_path):
     assert not output.exists()
 
 
+def test_extract_working_copy_removes_partial_output_on_failure(
+    tmp_path, monkeypatch,
+):
+    """A partial output left by a mid-encode failure must be removed.
+
+    Without cleanup, ``working/<id>.jpg`` still exists after the failed
+    encode. It is skipped by the on-demand write's cacheable-open logic
+    (which decodes the file to measure it), but scanner backfill's post-
+    loop quota accounting counts every canonical file. That would let a
+    batch of encoding failures leave corrupt bytes in the cache that
+    ``PIL.Image.open`` in later routes 500s on and that eviction skips
+    under the 60-second writer grace.
+    """
+    from image_loader import extract_working_copy
+    from PIL import Image
+
+    source = tmp_path / "photo.jpg"
+    Image.new("RGB", (100, 100), color=(255, 0, 0)).save(str(source), "JPEG")
+    output = tmp_path / "working" / "42.jpg"
+
+    real_save = Image.Image.save
+
+    def fail_after_writing(self, fp, *args, **kwargs):
+        # Simulate ``img.save`` writing partial JPEG bytes and then
+        # crashing (out-of-disk, corrupt tables, etc.).
+        if isinstance(fp, str):
+            with open(fp, "wb") as fh:
+                fh.write(b"\xff\xd8\xff\xe0truncated jpeg header")
+        raise OSError("simulated encoder failure")
+
+    monkeypatch.setattr(Image.Image, "save", fail_after_writing)
+
+    result = extract_working_copy(str(source), str(output), max_size=0)
+
+    Image.Image.save = real_save
+
+    assert result is False
+    assert not output.exists()
+
+
+def test_extract_working_copy_failure_preserves_concurrent_publication(
+    tmp_path, monkeypatch,
+):
+    """A failed writer cleans only its private tempfile, not output_path."""
+    from image_loader import extract_working_copy
+    from PIL import Image
+
+    source = tmp_path / "photo.jpg"
+    Image.new("RGB", (100, 100), color=(255, 0, 0)).save(source, "JPEG")
+    output = tmp_path / "working" / "42.jpg"
+    output.parent.mkdir()
+    published = b"valid bytes published by another request"
+    output.write_bytes(published)
+
+    def fail_after_writing(_self, fp, *args, **kwargs):
+        with open(fp, "wb") as handle:
+            handle.write(b"partial private bytes")
+        raise OSError("simulated encoder failure")
+
+    monkeypatch.setattr(Image.Image, "save", fail_after_writing)
+
+    result = extract_working_copy(str(source), str(output), max_size=0)
+
+    assert result is False
+    assert output.read_bytes() == published
+    assert not list(output.parent.glob("*.jpg.tmp"))
+
+
+def test_extract_working_copy_uses_publication_guard(tmp_path):
+    from image_loader import extract_working_copy
+    from PIL import Image
+
+    source = tmp_path / "photo.jpg"
+    output = tmp_path / "working" / "42.jpg"
+    Image.new("RGB", (100, 100), color=(255, 0, 0)).save(source, "JPEG")
+    events = []
+
+    @contextlib.contextmanager
+    def guard():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    assert extract_working_copy(
+        str(source), str(output), max_size=0, publication_guard=guard,
+    )
+    assert output.exists()
+    assert events == ["enter", "exit"]
+
+
 # ── load_working_image tests ──────────────────────────────────────────
 
 
@@ -524,6 +617,47 @@ def test_load_working_image_uses_original_for_jpeg(tmp_path):
 
     assert img is not None
     assert max(img.size) <= 1024
+
+
+def test_load_working_image_retries_original_after_working_copy_eviction(
+    tmp_path, monkeypatch,
+):
+    """A selected working copy lost before open falls back to its source."""
+    import image_loader
+    from PIL import Image
+
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    wc_path = working_dir / "42.jpg"
+    Image.new("RGB", (800, 600), color="blue").save(wc_path, "JPEG")
+    source_dir = tmp_path / "photos"
+    source_dir.mkdir()
+    source_path = source_dir / "test.jpg"
+    Image.new("RGB", (800, 600), color="red").save(source_path, "JPEG")
+
+    real_load_standard = image_loader._load_standard
+
+    def evict_before_open(path, max_size):
+        if os.path.abspath(path) == os.path.abspath(wc_path):
+            os.unlink(wc_path)
+            return None
+        return real_load_standard(path, max_size)
+
+    monkeypatch.setattr(image_loader, "_load_standard", evict_before_open)
+    photo = {
+        "working_copy_path": "working/42.jpg",
+        "folder_id": 1,
+        "filename": "test.jpg",
+    }
+
+    img, input_source = image_loader.load_working_image(
+        photo, str(tmp_path), max_size=1024,
+        folders={1: str(source_dir)}, return_source=True,
+    )
+
+    assert img is not None
+    assert input_source == "original"
+    assert img.getpixel((0, 0))[0] > img.getpixel((0, 0))[2]
 
 
 def test_load_working_image_returns_none_when_no_working_copy_no_folders(tmp_path):

@@ -236,6 +236,12 @@ SCHEMA = {
         "label": "Working copy quality",
         "desc": "JPEG quality for the working copy (1–100).",
     },
+    "working_copy_cache_max_mb": {
+        "type": "int", "min": 0, "max": 1048576,
+        "category": "Working copy", "scope": "global",
+        "label": "Working copy cache max (MB)",
+        "desc": "On-disk budget for generated working copies. Oldest files are removed first.",
+    },
 
     # --- Preview ----------------------------------------------------------
     "preview_max_size": {

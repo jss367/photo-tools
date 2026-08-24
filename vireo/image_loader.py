@@ -21,9 +21,11 @@ RAW strategy:
   the embedded JPEG only when libraw cannot decode the file.
 """
 
+import contextlib
 import io
 import logging
 import os
+import tempfile
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -540,7 +542,9 @@ def get_canonical_image_path(photo, vireo_dir, folders):
     return os.path.join(folder_path, photo["filename"])
 
 
-def load_working_image(photo, vireo_dir, max_size=1024, folders=None):
+def load_working_image(
+    photo, vireo_dir, max_size=1024, folders=None, *, return_source=False,
+):
     """Load a photo's working image — the fast path for all pixel operations.
 
     Uses the pre-extracted working copy JPEG if available,
@@ -553,19 +557,33 @@ def load_working_image(photo, vireo_dir, max_size=1024, folders=None):
         folders: optional {folder_id: path} mapping (required when working_copy_path is NULL)
 
     Returns:
-        PIL.Image.Image or None
+        PIL.Image.Image or None. When ``return_source=True``, returns an
+        ``(image, source_kind)`` pair whose source kind is ``working_copy``
+        or ``original``. This lets delayed artifact publishers preserve the
+        provenance of the pixels they actually consumed even if the catalog
+        row changes afterward.
     """
+    def _result(image, source_kind):
+        if return_source:
+            return image, source_kind
+        return image
+
     if photo.get("working_copy_path"):
         wc_path = os.path.join(vireo_dir, photo["working_copy_path"])
         if os.path.exists(wc_path):
-            return _load_standard(wc_path, max_size)
+            working_image = _load_standard(wc_path, max_size)
+            if working_image is not None:
+                return _result(working_image, "working_copy")
 
-    # No working copy — load original (may be JPEG or RAW)
+    # No usable working copy — load original (may be JPEG or RAW). This also
+    # closes the exists/open race with quota eviction: a failed working-copy
+    # open must not strand direct callers when ``folders`` can resolve the
+    # still-available source.
     if folders is None:
-        return None
+        return _result(None, "original")
     folder_path = folders.get(photo["folder_id"], "")
     source_path = os.path.join(folder_path, photo["filename"])
-    return load_image(source_path, max_size)
+    return _result(load_image(source_path, max_size), "original")
 
 
 def extract_working_copy(
@@ -574,6 +592,7 @@ def extract_working_copy(
     max_size=4096,
     quality=92,
     raw_decode=RAW_DECODE_PRESERVE_HIGHLIGHTS,
+    publication_guard=None,
 ):
     """Extract a JPEG working copy from an image file.
 
@@ -585,10 +604,14 @@ def extract_working_copy(
         raw_decode: RAW decode strategy. Working copies default to the
             highlight-preserving edit source; display renditions can request
             RAW_DECODE_CAMERA_RENDERED without changing that edit source.
+        publication_guard: optional context-manager factory that serializes
+            publication to a shared canonical cache path with eviction.
 
     Returns:
         True on success, False on failure
     """
+    img = None
+    tmp_path = None
     try:
         img = load_image(
             source_path,
@@ -597,13 +620,36 @@ def extract_working_copy(
         )
         if img is None:
             return False
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        img.save(output_path, "JPEG", quality=quality)
+        output_dir = os.path.dirname(output_path)
+        os.makedirs(output_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(output_path)}.",
+            suffix=".jpg.tmp",
+            dir=output_dir,
+        )
+        os.close(fd)
+        img.save(tmp_path, "JPEG", quality=quality)
+        guard = publication_guard() if publication_guard else contextlib.nullcontext()
+        with guard:
+            os.replace(tmp_path, output_path)
+        tmp_path = None
         return True
     except Exception:
         log.warning("Failed to extract working copy from %s", source_path,
                     exc_info=True)
         return False
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                log.warning(
+                    "Could not remove partial working-copy tempfile %s",
+                    tmp_path, exc_info=True,
+                )
+        if img is not None:
+            with contextlib.suppress(Exception):
+                img.close()
 
 
 def _load_raw(path, max_size, raw_decode=RAW_DECODE_JPEG_FIRST):

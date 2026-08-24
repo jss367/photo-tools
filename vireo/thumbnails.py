@@ -41,6 +41,70 @@ def _recipe_source_path(photo, recipe, max_size, vireo_dir, folders):
     return recipe_render_source(photo, recipe, max_size, vireo_dir, folders)[0]
 
 
+def _is_working_copy_source(photo, source_path, vireo_dir):
+    """Whether ``source_path`` is this photo's canonical working copy."""
+    wc_rel = _photo_value(photo, "working_copy_path")
+    if not wc_rel or not source_path or not vireo_dir:
+        return False
+    wc_path = wc_rel if os.path.isabs(wc_rel) else os.path.join(vireo_dir, wc_rel)
+    return os.path.abspath(source_path) == os.path.abspath(wc_path)
+
+
+def _retry_thumbnail_after_working_copy_eviction(
+    photo, source_path, cache_dir, size, quality, recipe, folder_path,
+    vireo_dir, cache_name=None,
+):
+    """Retry the original when a selected working copy vanished on open.
+
+    Returns ``(result, retry_source)``. ``retry_source`` becomes the caller's
+    active source even on failure so its existing RAW companion/working-copy
+    fallbacks can run with the correct extension and failure semantics.
+    """
+    if not _is_working_copy_source(photo, source_path, vireo_dir):
+        return None, source_path
+    filename = _photo_value(photo, "filename")
+    photo_id = _photo_value(photo, "id")
+    if not filename or not folder_path:
+        return None, source_path
+    original_path = os.path.join(folder_path, filename)
+    if (
+        os.path.abspath(original_path) == os.path.abspath(source_path)
+        or not os.path.isfile(original_path)
+    ):
+        return None, original_path
+    if _has_current_raw_failure(photo, original_path):
+        return None, original_path
+
+    log.info(
+        "Thumbnail working copy disappeared for photo %s; retrying original %s",
+        photo_id, original_path,
+    )
+    original_is_raw = (
+        os.path.splitext(original_path)[1].lower() in RAW_EXTENSIONS
+    )
+    raw_decode = (
+        RAW_DECODE_PRESERVE_HIGHLIGHTS
+        if recipe and original_is_raw else None
+    )
+    load_max_size = None if recipe and recipe.get("crop") else size
+    min_source_size = (
+        _scaled_recipe_source_dimensions(photo, load_max_size)
+        if recipe and original_is_raw else None
+    )
+    return generate_thumbnail(
+        photo_id,
+        original_path,
+        cache_dir,
+        size=size,
+        quality=quality,
+        recipe=recipe,
+        raw_decode=raw_decode,
+        min_source_size=min_source_size,
+        native_size=_recipe_source_dimensions(photo) if recipe else None,
+        cache_name=cache_name,
+    ), original_path
+
+
 def _has_current_raw_failure(photo, source_path):
     """Whether this RAW row carries an explicit `source` failure marker.
 
@@ -363,6 +427,21 @@ def generate_all(db, cache_dir, progress_callback=None, config=None, vireo_dir=N
             **recipe_kwargs,
             **raw_decode_kwargs,
         )
+        if result_path is None and _is_working_copy_source(
+            source_photo, source_path, vireo_dir,
+        ):
+            result_path, source_path = (
+                _retry_thumbnail_after_working_copy_eviction(
+                    source_photo,
+                    source_path,
+                    cache_dir,
+                    thumb_size,
+                    thumb_quality,
+                    recipe,
+                    folders.get(source_photo["folder_id"]),
+                    vireo_dir,
+                )
+            )
         if (
             result_path is None
             and recipe

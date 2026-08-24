@@ -131,6 +131,17 @@ from web.photo_review import create_photo_review_blueprint
 from web.system import system_blueprint
 from web.workspaces import create_workspace_blueprint
 from werkzeug.exceptions import BadRequest
+from working_copy_cache import (
+    arrange_deferred_over_quota_retry as arrange_deferred_working_copy_quota_retry,
+)
+from working_copy_cache import (
+    evict_if_over_quota as evict_working_copy_cache_if_over_quota,
+)
+from working_copy_cache import (
+    working_copy_publication_guard,
+    working_copy_quota_bytes,
+    working_copy_stats,
+)
 from xmp import read_sync_preview_metadata
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -3659,6 +3670,80 @@ def _enforce_preview_cache_quota_at_startup(app):
             pass
 
 
+def _enforce_working_copy_cache_quota_at_startup(app):
+    """Apply the persistent working-copy ceiling before startup backfill.
+
+    Quota eviction records a source-mtime marker on each removed row. Running
+    this before the deferred backfill timer is what prevents startup from
+    immediately regenerating files that were deliberately removed.
+
+    Sweeps ``.<id>.render.*.jpg.tmp`` orphans in ``working/`` first so a
+    process kill during a prior on-demand extraction does not permanently
+    consume disk outside the configured ceiling (quota accounting skips these
+    files by design, so the sweep is their only cleanup path). Passes
+    ``startup=True`` so a legacy ``working/<id>.jpg`` whose mtime happens to
+    fall inside the concurrent-writer grace window is still reclaimed on the
+    first pass — no cache writer can be active this early.
+    """
+    from working_copy_cache import sweep_abandoned_render_tempfiles
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    sweep_abandoned_render_tempfiles(vireo_dir)
+    db = Database(app.config["DB_PATH"])
+    try:
+        evict_working_copy_cache_if_over_quota(db, vireo_dir, startup=True)
+    finally:
+        try:
+            db.conn.close()
+        except Exception:
+            pass
+
+
+def _sweep_abandoned_transient_originals(app):
+    """Reclaim non-cacheable ``/original`` renditions the process orphaned.
+
+    When ``_serve_generated_original`` streams a rendition too large for the
+    quota (or when the quota is zero), it moves the file into
+    ``<vireo_dir>/originals/.<id>.transient.*.jpg`` and unlinks it in the
+    generator's ``finally`` block after streaming. A process kill or crash
+    during that stream leaves the ``.transient.*.jpg`` behind: working-copy
+    eviction only scans ``working/`` and cannot see it, so repeated
+    interrupted requests can accumulate arbitrary bytes outside the quota
+    with no other cleanup path.
+    """
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    originals_dir = os.path.join(vireo_dir, "originals")
+    if not os.path.isdir(originals_dir):
+        return
+    try:
+        with os.scandir(originals_dir) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_file():
+                        continue
+                except OSError:
+                    continue
+                name = entry.name
+                if not (
+                    name.startswith(".")
+                    and ".transient." in name
+                    and name.endswith(".jpg")
+                ):
+                    continue
+                try:
+                    os.remove(entry.path)
+                except OSError as exc:
+                    log.warning(
+                        "Could not remove abandoned transient rendition %s: %s",
+                        entry.path, exc,
+                    )
+    except OSError as exc:
+        log.warning(
+            "Could not scan originals directory for transient renditions %s: %s",
+            originals_dir, exc,
+        )
+
+
 def _collection_accepts_manual_photos(rules):
     """Return True when collection rules are static photo-id membership only."""
     if isinstance(rules, list):
@@ -4111,6 +4196,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     _migrate_edit_math_render_caches(app)
     _migrate_unedited_raw_preview_sources(app)
     _enforce_preview_cache_quota_at_startup(app)
+    _sweep_abandoned_transient_originals(app)
+    _enforce_working_copy_cache_quota_at_startup(app)
 
     # Request timing middleware — logs slow requests and user actions
     @app.before_request
@@ -19920,7 +20007,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # All-settings region can't race with the curated form's full-snapshot
         # save and silently overwrite a recently-saved schema value.
         with _settings_write_lock:
-            current = cfg.load()
+            previous = cfg.load()
+            current = dict(previous)
 
             # Handle keyboard_shortcuts with validation
             if "keyboard_shortcuts" in body:
@@ -19999,20 +20087,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         return json_error(
                             f"unknown process id: {pid}", status=400
                         )
-            # Apply HF token to environment immediately
-            hf_token = current.get("hf_token", "")
-            if hf_token:
-                os.environ["HF_TOKEN"] = hf_token
-            elif "HF_TOKEN" in os.environ:
-                del os.environ["HF_TOKEN"]
             cfg.save(current)
             if "inat_token" in body:
                 _advance_inat_token_generation()
-            # If the user shrunk the preview cache quota, evict immediately to the
-            # new size rather than waiting for the next cache write. No-op when
-            # already under quota, so always safe to call.
-            vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
-            evict_preview_cache_if_over_quota(_get_db(), vireo_dir)
+            _settings_post_save_side_effects(current, previous)
         return jsonify({"ok": True})
 
     @app.route("/api/settings/schema")
@@ -20126,20 +20204,82 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "effective": effective_layer,
         })
 
-    def _settings_post_save_side_effects(current):
+    def _settings_post_save_side_effects(current, previous=None):
         """Side effects mirrored from the legacy /api/config POST handler.
 
-        Keeps the new schema-driven write path behaviorally identical to the
-        old curated-form save: HF_TOKEN env var is kept in sync, and the
-        preview cache is evicted if its budget shrunk.
+        Keeps every global settings write behaviorally identical to the old
+        curated-form save: HF_TOKEN stays in sync, cache budgets take effect
+        immediately, and raising the working-copy ceiling makes deliberately
+        evicted rows eligible for a future backfill again.
         """
         hf_token = current.get("hf_token", "")
         if hf_token:
             os.environ["HF_TOKEN"] = hf_token
         elif "HF_TOKEN" in os.environ:
             del os.environ["HF_TOKEN"]
+
+        previous = previous or {}
+        try:
+            previous_working_copy_quota = int(
+                previous.get("working_copy_cache_max_mb", 20480)
+            )
+        except (TypeError, ValueError):
+            previous_working_copy_quota = 20480
+        try:
+            current_working_copy_quota = int(
+                current.get("working_copy_cache_max_mb", 20480)
+            )
+        except (TypeError, ValueError):
+            current_working_copy_quota = 20480
+        quota_db = _get_db()
+        if current_working_copy_quota > previous_working_copy_quota:
+            # The next scoped scan or startup backfill can use the newly
+            # available space; settings writes never perform RAW decoding.
+            # Acquire the publication guard so this clear serializes with
+            # concurrent on-demand extractions that decide cacheability
+            # under the same guard. Without it, an in-flight non-cacheable
+            # commit that reads the still-stale request-start budget could
+            # stamp a fresh ``working_copy_evicted_mtime`` after this
+            # UPDATE runs, leaving the row permanently ineligible for
+            # backfill under the raised ceiling.
+            with working_copy_publication_guard():
+                quota_db.conn.execute(
+                    "UPDATE photos SET working_copy_evicted_mtime=NULL, "
+                    "working_copy_failed_at=CASE WHEN "
+                    "working_copy_failed_source='source' "
+                    "AND companion_path IS NOT NULL THEN NULL "
+                    "ELSE working_copy_failed_at END, "
+                    "working_copy_failed_mtime=CASE WHEN "
+                    "working_copy_failed_source='source' "
+                    "AND companion_path IS NOT NULL THEN NULL "
+                    "ELSE working_copy_failed_mtime END, "
+                    "working_copy_failed_source=CASE WHEN "
+                    "working_copy_failed_source='source' "
+                    "AND companion_path IS NOT NULL THEN NULL "
+                    "ELSE working_copy_failed_source END "
+                    "WHERE working_copy_evicted_mtime IS NOT NULL"
+                )
+                commit_with_retry(quota_db.conn)
+
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
-        evict_preview_cache_if_over_quota(_get_db(), vireo_dir)
+        evict_preview_cache_if_over_quota(quota_db, vireo_dir)
+        if current_working_copy_quota < previous_working_copy_quota:
+            # Cache writers and startup already enforce an unchanged quota.
+            # Avoid scanning every photo and working-copy file while holding
+            # the publication lock for unrelated settings saves.
+            eviction_result = evict_working_copy_cache_if_over_quota(
+                quota_db, vireo_dir,
+            )
+            if eviction_result.get("deferred"):
+                # Snapshot retries exhausted under catalog contention.
+                # Without a scheduled follow-up, the cache would sit above
+                # the new ceiling until an unrelated cache write or
+                # restart eventually re-ran enforcement. Spawn a bounded
+                # background retry that opens its own SQLite connection
+                # (Database handles are thread-affine).
+                arrange_deferred_working_copy_quota_retry(
+                    app.config["DB_PATH"], vireo_dir,
+                )
 
     def _read_raw_config_file():
         """Return the parsed contents of ~/.vireo/config.json, or {}.
@@ -20209,12 +20349,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error(f"unknown process id: {value}", status=400)
 
         with _settings_write_lock:
+            previous = cfg.load()
             raw = _read_raw_config_file()
             schema.set_dotted(raw, key, value)
             cfg.save(raw)
             if key == "inat_token":
                 _advance_inat_token_generation()
-            _settings_post_save_side_effects(cfg.load())
+            _settings_post_save_side_effects(cfg.load(), previous)
         return jsonify({"ok": True, "key": key, "value": value})
 
     @app.route("/api/settings/global/<path:key>", methods=["DELETE"])
@@ -20227,12 +20368,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error(f"unknown setting {key!r}", status=400)
 
         with _settings_write_lock:
+            previous = cfg.load()
             raw = _read_raw_config_file()
             schema.delete_dotted(raw, key)
             cfg.save(raw)
             if key == "inat_token":
                 _advance_inat_token_generation()
-            _settings_post_save_side_effects(cfg.load())
+            _settings_post_save_side_effects(cfg.load(), previous)
         return jsonify({"ok": True, "key": key})
 
     def _read_workspace_overrides(db):
@@ -20617,6 +20759,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return jsonify({"error": "validation failed", "errors": errors}), 400
 
         with _settings_write_lock:
+            previous = cfg.load()
             # Exports omit secret values (see /api/settings/export), so a
             # restored backup must not wipe the tokens already configured on
             # this machine: absent secret keys keep their current on-disk
@@ -20631,7 +20774,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             cfg.save(payload)
             if "inat_token" in payload:
                 _advance_inat_token_generation()
-            _settings_post_save_side_effects(cfg.load())
+            _settings_post_save_side_effects(cfg.load(), previous)
         return jsonify({"ok": True})
 
     def _computation_store():
@@ -20902,10 +21045,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
 
             if recipe.get("crop"):
-                source_path, _using_working_copy = _recipe_render_source(
+                source_path, using_working_copy = _recipe_render_source(
                     photo, recipe, 0, vireo_dir, folders,
                 )
-                return source_path or fallback_path
+                return source_path or fallback_path, bool(using_working_copy)
 
             # For RAW primaries, skip the working-copy short-circuit while the
             # RAW source is available: legacy working copies predate the
@@ -20924,7 +21067,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     os.path.exists(wc_path)
                     and _path_satisfies_recipe_render(wc_path, photo, recipe, 0)
                 ):
-                    return wc_path
+                    return wc_path, True
 
             folder_path = folders.get(photo["folder_id"])
             if folder_path:
@@ -20943,11 +21086,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                 companion, photo, recipe, 0,
                             )
                         ):
-                            return companion
+                            return companion, False
                 original = os.path.join(folder_path, photo["filename"])
                 if os.path.exists(original):
-                    return original
-            return fallback_path
+                    return original, False
+            return fallback_path, False
 
         def _external_edit_handoff_path(photo, fallback_path):
             recipe = db.get_photo_edit_recipe(photo["id"])
@@ -20966,47 +21109,103 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 load_image,
             )
 
-            source_path = _external_edit_recipe_source(
+            source_path, using_working_copy = _external_edit_recipe_source(
                 photo, recipe, fallback_path,
             )
-            if not source_path or not os.path.isfile(source_path):
-                return None, f"{photo['filename']}: source file missing"
-
-            out_dir = os.path.join(vireo_dir, "external-edits")
-            os.makedirs(out_dir, exist_ok=True)
-            out_path = os.path.join(out_dir, f"{photo['id']}.jpg")
-            meta_path = os.path.join(out_dir, f"{photo['id']}.json")
-            source_mtime = os.path.getmtime(source_path)
-            recipe_json = recipe_to_json(recipe) or ""
-            # Include the edit-math version so a math bump invalidates this
-            # handoff render: the JPEG is keyed by recipe/source/mtime, none
-            # of which change when only the per-pixel rendering math changes,
-            # so without this we'd keep handing editors the stale render.
-            expected_meta = {
-                "recipe": recipe_json,
-                "source_path": source_path,
-                "source_mtime": source_mtime,
-                "edit_math_version": EDIT_MATH_VERSION,
-            }
-            try:
-                if os.path.isfile(out_path) and os.path.isfile(meta_path):
-                    with open(meta_path, encoding="utf-8") as f:
-                        cached_meta = json.load(f)
-                    if cached_meta == expected_meta:
-                        return out_path, None
-            except (OSError, ValueError, TypeError):
-                pass
-
-            # Derive the decode mode from the primary photo's extension rather
-            # than source_path so a future change to source_path resolution
-            # (working copy, companion JPEG fallback, etc.) cannot silently
-            # bypass RAW_DECODE_PRESERVE_HIGHLIGHTS for a RAW primary.
-            primary_is_raw = (
-                os.path.splitext(photo["filename"])[1].lower() in RAW_EXTENSIONS
+            fallback_available = bool(
+                fallback_path and os.path.isfile(fallback_path)
             )
-            raw_decode = RAW_DECODE_PRESERVE_HIGHLIGHTS if primary_is_raw else None
-            load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
-            img = load_image(source_path, max_size=None, **load_kwargs)
+            # When the original is offline the working copy is the only usable
+            # local source; the retry-from-original recovery below cannot save
+            # us. Hold the publication/eviction guard through the exists →
+            # getmtime → decode window so quota enforcement cannot unlink the
+            # working copy mid-handoff. Guard is an RLock, so nested
+            # acquisitions inside load_image are safe.
+            pin_working_copy = using_working_copy and not fallback_available
+            source_pin_cm = (
+                working_copy_publication_guard()
+                if pin_working_copy else contextlib.nullcontext()
+            )
+            with source_pin_cm:
+                if not source_path or not os.path.isfile(source_path):
+                    if using_working_copy and fallback_available:
+                        # Quota enforcement can unlink the working copy between
+                        # recipe-source resolution and this existence check.
+                        # Fall back to the original before reporting missing.
+                        source_path = fallback_path
+                        using_working_copy = False
+                    else:
+                        return None, f"{photo['filename']}: source file missing"
+
+                out_dir = os.path.join(vireo_dir, "external-edits")
+                os.makedirs(out_dir, exist_ok=True)
+                out_path = os.path.join(out_dir, f"{photo['id']}.jpg")
+                meta_path = os.path.join(out_dir, f"{photo['id']}.json")
+                try:
+                    source_mtime = os.path.getmtime(source_path)
+                except FileNotFoundError:
+                    if using_working_copy and fallback_available:
+                        source_path = fallback_path
+                        using_working_copy = False
+                        source_mtime = os.path.getmtime(source_path)
+                    else:
+                        return None, f"{photo['filename']}: source file missing"
+                recipe_json = recipe_to_json(recipe) or ""
+                # Include the edit-math version so a math bump invalidates this
+                # handoff render: the JPEG is keyed by recipe/source/mtime,
+                # none of which change when only the per-pixel rendering math
+                # changes, so without this we'd keep handing editors the stale
+                # render.
+                expected_meta = {
+                    "recipe": recipe_json,
+                    "source_path": source_path,
+                    "source_mtime": source_mtime,
+                    "edit_math_version": EDIT_MATH_VERSION,
+                }
+                try:
+                    if os.path.isfile(out_path) and os.path.isfile(meta_path):
+                        with open(meta_path, encoding="utf-8") as f:
+                            cached_meta = json.load(f)
+                        if cached_meta == expected_meta:
+                            return out_path, None
+                except (OSError, ValueError, TypeError):
+                    pass
+
+                # Derive the decode mode from the primary photo's extension
+                # rather than source_path so a future change to source_path
+                # resolution (working copy, companion JPEG fallback, etc.)
+                # cannot silently bypass RAW_DECODE_PRESERVE_HIGHLIGHTS for a
+                # RAW primary.
+                primary_is_raw = (
+                    os.path.splitext(photo["filename"])[1].lower()
+                    in RAW_EXTENSIONS
+                )
+                raw_decode = (
+                    RAW_DECODE_PRESERVE_HIGHLIGHTS if primary_is_raw else None
+                )
+                load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
+                img = load_image(source_path, max_size=None, **load_kwargs)
+                if img is None and using_working_copy and fallback_path and (
+                    os.path.isfile(fallback_path)
+                    and os.path.abspath(fallback_path)
+                    != os.path.abspath(source_path)
+                ):
+                    # Working copy was evicted between validation and decode.
+                    # Retry from the original before the companion fallback so
+                    # RAW primaries still use the highlight-preserving decode.
+                    retry_img = load_image(
+                        fallback_path, max_size=None, **load_kwargs,
+                    )
+                    if retry_img is not None:
+                        img = retry_img
+                        source_path = fallback_path
+                        using_working_copy = False
+                        try:
+                            source_mtime = os.path.getmtime(source_path)
+                        except OSError:
+                            pass
+                        expected_meta["source_path"] = source_path
+                        expected_meta["source_mtime"] = source_mtime
             expected_w, expected_h = 0, 0
             needs_companion = False
             if primary_is_raw:
@@ -21314,7 +21513,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if os.path.isdir(path):
                 for dirpath, dirnames, filenames in os.walk(path):
                     for f in filenames:
-                        total += os.path.getsize(os.path.join(dirpath, f))
+                        try:
+                            total += os.path.getsize(os.path.join(dirpath, f))
+                        except OSError:
+                            # Cache eviction and generation can race a storage
+                            # refresh. A disappearing file should make this
+                            # snapshot slightly stale, not fail the endpoint.
+                            continue
             return total
 
         db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
@@ -21323,6 +21528,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             os.path.dirname(app.config["THUMB_CACHE_DIR"]), "previews"
         )
         preview = _dir_stats(preview_dir)
+        working = working_copy_stats(
+            os.path.dirname(app.config["THUMB_CACHE_DIR"])
+        )
         emb = _dir_stats(EMB_CACHE_DIR)
         models_size = _dir_size_recursive(DEFAULT_MODELS_DIR)
         db = _get_db()
@@ -21332,6 +21540,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         ).fetchone()
         masks = _storage_masks_data(db)
         masks_size = masks["total_bytes"]
+        storage_root = os.path.dirname(app.config["THUMB_CACHE_DIR"])
 
         # HuggingFace cache — only count Vireo-relevant models
         hf_cache = os.path.expanduser("~/.cache/huggingface/hub")
@@ -21352,19 +21561,100 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         }
                     )
 
-        total = (
-            db_size
-            + thumb["size"]
-            + preview["size"]
-            + emb["size"]
-            + models_size
-            + hf_size
-            + offline_size
-            + masks_size
-        )
-        reclaimable = thumb["size"] + preview["size"] + emb["size"]
+        def _is_within(path, root):
+            try:
+                return os.path.commonpath(
+                    [os.path.abspath(path), os.path.abspath(root)]
+                ) == os.path.abspath(root)
+            except (OSError, ValueError):
+                return False
 
-        storage_root = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+        named_storage = [
+            (db_path, db_size),
+            (thumb["path"], thumb["size"]),
+            (preview["path"], preview["size"]),
+            (working["path"], working["size"]),
+            (EMB_CACHE_DIR, emb["size"]),
+            (DEFAULT_MODELS_DIR, models_size),
+            (os.path.join(storage_root, "offline"), offline_size),
+            (masks["path"], masks_size),
+            (hf_cache, hf_size),
+        ]
+        named_inside_root = sum(
+            size for path, size in named_storage
+            if _is_within(path, storage_root)
+        )
+
+        catalog_root = os.path.dirname(os.path.abspath(db_path))
+        if os.path.abspath(storage_root) == catalog_root:
+            # In the conventional layout this is Vireo's dedicated data
+            # directory. Include taxonomy, logs, SQLite sidecars/backups, and
+            # other managed files that do not have their own category.
+            storage_root_size = _dir_size_recursive(storage_root)
+            other_size = max(0, storage_root_size - named_inside_root)
+        else:
+            # ``--thumb-dir`` may be any directory (for example
+            # /data/thumbs). Its parent is not necessarily owned by Vireo, so
+            # never recurse across that shared parent and classify siblings as
+            # Vireo data. Count only explicit auxiliary paths Vireo creates.
+            auxiliary_paths = [
+                os.path.join(storage_root, dirname)
+                for dirname in (
+                    "originals",
+                    "external-edits",
+                    "external-dng",
+                    "inat-uploads",
+                    "inat-exports",
+                    "edit-masks",
+                    # ``staging_recovery`` treats <vireo_dir>/staging as
+                    # Vireo-managed storage that may hold the only remaining
+                    # copies of photos from failed or cancelled imports. Omit
+                    # and the Storage page under a custom ``--thumb-dir``
+                    # layout can hide a very large staging tree.
+                    "staging",
+                )
+            ]
+            auxiliary_paths.extend([
+                app.config["CARD_CLEANUP_DIR"],
+                app.config["COMPUTATION_CACHE_DIR"],
+                # Taxonomy assets remain beside the catalog even when
+                # generated image caches use a custom thumbnail root.
+                os.path.join(catalog_root, "taxonomy.json"),
+                os.path.join(catalog_root, "taxonomy"),
+                f"{db_path}-wal",
+                f"{db_path}-shm",
+                f"{db_path}-journal",
+            ])
+            # Schema migrations retain one full catalog snapshot beside the
+            # database as ``<db>.pre-v<N>.bak``. In a split custom-thumbnail
+            # layout the catalog parent is deliberately not recursed, so add
+            # only this exact Vireo-owned filename pattern rather than
+            # sweeping unrelated siblings into the Storage total.
+            backup_name_re = re.compile(
+                re.escape(os.path.basename(db_path))
+                + r"\.pre-v\d+\.bak\Z"
+            )
+            try:
+                with os.scandir(catalog_root) as entries:
+                    auxiliary_paths.extend(
+                        entry.path
+                        for entry in entries
+                        if entry.is_file()
+                        and backup_name_re.fullmatch(entry.name)
+                    )
+            except OSError:
+                pass
+            other_size = 0
+            for path in auxiliary_paths:
+                try:
+                    if os.path.isfile(path):
+                        other_size += os.path.getsize(path)
+                    elif os.path.isdir(path):
+                        other_size += _dir_size_recursive(path)
+                except OSError:
+                    continue
+        total = sum(size for _path, size in named_storage) + other_size
+        reclaimable = thumb["size"] + preview["size"] + emb["size"]
 
         def _volume_for_path(path):
             usage_path = os.path.abspath(path)
@@ -21404,7 +21694,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             ("catalog", "Catalog and masks", os.path.dirname(db_path)),
             (
                 "generated",
-                "Thumbnails, previews, and offline originals",
+                "Thumbnails, previews, working copies, and offline originals",
                 storage_root,
             ),
         ]
@@ -21447,6 +21737,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "database": {"size": db_size, "path": db_path},
                 "thumbnails": thumb,
                 "previews": preview,
+                "working_copies": working,
+                "other": {"size": other_size, "path": storage_root},
                 "embeddings": emb,
                 "models": {"size": models_size, "path": DEFAULT_MODELS_DIR},
                 "hf_cache": {"size": hf_size, "path": hf_cache, "models": hf_models},
@@ -24697,10 +24989,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             os.path.splitext(photo["filename"])[1].lower() in RAW_EXTENSIONS
         )
         if recipe.get("crop"):
-            source_path, _using_working_copy = _recipe_render_source(
+            source_path, using_working_copy = _recipe_render_source(
                 photo, recipe, 0, vireo_dir, folders,
             )
-            return source_path or fallback_path
+            return source_path or fallback_path, bool(using_working_copy)
 
         # For RAW primaries, skip the working-copy short-circuit while the
         # RAW source is available: legacy working copies predate the
@@ -24719,7 +25011,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 os.path.exists(wc_path)
                 and _path_satisfies_recipe_render(wc_path, photo, recipe, 0)
             ):
-                return wc_path
+                return wc_path, True
 
         companion_path = photo["companion_path"]
         raw_source_available = os.path.exists(fallback_path)
@@ -24731,8 +25023,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 os.path.exists(companion)
                 and _path_satisfies_recipe_render(companion, photo, recipe, 0)
             ):
-                return companion
-        return fallback_path
+                return companion, False
+        return fallback_path, False
 
     def _inat_upload_photo_path(db, photo, fallback_path):
         import config as cfg
@@ -24754,45 +25046,101 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             load_image,
         )
 
-        source_path = _inat_edit_recipe_source(photo, recipe, fallback_path)
-        if not source_path or not os.path.isfile(source_path):
-            return None, f"{photo['filename']}: source file missing"
-
-        out_dir = os.path.join(vireo_dir, "inat-uploads")
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"{photo['id']}.jpg")
-        meta_path = os.path.join(out_dir, f"{photo['id']}.json")
-        source_mtime = os.path.getmtime(source_path)
-        recipe_json = recipe_to_json(recipe) or ""
-        # Include the edit-math version so a math bump invalidates this cached
-        # render — the JPEG is keyed by recipe/source/mtime, none of which
-        # change when only the per-pixel rendering math does, so without this
-        # we'd keep submitting stale renders to iNaturalist after a deploy.
-        expected_meta = {
-            "recipe": recipe_json,
-            "source_path": source_path,
-            "source_mtime": source_mtime,
-            "edit_math_version": EDIT_MATH_VERSION,
-        }
-        try:
-            if os.path.isfile(out_path) and os.path.isfile(meta_path):
-                with open(meta_path, encoding="utf-8") as f:
-                    cached_meta = json.load(f)
-                if cached_meta == expected_meta:
-                    return out_path, None
-        except (OSError, ValueError, TypeError):
-            pass
-
-        # Derive the decode mode from the primary photo's extension rather
-        # than source_path so a future change to source_path resolution
-        # (working copy, companion JPEG fallback, etc.) cannot silently
-        # bypass RAW_DECODE_PRESERVE_HIGHLIGHTS for a RAW primary.
-        primary_is_raw = (
-            os.path.splitext(photo["filename"])[1].lower() in RAW_EXTENSIONS
+        source_path, using_working_copy = _inat_edit_recipe_source(
+            photo, recipe, fallback_path,
         )
-        raw_decode = RAW_DECODE_PRESERVE_HIGHLIGHTS if primary_is_raw else None
-        load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
-        img = load_image(source_path, max_size=None, **load_kwargs)
+        fallback_available = bool(
+            fallback_path and os.path.isfile(fallback_path)
+        )
+        # When the original is offline the working copy is the only usable
+        # local source; the retry-from-original recovery below cannot save us.
+        # Hold the publication/eviction guard through the exists → getmtime →
+        # decode window so quota enforcement cannot unlink the working copy
+        # mid-upload. Guard is an RLock, so nested acquisitions inside
+        # load_image are safe.
+        pin_working_copy = using_working_copy and not fallback_available
+        source_pin_cm = (
+            working_copy_publication_guard()
+            if pin_working_copy else contextlib.nullcontext()
+        )
+        with source_pin_cm:
+            if not source_path or not os.path.isfile(source_path):
+                if using_working_copy and fallback_available:
+                    # Quota enforcement can unlink the working copy between
+                    # recipe-source resolution and this existence check.
+                    source_path = fallback_path
+                    using_working_copy = False
+                else:
+                    return None, f"{photo['filename']}: source file missing"
+
+            out_dir = os.path.join(vireo_dir, "inat-uploads")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"{photo['id']}.jpg")
+            meta_path = os.path.join(out_dir, f"{photo['id']}.json")
+            try:
+                source_mtime = os.path.getmtime(source_path)
+            except FileNotFoundError:
+                if using_working_copy and fallback_available:
+                    source_path = fallback_path
+                    using_working_copy = False
+                    source_mtime = os.path.getmtime(source_path)
+                else:
+                    return None, f"{photo['filename']}: source file missing"
+            recipe_json = recipe_to_json(recipe) or ""
+            # Include the edit-math version so a math bump invalidates this
+            # cached render — the JPEG is keyed by recipe/source/mtime, none
+            # of which change when only the per-pixel rendering math does, so
+            # without this we'd keep submitting stale renders to iNaturalist
+            # after a deploy.
+            expected_meta = {
+                "recipe": recipe_json,
+                "source_path": source_path,
+                "source_mtime": source_mtime,
+                "edit_math_version": EDIT_MATH_VERSION,
+            }
+            try:
+                if os.path.isfile(out_path) and os.path.isfile(meta_path):
+                    with open(meta_path, encoding="utf-8") as f:
+                        cached_meta = json.load(f)
+                    if cached_meta == expected_meta:
+                        return out_path, None
+            except (OSError, ValueError, TypeError):
+                pass
+
+            # Derive the decode mode from the primary photo's extension rather
+            # than source_path so a future change to source_path resolution
+            # (working copy, companion JPEG fallback, etc.) cannot silently
+            # bypass RAW_DECODE_PRESERVE_HIGHLIGHTS for a RAW primary.
+            primary_is_raw = (
+                os.path.splitext(photo["filename"])[1].lower()
+                in RAW_EXTENSIONS
+            )
+            raw_decode = (
+                RAW_DECODE_PRESERVE_HIGHLIGHTS if primary_is_raw else None
+            )
+            load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
+            img = load_image(source_path, max_size=None, **load_kwargs)
+            if img is None and using_working_copy and fallback_path and (
+                os.path.isfile(fallback_path)
+                and os.path.abspath(fallback_path)
+                != os.path.abspath(source_path)
+            ):
+                # Working copy was evicted between validation and decode;
+                # retry from the original before the companion fallback so
+                # RAW primaries still use the highlight-preserving decode.
+                retry_img = load_image(
+                    fallback_path, max_size=None, **load_kwargs,
+                )
+                if retry_img is not None:
+                    img = retry_img
+                    source_path = fallback_path
+                    using_working_copy = False
+                    try:
+                        source_mtime = os.path.getmtime(source_path)
+                    except OSError:
+                        pass
+                    expected_meta["source_path"] = source_path
+                    expected_meta["source_mtime"] = source_mtime
         expected_w, expected_h = 0, 0
         needs_companion = False
         if primary_is_raw:
@@ -33012,6 +33360,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # at scan time).
         import config as cfg
         from thumbnails import (
+            _retry_thumbnail_after_working_copy_eviction,
             _retry_thumbnail_with_working_copy,
             generate_thumbnail,
         )
@@ -33106,6 +33455,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 ),
                 cache_name=cache_filename,
             )
+            if not result and _using_working_copy:
+                result, source = (
+                    _retry_thumbnail_after_working_copy_eviction(
+                        photo,
+                        source,
+                        thumb_dir,
+                        thumb_size,
+                        cfg.load().get("thumbnail_quality", 85),
+                        render_recipe,
+                        folder_row["path"],
+                        vireo_dir,
+                        cache_name=cache_filename,
+                    )
+                )
             if (
                 not result
                 and os.path.splitext(source)[1].lower() in RAW_EXTENSIONS
@@ -37137,10 +37500,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # Try working copy first, fall back to original
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
         image_path = None
+        using_working_copy = False
         if photo["working_copy_path"]:
             wc = os.path.join(vireo_dir, photo["working_copy_path"])
             if os.path.exists(wc):
                 image_path = wc
+                using_working_copy = True
         if image_path is None:
             folder = db.conn.execute(
                 "SELECT path FROM folders WHERE id=?", (photo["folder_id"],)
@@ -37150,6 +37515,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             image_path = os.path.join(folder["path"], photo["filename"])
 
         img = load_image(image_path, max_size=None)
+        if img is None and using_working_copy:
+            # Quota enforcement can unlink the working copy after the
+            # existence check above but before Pillow opens it. Re-resolve
+            # the primary source once so an otherwise healthy crop request
+            # does not become a transient 500 during eviction.
+            folder = db.conn.execute(
+                "SELECT path FROM folders WHERE id=?", (photo["folder_id"],)
+            ).fetchone()
+            original_path = (
+                os.path.join(folder["path"], photo["filename"])
+                if folder else None
+            )
+            if original_path and os.path.isfile(original_path):
+                img = load_image(original_path, max_size=None)
         if img is None:
             return "Could not load image", 500
 
@@ -37711,81 +38090,154 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # the editor's 100% zoom requests a native-resolution render, and
             # short-circuiting to a 4096-capped working copy would silently
             # serve half-resolution pixels as "1:1".
-            source_recipe = recipe
-            if not recipe:
-                from render_source import working_copy_satisfies_recipe_render
-                undersized_wc = photo["working_copy_path"] and (
-                    not working_copy_satisfies_recipe_render(
-                        photo, recipe, size, vireo_dir,
+            original_abs = os.path.join(
+                folder_row["path"], photo["filename"],
+            )
+
+            def _select_and_load_source():
+                source_recipe = recipe
+                if not recipe:
+                    from render_source import working_copy_satisfies_recipe_render
+
+                    undersized_wc = photo["working_copy_path"] and (
+                        not working_copy_satisfies_recipe_render(
+                            photo, recipe, size, vireo_dir,
+                        )
+                    )
+                    if request.args.get("analysis") == "1" or undersized_wc:
+                        source_recipe = {"version": SCHEMA_VERSION}
+                canonical, using_working_copy = _recipe_render_source(
+                    photo, source_recipe, size, vireo_dir,
+                    {folder_row["id"]: folder_row["path"]},
+                )
+                selected_ext = os.path.splitext(canonical)[1].lower()
+                source_failure_current = (
+                    not using_working_copy
+                    and selected_ext in RAW_EXTENSIONS
+                    and _has_current_working_copy_failure(
+                        photo,
+                        vireo_dir,
+                        trust_existing_working_copy=False,
+                        live_source_path=canonical,
+                        folder_path=folder_row["path"],
                     )
                 )
-                if request.args.get("analysis") == "1" or undersized_wc:
-                    source_recipe = {"version": SCHEMA_VERSION}
-            canonical, using_working_copy = _recipe_render_source(
-                photo, source_recipe, size, vireo_dir,
-                {folder_row["id"]: folder_row["path"]},
-            )
-            selected_ext = os.path.splitext(canonical)[1].lower()
-            if (
-                not using_working_copy
-                and selected_ext in RAW_EXTENSIONS
-                and _has_current_working_copy_failure(
-                    photo,
-                    vireo_dir,
-                    trust_existing_working_copy=False,
-                    live_source_path=canonical,
-                    folder_path=folder_row["path"],
+                raw_decode = (
+                    RAW_DECODE_PRESERVE_HIGHLIGHTS
+                    if selected_ext in RAW_EXTENSIONS
+                    else None
                 )
-            ):
+                load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
+                # A cropped output needs more source pixels than its requested
+                # long edge. Scale the source request by the crop ratio, then
+                # let the recipe renderer crop and cap the result to ``size``.
+                # At 100% this naturally reaches the full source and stays
+                # truly 1:1 without forcing a native decode for every fitted
+                # slider update.
+                native_dims = _recipe_source_dimensions(photo)
+                load_max_size = size
+                if apply_crop and recipe.get("crop"):
+                    selected_dims = native_dims
+                    try:
+                        from PIL import Image as _PILImage
+
+                        with _PILImage.open(canonical) as selected_image:
+                            candidate_dims = _image_size_after_exif_orientation(
+                                selected_image,
+                            )
+                        if all(candidate_dims):
+                            selected_dims = candidate_dims
+                    except Exception:
+                        # Some RAW formats cannot be opened by Pillow. Their
+                        # stored native dimensions remain the best available
+                        # decode bound.
+                        pass
+                    if all(selected_dims):
+                        selected_source_long = max(selected_dims)
+                        rendered_long = rendered_recipe_long_edge(
+                            selected_dims[0], selected_dims[1], recipe,
+                        )
+                        if rendered_long > 0:
+                            load_max_size = min(
+                                selected_source_long,
+                                int(math.ceil(
+                                    size * selected_source_long / rendered_long
+                                )),
+                            )
+                    else:
+                        load_max_size = None
+                img = None
+                if not source_failure_current:
+                    img = load_image(
+                        canonical, max_size=load_max_size, **load_kwargs,
+                    )
+                return (
+                    canonical, using_working_copy, selected_ext,
+                    load_max_size, native_dims, img, source_failure_current,
+                )
+
+            # If the original volume is offline, the working copy is the only
+            # local edit source. Hold the publication/eviction guard from
+            # source selection through Pillow decode so quota enforcement
+            # cannot unlink it in the exists/open window. Once load_image
+            # returns, the decoded PIL image no longer depends on the path.
+            source_guard = contextlib.nullcontext()
+            if photo["working_copy_path"] and not os.path.exists(original_abs):
+                source_guard = working_copy_publication_guard()
+            with source_guard:
+                (
+                    canonical, using_working_copy, selected_ext,
+                    load_max_size, native_dims, img, source_failure_current,
+                ) = _select_and_load_source()
+            if source_failure_current:
                 log.info(
                     "Skipping edit-preview generation for photo %s; RAW "
                     "working-copy extraction already failed for current source mtime",
                     photo_id,
                 )
                 return "Could not load image", 500
-            raw_decode = (
-                RAW_DECODE_PRESERVE_HIGHLIGHTS
-                if selected_ext in RAW_EXTENSIONS
-                else None
-            )
-            load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
-            # A cropped output needs more source pixels than its requested
-            # long edge. Scale the source request by the crop ratio, then let
-            # the recipe renderer crop and cap the result to ``size``. At
-            # 100% this naturally reaches the full source and stays truly 1:1
-            # without forcing a native decode for every fitted slider update.
-            native_dims = _recipe_source_dimensions(photo)
-            load_max_size = size
-            if apply_crop and recipe.get("crop"):
-                selected_dims = native_dims
-                try:
-                    from PIL import Image as _PILImage
-
-                    with _PILImage.open(canonical) as selected_image:
-                        candidate_dims = _image_size_after_exif_orientation(
-                            selected_image,
-                        )
-                    if all(candidate_dims):
-                        selected_dims = candidate_dims
-                except Exception:
-                    # Some RAW formats cannot be opened by Pillow. Their stored
-                    # native dimensions remain the best available decode bound.
-                    pass
-                if all(selected_dims):
-                    selected_source_long = max(selected_dims)
-                    rendered_long = rendered_recipe_long_edge(
-                        selected_dims[0], selected_dims[1], recipe,
+            if img is None and using_working_copy:
+                # Quota enforcement can unlink the selected working copy
+                # after _recipe_render_source returned but before
+                # load_image opens it. Retry the original source once so an
+                # otherwise healthy edit preview does not become a
+                # transient 500 during eviction; mirrors the crop and
+                # preview materializer recovery paths.
+                original_ext = os.path.splitext(original_abs)[1].lower()
+                original_is_raw = original_ext in RAW_EXTENSIONS
+                original_failure_current = (
+                    original_is_raw
+                    and _has_current_working_copy_failure(
+                        photo,
+                        vireo_dir,
+                        trust_existing_working_copy=False,
+                        live_source_path=original_abs,
+                        folder_path=folder_row["path"],
                     )
-                    if rendered_long > 0:
-                        load_max_size = min(
-                            selected_source_long,
-                            int(math.ceil(
-                                size * selected_source_long / rendered_long
-                            )),
-                        )
-                else:
-                    load_max_size = None
-            img = load_image(canonical, max_size=load_max_size, **load_kwargs)
+                )
+                if (
+                    os.path.abspath(original_abs)
+                    != os.path.abspath(canonical)
+                    and os.path.isfile(original_abs)
+                    and not original_failure_current
+                ):
+                    fallback_raw_decode = (
+                        RAW_DECODE_PRESERVE_HIGHLIGHTS
+                        if original_is_raw else None
+                    )
+                    fallback_kwargs = (
+                        {"raw_decode": fallback_raw_decode}
+                        if fallback_raw_decode else {}
+                    )
+                    img = load_image(
+                        original_abs,
+                        max_size=load_max_size,
+                        **fallback_kwargs,
+                    )
+                    if img is not None:
+                        canonical = original_abs
+                        selected_ext = original_ext
+                        using_working_copy = False
             if (
                 img is not None
                 and selected_ext in RAW_EXTENSIONS
@@ -38431,7 +38883,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # used by thumbnails and previews, so it must not be used as the
         # unedited lightbox rendition while the source is available.
         if trusted_wc_path and not primary_is_raw:
-            return send_file(trusted_wc_path, mimetype="image/jpeg")
+            # The dimension check above intentionally happens without holding
+            # the publication lock, but quota eviction can unlink the file in
+            # the gap before ``send_file`` opens it. Revalidate and open under
+            # the shared guard. ``send_file`` opens eagerly; once it returns,
+            # POSIX keeps the fd readable after unlink and Windows prevents
+            # eviction from unlinking the open handle.
+            with working_copy_publication_guard():
+                if os.path.isfile(trusted_wc_path):
+                    return send_file(trusted_wc_path, mimetype="image/jpeg")
 
         # Resolve original file path
         from offline_cache import resolve_original_path
@@ -38484,7 +38944,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # RAW. A camera-rendered display cache or companion still wins
             # above when available; otherwise the edit-quality working copy
             # is the best usable full-resolution fallback.
-            return send_file(trusted_wc_path, mimetype="image/jpeg")
+            #
+            # Hold the publication guard through ``send_file`` so a concurrent
+            # quota reduction cannot unlink the only usable rendition between
+            # this check and the file open — mirrors the non-RAW cache-hit
+            # branch above.
+            with working_copy_publication_guard():
+                if os.path.isfile(trusted_wc_path):
+                    return send_file(trusted_wc_path, mimetype="image/jpeg")
 
         has_current_raw_failure = (
             (not using_offline_cache or resolved_ext in RAW_EXTENSIONS)
@@ -38515,7 +38982,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 resolved_ext = os.path.splitext(image_path)[1].lower()
             else:
                 if primary_is_raw and trusted_wc_path:
-                    return send_file(trusted_wc_path, mimetype="image/jpeg")
+                    # Same eviction race as the non-RAW cache-hit branch:
+                    # revalidate under the publication guard before opening.
+                    with working_copy_publication_guard():
+                        if os.path.isfile(trusted_wc_path):
+                            return send_file(
+                                trusted_wc_path, mimetype="image/jpeg",
+                            )
                 log.info(
                     "Skipping original-image extraction for photo %s; RAW working-copy "
                     "extraction already failed for current source mtime",
@@ -38543,7 +39016,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         else:
             wc_rel = f"working/{photo_id}.jpg"
             wc_abs = os.path.join(vireo_dir, wc_rel)
-        quality = cfg.load().get("working_copy_quality", 92)
+        working_copy_config = cfg.load()
+        quality = working_copy_config.get("working_copy_quality", 92)
 
         # Unedited RAW primaries use their camera-rendered full-size preview
         # when available. Edited renders took the recipe branch above and keep
@@ -38556,54 +39030,283 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             else RAW_DECODE_PRESERVE_HIGHLIGHTS
         )
 
-        def _extract_original_copy(source_path):
-            output_path = wc_abs
-            tmp_path = None
-            if primary_is_raw:
-                fd, tmp_path = tempfile.mkstemp(
-                    prefix=f".{photo_id}.display.",
-                    suffix=".jpg.tmp",
-                    dir=os.path.dirname(wc_abs),
-                )
-                os.close(fd)
-                output_path = tmp_path
+        def _extract_to_private_tmp(source_path):
+            """Encode ``source_path`` to a per-request private tempfile.
+
+            Returns the tempfile path on success or ``None`` on failure —
+            publishing (moving the bytes to ``wc_abs``) is the caller's
+            decision. The non-cacheable branch skips publication entirely
+            and streams the tempfile directly, so concurrent waiters —
+            each with their own tempfile — cannot race to remove each
+            other's canonical file out from under ``send_file``. When
+            multiple producers miss the cache at once (single-flight
+            waiters wake as new producers after the first producer
+            finishes) each still writes its own bytes to a distinct path,
+            so their ``extract_working_copy`` calls never interleave into a
+            truncated file that ``PIL.Image.open`` later 500s on.
+            """
+            output_dir = os.path.dirname(wc_abs)
+            os.makedirs(output_dir, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=f".{photo_id}.render.",
+                suffix=".jpg.tmp",
+                dir=output_dir,
+            )
+            os.close(fd)
             try:
                 extracted = extract_working_copy(
                     source_path,
-                    output_path,
+                    tmp_path,
                     max_size=0,
                     quality=quality,
                     raw_decode=extraction_decode,
                 )
-                if extracted and tmp_path:
-                    os.replace(tmp_path, wc_abs)
-                    tmp_path = None
-                    # The display cache-hit check compares against
-                    # ``max(mtime(image_path), mtime(companion))``.
-                    # Leaving wall-clock mtime here fails that check
-                    # whenever either live source has a future mtime
-                    # (clock skew, archives that preserve future
-                    # timestamps), and every request re-decodes the RAW
-                    # and companion. Peg to the same max the check
-                    # consults. Use ``raw_source_path`` — the RAW resolved
-                    # before the has_current_raw_failure branch rewrote
-                    # ``image_path`` to the companion — so a newer RAW
-                    # mtime doesn't fail the gate and re-extract on every
-                    # hit.
-                    _peg_display_cache_mtime(
-                        wc_abs, (raw_source_path, companion_for_extraction),
-                    )
-                return extracted
-            finally:
-                if tmp_path:
-                    with contextlib.suppress(OSError):
-                        os.unlink(tmp_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+                raise
+            if not extracted:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+                return None
+            return tmp_path
 
-        if _extract_original_copy(source_for_extraction):
+        def _publish_extraction(tmp_path):
+            """Atomically move ``tmp_path`` to ``wc_abs`` (and peg RAW mtime).
+
+            Callers pass a path returned from ``_extract_to_private_tmp``
+            and must stop referring to it after this call — the tempfile
+            no longer exists at that path. The RAW branch pegs the display
+            cache mtime so the source-mtime cache-hit check does not
+            re-decode on every request under clock skew or preserved-
+            forward archive timestamps.
+            """
+            os.replace(tmp_path, wc_abs)
+            if primary_is_raw:
+                # The display cache-hit check compares against
+                # ``max(mtime(image_path), mtime(companion))``.
+                # Leaving wall-clock mtime here fails that check
+                # whenever either live source has a future mtime
+                # (clock skew, archives that preserve future
+                # timestamps), and every request re-decodes the RAW
+                # and companion. Peg to the same max the check
+                # consults. Use ``raw_source_path`` — the RAW resolved
+                # before the has_current_raw_failure branch rewrote
+                # ``image_path`` to the companion — so a newer RAW
+                # mtime doesn't fail the gate and re-extract on every
+                # hit.
+                _peg_display_cache_mtime(
+                    wc_abs,
+                    (raw_source_path, companion_for_extraction),
+                )
+
+        def _serve_generated_original(tmp_path, uw, uh):
+            """Publish to the cache, or stream the private tmp transiently.
+
+            ``tmp_path`` is the private rendition from
+            ``_extract_to_private_tmp``. The RAW branch has always already
+            published (its callers publish immediately so their
+            ``PIL.Image.open`` size peek reads a known path); it passes
+            ``tmp_path=None`` and this call just serves ``wc_abs``.
+            Otherwise, the cacheable branch publishes and serves from
+            ``wc_abs`` (pinning against concurrent eviction with an open
+            fd); the non-cacheable branch keeps the file at a per-request
+            transient path and streams from there — ``wc_abs`` is never
+            touched, so concurrent waiters cannot collide there.
+            """
+            if primary_is_raw:
+                return send_file(wc_abs, mimetype="image/jpeg")
+
+            def _commit_generated_original(*, tracked):
+                if tracked:
+                    updates = [
+                        "working_copy_path=?",
+                        "working_copy_evicted_mtime=NULL",
+                    ]
+                    params = [wc_rel]
+                else:
+                    updates = [
+                        "working_copy_path=NULL",
+                        "working_copy_evicted_mtime=COALESCE(file_mtime, -1)",
+                    ]
+                    params = []
+                if not photo["width"] or not photo["height"]:
+                    updates.extend(["width=?", "height=?"])
+                    params.extend([uw, uh])
+                params.append(photo_id)
+                db.conn.execute(
+                    f"UPDATE photos SET {', '.join(updates)} WHERE id=?",
+                    params,
+                )
+                db.conn.commit()
+
+            # Decide cacheability under the publication/eviction guard using
+            # a freshly reloaded quota. If a settings save raised
+            # ``working_copy_cache_max_mb`` while this slow extraction was
+            # encoding, a budget snapshot captured at request start would
+            # be stale: reusing it here would treat a rendition that now
+            # fits as non-cacheable and stamp a new
+            # ``working_copy_evicted_mtime`` after the settings handler
+            # already cleared markers, suppressing backfill for that row
+            # until another quota bump or source-mtime change. Reloading
+            # under the guard also serializes the marker write with the
+            # settings handler's clear (which acquires the same guard when
+            # raising the quota) so a race cannot leave a stale marker.
+            with working_copy_publication_guard():
+                current_budget = working_copy_quota_bytes()
+                try:
+                    generated_size = os.path.getsize(tmp_path)
+                except OSError:
+                    generated_size = current_budget + 1
+                cacheable = (
+                    current_budget > 0
+                    and generated_size <= current_budget
+                )
+                if cacheable:
+                    # Publish first, then open the file BEFORE we commit the
+                    # row that makes ``wc_abs`` visible to concurrent
+                    # eviction passes. A peer thread that runs
+                    # ``evict_if_over_quota`` between the commit here and
+                    # the open below can select this just-written file as
+                    # the oldest and unlink it before Flask ever has an fd
+                    # on it, turning a successful render into a 500.
+                    # Opening first: POSIX keeps the bytes readable through
+                    # an unlink; Windows makes the open fd itself prevent
+                    # unlink so eviction of this specific file just no-ops.
+                    _publish_extraction(tmp_path)
+                    try:
+                        rendition_fh = open(wc_abs, "rb")  # noqa: SIM115 — closed by send_file's response
+                    except OSError:
+                        log.exception(
+                            "Failed to open just-written working copy %s",
+                            wc_abs,
+                        )
+                        return "Could not load image", 500
+                    _commit_generated_original(tracked=True)
+                else:
+                    # Non-cacheable: keep the rendition in ``tmp_path`` (a
+                    # per-request private tempfile) and never publish to
+                    # ``wc_abs`` at all. Publishing would only invite two
+                    # races under a zero or undersized quota: waiters would
+                    # compete to move ``wc_abs`` to their own transient
+                    # location and every waiter but the winner would
+                    # ``os.replace(wc_abs, ...)`` a missing file (500), and
+                    # a concurrent eviction pass would see and immediately
+                    # unlink the "orphan" it cannot reconcile against any
+                    # catalog row. The DB still records
+                    # ``working_copy_path=NULL`` so future requests know
+                    # they must regenerate rather than expect a cache hit.
+                    # The response still needs a decoded JPEG, but a zero
+                    # quota (or one smaller than this single rendition)
+                    # must not turn that response into a persistent cache
+                    # entry.
+                    # A transient full-resolution response must not orphan
+                    # an existing capped working copy that remains useful
+                    # to previews/edits/exports and still counts toward the
+                    # quota. Revalidate both its catalog row and file while
+                    # holding the publication/eviction lock. The request's
+                    # ``photo`` snapshot may predate a concurrent eviction;
+                    # restoring that stale path would point consumers at a
+                    # file that no longer exists.
+                    current_row = db.conn.execute(
+                        "SELECT working_copy_path FROM photos WHERE id=?",
+                        (photo_id,),
+                    ).fetchone()
+                    preserve_existing_copy = bool(
+                        current_row
+                        and current_row["working_copy_path"] == wc_rel
+                        and os.path.isfile(wc_abs)
+                    )
+                    _commit_generated_original(
+                        tracked=preserve_existing_copy,
+                    )
+
+            if cacheable:
+                # The on-demand route is also a cache writer. Apply the same
+                # oldest-first ceiling as scanner/backfill generation. The
+                # open fd above pins the rendition against this call's own
+                # enforcement pass too.
+                response = send_file(rendition_fh, mimetype="image/jpeg")
+                try:
+                    evict_working_copy_cache_if_over_quota(db, vireo_dir)
+                except Exception:
+                    # Serving the successfully generated image is more useful
+                    # than turning a transient maintenance error into a 500;
+                    # startup and later writes will retry enforcement.
+                    log.exception(
+                        "Working-copy quota enforcement failed after "
+                        "on-demand write"
+                    )
+                return response
+
+            # Non-cacheable rendition: relocate ``tmp_path`` into
+            # ``originals/`` so a stream interrupted by a process kill is
+            # reclaimed by ``_sweep_abandoned_transient_originals`` on the
+            # next startup. ``tmp_path`` is unique per waiter (mkstemp), so
+            # the move never collides with a peer's tempfile. Windows can
+            # delete the private file after its response handle closes
+            # (unlinking an open file is not supported there).
+            transient_dir = os.path.join(vireo_dir, "originals")
+            os.makedirs(transient_dir, exist_ok=True)
+            fd, transient_path = tempfile.mkstemp(
+                prefix=f".{photo_id}.transient.",
+                suffix=".jpg",
+                dir=transient_dir,
+            )
+            os.close(fd)
+            try:
+                os.replace(tmp_path, transient_path)
+            except OSError:
+                log.exception(
+                    "Failed to relocate rendition %s to transient path %s",
+                    tmp_path, transient_path,
+                )
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+                with contextlib.suppress(OSError):
+                    os.unlink(transient_path)
+                return "Could not load image", 500
+            try:
+                rendition_fh = open(transient_path, "rb")  # noqa: SIM115 — closed by _stream_rendition's finally
+            except OSError:
+                log.exception(
+                    "Failed to open just-written non-cacheable "
+                    "rendition %s", transient_path,
+                )
+                with contextlib.suppress(OSError):
+                    os.unlink(transient_path)
+                return "Could not load image", 500
+
+            def _stream_rendition():
+                try:
+                    while chunk := rendition_fh.read(1024 * 1024):
+                        yield chunk
+                finally:
+                    with contextlib.suppress(Exception):
+                        rendition_fh.close()
+                    with contextlib.suppress(OSError):
+                        os.unlink(transient_path)
+
+            return Response(_stream_rendition(), mimetype="image/jpeg")
+
+        tmp_path = _extract_to_private_tmp(source_for_extraction)
+        if tmp_path:
             # Update DB so future requests are fast; also backfill
             # dimensions if missing so the full-res shortcut works next time
             from PIL import Image as _PILImage
-            with _PILImage.open(wc_abs) as upgraded:
+            if primary_is_raw:
+                # RAW display cache goes through ``wc_abs`` immediately so
+                # subsequent checks (undersized retry, trusted-wc override)
+                # can peek at the just-written file directly.
+                _publish_extraction(tmp_path)
+                tmp_path = None
+                peek_path = wc_abs
+            else:
+                # Non-RAW: keep the rendition private until cacheability
+                # is decided in ``_serve_generated_original``. Peek at the
+                # tempfile itself for its dimensions.
+                peek_path = tmp_path
+            with _PILImage.open(peek_path) as upgraded:
                 uw, uh = upgraded.size
             # For RAW sources, extract_working_copy can succeed via the
             # embedded JPEG fallback when libraw can't demosaic the file.
@@ -38634,9 +39337,31 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         "from companion JPEG",
                         photo_id, uw, uh, expected_w, expected_h,
                     )
-                    if _extract_original_copy(companion_for_extraction):
-                        with _PILImage.open(wc_abs) as upgraded:
-                            uw, uh = upgraded.size
+                    companion_tmp = _extract_to_private_tmp(
+                        companion_for_extraction,
+                    )
+                    if companion_tmp:
+                        if primary_is_raw:
+                            # RAW display cache: publish the companion bytes
+                            # directly to ``wc_abs`` (overwriting the RAW
+                            # extraction we published above). The subsequent
+                            # size peek reads from the published path.
+                            _publish_extraction(companion_tmp)
+                            with _PILImage.open(wc_abs) as upgraded:
+                                uw, uh = upgraded.size
+                        else:
+                            # Non-RAW: neither the primary nor the companion
+                            # rendition has been published yet. Discard the
+                            # undersized primary tempfile and hand the
+                            # companion bytes to ``_serve_generated_original``
+                            # instead so the cacheable/transient decision
+                            # runs against them.
+                            if tmp_path:
+                                with contextlib.suppress(OSError):
+                                    os.unlink(tmp_path)
+                            tmp_path = companion_tmp
+                            with _PILImage.open(tmp_path) as upgraded:
+                                uw, uh = upgraded.size
                     else:
                         log.warning(
                             "Companion re-extraction failed for photo %s; "
@@ -38658,25 +39383,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     # the 1:1 display cache when a trusted full-res copy is
                     # already available, and mark the RAW retry so later
                     # requests take the fast fallback path.
-                    with contextlib.suppress(OSError):
-                        os.unlink(wc_abs)
-                    _record_working_copy_failure(
-                        db, photo, source_for_extraction,
-                    )
-                    return send_file(trusted_wc_path, mimetype="image/jpeg")
-            if not primary_is_raw:
-                updates = ["working_copy_path=?"]
-                params = [wc_rel]
-                if not photo["width"] or not photo["height"]:
-                    updates.extend(["width=?", "height=?"])
-                    params.extend([uw, uh])
-                params.append(photo_id)
-                db.conn.execute(
-                    f"UPDATE photos SET {', '.join(updates)} WHERE id=?",
-                    params,
-                )
-                db.conn.commit()
-            return send_file(wc_abs, mimetype="image/jpeg")
+                    #
+                    # Hold the publication guard through ``send_file`` so a
+                    # concurrent quota reduction cannot unlink the fallback
+                    # between validation and open — mirrors the guarded
+                    # cache-hit returns above. If the trusted copy was
+                    # already evicted, keep the undersized display cache
+                    # rather than destroying it and 500ing: falling through
+                    # serves ``wc_abs`` via ``_serve_generated_original``,
+                    # and the retry mark is redundant when there is no
+                    # trusted fallback for a later request to take.
+                    with working_copy_publication_guard():
+                        if os.path.isfile(trusted_wc_path):
+                            with contextlib.suppress(OSError):
+                                os.unlink(wc_abs)
+                            _record_working_copy_failure(
+                                db, photo, source_for_extraction,
+                            )
+                            return send_file(
+                                trusted_wc_path, mimetype="image/jpeg",
+                            )
+            return _serve_generated_original(tmp_path, uw, uh)
 
         # extract_working_copy failed on a RAW source: try the full-res
         # companion JPEG as a fallback before giving up. This catches
@@ -38687,28 +39414,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             resolved_ext in RAW_EXTENSIONS
             and companion_for_extraction
             and companion_for_extraction != source_for_extraction
-            and _extract_original_copy(companion_for_extraction)
         ):
-            from PIL import Image as _PILImage
-            with _PILImage.open(wc_abs) as upgraded:
-                uw, uh = upgraded.size
-            if not primary_is_raw:
-                updates = ["working_copy_path=?"]
-                params = [wc_rel]
-                if not photo["width"] or not photo["height"]:
-                    updates.extend(["width=?", "height=?"])
-                    params.extend([uw, uh])
-                params.append(photo_id)
-                db.conn.execute(
-                    f"UPDATE photos SET {', '.join(updates)} WHERE id=?",
-                    params,
+            companion_tmp = _extract_to_private_tmp(companion_for_extraction)
+            if companion_tmp:
+                from PIL import Image as _PILImage
+                if primary_is_raw:
+                    _publish_extraction(companion_tmp)
+                    companion_tmp = None
+                    peek_path = wc_abs
+                else:
+                    peek_path = companion_tmp
+                with _PILImage.open(peek_path) as upgraded:
+                    uw, uh = upgraded.size
+                log.info(
+                    "RAW extraction failed for photo %s original; served "
+                    "companion JPEG instead", photo_id,
                 )
-                db.conn.commit()
-            log.info(
-                "RAW extraction failed for photo %s original; served "
-                "companion JPEG instead", photo_id,
-            )
-            return send_file(wc_abs, mimetype="image/jpeg")
+                return _serve_generated_original(companion_tmp, uw, uh)
 
         # Fallback: serve via load_image
         raw_decode = (
@@ -38768,7 +39490,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # Source/offline bytes are unavailable. A working copy is less
                 # faithful to the camera rendition, but remains the best usable
                 # full-resolution fallback and preserves offline behavior.
-                return send_file(trusted_wc_path, mimetype="image/jpeg")
+                #
+                # Hold the publication guard through ``send_file`` so a
+                # concurrent quota reduction cannot unlink the fallback
+                # between validation and open — mirrors the guarded returns
+                # above. If it was evicted mid-flight, fall through to the
+                # 500 rather than raising inside ``send_file``.
+                with working_copy_publication_guard():
+                    if os.path.isfile(trusted_wc_path):
+                        return send_file(
+                            trusted_wc_path, mimetype="image/jpeg",
+                        )
             return "Could not load image", 500
         if primary_is_raw:
             cache_path = display_cache_path

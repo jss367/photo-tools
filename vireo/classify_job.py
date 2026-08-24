@@ -1216,10 +1216,15 @@ def _prepare_image(photo, folders, detection, vireo_dir=None):
     image_path = os.path.join(folder_path, photo["filename"])
 
     img = None
+    input_source = "original"
     if vireo_dir and load_working_image is not None:
-        img = load_working_image(photo, vireo_dir, max_size=None, folders=folders)
+        img, input_source = load_working_image(
+            photo, vireo_dir, max_size=None, folders=folders,
+            return_source=True,
+        )
     if img is None:
         img = load_image(image_path, max_size=None)
+        input_source = "original"
     if img is None:
         return None, folder_path, image_path
 
@@ -1240,6 +1245,11 @@ def _prepare_image(photo, folders, detection, vireo_dir=None):
             crop.close()
 
     img.thumbnail((1024, 1024), Image.LANCZOS)
+    # Classification artifacts are published after predictions are persisted,
+    # which may be long after this image was loaded. Carry the actual pixel
+    # source with the in-memory image so quota eviction cannot make a
+    # working-copy-backed result look original-backed by clearing the row.
+    img.info["_vireo_input_source"] = input_source
     return img, folder_path, image_path
 
 
@@ -1332,21 +1342,25 @@ def _flush_batch(batch, clf, model_type, model_name, db, raw_results, top_k=1):
                     "taxonomy": alt_pred.get("taxonomy"),
                 })
 
-            raw_results.append(
-                {
-                    "photo": entry["photo"],
-                    "detection_id": entry.get("detection_id"),
-                    "folder_path": entry["folder_path"],
-                    "image_path": entry["image_path"],
-                    "prediction": top["species"],
-                    "confidence": top["score"],
-                    "timestamp": timestamp,
-                    "filename": entry["photo"]["filename"],
-                    "embedding": embedding,
-                    "taxonomy": top.get("taxonomy"),
-                    "alternatives": alternatives,
-                }
+            raw_result = {
+                "photo": entry["photo"],
+                "detection_id": entry.get("detection_id"),
+                "folder_path": entry["folder_path"],
+                "image_path": entry["image_path"],
+                "prediction": top["species"],
+                "confidence": top["score"],
+                "timestamp": timestamp,
+                "filename": entry["photo"]["filename"],
+                "embedding": embedding,
+                "taxonomy": top.get("taxonomy"),
+                "alternatives": alternatives,
+            }
+            input_source = getattr(entry["img"], "info", {}).get(
+                "_vireo_input_source"
             )
+            if input_source in ("original", "working_copy"):
+                raw_result["_input_source"] = input_source
+            raw_results.append(raw_result)
     finally:
         # Close all PIL images to avoid resource leaks
         for entry in batch:
@@ -1882,6 +1896,7 @@ def _publish_classifier_runs_for_raw_results(
             continue
         seen.add(det_id)
         try:
+            input_source = result.get("_input_source")
             promote_and_publish_classifier_run(
                 db,
                 det_id,
@@ -1891,6 +1906,11 @@ def _publish_classifier_runs_for_raw_results(
                 model_identity,
                 store=store,
                 taxonomy_identity=taxonomy_identity,
+                source_is_original=(
+                    input_source == "original"
+                    if input_source in ("original", "working_copy")
+                    else None
+                ),
             )
         except Exception:
             log.warning(

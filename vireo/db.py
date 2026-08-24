@@ -799,6 +799,7 @@ class Database:
                 companion_path           TEXT,
                 exif_data                TEXT,
                 working_copy_path        TEXT,
+                working_copy_evicted_mtime REAL,
                 working_copy_failed_at   TEXT,
                 working_copy_failed_mtime REAL,
                 working_copy_failed_source TEXT,
@@ -1637,6 +1638,15 @@ class Database:
         except sqlite3.OperationalError:
             self.conn.execute(
                 "ALTER TABLE photos ADD COLUMN working_copy_failed_source TEXT"
+            )
+        # Quota eviction is not an extraction failure: keep its source-mtime
+        # marker separate so startup backfill does not immediately recreate
+        # deliberately removed working copies.
+        try:
+            self.conn.execute("SELECT working_copy_evicted_mtime FROM photos LIMIT 0")
+        except sqlite3.OperationalError:
+            self.conn.execute(
+                "ALTER TABLE photos ADD COLUMN working_copy_evicted_mtime REAL"
             )
         # Record the folder a photo most recently moved from. This lets
         # per-photo moves prove that a same-stem file already at the

@@ -1010,6 +1010,7 @@ def _invalidate_derived_caches(db, vireo_dir, photo_id, thumb_cache_dir=None):
     # not be permanently locked out by a stale failure record.
     db.conn.execute(
         "UPDATE photos SET working_copy_path = NULL,"
+        " working_copy_evicted_mtime = NULL,"
         " working_copy_failed_at = NULL,"
         " working_copy_failed_mtime = NULL,"
         " working_copy_failed_source = NULL"
@@ -1217,6 +1218,9 @@ def _working_copy_candidate_predicate(wc_max_size, alias=""):
     where = (
         f"{p}working_copy_path IS NULL"
         f" AND ({p}extension IN ({placeholders}){jpeg_clause})"
+        f" AND ({p}working_copy_evicted_mtime IS NULL"
+        f"      OR ({p}file_mtime IS NOT NULL"
+        f"          AND {p}working_copy_evicted_mtime != {p}file_mtime))"
         f" AND ({p}working_copy_failed_at IS NULL"
         f"      OR {p}working_copy_failed_mtime IS NULL"
         f"      OR {p}file_mtime IS NULL"
@@ -1238,6 +1242,14 @@ def working_copy_backfill_candidate_count(db):
 
     user_cfg = cfg.load()
     wc_max_size = user_cfg.get("working_copy_max_size", 4096)
+    try:
+        wc_cache_max_mb = int(
+            user_cfg.get("working_copy_cache_max_mb", 20480)
+        )
+    except (TypeError, ValueError):
+        wc_cache_max_mb = 20480
+    if wc_cache_max_mb <= 0:
+        return 0
     where, params = _working_copy_candidate_predicate(wc_max_size)
     return db.conn.execute(
         f"SELECT COUNT(*) FROM photos WHERE {where}", params
@@ -1297,6 +1309,26 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
     user_cfg = cfg.load()
     wc_max_size = user_cfg.get("working_copy_max_size", 4096)
     wc_quality = user_cfg.get("working_copy_quality", 92)
+
+    def _configured_quota_mb():
+        try:
+            return int(
+                cfg.load().get("working_copy_cache_max_mb", 20480)
+            )
+        except (TypeError, ValueError):
+            return 20480
+
+    # A zero-byte quota is an explicit "keep no working copies" setting.
+    # Skip RAW decoding entirely instead of generating a JPEG only for the
+    # quota pass below to delete it immediately.
+    try:
+        wc_cache_max_mb = int(
+            user_cfg.get("working_copy_cache_max_mb", 20480)
+        )
+    except (TypeError, ValueError):
+        wc_cache_max_mb = 20480
+    if wc_cache_max_mb <= 0:
+        return
 
     # Candidate criteria (NULL working_copy_path + RAW or oversized JPEG +
     # not blocked by a stale failure marker) is shared with the startup gate
@@ -1371,7 +1403,8 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
 
     rows = db.conn.execute(
         f"""
-        SELECT p.id, p.filename, p.companion_path, p.working_copy_path,
+        SELECT p.id, p.folder_id, p.filename, p.companion_path,
+               p.working_copy_path,
                p.extension, p.width, p.height, p.exif_data, p.file_mtime,
                p.file_size,
                f.path AS folder_path
@@ -1420,6 +1453,30 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             progress_callback(current, total)
 
     _emit_working_copy_progress(0)
+
+    # Bound the transient overshoot while a large batch is running. A
+    # library much larger than the configured quota would otherwise
+    # generate the entire set before the post-loop enforce and fill the
+    # disk by hundreds of gigabytes.
+    from working_copy_cache import (
+        evict_if_over_quota,
+        working_copy_publication_guard,
+    )
+
+    quota_bytes = wc_cache_max_mb * 1024 * 1024
+    # Enforce roughly every quarter of the configured quota, capped at 512 MB
+    # so it doesn't run for every file on a small budget and doesn't defer
+    # eviction past ~2% of the ceiling on a large one. The 1 KB floor is only
+    # a safety net for tests with a near-zero quota.
+    def _incremental_threshold(limit_bytes):
+        return max(
+            1024, min(limit_bytes // 4, 512 * 1024 * 1024),
+        )
+
+    incremental_threshold = _incremental_threshold(quota_bytes)
+    new_bytes_since_enforce = 0
+    retained_new_files = {}
+    stop_after_current = False
 
     # Commit per row so the writer lock is released between iterations.
     # Otherwise the first UPDATE in a batch auto-opens a transaction and
@@ -1521,7 +1578,10 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
 
         # extract_working_copy is slow (RAW decode + JPEG encode); run it
         # before any DB write so no transaction is open while it runs.
-        ok = extract_working_copy(source, wc_abs, max_size=wc_max_size, quality=wc_quality)
+        ok = extract_working_copy(
+            source, wc_abs, max_size=wc_max_size, quality=wc_quality,
+            publication_guard=working_copy_publication_guard,
+        )
         # Card-side override failed but the verified archive copy exists
         # — retry from the archive before falling through to the RAW→
         # companion fallback or recording a failure marker. Without this,
@@ -1549,6 +1609,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     companion_override_used = False
                 ok = extract_working_copy(
                     source, wc_abs, max_size=wc_max_size, quality=wc_quality,
+                    publication_guard=working_copy_publication_guard,
                 )
         raw_failed_then_companion = False
         # libraw returns an embedded JPEG when it can't demosaic a RAW; that
@@ -1619,6 +1680,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             # companion extraction also fails.
             ok = extract_working_copy(
                 source, wc_abs, max_size=wc_max_size, quality=wc_quality,
+                publication_guard=working_copy_publication_guard,
             )
             # Companion attempt used a card override and failed — retry
             # from the verified archive companion before recording failure.
@@ -1642,33 +1704,75 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 ok = extract_working_copy(
                     source, wc_abs,
                     max_size=wc_max_size, quality=wc_quality,
+                    publication_guard=working_copy_publication_guard,
                 )
             raw_failed_then_companion = ok
+        publication_lost = False
+        quota_lowered_during_extraction = False
+        retained_before_quota_lowering = set()
         if ok:
-            if raw_failed_then_companion:
-                # The companion-derived working copy is usable, but request
-                # paths still need to know the RAW itself failed: edited RAW
-                # render paths (preview/edit-preview/original/export) gate
-                # companion selection in _recipe_render_source on a present
-                # "source" failure marker. Clearing it here would push those
-                # paths back through the unsupported RAW decode and 500.
-                db.conn.execute(
-                    "UPDATE photos SET working_copy_path=?,"
-                    " working_copy_failed_at=datetime('now'),"
-                    " working_copy_failed_mtime=?,"
-                    " working_copy_failed_source='source'"
-                    " WHERE id=?",
-                    (wc_rel, row["file_mtime"], row["id"]),
-                )
-            else:
-                db.conn.execute(
-                    "UPDATE photos SET working_copy_path=?,"
-                    " working_copy_failed_at=NULL,"
-                    " working_copy_failed_mtime=NULL,"
-                    " working_copy_failed_source=NULL"
-                    " WHERE id=?",
-                    (wc_rel, row["id"]),
-                )
+            # ``extract_working_copy`` guards its atomic replace, but its
+            # guard ends before returning. A competing job may already have
+            # committed the same canonical path, allowing quota eviction to
+            # delete our replacement in that narrow gap. Reacquire the same
+            # guard, revalidate the published file, and hold it through the
+            # catalog commit so eviction can never leave a non-NULL path
+            # pointing at bytes it removed before this job committed.
+            with working_copy_publication_guard():
+                if not os.path.isfile(wc_abs):
+                    publication_lost = True
+                else:
+                    # A settings request can lower the quota and finish its
+                    # one-time eviction while this slow extraction is still
+                    # encoding. Re-read the saved ceiling under the same
+                    # publication/eviction guard before exposing the row. If
+                    # it fell, enforce it before releasing the guard so this
+                    # stale batch cannot refill the cache after that request
+                    # returns.
+                    latest_quota_mb = _configured_quota_mb()
+                    quota_lowered_during_extraction = (
+                        latest_quota_mb < wc_cache_max_mb
+                    )
+                    if quota_lowered_during_extraction:
+                        wc_cache_max_mb = latest_quota_mb
+                        quota_bytes = max(0, wc_cache_max_mb) * 1024 * 1024
+                        incremental_threshold = _incremental_threshold(
+                            quota_bytes
+                        )
+                        retained_before_quota_lowering = set(
+                            retained_new_files
+                        )
+
+                if not publication_lost and raw_failed_then_companion:
+                    # The companion-derived working copy is usable, but
+                    # request paths still need to know the RAW itself failed:
+                    # edited RAW render paths gate companion selection on a
+                    # present "source" failure marker.
+                    db.conn.execute(
+                        "UPDATE photos SET working_copy_path=?,"
+                        " working_copy_evicted_mtime=NULL,"
+                        " working_copy_failed_at=datetime('now'),"
+                        " working_copy_failed_mtime=?,"
+                        " working_copy_failed_source='source'"
+                        " WHERE id=?",
+                        (wc_rel, row["file_mtime"], row["id"]),
+                    )
+                elif not publication_lost:
+                    db.conn.execute(
+                        "UPDATE photos SET working_copy_path=?,"
+                        " working_copy_evicted_mtime=NULL,"
+                        " working_copy_failed_at=NULL,"
+                        " working_copy_failed_mtime=NULL,"
+                        " working_copy_failed_source=NULL"
+                        " WHERE id=?",
+                        (wc_rel, row["id"]),
+                    )
+                if not publication_lost:
+                    commit_with_retry(db.conn)
+                    if quota_lowered_during_extraction:
+                        evict_if_over_quota(
+                            db, vireo_dir, quota_mb=wc_cache_max_mb,
+                        )
         else:
             # Mark failure gated on current file_mtime so a future content
             # change (mtime bump) clears the gate and we retry. The
@@ -1689,9 +1793,195 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 " WHERE id=?",
                 (row["file_mtime"], failure_source, row["id"]),
             )
-        commit_with_retry(db.conn)
+            commit_with_retry(db.conn)
+
+        if publication_lost:
+            log.info(
+                "Working copy for photo %s was evicted before its catalog "
+                "commit; leaving the eviction marker intact",
+                row["id"],
+            )
+            _emit_working_copy_progress(i)
+            continue
+
+        if quota_lowered_during_extraction:
+            new_bytes_since_enforce = 0
+            retained_new_files = {
+                path: size
+                for path, size in retained_new_files.items()
+                if os.path.isfile(path)
+            }
+            removed_batch_files = (
+                retained_before_quota_lowering - set(retained_new_files)
+            )
+            if quota_bytes <= 0 or removed_batch_files:
+                stop_after_current = True
 
         _emit_working_copy_progress(i)
+
+        # Track newly-generated bytes so the loop doesn't overshoot the
+        # quota by hundreds of gigabytes on a large backfill. A tiny wc_abs
+        # stat is cheap next to the RAW decode / JPEG encode that just ran.
+        if ok:
+            try:
+                new_bytes = os.path.getsize(wc_abs)
+            except OSError:
+                new_bytes = 0
+            new_bytes_since_enforce += new_bytes
+            if new_bytes:
+                retained_new_files[wc_abs] = new_bytes
+
+            if new_bytes_since_enforce >= incremental_threshold:
+                retained_before_enforce = set(retained_new_files)
+                try:
+                    evict_if_over_quota(db, vireo_dir)
+                except Exception:
+                    log.exception(
+                        "Working-copy quota enforcement failed mid-batch"
+                    )
+                new_bytes_since_enforce = 0
+                # Quota enforcement may have immediately reclaimed this
+                # rendition (for example, when a single JPEG is larger than
+                # the whole budget) or an earlier file from this batch. Only
+                # retained bytes should move the batch toward its stop point;
+                # otherwise one oversized file defers every later candidate,
+                # including copies that would fit in the cache.
+                retained_new_files = {
+                    path: size
+                    for path, size in retained_new_files.items()
+                    if os.path.isfile(path)
+                }
+                # Once enforcement removes an earlier fitting rendition from
+                # this same batch to keep the current one, retained capacity
+                # has started rotating rather than growing. Continuing would
+                # decode every remaining RAW only to evict another result.
+                # Do not treat removal of only the current file as rotation:
+                # that is the individually-oversized case, where later
+                # candidates may still fit and must remain eligible.
+                removed_batch_files = (
+                    retained_before_enforce - set(retained_new_files)
+                )
+                if any(path != wc_abs for path in removed_batch_files):
+                    stop_after_current = True
+
+            # Once this batch alone has produced a full quota's worth of new
+            # working copies, further generation would only displace files we
+            # just wrote. Stop cleanly instead of churning disk.
+            if (
+                not stop_after_current
+                and quota_bytes > 0
+                and sum(retained_new_files.values()) >= quota_bytes
+            ):
+                stop_after_current = True
+
+        if stop_after_current:
+            # A settings write may raise the ceiling while this slow batch is
+            # decoding. Adopt the latest value before marking the remaining
+            # rows as capacity-deferred; otherwise the settings handler can
+            # clear old eviction markers and this stale batch can recreate
+            # them afterward, suppressing startup backfill indefinitely.
+            latest_quota_mb = _configured_quota_mb()
+            if latest_quota_mb != wc_cache_max_mb:
+                wc_cache_max_mb = latest_quota_mb
+                quota_bytes = max(0, wc_cache_max_mb) * 1024 * 1024
+                incremental_threshold = _incremental_threshold(quota_bytes)
+                stop_after_current = (
+                    quota_bytes <= 0
+                    or sum(retained_new_files.values()) >= quota_bytes
+                )
+                if not stop_after_current:
+                    continue
+
+            log.info(
+                "Working-copy batch reached quota (%d MB) after %d of %d "
+                "candidates; deferring the rest to a later pass",
+                wc_cache_max_mb, i, total,
+            )
+            # Mark the remaining candidates as capacity-deferred so the
+            # startup gate doesn't re-launch backfill on every restart
+            # while the quota is unchanged. Without this, the next launch
+            # would decode and write another quota-sized batch only to
+            # evict the batch we just committed — and repeat indefinitely.
+            # Reuse ``working_copy_evicted_mtime``: the settings write path
+            # already clears this marker when the user raises the ceiling,
+            # and the candidate predicate treats a file_mtime change as an
+            # escape hatch so a rewritten source retries automatically.
+            # ``photos.id`` is not AUTOINCREMENT, so deleting the highest-ID
+            # pending row while this long-running batch is decoding can let a
+            # re-import reuse that id. Carry the source identity captured by
+            # the candidate snapshot through both writes; an id-only UPDATE
+            # would otherwise stamp the replacement row's current mtime as
+            # evicted and suppress its startup backfill.
+            deferred_rows = [
+                (
+                    row["file_mtime"], row["id"], row["folder_id"],
+                    row["filename"], row["file_size"], row["file_mtime"],
+                )
+                for row in rows[i:]
+            ]
+            if deferred_rows:
+                db.conn.executemany(
+                    "UPDATE photos SET"
+                    " working_copy_evicted_mtime=COALESCE(?, -1)"
+                    " WHERE id=? AND folder_id=? AND filename=?"
+                    " AND file_size IS ? AND file_mtime IS ?"
+                    " AND working_copy_path IS NULL",
+                    deferred_rows,
+                )
+                commit_with_retry(db.conn)
+
+                # Close the remaining save/side-effect race: if the config
+                # increased after the check above but before this commit, the
+                # settings handler may already have performed its one-time
+                # marker clear. Re-read after committing and undo only this
+                # pass's deferred markers when the new capacity can hold more
+                # of the batch. If the save happens after this read, its own
+                # side effect clears them instead.
+                refreshed_quota_mb = _configured_quota_mb()
+                refreshed_quota_bytes = (
+                    max(0, refreshed_quota_mb) * 1024 * 1024
+                )
+                if (
+                    refreshed_quota_mb > wc_cache_max_mb
+                    and sum(retained_new_files.values())
+                    < refreshed_quota_bytes
+                ):
+                    deferred_marker_rows = [
+                        (
+                            row["id"], row["folder_id"], row["filename"],
+                            row["file_size"], row["file_mtime"],
+                            row["file_mtime"],
+                        )
+                        for row in rows[i:]
+                    ]
+                    db.conn.executemany(
+                        "UPDATE photos SET working_copy_evicted_mtime=NULL "
+                        "WHERE id=? AND folder_id=? AND filename=?"
+                        " AND file_size IS ? AND file_mtime IS ?"
+                        " AND working_copy_path IS NULL"
+                        " AND working_copy_evicted_mtime IS COALESCE(?, -1)",
+                        deferred_marker_rows,
+                    )
+                    commit_with_retry(db.conn)
+                    wc_cache_max_mb = refreshed_quota_mb
+                    quota_bytes = refreshed_quota_bytes
+                    incremental_threshold = _incremental_threshold(
+                        quota_bytes,
+                    )
+                    stop_after_current = False
+                    continue
+            break
+
+    # A scan/import may add a large batch at once. Enforce once after the
+    # batch so the quota stays a hard steady-state ceiling without rescanning
+    # the working directory after every generated file.
+    try:
+        evict_if_over_quota(db, vireo_dir)
+    except Exception:
+        # The working copies themselves are valid even if quota maintenance
+        # hits a transient filesystem/database error. Keep the scan result and
+        # retry enforcement at startup or on the next config/cache write.
+        log.exception("Working-copy quota enforcement failed")
 
 
 def backfill_working_copies(db, vireo_dir, progress_callback=None,

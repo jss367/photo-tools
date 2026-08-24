@@ -940,6 +940,45 @@ def test_api_storage_custom_thumb_dir_ignores_unrelated_siblings(
     )
     assert after_owned["total"] - after_unrelated["total"] == len(owned)
 
+    # Staging is Vireo-managed under a custom --thumb-dir too — an omitted
+    # entry in the allowlist would hide potentially very large recovery data
+    # from Storage totals.
+    staging = shared_root / "staging" / "pipeline-abc"
+    staging.mkdir(parents=True)
+    staged = b"pipeline-recovery-data"
+    (staging / "photo.NEF").write_bytes(staged)
+    after_staging = app.test_client().get("/api/storage").get_json()
+    assert (
+        after_staging["other"]["size"] - after_owned["other"]["size"]
+        == len(staged)
+    )
+    assert after_staging["total"] - after_owned["total"] == len(staged)
+
+
+def test_startup_sweeps_abandoned_transient_originals(app_and_db, tmp_path):
+    """A killed process can leave ``.transient.*.jpg`` under ``originals/``.
+
+    Working-copy eviction only scans ``working/``, so those orphans would
+    otherwise accumulate outside the configured quota with no cleanup path.
+    Startup sweeps them explicitly.
+    """
+    from app import _sweep_abandoned_transient_originals
+
+    app, _ = app_and_db
+    originals = tmp_path / "originals"
+    originals.mkdir(exist_ok=True)
+    orphan = originals / ".42.transient.abcdef.jpg"
+    orphan.write_bytes(b"x" * 1024)
+    peer = originals / "1.display.jpg"
+    peer.write_bytes(b"y" * 256)
+
+    _sweep_abandoned_transient_originals(app)
+
+    assert not orphan.exists()
+    # Non-transient files under originals/ are unrelated Vireo state
+    # (display caches, paired-render bytes, etc.) and must be left alone.
+    assert peer.exists()
+
 
 def test_config_update_immediately_enforces_working_copy_quota(
     app_and_db, tmp_path,

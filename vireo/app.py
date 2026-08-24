@@ -3681,6 +3681,51 @@ def _enforce_working_copy_cache_quota_at_startup(app):
             pass
 
 
+def _sweep_abandoned_transient_originals(app):
+    """Reclaim non-cacheable ``/original`` renditions the process orphaned.
+
+    When ``_serve_generated_original`` streams a rendition too large for the
+    quota (or when the quota is zero), it moves the file into
+    ``<vireo_dir>/originals/.<id>.transient.*.jpg`` and unlinks it in the
+    generator's ``finally`` block after streaming. A process kill or crash
+    during that stream leaves the ``.transient.*.jpg`` behind: working-copy
+    eviction only scans ``working/`` and cannot see it, so repeated
+    interrupted requests can accumulate arbitrary bytes outside the quota
+    with no other cleanup path.
+    """
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    originals_dir = os.path.join(vireo_dir, "originals")
+    if not os.path.isdir(originals_dir):
+        return
+    try:
+        with os.scandir(originals_dir) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_file():
+                        continue
+                except OSError:
+                    continue
+                name = entry.name
+                if not (
+                    name.startswith(".")
+                    and ".transient." in name
+                    and name.endswith(".jpg")
+                ):
+                    continue
+                try:
+                    os.remove(entry.path)
+                except OSError as exc:
+                    log.warning(
+                        "Could not remove abandoned transient rendition %s: %s",
+                        entry.path, exc,
+                    )
+    except OSError as exc:
+        log.warning(
+            "Could not scan originals directory for transient renditions %s: %s",
+            originals_dir, exc,
+        )
+
+
 def _collection_accepts_manual_photos(rules):
     """Return True when collection rules are static photo-id membership only."""
     if isinstance(rules, list):
@@ -4133,6 +4178,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     _migrate_edit_math_render_caches(app)
     _migrate_unedited_raw_preview_sources(app)
     _enforce_preview_cache_quota_at_startup(app)
+    _sweep_abandoned_transient_originals(app)
     _enforce_working_copy_cache_quota_at_startup(app)
 
     # Request timing middleware — logs slow requests and user actions
@@ -21068,6 +21114,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "inat-uploads",
                     "inat-exports",
                     "edit-masks",
+                    # ``staging_recovery`` treats <vireo_dir>/staging as
+                    # Vireo-managed storage that may hold the only remaining
+                    # copies of photos from failed or cancelled imports. Omit
+                    # and the Storage page under a custom ``--thumb-dir``
+                    # layout can hide a very large staging tree.
+                    "staging",
                 )
             ]
             auxiliary_paths.extend([

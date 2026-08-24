@@ -25,6 +25,23 @@ _UNTRACKED_WRITE_GRACE_SECONDS = 60
 _eviction_lock = threading.Lock()
 
 
+def _is_private_render_tempfile(name):
+    """Return True for the on-demand extractor's private tempfiles.
+
+    ``vireo/app.py`` writes each on-demand working copy into a private
+    ``.<photo_id>.render.*.jpg.tmp`` file before atomically publishing it to
+    the canonical path. A process kill during that window leaves the tempfile
+    behind; counting it toward quota usage — while eviction is unable to
+    remove it because it never matches a catalog row — lets an orphan
+    permanently consume the working-copy budget.
+    """
+    return (
+        name.startswith(".")
+        and ".render." in name
+        and name.endswith(".jpg.tmp")
+    )
+
+
 def working_copy_quota_bytes(quota_mb=None):
     """Return the configured working-copy budget in bytes."""
     if quota_mb is None:
@@ -41,7 +58,12 @@ def working_copy_quota_bytes(quota_mb=None):
 
 
 def working_copy_stats(vireo_dir, quota_mb=None):
-    """Return direct-file count/bytes and the configured quota."""
+    """Return direct-file count/bytes and the configured quota.
+
+    Skips the private ``.<id>.render.*.jpg.tmp`` files the on-demand
+    extractor uses as a staging area — those are not user-visible cache
+    entries and eviction cannot reclaim them.
+    """
     working_dir = os.path.join(vireo_dir, "working")
     count = 0
     total = 0
@@ -51,6 +73,8 @@ def working_copy_stats(vireo_dir, quota_mb=None):
                 for entry in entries:
                     try:
                         if not entry.is_file():
+                            continue
+                        if _is_private_render_tempfile(entry.name):
                             continue
                         total += entry.stat().st_size
                         count += 1
@@ -101,6 +125,13 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None):
                 for entry in directory_entries:
                     try:
                         if not entry.is_file():
+                            continue
+                        if _is_private_render_tempfile(entry.name):
+                            # A leftover on-demand extractor tempfile that
+                            # eviction cannot reclaim (no catalog row keys off
+                            # this name). Counting it toward ``total`` would
+                            # force eviction to churn real working copies to
+                            # stay under quota while the orphan lingered.
                             continue
                         st = entry.stat()
                     except OSError as exc:
@@ -171,11 +202,21 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None):
             except OSError as exc:
                 log.warning("Failed to remove working-copy file %s: %s", path, exc)
                 continue
-            evicted.append((photo_id, expected_rel))
+            evicted.append((photo_id, expected_rel, path))
             total -= size
             freed_bytes += size
 
-        for photo_id, expected_rel in evicted:
+        for photo_id, expected_rel, path in evicted:
+            # Between the ``os.remove`` above and this UPDATE, an on-demand
+            # ``/photos/<id>/original`` request can regenerate the same
+            # ``working/<id>.jpg`` and commit ``working_copy_path`` to the
+            # same relative path. Clearing the row now would mark that
+            # freshly written replacement as evicted while its bytes remain
+            # on disk — the file becomes untracked and eviction skips it
+            # forever after the writer-grace window closes. Only clear the
+            # row if the file is still missing.
+            if os.path.exists(path):
+                continue
             db.conn.execute(
                 "UPDATE photos SET working_copy_path=NULL, "
                 "working_copy_evicted_mtime=COALESCE(file_mtime, -1) "

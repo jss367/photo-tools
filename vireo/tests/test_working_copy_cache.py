@@ -129,6 +129,90 @@ def test_working_copy_stats_include_all_direct_files(tmp_path):
     }
 
 
+def test_working_copy_stats_skip_private_render_tempfiles(tmp_path):
+    """A killed on-demand extractor leaves ``.render.*.jpg.tmp`` behind.
+
+    Eviction has no catalog row to key off those names, so counting them
+    toward quota usage would permanently inflate reported/enforced totals.
+    """
+    from working_copy_cache import working_copy_stats
+
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    (working_dir / "1.jpg").write_bytes(b"real")
+    (working_dir / ".1.render.abcdef.jpg.tmp").write_bytes(b"orphaned tempfile")
+
+    assert working_copy_stats(str(tmp_path), quota_mb=1) == {
+        "count": 1,
+        "size": 4,
+        "path": str(working_dir),
+        "quota_bytes": 1 * 1024 * 1024,
+    }
+
+
+def test_evict_ignores_private_render_tempfiles(tmp_path):
+    from working_copy_cache import evict_if_over_quota
+
+    db, working_dir, photo_ids = _seed_working_copies(tmp_path, [500_000])
+    # Simulate a leftover on-demand extractor tempfile. If quota accounting
+    # counted this toward ``total``, the eviction pass would delete the
+    # legitimate working copy while the orphan lingered.
+    orphan = working_dir / f".{photo_ids[0]}.render.deadbeef.jpg.tmp"
+    orphan.write_bytes(b"x" * 900_000)
+    try:
+        result = evict_if_over_quota(db, str(tmp_path), quota_mb=1)
+
+        assert result["evicted"] == 0
+        assert (working_dir / f"{photo_ids[0]}.jpg").exists()
+        # The orphan itself is left in place — eviction only touches files
+        # backed by catalog rows — but it does not force real working copies
+        # to be discarded to stay under quota.
+        assert orphan.exists()
+    finally:
+        db.close()
+
+
+def test_evict_does_not_clear_concurrently_replaced_working_copy(
+    tmp_path, monkeypatch,
+):
+    """A concurrent on-demand write must not be marked evicted.
+
+    A peer request can regenerate ``working/<id>.jpg`` and commit the same
+    ``working_copy_path`` between our ``os.remove`` and our subsequent
+    DB UPDATE. Clearing the row then would leave untracked bytes on disk.
+    """
+    import working_copy_cache
+
+    db, working_dir, photo_ids = _seed_working_copies(tmp_path, [700_000])
+    victim_id = photo_ids[0]
+    victim_path = working_dir / f"{victim_id}.jpg"
+    real_remove = working_copy_cache.os.remove
+
+    def remove_then_repopulate(path):
+        real_remove(path)
+        if path == str(victim_path):
+            # Simulate an on-demand extractor writing a fresh copy after
+            # our unlink but before our UPDATE.
+            victim_path.write_bytes(b"y" * 500_000)
+
+    monkeypatch.setattr(working_copy_cache.os, "remove", remove_then_repopulate)
+    try:
+        result = working_copy_cache.evict_if_over_quota(
+            db, str(tmp_path), quota_mb=0,
+        )
+
+        assert result["evicted"] == 1
+        assert victim_path.exists()
+        row = db.conn.execute(
+            "SELECT working_copy_path FROM photos WHERE id=?", (victim_id,),
+        ).fetchone()
+        # The row still points at the freshly written replacement, so the
+        # bytes are tracked and future eviction can find and remove them.
+        assert row["working_copy_path"] == f"working/{victim_id}.jpg"
+    finally:
+        db.close()
+
+
 def test_evicts_legacy_canonical_file_without_catalog_path(tmp_path):
     from working_copy_cache import evict_if_over_quota
 

@@ -11032,6 +11032,54 @@ def test_api_photos_query_basic(app_and_db):
     assert "species" in data["photos"][0]
 
 
+def test_api_photos_query_offline_members_are_opt_in_and_read_only(app_and_db):
+    """Browse can reveal offline collection members without selecting them."""
+    app, db = app_and_db
+    client = app.test_client()
+    available_before = db.count_photos()
+    offline_folder = db.add_folder("/temporarily-offline", name="offline")
+    offline_id = db.add_photo(
+        folder_id=offline_folder,
+        filename="offline.jpg",
+        extension=".jpg",
+        file_size=100,
+        file_mtime=1.0,
+    )
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?",
+        (offline_folder,),
+    )
+    db.conn.commit()
+
+    hidden = client.post('/api/photos/query', json={
+        "rules": [{"field": "all"}],
+        "include_availability": True,
+    }).get_json()
+    assert hidden["available_total"] == available_before
+    assert hidden["inventory_total"] == available_before + 1
+    assert hidden["offline_total"] == 1
+    assert offline_id not in {p["id"] for p in hidden["photos"]}
+
+    shown = client.post('/api/photos/query', json={
+        "rules": [{"field": "all"}],
+        "include_availability": True,
+        "include_offline": True,
+    }).get_json()
+    offline_photo = next(p for p in shown["photos"] if p["id"] == offline_id)
+    assert offline_photo["folder_status"] == "missing"
+    assert shown["total"] == shown["inventory_total"] == available_before + 1
+
+    # IDs-only is the source of truth for Select all / bulk actions. The
+    # display flag must never widen it to inaccessible photos.
+    selection = client.post('/api/photos/query', json={
+        "rules": [{"field": "all"}],
+        "ids_only": True,
+        "include_offline": True,
+    }).get_json()
+    assert offline_id not in selection["ids"]
+    assert selection["total"] == available_before
+
+
 def test_api_photos_query_group_tree_and_paging(app_and_db):
     app, _ = app_and_db
     client = app.test_client()
@@ -11079,6 +11127,12 @@ def test_api_photos_query_validation(app_and_db, monkeypatch):
     }).status_code == 400
     assert client.post('/api/photos/query', json={
         "rules": [], "sort": {"col": "date"},
+    }).status_code == 400
+    assert client.post('/api/photos/query', json={
+        "rules": [], "include_offline": 1,
+    }).status_code == 400
+    assert client.post('/api/photos/query', json={
+        "rules": [], "include_availability": "yes",
     }).status_code == 400
     # A group whose ``rules`` key is ``null`` (or any non-list) must land as
     # a 400 from ``_validate_node``. Before the guard, the active-model
@@ -11498,6 +11552,42 @@ def test_api_photos_query_visual_ranks_by_similarity(app_and_db, monkeypatch):
     })
     data = resp.get_json()
     assert data["ids"] == [photos["bird1.jpg"], photos["bird2.jpg"]]
+
+
+def test_api_photos_query_visual_reports_offline_members(app_and_db, monkeypatch):
+    """Resolved visual collections use the same inventory/availability split."""
+    app, db = app_and_db
+    photos = _seed_embeddings(db)
+    _stub_clip(monkeypatch)
+    offline_id = photos["bird2.jpg"]
+    offline_folder = db.get_photo(offline_id)["folder_id"]
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?",
+        (offline_folder,),
+    )
+    db.conn.commit()
+    client = app.test_client()
+
+    hidden = client.post('/api/photos/query', json={
+        "rules": [],
+        "visual": {"prompt": "a bird", "strength": "balanced"},
+        "include_availability": True,
+    }).get_json()
+    assert hidden["inventory_total"] == 2
+    assert hidden["available_total"] == 1
+    assert hidden["offline_total"] == 1
+    assert [p["filename"] for p in hidden["photos"]] == ["bird1.jpg"]
+
+    shown = client.post('/api/photos/query', json={
+        "rules": [],
+        "visual": {"prompt": "a bird", "strength": "balanced"},
+        "include_availability": True,
+        "include_offline": True,
+    }).get_json()
+    assert [p["filename"] for p in shown["photos"]] == [
+        "bird1.jpg", "bird2.jpg",
+    ]
+    assert shown["photos"][1]["folder_status"] == "missing"
 
 
 def test_api_photos_query_visual_error_states(app_and_db, monkeypatch):

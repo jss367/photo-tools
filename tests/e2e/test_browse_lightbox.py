@@ -124,6 +124,57 @@ def test_browse_lightbox_autoloads_next_page_at_navigation_boundary(
     assert page.evaluate("window._lightboxCurrentId === photos[2].id") is True
 
 
+def test_browse_lightbox_offline_filter_keeps_live_pagination_list(
+    live_server, page,
+):
+    """The available-only lightbox list retains identity as pages load."""
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.wait_for(state="visible")
+
+    result = page.evaluate(
+        """() => {
+          const originalPhotos = photos;
+          const originalShowOffline = showOfflineCollectionPhotos;
+          const originalList = window._lightboxPhotoList;
+          const originalCurrentId = window._lightboxCurrentId;
+          try {
+            photos = [
+              {id: 101, folder_status: 'ok'},
+              {id: 102, folder_status: 'missing'}
+            ];
+            showOfflineCollectionPhotos = false;
+            const defaultListIsLive = availableBrowsePhotos() === photos;
+
+            showOfflineCollectionPhotos = true;
+            const filteredList = availableBrowsePhotos();
+            window._lightboxPhotoList = filteredList;
+            window._lightboxCurrentId = 101;
+            photos.push({id: 103, folder_status: 'ok'});
+            syncBrowseAvailableLightboxPhotos();
+
+            return {
+              defaultListIsLive,
+              filteredListKeepsIdentity: window._lightboxPhotoList === filteredList,
+              filteredIds: filteredList.map(photo => photo.id),
+              ownsLoadedWindow: browseLightboxOwnsLoadedWindow()
+            };
+          } finally {
+            photos = originalPhotos;
+            showOfflineCollectionPhotos = originalShowOffline;
+            window._lightboxPhotoList = originalList;
+            window._lightboxCurrentId = originalCurrentId;
+          }
+        }"""
+    )
+
+    assert result == {
+        "defaultListIsLive": True,
+        "filteredListKeepsIdentity": True,
+        "filteredIds": [101, 103],
+        "ownsLoadedWindow": True,
+    }
+
+
 def test_browse_lightbox_single_photo_window_waits_for_previous_page(
     live_server, page,
 ):

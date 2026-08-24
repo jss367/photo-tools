@@ -214,6 +214,10 @@ body.sidebar-resizing {
   text-transform: uppercase;
   letter-spacing: 0.03em;
 }
+.tree-item .collection-offline-count {
+  color: var(--warning);
+  font-size: 10px;
+}
 .tree-indent { width: 16px; flex-shrink: 0; }
 .tree-toggle {
   width: 16px;
@@ -334,6 +338,48 @@ body.sidebar-resizing {
 }
 .grid-card:hover { transform: translateY(-1px); border-color: var(--accent); }
 .grid-card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.grid-card.offline {
+  cursor: default;
+  opacity: 0.78;
+}
+.grid-card.offline:hover {
+  transform: none;
+  border-color: var(--border-primary);
+}
+.offline-photo-placeholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  background: var(--bg-tertiary);
+  color: var(--text-faint);
+  font-size: 11px;
+  text-align: center;
+}
+.offline-photo-placeholder .offline-icon { font-size: 24px; }
+.offline-collection-notice {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 20px;
+  border-bottom: 1px solid var(--border-primary);
+  background: var(--warning-bg, #fef3c7);
+  color: var(--warning-fg, #92400e);
+  font-size: 12px;
+}
+.offline-collection-notice button {
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 3px 8px;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
 .grid-card-img-wrap {
   position: relative;
   width: 100%;
@@ -1760,6 +1806,12 @@ body.sidebar-resizing {
       </div>
     </div>
 
+    <div class="offline-collection-notice" id="offlineCollectionNotice">
+      <span id="offlineCollectionText"></span>
+      <button type="button" id="offlineCollectionToggle"
+              onclick="toggleOfflineCollectionPhotos()"></button>
+    </div>
+
     <!-- Calendar Heatmap (Timeline Mode) -->
     <div class="calendar-container" id="calendarContainer">
       <div class="calendar-header">
@@ -1988,7 +2040,7 @@ body.sidebar-resizing {
     <!-- Photo Detail (shown when a photo is selected) -->
     <div class="detail-content" id="detailContent">
       <button class="detail-close" onclick="closeDetail()">&times;</button>
-      <img class="detail-preview single-only" id="detailImg" src="" alt="" style="cursor:pointer;" onclick="openLightbox(window._detailPhotoId, document.getElementById('detailFilename').textContent, photos)">
+      <img class="detail-preview single-only" id="detailImg" src="" alt="" style="cursor:pointer;" onclick="openLightbox(window._detailPhotoId, document.getElementById('detailFilename').textContent, availableBrowsePhotos())">
       <div class="detail-filename single-only" id="detailFilename"></div>
       <button class="detail-source-control single-only" id="detailSourceControl" type="button" onclick="event.stopPropagation(); vireoTogglePairSource(window._detailPhotoId);"></button>
 
@@ -2342,6 +2394,13 @@ var dashboardCollectionScope = false;
 // the expression (so a user-edited chip set isn't silently reverted to
 // the saved collection on the next membership refresh).
 var openedCollectionId = null;
+// A saved collection's logical membership includes photos whose storage is
+// offline. They stay hidden by default and, when revealed, render as read-only
+// cards; selection endpoints remain accessible-only.
+var showOfflineCollectionPhotos = false;
+var collectionInventoryTotal = 0;
+var collectionAvailableTotal = 0;
+var collectionOfflineTotal = 0;
 // Sidebar collections render before the universal filter registry necessarily
 // finishes loading. Keep the init promise so an early collection click can
 // wait for the filter bar instead of being silently discarded.
@@ -2818,6 +2877,7 @@ function hasActiveBrowseFilter() {
     activeFolderId ||
     activeKeyword ||
     activeCollectionId ||
+    openedCollectionId ||
     (window.VireoFilter && VireoFilter.hasFilters())
   );
 }
@@ -2956,6 +3016,21 @@ function renderCardInfo(p) {
 
 function renderPhotoCard(p, idx) {
   var selectedClass = (p.id === selectedPhotoId || selectedPhotos.has(p.id)) ? ' selected' : '';
+  var isOffline = p.folder_status &&
+    p.folder_status !== 'ok' && p.folder_status !== 'partial';
+  if (isOffline) {
+    return '<div class="grid-card offline" data-id="' + p.id +
+      '" data-idx="' + idx + '" data-filename="' + escapeAttr(p.filename) +
+      '" aria-disabled="true" title="This photo\'s folder is offline. Reconnect or relocate the folder to edit it.">' +
+      '<div class="grid-card-img-wrap">' +
+        '<div class="offline-photo-placeholder">' +
+          '<span class="offline-icon">\u26d3</span>' +
+          '<span>Folder offline</span>' +
+        '</div>' +
+      '</div>' +
+      '<div class="grid-card-info">' + renderCardInfo(p) + '</div>' +
+    '</div>';
+  }
   var isRawJpegPair = typeof window.vireoPhotoIsRawJpegPair === 'function'
     ? window.vireoPhotoIsRawJpegPair(p)
     : false;
@@ -3087,7 +3162,9 @@ function prependGridPhotos(newPhotos) {
     var idx = parseInt(card.dataset.idx, 10) + newPhotos.length;
     var id = parseInt(card.dataset.id, 10);
     card.dataset.idx = idx;
-    card.setAttribute('onclick', 'selectPhoto(event,' + id + ',' + idx + ')');
+    if (!card.classList.contains('offline')) {
+      card.setAttribute('onclick', 'selectPhoto(event,' + id + ',' + idx + ')');
+    }
   });
   grid.insertAdjacentHTML('afterbegin', html);
   if (selectedIndex >= 0) selectedIndex += newPhotos.length;
@@ -3453,6 +3530,7 @@ async function bootstrapBrowse() {
             info.reason !== 'expressionLoaded' &&
             info.reason !== 'expressionRefreshed') {
           openedCollectionId = null;
+          clearOfflineCollectionState();
         }
         // A cleared quick search is the one filter edit where the previously
         // selected photo is expected to reappear in the wider result set \u2014
@@ -3590,7 +3668,16 @@ async function bootstrapBrowse() {
         filterByCollection(activeCollectionId);
         return;
       }
-      if (VireoFilter.hasFilters()) {
+      // A dashboard-scoped collection deep link (?dashboard_scope=1&collection_id=...)
+      // paints from /api/browse/init and then falls through both branches above
+      // when no explicit filter chips came from the URL. /api/browse/init does
+      // not return availability totals, so ``updateOfflineCollectionState`` never
+      // runs and the offline-photos notice stays hidden — users cannot reveal
+      // the offline members until another action reloads the grid. Force a
+      // scoped /api/photos/query here so ``loadPhotos`` populates the
+      // availability state from the response (Codex review r3839992513).
+      if (VireoFilter.hasFilters() ||
+          (activeCollectionId && dashboardCollectionScope && !scopeChanged)) {
         resetAndLoad();
         loadSummary();
       }
@@ -3629,6 +3716,19 @@ async function bootstrapBrowse() {
   }
 }
 
+function collectionCountMarkup(collection) {
+  if (collection.photo_count == null) return '';
+  var total = Number(collection.photo_count);
+  var offline = Number(collection.offline_photo_count || 0);
+  var html = total.toLocaleString();
+  if (offline > 0) {
+    html += ' <span class="collection-offline-count" title="' +
+      offline.toLocaleString() + ' photo' + (offline === 1 ? '' : 's') +
+      ' currently offline">\u00b7 ' + offline.toLocaleString() + ' offline</span>';
+  }
+  return html;
+}
+
 function renderCollectionList(collections) {
   collectionsById = {};
   var html = '';
@@ -3653,7 +3753,7 @@ function renderCollectionList(collections) {
       : '';
     var trailing = unavailable
       ? '<span class="collection-unavailable-badge">unavailable</span>'
-      : '<span class="count">' + (c.photo_count != null ? c.photo_count : '') + '</span>';
+      : '<span class="count">' + collectionCountMarkup(c) + '</span>';
     var visualMark = c.visual_json
       ? '<span class="collection-visual-mark" title="Includes a visual search clause">\u2726</span>'
       : '';
@@ -4109,6 +4209,7 @@ function filterByFolder(folderId) {
   // browse init, but filterByFolder's reloadBrowseResults() path
   // bypasses VireoFilter, so clear it explicitly here.
   openedCollectionId = null;
+  clearOfflineCollectionState();
   document.querySelectorAll('#folderTree .tree-item').forEach(function(el) {
     el.classList.toggle('active', parseInt(el.dataset.folderId) === activeFolderId);
   });
@@ -4243,6 +4344,7 @@ async function filterByKeyword(name) {
   }
   activeFolderId = null;
   activeCollectionId = null;
+  clearOfflineCollectionState();
   // The rule toggles: adding an identical keyword rule removes it. The
   // filter bar's onChange handles the reload.
   VireoFilter.addRule('keyword', 'is', name);
@@ -4335,7 +4437,7 @@ async function loadCollectionCounts() {
             trailing.textContent = 'unavailable';
           } else {
             trailing.className = 'count';
-            trailing.textContent = meta.photo_count != null ? meta.photo_count : '';
+            trailing.innerHTML = collectionCountMarkup(meta);
           }
         }
         if (isUnavailable) {
@@ -4348,7 +4450,9 @@ async function loadCollectionCounts() {
         }
       } else if (!isUnavailable) {
         var span = el.querySelector('.count');
-        if (span && meta.photo_count != null) span.textContent = meta.photo_count;
+        if (span && meta.photo_count != null) {
+          span.innerHTML = collectionCountMarkup(meta);
+        }
       }
     });
   } catch(e) {}
@@ -4360,6 +4464,76 @@ function scheduleCollectionCountsRefresh() {
     collectionCountRefreshTimer = null;
     loadCollectionCounts();
   }, 150);
+}
+
+function hasCollectionAvailabilityScope() {
+  return openedCollectionId != null || activeCollectionId != null;
+}
+
+function renderOfflineCollectionNotice() {
+  var notice = document.getElementById('offlineCollectionNotice');
+  if (!notice) return;
+  if (!hasCollectionAvailabilityScope() || collectionOfflineTotal <= 0) {
+    notice.style.display = 'none';
+    return;
+  }
+  var text = document.getElementById('offlineCollectionText');
+  var toggle = document.getElementById('offlineCollectionToggle');
+  var available = collectionAvailableTotal.toLocaleString();
+  var inventory = collectionInventoryTotal.toLocaleString();
+  var offline = collectionOfflineTotal.toLocaleString();
+  text.textContent = available + ' of ' + inventory + ' photos available \u00b7 ' +
+    offline + ' offline' +
+    (showOfflineCollectionPhotos
+      ? ' (shown read-only)'
+      : ' (hidden)');
+  toggle.textContent = showOfflineCollectionPhotos
+    ? 'Hide offline photos'
+    : 'Show offline photos';
+  notice.style.display = 'flex';
+}
+
+function clearOfflineCollectionState() {
+  showOfflineCollectionPhotos = false;
+  collectionInventoryTotal = 0;
+  collectionAvailableTotal = 0;
+  collectionOfflineTotal = 0;
+  renderOfflineCollectionNotice();
+}
+
+function updateOfflineCollectionState(data) {
+  if (!hasCollectionAvailabilityScope()) {
+    clearOfflineCollectionState();
+    return;
+  }
+  collectionInventoryTotal = Number(data.inventory_total || data.total || 0);
+  collectionAvailableTotal = Number(data.available_total || data.total || 0);
+  collectionOfflineTotal = Number(data.offline_total || 0);
+  // Visual collections intentionally skip sidebar counts until their prompt
+  // is resolved. Once opened, promote the resolved membership into the same
+  // total/offline presentation as metadata collections.
+  var collectionId = openedCollectionId != null
+    ? openedCollectionId
+    : activeCollectionId;
+  var meta = collectionsById[collectionId];
+  if (meta && data.inventory_total != null) {
+    meta.photo_count = collectionInventoryTotal;
+    meta.available_photo_count = collectionAvailableTotal;
+    meta.offline_photo_count = collectionOfflineTotal;
+    var row = document.querySelector(
+      '#collectionList .tree-item[data-collection-id="' + collectionId + '"] .count'
+    );
+    if (row) row.innerHTML = collectionCountMarkup(meta);
+  }
+  if (collectionOfflineTotal <= 0) showOfflineCollectionPhotos = false;
+  renderOfflineCollectionNotice();
+}
+
+function toggleOfflineCollectionPhotos() {
+  if (!hasCollectionAvailabilityScope() || collectionOfflineTotal <= 0) return;
+  showOfflineCollectionPhotos = !showOfflineCollectionPhotos;
+  renderOfflineCollectionNotice();
+  resetAndLoad({ preserveCollection: true });
 }
 
 function refreshActiveCollectionAfterMembershipChange() {
@@ -4700,6 +4874,7 @@ async function filterByCollection(id, options) {
   activeKeyword = null;
   activeCollectionId = null;
   dashboardCollectionScope = false;
+  clearOfflineCollectionState();
   // Track which collection is currently loaded so post-membership refresh
   // can pull fresh rules/photo_ids without waiting for a user reopen.
   openedCollectionId = id;
@@ -5377,8 +5552,20 @@ async function resetAndLoad(options) {
       return true;
     }
 
+    // The anchor may have been rendered as an offline placeholder — e.g. a
+    // folder-health refresh with ``showOfflineCollectionPhotos`` on keeps the
+    // just-went-missing photo in the reloaded dataset with ``folder_status``
+    // set to a non-``ok``/``partial`` value. Restoring the selection there
+    // would let updateBatchBar() expose Develop/Export/Delete against a
+    // supposedly read-only photo (Codex review r3839992514).
+    var anchorIndex = photos.findIndex(function(p) { return p.id === anchor.photoId; });
+    if (anchorIndex < 0 || !browsePhotoIsAvailable(photos[anchorIndex])) {
+      clearActiveSelectionAndDetail();
+      return true;
+    }
+
     selectedPhotoId = anchor.photoId;
-    selectedIndex = photos.findIndex(function(p) { return p.id === anchor.photoId; });
+    selectedIndex = anchorIndex;
     refreshCardSelectionVisuals();
     updateBatchBar();
     if (anchor.detailVisible) loadDetail(anchor.photoId);
@@ -5475,6 +5662,10 @@ function buildBrowsePageRequest(page, requestPerPage) {
     page: page,
     per_page: requestPerPage,
   };
+  if (hasCollectionAvailabilityScope()) {
+    body.include_availability = true;
+    if (showOfflineCollectionPhotos) body.include_offline = true;
+  }
   var visual = window.VireoFilter && VireoFilter.getVisual ? VireoFilter.getVisual() : null;
   if (visual) body.visual = visual;
   if (activeFolderId) body.folder_id = activeFolderId;
@@ -5538,6 +5729,7 @@ async function prependPreviousPhotos(options) {
     // object while it is open, so mutating it lets Previous navigation see
     // the newly prepended page without closing and reopening the viewer.
     Array.prototype.unshift.apply(photos, preceding);
+    syncBrowseAvailableLightboxPhotos();
     earliestPage = requestedPage;
     prependGridPhotos(preceding);
     updatePreviousPhotosButton();
@@ -5619,6 +5811,7 @@ async function loadPhotos(options) {
     var data = await safeFetch(request.url, request.options);
     if (!windowIsCurrent()) return null;  // grid was reset mid-flight; drop stale response
     totalPhotos = data.total;
+    updateOfflineCollectionState(data);
     if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalPhotos);
     if (window.VireoFilter && VireoFilter.setVisualInfo) {
       VireoFilter.setVisualInfo(data.visual || null);
@@ -5634,6 +5827,7 @@ async function loadPhotos(options) {
       // Keep the array identity stable. The shared lightbox navigates the
       // same object and can therefore continue into this newly loaded page.
       Array.prototype.push.apply(photos, data.photos);
+      syncBrowseAvailableLightboxPhotos();
       currentPage += chunk;
       // A deep-link window starts partway in, so it is exhausted when it
       // reaches the end of the dataset — not when it holds ``totalPhotos``
@@ -6091,11 +6285,40 @@ function renderGrid() {
 /* ---------- Grid dblclick delegation (XSS-safe) ---------- */
 document.getElementById('grid').addEventListener('dblclick', function(e) {
   var card = e.target.closest('.grid-card');
-  if (!card) return;
+  if (!card || card.classList.contains('offline')) return;
   var id = parseInt(card.dataset.id, 10);
   var filename = card.dataset.filename || '';
-  openLightbox(id, filename, photos);
+  openLightbox(id, filename, availableBrowsePhotos());
 });
+
+var browseAvailableLightboxPhotos = [];
+
+function browsePhotoIsAvailable(photo) {
+  return !photo.folder_status ||
+    photo.folder_status === 'ok' || photo.folder_status === 'partial';
+}
+
+function replaceBrowseAvailableLightboxPhotos(available) {
+  browseAvailableLightboxPhotos.length = 0;
+  available.forEach(function(photo) {
+    browseAvailableLightboxPhotos.push(photo);
+  });
+}
+
+function syncBrowseAvailableLightboxPhotos() {
+  if (window._lightboxPhotoList !== browseAvailableLightboxPhotos) return;
+  replaceBrowseAvailableLightboxPhotos(photos.filter(browsePhotoIsAvailable));
+}
+
+function availableBrowsePhotos() {
+  // Default Browse results already exclude offline folders. Preserve the
+  // shared array identity so lightbox boundary prefetch sees later pages as
+  // loadPhotos mutates ``photos``. The opt-in offline view needs a filtered
+  // list; keep that list stable and synchronize it after every append/prepend.
+  if (!showOfflineCollectionPhotos) return photos;
+  replaceBrowseAvailableLightboxPhotos(photos.filter(browsePhotoIsAvailable));
+  return browseAvailableLightboxPhotos;
+}
 
 function getBrowseShortcutPhoto() {
   var idx = -1;
@@ -6109,7 +6332,10 @@ function getBrowseShortcutPhoto() {
     idx = selectedIndex;
   }
   if (idx < 0 && photos.length > 0) {
-    idx = 0;
+    idx = photos.findIndex(function(photo) {
+      return !photo.folder_status ||
+        photo.folder_status === 'ok' || photo.folder_status === 'partial';
+    });
   }
   if (idx < 0 || !photos[idx]) return null;
   return { photo: photos[idx], index: idx };
@@ -6118,7 +6344,7 @@ function getBrowseShortcutPhoto() {
 function openBrowseShortcutPhoto(fullscreen) {
   var item = getBrowseShortcutPhoto();
   if (!item) return false;
-  openLightbox(item.photo.id, item.photo.filename || '', photos);
+  openLightbox(item.photo.id, item.photo.filename || '', availableBrowsePhotos());
   if (fullscreen && typeof requestLightboxFullscreen === 'function') {
     requestLightboxFullscreen();
   }
@@ -6136,18 +6362,19 @@ function browseKeyMatchesConfiguredShortcut(e) {
 }
 
 /* Keep Browse's lightbox navigation moving across lazy-loaded page edges.
-   The grid and lightbox share the same ``photos`` array while Browse owns the
-   viewer. ``loadPhotos``/``prependPreviousPhotos`` mutate that array in place,
-   so a prefetched page becomes available to the shared lightbox immediately.
-   If the user reaches an edge before the request finishes, retry at the same
-   boundary and advance as soon as the page is available. */
+   The normal grid and lightbox share ``photos``; the opt-in offline grid uses
+   a stable available-only list. ``loadPhotos``/``prependPreviousPhotos`` keep
+   the active list synchronized, so prefetched pages reach the lightbox without
+   reopening it. If the user reaches an edge before the request finishes, retry
+   at the same boundary and advance as soon as the page is available. */
 var browseLightboxBoundaryRetry = null;
 var browseLightboxSession = 0;
 
 function browseLightboxOwnsLoadedWindow() {
   return (
     typeof window._lightboxPhotoList !== 'undefined' &&
-    window._lightboxPhotoList === photos &&
+    (window._lightboxPhotoList === photos ||
+     window._lightboxPhotoList === browseAvailableLightboxPhotos) &&
     typeof window._lightboxCurrentId !== 'undefined' &&
     window._lightboxCurrentId != null
   );
@@ -6158,11 +6385,14 @@ function refreshBrowseLightboxCounter() {
   var visibleId = window._lightboxCommittedId != null
     ? window._lightboxCommittedId
     : window._lightboxCurrentId;
-  var index = photos.findIndex(function(photo) { return photo.id === visibleId; });
+  var lightboxPhotos = window._lightboxPhotoList;
+  var index = lightboxPhotos.findIndex(function(photo) {
+    return photo.id === visibleId;
+  });
   var counter = document.getElementById('lightboxCounter');
-  if (index < 0 || !counter || photos.length < 2) return;
-  var filename = photos[index].filename || '';
-  counter.textContent = (index + 1) + ' / ' + photos.length
+  if (index < 0 || !counter || lightboxPhotos.length < 2) return;
+  var filename = lightboxPhotos[index].filename || '';
+  counter.textContent = (index + 1) + ' / ' + lightboxPhotos.length
     + (filename ? ' \u00b7 ' + filename : '');
   counter.title = filename;
   counter.style.display = '';
@@ -6171,11 +6401,14 @@ function refreshBrowseLightboxCounter() {
 function continueBrowseLightboxAcrossBoundary(delta, currentId, session) {
   if (session !== browseLightboxSession) return;
   if (!browseLightboxOwnsLoadedWindow() || window._lightboxCurrentId !== currentId) return;
-  var index = photos.findIndex(function(photo) { return photo.id === currentId; });
+  var lightboxPhotos = window._lightboxPhotoList;
+  var index = lightboxPhotos.findIndex(function(photo) {
+    return photo.id === currentId;
+  });
   if (index < 0) return;
 
   var nextIndex = index + delta;
-  if (nextIndex >= 0 && nextIndex < photos.length) {
+  if (nextIndex >= 0 && nextIndex < lightboxPhotos.length) {
     lightboxNav(delta);
     return;
   }
@@ -6204,9 +6437,12 @@ function continueBrowseLightboxAcrossBoundary(delta, currentId, session) {
 document.addEventListener('lightbox:photochanged', function(event) {
   if (!browseLightboxOwnsLoadedWindow() || loading) return;
   var photoId = event && event.detail && event.detail.photoId;
-  var index = photos.findIndex(function(photo) { return photo.id === photoId; });
+  var lightboxPhotos = window._lightboxPhotoList;
+  var index = lightboxPhotos.findIndex(function(photo) {
+    return photo.id === photoId;
+  });
   if (index < 0) return;
-  if (!allLoaded && index >= photos.length - 3) loadPhotos({ silent: true });
+  if (!allLoaded && index >= lightboxPhotos.length - 3) loadPhotos({ silent: true });
   if (earliestPage > 1 && index <= 2) prependPreviousPhotos({ silent: true });
 });
 
@@ -6326,7 +6562,10 @@ function selectPhoto(e, id, idx) {
     var start = Math.min(selectedIndex, idx);
     var end = Math.max(selectedIndex, idx);
     for (var i = start; i <= end; i++) {
-      if (photos[i]) selectedPhotos.add(photos[i].id);
+      if (photos[i] && (!photos[i].folder_status ||
+          photos[i].folder_status === 'ok' || photos[i].folder_status === 'partial')) {
+        selectedPhotos.add(photos[i].id);
+      }
     }
   } else if (e.metaKey || e.ctrlKey) {
     // Cmd/Ctrl-click: toggle in selection. Fold the focused photo into the
@@ -10598,13 +10837,21 @@ function getBrowseGridColumnCount() {
 
 async function moveBrowseSelection(delta, e) {
   var nextIndex = selectedIndex < 0 && delta > 0 ? 0 : selectedIndex + delta;
-  while (delta > 0 && nextIndex >= photos.length && !allLoaded) {
+  while (true) {
+    while (nextIndex >= 0 && nextIndex < photos.length && photos[nextIndex] &&
+           !browsePhotoIsAvailable(photos[nextIndex])) {
+      nextIndex += delta > 0 ? 1 : -1;
+    }
+    if (nextIndex >= 0 && nextIndex < photos.length && photos[nextIndex]) break;
+    if (delta <= 0 || nextIndex < 0 || allLoaded) return;
+
+    // Skipping trailing offline cards can move us beyond the loaded window.
+    // Fetch the next page and resume the skip until an available row appears
+    // or the dataset is exhausted.
     var beforeLength = photos.length;
     await loadPhotos();
-    if (photos.length === beforeLength) break;
-    nextIndex = selectedIndex < 0 ? 0 : selectedIndex + delta;
+    if (photos.length === beforeLength) return;
   }
-  if (nextIndex < 0 || nextIndex >= photos.length || !photos[nextIndex]) return;
   var selectionEvent = {
     shiftKey: !!(e && e.shiftKey),
     metaKey: !!(e && e.metaKey),
@@ -10931,6 +11178,7 @@ document.addEventListener('contextmenu', function(e) {
   // handler owns only grid-card context menus. Modal right-clicks are either
   // handled by their own delegation (lightbox) or fall through to the browser.
   if (e.target.closest('.vireo-ctx-menu')) return;
+  if (card.classList.contains('offline')) return;
   e.preventDefault();
   var pid = parseInt(card.dataset.id, 10);
   // Finder-style coercion: right-click on an item outside the selection

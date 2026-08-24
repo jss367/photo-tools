@@ -1520,6 +1520,55 @@ def test_arrow_navigation_loads_next_page_at_loaded_boundary(live_server, page):
     assert page.evaluate("selectedPhotoId === photos[2].id")
 
 
+def test_arrow_navigation_loads_past_trailing_offline_photo(live_server, page):
+    """Keyboard navigation loads again after skipping an offline page tail."""
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.wait_for(state="visible")
+
+    result = page.evaluate(
+        """async () => {
+          const originalPhotos = photos;
+          const originalSelectedIndex = selectedIndex;
+          const originalAllLoaded = allLoaded;
+          const originalLoadPhotos = loadPhotos;
+          const originalSelectPhoto = selectPhoto;
+          const originalScrollToCard = scrollToCard;
+          let loads = 0;
+          let selected = null;
+          try {
+            photos = [
+              {id: 201, folder_status: 'ok'},
+              {id: 202, folder_status: 'missing'}
+            ];
+            selectedIndex = 0;
+            allLoaded = false;
+            loadPhotos = async function() {
+              loads += 1;
+              photos.push({id: 203, folder_status: 'ok'});
+              allLoaded = true;
+            };
+            selectPhoto = function(event, id, index) {
+              selected = {id, index};
+              selectedIndex = index;
+            };
+            scrollToCard = function() {};
+
+            await moveBrowseSelection(1, {});
+            return {loads, selected};
+          } finally {
+            photos = originalPhotos;
+            selectedIndex = originalSelectedIndex;
+            allLoaded = originalAllLoaded;
+            loadPhotos = originalLoadPhotos;
+            selectPhoto = originalSelectPhoto;
+            scrollToCard = originalScrollToCard;
+          }
+        }"""
+    )
+
+    assert result == {"loads": 1, "selected": {"id": 203, "index": 2}}
+
+
 def test_vertical_arrow_navigation_moves_by_rendered_grid_columns(live_server, page):
     """Up/down should move spatially by one visible grid row, not by one photo."""
     url = live_server["url"]

@@ -1,4 +1,5 @@
 # vireo/tests/test_image_loader.py
+import contextlib
 import io
 import os
 import sys
@@ -552,6 +553,30 @@ def test_extract_working_copy_failure_preserves_concurrent_publication(
     assert result is False
     assert output.read_bytes() == published
     assert not list(output.parent.glob("*.jpg.tmp"))
+
+
+def test_extract_working_copy_uses_publication_guard(tmp_path):
+    from image_loader import extract_working_copy
+    from PIL import Image
+
+    source = tmp_path / "photo.jpg"
+    output = tmp_path / "working" / "42.jpg"
+    Image.new("RGB", (100, 100), color=(255, 0, 0)).save(source, "JPEG")
+    events = []
+
+    @contextlib.contextmanager
+    def guard():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    assert extract_working_copy(
+        str(source), str(output), max_size=0, publication_guard=guard,
+    )
+    assert output.exists()
+    assert events == ["enter", "exit"]
 
 
 # ── load_working_image tests ──────────────────────────────────────────

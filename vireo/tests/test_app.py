@@ -1108,6 +1108,43 @@ def test_settings_global_delete_restores_default_and_clears_evictions(
     assert "working_copy_cache_max_mb" not in raw
 
 
+def test_quota_raise_reenables_evicted_companion_backed_copy(app_and_db):
+    """A known-good companion rendition can regenerate immediately."""
+    import config as cfg
+
+    app, db = app_and_db
+    photo = db.get_photos()[0]
+    cfg.set("working_copy_cache_max_mb", 0)
+    db.conn.execute(
+        """UPDATE photos
+           SET extension='.nef', companion_path='photo.jpg',
+               working_copy_path=NULL, working_copy_evicted_mtime=file_mtime,
+               working_copy_failed_at=datetime('now'),
+               working_copy_failed_mtime=file_mtime,
+               working_copy_failed_source='source'
+           WHERE id=?""",
+        (photo["id"],),
+    )
+    db.conn.commit()
+
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "working_copy_cache_max_mb", "value": 1},
+    )
+
+    assert response.status_code == 200
+    row = db.conn.execute(
+        """SELECT working_copy_evicted_mtime, working_copy_failed_at,
+                  working_copy_failed_mtime, working_copy_failed_source
+           FROM photos WHERE id=?""",
+        (photo["id"],),
+    ).fetchone()
+    assert row["working_copy_evicted_mtime"] is None
+    assert row["working_copy_failed_at"] is None
+    assert row["working_copy_failed_mtime"] is None
+    assert row["working_copy_failed_source"] is None
+
+
 def test_original_route_enforces_working_copy_quota(
     client_with_photo, tmp_path,
 ):

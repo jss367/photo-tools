@@ -1448,7 +1448,10 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
     # library much larger than the configured quota would otherwise
     # generate the entire set before the post-loop enforce and fill the
     # disk by hundreds of gigabytes.
-    from working_copy_cache import evict_if_over_quota
+    from working_copy_cache import (
+        evict_if_over_quota,
+        working_copy_publication_guard,
+    )
 
     quota_bytes = wc_cache_max_mb * 1024 * 1024
     # Enforce roughly every quarter of the configured quota, capped at 512 MB
@@ -1562,7 +1565,10 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
 
         # extract_working_copy is slow (RAW decode + JPEG encode); run it
         # before any DB write so no transaction is open while it runs.
-        ok = extract_working_copy(source, wc_abs, max_size=wc_max_size, quality=wc_quality)
+        ok = extract_working_copy(
+            source, wc_abs, max_size=wc_max_size, quality=wc_quality,
+            publication_guard=working_copy_publication_guard,
+        )
         # Card-side override failed but the verified archive copy exists
         # — retry from the archive before falling through to the RAW→
         # companion fallback or recording a failure marker. Without this,
@@ -1590,6 +1596,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                     companion_override_used = False
                 ok = extract_working_copy(
                     source, wc_abs, max_size=wc_max_size, quality=wc_quality,
+                    publication_guard=working_copy_publication_guard,
                 )
         raw_failed_then_companion = False
         # libraw returns an embedded JPEG when it can't demosaic a RAW; that
@@ -1660,6 +1667,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             # companion extraction also fails.
             ok = extract_working_copy(
                 source, wc_abs, max_size=wc_max_size, quality=wc_quality,
+                publication_guard=working_copy_publication_guard,
             )
             # Companion attempt used a card override and failed — retry
             # from the verified archive companion before recording failure.
@@ -1683,6 +1691,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 ok = extract_working_copy(
                     source, wc_abs,
                     max_size=wc_max_size, quality=wc_quality,
+                    publication_guard=working_copy_publication_guard,
                 )
             raw_failed_then_companion = ok
         if ok:

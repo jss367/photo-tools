@@ -576,6 +576,7 @@ def extract_working_copy(
     max_size=4096,
     quality=92,
     raw_decode=RAW_DECODE_PRESERVE_HIGHLIGHTS,
+    publication_guard=None,
 ):
     """Extract a JPEG working copy from an image file.
 
@@ -587,6 +588,8 @@ def extract_working_copy(
         raw_decode: RAW decode strategy. Working copies default to the
             highlight-preserving edit source; display renditions can request
             RAW_DECODE_CAMERA_RENDERED without changing that edit source.
+        publication_guard: optional context-manager factory that serializes
+            publication to a shared canonical cache path with eviction.
 
     Returns:
         True on success, False on failure
@@ -610,7 +613,9 @@ def extract_working_copy(
         )
         os.close(fd)
         img.save(tmp_path, "JPEG", quality=quality)
-        os.replace(tmp_path, output_path)
+        guard = publication_guard() if publication_guard else contextlib.nullcontext()
+        with guard:
+            os.replace(tmp_path, output_path)
         tmp_path = None
         return True
     except Exception:

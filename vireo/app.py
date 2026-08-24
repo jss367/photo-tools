@@ -19851,7 +19851,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # The next scoped scan or startup backfill can use the newly
             # available space; settings writes never perform RAW decoding.
             quota_db.conn.execute(
-                "UPDATE photos SET working_copy_evicted_mtime=NULL "
+                "UPDATE photos SET working_copy_evicted_mtime=NULL, "
+                "working_copy_failed_at=CASE WHEN "
+                "working_copy_failed_source='source' "
+                "AND companion_path IS NOT NULL THEN NULL "
+                "ELSE working_copy_failed_at END, "
+                "working_copy_failed_mtime=CASE WHEN "
+                "working_copy_failed_source='source' "
+                "AND companion_path IS NOT NULL THEN NULL "
+                "ELSE working_copy_failed_mtime END, "
+                "working_copy_failed_source=CASE WHEN "
+                "working_copy_failed_source='source' "
+                "AND companion_path IS NOT NULL THEN NULL "
+                "ELSE working_copy_failed_source END "
                 "WHERE working_copy_evicted_mtime IS NOT NULL"
             )
             commit_with_retry(quota_db.conn)

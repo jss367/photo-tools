@@ -5707,6 +5707,7 @@ async function prependPreviousPhotos(options) {
     // object while it is open, so mutating it lets Previous navigation see
     // the newly prepended page without closing and reopening the viewer.
     Array.prototype.unshift.apply(photos, preceding);
+    syncBrowseAvailableLightboxPhotos();
     earliestPage = requestedPage;
     prependGridPhotos(preceding);
     updatePreviousPhotosButton();
@@ -5804,6 +5805,7 @@ async function loadPhotos(options) {
       // Keep the array identity stable. The shared lightbox navigates the
       // same object and can therefore continue into this newly loaded page.
       Array.prototype.push.apply(photos, data.photos);
+      syncBrowseAvailableLightboxPhotos();
       currentPage += chunk;
       // A deep-link window starts partway in, so it is exhausted when it
       // reaches the end of the dataset — not when it holds ``totalPhotos``
@@ -6267,11 +6269,33 @@ document.getElementById('grid').addEventListener('dblclick', function(e) {
   openLightbox(id, filename, availableBrowsePhotos());
 });
 
-function availableBrowsePhotos() {
-  return photos.filter(function(photo) {
-    return !photo.folder_status ||
-      photo.folder_status === 'ok' || photo.folder_status === 'partial';
+var browseAvailableLightboxPhotos = [];
+
+function browsePhotoIsAvailable(photo) {
+  return !photo.folder_status ||
+    photo.folder_status === 'ok' || photo.folder_status === 'partial';
+}
+
+function replaceBrowseAvailableLightboxPhotos(available) {
+  browseAvailableLightboxPhotos.length = 0;
+  available.forEach(function(photo) {
+    browseAvailableLightboxPhotos.push(photo);
   });
+}
+
+function syncBrowseAvailableLightboxPhotos() {
+  if (window._lightboxPhotoList !== browseAvailableLightboxPhotos) return;
+  replaceBrowseAvailableLightboxPhotos(photos.filter(browsePhotoIsAvailable));
+}
+
+function availableBrowsePhotos() {
+  // Default Browse results already exclude offline folders. Preserve the
+  // shared array identity so lightbox boundary prefetch sees later pages as
+  // loadPhotos mutates ``photos``. The opt-in offline view needs a filtered
+  // list; keep that list stable and synchronize it after every append/prepend.
+  if (!showOfflineCollectionPhotos) return photos;
+  replaceBrowseAvailableLightboxPhotos(photos.filter(browsePhotoIsAvailable));
+  return browseAvailableLightboxPhotos;
 }
 
 function getBrowseShortcutPhoto() {
@@ -6316,18 +6340,19 @@ function browseKeyMatchesConfiguredShortcut(e) {
 }
 
 /* Keep Browse's lightbox navigation moving across lazy-loaded page edges.
-   The grid and lightbox share the same ``photos`` array while Browse owns the
-   viewer. ``loadPhotos``/``prependPreviousPhotos`` mutate that array in place,
-   so a prefetched page becomes available to the shared lightbox immediately.
-   If the user reaches an edge before the request finishes, retry at the same
-   boundary and advance as soon as the page is available. */
+   The normal grid and lightbox share ``photos``; the opt-in offline grid uses
+   a stable available-only list. ``loadPhotos``/``prependPreviousPhotos`` keep
+   the active list synchronized, so prefetched pages reach the lightbox without
+   reopening it. If the user reaches an edge before the request finishes, retry
+   at the same boundary and advance as soon as the page is available. */
 var browseLightboxBoundaryRetry = null;
 var browseLightboxSession = 0;
 
 function browseLightboxOwnsLoadedWindow() {
   return (
     typeof window._lightboxPhotoList !== 'undefined' &&
-    window._lightboxPhotoList === photos &&
+    (window._lightboxPhotoList === photos ||
+     window._lightboxPhotoList === browseAvailableLightboxPhotos) &&
     typeof window._lightboxCurrentId !== 'undefined' &&
     window._lightboxCurrentId != null
   );
@@ -6338,11 +6363,14 @@ function refreshBrowseLightboxCounter() {
   var visibleId = window._lightboxCommittedId != null
     ? window._lightboxCommittedId
     : window._lightboxCurrentId;
-  var index = photos.findIndex(function(photo) { return photo.id === visibleId; });
+  var lightboxPhotos = window._lightboxPhotoList;
+  var index = lightboxPhotos.findIndex(function(photo) {
+    return photo.id === visibleId;
+  });
   var counter = document.getElementById('lightboxCounter');
-  if (index < 0 || !counter || photos.length < 2) return;
-  var filename = photos[index].filename || '';
-  counter.textContent = (index + 1) + ' / ' + photos.length
+  if (index < 0 || !counter || lightboxPhotos.length < 2) return;
+  var filename = lightboxPhotos[index].filename || '';
+  counter.textContent = (index + 1) + ' / ' + lightboxPhotos.length
     + (filename ? ' \u00b7 ' + filename : '');
   counter.title = filename;
   counter.style.display = '';
@@ -6351,11 +6379,14 @@ function refreshBrowseLightboxCounter() {
 function continueBrowseLightboxAcrossBoundary(delta, currentId, session) {
   if (session !== browseLightboxSession) return;
   if (!browseLightboxOwnsLoadedWindow() || window._lightboxCurrentId !== currentId) return;
-  var index = photos.findIndex(function(photo) { return photo.id === currentId; });
+  var lightboxPhotos = window._lightboxPhotoList;
+  var index = lightboxPhotos.findIndex(function(photo) {
+    return photo.id === currentId;
+  });
   if (index < 0) return;
 
   var nextIndex = index + delta;
-  if (nextIndex >= 0 && nextIndex < photos.length) {
+  if (nextIndex >= 0 && nextIndex < lightboxPhotos.length) {
     lightboxNav(delta);
     return;
   }
@@ -6384,9 +6415,12 @@ function continueBrowseLightboxAcrossBoundary(delta, currentId, session) {
 document.addEventListener('lightbox:photochanged', function(event) {
   if (!browseLightboxOwnsLoadedWindow() || loading) return;
   var photoId = event && event.detail && event.detail.photoId;
-  var index = photos.findIndex(function(photo) { return photo.id === photoId; });
+  var lightboxPhotos = window._lightboxPhotoList;
+  var index = lightboxPhotos.findIndex(function(photo) {
+    return photo.id === photoId;
+  });
   if (index < 0) return;
-  if (!allLoaded && index >= photos.length - 3) loadPhotos({ silent: true });
+  if (!allLoaded && index >= lightboxPhotos.length - 3) loadPhotos({ silent: true });
   if (earliestPage > 1 && index <= 2) prependPreviousPhotos({ silent: true });
 });
 
@@ -10781,19 +10815,21 @@ function getBrowseGridColumnCount() {
 
 async function moveBrowseSelection(delta, e) {
   var nextIndex = selectedIndex < 0 && delta > 0 ? 0 : selectedIndex + delta;
-  while (delta > 0 && nextIndex >= photos.length && !allLoaded) {
+  while (true) {
+    while (nextIndex >= 0 && nextIndex < photos.length && photos[nextIndex] &&
+           !browsePhotoIsAvailable(photos[nextIndex])) {
+      nextIndex += delta > 0 ? 1 : -1;
+    }
+    if (nextIndex >= 0 && nextIndex < photos.length && photos[nextIndex]) break;
+    if (delta <= 0 || nextIndex < 0 || allLoaded) return;
+
+    // Skipping trailing offline cards can move us beyond the loaded window.
+    // Fetch the next page and resume the skip until an available row appears
+    // or the dataset is exhausted.
     var beforeLength = photos.length;
     await loadPhotos();
-    if (photos.length === beforeLength) break;
-    nextIndex = selectedIndex < 0 ? 0 : selectedIndex + delta;
+    if (photos.length === beforeLength) return;
   }
-  while (nextIndex >= 0 && nextIndex < photos.length && photos[nextIndex] &&
-         photos[nextIndex].folder_status &&
-         photos[nextIndex].folder_status !== 'ok' &&
-         photos[nextIndex].folder_status !== 'partial') {
-    nextIndex += delta > 0 ? 1 : -1;
-  }
-  if (nextIndex < 0 || nextIndex >= photos.length || !photos[nextIndex]) return;
   var selectionEvent = {
     shiftKey: !!(e && e.shiftKey),
     metaKey: !!(e && e.metaKey),

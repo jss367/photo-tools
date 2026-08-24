@@ -542,7 +542,9 @@ def get_canonical_image_path(photo, vireo_dir, folders):
     return os.path.join(folder_path, photo["filename"])
 
 
-def load_working_image(photo, vireo_dir, max_size=1024, folders=None):
+def load_working_image(
+    photo, vireo_dir, max_size=1024, folders=None, *, return_source=False,
+):
     """Load a photo's working image — the fast path for all pixel operations.
 
     Uses the pre-extracted working copy JPEG if available,
@@ -555,19 +557,28 @@ def load_working_image(photo, vireo_dir, max_size=1024, folders=None):
         folders: optional {folder_id: path} mapping (required when working_copy_path is NULL)
 
     Returns:
-        PIL.Image.Image or None
+        PIL.Image.Image or None. When ``return_source=True``, returns an
+        ``(image, source_kind)`` pair whose source kind is ``working_copy``
+        or ``original``. This lets delayed artifact publishers preserve the
+        provenance of the pixels they actually consumed even if the catalog
+        row changes afterward.
     """
+    def _result(image, source_kind):
+        if return_source:
+            return image, source_kind
+        return image
+
     if photo.get("working_copy_path"):
         wc_path = os.path.join(vireo_dir, photo["working_copy_path"])
         if os.path.exists(wc_path):
-            return _load_standard(wc_path, max_size)
+            return _result(_load_standard(wc_path, max_size), "working_copy")
 
     # No working copy — load original (may be JPEG or RAW)
     if folders is None:
-        return None
+        return _result(None, "original")
     folder_path = folders.get(photo["folder_id"], "")
     source_path = os.path.join(folder_path, photo["filename"])
-    return load_image(source_path, max_size)
+    return _result(load_image(source_path, max_size), "original")
 
 
 def extract_working_copy(

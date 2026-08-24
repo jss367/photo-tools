@@ -362,9 +362,16 @@ def promote_and_publish_classifier_run(
     model_identity,
     store=None,
     taxonomy_identity="no-tax",
+    source_is_original=None,
 ):
     """Attach portable identity to one fresh run and publish its raw output."""
     if not _is_sha256(labels_fingerprint_full):
+        return None
+    # Classification records the actual decoded source at image-preparation
+    # time. A later quota eviction can clear ``working_copy_path`` before
+    # this delayed promotion runs; never let that mutable row turn rendition-
+    # backed inference into an artifact advertised as original-backed.
+    if source_is_original is False:
         return None
     row = db.conn.execute(
         """SELECT d.photo_id, d.detector_model, d.runtime_fingerprint,
@@ -385,7 +392,7 @@ def promote_and_publish_classifier_run(
     if (
         row is None
         or row["companion_path"]
-        or row["working_copy_path"]
+        or (source_is_original is None and row["working_copy_path"])
         or not _is_sha256(row["file_hash"])
         or not _is_sha256(row["runtime_fingerprint"])
     ):

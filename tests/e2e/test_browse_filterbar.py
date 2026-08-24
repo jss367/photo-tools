@@ -10,6 +10,7 @@ Seed data (conftest): 3 hawk photos in /photos/park, 2 robins in
 /photos/yard; hawk1 has rating 4 and the Red-tailed Hawk species keyword.
 """
 
+import pytest
 from playwright.sync_api import expect
 
 
@@ -517,6 +518,90 @@ def test_clear_cancels_pending_live_search_debounce(live_server, page):
     assert not page.evaluate("VireoFilter.hasFilters()")
     assert search.input_value() == ""
     _wait_total(page, 5)
+
+
+@pytest.mark.parametrize("clear_action", ["top", "popover", "api"])
+def test_clearing_filters_keeps_selected_photo_in_place(
+    live_server, page, clear_action
+):
+    """Clear-all widens the grid around the current photo without resetting it."""
+    _open_browse(page, live_server)
+    selected_id = live_server["data"]["photos"][3]
+    page.evaluate("updateThumbSize(400)")
+
+    # Use a normal rule rather than quick search so this exercises the
+    # explicit clear-all reason instead of quickSearchCleared.
+    page.evaluate("VireoFilter.addRule('keyword', 'is', 'American Robin')")
+    page.wait_for_function("() => photos.length === 1")
+    selected = page.locator(f'.grid-card[data-id="{selected_id}"]')
+    selected.click()
+
+    top_before = page.evaluate(
+        """(id) => {
+          const card = document.querySelector(`.grid-card[data-id="${id}"]`);
+          const container = document.getElementById('gridContainer');
+          return card.getBoundingClientRect().top - container.getBoundingClientRect().top;
+        }""",
+        selected_id,
+    )
+
+    if clear_action == "popover":
+        page.click(".vf-filters-btn")
+        page.click(".vf-clear-rules")
+    elif clear_action == "api":
+        page.evaluate("VireoFilter.clearAll()")
+    else:
+        page.click(".vf-clear")
+    page.wait_for_function(
+        "(id) => photos.length === 5 && selectedPhotoId === id",
+        arg=selected_id,
+    )
+    page.wait_for_timeout(100)  # allow the anchor-restoration animation frame
+
+    assert page.evaluate("selectedPhotos.size") == 0
+    expect(selected).to_have_class("grid-card selected")
+    top_after = page.evaluate(
+        """(id) => {
+          const card = document.querySelector(`.grid-card[data-id="${id}"]`);
+          const container = document.getElementById('gridContainer');
+          return card.getBoundingClientRect().top - container.getBoundingClientRect().top;
+        }""",
+        selected_id,
+    )
+    assert abs(top_after - top_before) < 4
+
+
+@pytest.mark.parametrize("clear_action", ["popover", "api"])
+def test_clear_without_filters_does_not_reload(live_server, page, clear_action):
+    """No-op clears cancel pending text without reloading the photo dataset."""
+    _open_browse(page, live_server)
+    selected = page.locator(".grid-card").last
+    selected.click()
+    selected_id = int(selected.get_attribute("data-id"))
+    epoch_before = page.evaluate("loadEpoch")
+
+    if clear_action == "popover":
+        page.click(".vf-filters-btn")
+    page.evaluate(
+        """action => {
+          var input = document.querySelector('.vf-search input');
+          input.value = 'haw';
+          input.dispatchEvent(new Event('input', {bubbles: true}));
+          if (action === 'popover') {
+            document.querySelector('.vf-clear-rules').click();
+          } else {
+            VireoFilter.clearAll();
+          }
+        }""",
+        clear_action,
+    )
+    page.wait_for_timeout(300)
+
+    assert page.evaluate("loadEpoch") == epoch_before
+    assert not page.evaluate("VireoFilter.hasFilters()")
+    assert page.locator(".vf-search input").input_value() == ""
+    assert page.evaluate("selectedPhotoId") == selected_id
+    expect(selected).to_have_class("grid-card selected")
 
 
 def test_pause_resume_with_backslash(live_server, page):

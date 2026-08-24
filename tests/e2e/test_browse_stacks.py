@@ -440,6 +440,57 @@ def test_browse_stacks_collapse_expand_and_select(live_server, page):
     )
 
 
+def test_clearing_filters_preserves_photo_that_becomes_hidden_stack_member(
+    live_server, page
+):
+    """A widening clear expands a new stack rather than dropping its selected member."""
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'filter-clear-anchor-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.wait_for_function("VireoFilter.isReady()")
+    page.locator("#browseStacksToggle").check()
+    page.evaluate("updateThumbSize(400)")
+    page.evaluate("VireoFilter.addRule('keyword', 'is', 'Red-tailed Hawk')")
+    page.wait_for_function("() => photos.length === 1")
+
+    selected_id = burst_ids[0]
+    selected = page.locator(f'.grid-card[data-id="{selected_id}"]')
+    selected.click()
+    top_before = selected.evaluate(
+        """card => card.getBoundingClientRect().top -
+          document.getElementById('gridContainer').getBoundingClientRect().top"""
+    )
+
+    page.click(".vf-clear")
+    page.wait_for_function("id => selectedPhotoId === id", arg=selected_id)
+    member = page.locator(f'.browse-stack-member[data-id="{selected_id}"]')
+    member.wait_for(state="visible")
+    page.wait_for_timeout(100)
+
+    expect(member).to_have_class("browse-stack-member selected")
+    assert page.evaluate("selectedPhotos.size") == 0
+    assert page.evaluate(
+        "id => expandedBrowseStacks.has(browseStackCoverIdForPhoto(id))",
+        selected_id,
+    )
+    top_after = member.evaluate(
+        """card => card.getBoundingClientRect().top -
+          document.getElementById('gridContainer').getBoundingClientRect().top"""
+    )
+    assert abs(top_after - top_before) < 4
+
+
 def test_stack_metadata_callbacks_follow_promoted_cover(live_server, page):
     db = live_server["db"]
     burst_ids = live_server["data"]["photos"][:3]

@@ -4148,9 +4148,23 @@ function getGridCard(photoId) {
   return document.querySelector('.grid-card[data-id="' + photoId + '"]');
 }
 
+function getBrowsePhotoElement(photoId) {
+  return getGridCard(photoId) ||
+    document.querySelector('.browse-stack-member[data-id="' + photoId + '"]');
+}
+
+function loadedBrowseStackCoverForPhoto(photoId) {
+  var wantedId = Number(photoId);
+  return photos.find(function(photo) {
+    return photo.browse_stack && (photo.browse_stack.photo_ids || []).some(function(id) {
+      return Number(id) === wantedId;
+    });
+  }) || null;
+}
+
 function captureSelectedPhotoAnchor() {
   if (selectedPhotoId == null || selectedPhotos.size > 0) return null;
-  var card = getGridCard(selectedPhotoId);
+  var card = getBrowsePhotoElement(selectedPhotoId);
   if (!card) return null;
   var container = document.getElementById('gridContainer');
   var containerRect = container.getBoundingClientRect();
@@ -4164,7 +4178,7 @@ function captureSelectedPhotoAnchor() {
 
 function restorePhotoAnchor(anchor) {
   if (!anchor) return false;
-  var card = getGridCard(anchor.photoId);
+  var card = getBrowsePhotoElement(anchor.photoId);
   if (!card) return false;
   var container = document.getElementById('gridContainer');
   var containerRect = container.getBoundingClientRect();
@@ -4182,9 +4196,11 @@ function anchorSelectionIsCurrent(anchor, restoreEpoch) {
   return !!anchor && selectedPhotoId === anchor.photoId && selectedPhotos.size === 0;
 }
 
-async function loadUntilPhotoRendered(photoId, shouldContinue) {
+async function loadUntilPhotoRendered(photoId, shouldContinue, options) {
+  var resolveStackMember = !!(options && options.resolveStackMember);
   var card = getGridCard(photoId);
-  while (!card && !allLoaded) {
+  var stackCover = resolveStackMember ? loadedBrowseStackCoverForPhoto(photoId) : null;
+  while (!card && !stackCover && !allLoaded) {
     if (shouldContinue && !shouldContinue()) return null;
     var beforePage = currentPage;
     var beforeLen = photos.length;
@@ -4192,6 +4208,12 @@ async function loadUntilPhotoRendered(photoId, shouldContinue) {
     if (shouldContinue && !shouldContinue()) return null;
     if (currentPage === beforePage && photos.length === beforeLen) break;
     card = getGridCard(photoId);
+    if (resolveStackMember) stackCover = loadedBrowseStackCoverForPhoto(photoId);
+  }
+  if (!card && stackCover) {
+    await toggleBrowseStack(null, stackCover.id);
+    if (shouldContinue && !shouldContinue()) return null;
+    card = getBrowsePhotoElement(photoId);
   }
   return card;
 }
@@ -4384,15 +4406,16 @@ async function bootstrapBrowse() {
           openedCollectionId = null;
           clearOfflineCollectionState();
         }
-        // A cleared quick search is the one filter edit where the previously
-        // selected photo is expected to reappear in the wider result set \u2014
-        // preserve the anchor so the detail panel and scroll position don't
-        // reset. Every other filter change usually excludes the previously
-        // selected photo, and loadUntilPhotoRendered would then keep paging
-        // through the whole matching set (potentially many /api/photos/query
-        // requests) just to prove the anchor is gone.
+        // Clearing filters widens the result set, so the selected photo is
+        // expected to remain present. Preserve it as the viewport anchor so
+        // the newly included photos appear around it instead of resetting
+        // Browse to the first result. Every other filter change may exclude
+        // the selected photo, and loadUntilPhotoRendered would then keep
+        // paging through the whole matching set (potentially many
+        // /api/photos/query requests) just to prove the anchor is gone.
         var preserveAnchor = info && (
           info.reason === 'quickSearchCleared' ||
+          info.reason === 'filtersCleared' ||
           // A selected member of a just-opened collection should stay
           // anchored (it existed in the old collection view too). But a
           // membership-refresh reopen (reason 'expressionRefreshed') skips
@@ -6412,7 +6435,11 @@ async function resetAndLoad(options) {
     if (!resetRequestIsCurrent()) return null;
     if (!anchor) return true;
 
-    var card = await loadUntilPhotoRendered(anchor.photoId, anchorScanShouldContinue);
+    var card = await loadUntilPhotoRendered(
+      anchor.photoId,
+      anchorScanShouldContinue,
+      { resolveStackMember: true }
+    );
     if (!resetRequestIsCurrent()) return null;
     if (!anchorRestoreIsPending(anchor, restoreEpoch)) return true;
     if (!card) {
@@ -6426,8 +6453,11 @@ async function resetAndLoad(options) {
     // set to a non-``ok``/``partial`` value. Restoring the selection there
     // would let updateBatchBar() expose Develop/Export/Delete against a
     // supposedly read-only photo (Codex review r3839992514).
-    var anchorIndex = photos.findIndex(function(p) { return p.id === anchor.photoId; });
-    if (anchorIndex < 0 || !browsePhotoIsAvailable(photos[anchorIndex])) {
+    var anchorPhoto = findBrowsePhoto(anchor.photoId);
+    var anchorCoverId = browseStackCoverIdForPhoto(anchor.photoId);
+    var anchorGridId = anchorCoverId == null ? anchor.photoId : anchorCoverId;
+    var anchorIndex = photos.findIndex(function(p) { return p.id === anchorGridId; });
+    if (anchorIndex < 0 || !anchorPhoto || !browsePhotoIsAvailable(anchorPhoto)) {
       clearActiveSelectionAndDetail();
       return true;
     }
@@ -12945,7 +12975,10 @@ async function _runPhotoDeepLink(photoId) {
         onChange: function(info) {
           if (timelineMode) loadCalendarData();
           if (activeCollectionId && !dashboardCollectionScope) activeCollectionId = null;
-          var preserveAnchor = info && info.reason === 'quickSearchCleared';
+          var preserveAnchor = info && (
+            info.reason === 'quickSearchCleared' ||
+            info.reason === 'filtersCleared'
+          );
           resetAndLoad(preserveAnchor ? { preserveAnchor: true } : undefined);
           loadSummary();
         },

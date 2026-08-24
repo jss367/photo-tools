@@ -389,9 +389,9 @@
     if (!options.noPersist) schedulePersist();
     // `reason` (optional string) is forwarded to onChange so pages can
     // pick per-cause reload behavior — e.g. Browse preserving the
-    // selected-photo anchor when a quick search is cleared but not for
-    // every filter change (arbitrary edits usually exclude the anchor,
-    // and loadUntilPhotoRendered would then page through the whole set).
+    // selected-photo anchor when filters are cleared but not for every
+    // filter change (arbitrary edits usually exclude the anchor, and
+    // loadUntilPhotoRendered would then page through the whole set).
     if (state.onChange && !options.silent) state.onChange({ reason: options.reason || null });
     if (state.muted) refreshWouldMatch();
   }
@@ -572,16 +572,22 @@
     }
   }
 
+  function clearUnappliedQuickSearchText() {
+    const input = $('.vf-search input');
+    if (input) input.value = '';
+    hideSearchSuggest();
+  }
+
   function applyQuickSearch(text, opts) {
     cancelQuickSearchTimer();
     const value = String(text || '').trim();
     const current = quickSearchGroup();
     if ((!value && !current) ||
         (value && current && current._qs_text === value && !state.visual)) return;
-    // A cleared quick search is the one filter edit where the previously
-    // selected/open photo is expected to reappear in the wider result set.
-    // Flag it so the page can preserve the anchor for this case without
-    // reintroducing preservation for every filter change.
+    // A cleared quick search widens the result set, so the previously
+    // selected/open photo is expected to reappear. Flag it so the page can
+    // preserve the anchor for this case without reintroducing preservation
+    // for every filter change.
     const cleared = !value && !!quickSearchGroup();
     mutate(() => {
       state.root.rules = state.root.rules.filter((n) => !(isGroup(n) && n._qs));
@@ -1142,6 +1148,7 @@
       });
     }
     $('.vf-clear').addEventListener('click', () => {
+      if (!hasUserFilters() && !state.muted) return;
       // Kill any pending live-search debounce so it can't silently reinstate
       // the just-typed text after "Filters cleared" (Codex review r3791783342).
       cancelQuickSearchTimer();
@@ -1150,17 +1157,24 @@
         state.muted = false;
         state.visual = null;
         state.visualInfo = null;
-      });
+      }, { reason: 'filtersCleared' });
       toast('Filters cleared', true);
     });
     $('.vf-clear-rules').addEventListener('click', () => {
       cancelQuickSearchTimer();
+      // This control stays visible in the popover even when no filters are
+      // active. A search may still be waiting on its live-input debounce, so
+      // discard that text before avoiding the otherwise-no-op page reload.
+      if (!hasUserFilters() && !state.muted) {
+        clearUnappliedQuickSearchText();
+        return;
+      }
       mutate(() => {
         state.root = { mode: 'all', rules: [] };
         state.muted = false;
         state.visual = null;
         state.visualInfo = null;
-      });
+      }, { reason: 'filtersCleared' });
       toast('Filters cleared', true);
     });
     $('.vf-toast button').addEventListener('click', () => { undo(); $('.vf-toast').hidden = true; });
@@ -1674,12 +1688,16 @@
         if (state.ready) render();
         return;
       }
+      if (!hasUserFilters() && !state.muted) {
+        clearUnappliedQuickSearchText();
+        return;
+      }
       mutate(() => {
         state.root = { mode: 'all', rules: [] };
         state.muted = false;
         state.visual = null;
         state.visualInfo = null;
-      });
+      }, { reason: 'filtersCleared' });
     },
     isReady() { return !!state.ready && !!state.fields; },
     isMuted() { return state.muted; },

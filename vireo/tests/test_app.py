@@ -20295,9 +20295,16 @@ def test_browse_sidebar_panels_refresh_on_undo_and_redo(app_and_db):
         "document.addEventListener('vireo:edit-history-changed'"
     )
     assert listener_at != -1, "Browse must listen for undo/redo"
-    handler = html[listener_at: listener_at + 700]
+    handler = html[listener_at: listener_at + 1200]
     assert "refreshBrowseSidebarPanels(" in handler, (
         "undo/redo must repaint the whole sidebar, not one panel"
+    )
+    # Undo/redo can revert rating/flag/color-label edits too — the handler must
+    # also refresh those cover-affecting fields and reconcile stack covers so
+    # a demoted representative doesn't linger until another cover-affecting
+    # edit or a manual reload.
+    assert "_refreshBrowseCoverAffectingState(" in handler, (
+        "undo/redo must refresh cover-affecting fields and reconcile stacks"
     )
     body = _browse_js_function_body(
         html, "function refreshBrowseSidebarPanels(",

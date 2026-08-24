@@ -1056,6 +1056,92 @@ def test_unresolvable_cover_hydration_is_reported_and_recoverable(live_server, p
     assert page.evaluate("id => browseStackCoverRecheck.has(id)", burst_ids[1]) is False
 
 
+def test_navbar_undo_redo_reconciles_stack_covers(live_server, page):
+    """Navbar undo/redo of a cover-affecting edit must reconcile stack covers.
+
+    ``vireo:edit-history-changed`` used to only route through
+    ``_refreshBrowseKeywordState`` (species/representative fields) and
+    ``refreshBrowseSidebarPanels``. A rating/flag/color-label undo therefore
+    left ratings and flags on the loaded rows in their post-edit state and
+    never called ``reconcileBrowseStackCovers``, so a demoted cover kept
+    painting even though the server had reversed the edit.
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'undo-cover-reconcile-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
+
+    # Simulate the state the server holds after an undo: the previously demoted
+    # frame is now the higher-quality one, so the local representative should
+    # move to it once the event handler refreshes and reconciles.
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.10 WHERE id = ?",
+            (burst_ids[1],),
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[0],),
+        )
+
+    outcome = page.evaluate(
+        """async ids => {
+          var coverIdBefore = ids[1];
+          var promotedId = ids[0];
+          var reconcileCalls = [];
+          var originalReconcile = window.reconcileBrowseStackCovers;
+          window.reconcileBrowseStackCovers = function(list) {
+            reconcileCalls.push(Array.from(list || []));
+            return originalReconcile.apply(this, arguments);
+          };
+          try {
+            document.dispatchEvent(new CustomEvent('vireo:edit-history-changed', {
+              detail: {operation: 'undo'},
+            }));
+            // Let both fetches (keyword state + cover-affecting state) resolve
+            // and the trailing reconcile complete.
+            for (var i = 0; i < 40; i++) {
+              await new Promise(function(resolve) { setTimeout(resolve, 25); });
+              if (photos.some(function(p) { return p.id === promotedId && p.browse_stack; })) {
+                break;
+              }
+            }
+            var cover = photos.find(function(p) { return p.browse_stack; });
+            return {
+              coverId: cover ? cover.id : null,
+              coverIdBefore: coverIdBefore,
+              demotedStillHasStack: photos.some(function(p) {
+                return p.id === coverIdBefore && p.browse_stack;
+              }),
+              reconcileCalled: reconcileCalls.length > 0,
+              reconcileIncludedLoaded: reconcileCalls.some(function(list) {
+                return list.indexOf(promotedId) !== -1;
+              }),
+            };
+          } finally {
+            window.reconcileBrowseStackCovers = originalReconcile;
+          }
+        }""",
+        burst_ids,
+    )
+    assert outcome["reconcileCalled"] is True
+    assert outcome["reconcileIncludedLoaded"] is True
+    assert outcome["coverId"] == burst_ids[0]
+    assert outcome["demotedStillHasStack"] is False
+
+
 def test_expanding_stack_over_500_chunks_by_ids_requests(live_server, page):
     """A stack with more than 500 members must be expandable.
 

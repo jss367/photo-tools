@@ -390,6 +390,10 @@ def test_sweep_abandoned_render_tempfiles_removes_orphans(tmp_path):
     orphan_b.write_bytes(b"another orphan")
     scanner_orphan = working_dir / ".42.jpg.cafebabe.jpg.tmp"
     scanner_orphan.write_bytes(b"scanner partial write")
+    nested_orphan = (
+        working_dir / "..42.render.outer.jpg.tmp.inner.jpg.tmp"
+    )
+    nested_orphan.write_bytes(b"nested on-demand partial write")
     unrelated = working_dir / "leftover.tmp"
     unrelated.write_bytes(b"unrelated non-render tempfile")
     nested = working_dir / "nested"
@@ -401,6 +405,7 @@ def test_sweep_abandoned_render_tempfiles_removes_orphans(tmp_path):
     assert not orphan_a.exists()
     assert not orphan_b.exists()
     assert not scanner_orphan.exists()
+    assert not nested_orphan.exists()
     assert unrelated.exists()
     assert nested.exists()
 
@@ -410,6 +415,25 @@ def test_sweep_abandoned_render_tempfiles_missing_dir_is_noop(tmp_path):
 
     # Should not raise even if ``working/`` was never created.
     sweep_abandoned_render_tempfiles(str(tmp_path))
+
+
+def test_evict_reclaims_numeric_canonical_file_without_photo_row(tmp_path):
+    from db import Database
+    from working_copy_cache import evict_if_over_quota
+
+    db = Database(str(tmp_path / "vireo.db"))
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    orphan = working_dir / "999.jpg"
+    orphan.write_bytes(b"orphaned working copy")
+    try:
+        result = evict_if_over_quota(db, str(tmp_path), quota_mb=0)
+
+        assert result["evicted"] == 1
+        assert result["remaining_bytes"] == 0
+        assert not orphan.exists()
+    finally:
+        db.close()
 
 
 def test_evict_reconciles_tracked_row_when_file_is_missing(tmp_path):

@@ -202,6 +202,7 @@ body { padding-bottom: 36px; }
         <div class="setting-label">Storage limit<small>Maximum space for edit-quality JPEGs generated from RAW files. Oldest files are removed first.</small></div>
         <div class="setting-control">
           <input type="number" id="cfgWorkingCopyCacheMaxGb" min="0" step="1" value="20"
+                 aria-label="Working-copy storage limit in GB"
                  style="width:96px;background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-secondary);border-radius:4px;padding:4px 8px;font-size:13px;text-align:center;"
                  onchange="saveStorageConfig()">
           <span style="font-size:13px;color:var(--text-dim);">GB</span>

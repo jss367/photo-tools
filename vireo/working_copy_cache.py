@@ -63,7 +63,7 @@ def _is_private_working_tempfile(name):
     """
     if not name.startswith(".") or not name.endswith(".jpg.tmp"):
         return False
-    body = name[1:-len(".jpg.tmp")]
+    body = name[1:-len(".jpg.tmp")].lstrip(".")
     for marker in (".render.", ".jpg."):
         photo_id, separator, nonce = body.partition(marker)
         if separator and photo_id.isdigit() and nonce:
@@ -241,6 +241,7 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
             log.warning("Could not inspect working-copy cache %s: %s", working_dir, exc)
 
         entries = []
+        known_canonical_names = {f"{row['id']}.jpg" for row in rows}
         untracked_cutoff_ns = (
             time.time_ns() - _UNTRACKED_WRITE_GRACE_SECONDS * 1_000_000_000
         )
@@ -281,6 +282,25 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
                     expected_rel, _file_identity(st),
                 )
             )
+
+        # A deleted photo can leave its canonical file behind when Windows
+        # temporarily refuses an unlink while a response handle is open. No
+        # catalog row remains to contribute an ordinary eviction candidate,
+        # but Vireo still owns numeric ``working/<id>.jpg`` names.
+        for name, (path, st) in files.items():
+            stem, extension = os.path.splitext(name)
+            if (
+                name not in known_canonical_names
+                and extension.lower() == ".jpg"
+                and stem.isdigit()
+            ):
+                photo_id = int(stem)
+                entries.append(
+                    (
+                        st.st_mtime_ns, photo_id, st.st_size, path,
+                        f"working/{photo_id}.jpg", _file_identity(st),
+                    )
+                )
 
         if stale_tracked_ids:
             # A publisher may have replaced a file after the directory scan

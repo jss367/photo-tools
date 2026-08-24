@@ -1777,6 +1777,24 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 "candidates; deferring the rest to a later pass",
                 wc_cache_max_mb, i, total,
             )
+            # Mark the remaining candidates as capacity-deferred so the
+            # startup gate doesn't re-launch backfill on every restart
+            # while the quota is unchanged. Without this, the next launch
+            # would decode and write another quota-sized batch only to
+            # evict the batch we just committed — and repeat indefinitely.
+            # Reuse ``working_copy_evicted_mtime``: the settings write path
+            # already clears this marker when the user raises the ceiling,
+            # and the candidate predicate treats a file_mtime change as an
+            # escape hatch so a rewritten source retries automatically.
+            deferred_ids = [(row["id"],) for row in rows[i:]]
+            if deferred_ids:
+                db.conn.executemany(
+                    "UPDATE photos SET"
+                    " working_copy_evicted_mtime=COALESCE(file_mtime, -1)"
+                    " WHERE id=? AND working_copy_path IS NULL",
+                    deferred_ids,
+                )
+                commit_with_retry(db.conn)
             break
 
     # A scan/import may add a large batch at once. Enforce once after the

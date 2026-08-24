@@ -1327,3 +1327,81 @@ def test_incremental_enforcement_bounds_transient_overshoot(tmp_path, monkeypatc
         f"expected incremental enforcement to fire during a large batch; "
         f"observed {len(call_sites)} evict_if_over_quota calls"
     )
+
+
+def test_capacity_deferred_rows_do_not_retrigger_backfill(tmp_path, monkeypatch):
+    """Rows deferred by the quota stop must not re-trigger startup backfill.
+
+    Regression: when ``_extract_working_copies`` breaks out of the loop
+    because cumulative new bytes reached the quota, previously the
+    unprocessed rows still satisfied ``_working_copy_candidate_predicate``.
+    The next launch's startup gate saw a non-zero candidate count and
+    kicked off another backfill, which wrote yet another quota-sized
+    batch only to evict the previous one — churning disk on every
+    restart without ever changing steady-state usage.
+    """
+    import config as cfg
+    from db import Database
+    from scanner import (
+        _extract_working_copies,
+        working_copy_backfill_candidate_count,
+    )
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    cfg.save({
+        **cfg.DEFAULTS,
+        "working_copy_max_size": 1000,
+        "working_copy_quality": 90,
+        "working_copy_cache_max_mb": 1,
+    })
+
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    db = Database(str(vireo_dir / "test.db"))
+    try:
+        folder_id = db.add_folder(str(folder))
+        for i in range(6):
+            src = folder / f"big-{i}.jpg"
+            _make_noisy_jpeg(src, 2000, 1500)
+            _photo_id_of_file(db, folder_id, f"big-{i}.jpg", src)
+
+        _extract_working_copies(db, str(vireo_dir))
+
+        # After the first pass with a 1 MB quota against ~700 KB files, the
+        # loop must have stopped and marked the rest deferred so the startup
+        # gate sees no eligible candidates until the quota or source changes.
+        remaining = working_copy_backfill_candidate_count(db)
+        assert remaining == 0, (
+            "expected capacity-deferred rows to be excluded from the "
+            f"candidate predicate; still {remaining} eligible"
+        )
+
+        # A subsequent run must be a no-op: no additional files decoded,
+        # no additional bytes written on disk (i.e. no churn).
+        working_dir = vireo_dir / "working"
+        before = sorted(
+            (p.name, p.stat().st_mtime_ns, p.stat().st_size)
+            for p in working_dir.glob("*.jpg")
+        )
+        _extract_working_copies(db, str(vireo_dir))
+        after = sorted(
+            (p.name, p.stat().st_mtime_ns, p.stat().st_size)
+            for p in working_dir.glob("*.jpg")
+        )
+        assert after == before, (
+            "second backfill pass must not regenerate any working copy "
+            "while the quota is unchanged (churn regression)"
+        )
+
+        # Raising the quota clears the deferred markers and the deferred rows
+        # become eligible again — the exact escape hatch we want to preserve.
+        db.conn.execute(
+            "UPDATE photos SET working_copy_evicted_mtime=NULL"
+            " WHERE working_copy_path IS NULL"
+        )
+        db.conn.commit()
+        assert working_copy_backfill_candidate_count(db) > 0
+    finally:
+        db.close()

@@ -294,6 +294,32 @@ def test_collection_count_and_optional_grid_keep_offline_members(live_server, pa
     )
 
 
+def test_all_offline_collection_does_not_show_import_welcome(live_server, page):
+    """An opened collection remains an active scope when no files are online."""
+    db = live_server["db"]
+    db.conn.execute("UPDATE folders SET status = 'missing'")
+    db.conn.commit()
+    collection_id = next(
+        collection["id"]
+        for collection in db.get_collections()
+        if collection["name"] == "All Photos"
+    )
+
+    page.goto(f"{live_server['url']}/browse?collection_id={collection_id}")
+
+    expect(page.locator("#offlineCollectionNotice")).to_be_visible(timeout=15000)
+    expect(page.locator("#offlineCollectionText")).to_have_text(
+        "0 of 5 photos available · 5 offline (hidden)"
+    )
+    expect(page.locator("#grid .grid-card")).to_have_count(0)
+    expect(page.locator("#welcomeState")).to_be_hidden()
+    expect(page.locator("#emptyState")).to_be_visible()
+
+    page.locator("#offlineCollectionToggle").click()
+    expect(page.locator("#grid .grid-card.offline")).to_have_count(5)
+    expect(page.locator("#emptyState")).to_be_hidden()
+
+
 def test_pending_keyword_click_supersedes_deep_link_collection(live_server, page):
     """A keyword clicked during pending init must displace the URL collection.
 

@@ -1119,6 +1119,7 @@ def test_original_route_enforces_working_copy_quota(
     ).fetchone()
     assert row["working_copy_path"] == f"working/{photo_id}.jpg"
     assert row["working_copy_evicted_mtime"] is None
+    response.close()
 
     # A rendition larger than a zero-byte budget is still usable for the
     # current response, but it must remain untracked and disappear when the

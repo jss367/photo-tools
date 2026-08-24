@@ -1075,6 +1075,29 @@ def test_settings_global_patch_enforces_and_clears_working_copy_quota(
     assert row["working_copy_evicted_mtime"] is None
 
 
+def test_unrelated_setting_does_not_scan_working_copy_cache(
+    app_and_db, monkeypatch,
+):
+    """Only an effective quota reduction needs synchronous WC eviction."""
+    import app as app_module
+
+    app, _db = app_and_db
+    calls = []
+    monkeypatch.setattr(
+        app_module,
+        "evict_working_copy_cache_if_over_quota",
+        lambda *_args, **_kwargs: calls.append(True),
+    )
+
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={"key": "working_copy_quality", "value": 91},
+    )
+
+    assert response.status_code == 200
+    assert calls == []
+
+
 def test_settings_global_delete_restores_default_and_clears_evictions(
     app_and_db, tmp_path,
 ):

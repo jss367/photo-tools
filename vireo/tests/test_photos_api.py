@@ -2037,6 +2037,55 @@ def test_original_serves_full_res_working_copy(app_and_db):
     assert resp.status_code == 200
 
 
+def test_original_opens_full_res_working_copy_under_eviction_guard(
+    app_and_db, monkeypatch,
+):
+    """Eviction cannot unlink a selected cache hit before send_file opens it."""
+    import app as app_module
+    import flask
+    from PIL import Image
+
+    app, db = app_and_db
+    pid = db.get_photos()[0]["id"]
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    wc_path = os.path.join(working_dir, f"{pid}.jpg")
+    Image.new("RGB", (800, 600)).save(wc_path, "JPEG")
+    db.conn.execute(
+        "UPDATE photos SET width=800, height=600, working_copy_path=? "
+        "WHERE id=?",
+        (f"working/{pid}.jpg", pid),
+    )
+    db.conn.commit()
+
+    real_guard = app_module.working_copy_publication_guard
+    real_send_file = flask.send_file
+    inside_guard = False
+
+    @contextlib.contextmanager
+    def tracking_guard():
+        nonlocal inside_guard
+        with real_guard():
+            inside_guard = True
+            try:
+                yield
+            finally:
+                inside_guard = False
+
+    def guarded_send_file(*args, **kwargs):
+        assert inside_guard, "working-copy send_file must open under the guard"
+        return real_send_file(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "working_copy_publication_guard", tracking_guard)
+    monkeypatch.setattr(flask, "send_file", guarded_send_file)
+
+    response = app.test_client().get(f"/photos/{pid}/original")
+
+    assert response.status_code == 200
+    assert response.data
+
+
 def test_unedited_raw_original_uses_camera_display_cache_not_working_copy(
     app_and_db, monkeypatch, tmp_path,
 ):

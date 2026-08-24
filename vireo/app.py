@@ -19870,7 +19870,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
         evict_preview_cache_if_over_quota(quota_db, vireo_dir)
-        evict_working_copy_cache_if_over_quota(quota_db, vireo_dir)
+        if current_working_copy_quota < previous_working_copy_quota:
+            # Cache writers and startup already enforce an unchanged quota.
+            # Avoid scanning every photo and working-copy file while holding
+            # the publication lock for unrelated settings saves.
+            evict_working_copy_cache_if_over_quota(quota_db, vireo_dir)
 
     def _read_raw_config_file():
         """Return the parsed contents of ~/.vireo/config.json, or {}.
@@ -38315,7 +38319,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # used by thumbnails and previews, so it must not be used as the
         # unedited lightbox rendition while the source is available.
         if trusted_wc_path and not primary_is_raw:
-            return send_file(trusted_wc_path, mimetype="image/jpeg")
+            # The dimension check above intentionally happens without holding
+            # the publication lock, but quota eviction can unlink the file in
+            # the gap before ``send_file`` opens it. Revalidate and open under
+            # the shared guard. ``send_file`` opens eagerly; once it returns,
+            # POSIX keeps the fd readable after unlink and Windows prevents
+            # eviction from unlinking the open handle.
+            with working_copy_publication_guard():
+                if os.path.isfile(trusted_wc_path):
+                    return send_file(trusted_wc_path, mimetype="image/jpeg")
 
         # Resolve original file path
         from offline_cache import resolve_original_path

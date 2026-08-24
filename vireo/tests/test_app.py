@@ -847,6 +847,10 @@ def test_storage_page_confirms_destructive_working_copy_quota_reduction(
     )[1].split(b'</div>', 1)[0]
     for marker in (
         b'applyWorkingCopyLimitBtn',
+        b'<dialog class="modal-overlay" id="workingCopyLimitModal"',
+        b'modal.showModal()',
+        b'MAX_WORKING_COPY_QUOTA_MB = 1048576',
+        b'quotaMb > _committedWorkingCopyQuotaMb',
         b'Lower working-copy storage limit?',
         b'Lower limit and remove copies',
         b'Your original photos will not be deleted',

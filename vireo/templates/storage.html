@@ -76,6 +76,10 @@ body { padding-bottom: 36px; }
   z-index: 1000; justify-content: center; align-items: center;
 }
 .modal-overlay.open { display: flex; }
+dialog.modal-overlay {
+  border: none; padding: 0; margin: 0; max-width: none; max-height: none; color: inherit;
+}
+dialog.modal-overlay::backdrop { background: transparent; }
 .modal {
   background: var(--bg-secondary); border: 1px solid var(--border-primary); border-radius: 8px;
   width: 90%; max-width: 560px; max-height: 80vh; display: flex; flex-direction: column;
@@ -201,7 +205,7 @@ body { padding-bottom: 36px; }
       <div class="setting-row" style="align-items:flex-start;">
         <div class="setting-label">Storage limit<small>Maximum space for edit-quality JPEGs generated from RAW files. Oldest files are removed first.</small></div>
         <div class="setting-control">
-          <input type="number" id="cfgWorkingCopyCacheMaxGb" min="0" step="1" value="20"
+          <input type="number" id="cfgWorkingCopyCacheMaxGb" min="0" max="1024" step="1" value="20"
                  aria-label="Working-copy storage limit in GB"
                  style="width:96px;background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-secondary);border-radius:4px;padding:4px 8px;font-size:13px;text-align:center;"
                  oninput="updateWorkingCopyLimitState()">
@@ -236,9 +240,10 @@ body { padding-bottom: 36px; }
   </div>
 </div>
 
-<div class="modal-overlay" id="workingCopyLimitModal"
-     role="dialog" aria-modal="true" aria-labelledby="workingCopyLimitModalTitle"
-     onclick="if(event.target===this)closeWorkingCopyLimitModal()">
+<dialog class="modal-overlay" id="workingCopyLimitModal"
+        aria-labelledby="workingCopyLimitModalTitle"
+        oncancel="event.preventDefault();closeWorkingCopyLimitModal()"
+        onclick="if(event.target===this)closeWorkingCopyLimitModal()">
   <div class="modal">
     <div class="modal-header">
       <h3 id="workingCopyLimitModalTitle">Lower working-copy storage limit?</h3>
@@ -253,7 +258,7 @@ body { padding-bottom: 36px; }
               onclick="confirmWorkingCopyLimit()">Lower limit and remove copies</button>
     </div>
   </div>
-</div>
+</dialog>
 
 <div class="modal-overlay" id="masksModal" onclick="if(event.target===this)closeMasksModal()">
   <div class="modal">
@@ -327,9 +332,8 @@ loadStorageConfig();
 
 var _storageSaveTimer = null;
 var _committedWorkingCopyQuotaMb = 20480;
-// null = current working-copy usage has not yet been measured. Apply must
-// stay disabled until a measurement is available; otherwise the < comparison
-// in applyWorkingCopyLimit would bypass the eviction-confirmation modal.
+var MAX_WORKING_COPY_QUOTA_MB = 1048576;
+// null = current working-copy usage has not yet been measured.
 var _workingCopySizeBytes = null;
 var _pendingWorkingCopyQuotaMb = null;
 
@@ -359,7 +363,9 @@ function readWorkingCopyQuotaMb() {
   var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
   var gb = Number(input.value);
   if (!Number.isFinite(gb) || gb < 0 || input.value.trim() === '') return null;
-  return Math.round(gb * 1024);
+  var quotaMb = Math.round(gb * 1024);
+  if (!Number.isFinite(quotaMb) || quotaMb > MAX_WORKING_COPY_QUOTA_MB) return null;
+  return quotaMb;
 }
 
 function updateWorkingCopyLimitState() {
@@ -368,11 +374,7 @@ function updateWorkingCopyLimitState() {
   var applyBtn = document.getElementById('applyWorkingCopyLimitBtn');
   var valid = quotaMb != null;
   input.setAttribute('aria-invalid', valid ? 'false' : 'true');
-  var usageKnown = _workingCopySizeBytes != null;
-  applyBtn.disabled = !valid || quotaMb === _committedWorkingCopyQuotaMb || !usageKnown;
-  applyBtn.title = !usageKnown
-    ? 'Waiting for current working-copy usage before this limit can be applied'
-    : '';
+  applyBtn.disabled = !valid || quotaMb === _committedWorkingCopyQuotaMb;
 }
 
 // Autosaved storage controls — everything EXCEPT the working-copy quota.
@@ -445,56 +447,65 @@ async function applyWorkingCopyLimit() {
   }
   if (quotaMb === _committedWorkingCopyQuotaMb) return;
 
-  // Re-measure usage before comparing. The last snapshot could be minutes
-  // old and working-copy generation may have pushed usage above the new
-  // quota since; without this the direct-commit branch below would evict
-  // without showing the confirmation modal.
+  // Confirm every configured quota reduction. Usage can grow between this
+  // measurement and the config write, so a usage-only comparison could still
+  // allow eviction without confirmation.
+  if (quotaMb > _committedWorkingCopyQuotaMb) {
+    await commitWorkingCopyLimit(quotaMb);
+    return;
+  }
+
   var applyBtn = document.getElementById('applyWorkingCopyLimitBtn');
   var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
   applyBtn.disabled = true;
   input.disabled = true;
   applyBtn.textContent = 'Checking…';
   var usage = await refreshWorkingCopyUsage();
-  if (usage == null) {
-    input.disabled = false;
-    applyBtn.textContent = 'Apply';
-    updateWorkingCopyLimitState();
-    showToast('Could not measure current working-copy usage; try Refresh.', 'error');
-    return;
-  }
-
   var quotaBytes = quotaMb * 1024 * 1024;
-  if (quotaBytes < usage) {
-    input.disabled = false;
-    applyBtn.textContent = 'Apply';
-    updateWorkingCopyLimitState();
-    _pendingWorkingCopyQuotaMb = quotaMb;
-    var removalBytes = usage - quotaBytes;
-    var newLimit = storageFormatBytes(quotaBytes);
-    document.getElementById('workingCopyLimitModalDesc').textContent =
+  var removalBytes = usage == null ? null : Math.max(0, usage - quotaBytes);
+  var newLimit = storageFormatBytes(quotaBytes);
+  input.disabled = true;
+  applyBtn.textContent = 'Apply';
+  updateWorkingCopyLimitState();
+  _pendingWorkingCopyQuotaMb = quotaMb;
+  var desc = document.getElementById('workingCopyLimitModalDesc');
+  var confirmBtn = document.getElementById('confirmWorkingCopyLimitBtn');
+  if (removalBytes > 0) {
+    desc.textContent =
       'Lowering the limit to ' + newLimit + ' will remove approximately ' +
       storageFormatBytes(removalBytes) + ' of the oldest generated working copies. ' +
       'Your original photos will not be deleted. Vireo will use the originals when a working copy is unavailable.';
-    document.getElementById('workingCopyLimitModal').classList.add('open');
-    document.getElementById('confirmWorkingCopyLimitBtn').focus();
-    return;
+    confirmBtn.textContent = 'Lower limit and remove copies';
+  } else {
+    var usageNote = usage == null
+      ? 'Current working-copy usage could not be measured. '
+      : 'No working copies currently exceed the new limit. ';
+    desc.textContent = usageNote + 'If usage is above ' + newLimit +
+      ' when the change is applied, Vireo will remove the oldest generated working copies. ' +
+      'Your original photos will not be deleted.';
+    confirmBtn.textContent = 'Lower storage limit';
   }
-
-  // Usage is at or below the new quota; commit directly.
-  // commitWorkingCopyLimit takes over the input/button state via its own
-  // try/finally, so no restore is needed here.
-  await commitWorkingCopyLimit(quotaMb);
+  var modal = document.getElementById('workingCopyLimitModal');
+  modal.classList.add('open');
+  modal.showModal();
+  confirmBtn.focus();
 }
 
 function closeWorkingCopyLimitModal() {
-  document.getElementById('workingCopyLimitModal').classList.remove('open');
+  var modal = document.getElementById('workingCopyLimitModal');
+  if (modal.open) modal.close();
+  modal.classList.remove('open');
   _pendingWorkingCopyQuotaMb = null;
+  document.getElementById('cfgWorkingCopyCacheMaxGb').disabled = false;
+  updateWorkingCopyLimitState();
   document.getElementById('applyWorkingCopyLimitBtn').focus();
 }
 
 function confirmWorkingCopyLimit() {
   var quotaMb = _pendingWorkingCopyQuotaMb;
-  document.getElementById('workingCopyLimitModal').classList.remove('open');
+  var modal = document.getElementById('workingCopyLimitModal');
+  if (modal.open) modal.close();
+  modal.classList.remove('open');
   _pendingWorkingCopyQuotaMb = null;
   if (quotaMb != null) commitWorkingCopyLimit(quotaMb);
 }

@@ -603,6 +603,21 @@ def extract_working_copy(
     except Exception:
         log.warning("Failed to extract working copy from %s", source_path,
                     exc_info=True)
+        # Remove any partial bytes ``img.save`` wrote before raising.
+        # Leaving them behind counts toward the working-copy quota (working
+        # copy cache eviction excludes files under its 60-second writer
+        # grace) and can look like a valid rendition to callers that only
+        # check for path existence, while ``PIL.Image.open`` on the corrupt
+        # bytes 500s later.
+        try:
+            os.remove(output_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            log.warning(
+                "Could not remove partial working-copy output %s after "
+                "extraction failure", output_path, exc_info=True,
+            )
         return False
 
 

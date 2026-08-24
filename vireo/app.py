@@ -38348,18 +38348,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             else RAW_DECODE_PRESERVE_HIGHLIGHTS
         )
 
-        def _extract_original_copy(source_path):
-            # Always extract into a private tempfile before publishing to
-            # ``wc_abs``. When several requests miss the cache at once
-            # (single-flight waiters wake as new producers after the first
-            # producer moves its rendition aside), each producer writes its
-            # own bytes to a distinct path and only the atomic ``os.replace``
-            # ever touches ``wc_abs``. Without this, ``extract_working_copy``
-            # writes directly to ``wc_abs`` in every producer and the
-            # concurrent ``img.save`` calls can interleave into a truncated
-            # file — the next ``PIL.Image.open(wc_abs)`` in this route then
-            # 500s. The RAW branch already did the tempfile dance; the
-            # non-RAW branch now does it too.
+        def _extract_to_private_tmp(source_path):
+            """Encode ``source_path`` to a per-request private tempfile.
+
+            Returns the tempfile path on success or ``None`` on failure —
+            publishing (moving the bytes to ``wc_abs``) is the caller's
+            decision. The non-cacheable branch skips publication entirely
+            and streams the tempfile directly, so concurrent waiters —
+            each with their own tempfile — cannot race to remove each
+            other's canonical file out from under ``send_file``. When
+            multiple producers miss the cache at once (single-flight
+            waiters wake as new producers after the first producer
+            finishes) each still writes its own bytes to a distinct path,
+            so their ``extract_working_copy`` calls never interleave into a
+            truncated file that ``PIL.Image.open`` later 500s on.
+            """
             output_dir = os.path.dirname(wc_abs)
             os.makedirs(output_dir, exist_ok=True)
             fd, tmp_path = tempfile.mkstemp(
@@ -38376,39 +38379,64 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     quality=quality,
                     raw_decode=extraction_decode,
                 )
-                if extracted:
-                    os.replace(tmp_path, wc_abs)
-                    tmp_path = None
-                    if primary_is_raw:
-                        # The display cache-hit check compares against
-                        # ``max(mtime(image_path), mtime(companion))``.
-                        # Leaving wall-clock mtime here fails that check
-                        # whenever either live source has a future mtime
-                        # (clock skew, archives that preserve future
-                        # timestamps), and every request re-decodes the RAW
-                        # and companion. Peg to the same max the check
-                        # consults. Use ``raw_source_path`` — the RAW resolved
-                        # before the has_current_raw_failure branch rewrote
-                        # ``image_path`` to the companion — so a newer RAW
-                        # mtime doesn't fail the gate and re-extract on every
-                        # hit.
-                        _peg_display_cache_mtime(
-                            wc_abs,
-                            (raw_source_path, companion_for_extraction),
-                        )
-                return extracted
-            finally:
-                if tmp_path:
-                    with contextlib.suppress(OSError):
-                        os.unlink(tmp_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+                raise
+            if not extracted:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+                return None
+            return tmp_path
 
-        def _serve_generated_original(uw, uh):
-            """Persist/enforce a non-RAW copy, or serve it transiently."""
+        def _publish_extraction(tmp_path):
+            """Atomically move ``tmp_path`` to ``wc_abs`` (and peg RAW mtime).
+
+            Callers pass a path returned from ``_extract_to_private_tmp``
+            and must stop referring to it after this call — the tempfile
+            no longer exists at that path. The RAW branch pegs the display
+            cache mtime so the source-mtime cache-hit check does not
+            re-decode on every request under clock skew or preserved-
+            forward archive timestamps.
+            """
+            os.replace(tmp_path, wc_abs)
+            if primary_is_raw:
+                # The display cache-hit check compares against
+                # ``max(mtime(image_path), mtime(companion))``.
+                # Leaving wall-clock mtime here fails that check
+                # whenever either live source has a future mtime
+                # (clock skew, archives that preserve future
+                # timestamps), and every request re-decodes the RAW
+                # and companion. Peg to the same max the check
+                # consults. Use ``raw_source_path`` — the RAW resolved
+                # before the has_current_raw_failure branch rewrote
+                # ``image_path`` to the companion — so a newer RAW
+                # mtime doesn't fail the gate and re-extract on every
+                # hit.
+                _peg_display_cache_mtime(
+                    wc_abs,
+                    (raw_source_path, companion_for_extraction),
+                )
+
+        def _serve_generated_original(tmp_path, uw, uh):
+            """Publish to the cache, or stream the private tmp transiently.
+
+            ``tmp_path`` is the private rendition from
+            ``_extract_to_private_tmp``. The RAW branch has always already
+            published (its callers publish immediately so their
+            ``PIL.Image.open`` size peek reads a known path); it passes
+            ``tmp_path=None`` and this call just serves ``wc_abs``.
+            Otherwise, the cacheable branch publishes and serves from
+            ``wc_abs`` (pinning against concurrent eviction with an open
+            fd); the non-cacheable branch keeps the file at a per-request
+            transient path and streams from there — ``wc_abs`` is never
+            touched, so concurrent waiters cannot collide there.
+            """
             if primary_is_raw:
                 return send_file(wc_abs, mimetype="image/jpeg")
 
             try:
-                generated_size = os.path.getsize(wc_abs)
+                generated_size = os.path.getsize(tmp_path)
             except OSError:
                 generated_size = working_copy_budget + 1
             cacheable = (
@@ -38416,15 +38444,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 and generated_size <= working_copy_budget
             )
             if cacheable:
-                # Open the file BEFORE we commit the row that makes ``wc_abs``
-                # visible to concurrent eviction passes. A peer thread that
-                # runs ``evict_if_over_quota`` between the commit here and
-                # the open below can select this just-written file as the
-                # oldest and unlink it before Flask ever has an fd on it,
-                # turning a successful render into a 500. Opening first:
-                # POSIX keeps the bytes readable through an unlink; Windows
-                # makes the open fd itself prevent unlink so eviction of
-                # this specific file just no-ops.
+                # Publish first, then open the file BEFORE we commit the row
+                # that makes ``wc_abs`` visible to concurrent eviction
+                # passes. A peer thread that runs ``evict_if_over_quota``
+                # between the commit here and the open below can select
+                # this just-written file as the oldest and unlink it
+                # before Flask ever has an fd on it, turning a successful
+                # render into a 500. Opening first: POSIX keeps the bytes
+                # readable through an unlink; Windows makes the open fd
+                # itself prevent unlink so eviction of this specific file
+                # just no-ops.
+                _publish_extraction(tmp_path)
                 try:
                     rendition_fh = open(wc_abs, "rb")  # noqa: SIM115 — closed by send_file's response
                 except OSError:
@@ -38439,9 +38469,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 ]
                 params = [wc_rel]
             else:
-                # The response still needs a decoded JPEG, but a zero quota
-                # (or one smaller than this single rendition) must not turn
-                # that response into a persistent cache entry.
+                # Non-cacheable: keep the rendition in ``tmp_path`` (a
+                # per-request private tempfile) and never publish to
+                # ``wc_abs`` at all. Publishing would only invite two races
+                # under a zero or undersized quota: waiters would compete
+                # to move ``wc_abs`` to their own transient location and
+                # every waiter but the winner would ``os.replace(wc_abs,
+                # ...)`` a missing file (500), and a concurrent eviction
+                # pass would see and immediately unlink the "orphan" it
+                # cannot reconcile against any catalog row. The DB still
+                # records ``working_copy_path=NULL`` so future requests
+                # know they must regenerate rather than expect a cache
+                # hit. The response still needs a decoded JPEG, but a
+                # zero quota (or one smaller than this single rendition)
+                # must not turn that response into a persistent cache
+                # entry.
                 updates = [
                     "working_copy_path=NULL",
                     "working_copy_evicted_mtime=COALESCE(file_mtime, -1)",
@@ -38475,11 +38517,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     )
                 return response
 
-            # Non-cacheable rendition: move the atomically published file to
-            # a private one-shot path before the single-flight producer
-            # returns. Waiters therefore see no canonical cache hit, while
-            # Windows can delete the private file after its response handle
-            # closes (unlinking an open file is not supported there).
+            # Non-cacheable rendition: relocate ``tmp_path`` into
+            # ``originals/`` so a stream interrupted by a process kill is
+            # reclaimed by ``_sweep_abandoned_transient_originals`` on the
+            # next startup. ``tmp_path`` is unique per waiter (mkstemp), so
+            # the move never collides with a peer's tempfile. Windows can
+            # delete the private file after its response handle closes
+            # (unlinking an open file is not supported there).
             transient_dir = os.path.join(vireo_dir, "originals")
             os.makedirs(transient_dir, exist_ok=True)
             fd, transient_path = tempfile.mkstemp(
@@ -38488,7 +38532,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 dir=transient_dir,
             )
             os.close(fd)
-            os.replace(wc_abs, transient_path)
+            try:
+                os.replace(tmp_path, transient_path)
+            except OSError:
+                log.exception(
+                    "Failed to relocate rendition %s to transient path %s",
+                    tmp_path, transient_path,
+                )
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+                with contextlib.suppress(OSError):
+                    os.unlink(transient_path)
+                return "Could not load image", 500
             try:
                 rendition_fh = open(transient_path, "rb")  # noqa: SIM115 — closed by _stream_rendition's finally
             except OSError:
@@ -38512,11 +38567,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             return Response(_stream_rendition(), mimetype="image/jpeg")
 
-        if _extract_original_copy(source_for_extraction):
+        tmp_path = _extract_to_private_tmp(source_for_extraction)
+        if tmp_path:
             # Update DB so future requests are fast; also backfill
             # dimensions if missing so the full-res shortcut works next time
             from PIL import Image as _PILImage
-            with _PILImage.open(wc_abs) as upgraded:
+            if primary_is_raw:
+                # RAW display cache goes through ``wc_abs`` immediately so
+                # subsequent checks (undersized retry, trusted-wc override)
+                # can peek at the just-written file directly.
+                _publish_extraction(tmp_path)
+                tmp_path = None
+                peek_path = wc_abs
+            else:
+                # Non-RAW: keep the rendition private until cacheability
+                # is decided in ``_serve_generated_original``. Peek at the
+                # tempfile itself for its dimensions.
+                peek_path = tmp_path
+            with _PILImage.open(peek_path) as upgraded:
                 uw, uh = upgraded.size
             # For RAW sources, extract_working_copy can succeed via the
             # embedded JPEG fallback when libraw can't demosaic the file.
@@ -38547,9 +38615,31 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         "from companion JPEG",
                         photo_id, uw, uh, expected_w, expected_h,
                     )
-                    if _extract_original_copy(companion_for_extraction):
-                        with _PILImage.open(wc_abs) as upgraded:
-                            uw, uh = upgraded.size
+                    companion_tmp = _extract_to_private_tmp(
+                        companion_for_extraction,
+                    )
+                    if companion_tmp:
+                        if primary_is_raw:
+                            # RAW display cache: publish the companion bytes
+                            # directly to ``wc_abs`` (overwriting the RAW
+                            # extraction we published above). The subsequent
+                            # size peek reads from the published path.
+                            _publish_extraction(companion_tmp)
+                            with _PILImage.open(wc_abs) as upgraded:
+                                uw, uh = upgraded.size
+                        else:
+                            # Non-RAW: neither the primary nor the companion
+                            # rendition has been published yet. Discard the
+                            # undersized primary tempfile and hand the
+                            # companion bytes to ``_serve_generated_original``
+                            # instead so the cacheable/transient decision
+                            # runs against them.
+                            if tmp_path:
+                                with contextlib.suppress(OSError):
+                                    os.unlink(tmp_path)
+                            tmp_path = companion_tmp
+                            with _PILImage.open(tmp_path) as upgraded:
+                                uw, uh = upgraded.size
                     else:
                         log.warning(
                             "Companion re-extraction failed for photo %s; "
@@ -38577,7 +38667,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         db, photo, source_for_extraction,
                     )
                     return send_file(trusted_wc_path, mimetype="image/jpeg")
-            return _serve_generated_original(uw, uh)
+            return _serve_generated_original(tmp_path, uw, uh)
 
         # extract_working_copy failed on a RAW source: try the full-res
         # companion JPEG as a fallback before giving up. This catches
@@ -38588,16 +38678,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             resolved_ext in RAW_EXTENSIONS
             and companion_for_extraction
             and companion_for_extraction != source_for_extraction
-            and _extract_original_copy(companion_for_extraction)
         ):
-            from PIL import Image as _PILImage
-            with _PILImage.open(wc_abs) as upgraded:
-                uw, uh = upgraded.size
-            log.info(
-                "RAW extraction failed for photo %s original; served "
-                "companion JPEG instead", photo_id,
-            )
-            return _serve_generated_original(uw, uh)
+            companion_tmp = _extract_to_private_tmp(companion_for_extraction)
+            if companion_tmp:
+                from PIL import Image as _PILImage
+                if primary_is_raw:
+                    _publish_extraction(companion_tmp)
+                    companion_tmp = None
+                    peek_path = wc_abs
+                else:
+                    peek_path = companion_tmp
+                with _PILImage.open(peek_path) as upgraded:
+                    uw, uh = upgraded.size
+                log.info(
+                    "RAW extraction failed for photo %s original; served "
+                    "companion JPEG instead", photo_id,
+                )
+                return _serve_generated_original(companion_tmp, uw, uh)
 
         # Fallback: serve via load_image
         raw_decode = (

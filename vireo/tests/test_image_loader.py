@@ -486,6 +486,46 @@ def test_extract_working_copy_missing_source_returns_false(tmp_path):
     assert not output.exists()
 
 
+def test_extract_working_copy_removes_partial_output_on_failure(
+    tmp_path, monkeypatch,
+):
+    """A partial output left by a mid-encode failure must be removed.
+
+    Without cleanup, ``working/<id>.jpg`` still exists after the failed
+    encode. It is skipped by the on-demand write's cacheable-open logic
+    (which decodes the file to measure it), but scanner backfill's post-
+    loop quota accounting counts every canonical file. That would let a
+    batch of encoding failures leave corrupt bytes in the cache that
+    ``PIL.Image.open`` in later routes 500s on and that eviction skips
+    under the 60-second writer grace.
+    """
+    from image_loader import extract_working_copy
+    from PIL import Image
+
+    source = tmp_path / "photo.jpg"
+    Image.new("RGB", (100, 100), color=(255, 0, 0)).save(str(source), "JPEG")
+    output = tmp_path / "working" / "42.jpg"
+
+    real_save = Image.Image.save
+
+    def fail_after_writing(self, fp, *args, **kwargs):
+        # Simulate ``img.save`` writing partial JPEG bytes and then
+        # crashing (out-of-disk, corrupt tables, etc.).
+        if isinstance(fp, str):
+            with open(fp, "wb") as fh:
+                fh.write(b"\xff\xd8\xff\xe0truncated jpeg header")
+        raise OSError("simulated encoder failure")
+
+    monkeypatch.setattr(Image.Image, "save", fail_after_writing)
+
+    result = extract_working_copy(str(source), str(output), max_size=0)
+
+    Image.Image.save = real_save
+
+    assert result is False
+    assert not output.exists()
+
+
 # ── load_working_image tests ──────────────────────────────────────────
 
 

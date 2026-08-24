@@ -10,7 +10,6 @@ import logging
 import os
 import shutil
 import tempfile
-import threading
 
 import model_verify
 
@@ -549,6 +548,48 @@ def _needs_atomic_publish(filename):
     return filename.endswith(".json")
 
 
+@contextlib.contextmanager
+def _staged_sibling(dest_path):
+    """Yield a unique staging path beside `dest_path` for atomic publish.
+
+    A fixed ``<dest>.tmp`` name is *shared* by every concurrent writer,
+    which throws away the guarantee the os.replace exists for. The
+    background label_descriptions heal and a Settings Repair are both
+    supported recovery paths and can run at the same time — Repair calls
+    ensure_timm_label_descriptions directly — so both can reach the same
+    staging pathname. One writer's open() then truncates the inode the
+    other is still filling, one of them renames that shared inode onto
+    the target and briefly publishes a partial document, and the loser
+    fails outright because its temporary pathname has disappeared.
+    mkstemp hands each invocation its own inode, so the only thing that
+    overlaps is the os.replace itself, and that is atomic.
+
+    Staged in the destination's own directory so the replace stays within
+    one filesystem (what makes it atomic) — and, for the models dir,
+    so it can't strand a copy on a different volume.
+
+    The descriptor mkstemp opens is closed before the path is yielded:
+    Windows refuses to replace a file that any handle still has open, so
+    every caller must reach os.replace with nothing open on the staging
+    file. Callers here either shutil.copy2 onto the path or open/close it
+    in a ``with`` block, both of which leave no handle behind.
+
+    Removes the staging file if it still exists on exit, so a failed
+    writer never litters the model directory. After a successful
+    os.replace there is nothing left to remove.
+    """
+    fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(dest_path) or ".",
+        prefix=f"{os.path.basename(dest_path)}.part-",
+    )
+    os.close(fd)
+    try:
+        yield tmp_path
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+
+
 def _hf_download_with_retry(repo_id, filename, local_dir,
                             subfolder=None, progress_callback=None,
                             revision=None):
@@ -664,17 +705,12 @@ def _hf_download_with_retry(repo_id, filename, local_dir,
                     # file or no file. Cheap here: these are small
                     # metadata files — see _needs_atomic_publish for why
                     # the multi-GB weight artifacts must not do this.
-                    tmp_path = (
-                        f"{dest_path}.part-"
-                        f"{os.getpid()}-{threading.get_ident()}"
-                    )
-                    try:
+                    # The staging name is unique per invocation (see
+                    # _staged_sibling) so two concurrent publishers of the
+                    # same file never share one staging inode.
+                    with _staged_sibling(dest_path) as tmp_path:
                         shutil.copy2(cached_path, tmp_path)
                         os.replace(tmp_path, dest_path)
-                    except BaseException:
-                        with contextlib.suppress(OSError):
-                            os.unlink(tmp_path)
-                        raise
                 else:
                     # Weights: copy straight into place so a download
                     # never needs 2x the model size on disk. A failed
@@ -1402,15 +1438,40 @@ def ensure_timm_label_descriptions(model_dir, model_str, progress_callback=None)
         )
         return False
 
-    tmp_target = target + ".tmp"
+    # Stage under a name unique to this invocation, never a shared
+    # "<target>.tmp": a background heal and a Settings Repair both reach
+    # this fallback when the ONNX repo has no copy of the file, and a
+    # shared staging inode would let one truncate the other's bytes and
+    # publish a torn document. mkstemp creates the file 0600 and leaves
+    # it that way; ~/.vireo is single-user data, so private is the right
+    # default. The handle is closed before os.replace — Windows will not
+    # replace a file that anything still has open.
     try:
-        with open(tmp_target, "w") as f:
-            json.dump(descs, f)
-        os.replace(tmp_target, target)
+        with _staged_sibling(target) as tmp_target:
+            with open(tmp_target, "w") as f:
+                json.dump(descs, f)
+                # Closing only hands the bytes to the page cache; a crash
+                # right after the rename would otherwise expose exactly
+                # the empty/partial target this path exists to prevent.
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_target, target)
     except OSError as e:
+        # Losing the publish race is not a failure to heal. On Windows two
+        # os.replace calls onto one destination serialize and the loser
+        # gets PermissionError ("Access is denied") even though the file
+        # it wanted is now on disk — see the same handling in
+        # local_masks.snapshot. This is a post-condition check, not a
+        # retry loop: if a usable document is published, this heal's goal
+        # is met and reporting failure would only arm a needless retry.
+        if label_descriptions_usable(target):
+            log.info(
+                "label_descriptions.json for %s was published by a "
+                "concurrent writer while this heal was staging (%s)",
+                model_str, e,
+            )
+            return True
         log.warning("Could not write %s: %s", target, e)
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_target)
         return False
 
     log.info(

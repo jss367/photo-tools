@@ -3225,3 +3225,161 @@ def test_download_model_clears_a_failed_heal_verdict(tmp_path, monkeypatch):
             timm_classifier._HEAL_STATE.pop(stale, None)
             timm_classifier._HEAL_ATTEMPTS.pop(stale, None)
             timm_classifier._HEAL_RETRY_AT.pop(stale, None)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent atomic publication of label_descriptions.json
+# ---------------------------------------------------------------------------
+
+
+def test_staged_sibling_is_unique_per_invocation(tmp_path):
+    """Two writers staging for the same destination must not share a file.
+
+    A fixed "<dest>.tmp" gives concurrent writers one staging inode: one
+    open() truncates what the other is writing, the winner publishes a
+    torn document, and the loser fails because its pathname vanished.
+    """
+    import models
+
+    dest = tmp_path / "label_descriptions.json"
+    with models._staged_sibling(str(dest)) as a:
+        with models._staged_sibling(str(dest)) as b:
+            assert a != b
+            # Same directory, or os.replace stops being atomic.
+            assert os.path.dirname(a) == os.path.dirname(b) == str(tmp_path)
+            # mkstemp already created them, and the descriptor it opened is
+            # closed before the path is handed over: Windows refuses to
+            # os.replace a file anything still holds open.
+            assert os.path.isfile(a) and os.path.isfile(b)
+            with open(a, "w") as f:
+                f.write("a")
+            with open(b, "w") as f:
+                f.write("b")
+        assert not os.path.exists(b)
+    assert not os.path.exists(a)
+
+
+def test_staged_sibling_cleans_up_when_the_writer_fails(tmp_path):
+    """A crashed writer must not litter the model directory."""
+    import models
+
+    dest = tmp_path / "label_descriptions.json"
+    captured = {}
+    with pytest.raises(RuntimeError):
+        with models._staged_sibling(str(dest)) as tmp:
+            captured["tmp"] = tmp
+            with open(tmp, "w") as f:
+                f.write("{ partial")
+            raise RuntimeError("download died")
+    assert not os.path.exists(captured["tmp"])
+    assert list(os.listdir(tmp_path)) == []
+
+
+def test_concurrent_label_description_heals_publish_whole_json(
+    tmp_path, monkeypatch
+):
+    """A background heal and a Settings Repair can hit the upstream-config
+    fallback at the same time — Repair calls ensure_timm_label_descriptions
+    directly — so both are supported concurrent writers. Each must stage to
+    its own file: with a shared "<target>.tmp" one truncates the other's
+    inode, whoever renames first publishes a half-written document, and the
+    loser fails outright because its staging pathname is gone.
+    """
+    import contextlib
+    import threading
+
+    import models
+
+    target = tmp_path / "label_descriptions.json"
+
+    # Deliberately different payloads (and lengths) per writer. If both
+    # wrote identical bytes, an interleaved write into a shared inode
+    # would reassemble into a valid document and hide the bug.
+    payloads = [
+        {f"Genus alpha{i}": f"Alpha Bird {i}, Bird" for i in range(400)},
+        {"Genus beta": "Beta Bird, Bird"},
+    ]
+    handed = []
+    hand_lock = threading.Lock()
+
+    def _fake_upstream(model_str):
+        with hand_lock:
+            idx = len(handed)
+            handed.append(idx)
+        return {"label_descriptions": payloads[idx]}
+
+    # The ONNX repo has no copy of this optional file, which is exactly
+    # the precondition that routes both writers into the fallback.
+    monkeypatch.setattr(
+        models, "_download_optional_files",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(models, "_load_upstream_timm_config", _fake_upstream)
+
+    # Force the two writers to overlap inside the serialization step, the
+    # window where a shared staging file does its damage.
+    barrier = threading.Barrier(2, timeout=10)
+    real_dumps = json.dumps
+
+    def _interleaved_dump(obj, fp, *args, **kwargs):
+        text = real_dumps(obj)
+        half = len(text) // 2
+        fp.write(text[:half])
+        fp.flush()
+        with contextlib.suppress(threading.BrokenBarrierError):
+            barrier.wait()
+        fp.write(text[half:])
+
+    monkeypatch.setattr(models.json, "dump", _interleaved_dump)
+
+    torn_reads = []
+    stop = threading.Event()
+
+    def _reader():
+        while not stop.is_set():
+            try:
+                raw = target.read_bytes()
+            except OSError:
+                continue
+            if not raw:
+                torn_reads.append("")
+                continue
+            try:
+                json.loads(raw.decode())
+            except (ValueError, UnicodeDecodeError):
+                torn_reads.append(raw[:80])
+
+    results = []
+    res_lock = threading.Lock()
+
+    def _heal():
+        ok = models.ensure_timm_label_descriptions(
+            str(tmp_path), _TIMM_MODEL_STR
+        )
+        with res_lock:
+            results.append(ok)
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+    writers = [threading.Thread(target=_heal) for _ in range(2)]
+    for t in writers:
+        t.start()
+    for t in writers:
+        t.join(timeout=30)
+        assert not t.is_alive()
+    stop.set()
+    reader.join(timeout=5)
+
+    # Neither writer may fail because the other took its staging file.
+    assert results == [True, True], f"a concurrent heal failed: {results}"
+    # The published file is one writer's whole document, never a blend.
+    published = json.loads(target.read_text())
+    assert published in payloads
+    # And no reader ever observed a partial/empty target.
+    assert torn_reads == [], f"observed torn label_descriptions.json: {torn_reads[:3]}"
+    # No staging turds left in the model directory.
+    leftovers = [
+        p for p in os.listdir(tmp_path)
+        if p != "label_descriptions.json"
+    ]
+    assert leftovers == [], leftovers

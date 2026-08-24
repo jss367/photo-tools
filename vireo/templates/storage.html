@@ -327,7 +327,10 @@ loadStorageConfig();
 
 var _storageSaveTimer = null;
 var _committedWorkingCopyQuotaMb = 20480;
-var _workingCopySizeBytes = 0;
+// null = current working-copy usage has not yet been measured. Apply must
+// stay disabled until a measurement is available; otherwise the < comparison
+// in applyWorkingCopyLimit would bypass the eviction-confirmation modal.
+var _workingCopySizeBytes = null;
 var _pendingWorkingCopyQuotaMb = null;
 
 async function loadStorageConfig() {
@@ -365,24 +368,40 @@ function updateWorkingCopyLimitState() {
   var applyBtn = document.getElementById('applyWorkingCopyLimitBtn');
   var valid = quotaMb != null;
   input.setAttribute('aria-invalid', valid ? 'false' : 'true');
-  applyBtn.disabled = !valid || quotaMb === _committedWorkingCopyQuotaMb;
+  var usageKnown = _workingCopySizeBytes != null;
+  applyBtn.disabled = !valid || quotaMb === _committedWorkingCopyQuotaMb || !usageKnown;
+  applyBtn.title = !usageKnown
+    ? 'Waiting for current working-copy usage before this limit can be applied'
+    : '';
 }
 
-function storageConfigPayload(workingCopyQuotaMb) {
+// Autosaved storage controls — everything EXCEPT the working-copy quota.
+// The quota has its own explicit Apply flow (postWorkingCopyLimit); mixing
+// it into the autosave payload would let a debounced autosave that fires
+// while commitWorkingCopyLimit is in flight silently POST the old
+// _committedWorkingCopyQuotaMb and undo the quota change on the server.
+function autosaveStorageConfigPayload() {
   return {
     thumbnail_size: parseInt(document.getElementById('cfgThumbSize').value, 10) || 400,
     thumbnail_quality: parseInt(document.getElementById('cfgThumbQuality').value, 10) || 85,
     preview_quality: parseInt(document.getElementById('cfgPreviewQuality').value, 10) || 90,
     preview_cache_max_mb: Math.max(0, parseInt(document.getElementById('cfgPreviewCacheMaxMb').value, 10) || 0),
-    working_copy_cache_max_mb: workingCopyQuotaMb,
   };
 }
 
-async function postStorageConfig(workingCopyQuotaMb) {
+async function postAutosaveStorageConfig() {
   await safeFetch('/api/config', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(storageConfigPayload(workingCopyQuotaMb)),
+    body: JSON.stringify(autosaveStorageConfigPayload()),
+  });
+}
+
+async function postWorkingCopyLimit(workingCopyQuotaMb) {
+  await safeFetch('/api/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({working_copy_cache_max_mb: workingCopyQuotaMb}),
   });
 }
 
@@ -390,14 +409,35 @@ function saveStorageConfig() {
   clearTimeout(_storageSaveTimer);
   _storageSaveTimer = setTimeout(async function() {
     try {
-      await postStorageConfig(_committedWorkingCopyQuotaMb);
+      await postAutosaveStorageConfig();
       loadPreviewCacheStatus();
       loadStoragePanel();
     } catch(e) {}
   }, 250);
 }
 
-function applyWorkingCopyLimit() {
+// Fetch a fresh working-copy usage snapshot. Returns the size in bytes on
+// success, or null if the /api/storage scan failed. Keeps
+// _workingCopySizeBytes and the Apply button state in sync with the result.
+async function refreshWorkingCopyUsage() {
+  try {
+    var s = await safeFetch('/api/storage', {}, { toast: false });
+    var working = s && s.working_copies ? s.working_copies : null;
+    if (!working) {
+      _workingCopySizeBytes = null;
+      return null;
+    }
+    _workingCopySizeBytes = working.size || 0;
+    return _workingCopySizeBytes;
+  } catch(e) {
+    _workingCopySizeBytes = null;
+    return null;
+  } finally {
+    updateWorkingCopyLimitState();
+  }
+}
+
+async function applyWorkingCopyLimit() {
   var quotaMb = readWorkingCopyQuotaMb();
   if (quotaMb == null) {
     showToast('Enter a valid working-copy storage limit', 'error');
@@ -405,10 +445,31 @@ function applyWorkingCopyLimit() {
   }
   if (quotaMb === _committedWorkingCopyQuotaMb) return;
 
+  // Re-measure usage before comparing. The last snapshot could be minutes
+  // old and working-copy generation may have pushed usage above the new
+  // quota since; without this the direct-commit branch below would evict
+  // without showing the confirmation modal.
+  var applyBtn = document.getElementById('applyWorkingCopyLimitBtn');
+  var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
+  applyBtn.disabled = true;
+  input.disabled = true;
+  applyBtn.textContent = 'Checking…';
+  var usage = await refreshWorkingCopyUsage();
+  if (usage == null) {
+    input.disabled = false;
+    applyBtn.textContent = 'Apply';
+    updateWorkingCopyLimitState();
+    showToast('Could not measure current working-copy usage; try Refresh.', 'error');
+    return;
+  }
+
   var quotaBytes = quotaMb * 1024 * 1024;
-  if (quotaBytes < _workingCopySizeBytes) {
+  if (quotaBytes < usage) {
+    input.disabled = false;
+    applyBtn.textContent = 'Apply';
+    updateWorkingCopyLimitState();
     _pendingWorkingCopyQuotaMb = quotaMb;
-    var removalBytes = _workingCopySizeBytes - quotaBytes;
+    var removalBytes = usage - quotaBytes;
     var newLimit = storageFormatBytes(quotaBytes);
     document.getElementById('workingCopyLimitModalDesc').textContent =
       'Lowering the limit to ' + newLimit + ' will remove approximately ' +
@@ -419,7 +480,10 @@ function applyWorkingCopyLimit() {
     return;
   }
 
-  commitWorkingCopyLimit(quotaMb);
+  // Usage is at or below the new quota; commit directly.
+  // commitWorkingCopyLimit takes over the input/button state via its own
+  // try/finally, so no restore is needed here.
+  await commitWorkingCopyLimit(quotaMb);
 }
 
 function closeWorkingCopyLimitModal() {
@@ -443,7 +507,7 @@ async function commitWorkingCopyLimit(quotaMb) {
   applyBtn.disabled = true;
   applyBtn.textContent = 'Applying…';
   try {
-    await postStorageConfig(quotaMb);
+    await postWorkingCopyLimit(quotaMb);
     _committedWorkingCopyQuotaMb = quotaMb;
     input.value = quotaMb / 1024;
     showToast('Working-copy storage limit updated', 'success');
@@ -505,6 +569,7 @@ async function loadStoragePanel() {
 
     var working = s.working_copies || {count: 0, size: 0, quota_bytes: 0};
     _workingCopySizeBytes = working.size || 0;
+    updateWorkingCopyLimitState();
     var workingFileWord = working.count === 1 ? 'file' : 'files';
     document.getElementById('workingCopyCacheStatus').textContent =
       'Current: ' + storageFormatBytes(working.size) + ' / ' +
@@ -543,6 +608,10 @@ async function loadStoragePanel() {
     });
     document.getElementById('storageGrid').innerHTML = html || '<span style="color:var(--text-ghost);font-size:13px;">No generated storage yet.</span>';
   } catch(e) {
+    // Usage is unknown until the next successful scan; keep Apply disabled
+    // so a stale zero can't skip the eviction confirmation.
+    _workingCopySizeBytes = null;
+    updateWorkingCopyLimitState();
     document.getElementById('storageGrid').innerHTML = '<span style="color:var(--danger);font-size:12px;">Failed to load storage info</span>';
   }
   await loadMasksCard(s && s.masks);

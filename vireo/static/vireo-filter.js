@@ -389,9 +389,9 @@
     if (!options.noPersist) schedulePersist();
     // `reason` (optional string) is forwarded to onChange so pages can
     // pick per-cause reload behavior — e.g. Browse preserving the
-    // selected-photo anchor when a quick search is cleared but not for
-    // every filter change (arbitrary edits usually exclude the anchor,
-    // and loadUntilPhotoRendered would then page through the whole set).
+    // selected-photo anchor when filters are cleared but not for every
+    // filter change (arbitrary edits usually exclude the anchor, and
+    // loadUntilPhotoRendered would then page through the whole set).
     if (state.onChange && !options.silent) state.onChange({ reason: options.reason || null });
     if (state.muted) refreshWouldMatch();
   }
@@ -578,10 +578,10 @@
     const current = quickSearchGroup();
     if ((!value && !current) ||
         (value && current && current._qs_text === value && !state.visual)) return;
-    // A cleared quick search is the one filter edit where the previously
-    // selected/open photo is expected to reappear in the wider result set.
-    // Flag it so the page can preserve the anchor for this case without
-    // reintroducing preservation for every filter change.
+    // A cleared quick search widens the result set, so the previously
+    // selected/open photo is expected to reappear. Flag it so the page can
+    // preserve the anchor for this case without reintroducing preservation
+    // for every filter change.
     const cleared = !value && !!quickSearchGroup();
     mutate(() => {
       state.root.rules = state.root.rules.filter((n) => !(isGroup(n) && n._qs));
@@ -1150,7 +1150,7 @@
         state.muted = false;
         state.visual = null;
         state.visualInfo = null;
-      });
+      }, { reason: 'filtersCleared' });
       toast('Filters cleared', true);
     });
     $('.vf-clear-rules').addEventListener('click', () => {
@@ -1160,7 +1160,7 @@
         state.muted = false;
         state.visual = null;
         state.visualInfo = null;
-      });
+      }, { reason: 'filtersCleared' });
       toast('Filters cleared', true);
     });
     $('.vf-toast button').addEventListener('click', () => { undo(); $('.vf-toast').hidden = true; });
@@ -1679,7 +1679,7 @@
         state.muted = false;
         state.visual = null;
         state.visualInfo = null;
-      });
+      }, { reason: 'filtersCleared' });
     },
     isReady() { return !!state.ready && !!state.fields; },
     isMuted() { return state.muted; },

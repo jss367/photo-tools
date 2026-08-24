@@ -4384,15 +4384,16 @@ async function bootstrapBrowse() {
           openedCollectionId = null;
           clearOfflineCollectionState();
         }
-        // A cleared quick search is the one filter edit where the previously
-        // selected photo is expected to reappear in the wider result set \u2014
-        // preserve the anchor so the detail panel and scroll position don't
-        // reset. Every other filter change usually excludes the previously
-        // selected photo, and loadUntilPhotoRendered would then keep paging
-        // through the whole matching set (potentially many /api/photos/query
-        // requests) just to prove the anchor is gone.
+        // Clearing filters widens the result set, so the selected photo is
+        // expected to remain present. Preserve it as the viewport anchor so
+        // the newly included photos appear around it instead of resetting
+        // Browse to the first result. Every other filter change may exclude
+        // the selected photo, and loadUntilPhotoRendered would then keep
+        // paging through the whole matching set (potentially many
+        // /api/photos/query requests) just to prove the anchor is gone.
         var preserveAnchor = info && (
           info.reason === 'quickSearchCleared' ||
+          info.reason === 'filtersCleared' ||
           // A selected member of a just-opened collection should stay
           // anchored (it existed in the old collection view too). But a
           // membership-refresh reopen (reason 'expressionRefreshed') skips
@@ -12945,7 +12946,10 @@ async function _runPhotoDeepLink(photoId) {
         onChange: function(info) {
           if (timelineMode) loadCalendarData();
           if (activeCollectionId && !dashboardCollectionScope) activeCollectionId = null;
-          var preserveAnchor = info && info.reason === 'quickSearchCleared';
+          var preserveAnchor = info && (
+            info.reason === 'quickSearchCleared' ||
+            info.reason === 'filtersCleared'
+          );
           resetAndLoad(preserveAnchor ? { preserveAnchor: true } : undefined);
           loadSummary();
         },

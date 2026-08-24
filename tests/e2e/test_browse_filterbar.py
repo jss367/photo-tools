@@ -10,6 +10,7 @@ Seed data (conftest): 3 hawk photos in /photos/park, 2 robins in
 /photos/yard; hawk1 has rating 4 and the Red-tailed Hawk species keyword.
 """
 
+import pytest
 from playwright.sync_api import expect
 
 
@@ -517,6 +518,53 @@ def test_clear_cancels_pending_live_search_debounce(live_server, page):
     assert not page.evaluate("VireoFilter.hasFilters()")
     assert search.input_value() == ""
     _wait_total(page, 5)
+
+
+@pytest.mark.parametrize("clear_selector", [".vf-clear", ".vf-clear-rules"])
+def test_clearing_filters_keeps_selected_photo_in_place(
+    live_server, page, clear_selector
+):
+    """Clear-all widens the grid around the current photo without resetting it."""
+    _open_browse(page, live_server)
+    selected_id = live_server["data"]["photos"][3]
+    page.evaluate("updateThumbSize(400)")
+
+    # Use a normal rule rather than quick search so this exercises the
+    # explicit clear-all reason instead of quickSearchCleared.
+    page.evaluate("VireoFilter.addRule('keyword', 'is', 'American Robin')")
+    page.wait_for_function("() => photos.length === 1")
+    selected = page.locator(f'.grid-card[data-id="{selected_id}"]')
+    selected.click()
+
+    top_before = page.evaluate(
+        """(id) => {
+          const card = document.querySelector(`.grid-card[data-id="${id}"]`);
+          const container = document.getElementById('gridContainer');
+          return card.getBoundingClientRect().top - container.getBoundingClientRect().top;
+        }""",
+        selected_id,
+    )
+
+    if clear_selector == ".vf-clear-rules":
+        page.click(".vf-filters-btn")
+    page.click(clear_selector)
+    page.wait_for_function(
+        "(id) => photos.length === 5 && selectedPhotoId === id",
+        arg=selected_id,
+    )
+    page.wait_for_timeout(100)  # allow the anchor-restoration animation frame
+
+    assert page.evaluate("selectedPhotos.size") == 0
+    expect(selected).to_have_class("grid-card selected")
+    top_after = page.evaluate(
+        """(id) => {
+          const card = document.querySelector(`.grid-card[data-id="${id}"]`);
+          const container = document.getElementById('gridContainer');
+          return card.getBoundingClientRect().top - container.getBoundingClientRect().top;
+        }""",
+        selected_id,
+    )
+    assert abs(top_after - top_before) < 4
 
 
 def test_pause_resume_with_backslash(live_server, page):

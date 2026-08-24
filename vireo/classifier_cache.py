@@ -2,10 +2,13 @@
 
 import hashlib
 import json
+import logging
 import os
 
 from embedding_cache import canonicalize_labels
 from model_cache import get_default_cache
+
+log = logging.getLogger(__name__)
 
 
 def _ordered_labels_identity(labels):
@@ -185,14 +188,10 @@ def acquire_cached_classifier(
     # is responsible for internal dedup (the heal already uses a lock +
     # ``in_flight`` marker), so calling this on a fresh construction is a
     # harmless no-op.
-    value = handle._value
-    hook = getattr(value, "notify_reuse", None)
+    hook = getattr(handle.value, "notify_reuse", None)
     if hook is not None:
         try:
             hook()
         except Exception:
-            import logging as _logging
-            _logging.getLogger(__name__).exception(
-                "classifier notify_reuse hook raised; ignoring",
-            )
+            log.exception("classifier notify_reuse hook raised; ignoring")
     return handle

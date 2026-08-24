@@ -571,9 +571,14 @@ def load_working_image(
     if photo.get("working_copy_path"):
         wc_path = os.path.join(vireo_dir, photo["working_copy_path"])
         if os.path.exists(wc_path):
-            return _result(_load_standard(wc_path, max_size), "working_copy")
+            working_image = _load_standard(wc_path, max_size)
+            if working_image is not None:
+                return _result(working_image, "working_copy")
 
-    # No working copy — load original (may be JPEG or RAW)
+    # No usable working copy — load original (may be JPEG or RAW). This also
+    # closes the exists/open race with quota eviction: a failed working-copy
+    # open must not strand direct callers when ``folders`` can resolve the
+    # still-available source.
     if folders is None:
         return _result(None, "original")
     folder_path = folders.get(photo["folder_id"], "")

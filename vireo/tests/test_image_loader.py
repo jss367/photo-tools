@@ -619,6 +619,47 @@ def test_load_working_image_uses_original_for_jpeg(tmp_path):
     assert max(img.size) <= 1024
 
 
+def test_load_working_image_retries_original_after_working_copy_eviction(
+    tmp_path, monkeypatch,
+):
+    """A selected working copy lost before open falls back to its source."""
+    import image_loader
+    from PIL import Image
+
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    wc_path = working_dir / "42.jpg"
+    Image.new("RGB", (800, 600), color="blue").save(wc_path, "JPEG")
+    source_dir = tmp_path / "photos"
+    source_dir.mkdir()
+    source_path = source_dir / "test.jpg"
+    Image.new("RGB", (800, 600), color="red").save(source_path, "JPEG")
+
+    real_load_standard = image_loader._load_standard
+
+    def evict_before_open(path, max_size):
+        if os.path.abspath(path) == os.path.abspath(wc_path):
+            os.unlink(wc_path)
+            return None
+        return real_load_standard(path, max_size)
+
+    monkeypatch.setattr(image_loader, "_load_standard", evict_before_open)
+    photo = {
+        "working_copy_path": "working/42.jpg",
+        "folder_id": 1,
+        "filename": "test.jpg",
+    }
+
+    img, input_source = image_loader.load_working_image(
+        photo, str(tmp_path), max_size=1024,
+        folders={1: str(source_dir)}, return_source=True,
+    )
+
+    assert img is not None
+    assert input_source == "original"
+    assert img.getpixel((0, 0))[0] > img.getpixel((0, 0))[2]
+
+
 def test_load_working_image_returns_none_when_no_working_copy_no_folders(tmp_path):
     """load_working_image returns None when working_copy_path is set but file is missing, and folders is None."""
     from image_loader import load_working_image

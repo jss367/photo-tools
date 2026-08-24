@@ -830,6 +830,81 @@ def test_stack_expansion_response_yields_to_fresher_hydration(live_server, page)
     assert state["cached"] == [[pid, 4] for pid in sorted(burst_ids)]
 
 
+def test_generic_member_edit_invalidates_pending_cover_hydration(live_server, page):
+    """A generic member edit during hydration must not let pre-edit data land.
+
+    When Select all matching includes an uncached collapsed stack, a rating or
+    flag edit starts a cover hydration via ``reconcileBrowseStackCovers``. If a
+    concurrent wildlife or keyword edit completes before the hydration's
+    ``/api/photos/by-ids`` response arrives, its mutation path only ran through
+    ``refreshExpandedBrowseStackMembers``, which used to invalidate expansion
+    requests but not the pending hydration. The delayed response then wrote
+    pre-edit member objects into ``browseStackMembers`` and later expansion
+    showed stale badges until reload.
+    """
+    db = live_server["db"]
+    burst_ids = live_server["data"]["photos"][:3]
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'hydration-invalidate-burst' "
+            "WHERE id IN (?, ?, ?)",
+            burst_ids,
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?",
+            (burst_ids[1],),
+        )
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator("#browseStacksToggle").check()
+    expect(page.locator(f'.grid-card[data-id="{burst_ids[1]}"]')).to_be_visible()
+
+    outcome = page.evaluate(
+        """async ids => {
+          var coverId = ids[1];
+          var hiddenId = ids[0];
+          var originalSafeFetch = safeFetch;
+          var byIdsOptions = {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({photo_ids: ids}),
+          };
+          var preEdit = await originalSafeFetch('/api/photos/by-ids', byIdsOptions);
+          var release = null;
+          safeFetch = function(url) {
+            if (url === '/api/photos/by-ids' && !release) {
+              return new Promise(function(resolve) { release = resolve; });
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            // Rating edit routed through reconcileBrowseStackCovers begins the
+            // uncached cover's hydration; the /api/photos/by-ids response is
+            // captured for release after the wildlife edit lands.
+            var hydration = reconcileBrowseStackCovers([hiddenId]);
+            while (!release) {
+              await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            }
+            // Generic member mutation whose only cache-invalidation hook is
+            // refreshExpandedBrowseStackMembers. It must now drop the pending
+            // hydration record so the delayed response cannot land.
+            refreshExpandedBrowseStackMembers([hiddenId]);
+            release(JSON.parse(JSON.stringify(preEdit)));
+            await hydration;
+            return {
+              cached: browseStackMembers[String(coverId)] || null,
+              error: browseStackErrors[String(coverId)] || null,
+            };
+          } finally {
+            safeFetch = originalSafeFetch;
+          }
+        }""",
+        burst_ids,
+    )
+    assert outcome["error"] is None
+    assert outcome["cached"] is None
+
+
 def test_expanding_stack_over_500_chunks_by_ids_requests(live_server, page):
     """A stack with more than 500 members must be expandable.
 

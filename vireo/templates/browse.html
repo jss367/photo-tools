@@ -3301,9 +3301,28 @@ function markBrowseStackExpansionsStale(photoIds) {
   });
 }
 
+// A cover-hydration response captured its members before this mutation ran,
+// so on any overlap the pending record must be dropped: the sequence guard
+// then rejects the eventual response and its pre-edit members never land in
+// browseStackMembers. reconcileBrowseStackCovers only supersedes hydrations
+// it starts itself, so mutation paths that don't call it (wildlife, keyword,
+// metadata edits) rely on this to invalidate a matching in-flight request.
+function markBrowseStackHydrationsStale(photoIds) {
+  var wanted = (photoIds || []).map(Number);
+  if (!wanted.length) return;
+  Object.keys(browseStackHydrationRequests).forEach(function(cacheKey) {
+    var record = browseStackHydrationRequests[cacheKey];
+    if (!record || !record.memberIds) return;
+    if (wanted.some(function(id) { return record.memberIds.has(id); })) {
+      delete browseStackHydrationRequests[cacheKey];
+    }
+  });
+}
+
 function refreshExpandedBrowseStackMembers(photoIds) {
   var wanted = new Set((photoIds || []).map(Number));
   markBrowseStackExpansionsStale(photoIds);
+  markBrowseStackHydrationsStale(photoIds);
   Object.keys(browseStackMembers).forEach(function(coverId) {
     var members = browseStackMembers[coverId] || [];
     if (members.some(function(member) { return wanted.has(member.id); })) {
@@ -3359,9 +3378,12 @@ async function reconcileBrowseStackCovers(photoIds) {
     var uncachedCover = uncachedCovers[h];
     var uncachedKey = String(uncachedCover.id);
     var hydrationSeq = ++browseStackHydrationSeq;
-    browseStackHydrationRequests[uncachedKey] = hydrationSeq;
+    var memberIds = uncachedCover.browse_stack.photo_ids || [];
+    browseStackHydrationRequests[uncachedKey] = {
+      seq: hydrationSeq,
+      memberIds: new Set(memberIds.map(Number)),
+    };
     try {
-      var memberIds = uncachedCover.browse_stack.photo_ids || [];
       var hydratedMembers = [];
       for (var offset = 0; offset < memberIds.length; offset += 500) {
         var data = await safeFetch('/api/photos/by-ids', {
@@ -3374,8 +3396,11 @@ async function reconcileBrowseStackCovers(photoIds) {
       }
       // Overlapping edits may hydrate the same collapsed stack. Request order
       // tracks mutation freshness, so only the newest request may cache even
-      // when an older response happens to arrive first.
-      if (browseStackHydrationRequests[uncachedKey] !== hydrationSeq) continue;
+      // when an older response happens to arrive first. A generic member edit
+      // routed through refreshExpandedBrowseStackMembers may also drop the
+      // record entirely to discard this pre-edit response.
+      var currentRecord = browseStackHydrationRequests[uncachedKey];
+      if (!currentRecord || currentRecord.seq !== hydrationSeq) continue;
       delete browseStackHydrationRequests[uncachedKey];
       // Expansion can also hydrate this key while reconciliation is in flight;
       // and another response may already have promoted a replacement.
@@ -3397,7 +3422,8 @@ async function reconcileBrowseStackCovers(photoIds) {
         return uncachedCover;
       });
     } catch (e) {
-      if (browseStackHydrationRequests[uncachedKey] === hydrationSeq) {
+      var errorRecord = browseStackHydrationRequests[uncachedKey];
+      if (errorRecord && errorRecord.seq === hydrationSeq) {
         delete browseStackHydrationRequests[uncachedKey];
       }
       return false;

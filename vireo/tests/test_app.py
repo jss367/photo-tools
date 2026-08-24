@@ -928,6 +928,18 @@ def test_api_storage_custom_thumb_dir_ignores_unrelated_siblings(
     assert after_unrelated["other"]["size"] == before["other"]["size"]
     assert after_unrelated["total"] == before["total"]
 
+    taxonomy_payload = b"managed-taxonomy-data"
+    (tmp_path / "taxonomy.json").write_bytes(taxonomy_payload)
+    taxonomy_dir = tmp_path / "taxonomy"
+    taxonomy_dir.mkdir()
+    (taxonomy_dir / "index.bin").write_bytes(taxonomy_payload)
+    after_taxonomy = app.test_client().get("/api/storage").get_json()
+
+    assert (
+        after_taxonomy["other"]["size"] - after_unrelated["other"]["size"]
+        == len(taxonomy_payload) * 2
+    )
+
     originals = shared_root / "originals"
     originals.mkdir()
     owned = b"vireo-display-render"
@@ -935,10 +947,10 @@ def test_api_storage_custom_thumb_dir_ignores_unrelated_siblings(
     after_owned = app.test_client().get("/api/storage").get_json()
 
     assert (
-        after_owned["other"]["size"] - after_unrelated["other"]["size"]
+        after_owned["other"]["size"] - after_taxonomy["other"]["size"]
         == len(owned)
     )
-    assert after_owned["total"] - after_unrelated["total"] == len(owned)
+    assert after_owned["total"] - after_taxonomy["total"] == len(owned)
 
     # Staging is Vireo-managed under a custom --thumb-dir too — an omitted
     # entry in the allowlist would hide potentially very large recovery data

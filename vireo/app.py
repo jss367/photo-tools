@@ -21152,6 +21152,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             auxiliary_paths.extend([
                 app.config["CARD_CLEANUP_DIR"],
                 app.config["COMPUTATION_CACHE_DIR"],
+                # Taxonomy assets remain beside the catalog even when
+                # generated image caches use a custom thumbnail root.
+                os.path.join(catalog_root, "taxonomy.json"),
+                os.path.join(catalog_root, "taxonomy"),
                 f"{db_path}-wal",
                 f"{db_path}-shm",
                 f"{db_path}-journal",

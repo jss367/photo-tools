@@ -572,6 +572,12 @@
     }
   }
 
+  function clearUnappliedQuickSearchText() {
+    const input = $('.vf-search input');
+    if (input) input.value = '';
+    hideSearchSuggest();
+  }
+
   function applyQuickSearch(text, opts) {
     cancelQuickSearchTimer();
     const value = String(text || '').trim();
@@ -1155,10 +1161,14 @@
       toast('Filters cleared', true);
     });
     $('.vf-clear-rules').addEventListener('click', () => {
-      // This control stays visible in the popover even when no filters are
-      // active. Avoid turning that no-op into a full page reload.
-      if (!hasUserFilters() && !state.muted) return;
       cancelQuickSearchTimer();
+      // This control stays visible in the popover even when no filters are
+      // active. A search may still be waiting on its live-input debounce, so
+      // discard that text before avoiding the otherwise-no-op page reload.
+      if (!hasUserFilters() && !state.muted) {
+        clearUnappliedQuickSearchText();
+        return;
+      }
       mutate(() => {
         state.root = { mode: 'all', rules: [] };
         state.muted = false;
@@ -1678,7 +1688,10 @@
         if (state.ready) render();
         return;
       }
-      if (!hasUserFilters() && !state.muted) return;
+      if (!hasUserFilters() && !state.muted) {
+        clearUnappliedQuickSearchText();
+        return;
+      }
       mutate(() => {
         state.root = { mode: 'all', rules: [] };
         state.muted = false;

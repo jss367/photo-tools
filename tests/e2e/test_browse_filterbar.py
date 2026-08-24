@@ -573,7 +573,7 @@ def test_clearing_filters_keeps_selected_photo_in_place(
 
 @pytest.mark.parametrize("clear_action", ["popover", "api"])
 def test_clear_without_filters_does_not_reload(live_server, page, clear_action):
-    """Always-available clear controls are inert when there is nothing to clear."""
+    """No-op clears cancel pending text without reloading the photo dataset."""
     _open_browse(page, live_server)
     selected = page.locator(".grid-card").last
     selected.click()
@@ -582,11 +582,24 @@ def test_clear_without_filters_does_not_reload(live_server, page, clear_action):
 
     if clear_action == "popover":
         page.click(".vf-filters-btn")
-        page.click(".vf-clear-rules")
-    else:
-        page.evaluate("VireoFilter.clearAll()")
+    page.evaluate(
+        """action => {
+          var input = document.querySelector('.vf-search input');
+          input.value = 'haw';
+          input.dispatchEvent(new Event('input', {bubbles: true}));
+          if (action === 'popover') {
+            document.querySelector('.vf-clear-rules').click();
+          } else {
+            VireoFilter.clearAll();
+          }
+        }""",
+        clear_action,
+    )
+    page.wait_for_timeout(300)
 
     assert page.evaluate("loadEpoch") == epoch_before
+    assert not page.evaluate("VireoFilter.hasFilters()")
+    assert page.locator(".vf-search input").input_value() == ""
     assert page.evaluate("selectedPhotoId") == selected_id
     expect(selected).to_have_class("grid-card selected")
 

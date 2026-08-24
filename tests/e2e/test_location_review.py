@@ -198,7 +198,7 @@ def test_location_review_is_a_navigable_collection_page(live_server, page):
         "Choose a collection"
     )
     expect(page.locator("#locationReviewCollection")).to_contain_text(
-        "San Diego Field Notes (1)"
+        "San Diego Field Notes (1 available)"
     )
     expect(
         page.locator('.nav-tab[data-nav-id="location_review"]')

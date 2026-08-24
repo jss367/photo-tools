@@ -6052,6 +6052,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     def _resolve_visual(
         db, rules, visual, collection_id=None, folder_id=None,
         candidate_photo_ids=None,
+        include_offline_folders=False,
     ):
         """Run a visual clause over the rule tree's candidate photos.
 
@@ -6081,11 +6082,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return {**base, "status": "model_no_text_search"}, None, None
         candidates = db.query_photo_ids(
             rules, collection_id=collection_id, folder_id=folder_id,
+            include_offline_folders=include_offline_folders,
         )
         if candidate_photo_ids is not None:
             restrict = set(candidate_photo_ids)
             candidates = [pid for pid in candidates if pid in restrict]
-        emb_pairs = db.get_photos_with_embedding(model_name, photo_ids=candidates)
+        emb_pairs = db.get_photos_with_embedding(
+            model_name,
+            photo_ids=candidates,
+            include_offline_folders=include_offline_folders,
+        )
         if not emb_pairs:
             return (
                 {**base, "status": "no_embeddings",
@@ -8082,18 +8088,48 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         except ValueError as exc:
             return json_error(str(exc), 400)
 
+        include_offline = payload.get("include_offline", False)
+        include_availability = payload.get("include_availability", False)
+        if not isinstance(include_offline, bool):
+            return json_error("include_offline must be a boolean", 400)
+        if not isinstance(include_availability, bool):
+            return json_error("include_availability must be a boolean", 400)
+        # Offline rows are display-only. IDs-only responses feed selection
+        # and bulk actions, so those remain restricted to actionable photos.
+        if payload.get("ids_only"):
+            include_offline = False
+
         visual_info = None
         if visual is not None:
             try:
                 visual_info, ordered_ids, sims_by_pid = _resolve_visual(
                     db, rules, visual,
                     collection_id=collection_id, folder_id=folder_id,
+                    include_offline_folders=(
+                        include_offline or include_availability
+                    ),
                 )
             except ValueError as exc:
                 return json_error(str(exc), 400)
             if ordered_ids is not None:
                 # Healthy visual clause: results are the similarity-ranked
                 # matches; sort is relevance by design while it is active.
+                availability = None
+                folder_statuses = None
+                if include_offline or include_availability:
+                    inventory_ids = ordered_ids
+                    folder_statuses = db.get_photo_folder_statuses(inventory_ids)
+                    available_ids = [
+                        pid for pid in inventory_ids
+                        if folder_statuses.get(pid) in ("ok", "partial")
+                    ]
+                    if not include_offline:
+                        ordered_ids = available_ids
+                    availability = {
+                        "inventory_total": len(inventory_ids),
+                        "available_total": len(available_ids),
+                        "offline_total": len(inventory_ids) - len(available_ids),
+                    }
                 if payload.get("ids_only"):
                     if stacks:
                         # Same cover-first flattening the paginated visual
@@ -8123,8 +8159,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                         "visual": visual_info})
                     return jsonify({"ids": ordered_ids, "total": len(ordered_ids),
                                     "visual": visual_info})
+                # Offline members are display-only, so they never join a
+                # stack: each one stays its own item and is left out of the
+                # duplicate / burst tallies. Same rule the SQL projection
+                # applies in ``_browse_stack_query_parts``.
+                offline_ids = (
+                    [
+                        pid for pid in ordered_ids
+                        if folder_statuses.get(pid) not in ("ok", "partial")
+                    ]
+                    if include_offline and folder_statuses is not None
+                    else None
+                )
                 stack_items = (
-                    db.collapse_browse_stack_photo_ids(ordered_ids)
+                    db.collapse_browse_stack_photo_ids(
+                        ordered_ids, standalone_ids=offline_ids,
+                    )
                     if stacks else None
                 )
                 logical_ids = (
@@ -8158,6 +8208,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     entry["similarity"] = similarity_by_cover.get(
                         entry["id"], sims_by_pid.get(entry["id"]),
                     )
+                    if include_offline and folder_statuses is not None:
+                        entry["folder_status"] = folder_statuses.get(entry["id"])
                 response = {
                     "photos": photo_dicts,
                     "total": len(logical_ids),
@@ -8166,7 +8218,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "visual": visual_info,
                 }
                 if stacks:
+                    # Availability totals below are photo counts, so the
+                    # underlying (unstacked) total is what they must agree
+                    # with — never the stack count.
                     response["underlying_total"] = len(ordered_ids)
+                if availability is not None:
+                    response.update(availability)
                 return jsonify(response)
             # Unhealthy: fall through to metadata-only results with the
             # status attached so the UI can say why — never silently zero.
@@ -8197,20 +8254,26 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return jsonify(payload_out)
         try:
             underlying_total = db.count_photos_for_rules(
-                rules, collection_id=collection_id, folder_id=folder_id,
+                rules,
+                collection_id=collection_id,
+                folder_id=folder_id,
+                include_offline_folders=include_offline,
             )
             if stacks:
                 photos = db.query_browse_stacks(
                     rules, sort=sort, page=page, per_page=per_page,
                     collection_id=collection_id, folder_id=folder_id,
+                    include_offline_folders=include_offline,
                 )
                 total = db.count_browse_stacks(
                     rules, collection_id=collection_id, folder_id=folder_id,
+                    include_offline_folders=include_offline,
                 )
             else:
                 photos = db.query_photos(
                     rules, sort=sort, page=page, per_page=per_page,
                     collection_id=collection_id, folder_id=folder_id,
+                    include_offline_folders=include_offline,
                 )
                 total = underlying_total
         except ValueError as exc:
@@ -8226,6 +8289,38 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         }
         if stacks:
             response["underlying_total"] = underlying_total
+        if include_offline or include_availability:
+            # Availability is always reported in photos, never in stacks:
+            # the notice reads "N of M photos available", so it has to agree
+            # with the sidebar collection count and with ``underlying_total``
+            # — ``total`` is the logical item count once Stacks collapses it.
+            try:
+                inventory_total = (
+                    underlying_total
+                    if include_offline
+                    else db.count_photos_for_rules(
+                        rules,
+                        collection_id=collection_id,
+                        folder_id=folder_id,
+                        include_offline_folders=True,
+                    )
+                )
+                available_total = (
+                    db.count_photos_for_rules(
+                        rules,
+                        collection_id=collection_id,
+                        folder_id=folder_id,
+                    )
+                    if include_offline
+                    else underlying_total
+                )
+            except ValueError as exc:
+                return json_error(str(exc), 400)
+            response.update({
+                "inventory_total": inventory_total,
+                "available_total": available_total,
+                "offline_total": max(0, inventory_total - available_total),
+            })
         if visual_info is not None:
             response["visual"] = visual_info
         return jsonify(response)
@@ -13787,6 +13882,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # through ``/api/photos/query`` (Codex review r3621304875).
             if c["visual_json"] is not None:
                 d["photo_count"] = None
+                d["available_photo_count"] = None
+                d["offline_photo_count"] = None
                 _, degraded = _collection_rules_state(db, c["rules"])
                 if degraded:
                     d["count_error"] = True
@@ -13797,7 +13894,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     )
             else:
                 try:
-                    d["photo_count"] = db.count_collection_photos(c["id"])
+                    counts = db.count_collection_photo_availability(c["id"])
+                    d["photo_count"] = counts["total"]
+                    d["available_photo_count"] = counts["available"]
+                    d["offline_photo_count"] = counts["offline"]
                 except ValueError:
                     app.logger.exception(
                         "Failed to count photos for collection %s (%s)",
@@ -13805,6 +13905,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         c["name"],
                     )
                     d["photo_count"] = None
+                    d["available_photo_count"] = None
+                    d["offline_photo_count"] = None
                     d["count_error"] = True
             # Degraded rows must never advertise manual-add support: the
             # add-to-collection modal filters only on can_add_photos, and

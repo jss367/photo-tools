@@ -6537,6 +6537,23 @@ class Database:
                 result[row["id"]] = row
         return result
 
+    def get_photo_folder_statuses(self, photo_ids):
+        """Return ``{photo_id: folder_status}`` for the requested photos."""
+        if not photo_ids:
+            return {}
+        result = {}
+        for chunk in _chunks(list(dict.fromkeys(photo_ids))):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                f"""SELECT p.id, f.status
+                    FROM photos p
+                    JOIN folders f ON f.id = p.folder_id
+                    WHERE p.id IN ({placeholders})""",
+                list(chunk),
+            ).fetchall()
+            result.update({row["id"]: row["status"] for row in rows})
+        return result
+
     def count_photos(self):
         """Return photo count for the active workspace.
 
@@ -18072,17 +18089,22 @@ class Database:
         )
         self.conn.commit()
 
-    def get_photos_with_embedding(self, model, variant='', photo_ids=None):
+    def get_photos_with_embedding(
+        self, model, variant='', photo_ids=None, include_offline_folders=False,
+    ):
         """Return (photo_id, embedding_blob) pairs in the active workspace
         with a stored embedding for ``(model, variant)``.
 
         Pass ``photo_ids`` to restrict the result to a subset.
         """
         ws = self._ws_id()
+        folder_join = "JOIN folders f ON f.id = p.folder_id"
+        if not include_offline_folders:
+            folder_join += " AND f.status IN ('ok', 'partial')"
         sql = (
             "SELECT pe.photo_id, pe.embedding FROM photo_embeddings pe "
             "JOIN photos p ON p.id = pe.photo_id "
-            "JOIN folders f ON f.id = p.folder_id AND f.status IN ('ok', 'partial') "
+            f"{folder_join} "
             "JOIN workspace_folders wf "
             "  ON wf.folder_id = p.folder_id AND wf.workspace_id = ? "
             "WHERE pe.model = ? AND pe.variant = ?"
@@ -22806,7 +22828,13 @@ class Database:
         }.get(sort, _PHOTO_DATE_ASC_ORDER)
 
     def get_collection_photos(
-        self, collection_id, page=1, per_page=50, photo_ids=None, sort="date",
+        self,
+        collection_id,
+        page=1,
+        per_page=50,
+        photo_ids=None,
+        sort="date",
+        include_offline_folders=False,
     ):
         """Build SQL from collection rules and return matching photos.
 
@@ -22816,7 +22844,10 @@ class Database:
         The collection rules still apply, which also lets the client detect a
         photo that left the collection because its species keywords changed.
         """
-        parts = self._build_collection_query(collection_id)
+        parts = self._build_collection_query(
+            collection_id,
+            include_offline_folders=include_offline_folders,
+        )
         if parts is None:
             return []
 
@@ -22840,6 +22871,8 @@ class Database:
         order = self._collection_sort_clause(sort)
 
         pcols = ", ".join(f"p.{c.strip()}" for c in self.PHOTO_COLS.split(","))
+        if include_offline_folders:
+            pcols += ", f.status AS folder_status"
         query = f"""
             SELECT DISTINCT {pcols} FROM photos p
             {folder_join}
@@ -22875,9 +22908,19 @@ class Database:
         """
         return [row["id"] for row in self.conn.execute(query, params).fetchall()]
 
-    def count_collection_photos(self, collection_id):
-        """Return total count of photos matching collection rules."""
-        parts = self._build_collection_query(collection_id)
+    def count_collection_photos(
+        self, collection_id, include_offline_folders=False,
+    ):
+        """Return the count of photos matching collection rules.
+
+        The default is the actionable count from accessible folders. Pass
+        ``include_offline_folders=True`` for stable collection membership:
+        photos remain members while their storage is temporarily missing.
+        """
+        parts = self._build_collection_query(
+            collection_id,
+            include_offline_folders=include_offline_folders,
+        )
         if parts is None:
             return 0
 
@@ -22889,6 +22932,35 @@ class Database:
             {where}
         """
         return self.conn.execute(query, params).fetchone()[0]
+
+    def count_collection_photo_availability(self, collection_id):
+        """Return stable membership and actionable counts for a collection."""
+        parts = self._build_collection_query(
+            collection_id, include_offline_folders=True,
+        )
+        if parts is None:
+            return {"total": 0, "available": 0, "offline": 0}
+
+        folder_join, join_clause, where, params = parts
+        row = self.conn.execute(
+            f"""SELECT
+                    COUNT(DISTINCT p.id) AS total,
+                    COUNT(DISTINCT CASE
+                        WHEN f.status IN ('ok', 'partial') THEN p.id
+                    END) AS available
+                FROM photos p
+                {folder_join}
+                {join_clause}
+                {where}""",
+            params,
+        ).fetchone()
+        total = row["total"] or 0
+        available = row["available"] or 0
+        return {
+            "total": total,
+            "available": available,
+            "offline": max(0, total - available),
+        }
 
     def rules_resolvable(self, rules):
         """Return True if a rule tree can be resolved to SQL clauses without
@@ -22906,7 +22978,13 @@ class Database:
             return False
         return True
 
-    def count_photos_for_rules(self, rules, collection_id=None, folder_id=None):
+    def count_photos_for_rules(
+        self,
+        rules,
+        collection_id=None,
+        folder_id=None,
+        include_offline_folders=False,
+    ):
         """Return the number of photos in the active workspace that match
         an unsaved rules list. Used by the smart-collection modal preview
         and /api/photos/query totals.
@@ -22914,8 +22992,15 @@ class Database:
         Raises ValueError on malformed input (propagated from
         ``_build_query_from_rules``).
         """
-        folder_join, join_clause, where, params = self._build_query_from_rules(rules)
-        where, params = self._append_collection_restriction(collection_id, where, params)
+        folder_join, join_clause, where, params = self._build_query_from_rules(
+            rules, include_offline_folders=include_offline_folders,
+        )
+        where, params = self._append_collection_restriction(
+            collection_id,
+            where,
+            params,
+            include_offline_folders=include_offline_folders,
+        )
         where, params = self._append_folder_restriction(folder_id, where, params)
         query = f"""
             SELECT COUNT(DISTINCT p.id) FROM photos p
@@ -22947,7 +23032,13 @@ class Database:
             where = f"WHERE {clause}"
         return where, list(params) + list(subtree)
 
-    def _append_collection_restriction(self, collection_id, where, params):
+    def _append_collection_restriction(
+        self,
+        collection_id,
+        where,
+        params,
+        include_offline_folders=False,
+    ):
         """AND a collection-membership subquery onto built rule clauses.
 
         Lets /api/photos/query serve Browse's dashboard-scoped collection
@@ -22959,7 +23050,10 @@ class Database:
         """
         if collection_id is None:
             return where, params
-        parts = self._build_collection_query(collection_id)
+        parts = self._build_collection_query(
+            collection_id,
+            include_offline_folders=include_offline_folders,
+        )
         if parts is None:
             raise ValueError("collection not found in active workspace")
         c_folder_join, c_join, c_where, c_params = parts
@@ -22975,16 +23069,31 @@ class Database:
             where = f"WHERE {clause}"
         return where, list(params) + list(c_params)
 
-    def query_photos(self, rules, sort="date", page=1, per_page=50,
-                     collection_id=None, folder_id=None):
+    def query_photos(
+        self,
+        rules,
+        sort="date",
+        page=1,
+        per_page=50,
+        collection_id=None,
+        folder_id=None,
+        include_offline_folders=False,
+    ):
         """Return paginated photos matching a universal-filter rule tree.
 
         The rules format is the smart-collection tree (see
         ``_build_query_from_rules``); ``count_photos_for_rules`` gives the
         matching total. Raises ValueError on malformed rules.
         """
-        folder_join, join_clause, where, params = self._build_query_from_rules(rules)
-        where, params = self._append_collection_restriction(collection_id, where, params)
+        folder_join, join_clause, where, params = self._build_query_from_rules(
+            rules, include_offline_folders=include_offline_folders,
+        )
+        where, params = self._append_collection_restriction(
+            collection_id,
+            where,
+            params,
+            include_offline_folders=include_offline_folders,
+        )
         where, params = self._append_folder_restriction(folder_id, where, params)
         sort_map = {
             "date": _PHOTO_DATE_ASC_ORDER,
@@ -23000,6 +23109,8 @@ class Database:
         page = max(1, page)
         offset = (page - 1) * per_page
         pcols = ", ".join(f"p.{c.strip()}" for c in self.PHOTO_COLS.split(","))
+        if include_offline_folders:
+            pcols += ", f.status AS folder_status"
         query = f"""
             SELECT DISTINCT {pcols} FROM photos p
             {folder_join}
@@ -23010,7 +23121,8 @@ class Database:
         """
         return self.conn.execute(query, [*params, per_page, offset]).fetchall()
 
-    def _browse_stack_query_parts(self, rules, collection_id=None, folder_id=None):
+    def _browse_stack_query_parts(self, rules, collection_id=None, folder_id=None,
+                                  include_offline_folders=False):
         """Build the scoped CTE shared by stacked Browse list/count queries.
 
         Stacks are a presentation of the current result set, not durable
@@ -23025,31 +23137,60 @@ class Database:
         live in ``pipeline_results_ws*.json`` and are not persisted to
         ``burst_id``, so they intentionally do not participate in Browse
         stacking today; the pipeline review page is where users see those.
+
+        ``include_offline_folders`` is the opt-in offline collection view
+        (PR #1563). Photos whose folder is offline are *shown* — they render
+        as read-only placeholders — but they never join a stack: each one
+        keeps its own ``photo:<id>`` key and is left out of every duplicate /
+        burst tally. Two reasons, both about not lying to the user:
+
+        * A stack's cover is its only interactive card, and
+          ``_STACK_COVER_ORDER`` ranks on quality alone. An offline member
+          could win the cover and turn a stack holding perfectly reachable
+          frames into a dead placeholder.
+        * The stack badge reads as "N photos here to cull". Counting frames
+          the user cannot rate, flag, or delete would make that count a
+          proxy rather than an answer (CORE_PHILOSOPHY, "no black boxes").
         """
-        folder_join, join_clause, where, params = self._build_query_from_rules(rules)
+        folder_join, join_clause, where, params = self._build_query_from_rules(
+            rules, include_offline_folders=include_offline_folders,
+        )
         where, params = self._append_collection_restriction(
             collection_id, where, params,
+            include_offline_folders=include_offline_folders,
         )
         where, params = self._append_folder_restriction(folder_id, where, params)
         pcols = ", ".join(f"p.{c.strip()}" for c in self.PHOTO_COLS.split(","))
+        if include_offline_folders:
+            pcols += ", f.status AS folder_status"
+            offline_expr = (
+                "CASE WHEN f.status IN ('ok', 'partial') THEN 0 ELSE 1 END"
+            )
+        else:
+            offline_expr = "0"
         ctes = f"""
             WITH scoped AS (
                 SELECT DISTINCT {pcols}, p.burst_id AS _stack_burst_id,
-                       p.file_hash AS _stack_file_hash
+                       p.file_hash AS _stack_file_hash,
+                       {offline_expr} AS _stack_offline
                 FROM photos p
                 {folder_join}
                 {join_clause}
                 {where}
             ), duplicate_counts AS (
                 SELECT scoped.*,
-                       CASE WHEN NULLIF(_stack_file_hash, '') IS NULL THEN 0 ELSE
-                           COUNT(*) OVER (PARTITION BY _stack_file_hash)
+                       CASE WHEN _stack_offline = 1
+                                 OR NULLIF(_stack_file_hash, '') IS NULL THEN 0 ELSE
+                           SUM(CASE WHEN _stack_offline = 0 THEN 1 ELSE 0 END)
+                           OVER (PARTITION BY _stack_file_hash)
                        END AS _duplicate_count
                 FROM scoped
             ), stack_counts AS (
                 SELECT duplicate_counts.*,
-                       CASE WHEN NULLIF(_stack_burst_id, '') IS NULL THEN 0 ELSE
-                           SUM(CASE WHEN _duplicate_count < 2 THEN 1 ELSE 0 END)
+                       CASE WHEN _stack_offline = 1
+                                 OR NULLIF(_stack_burst_id, '') IS NULL THEN 0 ELSE
+                           SUM(CASE WHEN _duplicate_count < 2 AND _stack_offline = 0
+                                    THEN 1 ELSE 0 END)
                            OVER (PARTITION BY _stack_burst_id)
                        END AS _burst_count
                 FROM duplicate_counts
@@ -23173,7 +23314,7 @@ class Database:
         return self._stack_sort_spec(sort)["order"]
 
     def _ranked_stack_query(self, rules, sort="date", collection_id=None,
-                            folder_id=None):
+                            folder_id=None, include_offline_folders=False):
         """Return the CTE + ``ranked`` window-function block shared by every
         stack-projected query. Callers append their own outer SELECT (with
         ORDER BY and optional LIMIT/OFFSET).
@@ -23184,6 +23325,7 @@ class Database:
         """
         ctes, params = self._browse_stack_query_parts(
             rules, collection_id=collection_id, folder_id=folder_id,
+            include_offline_folders=include_offline_folders,
         )
         cover_order = self._STACK_COVER_ORDER
         spec = self._stack_sort_spec(sort)
@@ -23223,7 +23365,8 @@ class Database:
         return ranked, params
 
     def query_browse_stacks(self, rules, sort="date", page=1, per_page=50,
-                            collection_id=None, folder_id=None):
+                            collection_id=None, folder_id=None,
+                            include_offline_folders=False):
         """Return one representative row per exact-duplicate or burst stack.
 
         The returned rows have three private columns consumed by the HTTP
@@ -23233,6 +23376,7 @@ class Database:
         """
         ranked, params = self._ranked_stack_query(
             rules, sort=sort, collection_id=collection_id, folder_id=folder_id,
+            include_offline_folders=include_offline_folders,
         )
         order = self._stack_sort_clause(sort)
         page = max(1, page)
@@ -23247,10 +23391,12 @@ class Database:
         """
         return self.conn.execute(query, [*params, per_page, offset]).fetchall()
 
-    def count_browse_stacks(self, rules, collection_id=None, folder_id=None):
+    def count_browse_stacks(self, rules, collection_id=None, folder_id=None,
+                            include_offline_folders=False):
         """Count logical Browse items after stack projection."""
         ctes, params = self._browse_stack_query_parts(
             rules, collection_id=collection_id, folder_id=folder_id,
+            include_offline_folders=include_offline_folders,
         )
         row = self.conn.execute(
             ctes + " SELECT COUNT(DISTINCT _stack_key) AS n FROM keyed",
@@ -23327,14 +23473,21 @@ class Database:
             rules, sort=sort, collection_id=collection_id, folder_id=folder_id,
         )
 
-    def collapse_browse_stack_photo_ids(self, photo_ids):
+    def collapse_browse_stack_photo_ids(self, photo_ids, standalone_ids=None):
         """Collapse an already ordered ID result, preserving group order.
 
         Visual search has already materialized its relevance-ordered IDs, so
         re-running the metadata SQL would lose that order. This bounded helper
         applies the same duplicate-first overlap rule in Python and selects a
         quality-ranked cover for each logical item.
+
+        ``standalone_ids`` are photos that must never join a stack — the
+        offline members of the opt-in offline collection view. They keep
+        their place in the relevance order as their own single-photo item,
+        and are left out of every duplicate / burst tally, matching the SQL
+        projection in ``_browse_stack_query_parts``.
         """
+        standalone = set(standalone_ids or ())
         ordered_ids = list(dict.fromkeys(photo_ids or []))
         if not ordered_ids:
             return []
@@ -23353,12 +23506,16 @@ class Database:
 
         duplicate_counts = {}
         for pid in ordered_ids:
+            if pid in standalone:
+                continue
             row = rows_by_id.get(pid)
             file_hash = row["file_hash"] if row else None
             if file_hash:
                 duplicate_counts[file_hash] = duplicate_counts.get(file_hash, 0) + 1
         burst_counts = {}
         for pid in ordered_ids:
+            if pid in standalone:
+                continue
             row = rows_by_id.get(pid)
             if not row:
                 continue
@@ -23377,7 +23534,9 @@ class Database:
                 continue
             file_hash = row["file_hash"]
             burst_id = row["burst_id"]
-            if file_hash and duplicate_counts.get(file_hash, 0) >= 2:
+            if pid in standalone:
+                key = (None, pid)
+            elif file_hash and duplicate_counts.get(file_hash, 0) >= 2:
                 key = ("duplicate", file_hash)
             elif burst_id and burst_counts.get(burst_id, 0) >= 2:
                 key = ("burst", burst_id)
@@ -23422,14 +23581,27 @@ class Database:
     # match both photos. ``display_expr`` is what the picker shows; using
     # ``MIN(col)`` picks a stable representative spelling within each
     # case-insensitive bucket instead of always lower-casing the label.
-    def query_photo_ids(self, rules, sort="date", collection_id=None,
-                        folder_id=None):
+    def query_photo_ids(
+        self,
+        rules,
+        sort="date",
+        collection_id=None,
+        folder_id=None,
+        include_offline_folders=False,
+    ):
         """Return every photo id matching a universal-filter rule tree, in
         display order — the rules analog of ``get_photo_ids`` (select-all,
         visual-search candidate scope). Raises ValueError on malformed rules.
         """
-        folder_join, join_clause, where, params = self._build_query_from_rules(rules)
-        where, params = self._append_collection_restriction(collection_id, where, params)
+        folder_join, join_clause, where, params = self._build_query_from_rules(
+            rules, include_offline_folders=include_offline_folders,
+        )
+        where, params = self._append_collection_restriction(
+            collection_id,
+            where,
+            params,
+            include_offline_folders=include_offline_folders,
+        )
         where, params = self._append_folder_restriction(folder_id, where, params)
         order = {
             "date": _PHOTO_DATE_ASC_ORDER,

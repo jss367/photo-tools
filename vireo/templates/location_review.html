@@ -680,9 +680,13 @@ body {
   }
 
   function collectionOptionLabel(collection) {
-    var count = collection.photo_count;
+    var count = collection.available_photo_count != null
+      ? collection.available_photo_count
+      : collection.photo_count;
     if (count == null) return collection.name;
-    return collection.name + ' (' + formatNumber(count) + ')';
+    var offline = Number(collection.offline_photo_count || 0);
+    return collection.name + ' (' + formatNumber(count) + ' available' +
+      (offline ? ', ' + formatNumber(offline) + ' offline' : '') + ')';
   }
 
   async function loadCollectionChoices() {

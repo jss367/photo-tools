@@ -84,6 +84,46 @@ def test_dashboard_collection_drill_down_is_explicitly_composable(live_server, p
     expect(page.locator(".grid-card")).to_have_count(2)
 
 
+def test_dashboard_collection_deep_link_loads_offline_availability(
+    live_server, page,
+):
+    """A scope-only dashboard link still exposes offline collection members."""
+    db = live_server["db"]
+    offline_folder = live_server["data"]["folders"][1]
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?",
+        (offline_folder,),
+    )
+    db.conn.commit()
+    collection_id = next(
+        collection["id"]
+        for collection in db.get_collections()
+        if collection["name"] == "All Photos"
+    )
+
+    query_requests = []
+    page.on(
+        "request",
+        lambda request: query_requests.append(request)
+        if request.method == "POST" and request.url.endswith("/api/photos/query")
+        else None,
+    )
+    page.goto(
+        f"{live_server['url']}/browse"
+        f"?dashboard_scope=1&collection_id={collection_id}"
+    )
+
+    notice = page.locator("#offlineCollectionNotice")
+    expect(notice).to_be_visible(timeout=15000)
+    expect(page.locator("#offlineCollectionText")).to_have_text(
+        "3 of 5 photos available · 2 offline (hidden)"
+    )
+    assert query_requests, "dashboard collection scope never queried availability"
+    payload = query_requests[-1].post_data_json
+    assert payload["collection_id"] == collection_id
+    assert payload["include_availability"] is True
+
+
 def test_dashboard_scoped_visual_collection_link_loads_visual_clause(live_server, page):
     """A bookmarked drilldown into a visual collection
     (``?dashboard_scope=1&collection_id=<visual>``) must load the saved

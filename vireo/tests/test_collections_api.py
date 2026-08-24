@@ -63,6 +63,35 @@ def test_create_and_list_collection(app_and_db):
     assert created_id in ids
 
 
+def test_collection_list_keeps_offline_members_in_total(app_and_db):
+    """Collection membership stays stable while storage is unavailable."""
+    app, db = app_and_db
+    _clear_default_collections(app, db)
+    client = app.test_client()
+    available_before = db.count_photos()
+
+    ok_folder = db.add_folder("/available", name="available")
+    offline_folder = db.add_folder("/offline", name="offline")
+    db.add_photo(folder_id=ok_folder, filename="online.jpg", extension=".jpg",
+                 file_size=100, file_mtime=1.0)
+    db.add_photo(folder_id=offline_folder, filename="offline.jpg", extension=".jpg",
+                 file_size=100, file_mtime=1.0)
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?",
+        (offline_folder,),
+    )
+    db.conn.commit()
+    client.post(
+        "/api/collections",
+        json={"name": "Everything", "rules": [{"field": "all"}]},
+    )
+
+    collection = client.get("/api/collections").get_json()[0]
+    assert collection["photo_count"] == available_before + 2
+    assert collection["available_photo_count"] == available_before + 1
+    assert collection["offline_photo_count"] == 1
+
+
 def test_list_collections_marks_manual_photo_targets(app_and_db):
     """GET /api/collections reports which collections can accept manual adds."""
     app, db = app_and_db

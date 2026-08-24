@@ -11083,6 +11083,177 @@ def test_api_photos_query_browse_stacks(app_and_db):
     )
 
 
+def test_api_photos_query_offline_members_are_opt_in_and_read_only(app_and_db):
+    """Browse can reveal offline collection members without selecting them."""
+    app, db = app_and_db
+    client = app.test_client()
+    available_before = db.count_photos()
+    offline_folder = db.add_folder("/temporarily-offline", name="offline")
+    offline_id = db.add_photo(
+        folder_id=offline_folder,
+        filename="offline.jpg",
+        extension=".jpg",
+        file_size=100,
+        file_mtime=1.0,
+    )
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?",
+        (offline_folder,),
+    )
+    db.conn.commit()
+
+    hidden = client.post('/api/photos/query', json={
+        "rules": [{"field": "all"}],
+        "include_availability": True,
+    }).get_json()
+    assert hidden["available_total"] == available_before
+    assert hidden["inventory_total"] == available_before + 1
+    assert hidden["offline_total"] == 1
+    assert offline_id not in {p["id"] for p in hidden["photos"]}
+
+    shown = client.post('/api/photos/query', json={
+        "rules": [{"field": "all"}],
+        "include_availability": True,
+        "include_offline": True,
+    }).get_json()
+    offline_photo = next(p for p in shown["photos"] if p["id"] == offline_id)
+    assert offline_photo["folder_status"] == "missing"
+    assert shown["total"] == shown["inventory_total"] == available_before + 1
+
+    # IDs-only is the source of truth for Select all / bulk actions. The
+    # display flag must never widen it to inaccessible photos.
+    selection = client.post('/api/photos/query', json={
+        "rules": [{"field": "all"}],
+        "ids_only": True,
+        "include_offline": True,
+    }).get_json()
+    assert offline_id not in selection["ids"]
+    assert selection["total"] == available_before
+
+
+def test_api_photos_query_offline_members_never_join_a_stack(app_and_db):
+    """Offline photos are shown but never stacked (merge of #1561 and #1563).
+
+    A stack's cover is its only interactive card and the badge count reads as
+    "N photos here to cull", so folding in members the user cannot rate, flag
+    or delete would both hide reachable frames behind a dead placeholder and
+    make the count a proxy rather than an answer. Offline members therefore
+    stay their own single-photo items, and the availability totals stay photo
+    counts that agree with ``underlying_total`` rather than the stack count.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    listed = db.get_photos(sort="name")
+    online_a, online_b = listed[0]["id"], listed[1]["id"]
+
+    offline_folder = db.add_folder("/temporarily-offline", name="offline")
+    offline_id = db.add_photo(
+        folder_id=offline_folder,
+        filename="zz-offline.jpg",
+        extension=".jpg",
+        file_size=100,
+        file_mtime=1.0,
+    )
+    with db.conn:
+        # All three share one burst. The offline frame also carries the best
+        # quality score, so it would win the cover if it were allowed in.
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'mixed-burst' WHERE id IN (?, ?, ?)",
+            (online_a, online_b, offline_id),
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.5 WHERE id = ?", (online_b,),
+        )
+        db.conn.execute(
+            "UPDATE photos SET quality_score = 0.99 WHERE id = ?", (offline_id,),
+        )
+        db.conn.execute(
+            "UPDATE folders SET status = 'missing' WHERE id = ?",
+            (offline_folder,),
+        )
+
+    shown = client.post("/api/photos/query", json={
+        "rules": [], "sort": "name", "stacks": True,
+        "include_availability": True, "include_offline": True,
+    })
+    assert shown.status_code == 200
+    data = shown.get_json()
+    by_id = {photo["id"]: photo for photo in data["photos"]}
+
+    # The stack holds only the two reachable frames, and the offline frame
+    # did not take the cover despite the best quality score.
+    stack = next(photo for photo in data["photos"] if photo["browse_stack"])
+    assert stack["id"] == online_b
+    assert stack["browse_stack"] == {
+        "kind": "burst", "count": 2, "photo_ids": [online_a, online_b],
+    }
+
+    # The offline frame is present as its own read-only item.
+    assert by_id[offline_id]["folder_status"] == "missing"
+    assert by_id[offline_id]["browse_stack"] is None
+
+    # Logical items: one stack + one untouched single + the offline placeholder.
+    assert data["total"] == 3
+    # Availability is reported in photos, so it agrees with underlying_total.
+    assert data["underlying_total"] == 4
+    assert data["inventory_total"] == 4
+    assert data["available_total"] == 3
+    assert data["offline_total"] == 1
+
+    # With offline members hidden the grid loses only the placeholder; the
+    # stack projection and the availability totals are unchanged.
+    hidden = client.post("/api/photos/query", json={
+        "rules": [], "sort": "name", "stacks": True,
+        "include_availability": True,
+    }).get_json()
+    assert offline_id not in {photo["id"] for photo in hidden["photos"]}
+    hidden_stack = next(p for p in hidden["photos"] if p["browse_stack"])
+    assert hidden_stack["id"] == online_b
+    assert hidden_stack["browse_stack"]["count"] == 2
+    assert hidden["total"] == 2
+    assert hidden["underlying_total"] == 3
+    assert hidden["inventory_total"] == 4
+    assert hidden["available_total"] == 3
+    assert hidden["offline_total"] == 1
+
+    # Select-all stays photo-based and accessible-only, so the stacked ids
+    # projection never offers the offline frame.
+    ids_only = client.post("/api/photos/query", json={
+        "rules": [], "sort": "name", "stacks": True, "ids_only": True,
+        "include_offline": True,
+    }).get_json()
+    assert offline_id not in ids_only["ids"]
+    assert ids_only["total"] == 3
+
+
+def test_collapse_browse_stack_photo_ids_keeps_standalone_ids_singular(app_and_db):
+    """The visual-search collapse helper honors the same offline rule."""
+    _app, db = app_and_db
+    listed = db.get_photos(sort="name")
+    first, second, third = (photo["id"] for photo in listed[:3])
+    with db.conn:
+        db.conn.execute(
+            "UPDATE photos SET burst_id = 'mixed-burst' WHERE id IN (?, ?, ?)",
+            (first, second, third),
+        )
+
+    grouped = db.collapse_browse_stack_photo_ids([first, second, third])
+    assert len(grouped) == 1
+    assert sorted(grouped[0]["member_ids"]) == sorted([first, second, third])
+
+    # Marking one id standalone drops it out of the burst tally and keeps it
+    # in relevance order as its own item.
+    split = db.collapse_browse_stack_photo_ids(
+        [first, second, third], standalone_ids=[second],
+    )
+    assert [item["cover_id"] for item in split].count(second) == 1
+    solo = next(item for item in split if item["cover_id"] == second)
+    assert solo["member_ids"] == [second]
+    assert solo["kind"] is None
+    rest = next(item for item in split if item["cover_id"] != second)
+    assert sorted(rest["member_ids"]) == sorted([first, third])
+
+
 def test_api_photos_query_group_tree_and_paging(app_and_db):
     app, _ = app_and_db
     client = app.test_client()
@@ -11133,6 +11304,12 @@ def test_api_photos_query_validation(app_and_db, monkeypatch):
     }).status_code == 400
     assert client.post('/api/photos/query', json={
         "rules": [], "stacks": "yes",
+    }).status_code == 400
+    assert client.post('/api/photos/query', json={
+        "rules": [], "include_offline": 1,
+    }).status_code == 400
+    assert client.post('/api/photos/query', json={
+        "rules": [], "include_availability": "yes",
     }).status_code == 400
     # A group whose ``rules`` key is ``null`` (or any non-list) must land as
     # a 400 from ``_validate_node``. Before the guard, the active-model
@@ -11592,6 +11769,42 @@ def test_api_photos_query_visual_ranks_by_similarity(app_and_db, monkeypatch):
     })
     data = resp.get_json()
     assert data["ids"] == [photos["bird1.jpg"], photos["bird2.jpg"]]
+
+
+def test_api_photos_query_visual_reports_offline_members(app_and_db, monkeypatch):
+    """Resolved visual collections use the same inventory/availability split."""
+    app, db = app_and_db
+    photos = _seed_embeddings(db)
+    _stub_clip(monkeypatch)
+    offline_id = photos["bird2.jpg"]
+    offline_folder = db.get_photo(offline_id)["folder_id"]
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?",
+        (offline_folder,),
+    )
+    db.conn.commit()
+    client = app.test_client()
+
+    hidden = client.post('/api/photos/query', json={
+        "rules": [],
+        "visual": {"prompt": "a bird", "strength": "balanced"},
+        "include_availability": True,
+    }).get_json()
+    assert hidden["inventory_total"] == 2
+    assert hidden["available_total"] == 1
+    assert hidden["offline_total"] == 1
+    assert [p["filename"] for p in hidden["photos"]] == ["bird1.jpg"]
+
+    shown = client.post('/api/photos/query', json={
+        "rules": [],
+        "visual": {"prompt": "a bird", "strength": "balanced"},
+        "include_availability": True,
+        "include_offline": True,
+    }).get_json()
+    assert [p["filename"] for p in shown["photos"]] == [
+        "bird1.jpg", "bird2.jpg",
+    ]
+    assert shown["photos"][1]["folder_status"] == "missing"
 
 
 def test_api_photos_query_visual_error_states(app_and_db, monkeypatch):

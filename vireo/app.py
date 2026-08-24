@@ -20648,10 +20648,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
 
             if recipe.get("crop"):
-                source_path, _using_working_copy = _recipe_render_source(
+                source_path, using_working_copy = _recipe_render_source(
                     photo, recipe, 0, vireo_dir, folders,
                 )
-                return source_path or fallback_path
+                return source_path or fallback_path, bool(using_working_copy)
 
             # For RAW primaries, skip the working-copy short-circuit while the
             # RAW source is available: legacy working copies predate the
@@ -20670,7 +20670,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     os.path.exists(wc_path)
                     and _path_satisfies_recipe_render(wc_path, photo, recipe, 0)
                 ):
-                    return wc_path
+                    return wc_path, True
 
             folder_path = folders.get(photo["folder_id"])
             if folder_path:
@@ -20689,11 +20689,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                 companion, photo, recipe, 0,
                             )
                         ):
-                            return companion
+                            return companion, False
                 original = os.path.join(folder_path, photo["filename"])
                 if os.path.exists(original):
-                    return original
-            return fallback_path
+                    return original, False
+            return fallback_path, False
 
         def _external_edit_handoff_path(photo, fallback_path):
             recipe = db.get_photo_edit_recipe(photo["id"])
@@ -20712,17 +20712,36 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 load_image,
             )
 
-            source_path = _external_edit_recipe_source(
+            source_path, using_working_copy = _external_edit_recipe_source(
                 photo, recipe, fallback_path,
             )
             if not source_path or not os.path.isfile(source_path):
-                return None, f"{photo['filename']}: source file missing"
+                if using_working_copy and fallback_path and os.path.isfile(
+                    fallback_path,
+                ):
+                    # Quota enforcement can unlink the working copy between
+                    # recipe-source resolution and this existence check.
+                    # Fall back to the original before reporting missing.
+                    source_path = fallback_path
+                    using_working_copy = False
+                else:
+                    return None, f"{photo['filename']}: source file missing"
 
             out_dir = os.path.join(vireo_dir, "external-edits")
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, f"{photo['id']}.jpg")
             meta_path = os.path.join(out_dir, f"{photo['id']}.json")
-            source_mtime = os.path.getmtime(source_path)
+            try:
+                source_mtime = os.path.getmtime(source_path)
+            except FileNotFoundError:
+                if using_working_copy and fallback_path and os.path.isfile(
+                    fallback_path,
+                ):
+                    source_path = fallback_path
+                    using_working_copy = False
+                    source_mtime = os.path.getmtime(source_path)
+                else:
+                    return None, f"{photo['filename']}: source file missing"
             recipe_json = recipe_to_json(recipe) or ""
             # Include the edit-math version so a math bump invalidates this
             # handoff render: the JPEG is keyed by recipe/source/mtime, none
@@ -20753,6 +20772,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             raw_decode = RAW_DECODE_PRESERVE_HIGHLIGHTS if primary_is_raw else None
             load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
             img = load_image(source_path, max_size=None, **load_kwargs)
+            if img is None and using_working_copy and fallback_path and (
+                os.path.isfile(fallback_path)
+                and os.path.abspath(fallback_path)
+                != os.path.abspath(source_path)
+            ):
+                # Working copy was evicted between validation and decode.
+                # Retry from the original before the companion fallback so
+                # RAW primaries still use the highlight-preserving decode.
+                retry_img = load_image(fallback_path, max_size=None, **load_kwargs)
+                if retry_img is not None:
+                    img = retry_img
+                    source_path = fallback_path
+                    using_working_copy = False
+                    try:
+                        source_mtime = os.path.getmtime(source_path)
+                    except OSError:
+                        pass
+                    expected_meta["source_path"] = source_path
+                    expected_meta["source_mtime"] = source_mtime
             expected_w, expected_h = 0, 0
             needs_companion = False
             if primary_is_raw:
@@ -24517,10 +24555,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             os.path.splitext(photo["filename"])[1].lower() in RAW_EXTENSIONS
         )
         if recipe.get("crop"):
-            source_path, _using_working_copy = _recipe_render_source(
+            source_path, using_working_copy = _recipe_render_source(
                 photo, recipe, 0, vireo_dir, folders,
             )
-            return source_path or fallback_path
+            return source_path or fallback_path, bool(using_working_copy)
 
         # For RAW primaries, skip the working-copy short-circuit while the
         # RAW source is available: legacy working copies predate the
@@ -24539,7 +24577,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 os.path.exists(wc_path)
                 and _path_satisfies_recipe_render(wc_path, photo, recipe, 0)
             ):
-                return wc_path
+                return wc_path, True
 
         companion_path = photo["companion_path"]
         raw_source_available = os.path.exists(fallback_path)
@@ -24551,8 +24589,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 os.path.exists(companion)
                 and _path_satisfies_recipe_render(companion, photo, recipe, 0)
             ):
-                return companion
-        return fallback_path
+                return companion, False
+        return fallback_path, False
 
     def _inat_upload_photo_path(db, photo, fallback_path):
         import config as cfg
@@ -24574,15 +24612,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             load_image,
         )
 
-        source_path = _inat_edit_recipe_source(photo, recipe, fallback_path)
+        source_path, using_working_copy = _inat_edit_recipe_source(
+            photo, recipe, fallback_path,
+        )
         if not source_path or not os.path.isfile(source_path):
-            return None, f"{photo['filename']}: source file missing"
+            if using_working_copy and fallback_path and os.path.isfile(
+                fallback_path,
+            ):
+                # Quota enforcement can unlink the working copy between
+                # recipe-source resolution and this existence check.
+                source_path = fallback_path
+                using_working_copy = False
+            else:
+                return None, f"{photo['filename']}: source file missing"
 
         out_dir = os.path.join(vireo_dir, "inat-uploads")
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"{photo['id']}.jpg")
         meta_path = os.path.join(out_dir, f"{photo['id']}.json")
-        source_mtime = os.path.getmtime(source_path)
+        try:
+            source_mtime = os.path.getmtime(source_path)
+        except FileNotFoundError:
+            if using_working_copy and fallback_path and os.path.isfile(
+                fallback_path,
+            ):
+                source_path = fallback_path
+                using_working_copy = False
+                source_mtime = os.path.getmtime(source_path)
+            else:
+                return None, f"{photo['filename']}: source file missing"
         recipe_json = recipe_to_json(recipe) or ""
         # Include the edit-math version so a math bump invalidates this cached
         # render — the JPEG is keyed by recipe/source/mtime, none of which
@@ -24613,6 +24671,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         raw_decode = RAW_DECODE_PRESERVE_HIGHLIGHTS if primary_is_raw else None
         load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
         img = load_image(source_path, max_size=None, **load_kwargs)
+        if img is None and using_working_copy and fallback_path and (
+            os.path.isfile(fallback_path)
+            and os.path.abspath(fallback_path)
+            != os.path.abspath(source_path)
+        ):
+            # Working copy was evicted between validation and decode; retry
+            # from the original before the companion fallback so RAW primaries
+            # still use the highlight-preserving decode.
+            retry_img = load_image(fallback_path, max_size=None, **load_kwargs)
+            if retry_img is not None:
+                img = retry_img
+                source_path = fallback_path
+                using_working_copy = False
+                try:
+                    source_mtime = os.path.getmtime(source_path)
+                except OSError:
+                    pass
+                expected_meta["source_path"] = source_path
+                expected_meta["source_mtime"] = source_mtime
         expected_w, expected_h = 0, 0
         needs_companion = False
         if primary_is_raw:
@@ -38388,7 +38465,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # RAW. A camera-rendered display cache or companion still wins
             # above when available; otherwise the edit-quality working copy
             # is the best usable full-resolution fallback.
-            return send_file(trusted_wc_path, mimetype="image/jpeg")
+            #
+            # Hold the publication guard through ``send_file`` so a concurrent
+            # quota reduction cannot unlink the only usable rendition between
+            # this check and the file open — mirrors the non-RAW cache-hit
+            # branch above.
+            with working_copy_publication_guard():
+                if os.path.isfile(trusted_wc_path):
+                    return send_file(trusted_wc_path, mimetype="image/jpeg")
 
         has_current_raw_failure = (
             (not using_offline_cache or resolved_ext in RAW_EXTENSIONS)
@@ -38419,7 +38503,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 resolved_ext = os.path.splitext(image_path)[1].lower()
             else:
                 if primary_is_raw and trusted_wc_path:
-                    return send_file(trusted_wc_path, mimetype="image/jpeg")
+                    # Same eviction race as the non-RAW cache-hit branch:
+                    # revalidate under the publication guard before opening.
+                    with working_copy_publication_guard():
+                        if os.path.isfile(trusted_wc_path):
+                            return send_file(
+                                trusted_wc_path, mimetype="image/jpeg",
+                            )
                 log.info(
                     "Skipping original-image extraction for photo %s; RAW working-copy "
                     "extraction already failed for current source mtime",

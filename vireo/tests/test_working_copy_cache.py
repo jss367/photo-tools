@@ -570,6 +570,96 @@ def test_reconcile_rechecks_missing_file_before_clearing_row(
         db.close()
 
 
+def test_evict_retries_after_snapshot_invalidation(tmp_path, monkeypatch):
+    """A concurrent catalog writer that keeps invalidating the pass must not
+    silently leave the cache above the new quota — retry with a fresh
+    snapshot until it succeeds or the retry cap is hit."""
+    import working_copy_cache
+    from db import Database
+
+    db, working_dir, photo_ids = _seed_working_copies(
+        tmp_path, [700_000, 700_000],
+    )
+    lifecycle_db = Database(str(tmp_path / "vireo.db"))
+    real_begin = working_copy_cache._begin_stable_eviction_transaction
+    attempts = {"count": 0}
+
+    def bump_data_version_on_first_call(candidate_db, expected_data_version):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            # Simulate an unrelated catalog writer committing between our
+            # snapshot and this lock acquisition. The pass must return None
+            # to trigger a snapshot retake instead of returning a stale
+            # "no eviction needed" payload.
+            lifecycle_db.conn.execute(
+                "UPDATE photos SET rating = COALESCE(rating, 0) + 1 "
+                "WHERE id=?",
+                (photo_ids[0],),
+            )
+            lifecycle_db.conn.commit()
+        return real_begin(candidate_db, expected_data_version)
+
+    monkeypatch.setattr(
+        working_copy_cache,
+        "_begin_stable_eviction_transaction",
+        bump_data_version_on_first_call,
+    )
+    try:
+        result = working_copy_cache.evict_if_over_quota(
+            db, str(tmp_path), quota_mb=1,
+        )
+        # Retry succeeded on the second attempt and evicted one file to
+        # bring usage under the 1 MB quota.
+        assert attempts["count"] >= 2
+        assert result.get("deferred") is not True
+        assert result["evicted"] == 1
+        assert result["remaining_bytes"] <= result["quota_bytes"]
+    finally:
+        lifecycle_db.close()
+        db.close()
+
+
+def test_evict_reports_deferred_when_retries_are_exhausted(
+    tmp_path, monkeypatch,
+):
+    """When every retry snapshot is invalidated, honestly report deferral so
+    the caller can log rather than treating the pass as successful."""
+    import working_copy_cache
+    from db import Database
+
+    db, working_dir, photo_ids = _seed_working_copies(
+        tmp_path, [700_000, 700_000],
+    )
+    lifecycle_db = Database(str(tmp_path / "vireo.db"))
+    real_begin = working_copy_cache._begin_stable_eviction_transaction
+
+    invalidate_counter = {"n": 0}
+
+    def always_invalidate(candidate_db, expected_data_version):
+        invalidate_counter["n"] += 1
+        lifecycle_db.conn.execute(
+            "UPDATE photos SET rating = ? WHERE id=?",
+            (invalidate_counter["n"], photo_ids[0]),
+        )
+        lifecycle_db.conn.commit()
+        return real_begin(candidate_db, expected_data_version)
+
+    monkeypatch.setattr(
+        working_copy_cache,
+        "_begin_stable_eviction_transaction",
+        always_invalidate,
+    )
+    try:
+        result = working_copy_cache.evict_if_over_quota(
+            db, str(tmp_path), quota_mb=1,
+        )
+        assert result.get("deferred") is True
+        assert result["evicted"] == 0
+    finally:
+        lifecycle_db.close()
+        db.close()
+
+
 def test_zero_quota_skips_working_copy_generation(
     tmp_path, monkeypatch,
 ):

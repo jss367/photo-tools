@@ -29,6 +29,12 @@ _UNTRACKED_WRITE_GRACE_SECONDS = 60
 # valid working copies, but the bytes still consume real disk — sweep so
 # they cannot accumulate indefinitely.
 _RENDER_TEMP_SWEEP_SECONDS = 60 * 60
+# Cap snapshot-invalidation retries inside a single eviction pass. Concurrent
+# catalog writers can bump ``PRAGMA data_version`` between our scan and the
+# transaction, so returning after one deferral lets a lowered quota persist
+# stale files indefinitely on a busy catalog. Retry with a fresh snapshot up
+# to this many times before giving up so the caller does not have to loop.
+_EVICTION_SNAPSHOT_RETRIES = 4
 # Publication paths may need to run quota enforcement before releasing the
 # guard (for example, when a settings write lowers the ceiling while a slow
 # RAW decode is in flight). Keep that nested enforcement serialized with
@@ -214,208 +220,241 @@ def evict_if_over_quota(db, vireo_dir, quota_mb=None, *, startup=False):
         }
 
     with _eviction_lock:
-        catalog_data_version = db.conn.execute(
-            "PRAGMA data_version"
-        ).fetchone()[0]
-        rows = db.conn.execute(
-            "SELECT id, working_copy_path, file_mtime FROM photos "
-        ).fetchall()
-        files = {}
-        total = 0
-        stale_temp_cutoff_ns = (
-            time.time_ns() - _RENDER_TEMP_SWEEP_SECONDS * 1_000_000_000
+        for _snapshot_attempt in range(_EVICTION_SNAPSHOT_RETRIES):
+            result = _evict_once(db, working_dir, max_bytes, startup=startup)
+            if result is not None:
+                return result
+        # A concurrent catalog writer kept invalidating our snapshot. Report
+        # deferral honestly so callers can log or retry later; another
+        # publication/startup pass will still catch it, but at least this
+        # settings save does not silently leave the cache over the new quota.
+        log.warning(
+            "Working-copy quota eviction deferred after %d snapshot retries; "
+            "usage may remain above the configured limit until another pass",
+            _EVICTION_SNAPSHOT_RETRIES,
         )
-        try:
-            with os.scandir(working_dir) as directory_entries:
-                for entry in directory_entries:
-                    try:
-                        if not entry.is_file():
-                            continue
-                        if _is_private_working_tempfile(entry.name):
-                            # A leftover on-demand extractor tempfile that
-                            # eviction cannot reclaim (no catalog row keys off
-                            # this name). Counting it toward ``total`` would
-                            # force eviction to churn real working copies to
-                            # stay under quota while the orphan lingered.
-                            # Old enough to be a crash orphan? Reclaim the
-                            # disk bytes so an interrupted producer cannot
-                            # leak indefinitely; recent ones may still hold
-                            # an active writer fd.
-                            try:
-                                st = entry.stat()
-                            except OSError:
-                                continue
-                            if st.st_mtime_ns <= stale_temp_cutoff_ns:
-                                try:
-                                    os.remove(entry.path)
-                                except FileNotFoundError:
-                                    pass
-                                except OSError as exc:
-                                    log.warning(
-                                        "Failed to remove stale render "
-                                        "tempfile %s: %s", entry.path, exc,
-                                    )
-                            continue
-                        st = entry.stat()
-                    except OSError as exc:
-                        log.warning(
-                            "Could not stat working-copy file %s: %s",
-                            entry.path, exc,
-                        )
-                        continue
-                    files[entry.name] = (entry.path, st)
-                    total += st.st_size
-        except OSError as exc:
-            log.warning("Could not inspect working-copy cache %s: %s", working_dir, exc)
+        return {
+            "evicted": 0,
+            "freed_bytes": 0,
+            "remaining_bytes": None,
+            "quota_bytes": max_bytes,
+            "deferred": True,
+        }
 
-        entries = []
-        known_canonical_names = {f"{row['id']}.jpg" for row in rows}
-        untracked_cutoff_ns = (
-            time.time_ns() - _UNTRACKED_WRITE_GRACE_SECONDS * 1_000_000_000
-        )
-        stale_tracked_ids = []
-        for row in rows:
-            expected_rel = f"working/{row['id']}.jpg"
-            tracked = row["working_copy_path"] == expected_rel
-            if row["working_copy_path"] is not None and not tracked:
-                # Do not let a malformed or legacy catalog path expand the
-                # deletion scope outside Vireo's managed working directory.
-                continue
-            file_entry = files.get(f"{row['id']}.jpg")
-            if file_entry is None:
-                if tracked:
-                    # A prior eviction unlinked the file but lost its DB
-                    # transition (typically a commit failure after the
-                    # unlinks). Reconcile so scanner backfill can regenerate
-                    # this row instead of skipping it forever because
-                    # working_copy_path is non-NULL.
-                    stale_tracked_ids.append(
-                        (row["id"], os.path.join(working_dir, f"{row['id']}.jpg"))
+
+def _evict_once(db, working_dir, max_bytes, *, startup):
+    """One snapshot-consistent eviction pass; ``None`` on data_version change.
+
+    Returns the same result payload as ``evict_if_over_quota`` when the pass
+    completed against a stable catalog snapshot. Returns ``None`` when the
+    catalog changed between our scan and the writer lock so the caller can
+    retake the snapshot and retry.
+
+    ``_eviction_lock`` must already be held by the caller so this pass stays
+    serialized with canonical publication.
+    """
+    catalog_data_version = db.conn.execute(
+        "PRAGMA data_version"
+    ).fetchone()[0]
+    rows = db.conn.execute(
+        "SELECT id, working_copy_path, file_mtime FROM photos "
+    ).fetchall()
+    files = {}
+    total = 0
+    stale_temp_cutoff_ns = (
+        time.time_ns() - _RENDER_TEMP_SWEEP_SECONDS * 1_000_000_000
+    )
+    try:
+        with os.scandir(working_dir) as directory_entries:
+            for entry in directory_entries:
+                try:
+                    if not entry.is_file():
+                        continue
+                    if _is_private_working_tempfile(entry.name):
+                        # A leftover on-demand extractor tempfile that
+                        # eviction cannot reclaim (no catalog row keys off
+                        # this name). Counting it toward ``total`` would
+                        # force eviction to churn real working copies to
+                        # stay under quota while the orphan lingered.
+                        # Old enough to be a crash orphan? Reclaim the
+                        # disk bytes so an interrupted producer cannot
+                        # leak indefinitely; recent ones may still hold
+                        # an active writer fd.
+                        try:
+                            st = entry.stat()
+                        except OSError:
+                            continue
+                        if st.st_mtime_ns <= stale_temp_cutoff_ns:
+                            try:
+                                os.remove(entry.path)
+                            except FileNotFoundError:
+                                pass
+                            except OSError as exc:
+                                log.warning(
+                                    "Failed to remove stale render "
+                                    "tempfile %s: %s", entry.path, exc,
+                                )
+                        continue
+                    st = entry.stat()
+                except OSError as exc:
+                    log.warning(
+                        "Could not stat working-copy file %s: %s",
+                        entry.path, exc,
                     )
-                continue
-            path, st = file_entry
-            if (
-                not tracked
-                and not startup
-                and st.st_mtime_ns > untracked_cutoff_ns
-            ):
-                # This may be an extraction that has published its final path
-                # but has not committed working_copy_path yet. Skipped at
-                # runtime; startup bypasses the grace because no cache writer
-                # can be active yet — the file is safe to reclaim.
-                continue
+                    continue
+                files[entry.name] = (entry.path, st)
+                total += st.st_size
+    except OSError as exc:
+        log.warning("Could not inspect working-copy cache %s: %s", working_dir, exc)
+
+    entries = []
+    known_canonical_names = {f"{row['id']}.jpg" for row in rows}
+    untracked_cutoff_ns = (
+        time.time_ns() - _UNTRACKED_WRITE_GRACE_SECONDS * 1_000_000_000
+    )
+    stale_tracked_ids = []
+    for row in rows:
+        expected_rel = f"working/{row['id']}.jpg"
+        tracked = row["working_copy_path"] == expected_rel
+        if row["working_copy_path"] is not None and not tracked:
+            # Do not let a malformed or legacy catalog path expand the
+            # deletion scope outside Vireo's managed working directory.
+            continue
+        file_entry = files.get(f"{row['id']}.jpg")
+        if file_entry is None:
+            if tracked:
+                # A prior eviction unlinked the file but lost its DB
+                # transition (typically a commit failure after the
+                # unlinks). Reconcile so scanner backfill can regenerate
+                # this row instead of skipping it forever because
+                # working_copy_path is non-NULL.
+                stale_tracked_ids.append(
+                    (row["id"], os.path.join(working_dir, f"{row['id']}.jpg"))
+                )
+            continue
+        path, st = file_entry
+        if (
+            not tracked
+            and not startup
+            and st.st_mtime_ns > untracked_cutoff_ns
+        ):
+            # This may be an extraction that has published its final path
+            # but has not committed working_copy_path yet. Skipped at
+            # runtime; startup bypasses the grace because no cache writer
+            # can be active yet — the file is safe to reclaim.
+            continue
+        entries.append(
+            (
+                st.st_mtime_ns, row["id"], st.st_size, path,
+                expected_rel, _file_identity(st),
+            )
+        )
+
+    # A deleted photo can leave its canonical file behind when Windows
+    # temporarily refuses an unlink while a response handle is open. No
+    # catalog row remains to contribute an ordinary eviction candidate,
+    # but Vireo still owns numeric ``working/<id>.jpg`` names.
+    for name, (path, st) in files.items():
+        stem, extension = os.path.splitext(name)
+        if (
+            name not in known_canonical_names
+            and extension.lower() == ".jpg"
+            and stem.isdigit()
+        ):
+            photo_id = int(stem)
             entries.append(
                 (
-                    st.st_mtime_ns, row["id"], st.st_size, path,
-                    expected_rel, _file_identity(st),
+                    st.st_mtime_ns, photo_id, st.st_size, path,
+                    f"working/{photo_id}.jpg", _file_identity(st),
                 )
             )
 
-        # A deleted photo can leave its canonical file behind when Windows
-        # temporarily refuses an unlink while a response handle is open. No
-        # catalog row remains to contribute an ordinary eviction candidate,
-        # but Vireo still owns numeric ``working/<id>.jpg`` names.
-        for name, (path, st) in files.items():
-            stem, extension = os.path.splitext(name)
-            if (
-                name not in known_canonical_names
-                and extension.lower() == ".jpg"
-                and stem.isdigit()
-            ):
-                photo_id = int(stem)
-                entries.append(
-                    (
-                        st.st_mtime_ns, photo_id, st.st_size, path,
-                        f"working/{photo_id}.jpg", _file_identity(st),
-                    )
-                )
+    if stale_tracked_ids:
+        # A publisher may have replaced a file after the directory scan
+        # observed it missing. Revalidate while holding the same lock
+        # used by canonical publication before clearing the catalog row.
+        still_missing = [
+            (pid, f"working/{pid}.jpg")
+            for pid, path in stale_tracked_ids
+            if not os.path.exists(path)
+        ]
+        db.conn.executemany(
+            "UPDATE photos SET working_copy_path=NULL "
+            "WHERE id=? AND working_copy_path=?",
+            still_missing,
+        )
+        if still_missing:
+            commit_with_retry(db.conn)
 
-        if stale_tracked_ids:
-            # A publisher may have replaced a file after the directory scan
-            # observed it missing. Revalidate while holding the same lock
-            # used by canonical publication before clearing the catalog row.
-            still_missing = [
-                (pid, f"working/{pid}.jpg")
-                for pid, path in stale_tracked_ids
-                if not os.path.exists(path)
-            ]
-            db.conn.executemany(
-                "UPDATE photos SET working_copy_path=NULL "
-                "WHERE id=? AND working_copy_path=?",
-                still_missing,
-            )
-            if still_missing:
-                commit_with_retry(db.conn)
-
-        if total <= max_bytes:
-            return {
-                "evicted": 0, "freed_bytes": 0, "remaining_bytes": total,
-                "quota_bytes": max_bytes,
-            }
-
-        if not _begin_stable_eviction_transaction(
-            db, catalog_data_version,
-        ):
-            log.info(
-                "Working-copy quota eviction deferred because the catalog "
-                "changed during candidate selection"
-            )
-            return {
-                "evicted": 0, "freed_bytes": 0, "remaining_bytes": total,
-                "quota_bytes": max_bytes,
-            }
-
-        evicted = []
-        freed_bytes = 0
-        for (
-            _mtime_ns, photo_id, size, path, expected_rel, sampled_identity,
-        ) in sorted(entries):
-            if total <= max_bytes:
-                break
-            try:
-                if _file_identity(os.stat(path)) != sampled_identity:
-                    # Atomic publication replaced the sampled candidate after
-                    # the scan. Never unlink or account that new rendition as
-                    # though it were the older file selected for eviction.
-                    continue
-                os.remove(path)
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                log.warning("Failed to remove working-copy file %s: %s", path, exc)
-                continue
-            evicted.append((photo_id, expected_rel, path))
-            total -= size
-            freed_bytes += size
-
-        for photo_id, expected_rel, path in evicted:
-            # Between the ``os.remove`` above and this UPDATE, an on-demand
-            # ``/photos/<id>/original`` request can regenerate the same
-            # ``working/<id>.jpg`` and commit ``working_copy_path`` to the
-            # same relative path. Clearing the row now would mark that
-            # freshly written replacement as evicted while its bytes remain
-            # on disk — the file becomes untracked and eviction skips it
-            # forever after the writer-grace window closes. Only clear the
-            # row if the file is still missing.
-            if os.path.exists(path):
-                continue
-            db.conn.execute(
-                "UPDATE photos SET working_copy_path=NULL, "
-                "working_copy_evicted_mtime=COALESCE(file_mtime, -1) "
-                "WHERE id=? AND (working_copy_path IS NULL "
-                "OR working_copy_path=?)",
-                (photo_id, expected_rel),
-            )
-        commit_with_retry(db.conn)
-        if evicted:
-            log.info(
-                "Working-copy quota eviction: removed %d files, freed %.1f MB",
-                len(evicted), freed_bytes / 1024 / 1024,
-            )
-
+    if total <= max_bytes:
         return {
-            "evicted": len(evicted),
-            "freed_bytes": freed_bytes,
-            "remaining_bytes": total,
+            "evicted": 0, "freed_bytes": 0, "remaining_bytes": total,
             "quota_bytes": max_bytes,
         }
+
+    if not _begin_stable_eviction_transaction(
+        db, catalog_data_version,
+    ):
+        log.info(
+            "Working-copy quota eviction snapshot invalidated by concurrent "
+            "catalog writer; retaking snapshot"
+        )
+        # Signal the caller to retake the snapshot and retry. Leaving stale
+        # files here (as an earlier revision did) let a lowered quota persist
+        # them indefinitely because the settings handler only called us once.
+        return None
+
+    evicted = []
+    freed_bytes = 0
+    for (
+        _mtime_ns, photo_id, size, path, expected_rel, sampled_identity,
+    ) in sorted(entries):
+        if total <= max_bytes:
+            break
+        try:
+            if _file_identity(os.stat(path)) != sampled_identity:
+                # Atomic publication replaced the sampled candidate after
+                # the scan. Never unlink or account that new rendition as
+                # though it were the older file selected for eviction.
+                continue
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("Failed to remove working-copy file %s: %s", path, exc)
+            continue
+        evicted.append((photo_id, expected_rel, path))
+        total -= size
+        freed_bytes += size
+
+    for photo_id, expected_rel, path in evicted:
+        # Between the ``os.remove`` above and this UPDATE, an on-demand
+        # ``/photos/<id>/original`` request can regenerate the same
+        # ``working/<id>.jpg`` and commit ``working_copy_path`` to the
+        # same relative path. Clearing the row now would mark that
+        # freshly written replacement as evicted while its bytes remain
+        # on disk — the file becomes untracked and eviction skips it
+        # forever after the writer-grace window closes. Only clear the
+        # row if the file is still missing.
+        if os.path.exists(path):
+            continue
+        db.conn.execute(
+            "UPDATE photos SET working_copy_path=NULL, "
+            "working_copy_evicted_mtime=COALESCE(file_mtime, -1) "
+            "WHERE id=? AND (working_copy_path IS NULL "
+            "OR working_copy_path=?)",
+            (photo_id, expected_rel),
+        )
+    commit_with_retry(db.conn)
+    if evicted:
+        log.info(
+            "Working-copy quota eviction: removed %d files, freed %.1f MB",
+            len(evicted), freed_bytes / 1024 / 1024,
+        )
+
+    return {
+        "evicted": len(evicted),
+        "freed_bytes": freed_bytes,
+        "remaining_bytes": total,
+        "quota_bytes": max_bytes,
+    }

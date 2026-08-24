@@ -3667,7 +3667,16 @@ async function bootstrapBrowse() {
         filterByCollection(activeCollectionId);
         return;
       }
-      if (VireoFilter.hasFilters()) {
+      // A dashboard-scoped collection deep link (?dashboard_scope=1&collection_id=...)
+      // paints from /api/browse/init and then falls through both branches above
+      // when no explicit filter chips came from the URL. /api/browse/init does
+      // not return availability totals, so ``updateOfflineCollectionState`` never
+      // runs and the offline-photos notice stays hidden — users cannot reveal
+      // the offline members until another action reloads the grid. Force a
+      // scoped /api/photos/query here so ``loadPhotos`` populates the
+      // availability state from the response (Codex review r3839992513).
+      if (VireoFilter.hasFilters() ||
+          (activeCollectionId && dashboardCollectionScope && !scopeChanged)) {
         resetAndLoad();
         loadSummary();
       }
@@ -5542,8 +5551,20 @@ async function resetAndLoad(options) {
       return true;
     }
 
+    // The anchor may have been rendered as an offline placeholder — e.g. a
+    // folder-health refresh with ``showOfflineCollectionPhotos`` on keeps the
+    // just-went-missing photo in the reloaded dataset with ``folder_status``
+    // set to a non-``ok``/``partial`` value. Restoring the selection there
+    // would let updateBatchBar() expose Develop/Export/Delete against a
+    // supposedly read-only photo (Codex review r3839992514).
+    var anchorIndex = photos.findIndex(function(p) { return p.id === anchor.photoId; });
+    if (anchorIndex < 0 || !browsePhotoIsAvailable(photos[anchorIndex])) {
+      clearActiveSelectionAndDetail();
+      return true;
+    }
+
     selectedPhotoId = anchor.photoId;
-    selectedIndex = photos.findIndex(function(p) { return p.id === anchor.photoId; });
+    selectedIndex = anchorIndex;
     refreshCardSelectionVisuals();
     updateBatchBar();
     if (anchor.detailVisible) loadDetail(anchor.photoId);

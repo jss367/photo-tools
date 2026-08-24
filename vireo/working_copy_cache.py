@@ -11,6 +11,7 @@ deliberately evicted copy from a missing copy that needs startup self-healing.
 A source-file change makes the marker stale and allows extraction again.
 """
 
+import contextlib
 import logging
 import os
 import threading
@@ -35,11 +36,28 @@ _RENDER_TEMP_SWEEP_SECONDS = 60 * 60
 # stale files indefinitely on a busy catalog. Retry with a fresh snapshot up
 # to this many times before giving up so the caller does not have to loop.
 _EVICTION_SNAPSHOT_RETRIES = 4
+# When ``evict_if_over_quota`` exhausts its in-line snapshot retries under
+# heavy catalog contention, ``arrange_deferred_over_quota_retry`` schedules a
+# bounded background pass so the cache does not silently sit above a lowered
+# quota until an unrelated cache write happens by. Delays back off from
+# ``_DEFERRED_RETRY_INITIAL_DELAY`` up to ``_DEFERRED_RETRY_MAX_DELAY`` for at
+# most ``_DEFERRED_RETRY_MAX_ATTEMPTS`` passes; each attempt is idempotent so
+# an unrelated success (from a scanner or on-demand cache writer) ends the
+# retry loop immediately.
+_DEFERRED_RETRY_INITIAL_DELAY = 1.0
+_DEFERRED_RETRY_MAX_DELAY = 30.0
+_DEFERRED_RETRY_MAX_ATTEMPTS = 6
 # Publication paths may need to run quota enforcement before releasing the
 # guard (for example, when a settings write lowers the ceiling while a slow
 # RAW decode is in flight). Keep that nested enforcement serialized with
 # other publishers without deadlocking the current thread.
 _eviction_lock = threading.RLock()
+# One background retry at a time is enough — overlapping ``deferred=True``
+# returns coalesce onto the pending pass, and that pass rereads state each
+# attempt so it also catches later drops. Without this coalescing, every
+# unrelated settings write during contention would spawn a new daemon thread.
+_deferred_retry_lock = threading.Lock()
+_deferred_retry_pending = False
 
 
 @contextmanager
@@ -458,3 +476,82 @@ def _evict_once(db, working_dir, max_bytes, *, startup):
         "remaining_bytes": total,
         "quota_bytes": max_bytes,
     }
+
+
+def arrange_deferred_over_quota_retry(
+    db_path, vireo_dir, quota_mb=None,
+    *, _sleep=time.sleep, _thread_starter=None,
+):
+    """Schedule a bounded background pass after ``deferred=True`` deferral.
+
+    ``_settings_post_save_side_effects`` calls ``evict_if_over_quota`` once
+    when the working-copy quota drops. If snapshot retries exhaust under a
+    busy catalog, the settings request returns while the cache still sits
+    above its new ceiling — every subsequent enforcement point (cache writer,
+    scanner backfill, restart) still runs, but there is no guarantee any of
+    those fires soon. This helper closes that window: it spawns a daemon
+    thread that retries with backoff, using its own SQLite connection because
+    ``Database`` handles are thread-affine.
+
+    Idempotent by design: overlapping deferrals coalesce onto one background
+    pass. Each attempt calls ``evict_if_over_quota`` which reads current
+    state, so a concurrent success (from a scanner run or an on-demand
+    writer) ends the loop naturally on the next attempt.
+
+    ``_sleep`` and ``_thread_starter`` are injected for tests; production
+    callers rely on the defaults.
+    """
+    global _deferred_retry_pending
+    with _deferred_retry_lock:
+        if _deferred_retry_pending:
+            return False
+        _deferred_retry_pending = True
+
+    def _run():
+        global _deferred_retry_pending
+        try:
+            from db import Database
+
+            delay = _DEFERRED_RETRY_INITIAL_DELAY
+            for _attempt in range(_DEFERRED_RETRY_MAX_ATTEMPTS):
+                _sleep(delay)
+                try:
+                    retry_db = Database(db_path, initialize_schema=False)
+                except Exception:
+                    log.exception(
+                        "Deferred working-copy quota retry could not open "
+                        "a database connection at %s", db_path,
+                    )
+                    return
+                try:
+                    result = evict_if_over_quota(
+                        retry_db, vireo_dir, quota_mb=quota_mb,
+                    )
+                except Exception:
+                    log.exception(
+                        "Deferred working-copy quota retry failed"
+                    )
+                    return
+                finally:
+                    with contextlib.suppress(Exception):
+                        retry_db.conn.close()
+                if not result.get("deferred"):
+                    return
+                delay = min(delay * 2, _DEFERRED_RETRY_MAX_DELAY)
+            log.warning(
+                "Working-copy quota deferred retry gave up after %d attempts; "
+                "the next cache writer or restart will re-enforce the quota",
+                _DEFERRED_RETRY_MAX_ATTEMPTS,
+            )
+        finally:
+            with _deferred_retry_lock:
+                _deferred_retry_pending = False
+
+    if _thread_starter is None:
+        thread = threading.Thread(
+            target=_run, name="wc-quota-deferred-retry", daemon=True,
+        )
+        thread.start()
+    else:
+        _thread_starter(_run)
+    return True

@@ -188,6 +188,79 @@ def test_open_external_uses_working_copy_when_raw_source_missing(
         assert img.size == (600, 800)
 
 
+def test_open_external_pins_working_copy_when_raw_source_missing(
+    client_with_photo, monkeypatch,
+):
+    """Offline RAW handoff must hold the working-copy publication guard
+    through decode so quota eviction cannot unlink the working copy
+    between validation and load_image — the retry-from-original recovery
+    elsewhere in the handoff can't save us when the RAW is offline."""
+    import threading
+
+    import image_loader
+    import working_copy_cache
+    from PIL import Image
+
+    app, db, photo_id = client_with_photo
+    client = app.test_client()
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    working_dir = os.path.join(vireo_dir, "working")
+    os.makedirs(working_dir, exist_ok=True)
+    working_path = os.path.join(working_dir, f"{photo_id}.jpg")
+    Image.new("RGB", (800, 600), (10, 20, 30)).save(working_path, "JPEG")
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='offline.NEF', extension='.nef',
+               working_copy_path=?,
+               width=800, height=600
+           WHERE id=?""",
+        (f"working/{photo_id}.jpg", photo_id),
+    )
+    db.conn.commit()
+    db.set_photo_edit_recipe(photo_id, {"rotation": 90})
+    client.post('/api/config',
+                data=json.dumps({"external_editor": "/usr/bin/gimp"}),
+                content_type='application/json')
+
+    guard_state = {"held_during_decode": False, "load_calls": 0}
+    real_load_image = image_loader.load_image
+
+    def probing_load_image(path, **kwargs):
+        guard_state["load_calls"] += 1
+        # A fresh thread proves eviction is truly blocked: an RLock owned
+        # by the handoff thread would still accept our re-acquire here,
+        # so we have to check ownership from outside the handler's stack.
+        probe = {"acquired": None}
+
+        def try_acquire():
+            got = working_copy_cache._eviction_lock.acquire(blocking=False)
+            probe["acquired"] = got
+            if got:
+                working_copy_cache._eviction_lock.release()
+
+        thread = threading.Thread(target=try_acquire)
+        thread.start()
+        thread.join()
+        if probe["acquired"] is False:
+            guard_state["held_during_decode"] = True
+        return real_load_image(path, **kwargs)
+
+    monkeypatch.setattr(image_loader, "load_image", probing_load_image)
+    launched = _patch_launchers(monkeypatch)
+
+    resp = client.post('/api/photos/open-external',
+                       data=json.dumps({"photo_ids": [photo_id]}),
+                       content_type='application/json')
+
+    assert resp.status_code == 200, resp.get_json()
+    assert guard_state["load_calls"] >= 1
+    assert guard_state["held_during_decode"], (
+        "Working copy must be pinned via working_copy_publication_guard "
+        "while decoding when the RAW original is offline; otherwise "
+        "quota eviction could unlink between validation and load_image."
+    )
+
+
 def test_open_external_uses_companion_when_raw_source_missing(
     client_with_photo, monkeypatch,
 ):

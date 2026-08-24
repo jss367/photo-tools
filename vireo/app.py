@@ -132,6 +132,9 @@ from web.system import system_blueprint
 from web.workspaces import create_workspace_blueprint
 from werkzeug.exceptions import BadRequest
 from working_copy_cache import (
+    arrange_deferred_over_quota_retry as arrange_deferred_working_copy_quota_retry,
+)
+from working_copy_cache import (
     evict_if_over_quota as evict_working_copy_cache_if_over_quota,
 )
 from working_copy_cache import (
@@ -19882,7 +19885,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # Cache writers and startup already enforce an unchanged quota.
             # Avoid scanning every photo and working-copy file while holding
             # the publication lock for unrelated settings saves.
-            evict_working_copy_cache_if_over_quota(quota_db, vireo_dir)
+            eviction_result = evict_working_copy_cache_if_over_quota(
+                quota_db, vireo_dir,
+            )
+            if eviction_result.get("deferred"):
+                # Snapshot retries exhausted under catalog contention.
+                # Without a scheduled follow-up, the cache would sit above
+                # the new ceiling until an unrelated cache write or
+                # restart eventually re-ran enforcement. Spawn a bounded
+                # background retry that opens its own SQLite connection
+                # (Database handles are thread-affine).
+                arrange_deferred_working_copy_quota_retry(
+                    app.config["DB_PATH"], vireo_dir,
+                )
 
     def _read_raw_config_file():
         """Return the parsed contents of ~/.vireo/config.json, or {}.
@@ -20715,82 +20730,100 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             source_path, using_working_copy = _external_edit_recipe_source(
                 photo, recipe, fallback_path,
             )
-            if not source_path or not os.path.isfile(source_path):
-                if using_working_copy and fallback_path and os.path.isfile(
-                    fallback_path,
-                ):
-                    # Quota enforcement can unlink the working copy between
-                    # recipe-source resolution and this existence check.
-                    # Fall back to the original before reporting missing.
-                    source_path = fallback_path
-                    using_working_copy = False
-                else:
-                    return None, f"{photo['filename']}: source file missing"
-
-            out_dir = os.path.join(vireo_dir, "external-edits")
-            os.makedirs(out_dir, exist_ok=True)
-            out_path = os.path.join(out_dir, f"{photo['id']}.jpg")
-            meta_path = os.path.join(out_dir, f"{photo['id']}.json")
-            try:
-                source_mtime = os.path.getmtime(source_path)
-            except FileNotFoundError:
-                if using_working_copy and fallback_path and os.path.isfile(
-                    fallback_path,
-                ):
-                    source_path = fallback_path
-                    using_working_copy = False
-                    source_mtime = os.path.getmtime(source_path)
-                else:
-                    return None, f"{photo['filename']}: source file missing"
-            recipe_json = recipe_to_json(recipe) or ""
-            # Include the edit-math version so a math bump invalidates this
-            # handoff render: the JPEG is keyed by recipe/source/mtime, none
-            # of which change when only the per-pixel rendering math changes,
-            # so without this we'd keep handing editors the stale render.
-            expected_meta = {
-                "recipe": recipe_json,
-                "source_path": source_path,
-                "source_mtime": source_mtime,
-                "edit_math_version": EDIT_MATH_VERSION,
-            }
-            try:
-                if os.path.isfile(out_path) and os.path.isfile(meta_path):
-                    with open(meta_path, encoding="utf-8") as f:
-                        cached_meta = json.load(f)
-                    if cached_meta == expected_meta:
-                        return out_path, None
-            except (OSError, ValueError, TypeError):
-                pass
-
-            # Derive the decode mode from the primary photo's extension rather
-            # than source_path so a future change to source_path resolution
-            # (working copy, companion JPEG fallback, etc.) cannot silently
-            # bypass RAW_DECODE_PRESERVE_HIGHLIGHTS for a RAW primary.
-            primary_is_raw = (
-                os.path.splitext(photo["filename"])[1].lower() in RAW_EXTENSIONS
+            fallback_available = bool(
+                fallback_path and os.path.isfile(fallback_path)
             )
-            raw_decode = RAW_DECODE_PRESERVE_HIGHLIGHTS if primary_is_raw else None
-            load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
-            img = load_image(source_path, max_size=None, **load_kwargs)
-            if img is None and using_working_copy and fallback_path and (
-                os.path.isfile(fallback_path)
-                and os.path.abspath(fallback_path)
-                != os.path.abspath(source_path)
-            ):
-                # Working copy was evicted between validation and decode.
-                # Retry from the original before the companion fallback so
-                # RAW primaries still use the highlight-preserving decode.
-                retry_img = load_image(fallback_path, max_size=None, **load_kwargs)
-                if retry_img is not None:
-                    img = retry_img
-                    source_path = fallback_path
-                    using_working_copy = False
-                    try:
+            # When the original is offline the working copy is the only usable
+            # local source; the retry-from-original recovery below cannot save
+            # us. Hold the publication/eviction guard through the exists →
+            # getmtime → decode window so quota enforcement cannot unlink the
+            # working copy mid-handoff. Guard is an RLock, so nested
+            # acquisitions inside load_image are safe.
+            pin_working_copy = using_working_copy and not fallback_available
+            source_pin_cm = (
+                working_copy_publication_guard()
+                if pin_working_copy else contextlib.nullcontext()
+            )
+            with source_pin_cm:
+                if not source_path or not os.path.isfile(source_path):
+                    if using_working_copy and fallback_available:
+                        # Quota enforcement can unlink the working copy between
+                        # recipe-source resolution and this existence check.
+                        # Fall back to the original before reporting missing.
+                        source_path = fallback_path
+                        using_working_copy = False
+                    else:
+                        return None, f"{photo['filename']}: source file missing"
+
+                out_dir = os.path.join(vireo_dir, "external-edits")
+                os.makedirs(out_dir, exist_ok=True)
+                out_path = os.path.join(out_dir, f"{photo['id']}.jpg")
+                meta_path = os.path.join(out_dir, f"{photo['id']}.json")
+                try:
+                    source_mtime = os.path.getmtime(source_path)
+                except FileNotFoundError:
+                    if using_working_copy and fallback_available:
+                        source_path = fallback_path
+                        using_working_copy = False
                         source_mtime = os.path.getmtime(source_path)
-                    except OSError:
-                        pass
-                    expected_meta["source_path"] = source_path
-                    expected_meta["source_mtime"] = source_mtime
+                    else:
+                        return None, f"{photo['filename']}: source file missing"
+                recipe_json = recipe_to_json(recipe) or ""
+                # Include the edit-math version so a math bump invalidates this
+                # handoff render: the JPEG is keyed by recipe/source/mtime,
+                # none of which change when only the per-pixel rendering math
+                # changes, so without this we'd keep handing editors the stale
+                # render.
+                expected_meta = {
+                    "recipe": recipe_json,
+                    "source_path": source_path,
+                    "source_mtime": source_mtime,
+                    "edit_math_version": EDIT_MATH_VERSION,
+                }
+                try:
+                    if os.path.isfile(out_path) and os.path.isfile(meta_path):
+                        with open(meta_path, encoding="utf-8") as f:
+                            cached_meta = json.load(f)
+                        if cached_meta == expected_meta:
+                            return out_path, None
+                except (OSError, ValueError, TypeError):
+                    pass
+
+                # Derive the decode mode from the primary photo's extension
+                # rather than source_path so a future change to source_path
+                # resolution (working copy, companion JPEG fallback, etc.)
+                # cannot silently bypass RAW_DECODE_PRESERVE_HIGHLIGHTS for a
+                # RAW primary.
+                primary_is_raw = (
+                    os.path.splitext(photo["filename"])[1].lower()
+                    in RAW_EXTENSIONS
+                )
+                raw_decode = (
+                    RAW_DECODE_PRESERVE_HIGHLIGHTS if primary_is_raw else None
+                )
+                load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
+                img = load_image(source_path, max_size=None, **load_kwargs)
+                if img is None and using_working_copy and fallback_path and (
+                    os.path.isfile(fallback_path)
+                    and os.path.abspath(fallback_path)
+                    != os.path.abspath(source_path)
+                ):
+                    # Working copy was evicted between validation and decode.
+                    # Retry from the original before the companion fallback so
+                    # RAW primaries still use the highlight-preserving decode.
+                    retry_img = load_image(
+                        fallback_path, max_size=None, **load_kwargs,
+                    )
+                    if retry_img is not None:
+                        img = retry_img
+                        source_path = fallback_path
+                        using_working_copy = False
+                        try:
+                            source_mtime = os.path.getmtime(source_path)
+                        except OSError:
+                            pass
+                        expected_meta["source_path"] = source_path
+                        expected_meta["source_mtime"] = source_mtime
             expected_w, expected_h = 0, 0
             needs_companion = False
             if primary_is_raw:
@@ -24615,81 +24648,98 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         source_path, using_working_copy = _inat_edit_recipe_source(
             photo, recipe, fallback_path,
         )
-        if not source_path or not os.path.isfile(source_path):
-            if using_working_copy and fallback_path and os.path.isfile(
-                fallback_path,
-            ):
-                # Quota enforcement can unlink the working copy between
-                # recipe-source resolution and this existence check.
-                source_path = fallback_path
-                using_working_copy = False
-            else:
-                return None, f"{photo['filename']}: source file missing"
-
-        out_dir = os.path.join(vireo_dir, "inat-uploads")
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"{photo['id']}.jpg")
-        meta_path = os.path.join(out_dir, f"{photo['id']}.json")
-        try:
-            source_mtime = os.path.getmtime(source_path)
-        except FileNotFoundError:
-            if using_working_copy and fallback_path and os.path.isfile(
-                fallback_path,
-            ):
-                source_path = fallback_path
-                using_working_copy = False
-                source_mtime = os.path.getmtime(source_path)
-            else:
-                return None, f"{photo['filename']}: source file missing"
-        recipe_json = recipe_to_json(recipe) or ""
-        # Include the edit-math version so a math bump invalidates this cached
-        # render — the JPEG is keyed by recipe/source/mtime, none of which
-        # change when only the per-pixel rendering math does, so without this
-        # we'd keep submitting stale renders to iNaturalist after a deploy.
-        expected_meta = {
-            "recipe": recipe_json,
-            "source_path": source_path,
-            "source_mtime": source_mtime,
-            "edit_math_version": EDIT_MATH_VERSION,
-        }
-        try:
-            if os.path.isfile(out_path) and os.path.isfile(meta_path):
-                with open(meta_path, encoding="utf-8") as f:
-                    cached_meta = json.load(f)
-                if cached_meta == expected_meta:
-                    return out_path, None
-        except (OSError, ValueError, TypeError):
-            pass
-
-        # Derive the decode mode from the primary photo's extension rather
-        # than source_path so a future change to source_path resolution
-        # (working copy, companion JPEG fallback, etc.) cannot silently
-        # bypass RAW_DECODE_PRESERVE_HIGHLIGHTS for a RAW primary.
-        primary_is_raw = (
-            os.path.splitext(photo["filename"])[1].lower() in RAW_EXTENSIONS
+        fallback_available = bool(
+            fallback_path and os.path.isfile(fallback_path)
         )
-        raw_decode = RAW_DECODE_PRESERVE_HIGHLIGHTS if primary_is_raw else None
-        load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
-        img = load_image(source_path, max_size=None, **load_kwargs)
-        if img is None and using_working_copy and fallback_path and (
-            os.path.isfile(fallback_path)
-            and os.path.abspath(fallback_path)
-            != os.path.abspath(source_path)
-        ):
-            # Working copy was evicted between validation and decode; retry
-            # from the original before the companion fallback so RAW primaries
-            # still use the highlight-preserving decode.
-            retry_img = load_image(fallback_path, max_size=None, **load_kwargs)
-            if retry_img is not None:
-                img = retry_img
-                source_path = fallback_path
-                using_working_copy = False
-                try:
+        # When the original is offline the working copy is the only usable
+        # local source; the retry-from-original recovery below cannot save us.
+        # Hold the publication/eviction guard through the exists → getmtime →
+        # decode window so quota enforcement cannot unlink the working copy
+        # mid-upload. Guard is an RLock, so nested acquisitions inside
+        # load_image are safe.
+        pin_working_copy = using_working_copy and not fallback_available
+        source_pin_cm = (
+            working_copy_publication_guard()
+            if pin_working_copy else contextlib.nullcontext()
+        )
+        with source_pin_cm:
+            if not source_path or not os.path.isfile(source_path):
+                if using_working_copy and fallback_available:
+                    # Quota enforcement can unlink the working copy between
+                    # recipe-source resolution and this existence check.
+                    source_path = fallback_path
+                    using_working_copy = False
+                else:
+                    return None, f"{photo['filename']}: source file missing"
+
+            out_dir = os.path.join(vireo_dir, "inat-uploads")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"{photo['id']}.jpg")
+            meta_path = os.path.join(out_dir, f"{photo['id']}.json")
+            try:
+                source_mtime = os.path.getmtime(source_path)
+            except FileNotFoundError:
+                if using_working_copy and fallback_available:
+                    source_path = fallback_path
+                    using_working_copy = False
                     source_mtime = os.path.getmtime(source_path)
-                except OSError:
-                    pass
-                expected_meta["source_path"] = source_path
-                expected_meta["source_mtime"] = source_mtime
+                else:
+                    return None, f"{photo['filename']}: source file missing"
+            recipe_json = recipe_to_json(recipe) or ""
+            # Include the edit-math version so a math bump invalidates this
+            # cached render — the JPEG is keyed by recipe/source/mtime, none
+            # of which change when only the per-pixel rendering math does, so
+            # without this we'd keep submitting stale renders to iNaturalist
+            # after a deploy.
+            expected_meta = {
+                "recipe": recipe_json,
+                "source_path": source_path,
+                "source_mtime": source_mtime,
+                "edit_math_version": EDIT_MATH_VERSION,
+            }
+            try:
+                if os.path.isfile(out_path) and os.path.isfile(meta_path):
+                    with open(meta_path, encoding="utf-8") as f:
+                        cached_meta = json.load(f)
+                    if cached_meta == expected_meta:
+                        return out_path, None
+            except (OSError, ValueError, TypeError):
+                pass
+
+            # Derive the decode mode from the primary photo's extension rather
+            # than source_path so a future change to source_path resolution
+            # (working copy, companion JPEG fallback, etc.) cannot silently
+            # bypass RAW_DECODE_PRESERVE_HIGHLIGHTS for a RAW primary.
+            primary_is_raw = (
+                os.path.splitext(photo["filename"])[1].lower()
+                in RAW_EXTENSIONS
+            )
+            raw_decode = (
+                RAW_DECODE_PRESERVE_HIGHLIGHTS if primary_is_raw else None
+            )
+            load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
+            img = load_image(source_path, max_size=None, **load_kwargs)
+            if img is None and using_working_copy and fallback_path and (
+                os.path.isfile(fallback_path)
+                and os.path.abspath(fallback_path)
+                != os.path.abspath(source_path)
+            ):
+                # Working copy was evicted between validation and decode;
+                # retry from the original before the companion fallback so
+                # RAW primaries still use the highlight-preserving decode.
+                retry_img = load_image(
+                    fallback_path, max_size=None, **load_kwargs,
+                )
+                if retry_img is not None:
+                    img = retry_img
+                    source_path = fallback_path
+                    using_working_copy = False
+                    try:
+                        source_mtime = os.path.getmtime(source_path)
+                    except OSError:
+                        pass
+                    expected_meta["source_path"] = source_path
+                    expected_meta["source_mtime"] = source_mtime
         expected_w, expected_h = 0, 0
         needs_companion = False
         if primary_is_raw:

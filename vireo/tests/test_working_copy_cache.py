@@ -660,6 +660,89 @@ def test_evict_reports_deferred_when_retries_are_exhausted(
         db.close()
 
 
+def test_arrange_deferred_over_quota_retry_runs_until_success(
+    tmp_path, monkeypatch,
+):
+    """When ``evict_if_over_quota`` reports ``deferred=True``, the retry
+    helper must spawn a bounded background pass and keep going until a
+    non-deferred result. Without this the settings handler would return
+    while the cache still sat above the new lowered quota — a scanner
+    or restart would eventually re-run enforcement, but there's no
+    guarantee those fire soon."""
+    import working_copy_cache
+    from db import Database
+
+    seed = Database(str(tmp_path / "vireo.db"))
+    seed.close()
+
+    calls = {"count": 0}
+    outcomes = iter([
+        {
+            "evicted": 0, "freed_bytes": 0, "remaining_bytes": None,
+            "quota_bytes": 0, "deferred": True,
+        },
+        {
+            "evicted": 0, "freed_bytes": 0, "remaining_bytes": None,
+            "quota_bytes": 0, "deferred": True,
+        },
+        {
+            "evicted": 1, "freed_bytes": 700_000, "remaining_bytes": 300_000,
+            "quota_bytes": 1_048_576,
+        },
+    ])
+
+    def fake_evict(db, vireo_dir, quota_mb=None):
+        calls["count"] += 1
+        return next(outcomes)
+
+    monkeypatch.setattr(working_copy_cache, "evict_if_over_quota", fake_evict)
+
+    # Reset the coalescing flag so pytest ordering never leaves a stale
+    # "pending" state from another test.
+    with working_copy_cache._deferred_retry_lock:
+        working_copy_cache._deferred_retry_pending = False
+
+    scheduled = working_copy_cache.arrange_deferred_over_quota_retry(
+        str(tmp_path / "vireo.db"),
+        str(tmp_path),
+        _sleep=lambda _delay: None,
+        _thread_starter=lambda target: target(),
+    )
+    assert scheduled is True
+    assert calls["count"] == 3
+    # After the loop exits, the coalescing flag must clear so a later
+    # deferral schedules its own pass instead of getting silently dropped.
+    assert working_copy_cache._deferred_retry_pending is False
+
+
+def test_arrange_deferred_over_quota_retry_coalesces_overlapping_calls(
+    tmp_path, monkeypatch,
+):
+    """Overlapping ``deferred=True`` returns must not each spawn their own
+    daemon thread — one bounded background pass is enough because each
+    attempt reads current state."""
+    import working_copy_cache
+    from db import Database
+
+    seed = Database(str(tmp_path / "vireo.db"))
+    seed.close()
+
+    # First helper hasn't finished yet: force the pending flag on so any
+    # second call must coalesce onto the in-flight pass.
+    with working_copy_cache._deferred_retry_lock:
+        working_copy_cache._deferred_retry_pending = True
+    try:
+        scheduled = working_copy_cache.arrange_deferred_over_quota_retry(
+            str(tmp_path / "vireo.db"), str(tmp_path),
+            _sleep=lambda _delay: None,
+            _thread_starter=lambda target: target(),
+        )
+        assert scheduled is False
+    finally:
+        with working_copy_cache._deferred_retry_lock:
+            working_copy_cache._deferred_retry_pending = False
+
+
 def test_zero_quota_skips_working_copy_generation(
     tmp_path, monkeypatch,
 ):

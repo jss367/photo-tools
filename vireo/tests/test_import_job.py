@@ -1351,7 +1351,7 @@ def _stub_extractor(monkeypatch, outcome):
     import scanner
     calls = []
 
-    def fake_extract(source_path, output_path, max_size=4096, quality=92):
+    def fake_extract(source_path, output_path, max_size=4096, quality=92, **_kwargs):
         calls.append((str(source_path), str(output_path)))
         return outcome(str(source_path))
 
@@ -2054,7 +2054,7 @@ def test_wc_extraction_deferred_to_after_last_batch(tmp_path, monkeypatch):
     # JPEG's row has already been merged in (pairing has run).
     calls = []
 
-    def fake_extract(source_path, output_path, max_size=4096, quality=92):
+    def fake_extract(source_path, output_path, max_size=4096, quality=92, **_kwargs):
         calls.append(str(source_path))
         # Simulate a RAW decode failure so the companion fallback path
         # is exercised — the reason deferral matters at all.
@@ -2380,7 +2380,7 @@ def test_wc_extraction_falls_back_to_archive_when_card_vanishes(
     # Track every extract_working_copy call's source path.
     calls = []
 
-    def fake_extract(source_path, output_path, max_size=4096, quality=92):
+    def fake_extract(source_path, output_path, max_size=4096, quality=92, **_kwargs):
         calls.append(str(source_path))
         if not os.path.isfile(source_path):
             return False
@@ -2460,7 +2460,7 @@ def test_wc_extraction_ignores_card_override_when_size_no_longer_matches(
 
     calls = []
 
-    def fake_extract(source_path, output_path, max_size=4096, quality=92):
+    def fake_extract(source_path, output_path, max_size=4096, quality=92, **_kwargs):
         calls.append(str(source_path))
         if not os.path.isfile(source_path):
             return False
@@ -2543,7 +2543,7 @@ def test_wc_extraction_ignores_card_override_when_mtime_no_longer_matches(
 
     calls = []
 
-    def fake_extract(source_path, output_path, max_size=4096, quality=92):
+    def fake_extract(source_path, output_path, max_size=4096, quality=92, **_kwargs):
         calls.append(str(source_path))
         if not os.path.isfile(source_path):
             return False
@@ -2626,7 +2626,7 @@ def test_wc_extraction_ignores_companion_override_when_mtime_changes(
 
     calls = []
 
-    def fake_extract(source_path, output_path, max_size=4096, quality=92):
+    def fake_extract(source_path, output_path, max_size=4096, quality=92, **_kwargs):
         calls.append(str(source_path))
         # Force the RAW primary to fail so the extractor falls into the
         # companion-fallback branch — that's the code path where the
@@ -2723,7 +2723,7 @@ def test_wc_extraction_retries_from_archive_when_card_read_fails(
     card_raw_path = str(card / "DSC_3001.NEF")
     calls = []
 
-    def fake_extract(source_path, output_path, max_size=4096, quality=92):
+    def fake_extract(source_path, output_path, max_size=4096, quality=92, **_kwargs):
         calls.append(str(source_path))
         # Card-side read always fails (simulate an unreadable RAW /
         # transient card I/O error); archive-side read succeeds.
@@ -2809,7 +2809,7 @@ def test_reclassified_landed_entry_skips_card_source_override(
     archive = tmp_path / "archive"
     calls = []
 
-    def fake_extract(source_path, output_path, max_size=4096, quality=92):
+    def fake_extract(source_path, output_path, max_size=4096, quality=92, **_kwargs):
         calls.append(str(source_path))
         if not os.path.isfile(source_path):
             return False

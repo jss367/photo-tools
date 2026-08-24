@@ -2177,7 +2177,7 @@ def test_scan_extracts_working_copy_for_raw(tmp_path, monkeypatch):
     monkeypatch.setattr(scanner, "extract_metadata", lambda paths, **_kwargs: {})
 
     # Mock extract_working_copy to actually create a file (simulates success)
-    def fake_extract(source, output, max_size=4096, quality=92):
+    def fake_extract(source, output, max_size=4096, quality=92, **_kwargs):
         os.makedirs(os.path.dirname(output), exist_ok=True)
         Image.new("RGB", (4096, 2731)).save(output, "JPEG")
         return True
@@ -2403,7 +2403,7 @@ def test_scan_skips_working_copy_for_jpeg(tmp_path, monkeypatch):
     # Mock extract_working_copy -- should never be called for JPEGs
     calls = []
 
-    def fake_extract(source, output, max_size=4096, quality=92):
+    def fake_extract(source, output, max_size=4096, quality=92, **_kwargs):
         calls.append(source)
         return True
 
@@ -2446,7 +2446,7 @@ def test_scan_uses_raw_primary_for_raw_working_copy(tmp_path, monkeypatch):
     # Track which source file extract_working_copy is called with
     sources_used = []
 
-    def fake_extract(source, output, max_size=4096, quality=92):
+    def fake_extract(source, output, max_size=4096, quality=92, **_kwargs):
         sources_used.append(source)
         os.makedirs(os.path.dirname(output), exist_ok=True)
         Image.new("RGB", (4096, 2731)).save(output, "JPEG")
@@ -2502,7 +2502,7 @@ def test_scan_falls_back_to_companion_when_raw_extraction_fails(
 
     sources_used = []
 
-    def fake_extract(source, output, max_size=4096, quality=92):
+    def fake_extract(source, output, max_size=4096, quality=92, **_kwargs):
         sources_used.append(source)
         # Simulate libraw failure on the RAW; succeed when called with the
         # companion JPEG.
@@ -2571,7 +2571,7 @@ def test_scan_falls_back_when_raw_working_copy_short_edge_is_smaller(
 
     sources_used = []
 
-    def fake_extract(source, output, max_size=4096, quality=92):
+    def fake_extract(source, output, max_size=4096, quality=92, **_kwargs):
         sources_used.append(source)
         os.makedirs(os.path.dirname(output), exist_ok=True)
         if source.endswith(".nef"):
@@ -2625,7 +2625,7 @@ def test_scan_accepts_near_full_raw_working_copy(tmp_path, monkeypatch):
 
     sources_used = []
 
-    def fake_extract(source, output, max_size=4096, quality=92):
+    def fake_extract(source, output, max_size=4096, quality=92, **_kwargs):
         sources_used.append(source)
         os.makedirs(os.path.dirname(output), exist_ok=True)
         # Expected scaled dimensions are 4096x2731. This is within 1% of
@@ -2701,7 +2701,7 @@ def test_scan_accepts_portrait_raw_working_copy_with_exif_orientation(
 
     sources_used = []
 
-    def fake_extract(source, output, max_size=4096, quality=92):
+    def fake_extract(source, output, max_size=4096, quality=92, **_kwargs):
         sources_used.append(source)
         os.makedirs(os.path.dirname(output), exist_ok=True)
         # libraw + image_loader normalize EXIF orientation: a 6000x4000 sensor
@@ -2761,7 +2761,7 @@ def test_scan_marks_source_failure_when_raw_and_companion_both_fail(
 
     monkeypatch.setattr(scanner, "extract_metadata", lambda paths, **_kwargs: {})
 
-    def fake_extract(source, output, max_size=4096, quality=92):
+    def fake_extract(source, output, max_size=4096, quality=92, **_kwargs):
         # Both RAW and companion fail (e.g. RAW unsupported + companion
         # write-locked or corrupt).
         return False

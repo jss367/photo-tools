@@ -646,6 +646,29 @@ async function loadStoragePanel() {
 
     var working = s.working_copies || {count: 0, size: 0, quota_bytes: 0};
     _workingCopySizeBytes = working.size || 0;
+    // Sync the cached "committed" quota from the server's authoritative
+    // value so a concurrent change (another tab, All Settings) is
+    // reflected in the Apply button state. Without this, an outside
+    // reduction leaves the input showing the old higher value and Apply
+    // disabled — the user can't restore that displayed limit without
+    // perturbing the field or reloading. Only overwrite the input value
+    // if it still matches the previously-known committed quota (the
+    // user hasn't edited it) and no confirmation modal is open, so
+    // in-progress edits and the pending-reduction dialog aren't
+    // clobbered by a background refresh.
+    if (working.quota_bytes != null) {
+      var newCommittedMb = Math.round(working.quota_bytes / (1024 * 1024));
+      if (newCommittedMb !== _committedWorkingCopyQuotaMb) {
+        var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
+        var currentInputMb = readWorkingCopyQuotaMb();
+        var modal = document.getElementById('workingCopyLimitModal');
+        var modalOpen = modal && (modal.open || modal.classList.contains('open'));
+        if (!modalOpen && currentInputMb === _committedWorkingCopyQuotaMb) {
+          input.value = newCommittedMb / 1024;
+        }
+        _committedWorkingCopyQuotaMb = newCommittedMb;
+      }
+    }
     updateWorkingCopyLimitState();
     var workingFileWord = working.count === 1 ? 'file' : 'files';
     document.getElementById('workingCopyCacheStatus').textContent =

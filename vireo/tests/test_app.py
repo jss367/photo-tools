@@ -864,6 +864,12 @@ def test_storage_page_confirms_destructive_working_copy_quota_reduction(
         # controls instead of dropping it via clearTimeout.
         b'await flushPendingStorageAutosave()',
         b'function flushPendingStorageAutosave',
+        # Refresh syncs the cached committed quota from the server's
+        # authoritative working.quota_bytes so a concurrent quota change
+        # (another tab, All Settings) doesn't leave Apply disabled with
+        # the input showing a stale value.
+        b'newCommittedMb = Math.round(working.quota_bytes / (1024 * 1024))',
+        b'currentInputMb === _committedWorkingCopyQuotaMb',
     ):
         assert marker in page.data
 

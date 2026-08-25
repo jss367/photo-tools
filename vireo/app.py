@@ -20010,6 +20010,56 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             previous = cfg.load()
             current = dict(previous)
 
+            # Atomic gate against silently evicting working copies. The
+            # storage page's client-side check compares the requested quota
+            # against a cached "committed" value and its own /api/storage
+            # snapshot; both can be stale by the time the write reaches
+            # here — another tab may have raised the stored quota, or a
+            # working copy may have been published between the client's
+            # measurement and this request — so a reduction that skipped
+            # the confirmation modal could still trigger eviction under
+            # ``_settings_post_save_side_effects``. Require an explicit
+            # ``_confirm_working_copy_eviction`` flag for any reduction
+            # of the stored quota via this endpoint; the settings
+            # PATCH/DELETE paths continue to enforce the quota directly.
+            new_wc = body.get("working_copy_cache_max_mb")
+            if new_wc is not None:
+                try:
+                    new_quota_mb = int(new_wc)
+                except (TypeError, ValueError):
+                    new_quota_mb = None
+                try:
+                    prev_quota_mb = int(
+                        previous.get("working_copy_cache_max_mb", 20480)
+                    )
+                except (TypeError, ValueError):
+                    prev_quota_mb = 20480
+                if (
+                    new_quota_mb is not None
+                    and new_quota_mb < prev_quota_mb
+                    and not body.get("_confirm_working_copy_eviction")
+                ):
+                    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+                    # Measure usage under the publication guard so the
+                    # value returned to the client is a snapshot no
+                    # concurrent publisher is mutating.
+                    with working_copy_publication_guard():
+                        usage = working_copy_stats(
+                            vireo_dir, quota_mb=new_quota_mb,
+                        )
+                    return jsonify({
+                        "ok": False,
+                        "error": (
+                            "working-copy quota reduction requires "
+                            "confirmation"
+                        ),
+                        "code": "working_copy_eviction_confirmation_required",
+                        "request_id": getattr(g, "request_id", None),
+                        "previous_working_copy_quota_mb": prev_quota_mb,
+                        "requested_working_copy_quota_mb": new_quota_mb,
+                        "current_working_copy_usage_bytes": usage["size"],
+                    }), 409
+
             # Handle keyboard_shortcuts with validation
             if "keyboard_shortcuts" in body:
                 shortcuts = body["keyboard_shortcuts"]

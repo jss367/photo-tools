@@ -399,12 +399,18 @@ async function postAutosaveStorageConfig() {
   });
 }
 
-async function postWorkingCopyLimit(workingCopyQuotaMb) {
+async function postWorkingCopyLimit(workingCopyQuotaMb, opts) {
+  opts = opts || {};
+  var payload = {working_copy_cache_max_mb: workingCopyQuotaMb};
+  if (opts.confirmed) payload._confirm_working_copy_eviction = true;
+  // Suppress the default toast: commitWorkingCopyLimit routes the
+  // 409 confirmation-required response back into the modal flow, and
+  // shows its own message for other failures.
   await safeFetch('/api/config', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({working_copy_cache_max_mb: workingCopyQuotaMb}),
-  });
+    body: JSON.stringify(payload),
+  }, { toast: false });
 }
 
 function saveStorageConfig() {
@@ -447,20 +453,35 @@ async function applyWorkingCopyLimit() {
   }
   if (quotaMb === _committedWorkingCopyQuotaMb) return;
 
-  // Confirm every configured quota reduction. Usage can grow between this
-  // measurement and the config write, so a usage-only comparison could still
-  // allow eviction without confirmation.
+  // Any reduction the client can already see needs the confirmation modal.
+  // For a raise, POST straight through: if _committedWorkingCopyQuotaMb is
+  // stale and the server sees a reduction, /api/config rejects with 409
+  // and commitWorkingCopyLimit reroutes to the modal below.
   if (quotaMb > _committedWorkingCopyQuotaMb) {
-    await commitWorkingCopyLimit(quotaMb);
+    await commitWorkingCopyLimit(quotaMb, { confirmed: false });
     return;
   }
+  await promptWorkingCopyLimit(quotaMb);
+}
 
+// Open the eviction confirmation modal for a proposed reduction. When the
+// server has already measured usage under the publication guard (the 409
+// response body), reuse that value instead of racing another /api/storage
+// scan against a concurrent publication.
+async function promptWorkingCopyLimit(quotaMb, opts) {
+  opts = opts || {};
   var applyBtn = document.getElementById('applyWorkingCopyLimitBtn');
   var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
   applyBtn.disabled = true;
   input.disabled = true;
-  applyBtn.textContent = 'Checking…';
-  var usage = await refreshWorkingCopyUsage();
+  var usage;
+  if (opts.usageBytes != null) {
+    _workingCopySizeBytes = opts.usageBytes;
+    usage = opts.usageBytes;
+  } else {
+    applyBtn.textContent = 'Checking…';
+    usage = await refreshWorkingCopyUsage();
+  }
   var quotaBytes = quotaMb * 1024 * 1024;
   var removalBytes = usage == null ? null : Math.max(0, usage - quotaBytes);
   var newLimit = storageFormatBytes(quotaBytes);
@@ -507,28 +528,58 @@ function confirmWorkingCopyLimit() {
   if (modal.open) modal.close();
   modal.classList.remove('open');
   _pendingWorkingCopyQuotaMb = null;
-  if (quotaMb != null) commitWorkingCopyLimit(quotaMb);
+  if (quotaMb != null) commitWorkingCopyLimit(quotaMb, { confirmed: true });
 }
 
-async function commitWorkingCopyLimit(quotaMb) {
+async function commitWorkingCopyLimit(quotaMb, opts) {
+  opts = opts || {};
   clearTimeout(_storageSaveTimer);
   var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
   var applyBtn = document.getElementById('applyWorkingCopyLimitBtn');
   input.disabled = true;
   applyBtn.disabled = true;
   applyBtn.textContent = 'Applying…';
+  var reroutedToModal = false;
   try {
-    await postWorkingCopyLimit(quotaMb);
+    await postWorkingCopyLimit(quotaMb, opts);
     _committedWorkingCopyQuotaMb = quotaMb;
     input.value = quotaMb / 1024;
     showToast('Working-copy storage limit updated', 'success');
     await refreshStoragePage();
   } catch(e) {
-    showToast('Could not update working-copy storage limit', 'error');
+    if (
+      !opts.confirmed && e && e.status === 409 &&
+      e.code === 'working_copy_eviction_confirmation_required'
+    ) {
+      // The server sees this as a reduction — either because the client's
+      // cached committed quota was stale (another tab raised it), or
+      // because the storage page was loaded before the current stored
+      // value. Sync the cached committed value to the server's truth so
+      // the Apply button state reflects reality, then re-prompt with the
+      // server's usage measurement.
+      var body = e.body || {};
+      if (typeof body.previous_working_copy_quota_mb === 'number') {
+        _committedWorkingCopyQuotaMb = body.previous_working_copy_quota_mb;
+      }
+      reroutedToModal = true;
+      input.disabled = false;
+      applyBtn.textContent = 'Apply';
+      updateWorkingCopyLimitState();
+      await promptWorkingCopyLimit(quotaMb, {
+        usageBytes:
+          typeof body.current_working_copy_usage_bytes === 'number'
+            ? body.current_working_copy_usage_bytes
+            : null,
+      });
+    } else {
+      showToast('Could not update working-copy storage limit', 'error');
+    }
   } finally {
-    input.disabled = false;
-    applyBtn.textContent = 'Apply';
-    updateWorkingCopyLimitState();
+    if (!reroutedToModal) {
+      input.disabled = false;
+      applyBtn.textContent = 'Apply';
+      updateWorkingCopyLimitState();
+    }
   }
 }
 

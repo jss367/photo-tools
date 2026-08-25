@@ -19966,6 +19966,41 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         return jsonify(cfg.load())
 
+    def _working_copy_quota_confirmation_required(
+        previous, requested_quota_mb, confirmed=False,
+    ):
+        """Return a 409 response for an unconfirmed quota reduction.
+
+        Every global-config mutation path calls this while holding
+        ``_settings_write_lock`` and before writing the new value. Keeping the
+        check here prevents schema PATCH/DELETE and settings import from
+        bypassing the Storage page's eviction warning.
+        """
+        try:
+            previous_quota_mb = int(
+                previous.get("working_copy_cache_max_mb", 20480)
+            )
+            requested_quota_mb = int(requested_quota_mb)
+        except (TypeError, ValueError):
+            return None
+        if requested_quota_mb >= previous_quota_mb or confirmed:
+            return None
+
+        vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+        # Measure usage under the publication guard so the value returned to
+        # the client is a snapshot no concurrent publisher is mutating.
+        with working_copy_publication_guard():
+            usage = working_copy_stats(vireo_dir, quota_mb=requested_quota_mb)
+        return jsonify({
+            "ok": False,
+            "error": "working-copy quota reduction requires confirmation",
+            "code": "working_copy_eviction_confirmation_required",
+            "request_id": getattr(g, "request_id", None),
+            "previous_working_copy_quota_mb": previous_quota_mb,
+            "requested_working_copy_quota_mb": requested_quota_mb,
+            "current_working_copy_usage_bytes": usage["size"],
+        }), 409
+
     @app.route("/api/recent-destinations", methods=["POST"])
     def api_recent_destinations_add():
         """Remember a destination selected in a folder picker."""
@@ -20010,55 +20045,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             previous = cfg.load()
             current = dict(previous)
 
-            # Atomic gate against silently evicting working copies. The
-            # storage page's client-side check compares the requested quota
-            # against a cached "committed" value and its own /api/storage
-            # snapshot; both can be stale by the time the write reaches
-            # here — another tab may have raised the stored quota, or a
-            # working copy may have been published between the client's
-            # measurement and this request — so a reduction that skipped
-            # the confirmation modal could still trigger eviction under
-            # ``_settings_post_save_side_effects``. Require an explicit
-            # ``_confirm_working_copy_eviction`` flag for any reduction
-            # of the stored quota via this endpoint; the settings
-            # PATCH/DELETE paths continue to enforce the quota directly.
+            # The client's cached quota can be stale, so enforce confirmation
+            # atomically against the stored value before any write/eviction.
             new_wc = body.get("working_copy_cache_max_mb")
             if new_wc is not None:
-                try:
-                    new_quota_mb = int(new_wc)
-                except (TypeError, ValueError):
-                    new_quota_mb = None
-                try:
-                    prev_quota_mb = int(
-                        previous.get("working_copy_cache_max_mb", 20480)
-                    )
-                except (TypeError, ValueError):
-                    prev_quota_mb = 20480
-                if (
-                    new_quota_mb is not None
-                    and new_quota_mb < prev_quota_mb
-                    and not body.get("_confirm_working_copy_eviction")
-                ):
-                    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
-                    # Measure usage under the publication guard so the
-                    # value returned to the client is a snapshot no
-                    # concurrent publisher is mutating.
-                    with working_copy_publication_guard():
-                        usage = working_copy_stats(
-                            vireo_dir, quota_mb=new_quota_mb,
-                        )
-                    return jsonify({
-                        "ok": False,
-                        "error": (
-                            "working-copy quota reduction requires "
-                            "confirmation"
-                        ),
-                        "code": "working_copy_eviction_confirmation_required",
-                        "request_id": getattr(g, "request_id", None),
-                        "previous_working_copy_quota_mb": prev_quota_mb,
-                        "requested_working_copy_quota_mb": new_quota_mb,
-                        "current_working_copy_usage_bytes": usage["size"],
-                    }), 409
+                confirmation = _working_copy_quota_confirmation_required(
+                    previous,
+                    new_wc,
+                    body.get("_confirm_working_copy_eviction"),
+                )
+                if confirmation is not None:
+                    return confirmation
 
             # Handle keyboard_shortcuts with validation
             if "keyboard_shortcuts" in body:
@@ -20400,6 +20397,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         with _settings_write_lock:
             previous = cfg.load()
+            if key == "working_copy_cache_max_mb":
+                confirmation = _working_copy_quota_confirmation_required(
+                    previous,
+                    value,
+                    body.get("_confirm_working_copy_eviction"),
+                )
+                if confirmation is not None:
+                    return confirmation
             raw = _read_raw_config_file()
             schema.set_dotted(raw, key, value)
             cfg.save(raw)
@@ -20417,8 +20422,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if key not in schema.SCHEMA:
             return json_error(f"unknown setting {key!r}", status=400)
 
+        body = request.get_json(silent=True) or {}
         with _settings_write_lock:
             previous = cfg.load()
+            if key == "working_copy_cache_max_mb":
+                confirmation = _working_copy_quota_confirmation_required(
+                    previous,
+                    cfg.DEFAULTS["working_copy_cache_max_mb"],
+                    body.get("_confirm_working_copy_eviction"),
+                )
+                if confirmation is not None:
+                    return confirmation
             raw = _read_raw_config_file()
             schema.delete_dotted(raw, key)
             cfg.save(raw)
@@ -20821,6 +20835,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 existing = schema.get_dotted(current_raw, secret_key, default=_MISSING)
                 if existing is not _MISSING:
                     schema.set_dotted(payload, secret_key, existing)
+            confirmation = _working_copy_quota_confirmation_required(
+                previous,
+                payload.get(
+                    "working_copy_cache_max_mb",
+                    cfg.DEFAULTS["working_copy_cache_max_mb"],
+                ),
+                body.get("_confirm_working_copy_eviction"),
+            )
+            if confirmation is not None:
+                return confirmation
             cfg.save(payload)
             if "inat_token" in payload:
                 _advance_inat_token_generation()

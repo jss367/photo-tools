@@ -864,6 +864,9 @@ def test_storage_page_confirms_destructive_working_copy_quota_reduction(
         # controls instead of dropping it via clearTimeout.
         b'await flushPendingStorageAutosave()',
         b'function flushPendingStorageAutosave',
+        b'saveStorageConfig();',
+        b'throw e;',
+        b'the working-copy limit was not updated',
         # Refresh syncs the cached committed quota from the server's
         # authoritative working.quota_bytes so a concurrent quota change
         # (another tab, All Settings) doesn't leave Apply disabled with
@@ -1203,8 +1206,8 @@ def test_settings_global_patch_enforces_and_clears_working_copy_quota(
 ):
     """The schema-driven PATCH mirrors the legacy /api/config quota transitions.
 
-    Reducing the quota through PATCH must evict immediately (not wait until
-    the next scan or config save); raising it must clear the per-row
+    Reducing the quota through PATCH must require confirmation and then evict
+    immediately (not wait until the next scan or config save); raising it must clear the per-row
     eviction marker so scan/backfill can regenerate deferred copies.
     Without both, the schema-rendered Settings form (which drives this
     endpoint) is silently a no-op on the working-copy budget.
@@ -1222,6 +1225,21 @@ def test_settings_global_patch_enforces_and_clears_working_copy_quota(
     response = app.test_client().patch(
         "/api/settings/global",
         json={"key": "working_copy_cache_max_mb", "value": 0},
+    )
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body["code"] == "working_copy_eviction_confirmation_required"
+    assert body["previous_working_copy_quota_mb"] == 20480
+    assert body["requested_working_copy_quota_mb"] == 0
+    assert path.exists()
+
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={
+            "key": "working_copy_cache_max_mb",
+            "value": 0,
+            "_confirm_working_copy_eviction": True,
+        },
     )
     assert response.status_code == 200
     assert not path.exists()
@@ -1288,7 +1306,11 @@ def test_settings_global_delete_restores_default_and_clears_evictions(
     # Shrink first via PATCH so an override is in place and eviction runs.
     app.test_client().patch(
         "/api/settings/global",
-        json={"key": "working_copy_cache_max_mb", "value": 0},
+        json={
+            "key": "working_copy_cache_max_mb",
+            "value": 0,
+            "_confirm_working_copy_eviction": True,
+        },
     ).close()
     row = db.conn.execute(
         "SELECT working_copy_evicted_mtime FROM photos WHERE id=1"
@@ -1309,6 +1331,61 @@ def test_settings_global_delete_restores_default_and_clears_evictions(
     with open(cfg.CONFIG_PATH) as f:
         raw = json.load(f)
     assert "working_copy_cache_max_mb" not in raw
+
+
+def test_settings_global_delete_requires_confirmation_for_quota_reduction(
+    app_and_db,
+):
+    """Resetting a quota above the default cannot silently lower it."""
+    import config as cfg
+
+    app, _db = app_and_db
+    cfg.set("working_copy_cache_max_mb", 40960)
+
+    response = app.test_client().delete(
+        "/api/settings/global/working_copy_cache_max_mb"
+    )
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body["previous_working_copy_quota_mb"] == 40960
+    assert body["requested_working_copy_quota_mb"] == 20480
+    assert cfg.load()["working_copy_cache_max_mb"] == 40960
+
+    response = app.test_client().delete(
+        "/api/settings/global/working_copy_cache_max_mb",
+        json={"_confirm_working_copy_eviction": True},
+    )
+    assert response.status_code == 200
+    assert cfg.load()["working_copy_cache_max_mb"] == 20480
+
+
+def test_settings_import_requires_confirmation_for_quota_reduction(app_and_db):
+    """Import validates a lower working-copy quota before replacing config."""
+    import config as cfg
+
+    app, _db = app_and_db
+    cfg.set("working_copy_cache_max_mb", 40960)
+    imported = json.dumps({"working_copy_cache_max_mb": 1024})
+
+    response = app.test_client().post(
+        "/api/settings/import", json={"json": imported},
+    )
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body["code"] == "working_copy_eviction_confirmation_required"
+    assert body["previous_working_copy_quota_mb"] == 40960
+    assert body["requested_working_copy_quota_mb"] == 1024
+    assert cfg.load()["working_copy_cache_max_mb"] == 40960
+
+    response = app.test_client().post(
+        "/api/settings/import",
+        json={
+            "json": imported,
+            "_confirm_working_copy_eviction": True,
+        },
+    )
+    assert response.status_code == 200
+    assert cfg.load()["working_copy_cache_max_mb"] == 1024
 
 
 def test_settings_patch_skips_working_copy_eviction_for_unrelated_writes(
@@ -1363,7 +1440,11 @@ def test_settings_patch_skips_working_copy_eviction_for_unrelated_writes(
     # would defeat the on-save enforcement the Storage UI advertises.
     response = app.test_client().patch(
         "/api/settings/global",
-        json={"key": "working_copy_cache_max_mb", "value": 1024},
+        json={
+            "key": "working_copy_cache_max_mb",
+            "value": 1024,
+            "_confirm_working_copy_eviction": True,
+        },
     )
     assert response.status_code == 200
     assert len(calls) == 1

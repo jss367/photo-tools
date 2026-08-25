@@ -436,7 +436,13 @@ async function flushPendingStorageAutosave() {
   _storageSaveTimer = null;
   try {
     await postAutosaveStorageConfig();
-  } catch(e) {}
+  } catch(e) {
+    // Keep the unrelated edit queued for retry and tell the Apply flow to
+    // stop. Proceeding would both lose that edit and send a quota snapshot
+    // whose surrounding storage settings are stale.
+    saveStorageConfig();
+    throw e;
+  }
 }
 
 // Fetch a fresh working-copy usage snapshot. Returns the size in bytes on
@@ -548,9 +554,20 @@ function confirmWorkingCopyLimit() {
 
 async function commitWorkingCopyLimit(quotaMb, opts) {
   opts = opts || {};
-  await flushPendingStorageAutosave();
   var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
   var applyBtn = document.getElementById('applyWorkingCopyLimitBtn');
+  try {
+    await flushPendingStorageAutosave();
+  } catch(e) {
+    input.disabled = false;
+    applyBtn.textContent = 'Apply';
+    updateWorkingCopyLimitState();
+    showToast(
+      'Could not save pending storage changes; the working-copy limit was not updated',
+      'error'
+    );
+    return;
+  }
   input.disabled = true;
   applyBtn.disabled = true;
   applyBtn.textContent = 'Applying…';

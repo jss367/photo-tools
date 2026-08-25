@@ -4666,17 +4666,48 @@ function _settingsScopeBaseFor(scope) {
   return (scope === 'workspace') ? '/api/settings/workspace' : '/api/settings/global';
 }
 
-async function saveSchemaSetting(key, value, scope) {
+function confirmWorkingCopyQuotaReduction(data) {
+  var quotaMb = Number(data.requested_working_copy_quota_mb);
+  var usageBytes = Number(data.current_working_copy_usage_bytes);
+  var quotaBytes = Number.isFinite(quotaMb) ? quotaMb * 1024 * 1024 : 0;
+  var removalBytes = Number.isFinite(usageBytes)
+    ? Math.max(0, usageBytes - quotaBytes)
+    : null;
+  var detail = removalBytes > 0
+    ? 'This will remove approximately ' + formatBytes(removalBytes) +
+      ' of the oldest generated working copies.'
+    : 'If current usage exceeds the new limit, Vireo will remove the oldest generated working copies.';
+  return confirm(
+    'Lower the working-copy storage limit to ' + formatBytes(quotaBytes) + '?\n\n' +
+    detail + '\n\nYour original photos will not be deleted.'
+  );
+}
+
+async function saveSchemaSetting(key, value, scope, confirmedEviction) {
   if (!scope) scope = ALL_SETTINGS_SCOPE;
   setRowStatus(key, 'Saving…', false);
   try {
+    var payload = { key: key, value: value };
+    if (confirmedEviction) payload._confirm_working_copy_eviction = true;
     var resp = await fetch(_settingsScopeBaseFor(scope), {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ key: key, value: value }),
+      body: JSON.stringify(payload),
     });
     if (!resp.ok) {
       var err = await resp.json().catch(function() { return { error: resp.statusText }; });
+      if (
+        resp.status === 409 && !confirmedEviction &&
+        err.code === 'working_copy_eviction_confirmation_required'
+      ) {
+        if (confirmWorkingCopyQuotaReduction(err)) {
+          return saveSchemaSetting(key, value, scope, true);
+        }
+        await refreshAllSettingsValues();
+        rerenderSettingRow(key);
+        setRowStatus(key, 'Not changed', false);
+        return;
+      }
       setRowStatus(key, err.error || 'Save failed', true);
       return;
     }
@@ -4697,7 +4728,7 @@ async function saveSchemaSetting(key, value, scope) {
   }
 }
 
-async function resetSchemaSetting(key) {
+async function resetSchemaSetting(key, confirmedEviction) {
   setRowStatus(key, 'Resetting…', false);
   try {
     var scope = ALL_SETTINGS_SCOPE;
@@ -4712,9 +4743,25 @@ async function resetSchemaSetting(key) {
     }
     var resp = await fetch(_settingsScopeBaseFor(scope) + '/' + encodeURIComponent(key), {
       method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(confirmedEviction
+        ? { _confirm_working_copy_eviction: true }
+        : {}),
     });
     if (!resp.ok) {
       var err = await resp.json().catch(function() { return { error: resp.statusText }; });
+      if (
+        resp.status === 409 && !confirmedEviction &&
+        err.code === 'working_copy_eviction_confirmation_required'
+      ) {
+        if (confirmWorkingCopyQuotaReduction(err)) {
+          return resetSchemaSetting(key, true);
+        }
+        await refreshAllSettingsValues();
+        rerenderSettingRow(key);
+        setRowStatus(key, 'Not changed', false);
+        return;
+      }
       setRowStatus(key, err.error || 'Reset failed', true);
       return;
     }
@@ -4787,22 +4834,37 @@ async function importSettingsFile(file) {
     clearTimeout(_wsSaveTimer);
     _wsSaveTimer = null;
   }
+  var confirmedEviction = false;
   try {
-    var resp = await fetch('/api/settings/import', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ json: text }),
-    });
-    var data = await resp.json().catch(function() { return {}; });
-    if (!resp.ok) {
-      var msg = data.error || resp.statusText || 'Import failed';
-      if (data.errors) {
-        msg += '\n\nFailed keys:\n' + Object.keys(data.errors).map(function(k) {
-          return '  ' + k + ': ' + data.errors[k];
-        }).join('\n');
+    while (true) {
+      var resp = await fetch('/api/settings/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          json: text,
+          _confirm_working_copy_eviction: confirmedEviction,
+        }),
+      });
+      var data = await resp.json().catch(function() { return {}; });
+      if (
+        resp.status === 409 && !confirmedEviction &&
+        data.code === 'working_copy_eviction_confirmation_required'
+      ) {
+        if (!confirmWorkingCopyQuotaReduction(data)) return;
+        confirmedEviction = true;
+        continue;
       }
-      alert(msg);
-      return;
+      if (!resp.ok) {
+        var msg = data.error || resp.statusText || 'Import failed';
+        if (data.errors) {
+          msg += '\n\nFailed keys:\n' + Object.keys(data.errors).map(function(k) {
+            return '  ' + k + ': ' + data.errors[k];
+          }).join('\n');
+        }
+        alert(msg);
+        return;
+      }
+      break;
     }
     await refreshAllSettingsValues();
     renderAllSettings(document.getElementById('allSettingsCategories'));

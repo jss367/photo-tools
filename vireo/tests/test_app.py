@@ -1281,6 +1281,74 @@ def test_api_config_coerces_string_working_copy_quota(app_and_db):
     assert isinstance(stored, int)
 
 
+def test_api_config_invalid_stored_quota_still_confirms_reduction(
+    app_and_db, tmp_path,
+):
+    """A legacy invalid stored quota must not bypass the confirmation gate.
+
+    Older ``/api/config`` writes and hand-edits could leave a non-integer
+    value in ``~/.vireo/config.json``. ``_settings_post_save_side_effects``
+    treats that unparseable value as the 20480 MB runtime default when
+    deciding whether to evict — so a lower valid request would still
+    trigger eviction. The confirmation gate must fall back to the same
+    default rather than returning ``None`` (skipping the modal) when it
+    can't parse the previous value; otherwise the client sees an OK
+    response and working copies disappear without a prompt.
+    """
+    import config as cfg
+
+    app, db = app_and_db
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    path = working_dir / "1.jpg"
+    path.write_bytes(b"working-copy")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path='working/1.jpg' WHERE id=1"
+    )
+    db.conn.commit()
+
+    # Simulate a legacy invalid value on disk (writing through cfg.set
+    # would fail today's schema check, so bypass it and write raw JSON).
+    with open(cfg.CONFIG_PATH, "w") as f:
+        json.dump({"working_copy_cache_max_mb": "not-an-integer"}, f)
+
+    for endpoint, kwargs in (
+        (
+            "/api/config",
+            {"json": {"working_copy_cache_max_mb": 1024}},
+        ),
+        (
+            "/api/settings/global",
+            {
+                "json": {
+                    "key": "working_copy_cache_max_mb", "value": 1024,
+                },
+                "method": "PATCH",
+            },
+        ),
+    ):
+        method = kwargs.pop("method", "POST")
+        response = app.test_client().open(endpoint, method=method, **kwargs)
+        assert response.status_code == 409, (endpoint, response.get_json())
+        body = response.get_json()
+        assert body["code"] == "working_copy_eviction_confirmation_required"
+        assert body["previous_working_copy_quota_mb"] == 20480
+        assert body["requested_working_copy_quota_mb"] == 1024
+        assert path.exists()
+
+    # Confirmed reduction now goes through; the legacy value was replaced.
+    response = app.test_client().post(
+        "/api/config",
+        json={
+            "working_copy_cache_max_mb": 0,
+            "_confirm_working_copy_eviction": True,
+        },
+    )
+    assert response.status_code == 200
+    assert not path.exists()
+    assert cfg.load()["working_copy_cache_max_mb"] == 0
+
+
 def test_settings_global_patch_enforces_and_clears_working_copy_quota(
     app_and_db, tmp_path,
 ):

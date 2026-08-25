@@ -19975,11 +19975,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         ``_settings_write_lock`` and before writing the new value. Keeping the
         check here prevents schema PATCH/DELETE and settings import from
         bypassing the Storage page's eviction warning.
+
+        A legacy config with an invalid ``working_copy_cache_max_mb`` (possibly
+        left by a hand-edit or an older, unvalidated ``/api/config`` write)
+        must not skip the gate: ``_settings_post_save_side_effects`` interprets
+        an unparseable stored value as the 20480 MB runtime default, so a
+        lower request would still evict working copies. Fall back to the same
+        default here so the confirmation invariant holds against those legacy
+        configs.
         """
         try:
             previous_quota_mb = int(
                 previous.get("working_copy_cache_max_mb", 20480)
             )
+        except (TypeError, ValueError):
+            previous_quota_mb = 20480
+        try:
             requested_quota_mb = int(requested_quota_mb)
         except (TypeError, ValueError):
             return None

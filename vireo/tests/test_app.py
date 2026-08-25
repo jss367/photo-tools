@@ -860,6 +860,10 @@ def test_storage_page_confirms_destructive_working_copy_quota_reduction(
         b'_confirm_working_copy_eviction = true',
         b"'working_copy_eviction_confirmation_required'",
         b'previous_working_copy_quota_mb',
+        # Apply must flush a queued autosave for the other storage
+        # controls instead of dropping it via clearTimeout.
+        b'await flushPendingStorageAutosave()',
+        b'function flushPendingStorageAutosave',
     ):
         assert marker in page.data
 

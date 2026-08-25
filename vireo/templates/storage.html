@@ -416,12 +416,27 @@ async function postWorkingCopyLimit(workingCopyQuotaMb, opts) {
 function saveStorageConfig() {
   clearTimeout(_storageSaveTimer);
   _storageSaveTimer = setTimeout(async function() {
+    _storageSaveTimer = null;
     try {
       await postAutosaveStorageConfig();
       loadPreviewCacheStatus();
       loadStoragePanel();
     } catch(e) {}
   }, 250);
+}
+
+// If a debounced autosave for other storage controls is queued but has not
+// yet fired, POST its payload synchronously before returning. The
+// working-copy Apply flow used to `clearTimeout(_storageSaveTimer)` on
+// entry, which silently dropped any preview-cache or thumbnail edit from
+// the last 250 ms; flushing keeps those edits reaching the server.
+async function flushPendingStorageAutosave() {
+  if (_storageSaveTimer == null) return;
+  clearTimeout(_storageSaveTimer);
+  _storageSaveTimer = null;
+  try {
+    await postAutosaveStorageConfig();
+  } catch(e) {}
 }
 
 // Fetch a fresh working-copy usage snapshot. Returns the size in bytes on
@@ -533,7 +548,7 @@ function confirmWorkingCopyLimit() {
 
 async function commitWorkingCopyLimit(quotaMb, opts) {
   opts = opts || {};
-  clearTimeout(_storageSaveTimer);
+  await flushPendingStorageAutosave();
   var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
   var applyBtn = document.getElementById('applyWorkingCopyLimitBtn');
   input.disabled = true;

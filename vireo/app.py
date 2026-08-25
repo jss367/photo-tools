@@ -20036,6 +20036,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/config", methods=["POST"])
     def api_config_set():
         import config as cfg
+        import config_schema as schema
 
         body = request.get_json(silent=True) or {}
         # Share the schema-driven settings write lock so an autosave in the
@@ -20045,13 +20046,33 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             previous = cfg.load()
             current = dict(previous)
 
-            # The client's cached quota can be stale, so enforce confirmation
-            # atomically against the stored value before any write/eviction.
-            new_wc = body.get("working_copy_cache_max_mb")
-            if new_wc is not None:
+            # Validate the working-copy quota against the schema up front.
+            # Without this, a non-integer or explicit ``null`` value used to
+            # slip past the confirmation gate (int() raised, ``new_quota_mb``
+            # stayed None) but was still persisted verbatim; the post-save
+            # side effect then fell back to the 20 GB default when parsing
+            # the stored value — a silent reduction that could evict working
+            # copies without a confirmation prompt whenever the previously
+            # stored quota exceeded 20 GB.
+            #
+            # After validation the confirmation gate delegates to the same
+            # helper every other global-config write path uses, so a stale
+            # client cache still can't bypass the Storage-page warning.
+            if "working_copy_cache_max_mb" in body:
+                try:
+                    new_quota_mb = schema.validate_value(
+                        "working_copy_cache_max_mb",
+                        body["working_copy_cache_max_mb"],
+                    )
+                except schema.ValidationError as e:
+                    return json_error(str(e), status=400)
+                # Persist the validated integer so the ``for key in body``
+                # loop below can't write a raw payload value that later
+                # parses to a different fallback default.
+                body["working_copy_cache_max_mb"] = new_quota_mb
                 confirmation = _working_copy_quota_confirmation_required(
                     previous,
-                    new_wc,
+                    new_quota_mb,
                     body.get("_confirm_working_copy_eviction"),
                 )
                 if confirmation is not None:

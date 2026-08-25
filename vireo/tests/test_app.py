@@ -1201,6 +1201,65 @@ def test_api_config_same_value_needs_no_confirmation(app_and_db):
     assert cfg.load()["working_copy_cache_max_mb"] == 20480
 
 
+def test_api_config_rejects_invalid_working_copy_quota(app_and_db, tmp_path):
+    """Non-integer / null / out-of-range quota values must be rejected.
+
+    Without schema validation on this endpoint, a payload like
+    ``{"working_copy_cache_max_mb": "1024.5"}`` used to slip past the
+    confirmation gate (int() raised, ``new_quota_mb`` stayed None) but
+    was still written verbatim. The post-save side effect then parsed
+    the stored value as the 20 GB default and, if the previously stored
+    quota was higher, evicted working copies without a confirmation
+    prompt. Enforce schema validation up front so invalid payloads
+    cannot cause a silent reduction.
+    """
+    import config as cfg
+
+    app, db = app_and_db
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    path = working_dir / "1.jpg"
+    path.write_bytes(b"working-copy")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path='working/1.jpg' WHERE id=1"
+    )
+    db.conn.commit()
+
+    # Previously stored quota above the 20 GB default: this is the
+    # regression window where a fall-through to the default would look
+    # like a reduction to the post-save side effect.
+    cfg.set("working_copy_cache_max_mb", 40960)
+
+    client = app.test_client()
+    for bad in ["1024.5", 1024.5, None, "not-a-number", -1, 1048577, True]:
+        response = client.post(
+            "/api/config", json={"working_copy_cache_max_mb": bad},
+        )
+        assert response.status_code == 400, (bad, response.get_json())
+
+    # The stored value stayed at the higher quota and the working copy
+    # on disk was not evicted.
+    assert cfg.load()["working_copy_cache_max_mb"] == 40960
+    assert path.exists()
+
+
+def test_api_config_coerces_string_working_copy_quota(app_and_db):
+    """A numeric string is accepted (schema coerces) and stored as int."""
+    import config as cfg
+
+    app, _db = app_and_db
+    cfg.set("working_copy_cache_max_mb", 1024)
+
+    response = app.test_client().post(
+        "/api/config", json={"working_copy_cache_max_mb": "40960"},
+    )
+
+    assert response.status_code == 200
+    stored = cfg.load()["working_copy_cache_max_mb"]
+    assert stored == 40960
+    assert isinstance(stored, int)
+
+
 def test_settings_global_patch_enforces_and_clears_working_copy_quota(
     app_and_db, tmp_path,
 ):

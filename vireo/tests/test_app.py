@@ -833,6 +833,50 @@ def test_storage_page_has_health_cleanup_and_location_controls(app_and_db):
     assert page.data.count(b"{name: 'Database'") == 1
 
 
+def test_storage_page_confirms_destructive_working_copy_quota_reduction(
+    app_and_db,
+):
+    """Quota input stays pending until Apply and explains cache eviction."""
+    app, _ = app_and_db
+    page = app.test_client().get('/storage')
+
+    assert page.status_code == 200
+    assert b'oninput="updateWorkingCopyLimitState()"' in page.data
+    assert b'onchange="saveStorageConfig()"' not in page.data.split(
+        b'id="cfgWorkingCopyCacheMaxGb"', 1,
+    )[1].split(b'</div>', 1)[0]
+    for marker in (
+        b'applyWorkingCopyLimitBtn',
+        b'<dialog class="modal-overlay" id="workingCopyLimitModal"',
+        b'modal.showModal()',
+        b'MAX_WORKING_COPY_QUOTA_MB = 1048576',
+        b'quotaMb > _committedWorkingCopyQuotaMb',
+        b'Lower working-copy storage limit?',
+        b'Lower limit and remove copies',
+        b'Your original photos will not be deleted',
+        b'working_copy_cache_max_mb: workingCopyQuotaMb',
+        # 409 recovery flow: confirm flag sent after modal confirmation,
+        # and stale-cache 409 rerouted back into the modal.
+        b'_confirm_working_copy_eviction = true',
+        b"'working_copy_eviction_confirmation_required'",
+        b'previous_working_copy_quota_mb',
+        # Apply must flush a queued autosave for the other storage
+        # controls instead of dropping it via clearTimeout.
+        b'await flushPendingStorageAutosave()',
+        b'function flushPendingStorageAutosave',
+        b'saveStorageConfig();',
+        b'throw e;',
+        b'the working-copy limit was not updated',
+        # Refresh syncs the cached committed quota from the server's
+        # authoritative working.quota_bytes so a concurrent quota change
+        # (another tab, All Settings) doesn't leave Apply disabled with
+        # the input showing a stale value.
+        b'newCommittedMb = Math.round(working.quota_bytes / (1024 * 1024))',
+        b'currentInputMb === _committedWorkingCopyQuotaMb',
+    ):
+        assert marker in page.data
+
+
 def test_api_storage_includes_offline_originals(app_and_db):
     """Storage totals include Vireo-managed offline originals."""
     app, _ = app_and_db
@@ -1021,7 +1065,11 @@ def test_config_update_immediately_enforces_working_copy_quota(
     db.conn.commit()
 
     response = app.test_client().post(
-        "/api/config", json={"working_copy_cache_max_mb": 0},
+        "/api/config",
+        json={
+            "working_copy_cache_max_mb": 0,
+            "_confirm_working_copy_eviction": True,
+        },
     )
 
     assert response.status_code == 200
@@ -1045,13 +1093,269 @@ def test_config_update_immediately_enforces_working_copy_quota(
     assert row["working_copy_evicted_mtime"] is None
 
 
+def test_api_config_rejects_unconfirmed_working_copy_reduction(
+    app_and_db, tmp_path,
+):
+    """A quota reduction without the confirmation flag must not evict.
+
+    The storage page's client-side confirmation modal can be bypassed by
+    stale cached state (another tab raising the quota, a working copy
+    published between the client's usage snapshot and this write). Guard
+    the endpoint atomically so a reduction always requires an explicit
+    ``_confirm_working_copy_eviction`` flag; the response carries the
+    prior quota and current usage so the client can render an accurate
+    modal on the retry.
+    """
+    import config as cfg
+
+    app, db = app_and_db
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    path = working_dir / "1.jpg"
+    payload = b"x" * 4096
+    path.write_bytes(payload)
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path='working/1.jpg' WHERE id=1"
+    )
+    db.conn.commit()
+
+    # Seed a non-default committed quota so we can assert the response
+    # echoes the actual stored value rather than the schema default.
+    cfg.set("working_copy_cache_max_mb", 40960)
+
+    response = app.test_client().post(
+        "/api/config", json={"working_copy_cache_max_mb": 1024},
+    )
+
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body["code"] == "working_copy_eviction_confirmation_required"
+    assert body["previous_working_copy_quota_mb"] == 40960
+    assert body["requested_working_copy_quota_mb"] == 1024
+    assert body["current_working_copy_usage_bytes"] == len(payload)
+
+    # Nothing evicted, nothing written.
+    assert path.exists()
+    row = db.conn.execute(
+        "SELECT working_copy_path FROM photos WHERE id=1"
+    ).fetchone()
+    assert row["working_copy_path"] == "working/1.jpg"
+    assert cfg.load()["working_copy_cache_max_mb"] == 40960
+
+
+def test_api_config_allows_confirmed_working_copy_reduction(
+    app_and_db, tmp_path,
+):
+    """With the confirmation flag, /api/config still runs the eviction."""
+    import config as cfg
+
+    app, db = app_and_db
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    path = working_dir / "1.jpg"
+    path.write_bytes(b"working-copy")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path='working/1.jpg' WHERE id=1"
+    )
+    db.conn.commit()
+
+    response = app.test_client().post(
+        "/api/config",
+        json={
+            "working_copy_cache_max_mb": 0,
+            "_confirm_working_copy_eviction": True,
+        },
+    )
+    assert response.status_code == 200
+    assert not path.exists()
+    assert cfg.load()["working_copy_cache_max_mb"] == 0
+
+
+def test_api_config_rejects_non_boolean_eviction_confirmation(app_and_db):
+    """Only the literal JSON boolean true can authorize cache eviction."""
+    import config as cfg
+
+    app, _db = app_and_db
+    cfg.set("working_copy_cache_max_mb", 40960)
+
+    client = app.test_client()
+    for invalid_confirmation in ["false", 1, {}, []]:
+        response = client.post(
+            "/api/config",
+            json={
+                "working_copy_cache_max_mb": 1024,
+                "_confirm_working_copy_eviction": invalid_confirmation,
+            },
+        )
+        assert response.status_code == 409
+
+    assert cfg.load()["working_copy_cache_max_mb"] == 40960
+
+
+def test_api_config_raise_needs_no_confirmation(app_and_db):
+    """Raising the ceiling never triggers eviction and needs no flag."""
+    import config as cfg
+
+    app, _db = app_and_db
+    cfg.set("working_copy_cache_max_mb", 1024)
+
+    response = app.test_client().post(
+        "/api/config", json={"working_copy_cache_max_mb": 40960},
+    )
+
+    assert response.status_code == 200
+    assert cfg.load()["working_copy_cache_max_mb"] == 40960
+
+
+def test_api_config_same_value_needs_no_confirmation(app_and_db):
+    """POSTing the currently-stored quota is a no-op and passes the gate."""
+    import config as cfg
+
+    app, _db = app_and_db
+    cfg.set("working_copy_cache_max_mb", 20480)
+
+    response = app.test_client().post(
+        "/api/config", json={"working_copy_cache_max_mb": 20480},
+    )
+
+    assert response.status_code == 200
+    assert cfg.load()["working_copy_cache_max_mb"] == 20480
+
+
+def test_api_config_rejects_invalid_working_copy_quota(app_and_db, tmp_path):
+    """Non-integer / null / out-of-range quota values must be rejected.
+
+    Without schema validation on this endpoint, a payload like
+    ``{"working_copy_cache_max_mb": "1024.5"}`` used to slip past the
+    confirmation gate (int() raised, ``new_quota_mb`` stayed None) but
+    was still written verbatim. The post-save side effect then parsed
+    the stored value as the 20 GB default and, if the previously stored
+    quota was higher, evicted working copies without a confirmation
+    prompt. Enforce schema validation up front so invalid payloads
+    cannot cause a silent reduction.
+    """
+    import config as cfg
+
+    app, db = app_and_db
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    path = working_dir / "1.jpg"
+    path.write_bytes(b"working-copy")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path='working/1.jpg' WHERE id=1"
+    )
+    db.conn.commit()
+
+    # Previously stored quota above the 20 GB default: this is the
+    # regression window where a fall-through to the default would look
+    # like a reduction to the post-save side effect.
+    cfg.set("working_copy_cache_max_mb", 40960)
+
+    client = app.test_client()
+    for bad in ["1024.5", 1024.5, None, "not-a-number", -1, 1048577, True]:
+        response = client.post(
+            "/api/config", json={"working_copy_cache_max_mb": bad},
+        )
+        assert response.status_code == 400, (bad, response.get_json())
+
+    # The stored value stayed at the higher quota and the working copy
+    # on disk was not evicted.
+    assert cfg.load()["working_copy_cache_max_mb"] == 40960
+    assert path.exists()
+
+
+def test_api_config_coerces_string_working_copy_quota(app_and_db):
+    """A numeric string is accepted (schema coerces) and stored as int."""
+    import config as cfg
+
+    app, _db = app_and_db
+    cfg.set("working_copy_cache_max_mb", 1024)
+
+    response = app.test_client().post(
+        "/api/config", json={"working_copy_cache_max_mb": "40960"},
+    )
+
+    assert response.status_code == 200
+    stored = cfg.load()["working_copy_cache_max_mb"]
+    assert stored == 40960
+    assert isinstance(stored, int)
+
+
+def test_api_config_invalid_stored_quota_still_confirms_reduction(
+    app_and_db, tmp_path,
+):
+    """A legacy invalid stored quota must not bypass the confirmation gate.
+
+    Older ``/api/config`` writes and hand-edits could leave a non-integer
+    value in ``~/.vireo/config.json``. ``_settings_post_save_side_effects``
+    treats that unparseable value as the 20480 MB runtime default when
+    deciding whether to evict — so a lower valid request would still
+    trigger eviction. The confirmation gate must fall back to the same
+    default rather than returning ``None`` (skipping the modal) when it
+    can't parse the previous value; otherwise the client sees an OK
+    response and working copies disappear without a prompt.
+    """
+    import config as cfg
+
+    app, db = app_and_db
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    path = working_dir / "1.jpg"
+    path.write_bytes(b"working-copy")
+    db.conn.execute(
+        "UPDATE photos SET working_copy_path='working/1.jpg' WHERE id=1"
+    )
+    db.conn.commit()
+
+    # Simulate a legacy invalid value on disk (writing through cfg.set
+    # would fail today's schema check, so bypass it and write raw JSON).
+    with open(cfg.CONFIG_PATH, "w") as f:
+        json.dump({"working_copy_cache_max_mb": "not-an-integer"}, f)
+
+    for endpoint, kwargs in (
+        (
+            "/api/config",
+            {"json": {"working_copy_cache_max_mb": 1024}},
+        ),
+        (
+            "/api/settings/global",
+            {
+                "json": {
+                    "key": "working_copy_cache_max_mb", "value": 1024,
+                },
+                "method": "PATCH",
+            },
+        ),
+    ):
+        method = kwargs.pop("method", "POST")
+        response = app.test_client().open(endpoint, method=method, **kwargs)
+        assert response.status_code == 409, (endpoint, response.get_json())
+        body = response.get_json()
+        assert body["code"] == "working_copy_eviction_confirmation_required"
+        assert body["previous_working_copy_quota_mb"] == 20480
+        assert body["requested_working_copy_quota_mb"] == 1024
+        assert path.exists()
+
+    # Confirmed reduction now goes through; the legacy value was replaced.
+    response = app.test_client().post(
+        "/api/config",
+        json={
+            "working_copy_cache_max_mb": 0,
+            "_confirm_working_copy_eviction": True,
+        },
+    )
+    assert response.status_code == 200
+    assert not path.exists()
+    assert cfg.load()["working_copy_cache_max_mb"] == 0
+
+
 def test_settings_global_patch_enforces_and_clears_working_copy_quota(
     app_and_db, tmp_path,
 ):
     """The schema-driven PATCH mirrors the legacy /api/config quota transitions.
 
-    Reducing the quota through PATCH must evict immediately (not wait until
-    the next scan or config save); raising it must clear the per-row
+    Reducing the quota through PATCH must require confirmation and then evict
+    immediately (not wait until the next scan or config save); raising it must clear the per-row
     eviction marker so scan/backfill can regenerate deferred copies.
     Without both, the schema-rendered Settings form (which drives this
     endpoint) is silently a no-op on the working-copy budget.
@@ -1069,6 +1373,21 @@ def test_settings_global_patch_enforces_and_clears_working_copy_quota(
     response = app.test_client().patch(
         "/api/settings/global",
         json={"key": "working_copy_cache_max_mb", "value": 0},
+    )
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body["code"] == "working_copy_eviction_confirmation_required"
+    assert body["previous_working_copy_quota_mb"] == 20480
+    assert body["requested_working_copy_quota_mb"] == 0
+    assert path.exists()
+
+    response = app.test_client().patch(
+        "/api/settings/global",
+        json={
+            "key": "working_copy_cache_max_mb",
+            "value": 0,
+            "_confirm_working_copy_eviction": True,
+        },
     )
     assert response.status_code == 200
     assert not path.exists()
@@ -1135,7 +1454,11 @@ def test_settings_global_delete_restores_default_and_clears_evictions(
     # Shrink first via PATCH so an override is in place and eviction runs.
     app.test_client().patch(
         "/api/settings/global",
-        json={"key": "working_copy_cache_max_mb", "value": 0},
+        json={
+            "key": "working_copy_cache_max_mb",
+            "value": 0,
+            "_confirm_working_copy_eviction": True,
+        },
     ).close()
     row = db.conn.execute(
         "SELECT working_copy_evicted_mtime FROM photos WHERE id=1"
@@ -1156,6 +1479,61 @@ def test_settings_global_delete_restores_default_and_clears_evictions(
     with open(cfg.CONFIG_PATH) as f:
         raw = json.load(f)
     assert "working_copy_cache_max_mb" not in raw
+
+
+def test_settings_global_delete_requires_confirmation_for_quota_reduction(
+    app_and_db,
+):
+    """Resetting a quota above the default cannot silently lower it."""
+    import config as cfg
+
+    app, _db = app_and_db
+    cfg.set("working_copy_cache_max_mb", 40960)
+
+    response = app.test_client().delete(
+        "/api/settings/global/working_copy_cache_max_mb"
+    )
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body["previous_working_copy_quota_mb"] == 40960
+    assert body["requested_working_copy_quota_mb"] == 20480
+    assert cfg.load()["working_copy_cache_max_mb"] == 40960
+
+    response = app.test_client().delete(
+        "/api/settings/global/working_copy_cache_max_mb",
+        json={"_confirm_working_copy_eviction": True},
+    )
+    assert response.status_code == 200
+    assert cfg.load()["working_copy_cache_max_mb"] == 20480
+
+
+def test_settings_import_requires_confirmation_for_quota_reduction(app_and_db):
+    """Import validates a lower working-copy quota before replacing config."""
+    import config as cfg
+
+    app, _db = app_and_db
+    cfg.set("working_copy_cache_max_mb", 40960)
+    imported = json.dumps({"working_copy_cache_max_mb": 1024})
+
+    response = app.test_client().post(
+        "/api/settings/import", json={"json": imported},
+    )
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body["code"] == "working_copy_eviction_confirmation_required"
+    assert body["previous_working_copy_quota_mb"] == 40960
+    assert body["requested_working_copy_quota_mb"] == 1024
+    assert cfg.load()["working_copy_cache_max_mb"] == 40960
+
+    response = app.test_client().post(
+        "/api/settings/import",
+        json={
+            "json": imported,
+            "_confirm_working_copy_eviction": True,
+        },
+    )
+    assert response.status_code == 200
+    assert cfg.load()["working_copy_cache_max_mb"] == 1024
 
 
 def test_settings_patch_skips_working_copy_eviction_for_unrelated_writes(
@@ -1210,7 +1588,11 @@ def test_settings_patch_skips_working_copy_eviction_for_unrelated_writes(
     # would defeat the on-save enforcement the Storage UI advertises.
     response = app.test_client().patch(
         "/api/settings/global",
-        json={"key": "working_copy_cache_max_mb", "value": 1024},
+        json={
+            "key": "working_copy_cache_max_mb",
+            "value": 1024,
+            "_confirm_working_copy_eviction": True,
+        },
     )
     assert response.status_code == 200
     assert len(calls) == 1

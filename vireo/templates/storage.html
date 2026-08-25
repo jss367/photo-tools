@@ -76,6 +76,10 @@ body { padding-bottom: 36px; }
   z-index: 1000; justify-content: center; align-items: center;
 }
 .modal-overlay.open { display: flex; }
+dialog.modal-overlay {
+  border: none; padding: 0; margin: 0; max-width: none; max-height: none; color: inherit;
+}
+dialog.modal-overlay::backdrop { background: transparent; }
 .modal {
   background: var(--bg-secondary); border: 1px solid var(--border-primary); border-radius: 8px;
   width: 90%; max-width: 560px; max-height: 80vh; display: flex; flex-direction: column;
@@ -201,11 +205,13 @@ body { padding-bottom: 36px; }
       <div class="setting-row" style="align-items:flex-start;">
         <div class="setting-label">Storage limit<small>Maximum space for edit-quality JPEGs generated from RAW files. Oldest files are removed first.</small></div>
         <div class="setting-control">
-          <input type="number" id="cfgWorkingCopyCacheMaxGb" min="0" step="1" value="20"
+          <input type="number" id="cfgWorkingCopyCacheMaxGb" min="0" max="1024" step="1" value="20"
                  aria-label="Working-copy storage limit in GB"
                  style="width:96px;background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-secondary);border-radius:4px;padding:4px 8px;font-size:13px;text-align:center;"
-                 onchange="saveStorageConfig()">
+                 oninput="updateWorkingCopyLimitState()">
           <span style="font-size:13px;color:var(--text-dim);">GB</span>
+          <button id="applyWorkingCopyLimitBtn" class="btn-secondary"
+                  onclick="applyWorkingCopyLimit()" disabled>Apply</button>
         </div>
       </div>
       <div id="workingCopyCacheStatus" style="font-size:12px;color:var(--text-dim);margin-top:10px;">Loading...</div>
@@ -233,6 +239,26 @@ body { padding-bottom: 36px; }
     <div id="matrixContent"><span style="color:var(--text-ghost);font-size:13px;">Loading...</span></div>
   </div>
 </div>
+
+<dialog class="modal-overlay" id="workingCopyLimitModal"
+        aria-labelledby="workingCopyLimitModalTitle"
+        oncancel="event.preventDefault();closeWorkingCopyLimitModal()"
+        onclick="if(event.target===this)closeWorkingCopyLimitModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="workingCopyLimitModalTitle">Lower working-copy storage limit?</h3>
+      <button class="modal-close" aria-label="Close" onclick="closeWorkingCopyLimitModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-desc" id="workingCopyLimitModalDesc"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" onclick="closeWorkingCopyLimitModal()">Cancel</button>
+      <button class="btn-danger" id="confirmWorkingCopyLimitBtn"
+              onclick="confirmWorkingCopyLimit()">Lower limit and remove copies</button>
+    </div>
+  </div>
+</dialog>
 
 <div class="modal-overlay" id="masksModal" onclick="if(event.target===this)closeMasksModal()">
   <div class="modal">
@@ -305,6 +331,11 @@ refreshStoragePage();
 loadStorageConfig();
 
 var _storageSaveTimer = null;
+var _committedWorkingCopyQuotaMb = 20480;
+var MAX_WORKING_COPY_QUOTA_MB = 1048576;
+// null = current working-copy usage has not yet been measured.
+var _workingCopySizeBytes = null;
+var _pendingWorkingCopyQuotaMb = null;
 
 async function loadStorageConfig() {
   try {
@@ -320,30 +351,268 @@ async function loadStorageConfig() {
     document.getElementById('cfgPreviewQualityVal').textContent = pq;
     document.getElementById('cfgPreviewCacheMaxMb').value =
       cfg.preview_cache_max_mb != null ? cfg.preview_cache_max_mb : 20480;
+    _committedWorkingCopyQuotaMb =
+      cfg.working_copy_cache_max_mb != null ? cfg.working_copy_cache_max_mb : 20480;
     document.getElementById('cfgWorkingCopyCacheMaxGb').value =
-      (cfg.working_copy_cache_max_mb != null ? cfg.working_copy_cache_max_mb : 20480) / 1024;
+      _committedWorkingCopyQuotaMb / 1024;
+    updateWorkingCopyLimitState();
   } catch(e) {}
+}
+
+function readWorkingCopyQuotaMb() {
+  var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
+  var gb = Number(input.value);
+  if (!Number.isFinite(gb) || gb < 0 || input.value.trim() === '') return null;
+  var quotaMb = Math.round(gb * 1024);
+  if (!Number.isFinite(quotaMb) || quotaMb > MAX_WORKING_COPY_QUOTA_MB) return null;
+  return quotaMb;
+}
+
+function updateWorkingCopyLimitState() {
+  var quotaMb = readWorkingCopyQuotaMb();
+  var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
+  var applyBtn = document.getElementById('applyWorkingCopyLimitBtn');
+  var valid = quotaMb != null;
+  input.setAttribute('aria-invalid', valid ? 'false' : 'true');
+  applyBtn.disabled = !valid || quotaMb === _committedWorkingCopyQuotaMb;
+}
+
+// Autosaved storage controls — everything EXCEPT the working-copy quota.
+// The quota has its own explicit Apply flow (postWorkingCopyLimit); mixing
+// it into the autosave payload would let a debounced autosave that fires
+// while commitWorkingCopyLimit is in flight silently POST the old
+// _committedWorkingCopyQuotaMb and undo the quota change on the server.
+function autosaveStorageConfigPayload() {
+  return {
+    thumbnail_size: parseInt(document.getElementById('cfgThumbSize').value, 10) || 400,
+    thumbnail_quality: parseInt(document.getElementById('cfgThumbQuality').value, 10) || 85,
+    preview_quality: parseInt(document.getElementById('cfgPreviewQuality').value, 10) || 90,
+    preview_cache_max_mb: Math.max(0, parseInt(document.getElementById('cfgPreviewCacheMaxMb').value, 10) || 0),
+  };
+}
+
+async function postAutosaveStorageConfig() {
+  await safeFetch('/api/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(autosaveStorageConfigPayload()),
+  });
+}
+
+async function postWorkingCopyLimit(workingCopyQuotaMb, opts) {
+  opts = opts || {};
+  var payload = {working_copy_cache_max_mb: workingCopyQuotaMb};
+  if (opts.confirmed) payload._confirm_working_copy_eviction = true;
+  // Suppress the default toast: commitWorkingCopyLimit routes the
+  // 409 confirmation-required response back into the modal flow, and
+  // shows its own message for other failures.
+  await safeFetch('/api/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload),
+  }, { toast: false });
 }
 
 function saveStorageConfig() {
   clearTimeout(_storageSaveTimer);
   _storageSaveTimer = setTimeout(async function() {
+    _storageSaveTimer = null;
     try {
-      await safeFetch('/api/config', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          thumbnail_size: parseInt(document.getElementById('cfgThumbSize').value, 10) || 400,
-          thumbnail_quality: parseInt(document.getElementById('cfgThumbQuality').value, 10) || 85,
-          preview_quality: parseInt(document.getElementById('cfgPreviewQuality').value, 10) || 90,
-          preview_cache_max_mb: Math.max(0, parseInt(document.getElementById('cfgPreviewCacheMaxMb').value, 10) || 0),
-          working_copy_cache_max_mb: Math.max(0, Math.round((parseFloat(document.getElementById('cfgWorkingCopyCacheMaxGb').value) || 0) * 1024)),
-        }),
-      });
+      await postAutosaveStorageConfig();
       loadPreviewCacheStatus();
       loadStoragePanel();
     } catch(e) {}
   }, 250);
+}
+
+// If a debounced autosave for other storage controls is queued but has not
+// yet fired, POST its payload synchronously before returning. The
+// working-copy Apply flow used to `clearTimeout(_storageSaveTimer)` on
+// entry, which silently dropped any preview-cache or thumbnail edit from
+// the last 250 ms; flushing keeps those edits reaching the server.
+async function flushPendingStorageAutosave() {
+  if (_storageSaveTimer == null) return;
+  clearTimeout(_storageSaveTimer);
+  _storageSaveTimer = null;
+  try {
+    await postAutosaveStorageConfig();
+  } catch(e) {
+    // Keep the unrelated edit queued for retry and tell the Apply flow to
+    // stop. Proceeding would both lose that edit and send a quota snapshot
+    // whose surrounding storage settings are stale.
+    saveStorageConfig();
+    throw e;
+  }
+}
+
+// Fetch a fresh working-copy usage snapshot. Returns the size in bytes on
+// success, or null if the /api/storage scan failed. Keeps
+// _workingCopySizeBytes and the Apply button state in sync with the result.
+async function refreshWorkingCopyUsage() {
+  try {
+    var s = await safeFetch('/api/storage', {}, { toast: false });
+    var working = s && s.working_copies ? s.working_copies : null;
+    if (!working) {
+      _workingCopySizeBytes = null;
+      return null;
+    }
+    _workingCopySizeBytes = working.size || 0;
+    return _workingCopySizeBytes;
+  } catch(e) {
+    _workingCopySizeBytes = null;
+    return null;
+  } finally {
+    updateWorkingCopyLimitState();
+  }
+}
+
+async function applyWorkingCopyLimit() {
+  var quotaMb = readWorkingCopyQuotaMb();
+  if (quotaMb == null) {
+    showToast('Enter a valid working-copy storage limit', 'error');
+    return;
+  }
+  if (quotaMb === _committedWorkingCopyQuotaMb) return;
+
+  // Any reduction the client can already see needs the confirmation modal.
+  // For a raise, POST straight through: if _committedWorkingCopyQuotaMb is
+  // stale and the server sees a reduction, /api/config rejects with 409
+  // and commitWorkingCopyLimit reroutes to the modal below.
+  if (quotaMb > _committedWorkingCopyQuotaMb) {
+    await commitWorkingCopyLimit(quotaMb, { confirmed: false });
+    return;
+  }
+  await promptWorkingCopyLimit(quotaMb);
+}
+
+// Open the eviction confirmation modal for a proposed reduction. When the
+// server has already measured usage under the publication guard (the 409
+// response body), reuse that value instead of racing another /api/storage
+// scan against a concurrent publication.
+async function promptWorkingCopyLimit(quotaMb, opts) {
+  opts = opts || {};
+  var applyBtn = document.getElementById('applyWorkingCopyLimitBtn');
+  var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
+  applyBtn.disabled = true;
+  input.disabled = true;
+  var usage;
+  if (opts.usageBytes != null) {
+    _workingCopySizeBytes = opts.usageBytes;
+    usage = opts.usageBytes;
+  } else {
+    applyBtn.textContent = 'Checking…';
+    usage = await refreshWorkingCopyUsage();
+  }
+  var quotaBytes = quotaMb * 1024 * 1024;
+  var removalBytes = usage == null ? null : Math.max(0, usage - quotaBytes);
+  var newLimit = storageFormatBytes(quotaBytes);
+  input.disabled = true;
+  applyBtn.textContent = 'Apply';
+  updateWorkingCopyLimitState();
+  _pendingWorkingCopyQuotaMb = quotaMb;
+  var desc = document.getElementById('workingCopyLimitModalDesc');
+  var confirmBtn = document.getElementById('confirmWorkingCopyLimitBtn');
+  if (removalBytes > 0) {
+    desc.textContent =
+      'Lowering the limit to ' + newLimit + ' will remove approximately ' +
+      storageFormatBytes(removalBytes) + ' of the oldest generated working copies. ' +
+      'Your original photos will not be deleted. Vireo will use the originals when a working copy is unavailable.';
+    confirmBtn.textContent = 'Lower limit and remove copies';
+  } else {
+    var usageNote = usage == null
+      ? 'Current working-copy usage could not be measured. '
+      : 'No working copies currently exceed the new limit. ';
+    desc.textContent = usageNote + 'If usage is above ' + newLimit +
+      ' when the change is applied, Vireo will remove the oldest generated working copies. ' +
+      'Your original photos will not be deleted.';
+    confirmBtn.textContent = 'Lower storage limit';
+  }
+  var modal = document.getElementById('workingCopyLimitModal');
+  modal.classList.add('open');
+  modal.showModal();
+  confirmBtn.focus();
+}
+
+function closeWorkingCopyLimitModal() {
+  var modal = document.getElementById('workingCopyLimitModal');
+  if (modal.open) modal.close();
+  modal.classList.remove('open');
+  _pendingWorkingCopyQuotaMb = null;
+  document.getElementById('cfgWorkingCopyCacheMaxGb').disabled = false;
+  updateWorkingCopyLimitState();
+  document.getElementById('applyWorkingCopyLimitBtn').focus();
+}
+
+function confirmWorkingCopyLimit() {
+  var quotaMb = _pendingWorkingCopyQuotaMb;
+  var modal = document.getElementById('workingCopyLimitModal');
+  if (modal.open) modal.close();
+  modal.classList.remove('open');
+  _pendingWorkingCopyQuotaMb = null;
+  if (quotaMb != null) commitWorkingCopyLimit(quotaMb, { confirmed: true });
+}
+
+async function commitWorkingCopyLimit(quotaMb, opts) {
+  opts = opts || {};
+  var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
+  var applyBtn = document.getElementById('applyWorkingCopyLimitBtn');
+  try {
+    await flushPendingStorageAutosave();
+  } catch(e) {
+    input.disabled = false;
+    applyBtn.textContent = 'Apply';
+    updateWorkingCopyLimitState();
+    showToast(
+      'Could not save pending storage changes; the working-copy limit was not updated',
+      'error'
+    );
+    return;
+  }
+  input.disabled = true;
+  applyBtn.disabled = true;
+  applyBtn.textContent = 'Applying…';
+  var reroutedToModal = false;
+  try {
+    await postWorkingCopyLimit(quotaMb, opts);
+    _committedWorkingCopyQuotaMb = quotaMb;
+    input.value = quotaMb / 1024;
+    showToast('Working-copy storage limit updated', 'success');
+    await refreshStoragePage();
+  } catch(e) {
+    if (
+      !opts.confirmed && e && e.status === 409 &&
+      e.code === 'working_copy_eviction_confirmation_required'
+    ) {
+      // The server sees this as a reduction — either because the client's
+      // cached committed quota was stale (another tab raised it), or
+      // because the storage page was loaded before the current stored
+      // value. Sync the cached committed value to the server's truth so
+      // the Apply button state reflects reality, then re-prompt with the
+      // server's usage measurement.
+      var body = e.body || {};
+      if (typeof body.previous_working_copy_quota_mb === 'number') {
+        _committedWorkingCopyQuotaMb = body.previous_working_copy_quota_mb;
+      }
+      reroutedToModal = true;
+      input.disabled = false;
+      applyBtn.textContent = 'Apply';
+      updateWorkingCopyLimitState();
+      await promptWorkingCopyLimit(quotaMb, {
+        usageBytes:
+          typeof body.current_working_copy_usage_bytes === 'number'
+            ? body.current_working_copy_usage_bytes
+            : null,
+      });
+    } else {
+      showToast('Could not update working-copy storage limit', 'error');
+    }
+  } finally {
+    if (!reroutedToModal) {
+      input.disabled = false;
+      applyBtn.textContent = 'Apply';
+      updateWorkingCopyLimitState();
+    }
+  }
 }
 
 async function loadStoragePanel() {
@@ -393,6 +662,31 @@ async function loadStoragePanel() {
       : 'Safe caches are empty';
 
     var working = s.working_copies || {count: 0, size: 0, quota_bytes: 0};
+    _workingCopySizeBytes = working.size || 0;
+    // Sync the cached "committed" quota from the server's authoritative
+    // value so a concurrent change (another tab, All Settings) is
+    // reflected in the Apply button state. Without this, an outside
+    // reduction leaves the input showing the old higher value and Apply
+    // disabled — the user can't restore that displayed limit without
+    // perturbing the field or reloading. Only overwrite the input value
+    // if it still matches the previously-known committed quota (the
+    // user hasn't edited it) and no confirmation modal is open, so
+    // in-progress edits and the pending-reduction dialog aren't
+    // clobbered by a background refresh.
+    if (working.quota_bytes != null) {
+      var newCommittedMb = Math.round(working.quota_bytes / (1024 * 1024));
+      if (newCommittedMb !== _committedWorkingCopyQuotaMb) {
+        var input = document.getElementById('cfgWorkingCopyCacheMaxGb');
+        var currentInputMb = readWorkingCopyQuotaMb();
+        var modal = document.getElementById('workingCopyLimitModal');
+        var modalOpen = modal && (modal.open || modal.classList.contains('open'));
+        if (!modalOpen && currentInputMb === _committedWorkingCopyQuotaMb) {
+          input.value = newCommittedMb / 1024;
+        }
+        _committedWorkingCopyQuotaMb = newCommittedMb;
+      }
+    }
+    updateWorkingCopyLimitState();
     var workingFileWord = working.count === 1 ? 'file' : 'files';
     document.getElementById('workingCopyCacheStatus').textContent =
       'Current: ' + storageFormatBytes(working.size) + ' / ' +
@@ -431,6 +725,10 @@ async function loadStoragePanel() {
     });
     document.getElementById('storageGrid').innerHTML = html || '<span style="color:var(--text-ghost);font-size:13px;">No generated storage yet.</span>';
   } catch(e) {
+    // Usage is unknown until the next successful scan; keep Apply disabled
+    // so a stale zero can't skip the eviction confirmation.
+    _workingCopySizeBytes = null;
+    updateWorkingCopyLimitState();
     document.getElementById('storageGrid').innerHTML = '<span style="color:var(--danger);font-size:12px;">Failed to load storage info</span>';
   }
   await loadMasksCard(s && s.masks);

@@ -19983,7 +19983,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             requested_quota_mb = int(requested_quota_mb)
         except (TypeError, ValueError):
             return None
-        if requested_quota_mb >= previous_quota_mb or confirmed:
+        if requested_quota_mb >= previous_quota_mb or confirmed is True:
             return None
 
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])

@@ -1171,6 +1171,27 @@ def test_api_config_allows_confirmed_working_copy_reduction(
     assert cfg.load()["working_copy_cache_max_mb"] == 0
 
 
+def test_api_config_rejects_non_boolean_eviction_confirmation(app_and_db):
+    """Only the literal JSON boolean true can authorize cache eviction."""
+    import config as cfg
+
+    app, _db = app_and_db
+    cfg.set("working_copy_cache_max_mb", 40960)
+
+    client = app.test_client()
+    for invalid_confirmation in ["false", 1, {}, []]:
+        response = client.post(
+            "/api/config",
+            json={
+                "working_copy_cache_max_mb": 1024,
+                "_confirm_working_copy_eviction": invalid_confirmation,
+            },
+        )
+        assert response.status_code == 409
+
+    assert cfg.load()["working_copy_cache_max_mb"] == 40960
+
+
 def test_api_config_raise_needs_no_confirmation(app_and_db):
     """Raising the ceiling never triggers eviction and needs no flag."""
     import config as cfg

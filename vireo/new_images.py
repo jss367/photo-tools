@@ -5,6 +5,7 @@ import threading
 import time
 from pathlib import Path
 
+import volume_reachability
 from image_loader import (
     SUPPORTED_EXTENSIONS,
     is_excluded_scan_path,
@@ -102,13 +103,33 @@ def mapped_roots(db, workspace_id, *, include_missing=False):
     ]
 
 
+class _RootOffline(Exception):
+    """Raised from the walk's ``onerror`` to abandon one root's traversal."""
+
+    def __init__(self, exc):
+        super().__init__(str(exc))
+        self.exc = exc
+
+
 def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
                                    progress_callback=None,
-                                   progress_every=250):
-    """Return {'new_count': int, 'per_root': [...], 'sample': [abs_path, ...]}.
+                                   progress_every=250,
+                                   reachability=None):
+    """Return {'new_count': int, 'per_root': [...], 'sample': [abs_path, ...],
+    'unreachable_roots': [abs_path, ...]}.
 
     Walks each mapped root recursively, collects image files, and diffs against
     the set of photo paths already ingested into the workspace.
+
+    A root whose volume is offline is *reported*, never raised: it appears in
+    ``per_root`` with ``unreachable: True`` and in ``unreachable_roots``, and
+    the remaining roots are still walked. Two signals feed that verdict —
+    ``reachability`` (a :class:`volume_reachability.VolumeReachability`,
+    defaulting to the shared gate) is consulted before touching each root so
+    a known-dead share is skipped without any filesystem call, and an
+    offline-class ``OSError`` (``ENOTCONN``/``EIO``/…) raised mid-walk marks
+    the root offline in that gate for everyone else. ``new_count`` therefore
+    covers reachable roots only, and callers must say so when they show it.
 
     ``progress_callback``, if given, is invoked as
     ``progress_callback(files_checked, new_found)`` once every
@@ -117,15 +138,29 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
     Callers use this to surface live progress for transparency without
     needing to refactor the walk.
     """
+    if reachability is None:
+        reachability = volume_reachability.get_shared()
     known = _known_paths_for_workspace(db, workspace_id)
     roots = mapped_roots(db, workspace_id)
 
     per_root = []
     sample = []
+    unreachable_roots = []
     total = 0
     files_checked = 0
     last_emitted = 0
     seen_new_paths = set()
+
+    def _unreachable(root, mount_root):
+        log.warning(
+            "new-images: skipping %s — volume %s is offline",
+            root["path"], mount_root or root["path"],
+        )
+        unreachable_roots.append(root["path"])
+        per_root.append({
+            "folder_id": root["id"], "path": root["path"],
+            "new_count": 0, "unreachable": True,
+        })
 
     def _maybe_emit():
         nonlocal last_emitted
@@ -134,6 +169,13 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
         if files_checked - last_emitted >= progress_every:
             progress_callback(files_checked, total)
             last_emitted = files_checked
+
+    def _tick(is_new):
+        nonlocal files_checked, total
+        files_checked += 1
+        if is_new:
+            total += 1
+        _maybe_emit()
 
     for root in roots:
         root_path = root["path"]
@@ -149,51 +191,53 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
         if is_excluded_scan_path(root_path):
             per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
             continue
+        # Ask the shared gate before any filesystem call on the root. On a
+        # dropped SMB share ``os.path.isdir`` can answer from stale cached
+        # metadata (or hang), so the bounded probe — not isdir — decides
+        # whether this root is worth walking at all.
+        mount_root, reachable = reachability.check(root_path)
+        if not reachable:
+            _unreachable(root, mount_root)
+            continue
         if not os.path.isdir(root_path):
             per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
             continue
 
         root_new = 0
+        root_new_paths = []
+
+        def _on_walk_error(exc, _mount_root=mount_root):
+            # Offline-class errors abort this root and publish the outage;
+            # anything else (a permission-denied subfolder) is skipped the
+            # way the scanner skips it, so the count stays a lower bound
+            # for the same files a scan would ingest.
+            if volume_reachability.is_offline_error(exc):
+                reachability.mark_offline(_mount_root)
+                raise _RootOffline(exc)
+            log.debug("new-images: skipping unreadable path: %s", exc)
+
         # safe_scan_walk skips other-app data bundles (e.g.
         # "Photos Library.photoslibrary") without stat-following any
         # symlinked child that points at one — the os.walk classification
         # stat alone is enough to trip the macOS TCC prompt. Mirror what
         # scanner.scan() will eventually pick up, so the "new images"
         # banner can't be inflated by files the scanner will never ingest.
-        for dirpath, _dirnames, filenames in safe_scan_walk(root_path):
-            for name in filenames:
-                files_checked += 1
-                # Mirror ``vireo/scanner.py``: skip dotfiles (e.g. macOS
-                # AppleDouble sidecars ``._IMG_0001.JPG``) so we don't count
-                # files the scanner will never ingest, which would otherwise
-                # produce a stuck "new images" banner.
-                if name.startswith("."):
-                    _maybe_emit()
-                    continue
-                ext = Path(name).suffix.lower()
-                if ext not in SUPPORTED_EXTENSIONS:
-                    _maybe_emit()
-                    continue
-                full = os.path.join(dirpath, name)
-                if full in known:
-                    _maybe_emit()
-                    continue
-                # Mirror ``vireo/scanner.py``: os.walk lists broken symlinks
-                # in `filenames`, but scanner refuses to ingest them
-                # (os.path.isfile == False). Counting them as "new" would
-                # leave the banner stuck on files no scan can clear.
-                if not os.path.isfile(full):
-                    _maybe_emit()
-                    continue
-                if full in seen_new_paths:
-                    _maybe_emit()
-                    continue
-                seen_new_paths.add(full)
-                root_new += 1
-                total += 1
-                if sample_limit is None or len(sample) < sample_limit:
-                    sample.append(full)
-                _maybe_emit()
+        try:
+            walk = safe_scan_walk(root_path, onerror=_on_walk_error)
+            root_new = _walk_root_for_new_images(
+                walk, known, seen_new_paths, root_new_paths, on_file=_tick,
+            )
+        except _RootOffline:
+            # Whatever this root had already contributed is dropped: a
+            # partial count would masquerade as a complete one.
+            for path in root_new_paths:
+                seen_new_paths.discard(path)
+            total -= len(root_new_paths)
+            _unreachable(root, mount_root)
+            continue
+        for path in root_new_paths:
+            if sample_limit is None or len(sample) < sample_limit:
+                sample.append(path)
 
         per_root.append({"folder_id": root["id"], "path": root_path, "new_count": root_new})
 
@@ -205,7 +249,47 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
         "per_root": per_root,
         "sample": sample,
         "sample_complete": sample_limit is None or len(sample) >= total,
+        "unreachable_roots": unreachable_roots,
     }
+
+
+def _walk_root_for_new_images(walk, known, seen_new_paths, root_new_paths,
+                              on_file):
+    """Consume one root's ``safe_scan_walk`` and collect its new image paths.
+
+    Appends each newly discovered path to ``root_new_paths`` (and to the
+    cross-root ``seen_new_paths`` set) and calls ``on_file(is_new)`` once per
+    filename encountered so the caller can keep its progress counters. The
+    caller owns error handling: an offline-class ``OSError`` surfaces through
+    the walk's ``onerror`` as :class:`_RootOffline` and unwinds this loop.
+    """
+    root_new = 0
+    for dirpath, _dirnames, filenames in walk:
+        for name in filenames:
+            is_new = False
+            # Mirror ``vireo/scanner.py``: skip dotfiles (e.g. macOS
+            # AppleDouble sidecars ``._IMG_0001.JPG``) so we don't count
+            # files the scanner will never ingest, which would otherwise
+            # produce a stuck "new images" banner.
+            if not name.startswith("."):
+                ext = Path(name).suffix.lower()
+                if ext in SUPPORTED_EXTENSIONS:
+                    full = os.path.join(dirpath, name)
+                    # Mirror ``vireo/scanner.py``: os.walk lists broken
+                    # symlinks in `filenames`, but scanner refuses to ingest
+                    # them (os.path.isfile == False). Counting them as "new"
+                    # would leave the banner stuck on files no scan can clear.
+                    if (
+                        full not in known
+                        and full not in seen_new_paths
+                        and os.path.isfile(full)
+                    ):
+                        seen_new_paths.add(full)
+                        root_new_paths.append(full)
+                        root_new += 1
+                        is_new = True
+            on_file(is_new)
+    return root_new
 
 
 class NewImagesCache:

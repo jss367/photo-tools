@@ -1451,3 +1451,81 @@ def test_safe_scan_walk_cancels_while_enumerating_single_large_directory(
     # the walker checks the callback every 256 entries starting at
     # i=256.
     assert 2 <= calls["n"] <= 6, calls
+
+
+def test_safe_scan_walk_reports_error_raised_while_iterating(tmp_path, monkeypatch):
+    """An ``OSError`` raised *during* ``scandir`` iteration (macOS raises
+    ``ENOTCONN`` this way when an SMB share drops mid-walk) must go through
+    ``onerror`` like ``os.walk`` does, not escape and kill the whole walk."""
+    import errno
+
+    import image_loader
+    from image_loader import safe_scan_walk
+
+    root = tmp_path / "photos"
+    root.mkdir()
+    (root / "ok.jpg").write_bytes(b"")
+    dropped = root / "dropped"
+    dropped.mkdir()
+    (dropped / "gone.jpg").write_bytes(b"")
+
+    real_scandir = image_loader.os.scandir
+
+    class _DisconnectedIterator:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise OSError(errno.ENOTCONN, "Socket is not connected", str(dropped))
+
+    def fake_scandir(path):
+        if str(path) == str(dropped):
+            return _DisconnectedIterator()
+        return real_scandir(path)
+
+    monkeypatch.setattr(image_loader.os, "scandir", fake_scandir)
+
+    errors = []
+    visited = [
+        dirpath for dirpath, _dirs, _files in safe_scan_walk(str(root), onerror=errors.append)
+    ]
+    assert str(root) in visited
+    assert str(dropped) not in visited
+    assert len(errors) == 1
+    assert errors[0].errno == errno.ENOTCONN
+
+
+def test_safe_scan_walk_iteration_error_without_onerror_is_swallowed(tmp_path, monkeypatch):
+    import errno
+
+    import image_loader
+    from image_loader import safe_scan_walk
+
+    root = tmp_path / "photos"
+    root.mkdir()
+    real_scandir = image_loader.os.scandir
+
+    class _Broken:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(
+        image_loader.os, "scandir",
+        lambda p: _Broken() if str(p) == str(root) else real_scandir(p),
+    )
+    assert list(safe_scan_walk(str(root))) == []

@@ -61,6 +61,9 @@ from resource_ledger import (
     bind_resource_pure_cancel_check,
     suspend_resource_wait_timing,
 )
+from volume_reachability import (
+    mount_root_candidates as _archive_mount_root_candidates,
+)
 
 log = logging.getLogger(__name__)
 
@@ -207,91 +210,6 @@ class _StagedMaskFile:
                     os.unlink(path)
         with contextlib.suppress(OSError):
             os.rmdir(self.stage_dir)
-
-
-def _archive_mount_root_candidates(path: str) -> list[str]:
-    """Return the plausible mount-root prefix(es) for ``path``, if any.
-
-    Extracts the mount-root component under each OS's mount conventions —
-    the first entry under ``/Volumes/`` or ``/mnt/`` (SMB/NFS style), the
-    first user/name pair under ``/media/<user>/``, a Windows drive letter
-    (``Z:/...`` — mapped SMB drives use this), or a UNC share
-    (``//server/share/...``). These shapes strongly imply the user
-    intended the location as a mount point; the caller decides what state
-    to require of it (missing entirely vs. present but not actually
-    mounted).
-
-    Windows mapped drives and UNC paths (Codex #1388 P2 r3663816324) are
-    documented storage layouts in ``docs/WINDOWS_SUPPORT.md``; without
-    detecting them, a disconnected SMB share on Windows would fall
-    through to folder-scoped skips and classify would keep reissuing
-    reads across the dead share instead of pausing for reconnection.
-
-    Both the raw expanded path and the normalized absolute form are
-    checked so relative or ``~``-prefixed paths still match. Duplicates
-    are collapsed, and paths not shaped like a mount root return no
-    candidates.
-    """
-    def _candidate(posix_path: str) -> str | None:
-        parts = posix_path.split("/")
-        if len(parts) >= 3 and parts[0] == "" and parts[1] in {"Volumes", "mnt"}:
-            return f"/{parts[1]}/{parts[2]}"
-        if len(parts) >= 4 and parts[0] == "" and parts[1] == "media":
-            return f"/media/{parts[2]}/{parts[3]}"
-        # UNC share: ``\\server\share\...`` after backslash-normalization
-        # becomes ``//server/share/...``, so ``parts`` starts with two
-        # empty strings.
-        if (
-            len(parts) >= 4
-            and parts[0] == ""
-            and parts[1] == ""
-            and parts[2]
-            and parts[3]
-        ):
-            return f"//{parts[2]}/{parts[3]}"
-        # Windows drive letter: ``Z:\...`` after normalization becomes
-        # ``Z:/...``. ``os.path.ismount("Z:")`` (no separator) returns
-        # False even for a real mounted drive because Windows treats
-        # ``Z:`` as a relative path on drive Z, so return with a trailing
-        # separator that ismount accepts.
-        if (
-            parts
-            and len(parts[0]) == 2
-            and parts[0][1] == ":"
-            and parts[0][0].isalpha()
-        ):
-            return f"{parts[0].upper()}/"
-        return None
-
-    raw_posix = os.path.expanduser(path).replace("\\", "/")
-    normalized = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
-    normalized_posix = normalized.replace("\\", "/")
-    # Also probe the symlink-resolved form so a catalog alias like
-    # ``/photos`` pointing into ``/Volumes/NAS/photos`` retains its
-    # mount-shaped prefix (Codex #1388 P2 r3664891998). Without this,
-    # neither the raw alias nor its ``abspath`` normalization has a
-    # ``/Volumes``/``/mnt``/``/media``/drive-letter/UNC prefix, so
-    # ``_source_offline_reason`` would classify a disconnected share
-    # reached via the alias as folder-scoped and classify would skip
-    # its photos instead of pausing for reconnection. ``realpath``
-    # only resolves symlinks (readlink), so it does not stat the
-    # target and stays safe even when the underlying mount is dead.
-    try:
-        resolved = os.path.realpath(os.path.expanduser(path))
-    except OSError:
-        resolved = None
-    resolved_posix = (
-        resolved.replace("\\", "/") if resolved else None
-    )
-
-    seen: list[str] = []
-    for source in (raw_posix, normalized_posix, resolved_posix):
-        if source is None:
-            continue
-        cand = _candidate(source)
-        if cand and cand not in seen:
-            seen.append(cand)
-    return seen
 
 
 def _archive_mount_baseline(

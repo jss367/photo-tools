@@ -13233,11 +13233,33 @@ async function checkNewImages() {
       sessionStorage.removeItem(_newImagesDismissKey(wsId));
     }
 
+    // Roots the walk could not check because their volume is offline. The
+    // count above covers only the reachable roots, so the banner must say
+    // so rather than present a partial number as the whole truth.
+    const unreachable = Array.isArray(data.unreachable_roots) ? data.unreachable_roots : [];
+    const cta = banner.querySelector('.banner-cta');
+
     if (data.new_count > 0 && wsId !== '' && !_isNewImagesDismissed(wsId, data.new_count)) {
       const s = data.new_count === 1 ? '' : 's';
-      msg.textContent = `${data.new_count} new image${s} detected in your registered folders.`;
+      let text = `${data.new_count} new image${s} detected in your registered folders.`;
+      if (unreachable.length) {
+        text += ` ${_offlineRootsPhrase(unreachable)} offline and not checked.`;
+      }
+      msg.textContent = text;
+      if (cta) cta.style.display = '';
       banner.dataset.count = String(data.new_count);
       banner.dataset.ws = wsId;
+      delete banner.dataset.offline;
+      banner.style.display = 'flex';
+    } else if (unreachable.length && wsId !== '' && !_isNewImagesOfflineDismissed(wsId, unreachable)) {
+      // Nothing importable was found, but that is not a real zero: at least
+      // one registered folder is on a volume that is offline right now.
+      // Say that instead of silently hiding, and offer nothing to import.
+      msg.textContent = `Couldn't check for new images: ${_offlineRootsPhrase(unreachable)} offline.`;
+      if (cta) cta.style.display = 'none';
+      banner.dataset.count = '0';
+      banner.dataset.ws = wsId;
+      banner.dataset.offline = _offlineRootsKey(unreachable);
       banner.style.display = 'flex';
     } else {
       banner.style.display = 'none';
@@ -13246,17 +13268,41 @@ async function checkNewImages() {
   finally { _newImagesInFlight = false; }
 }
 
+function _offlineRootsPhrase(roots) {
+  if (roots.length === 1) return `${roots[0]} is`;
+  return `${roots.length} folders (${roots.join(', ')}) are`;
+}
+
+function _offlineRootsKey(roots) {
+  return roots.slice().sort().join('\n');
+}
+
+// The offline notice is dismissed per workspace for exactly this set of
+// offline roots; a different volume dropping (or one coming back while
+// another stays down) re-arms it.
+function _newImagesOfflineDismissKey(wsId) {
+  return 'newImagesOfflineDismissed_ws_' + String(wsId);
+}
+
+function _isNewImagesOfflineDismissed(wsId, roots) {
+  const stored = sessionStorage.getItem(_newImagesOfflineDismissKey(wsId));
+  return !!stored && stored === _offlineRootsKey(roots);
+}
+
 function dismissNewImagesBanner() {
   const banner = document.getElementById('newImagesBanner');
   if (!banner) return;
   const wsId = banner.dataset.ws || '';
   const count = Number(banner.dataset.count || 0);
   banner.style.display = 'none';
-  if (wsId !== '') {
-    // Store the dismissed count under a key scoped to this workspace id so
-    // dismissing in workspace B doesn't overwrite A's entry.
-    sessionStorage.setItem(_newImagesDismissKey(wsId), String(count));
+  if (wsId === '') return;
+  if (banner.dataset.offline) {
+    sessionStorage.setItem(_newImagesOfflineDismissKey(wsId), banner.dataset.offline);
+    return;
   }
+  // Store the dismissed count under a key scoped to this workspace id so
+  // dismissing in workspace B doesn't overwrite A's entry.
+  sessionStorage.setItem(_newImagesDismissKey(wsId), String(count));
 }
 
 async function reviewNewImagesImport(btn) {

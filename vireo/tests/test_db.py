@@ -26617,3 +26617,27 @@ def test_mixed_species_group_repair_runs_on_app_startup(tmp_path, monkeypatch):
         ) == "1"
     finally:
         reopened.close()
+
+
+def test_get_workspace_root_folder_ids_matches_roots_without_counting_photos(tmp_path):
+    """The ids-only accessor must agree with ``get_workspace_folder_roots`` on
+    which folders are roots. It exists so 15s pollers (the Work Locally
+    blocker) skip the per-root subtree photo count that costs ~0.75s on a
+    large catalog."""
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    assert db.get_workspace_root_folder_ids(ws_id) == []
+
+    a = db.add_folder(str(tmp_path / "a"), name="a")
+    b = db.add_folder(str(tmp_path / "b"), name="b")
+    (tmp_path / "a" / "sub").mkdir(parents=True)
+    child = db.add_folder(str(tmp_path / "a" / "sub"), name="sub", parent_id=a)
+
+    ids = db.get_workspace_root_folder_ids(ws_id)
+    full = sorted(int(r["id"]) for r in db.get_workspace_folder_roots(ws_id))
+    assert sorted(ids) == full
+    assert set(ids) >= {a, b}
+    assert child not in ids or child in full

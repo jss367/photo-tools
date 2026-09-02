@@ -28,6 +28,20 @@ All notable changes to Vireo are documented in this file.
   updater, and uninstall-preservation gates before publication.
 
 ### Fixed
+- **Offline NAS no longer breaks the new-images check.** When a registered
+  folder's volume is unreachable (an SMB share that dropped mid-walk, or one
+  that is not mounted), the new-images walk now skips that folder and keeps
+  checking the others instead of failing with a traceback. The banner says
+  which folder is offline and that it was not checked, so a count shown for
+  the remaining folders is never mistaken for the whole library. A single
+  bounded reachability check per volume is consulted before any walk and is
+  shared across the app, so a dead share is never hammered on every poll.
+- **Background polls no longer tie up the app.** The navbar's new-images
+  poll used to block for half a second on every request while a long walk
+  was already running, and the Work Locally status poll on Browse recounted
+  every root's photos on each tick. Both now answer immediately; on an
+  88,000-photo catalog this removes thousands of slow-request warnings per
+  day from the log.
 - Large existing photo catalogs no longer fail Vireo's startup check while a
   one-time Wildlife metadata migration scans tens of thousands of sidecar
   files. The app opens first and completes that migration in the background.

@@ -1,0 +1,422 @@
+"""Bounded reachability checks for mounted volumes.
+
+Vireo's catalog usually lives on an SMB/NFS share. When that share drops,
+plain filesystem calls stop being safe: a stale mount can hang an
+``os.stat`` for minutes, ``os.path.isdir`` can answer ``True`` from cached
+parent metadata while every read raises ``ENOTCONN``/``EIO``, and a
+background walk that trips over that turns into a failed job with a
+traceback rather than a "volume offline" state the user can act on.
+
+This module is the single place that answers *"is the volume under this
+path reachable right now?"*:
+
+* :func:`mount_root_candidates` extracts the mount-shaped prefix of a path
+  (``/Volumes/<name>``, ``/mnt/<name>``, ``/media/<user>/<name>``, a drive
+  letter, or a UNC share).
+* :func:`network_root_reachable` is a bounded, out-of-process ``stat`` of a
+  mount root (macOS). A timed-out probe is killed and reaped on a daemon
+  thread so an uninterruptible filesystem call can never hold the caller.
+* :class:`VolumeReachability` caches those answers for a short window so
+  the navbar's polls and the new-images walk consult one gate instead of
+  each touching the share, and lets a walk that hits an offline error mark
+  the root offline for everyone else immediately.
+* :func:`is_offline_error` classifies an ``OSError`` as "the volume went
+  away" (as opposed to a per-file permission or corruption problem).
+
+Both the pipeline (``pipeline_job``) and the Flask app (``app``) import the
+moved helpers under their historical private names, so their existing call
+sites and tests are unaffected.
+"""
+import contextlib
+import errno
+import logging
+import os
+import subprocess
+import sys
+import threading
+import time
+
+from proc import no_window_kwargs
+
+log = logging.getLogger(__name__)
+
+MOUNT_QUERY_TIMEOUT_SECS = 5
+_MAX_NETWORK_PROBES = 8
+_NETWORK_PROBE_RESERVED = object()
+_NETWORK_PROBE_LOCK = threading.Lock()
+_NETWORK_PROBES = {}
+
+# ``OSError`` errnos that mean the *volume* is gone, not that one file is
+# unreadable. ``ENOTCONN`` ("Socket is not connected") is what macOS raises
+# from ``scandir`` on a dropped SMB share; ``EIO``/``ESTALE`` are the NFS and
+# stale-handle shapes; the ``EHOST*``/``ENET*`` family covers the transport
+# dying under an open mount. ``ENOENT`` is deliberately absent — a missing
+# folder is the folder-health loop's business, not an outage.
+OFFLINE_ERRNOS = frozenset(
+    code for code in (
+        getattr(errno, "ENOTCONN", None),
+        getattr(errno, "EIO", None),
+        getattr(errno, "ESTALE", None),
+        getattr(errno, "ENXIO", None),
+        getattr(errno, "ENODEV", None),
+        getattr(errno, "EHOSTDOWN", None),
+        getattr(errno, "EHOSTUNREACH", None),
+        getattr(errno, "ENETDOWN", None),
+        getattr(errno, "ENETUNREACH", None),
+        getattr(errno, "ENETRESET", None),
+        getattr(errno, "ECONNRESET", None),
+        getattr(errno, "ECONNABORTED", None),
+        getattr(errno, "ETIMEDOUT", None),
+    )
+    if code is not None
+)
+
+
+def is_offline_error(exc):
+    """Return True when ``exc`` is an ``OSError`` that means the volume
+    holding the path is unreachable rather than a single entry being bad."""
+    return isinstance(exc, OSError) and exc.errno in OFFLINE_ERRNOS
+
+
+def mount_root_candidates(path: str) -> list[str]:
+    """Return the plausible mount-root prefix(es) for ``path``, if any.
+
+    Extracts the mount-root component under each OS's mount conventions —
+    the first entry under ``/Volumes/`` or ``/mnt/`` (SMB/NFS style), the
+    first user/name pair under ``/media/<user>/``, a Windows drive letter
+    (``Z:/...`` — mapped SMB drives use this), or a UNC share
+    (``//server/share/...``). These shapes strongly imply the user
+    intended the location as a mount point; the caller decides what state
+    to require of it (missing entirely vs. present but not actually
+    mounted).
+
+    Windows mapped drives and UNC paths (Codex #1388 P2 r3663816324) are
+    documented storage layouts in ``docs/WINDOWS_SUPPORT.md``; without
+    detecting them, a disconnected SMB share on Windows would fall
+    through to folder-scoped skips and classify would keep reissuing
+    reads across the dead share instead of pausing for reconnection.
+
+    Both the raw expanded path and the normalized absolute form are
+    checked so relative or ``~``-prefixed paths still match. Duplicates
+    are collapsed, and paths not shaped like a mount root return no
+    candidates.
+    """
+    def _candidate(posix_path: str) -> str | None:
+        parts = posix_path.split("/")
+        if len(parts) >= 3 and parts[0] == "" and parts[1] in {"Volumes", "mnt"}:
+            return f"/{parts[1]}/{parts[2]}"
+        if len(parts) >= 4 and parts[0] == "" and parts[1] == "media":
+            return f"/media/{parts[2]}/{parts[3]}"
+        # UNC share: ``\\server\share\...`` after backslash-normalization
+        # becomes ``//server/share/...``, so ``parts`` starts with two
+        # empty strings.
+        if (
+            len(parts) >= 4
+            and parts[0] == ""
+            and parts[1] == ""
+            and parts[2]
+            and parts[3]
+        ):
+            return f"//{parts[2]}/{parts[3]}"
+        # Windows drive letter: ``Z:\...`` after normalization becomes
+        # ``Z:/...``. ``os.path.ismount("Z:")`` (no separator) returns
+        # False even for a real mounted drive because Windows treats
+        # ``Z:`` as a relative path on drive Z, so return with a trailing
+        # separator that ismount accepts.
+        if (
+            parts
+            and len(parts[0]) == 2
+            and parts[0][1] == ":"
+            and parts[0][0].isalpha()
+        ):
+            return f"{parts[0].upper()}/"
+        return None
+
+    raw_posix = os.path.expanduser(path).replace("\\", "/")
+    normalized = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+    normalized_posix = normalized.replace("\\", "/")
+    # Also probe the symlink-resolved form so a catalog alias like
+    # ``/photos`` pointing into ``/Volumes/NAS/photos`` retains its
+    # mount-shaped prefix (Codex #1388 P2 r3664891998). Without this,
+    # neither the raw alias nor its ``abspath`` normalization has a
+    # ``/Volumes``/``/mnt``/``/media``/drive-letter/UNC prefix, so
+    # ``pipeline_job._source_offline_reason`` would classify a disconnected share
+    # reached via the alias as folder-scoped and classify would skip
+    # its photos instead of pausing for reconnection. ``realpath``
+    # only resolves symlinks (readlink), so it does not stat the
+    # target and stays safe even when the underlying mount is dead.
+    try:
+        resolved = os.path.realpath(os.path.expanduser(path))
+    except OSError:
+        resolved = None
+    resolved_posix = (
+        resolved.replace("\\", "/") if resolved else None
+    )
+
+    seen: list[str] = []
+    for source in (raw_posix, normalized_posix, resolved_posix):
+        if source is None:
+            continue
+        cand = _candidate(source)
+        if cand and cand not in seen:
+            seen.append(cand)
+    return seen
+
+
+
+
+def _reserve_network_probe(root):
+    """Reserve a bounded probe slot, reusing one already active per root."""
+    with _NETWORK_PROBE_LOCK:
+        if root in _NETWORK_PROBES:
+            return False
+        if len(_NETWORK_PROBES) >= _MAX_NETWORK_PROBES:
+            return False
+        _NETWORK_PROBES[root] = _NETWORK_PROBE_RESERVED
+        return True
+
+
+def _release_network_probe(root, owner):
+    """Release ``root`` only when it is still owned by this probe."""
+    with _NETWORK_PROBE_LOCK:
+        if _NETWORK_PROBES.get(root) is owner:
+            _NETWORK_PROBES.pop(root, None)
+
+
+def _reap_abandoned_network_probe(root, process):
+    """Reap a timed-out probe away from the request path."""
+    try:
+        process.communicate()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    finally:
+        _release_network_probe(root, process)
+
+
+def _abandon_network_probe(root, process):
+    """Kill a timed-out probe without synchronously waiting for it."""
+    with contextlib.suppress(OSError):
+        process.kill()
+    threading.Thread(
+        target=_reap_abandoned_network_probe,
+        args=(root, process),
+        name="vireo-network-probe-reaper",
+        daemon=True,
+    ).start()
+
+
+def network_root_reachable(root, timeout=MOUNT_QUERY_TIMEOUT_SECS,
+                             run=None, popen=subprocess.Popen):
+    """Bounded, out-of-process reachability probe for a mounted network root.
+
+    ``mount`` listing a share and Finder reporting a file's absence are
+    not sufficient signals that the underlying server is actually reachable:
+    an SMB mount can remain in the kernel mount table while its server is
+    unreachable, and Finder's ``exists`` query can then return false from
+    cached parent metadata even though the photo will reappear on
+    reconnect. Repeating the same Finder query does not detect this — it
+    reuses the same cache. A ``stat`` on the mount root in a bounded
+    subprocess is an *independent* signal: it does not touch Finder. On
+    timeout the child is killed and reaped on a daemon thread so an
+    uninterruptible filesystem call cannot hold the request thread in
+    Python's usual synchronous kill-and-wait timeout cleanup. Active probes
+    are reused per root and globally capped so retries cannot accumulate an
+    unbounded number of stuck children and reaper threads.
+
+    Returns ``True`` only when ``stat`` completed in time and reported the
+    root as a directory. Any other outcome (timeout, non-zero exit, error)
+    is treated as unreachable so the caller fails closed.
+    """
+    if sys.platform != "darwin":
+        return False
+    argv = ["/usr/bin/stat", "-f", "%HT", root]
+    if run is not None:
+        try:
+            result = run(
+                argv, capture_output=True, text=True, timeout=timeout,
+                **no_window_kwargs(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return (
+            result.returncode == 0
+            and (result.stdout or "").strip() == "Directory"
+        )
+    try:
+        root_key = os.path.normcase(os.path.normpath(os.fspath(root)))
+    except (TypeError, ValueError):
+        return False
+    if not _reserve_network_probe(root_key):
+        return False
+
+    process = None
+    abandoned = False
+    try:
+        process = popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            **no_window_kwargs(),
+        )
+        with _NETWORK_PROBE_LOCK:
+            _NETWORK_PROBES[root_key] = process
+        stdout, _stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        abandoned = True
+        _abandon_network_probe(root_key, process)
+        return False
+    except (OSError, subprocess.SubprocessError):
+        if process is not None:
+            abandoned = True
+            _abandon_network_probe(root_key, process)
+        else:
+            _release_network_probe(root_key, _NETWORK_PROBE_RESERVED)
+        return False
+    finally:
+        if process is not None and not abandoned:
+            _release_network_probe(root_key, process)
+    return process.returncode == 0 and (stdout or "").strip() == "Directory"
+
+
+
+def _probe_root_generic(root, timeout):
+    """Bounded ``isdir`` for platforms without the macOS ``stat`` probe.
+
+    Runs the check on a daemon thread and gives up after ``timeout``; a
+    thread stuck in an uninterruptible call is leaked rather than joined,
+    which is the lesser evil compared to freezing the caller. Non-macOS
+    hosts (Linux, Windows) do not have the SMB-stall failure mode nearly as
+    often, so this is a safety net rather than the primary path.
+    """
+    outcome = {}
+
+    def worker():
+        try:
+            outcome["ok"] = os.path.isdir(root)
+        except OSError:
+            outcome["ok"] = False
+
+    thread = threading.Thread(
+        target=worker, name="vireo-volume-probe", daemon=True,
+    )
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        return False
+    return bool(outcome.get("ok"))
+
+
+def probe_root(root, timeout=MOUNT_QUERY_TIMEOUT_SECS):
+    """Return True when the mount root answers a bounded liveness check."""
+    if sys.platform == "darwin":
+        return network_root_reachable(root, timeout=timeout)
+    return _probe_root_generic(root, timeout)
+
+
+class VolumeReachability:
+    """Short-lived cache of per-mount-root reachability answers.
+
+    ``check(path)`` resolves the path's mount root, returns the cached
+    verdict when it is fresh, and otherwise runs one bounded probe. A path
+    with no mount-shaped prefix (an ordinary local folder) is always
+    reachable — the walk itself is the right check there and probing would
+    only add latency.
+
+    Reachable answers are cached for ``ttl_seconds``; offline answers for
+    ``offline_ttl_seconds`` (matching the new-images error backoff so a
+    dropped share is retried at the same cadence as before). ``mark_offline``
+    lets a caller that observed an offline error mid-walk publish it, so the
+    next poll fails fast instead of walking into the same dead share.
+    """
+
+    def __init__(self, ttl_seconds=30.0, offline_ttl_seconds=30.0,
+                 probe=probe_root, clock=time.monotonic):
+        self._ttl = float(ttl_seconds)
+        self._offline_ttl = float(offline_ttl_seconds)
+        self._probe = probe
+        self._clock = clock
+        # root -> (reachable: bool, recorded_at)
+        self._verdicts = {}
+        self._lock = threading.Lock()
+        # Serialize probes per root so two concurrent walks over the same
+        # share run one ``stat`` instead of colliding on the global probe
+        # slot (which would fail the loser closed and cache a false
+        # "offline" verdict).
+        self._root_locks = {}
+
+    def _root_lock(self, root):
+        with self._lock:
+            lock = self._root_locks.get(root)
+            if lock is None:
+                lock = self._root_locks[root] = threading.Lock()
+            return lock
+
+    def _fresh_verdict(self, root):
+        with self._lock:
+            entry = self._verdicts.get(root)
+            if entry is None:
+                return None
+            reachable, recorded_at = entry
+            ttl = self._ttl if reachable else self._offline_ttl
+            if self._clock() - recorded_at > ttl:
+                del self._verdicts[root]
+                return None
+            return reachable
+
+    def root_reachable(self, root):
+        """Return the (cached or freshly probed) verdict for a mount root."""
+        cached = self._fresh_verdict(root)
+        if cached is not None:
+            return cached
+        with self._root_lock(root):
+            cached = self._fresh_verdict(root)
+            if cached is not None:
+                return cached
+            try:
+                reachable = bool(self._probe(root))
+            except Exception:
+                log.exception("volume probe raised for %s; treating as offline", root)
+                reachable = False
+            with self._lock:
+                self._verdicts[root] = (reachable, self._clock())
+            if not reachable:
+                log.warning("Volume %s is not reachable", root)
+            return reachable
+
+    def check(self, path):
+        """Return ``(mount_root, reachable)`` for ``path``.
+
+        ``mount_root`` is ``None`` (and ``reachable`` True) for paths that
+        are not on a mount-shaped location. When several candidate roots
+        apply (an alias resolving into a share), the first offline one is
+        returned so callers can name it.
+        """
+        candidates = mount_root_candidates(path)
+        if not candidates:
+            return None, True
+        for root in candidates:
+            if not self.root_reachable(root):
+                return root, False
+        return candidates[0], True
+
+    def mark_offline(self, root):
+        """Record that ``root`` was just observed offline (e.g. ``ENOTCONN``
+        mid-walk) so subsequent checks fail fast within the backoff window."""
+        if not root:
+            return
+        with self._lock:
+            self._verdicts[root] = (False, self._clock())
+        log.warning("Volume %s went offline during a filesystem walk", root)
+
+    def clear(self):
+        with self._lock:
+            self._verdicts.clear()
+
+
+_shared = VolumeReachability()
+
+
+def get_shared():
+    """Process-wide gate shared by the navbar probe, walks, and scans."""
+    return _shared

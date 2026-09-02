@@ -1370,3 +1370,138 @@ def test_new_images_preview_reports_missing_files(app_and_db):
     assert files["here.jpg"]["available"] is True
     assert files["gone.jpg"]["available"] is False
     assert files["gone.jpg"]["error"] == "File is no longer available"
+
+
+# ---------------------------------------------------------------------------
+# Polling an in-flight walk must not block; offline roots are surfaced
+# ---------------------------------------------------------------------------
+
+def test_api_new_images_polls_do_not_wait_on_an_inflight_walk(app_and_db, monkeypatch):
+    """Only the request that *starts* a walk waits for it. Follow-up polls
+    while the walk is still running return ``pending`` immediately.
+
+    Regression guard for the log-spam / thread-hogging bug: with a
+    multi-minute NAS walk in flight, every 3s client re-poll used to sit
+    out the full grace window, so one walk produced hundreds of 0.5s
+    "slow request" warnings and held a Flask worker per open tab.
+    """
+    import threading
+    import time
+
+    import new_images as new_images_module
+
+    app, db, ws_id, tmp_path = app_and_db
+    root = tmp_path / "shoot"
+    _touch_image(str(root / "IMG.JPG"))
+    db.add_folder(str(root), name="shoot")
+
+    release = threading.Event()
+    started = threading.Event()
+
+    def slow_walk(*args, **kwargs):
+        started.set()
+        release.wait(10)
+        return {
+            "new_count": 1, "per_root": [], "sample": [str(root / "IMG.JPG")],
+            "sample_complete": True, "unreachable_roots": [],
+        }
+
+    monkeypatch.setattr(new_images_module, "count_new_images_for_workspace", slow_walk)
+    client = app.test_client()
+    try:
+        first = client.get("/api/workspaces/active/new-images").get_json()
+        assert first.get("pending") is True
+        assert started.wait(2)
+
+        t0 = time.monotonic()
+        second = client.get("/api/workspaces/active/new-images").get_json()
+        elapsed = time.monotonic() - t0
+        assert second.get("pending") is True
+        assert elapsed < 0.3, f"poll on in-flight walk blocked for {elapsed:.2f}s"
+    finally:
+        release.set()
+
+    deadline = time.monotonic() + 3
+    data = client.get("/api/workspaces/active/new-images").get_json()
+    while data.get("pending") and time.monotonic() < deadline:
+        time.sleep(0.05)
+        data = client.get("/api/workspaces/active/new-images").get_json()
+    assert data["new_count"] == 1
+
+
+def test_api_new_images_payload_names_unreachable_roots(app_and_db, monkeypatch):
+    """The banner can only be honest about a partial count if the payload
+    carries the roots the walk had to skip."""
+    import time
+
+    import new_images as new_images_module
+
+    app, db, ws_id, tmp_path = app_and_db
+    root = tmp_path / "shoot"
+    _touch_image(str(root / "IMG.JPG"))
+    db.add_folder(str(root), name="shoot")
+
+    def walk_with_offline_root(*args, **kwargs):
+        return {
+            "new_count": 1,
+            "per_root": [
+                {"folder_id": 1, "path": str(root), "new_count": 1},
+                {"folder_id": 2, "path": "/Volumes/NAS/shoot", "new_count": 0,
+                 "unreachable": True},
+            ],
+            "sample": [str(root / "IMG.JPG")],
+            "sample_complete": True,
+            "unreachable_roots": ["/Volumes/NAS/shoot"],
+        }
+
+    monkeypatch.setattr(
+        new_images_module, "count_new_images_for_workspace", walk_with_offline_root,
+    )
+    client = app.test_client()
+    data = client.get("/api/workspaces/active/new-images").get_json()
+    deadline = time.monotonic() + 3
+    while data.get("pending") and time.monotonic() < deadline:
+        time.sleep(0.05)
+        data = client.get("/api/workspaces/active/new-images").get_json()
+    assert data["new_count"] == 1
+    assert data["unreachable_roots"] == ["/Volumes/NAS/shoot"]
+    assert data.get("error") is None, "an offline volume is a caveat, not a failure"
+
+
+def test_new_images_walk_job_completes_with_offline_caveat(app_and_db, monkeypatch):
+    """The ephemeral bottom-panel job for a walk that skipped an offline root
+    finishes ``completed`` (not ``failed``) and names the skipped roots, so
+    the Jobs panel and the banner tell the same story."""
+    import time
+
+    import new_images as new_images_module
+
+    app, db, ws_id, tmp_path = app_and_db
+    root = tmp_path / "shoot"
+    _touch_image(str(root / "IMG.JPG"))
+    db.add_folder(str(root), name="shoot")
+
+    def walk_with_offline_root(*args, **kwargs):
+        return {
+            "new_count": 0, "per_root": [], "sample": [], "sample_complete": True,
+            "unreachable_roots": ["/Volumes/NAS/shoot"],
+        }
+
+    monkeypatch.setattr(
+        new_images_module, "count_new_images_for_workspace", walk_with_offline_root,
+    )
+    client = app.test_client()
+    client.get("/api/workspaces/active/new-images")
+
+    runner = app._job_runner
+    deadline = time.monotonic() + 3
+    job = None
+    while time.monotonic() < deadline:
+        jobs = [j for j in runner.list_jobs() if j.get("type") == "new_images_walk"]
+        if jobs and jobs[0].get("status") in ("completed", "failed"):
+            job = jobs[0]
+            break
+        time.sleep(0.05)
+    assert job is not None, "new_images_walk job never reached a terminal state"
+    assert job["status"] == "completed"
+    assert job.get("result", {}).get("unreachable_roots") == ["/Volumes/NAS/shoot"]

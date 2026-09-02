@@ -2927,6 +2927,25 @@ class Database:
             (folder_id,),
         ).fetchall()
 
+    def get_workspace_root_folder_ids(self, workspace_id):
+        """Return just the ids of the workspace's user-facing roots.
+
+        ``get_workspace_folder_roots`` computes a per-root subtree photo
+        count with a correlated prefix scan over ``photos`` — sub-second on
+        a small catalog, ~0.75s on an 88k-photo library. Pollers that only
+        need to know *which* roots exist (the Work Locally blocker poll runs
+        every 15s on Browse) must not pay for counts they discard.
+        """
+        rows = self.conn.execute(
+            """SELECT f.id
+               FROM folders f
+               JOIN workspace_folders wf ON wf.folder_id = f.id
+               WHERE wf.workspace_id = ? AND wf.is_root = 1
+               ORDER BY f.path""",
+            (workspace_id,),
+        ).fetchall()
+        return [int(row["id"]) for row in rows]
+
     def get_workspace_folder_roots(self, workspace_id):
         """Return user-facing workspace roots, hiding covered descendants.
 

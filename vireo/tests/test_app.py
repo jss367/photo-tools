@@ -6294,9 +6294,12 @@ def test_network_root_reachable_caps_abandoned_probes(monkeypatch):
     import time
 
     import app as app_module
+    import volume_reachability
 
     monkeypatch.setattr(app_module.sys, "platform", "darwin")
-    monkeypatch.setattr(app_module, "_MAX_NETWORK_PROBES", 2)
+    # The probe registry lives in ``volume_reachability``; ``app`` re-exports
+    # the function, so the cap has to be patched where it is read.
+    monkeypatch.setattr(volume_reachability, "_MAX_NETWORK_PROBES", 2)
     release_reapers = threading.Event()
     popen_calls = []
 

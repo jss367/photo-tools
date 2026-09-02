@@ -351,49 +351,58 @@ def safe_scan_walk(top, onerror=None, cancel_check=None, on_scandir_batch=None):
     nondirs = []
     skipped = []
     seen = set()
-    with scandir_it:
-        for i, entry in enumerate(scandir_it):
-            # Poll cancellation while we're still filling the buffer.
-            # A directory with millions of entries would otherwise finish
-            # the whole ``scandir`` loop before yielding, leaving pause
-            # and cancel stuck for the full enumeration. 256 is small
-            # enough that a big-mount stat batch still gets checked
-            # promptly, cheap enough that the check adds no measurable
-            # overhead to normal folders.
-            if i and (i & 0xFF) == 0:
-                if cancel_check is not None and cancel_check():
-                    raise ScanCancelled("directory walk cancelled")
-                # Same checkpoint fires a heartbeat: the outer per-yield
-                # progress loop can't advance while this scandir call is
-                # still buffering, so a single huge directory would look
-                # stalled to the Jobs UI without this.
-                if on_scandir_batch is not None:
-                    on_scandir_batch()
-            name = entry.name
-            if name in seen:
-                continue
-            seen.add(name)
-            # Name-based exclusion catches direct bundle entries
-            # (``Photos Library.photoslibrary``) without any stat.
-            if is_excluded_scan_dir(name):
-                skipped.append(name)
-                continue
-            # Symlink whose target names an excluded bundle. os.readlink
-            # is textual and never follows the link, so this is safe even
-            # when the target is a protected macOS bundle.
-            if _symlink_target_is_excluded(entry):
-                skipped.append(name)
-                continue
-            try:
-                entry_is_dir = entry.is_dir(follow_symlinks=False)
-            except OSError as exc:
-                if onerror is not None:
-                    onerror(exc)
-                entry_is_dir = False
-            if entry_is_dir:
-                dirs.append(name)
-            else:
-                nondirs.append(name)
+    try:
+        with scandir_it:
+            for i, entry in enumerate(scandir_it):
+                # Poll cancellation while we're still filling the buffer.
+                # A directory with millions of entries would otherwise finish
+                # the whole ``scandir`` loop before yielding, leaving pause
+                # and cancel stuck for the full enumeration. 256 is small
+                # enough that a big-mount stat batch still gets checked
+                # promptly, cheap enough that the check adds no measurable
+                # overhead to normal folders.
+                if i and (i & 0xFF) == 0:
+                    if cancel_check is not None and cancel_check():
+                        raise ScanCancelled("directory walk cancelled")
+                    # Same checkpoint fires a heartbeat: the outer per-yield
+                    # progress loop can't advance while this scandir call is
+                    # still buffering, so a single huge directory would look
+                    # stalled to the Jobs UI without this.
+                    if on_scandir_batch is not None:
+                        on_scandir_batch()
+                name = entry.name
+                if name in seen:
+                    continue
+                seen.add(name)
+                # Name-based exclusion catches direct bundle entries
+                # (``Photos Library.photoslibrary``) without any stat.
+                if is_excluded_scan_dir(name):
+                    skipped.append(name)
+                    continue
+                # Symlink whose target names an excluded bundle. os.readlink
+                # is textual and never follows the link, so this is safe even
+                # when the target is a protected macOS bundle.
+                if _symlink_target_is_excluded(entry):
+                    skipped.append(name)
+                    continue
+                try:
+                    entry_is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError as exc:
+                    if onerror is not None:
+                        onerror(exc)
+                    entry_is_dir = False
+                if entry_is_dir:
+                    dirs.append(name)
+                else:
+                    nondirs.append(name)
+    except OSError as exc:
+        # Mirror ``os.walk``: an error raised *while iterating* (not just
+        # when opening) is reported and the directory is abandoned. macOS
+        # raises ``ENOTCONN`` from the iterator when an SMB share drops
+        # mid-walk; without this the whole walk died with a traceback.
+        if onerror is not None:
+            onerror(exc)
+        return
     if skipped:
         log.info(
             "Skipping other-app data bundle(s) under %s: %s",

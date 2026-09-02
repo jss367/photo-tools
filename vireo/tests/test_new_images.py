@@ -59,7 +59,7 @@ def test_count_new_images_deduplicates_repeated_walk_entries(
     _touch_image(str(photo))
     db.add_folder(str(root), name="USA2026")
 
-    def duplicate_walk(_root):
+    def duplicate_walk(_root, **_kwargs):
         yield str(root), [], ["IMG_0001.JPG", "IMG_0001.JPG", "IMG_0001.JPG"]
 
     monkeypatch.setattr(new_images, "safe_scan_walk", duplicate_walk)
@@ -1310,3 +1310,143 @@ def test_move_folders_to_workspace_invalidates_both_workspaces(tmp_path):
     assert db._new_images_cache.get(db._db_path, ws_b) is None, (
         "move_folders_to_workspace must invalidate the target workspace's cache"
     )
+
+
+# ---------------------------------------------------------------------------
+# Offline volumes: reported, never raised
+# ---------------------------------------------------------------------------
+
+class _FakeReachability:
+    """Scripted stand-in for ``volume_reachability.VolumeReachability``."""
+
+    def __init__(self, offline_prefixes=(), mount_root="/Volumes/Fake"):
+        self.offline_prefixes = tuple(offline_prefixes)
+        self.mount_root = mount_root
+        self.checked = []
+        self.marked_offline = []
+
+    def check(self, path):
+        self.checked.append(path)
+        for prefix in self.offline_prefixes:
+            if path.startswith(prefix):
+                return self.mount_root, False
+        return self.mount_root, True
+
+    def mark_offline(self, root):
+        self.marked_offline.append(root)
+
+
+def test_count_skips_root_on_offline_volume_and_reports_it(db_with_workspace):
+    """A root whose volume the gate reports offline is skipped without any
+    filesystem walk and named in the result, while other roots still count."""
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    online = tmp_path / "online"
+    offline = tmp_path / "offline"
+    _touch_image(str(online / "a.jpg"))
+    _touch_image(str(offline / "b.jpg"))
+    db.add_folder(str(online), name="online")
+    db.add_folder(str(offline), name="offline")
+
+    gate = _FakeReachability(offline_prefixes=(str(offline),))
+    result = count_new_images_for_workspace(db, ws_id, reachability=gate)
+
+    assert result["new_count"] == 1
+    assert result["unreachable_roots"] == [str(offline)]
+    by_path = {r["path"]: r for r in result["per_root"]}
+    assert by_path[str(offline)]["unreachable"] is True
+    assert by_path[str(offline)]["new_count"] == 0
+    assert "unreachable" not in by_path[str(online)]
+    assert str(offline) in gate.checked
+
+
+def test_count_marks_root_offline_when_walk_raises_enotconn(
+    db_with_workspace, monkeypatch,
+):
+    """``ENOTCONN`` mid-walk (macOS SMB share dropping) abandons that root,
+    publishes the outage to the gate, and does not raise — the exact
+    failure that used to kill the walk with a traceback."""
+    import errno
+
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    healthy = tmp_path / "healthy"
+    flaky = tmp_path / "flaky"
+    _touch_image(str(healthy / "ok.jpg"))
+    _touch_image(str(flaky / "first.jpg"))
+    _touch_image(str(flaky / "second.jpg"))
+    db.add_folder(str(healthy), name="healthy")
+    db.add_folder(str(flaky), name="flaky")
+
+    real_walk = new_images_module.safe_scan_walk
+
+    def walk_that_drops(top, onerror=None, **kwargs):
+        if top == str(flaky):
+            # One file is yielded (and would have been counted) before the
+            # share disappears under the walk.
+            yield top, [], ["first.jpg"]
+            onerror(OSError(errno.ENOTCONN, "Socket is not connected", top))
+            yield top, [], ["second.jpg"]
+            return
+        yield from real_walk(top, onerror=onerror, **kwargs)
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", walk_that_drops)
+
+    gate = _FakeReachability()
+    result = count_new_images_for_workspace(db, ws_id, reachability=gate)
+
+    assert result["new_count"] == 1, "the abandoned root's partial count is dropped"
+    assert result["sample"] == [str(healthy / "ok.jpg")]
+    assert result["unreachable_roots"] == [str(flaky)]
+    assert gate.marked_offline == [gate.mount_root]
+    by_path = {r["path"]: r for r in result["per_root"]}
+    assert by_path[str(flaky)]["unreachable"] is True
+
+
+def test_count_keeps_walking_past_permission_errors(db_with_workspace, monkeypatch):
+    """Per-folder errors that are not volume loss (EACCES) are skipped the
+    way the scanner skips them; the root is neither abandoned nor flagged."""
+    import errno
+
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    root = tmp_path / "root"
+    _touch_image(str(root / "a.jpg"))
+    _touch_image(str(root / "b.jpg"))
+    db.add_folder(str(root), name="root")
+
+    def walk_with_denied_subdir(top, onerror=None, **kwargs):
+        yield top, ["denied"], ["a.jpg"]
+        onerror(OSError(errno.EACCES, "Permission denied", os.path.join(top, "denied")))
+        yield top, [], ["b.jpg"]
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", walk_with_denied_subdir)
+
+    gate = _FakeReachability()
+    result = count_new_images_for_workspace(db, ws_id, reachability=gate)
+
+    assert result["new_count"] == 2
+    assert result["unreachable_roots"] == []
+    assert gate.marked_offline == []
+
+
+def test_count_uses_shared_gate_by_default(db_with_workspace, monkeypatch):
+    import volume_reachability
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    root = tmp_path / "root"
+    _touch_image(str(root / "a.jpg"))
+    db.add_folder(str(root), name="root")
+
+    gate = _FakeReachability(offline_prefixes=(str(root),))
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+
+    result = count_new_images_for_workspace(db, ws_id)
+    assert result["unreachable_roots"] == [str(root)]
+    assert result["new_count"] == 0

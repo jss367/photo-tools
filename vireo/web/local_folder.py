@@ -167,7 +167,10 @@ def create_local_folder_blueprint(
         return db, workspace_id, None
 
     def _active_root_ids(db, workspace_id):
-        return [int(row["id"]) for row in db.get_workspace_folder_roots(workspace_id)]
+        # Ids only: the blocker endpoint is polled every 15s from Browse and
+        # must not run the per-root photo-count subquery that
+        # ``get_workspace_folder_roots`` pays for (~0.75s on a large catalog).
+        return db.get_workspace_root_folder_ids(workspace_id)
 
     def _requested_roots(db, workspace_id, body, *, local_only=False):
         active_roots = set(_active_root_ids(db, workspace_id))

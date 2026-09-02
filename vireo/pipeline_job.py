@@ -64,9 +64,6 @@ from resource_ledger import (
 from volume_reachability import (
     mount_root_candidates as _archive_mount_root_candidates,
 )
-from volume_reachability import (
-    mount_root_resolution_conclusive as _archive_mount_resolution_conclusive,
-)
 
 log = logging.getLogger(__name__)
 
@@ -257,7 +254,9 @@ def _archive_mount_baseline(
     known = known_mounted_roots or set()
     baseline = {}
     candidates = _archive_mount_root_candidates(path)
-    conclusive = _archive_mount_resolution_conclusive(path)
+    # Candidates and confidence come from the same resolution (the list
+    # carries ``conclusive``); two calls could disagree under saturation.
+    conclusive = getattr(candidates, "conclusive", True)
     for root in candidates:
         # An inconclusive resolution (a mount-shaped prefix could not be
         # inspected in time) is read as "assume it was a mount": the later
@@ -402,7 +401,7 @@ def _missing_archive_mount_root(path: str) -> str | None:
     as offline.
     """
     candidates = _archive_mount_root_candidates(path)
-    if candidates and not _archive_mount_resolution_conclusive(path):
+    if candidates and not getattr(candidates, "conclusive", True):
         # Could not inspect the mount prefix in time: refuse rather than
         # risk creating a stub and writing onto the local disk.
         return candidates[0]
@@ -514,7 +513,7 @@ def _source_offline_reason(
     # successful root probe leaves the caller with the ordinary
     # "readable folder → per-photo failure" outcome below.
     candidates = _archive_mount_root_candidates(image_path)
-    if candidates and not _archive_mount_resolution_conclusive(image_path):
+    if candidates and not getattr(candidates, "conclusive", True):
         return "mount", f"volume {candidates[0]} could not be inspected in time"
     for mount_root in candidates:
         if _mount_root_offline(mount_root):

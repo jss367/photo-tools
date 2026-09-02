@@ -438,3 +438,52 @@ def test_generic_probe_requires_readable_listing_even_when_mounted(monkeypatch):
     monkeypatch.setattr(vr.os, "scandir", dead_scandir)
     assert vr._probe_root_generic("/mnt/NAS", timeout=1) is False
     assert "/mnt/NAS" not in vr._MOUNT_BASELINE
+
+
+def test_mount_root_candidates_carry_confidence_on_the_same_object(monkeypatch):
+    """Candidates and confidence must come from one resolution: the returned
+    list carries ``conclusive`` so callers cannot pair a truncated candidate
+    list with a later, luckier confidence check."""
+    monkeypatch.setattr(vr, "_LINK_TARGET_CACHE", {})
+    monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: vr.INCONCLUSIVE)
+    cands = vr.mount_root_candidates("/mnt/archive/photos")
+    assert isinstance(cands, list) and cands == ["/mnt/archive"]
+    assert cands.conclusive is False
+    monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: None)
+    assert vr.mount_root_candidates("/mnt/archive/photos").conclusive is True
+
+
+def test_darwin_probe_requires_a_directory_listing():
+    """``stat`` can answer from cached attributes on a dead SMB mount; the
+    macOS probe now enumerates the root and accepts only a directory
+    listing (``.``/``..`` present)."""
+    import subprocess
+    from types import SimpleNamespace
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout=".\n..\nphotos\n")
+
+    assert vr._probe_root_darwin("/Volumes/NAS", run=fake_run) is True
+    assert calls[0][:3] == ["/bin/ls", "-1", "-f"] and calls[0][3] == "/Volumes/NAS"
+
+    file_like = lambda argv, **k: SimpleNamespace(returncode=0, stdout="/Volumes/NAS\n")  # noqa: E731
+    assert vr._probe_root_darwin("/Volumes/NAS", run=file_like) is False
+    failed = lambda argv, **k: SimpleNamespace(returncode=1, stdout="")  # noqa: E731
+    assert vr._probe_root_darwin("/Volumes/NAS", run=failed) is False
+
+    def timed_out(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+    assert vr._probe_root_darwin("/Volumes/NAS", run=timed_out) is False
+
+
+def test_probe_root_uses_directory_read_on_darwin(monkeypatch):
+    monkeypatch.setattr(vr.sys, "platform", "darwin")
+    seen = []
+    monkeypatch.setattr(vr, "_probe_root_darwin", lambda root, timeout=None: seen.append(root) or True)
+    monkeypatch.setattr(vr, "network_root_reachable", lambda *a, **k: pytest.fail("stat-only probe must not decide"))
+    assert vr.probe_root("/Volumes/NAS") is True
+    assert seen == ["/Volumes/NAS"]

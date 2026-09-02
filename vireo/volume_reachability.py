@@ -111,7 +111,19 @@ def _mount_shaped_candidate(posix_path: str) -> str | None:
     return None
 
 
-def mount_root_candidates(path: str, _report_confidence=None) -> list[str]:
+class MountRootCandidates(list):
+    """Mount-root candidates plus whether the resolution was conclusive.
+
+    A plain ``list`` for every existing caller; ``conclusive`` is False when a
+    mount-shaped prefix could not be inspected in time and no cached answer
+    existed. Carrying the flag on the same object means callers never pair
+    candidates from one resolution with confidence from another.
+    """
+
+    conclusive = True
+
+
+def mount_root_candidates(path: str) -> "MountRootCandidates":
     """Return the plausible mount-root prefix(es) for ``path``, if any.
 
     Extracts the mount-root component under each OS's mount conventions —
@@ -159,15 +171,14 @@ def mount_root_candidates(path: str, _report_confidence=None) -> list[str]:
         resolved.replace("\\", "/") if resolved else None
     )
 
-    seen: list[str] = []
+    seen = MountRootCandidates()
     for source in (raw_posix, normalized_posix, resolved_posix):
         if source is None:
             continue
         cand = _mount_shaped_candidate(source)
         if cand and cand not in seen:
             seen.append(cand)
-    if _report_confidence is not None:
-        _report_confidence.append(not inconclusive)
+    seen.conclusive = not inconclusive
     return seen
 
 
@@ -199,9 +210,8 @@ def mount_root_candidates_checked(path):
     ``conclusive`` is False when a prefix probe timed out or the probe
     registry was saturated and no cached answer existed; the gate treats that
     as offline rather than trusting a possibly-truncated resolution."""
-    confidence: list[bool] = []
-    candidates = mount_root_candidates(path, _report_confidence=confidence)
-    return candidates, (confidence[0] if confidence else True)
+    candidates = mount_root_candidates(path)
+    return list(candidates), getattr(candidates, "conclusive", True)
 
 
 
@@ -420,7 +430,17 @@ def network_root_reachable(root, timeout=MOUNT_QUERY_TIMEOUT_SECS,
     """
     if sys.platform != "darwin":
         return False
-    argv = ["/usr/bin/stat", "-f", "%HT", root]
+    return _bounded_process_probe(
+        ["/usr/bin/stat", "-f", "%HT", root], root, timeout,
+        accept=lambda out: (out or "").strip() == "Directory",
+        run=run, popen=popen,
+    )
+
+
+def _bounded_process_probe(argv, root, timeout, accept, run=None,
+                           popen=subprocess.Popen):
+    """Run ``argv`` out of process with the probe registry's bounds and return
+    ``accept(stdout)`` only if it completed in time with exit status 0."""
     if run is not None:
         try:
             result = run(
@@ -429,10 +449,7 @@ def network_root_reachable(root, timeout=MOUNT_QUERY_TIMEOUT_SECS,
             )
         except (OSError, subprocess.SubprocessError):
             return False
-        return (
-            result.returncode == 0
-            and (result.stdout or "").strip() == "Directory"
-        )
+        return result.returncode == 0 and bool(accept(result.stdout))
     try:
         root_key = os.path.normcase(os.path.normpath(os.fspath(root)))
     except (TypeError, ValueError):
@@ -467,7 +484,7 @@ def network_root_reachable(root, timeout=MOUNT_QUERY_TIMEOUT_SECS,
     finally:
         if process is not None and not abandoned:
             _release_network_probe(root_key, process)
-    return process.returncode == 0 and (stdout or "").strip() == "Directory"
+    return process.returncode == 0 and bool(accept(stdout))
 
 
 
@@ -569,10 +586,33 @@ def _probe_root_generic(root, timeout):
     return bool(outcome.get("ok"))
 
 
+def _darwin_listing_is_directory(stdout):
+    """``ls -1f`` prints ``.``/``..`` for a directory; a file prints itself."""
+    lines = {line.strip() for line in (stdout or "").splitlines()}
+    return "." in lines or ".." in lines
+
+
+def _probe_root_darwin(root, timeout=MOUNT_QUERY_TIMEOUT_SECS,
+                       run=None, popen=subprocess.Popen):
+    """Out-of-process, time-bounded *directory read* of a mount root.
+
+    ``stat`` alone (see :func:`network_root_reachable`) can succeed from
+    cached attributes on a disconnected SMB mount without reaching the
+    server. Enumerating the directory cannot, so the probe runs ``ls -1f``
+    on the root and accepts only a listing that shows it is a directory.
+    Same kill-and-reap machinery, per-root reuse, and global cap as the
+    ``stat`` probe.
+    """
+    return _bounded_process_probe(
+        ["/bin/ls", "-1", "-f", root], root, timeout,
+        accept=_darwin_listing_is_directory, run=run, popen=popen,
+    )
+
+
 def probe_root(root, timeout=MOUNT_QUERY_TIMEOUT_SECS):
     """Return True when the mount root answers a bounded liveness check."""
     if sys.platform == "darwin":
-        return network_root_reachable(root, timeout=timeout)
+        return _probe_root_darwin(root, timeout=timeout)
     return _probe_root_generic(root, timeout)
 
 

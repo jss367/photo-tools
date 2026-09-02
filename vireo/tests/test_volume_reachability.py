@@ -297,3 +297,46 @@ def test_resolver_skips_unc_server_prefix():
     finally:
         vr.os.path.islink = real
     assert calls == [], f"UNC server prefix was stat'ed: {calls}"
+
+
+def test_generic_probe_recognises_detached_mount_stub(monkeypatch):
+    """Linux keeps the mount-point directory after a share detaches. A root
+    seen as a real mount once must read as offline when it later exists only
+    as a plain directory; a root that was never a mount stays online."""
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
+    monkeypatch.setattr(vr, "_GENERIC_PROBES", {})
+    monkeypatch.setattr(vr.os.path, "isdir", lambda p: True)
+    mounted = {"/mnt/NAS": True}
+    monkeypatch.setattr(vr.os.path, "ismount", lambda p: mounted.get(p, False))
+
+    assert vr._probe_root_generic("/mnt/NAS", timeout=1) is True
+    assert vr._probe_root_generic("/mnt/photos", timeout=1) is True, "never a mount: plain dir is fine"
+    mounted["/mnt/NAS"] = False  # share detached, stub directory remains
+    assert vr._probe_root_generic("/mnt/NAS", timeout=1) is False
+    assert vr._probe_root_generic("/mnt/photos", timeout=1) is True
+    mounted["/mnt/NAS"] = True  # reconnected
+    assert vr._probe_root_generic("/mnt/NAS", timeout=1) is True
+
+
+def test_generic_probe_missing_directory_is_offline(monkeypatch):
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
+    monkeypatch.setattr(vr, "_GENERIC_PROBES", {})
+    monkeypatch.setattr(vr.os.path, "isdir", lambda p: False)
+    monkeypatch.setattr(vr.os.path, "ismount", lambda p: pytest.fail("ismount on a missing dir"))
+    assert vr._probe_root_generic("/mnt/gone", timeout=1) is False
+
+
+def test_bounded_link_target_global_cap(monkeypatch):
+    import threading
+
+    release = threading.Event()
+    monkeypatch.setattr(vr.os.path, "islink", lambda p: release.wait(5) or False)
+    monkeypatch.setattr(vr, "_BOUNDED_LINK_PROBES", {})
+    monkeypatch.setattr(vr, "_MAX_BOUNDED_LINK_PROBES", 2)
+    try:
+        assert vr._bounded_link_target("/mnt/a", timeout=0.02) is None
+        assert vr._bounded_link_target("/mnt/b", timeout=0.02) is None
+        assert vr._bounded_link_target("/mnt/c", timeout=0.02) is None
+        assert set(vr._BOUNDED_LINK_PROBES) == {"/mnt/a", "/mnt/b"}, "third path never spawned"
+    finally:
+        release.set()

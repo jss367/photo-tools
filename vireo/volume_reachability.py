@@ -170,6 +170,7 @@ _MAX_SYMLINK_HOPS = 40
 
 _BOUNDED_LINK_LOCK = threading.Lock()
 _BOUNDED_LINK_PROBES = {}
+_MAX_BOUNDED_LINK_PROBES = _MAX_NETWORK_PROBES
 
 
 def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
@@ -190,6 +191,13 @@ def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
             if existing.is_alive():
                 return None
             del _BOUNDED_LINK_PROBES[path]
+        # Reap finished probes for other paths, then apply the global cap so
+        # many distinct wedged prefixes cannot accumulate threads either.
+        for other, thread_ in list(_BOUNDED_LINK_PROBES.items()):
+            if not thread_.is_alive():
+                del _BOUNDED_LINK_PROBES[other]
+        if len(_BOUNDED_LINK_PROBES) >= _MAX_BOUNDED_LINK_PROBES:
+            return None
         outcome = {}
 
         def worker():
@@ -400,10 +408,37 @@ def network_root_reachable(root, timeout=MOUNT_QUERY_TIMEOUT_SECS,
 _GENERIC_PROBE_LOCK = threading.Lock()
 _GENERIC_PROBES = {}
 _MAX_GENERIC_PROBES = _MAX_NETWORK_PROBES
+# root -> True if the root was a real mount point the last time it was seen
+# online. A Linux mount point directory survives the share detaching, so a
+# bare ``isdir`` would call a dead ``/mnt/NAS`` healthy; remembering that it
+# *used to be* a mount lets the stub be recognised. Roots that were never a
+# mount (an ordinary local ``/mnt/photos`` folder) stay plain directories.
+_MOUNT_BASELINE = {}
+
+
+def _classify_generic_root(root):
+    """Return True when ``root`` is online, judged by mount state + history.
+
+    Runs inside the bounded probe thread (both calls ``lstat``). A root that
+    is a mount point now is online and recorded as such. A root that exists
+    but is *not* a mount point is online only if it was never seen mounted —
+    otherwise it is the stub left behind by a detached share (see
+    ``pipeline_job._archive_mount_baseline`` for the same reasoning).
+    """
+    if not os.path.isdir(root):
+        return False
+    is_mount = os.path.ismount(root)
+    if is_mount:
+        _MOUNT_BASELINE[root] = True
+        return True
+    if _MOUNT_BASELINE.get(root):
+        return False
+    _MOUNT_BASELINE.setdefault(root, False)
+    return True
 
 
 def _probe_root_generic(root, timeout):
-    """Bounded ``isdir`` for platforms without the macOS ``stat`` probe.
+    """Bounded mount-aware liveness check for hosts without the macOS probe.
 
     Runs the check on a daemon thread and gives up after ``timeout``. A
     thread stuck in an uninterruptible call cannot be killed, so it stays
@@ -426,7 +461,7 @@ def _probe_root_generic(root, timeout):
 
         def worker():
             try:
-                outcome["ok"] = os.path.isdir(root)
+                outcome["ok"] = _classify_generic_root(root)
             except OSError:
                 outcome["ok"] = False
             finally:

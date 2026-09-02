@@ -194,6 +194,13 @@ def test_is_offline_error_classifies_volume_loss_not_missing_files():
     assert not vr.is_offline_error(RuntimeError("not an OSError"))
 
 
+@pytest.mark.parametrize("winerror", [53, 55, 59, 64, 67])
+def test_is_offline_error_classifies_windows_network_loss(winerror):
+    exc = OSError(errno.ENOENT, "translated network failure")
+    exc.winerror = winerror
+    assert vr.is_offline_error(exc)
+
+
 def test_check_skips_probe_for_paths_without_mount_root(tmp_path):
     if sys.platform == "win32":
         pytest.skip("every absolute Windows path has a drive-letter candidate")

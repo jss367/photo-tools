@@ -82,12 +82,20 @@ OFFLINE_ERRNOS = frozenset(
     )
     if code is not None
 )
+# Native Windows filesystem errors whose POSIX ``errno`` translation can be
+# ENOENT/EINVAL even though the real failure is a disconnected mapped drive or
+# UNC share. Values are WinError.h's ERROR_BAD_NETPATH, ERROR_DEV_NOT_EXIST,
+# ERROR_UNEXP_NET_ERR, ERROR_NETNAME_DELETED, and ERROR_BAD_NET_NAME.
+OFFLINE_WINERRORS = frozenset({53, 55, 59, 64, 67})
 
 
 def is_offline_error(exc):
     """Return True when ``exc`` is an ``OSError`` that means the volume
     holding the path is unreachable rather than a single entry being bad."""
-    return isinstance(exc, OSError) and exc.errno in OFFLINE_ERRNOS
+    return isinstance(exc, OSError) and (
+        exc.errno in OFFLINE_ERRNOS
+        or getattr(exc, "winerror", None) in OFFLINE_WINERRORS
+    )
 
 
 def _mount_shaped_candidate(posix_path: str) -> str | None:

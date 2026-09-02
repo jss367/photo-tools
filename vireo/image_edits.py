@@ -207,6 +207,59 @@ def _normalize_color_grading(value):
     return out or None
 
 
+def _normalize_ranged(values, ranges, label):
+    """Validate every ``ranges`` key present in ``values``; drop zeros.
+
+    ``label`` is a format string receiving ``name`` for error messages.
+    Returns a dict of the non-zero rounded values.
+    """
+    out = {}
+    for name, (lo, hi) in ranges.items():
+        raw = values.get(name)
+        if raw in (None, ""):
+            continue
+        val = _number(raw, label.format(name=name), lo, hi)
+        if abs(val) > 1e-9:
+            out[name] = val
+    return out
+
+
+def _crop_in_bounds(x, y, w, h):
+    return x >= 0 and y >= 0 and w > 0 and h > 0 and x + w <= 1 and y + h <= 1
+
+
+def _normalize_crop(crop):
+    """Validate a normalized crop rectangle; return None for absent/full-frame."""
+    if crop is None:
+        return None
+    if not isinstance(crop, dict):
+        raise RecipeError("crop must be an object")
+    try:
+        raw_vals = [crop["x"], crop["y"], crop["w"], crop["h"]]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RecipeError("crop must include numeric x, y, w, and h") from exc
+    if any(isinstance(v, bool) for v in raw_vals):
+        raise RecipeError("crop must include numeric x, y, w, and h")
+    try:
+        x, y, w, h = (float(v) for v in raw_vals)
+    except (TypeError, ValueError) as exc:
+        raise RecipeError("crop must include numeric x, y, w, and h") from exc
+    if not all(math.isfinite(v) for v in (x, y, w, h)):
+        raise RecipeError("crop values must be finite")
+    if not _crop_in_bounds(x, y, w, h):
+        raise RecipeError("crop must fit inside normalized image bounds")
+    # Treat an effectively full-frame crop as no-op.
+    if (
+        abs(x) < 1e-9 and abs(y) < 1e-9
+        and abs(w - 1) < 1e-9 and abs(h - 1) < 1e-9
+    ):
+        return None
+    x, y, w, h = (round(v, 6) for v in (x, y, w, h))
+    if not _crop_in_bounds(x, y, w, h):
+        raise RecipeError("crop must fit inside normalized image bounds")
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
 def normalize_recipe(recipe):
     """Validate and canonicalize a non-destructive image edit recipe.
 
@@ -266,61 +319,18 @@ def normalize_recipe(recipe):
     if normalized_flip:
         out["flip"] = normalized_flip
 
-    crop = recipe.get("crop")
+    crop = _normalize_crop(recipe.get("crop"))
     if crop is not None:
-        if not isinstance(crop, dict):
-            raise RecipeError("crop must be an object")
-        raw_vals = []
-        try:
-            raw_vals = [crop["x"], crop["y"], crop["w"], crop["h"]]
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RecipeError("crop must include numeric x, y, w, and h") from exc
-        if any(isinstance(v, bool) for v in raw_vals):
-            raise RecipeError("crop must include numeric x, y, w, and h")
-        try:
-            x, y, w, h = (float(v) for v in raw_vals)
-        except (TypeError, ValueError) as exc:
-            raise RecipeError("crop must include numeric x, y, w, and h") from exc
-        vals = (x, y, w, h)
-        if not all(math.isfinite(v) for v in vals):
-            raise RecipeError("crop values must be finite")
-        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > 1 or y + h > 1:
-            raise RecipeError("crop must fit inside normalized image bounds")
-        # Treat an effectively full-frame crop as no-op.
-        if not (
-            abs(x) < 1e-9 and abs(y) < 1e-9
-            and abs(w - 1) < 1e-9 and abs(h - 1) < 1e-9
-        ):
-            x = round(x, 6)
-            y = round(y, 6)
-            w = round(w, 6)
-            h = round(h, 6)
-            if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > 1 or y + h > 1:
-                raise RecipeError("crop must fit inside normalized image bounds")
-            out["crop"] = {
-                "x": x,
-                "y": y,
-                "w": w,
-                "h": h,
-            }
+        out["crop"] = crop
 
     adjustments = recipe.get("adjustments")
     if adjustments is None:
         adjustments = {}
     if not isinstance(adjustments, dict):
         raise RecipeError("adjustments must be an object")
-    normalized_adjustments = {}
-    for name, (lo, hi) in _ADJUSTMENT_RANGES.items():
-        raw = adjustments.get(name)
-        if raw in (None, ""):
-            continue
-        if isinstance(raw, bool) or not isinstance(raw, int | float):
-            raise RecipeError(f"{name} adjustment must be numeric")
-        val = float(raw)
-        if not math.isfinite(val) or val < lo or val > hi:
-            raise RecipeError(f"{name} adjustment must be between {lo:g} and {hi:g}")
-        if abs(val) > 1e-9:
-            normalized_adjustments[name] = round(val, 6)
+    normalized_adjustments = _normalize_ranged(
+        adjustments, _ADJUSTMENT_RANGES, "{name} adjustment",
+    )
 
     # The USM radius only means something while sharpening is on, and its
     # default (1.0) is canonicalized to absence so an untouched radius slider
@@ -328,18 +338,11 @@ def normalize_recipe(recipe):
     if normalized_adjustments.get("sharpen"):
         raw_radius = adjustments.get("sharpen_radius")
         if raw_radius not in (None, ""):
-            if isinstance(raw_radius, bool) or not isinstance(
-                raw_radius, int | float
-            ):
-                raise RecipeError("sharpen_radius adjustment must be numeric")
-            radius = float(raw_radius)
-            lo, hi = SHARPEN_RADIUS_RANGE
-            if not math.isfinite(radius) or radius < lo or radius > hi:
-                raise RecipeError(
-                    f"sharpen_radius adjustment must be between {lo:g} and {hi:g}"
-                )
+            radius = _number(
+                raw_radius, "sharpen_radius adjustment", *SHARPEN_RADIUS_RANGE
+            )
             if abs(radius - SHARPEN_RADIUS_DEFAULT) > 1e-9:
-                normalized_adjustments["sharpen_radius"] = round(radius, 6)
+                normalized_adjustments["sharpen_radius"] = radius
 
     white_balance = adjustments.get("white_balance")
     if white_balance is None:
@@ -352,20 +355,9 @@ def normalize_recipe(recipe):
         white_balance = {}
     if not isinstance(white_balance, dict):
         raise RecipeError("white_balance adjustment must be an object")
-    normalized_wb = {}
-    for name, (lo, hi) in _WHITE_BALANCE_RANGES.items():
-        raw = white_balance.get(name)
-        if raw in (None, ""):
-            continue
-        if isinstance(raw, bool) or not isinstance(raw, int | float):
-            raise RecipeError(f"white_balance.{name} adjustment must be numeric")
-        val = float(raw)
-        if not math.isfinite(val) or val < lo or val > hi:
-            raise RecipeError(
-                f"white_balance.{name} adjustment must be between {lo:g} and {hi:g}"
-            )
-        if abs(val) > 1e-9:
-            normalized_wb[name] = round(val, 6)
+    normalized_wb = _normalize_ranged(
+        white_balance, _WHITE_BALANCE_RANGES, "white_balance.{name} adjustment",
+    )
     if normalized_wb:
         normalized_adjustments["white_balance"] = normalized_wb
 
@@ -432,33 +424,19 @@ def _normalize_local(local):
                 # branch radius (which may come from global sharpen), so it
                 # is kept even without a region sharpen delta and its 1.0
                 # value is meaningful — no default-drop like the global key.
-                if isinstance(raw, bool) or not isinstance(raw, int | float):
-                    raise RecipeError(
-                        "sharpen_radius adjustment must be numeric"
-                    )
-                radius = float(raw)
-                lo, hi = SHARPEN_RADIUS_RANGE
-                if not math.isfinite(radius) or radius < lo or radius > hi:
-                    raise RecipeError(
-                        f"sharpen_radius adjustment must be between "
-                        f"{lo:g} and {hi:g}"
-                    )
-                normalized_adj[name] = round(radius, 6)
+                normalized_adj[name] = _number(
+                    raw, "sharpen_radius adjustment", *SHARPEN_RADIUS_RANGE
+                )
                 continue
             if name not in _LOCAL_ADJUSTMENT_KEYS:
                 raise RecipeError(
                     f"{name} adjustment is not supported in local regions"
                 )
-            if isinstance(raw, bool) or not isinstance(raw, int | float):
-                raise RecipeError(f"{name} adjustment must be numeric")
-            val = float(raw)
-            lo, hi = _LOCAL_ADJUSTMENT_RANGES[name]
-            if not math.isfinite(val) or val < lo or val > hi:
-                raise RecipeError(
-                    f"{name} adjustment must be between {lo:g} and {hi:g}"
-                )
+            val = _number(
+                raw, f"{name} adjustment", *_LOCAL_ADJUSTMENT_RANGES[name]
+            )
             if abs(val) > 1e-9:
-                normalized_adj[name] = round(val, 6)
+                normalized_adj[name] = val
         if normalized_adj:
             normalized_regions.append(
                 {"region": region, "adjustments": normalized_adj}

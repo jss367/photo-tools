@@ -151,7 +151,12 @@ def test_decorator_line_belongs_to_its_function(repo):
 
     sel = _select(repo)
 
+    # test_beta ran beta's body on main and is picked from the map.
     assert sel.ids == {"vireo/tests/test_app.py::test_beta"}
+    # A signature/decorator change also selects test files that reference
+    # ``app.py`` by name — declaration-inspecting tests never execute the
+    # body but must still run when the header changes.
+    assert "vireo/tests/test_comments.py" in sel.files
 
 
 def test_module_level_change_selects_every_test_touching_the_file(repo):
@@ -198,7 +203,7 @@ def test_comment_only_change_selects_nothing_from_map(repo):
     assert meta["sha"]  # map still intact
 
 
-def test_insertion_between_nested_functions_picks_the_nested_one(repo):
+def test_ambiguous_insertion_between_nested_functions_widens_to_whole_file(repo):
     nested = textwrap.dedent(
         """
         def create_app():
@@ -227,13 +232,39 @@ def test_insertion_between_nested_functions_picks_the_nested_one(repo):
 
     # Insert a new route between route_a and route_b: the old-side
     # neighbours are the blank line 4 (create_app only) and line 5
-    # (route_b's def). The smaller enclosing function wins.
+    # (route_b's def, also inside create_app). The two neighbours resolve
+    # to different function spans, so the insertion is treated as
+    # ambiguous — the new lines could just as easily be a new
+    # module-level statement — and the file widens to the whole file
+    # rather than guessing an enclosing function.
     _write(repo, "vireo/nested.py", nested.replace("    def route_b", "    def route_new():\n        return 'n'\n\n    def route_b"))
     _commit(repo, "add route")
 
     sel = _select(repo)
 
-    assert sel.ids == {"vireo/tests/test_nested.py::test_route_b"}
+    assert sel.ids == {
+        "vireo/tests/test_nested.py::test_create_app",
+        "vireo/tests/test_nested.py::test_route_a",
+        "vireo/tests/test_nested.py::test_route_b",
+    }
+
+
+def test_insertion_at_eof_widens_to_whole_file(repo):
+    # Insert a module-level statement after the last body line of
+    # ``render_browse``. The first neighbour is inside render_browse and
+    # the second is past EOF (no enclosing function), so the insertion
+    # cannot be safely attributed to render_browse and the file widens
+    # to the whole file.
+    _write(repo, "vireo/app.py", APP_SRC.rstrip() + "\n\nEXTRA = 1\n")
+    _commit(repo, "append module-level constant")
+
+    sel = _select(repo)
+
+    assert sel.ids == {
+        "vireo/tests/test_app.py::test_alpha",
+        "vireo/tests/test_app.py::test_beta",
+        "vireo/tests/test_pages.py::test_browse",
+    }
 
 
 def test_test_asset_runs_the_tests_that_name_it(repo):

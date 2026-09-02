@@ -10,9 +10,16 @@ turns a *test-impact map* (per-test line coverage recorded on ``main``) plus
 Selection is conservative and precise at the same time:
 
 * A change inside a Python function selects every test that executed any
-  line of that function (innermost enclosing ``def``) on ``main``.
+  line of that function (innermost enclosing ``def``) on ``main``. A
+  signature or decorator change additionally selects tests that reference
+  the source file's basename — declaration-inspecting tests (route
+  contract snapshots, ``ast.parse`` of the source, ``app.url_map``
+  audits) never execute the body but must run when the header changes.
 * A change outside any function (imports, constants, class bodies, module
-  code) selects every test that executed any line of that file.
+  code) selects every test that executed any line of that file. A pure
+  insertion between functions (or at EOF beside a function) is treated
+  the same way: the new lines could be a new module- or class-level
+  statement that every importer sees.
 * A changed or added unit-test file runs in full.
 * Non-Python files (templates, static assets, data, shell scripts, docs)
   select every unit-test file that mentions their basename, plus the tests
@@ -335,7 +342,9 @@ def function_spans(source: str) -> list[Span]:
     closure in ``app.py`` that is ``create_app()``, i.e. every test that
     builds an app — so counting them would turn any route edit into "every
     test". A change to the header (decorator, signature) is attributed to
-    the body's tests instead, which is exactly the set that calls it.
+    the body's tests instead, which is exactly the set that calls it, plus
+    (via ``impacted_lines``' ``header_touched`` flag) any test that inspects
+    the declaration by name — see the mention fallback in ``select()``.
     """
     try:
         tree = ast.parse(source)
@@ -370,41 +379,65 @@ def _is_code(text_lines: list[str], line: int) -> bool:
     return bool(stripped) and not stripped.startswith("#")
 
 
-def impacted_lines(hunks: list[Hunk], source: str) -> set[int] | None:
+def impacted_lines(hunks: list[Hunk], source: str) -> tuple[set[int] | None, bool]:
     """Widen a file's hunks to the lines of their innermost enclosing functions.
 
-    Returns ``None`` when some changed code sits outside every function
-    (imports, constants, class bodies, module-level registration), which the
-    caller treats as "whole file". Blank and comment-only lines are ignored,
-    so a diff that only touches comments selects nothing from the map.
+    Returns ``(widened, header_touched)``.
 
-    Insertions are attributed to the *smaller* of the functions enclosing
-    their two neighbouring lines. In ``app.py`` every route is a closure
-    inside one 35k-line ``create_app``; a route added between two others has
-    a blank line (enclosed only by ``create_app``) on one side and the next
-    route's decorator on the other, and it is the route we want.
+    ``widened`` is ``None`` when some changed code sits outside every
+    function (imports, constants, class bodies, module-level registration)
+    or a pure insertion is ambiguous about which function it belongs to,
+    which the caller treats as "whole file". Blank and comment-only lines
+    are ignored, so a diff that only touches comments selects nothing from
+    the map.
+
+    ``header_touched`` is ``True`` when a modification lands on a function's
+    decorator or ``def`` line (anything before its body). The body-line
+    lookup catches every test that *called* the function, but a signature
+    or decorator change is also observable to tests that *inspect the
+    declaration* — route contract snapshots, ``ast.parse`` of the source,
+    ``app.url_map`` audits — which never run the body. The caller uses
+    this flag to widen through the basename-mention fallback.
+
+    A pure insertion is only attributed to a single function when both
+    neighbouring old-side lines resolve to the same enclosing function.
+    Otherwise the new lines may be a new module- or class-level statement
+    (a constant, a decorator-driven registration, a new function beside
+    an existing one) that every test importing the file would see, so the
+    file widens to the whole file. At EOF the second neighbour is past the
+    end of the base source and is treated as "outside every function" for
+    the same reason.
     """
     spans = function_spans(source)
     text_lines = source.splitlines()
     widened: set[int] = set()
+    header_touched = False
     for kind, lines in hunks:
         if kind == "ins":
-            candidates = [innermost_span(n, spans) for n in lines if 1 <= n <= len(text_lines)]
-            found = [c for c in candidates if c is not None]
-            if not found:
-                if not candidates:
-                    continue  # insertion at EOF of an empty file
-                return None
-            widened.update(_body_lines(min(found, key=lambda s: s[1] - s[0])))
-            continue
+            if not lines:
+                continue  # insertion into an empty file
+            candidates = [
+                innermost_span(n, spans) if 1 <= n <= len(text_lines) else None
+                for n in lines
+            ]
+            if (
+                len(candidates) == 2
+                and candidates[0] is not None
+                and candidates[0] == candidates[1]
+            ):
+                widened.update(_body_lines(candidates[0]))
+                continue
+            return None, header_touched
         for n in lines:
             if not _is_code(text_lines, n):
                 continue
             span = innermost_span(n, spans)
             if span is None:
-                return None
+                return None, header_touched
             widened.update(_body_lines(span))
-    return widened
+            if n < span[2]:
+                header_touched = True
+    return widened, header_touched
 
 
 def expand_to_functions(lines: set[int], spans: list[Span]) -> set[int] | None:
@@ -526,6 +559,48 @@ def _reference_strings(path: str, base: str, cwd: Path) -> set[str]:
     return names
 
 
+def _add_mention_selections(
+    path: str,
+    base: str,
+    head: str,
+    cwd: Path,
+    impact: ImpactMap,
+    test_specs: list[str],
+    sel: Selection,
+) -> bool:
+    """Select tests that mention ``path``'s basename in their source.
+
+    Returns ``True`` if any test file mentioned ``path``. Test files present
+    in the map narrow to the tests whose enclosing function contains the
+    mention; module-level mentions widen to the whole test file. Test files
+    that exist only on ``head`` are added whole (they are new and have no
+    map history).
+    """
+    basename = os.path.basename(path)
+    mentioned = False
+    for test_file, linenos in _grep_lines(basename, base, test_specs, cwd).items():
+        if not is_unit_test_file(test_file):
+            continue
+        mentioned = True
+        picked = None
+        if impact.has_file(test_file):
+            widened = expand_to_functions(linenos, function_spans(_show(base, test_file, cwd) or ""))
+            if widened is not None:
+                picked = impact.tests_for_lines(test_file, widened)
+        if picked:
+            sel.ids |= picked
+            sel.note(f"{path}: {test_file} mentions '{basename}' -> {len(picked)} tests")
+        else:
+            sel.files.add(test_file)
+            sel.note(f"{path}: {test_file} mentions '{basename}' (whole file)")
+    for test_file in _grep_files(basename, head, test_specs, cwd):
+        if is_unit_test_file(test_file) and test_file not in sel.files and not _show(base, test_file, cwd):
+            mentioned = True
+            sel.files.add(test_file)
+            sel.note(f"{path}: new {test_file} mentions '{basename}'")
+    return mentioned
+
+
 def select(
     base: str,
     head: str,
@@ -566,34 +641,11 @@ def select(
         # Tests that mention the file by name run regardless of coverage.
         # Not for ``vireo/**.py``: the map already knows exactly which tests
         # executed a module, and "app.py" appears in comments everywhere.
-        basename = os.path.basename(path)
+        # The source-file branch below re-enables this fallback narrowly for
+        # signature/decorator changes, which the body-line lookup misses.
         mentioned = False
         if kind != "source" or path.startswith("scripts/"):
-            for test_file, linenos in _grep_lines(basename, base, test_specs, cwd).items():
-                if not is_unit_test_file(test_file):
-                    continue
-                mentioned = True
-                # When the map measured the test file itself, narrow the
-                # mention to the tests whose function (or a helper they
-                # call) contains it; a module-level mention keeps the file.
-                picked = None
-                if impact.has_file(test_file):
-                    widened = expand_to_functions(linenos, function_spans(_show(base, test_file, cwd) or ""))
-                    if widened is not None:
-                        picked = impact.tests_for_lines(test_file, widened)
-                if picked:
-                    sel.ids |= picked
-                    sel.note(f"{path}: {test_file} mentions '{basename}' -> {len(picked)} tests")
-                else:
-                    sel.files.add(test_file)
-                    sel.note(f"{path}: {test_file} mentions '{basename}' (whole file)")
-            # A file mentioned only by tests added on this branch: those
-            # test files are selected on their own as changed test files.
-            for test_file in _grep_files(basename, head, test_specs, cwd):
-                if is_unit_test_file(test_file) and test_file not in sel.files and not _show(base, test_file, cwd):
-                    mentioned = True
-                    sel.files.add(test_file)
-                    sel.note(f"{path}: new {test_file} mentions '{basename}'")
+            mentioned = _add_mention_selections(path, base, head, cwd, impact, test_specs, sel)
 
         if kind == "testasset":
             if not mentioned and status != "D":
@@ -613,13 +665,21 @@ def select(
                 sel.note(f"{path}: whole file ({'deleted' if status == 'D' else 'no hunks'}) -> {len(picked)} tests")
             else:
                 source = _show(base, path, cwd) or ""
-                widened = impacted_lines(hunks, source)
+                widened, header_touched = impacted_lines(hunks, source)
                 if widened is None:
                     picked = impact.tests_for_lines(path, None)
                     sel.note(f"{path}: module-level change -> {len(picked)} tests (whole file)")
                 else:
                     picked = impact.tests_for_lines(path, widened)
                     sel.note(f"{path}: {len(hunks)} hunks in {len(widened)} function lines -> {len(picked)} tests")
+                if header_touched:
+                    # Declaration-inspecting tests (route contract snapshots,
+                    # ``ast.parse`` of the source, ``app.url_map`` audits)
+                    # don't execute the function's body but do reference the
+                    # source file by name. Include them via the mention
+                    # fallback so a decorator or signature change can't skip
+                    # the tests specifically built to catch it.
+                    _add_mention_selections(path, base, head, cwd, impact, test_specs, sel)
             sel.ids |= picked
             continue
 

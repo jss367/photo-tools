@@ -1481,3 +1481,52 @@ def test_count_probes_reachability_before_any_root_filesystem_check(
     assert result["unreachable_roots"] == [str(offline)]
     assert touched == [], f"filesystem checks ran on an offline root: {touched}"
     assert gate.checked == [str(offline)]
+
+
+def test_count_does_no_unbounded_lookups_on_reachable_mount_shaped_root(
+    db_with_workspace, monkeypatch,
+):
+    """After the gate says a mount-shaped root is reachable, nothing may run
+    an unbounded lookup on it before the walk: no ``is_excluded_scan_path``
+    (component lstat's), no ``isdir``. The walk itself is the first touch."""
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    root = tmp_path / "nas"
+    _touch_image(str(root / "a.jpg"))
+    db.add_folder(str(root), name="nas")
+
+    touched = []
+    monkeypatch.setattr(
+        new_images_module, "is_excluded_scan_path",
+        lambda p: touched.append(("excluded", p)) or False,
+    )
+    monkeypatch.setattr(
+        new_images_module.os.path, "isdir",
+        lambda p: touched.append(("isdir", p)) or True,
+    )
+    gate = _FakeReachability(mount_root="/Volumes/Fake")  # everything reachable, mount-shaped
+    result = count_new_images_for_workspace(db, ws_id, reachability=gate)
+    assert result["new_count"] == 1
+    assert touched == [], f"unbounded lookups ran on a mount-shaped root: {touched}"
+
+
+def test_count_excludes_bundle_root_on_mount_lexically(db_with_workspace, monkeypatch):
+    """A Photos library registered as a root on a share is still excluded, by
+    name alone — no filesystem access."""
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    bundle = tmp_path / "Photos Library.photoslibrary"
+    _touch_image(str(bundle / "originals" / "a.jpg"))
+    db.add_folder(str(bundle), name="lib")
+    monkeypatch.setattr(
+        new_images_module, "safe_scan_walk",
+        lambda *a, **k: pytest.fail("bundle root must not be walked"),
+    )
+    gate = _FakeReachability(mount_root="/Volumes/Fake")
+    result = count_new_images_for_workspace(db, ws_id, reachability=gate)
+    assert result["new_count"] == 0
+    assert result["unreachable_roots"] == []

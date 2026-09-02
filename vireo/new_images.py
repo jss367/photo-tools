@@ -9,6 +9,7 @@ from pathlib import Path
 import volume_reachability
 from image_loader import (
     SUPPORTED_EXTENSIONS,
+    is_excluded_scan_dir,
     is_excluded_scan_path,
     safe_scan_walk,
 )
@@ -202,15 +203,24 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
         if not reachable:
             _unreachable(root, mount_root)
             continue
-        if is_excluded_scan_path(root_path):
-            per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
-            continue
-        # On a dropped SMB share ``os.path.isdir`` can answer from stale
-        # cached metadata (or hang), so the bounded probe above — not isdir —
-        # decides whether this root is worth walking at all.
-        if not os.path.isdir(root_path):
-            per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
-            continue
+        if mount_root is not None:
+            # Mount-shaped root: the gate's verdict may be up to 30s old and
+            # the share can have dropped since, so no unbounded lookup may
+            # run here. The bundle exclusion is decided lexically from the
+            # path's component names (the same name test the walker applies
+            # to children), and there is no ``isdir`` — a root that vanished
+            # surfaces as an ``OSError`` from the walk's first ``scandir``
+            # and is handled by ``_on_walk_error`` below.
+            if any(is_excluded_scan_dir(part) for part in root_path.split(os.sep)):
+                per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
+                continue
+        else:
+            if is_excluded_scan_path(root_path):
+                per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
+                continue
+            if not os.path.isdir(root_path):
+                per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
+                continue
 
         root_new = 0
         root_new_paths = []

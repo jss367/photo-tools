@@ -417,3 +417,22 @@ def test_generic_probe_cold_start_treats_empty_unmounted_stub_as_offline(monkeyp
     assert "/mnt/NAS" not in vr._MOUNT_BASELINE, "a stub must not be recorded as a local dir"
     assert vr._probe_root_generic("/mnt/photos", timeout=1) is True
     assert vr._MOUNT_BASELINE["/mnt/photos"] is False
+
+
+def test_generic_probe_requires_readable_listing_even_when_mounted(monkeypatch):
+    """A share still in the mount table but with a dead server: ``isdir`` and
+    ``ismount`` succeed from cached metadata, the listing does not. Only the
+    listing counts."""
+    import errno
+
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
+    monkeypatch.setattr(vr, "_GENERIC_PROBES", {})
+    monkeypatch.setattr(vr.os.path, "isdir", lambda p: True)
+    monkeypatch.setattr(vr.os.path, "ismount", lambda p: True)
+
+    def dead_scandir(p):
+        raise OSError(errno.EIO, "Input/output error", p)
+
+    monkeypatch.setattr(vr.os, "scandir", dead_scandir)
+    assert vr._probe_root_generic("/mnt/NAS", timeout=1) is False
+    assert "/mnt/NAS" not in vr._MOUNT_BASELINE

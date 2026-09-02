@@ -477,6 +477,16 @@ def _classify_generic_root(root):
     if not os.path.isdir(root):
         return False
     is_mount = os.path.ismount(root)
+    # Read the directory: this is the one operation here that has to reach
+    # the server. ``isdir``/``ismount`` can both succeed from cached metadata
+    # on an NFS/SMB share whose server is gone; a listing cannot. It runs
+    # inside the bounded probe thread, so a hang becomes a timeout (offline)
+    # and an ``EIO``/``ENOTCONN`` becomes offline directly.
+    try:
+        with os.scandir(root) as it:
+            populated = next(it, None) is not None
+    except OSError:
+        return False
     if is_mount:
         _MOUNT_BASELINE[root] = True
         return True
@@ -487,11 +497,6 @@ def _classify_generic_root(root):
     # exactly what a detached share leaves behind, so read it as offline
     # rather than recording the stub as an ordinary local folder. A
     # populated non-mount directory is a real local root and stays online.
-    try:
-        with os.scandir(root) as it:
-            populated = next(it, None) is not None
-    except OSError:
-        return False
     if not populated:
         log.warning(
             "Volume %s is an empty, unmounted mount-point directory; "

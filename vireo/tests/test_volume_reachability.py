@@ -509,6 +509,7 @@ def test_bounded_link_target_reads_local_symlink_and_times_out_on_wedged_mount(t
     release = threading.Event()
     monkeypatch.setattr(vr.os.path, "islink", lambda p: release.wait(5) or False)
     monkeypatch.setattr(vr, "_BOUNDED_LINK_PROBES", {})
+    monkeypatch.setattr(vr, "_ABANDONED_LINK_PROBES", set())
     try:
         assert vr._bounded_link_target("/mnt/stuck", timeout=0.05) is vr.INCONCLUSIVE
         # Reused while alive: no second thread, immediate (inconclusive) answer.
@@ -520,6 +521,7 @@ def test_bounded_link_target_reads_local_symlink_and_times_out_on_wedged_mount(t
 
 def test_bounded_link_target_keeps_filesystem_errors_inconclusive(monkeypatch):
     monkeypatch.setattr(vr, "_BOUNDED_LINK_PROBES", {})
+    monkeypatch.setattr(vr, "_ABANDONED_LINK_PROBES", set())
     monkeypatch.setattr(vr, "_LINK_TARGET_CACHE", {})
 
     def fail(_path):
@@ -585,6 +587,7 @@ def test_bounded_link_target_global_cap(monkeypatch):
     release = threading.Event()
     monkeypatch.setattr(vr.os.path, "islink", lambda p: release.wait(5) or False)
     monkeypatch.setattr(vr, "_BOUNDED_LINK_PROBES", {})
+    monkeypatch.setattr(vr, "_ABANDONED_LINK_PROBES", set())
     monkeypatch.setattr(vr, "_MAX_BOUNDED_LINK_PROBES", 2)
     try:
         assert vr._bounded_link_target("/mnt/a", timeout=0.02) is vr.INCONCLUSIVE
@@ -593,6 +596,47 @@ def test_bounded_link_target_global_cap(monkeypatch):
         assert set(vr._BOUNDED_LINK_PROBES) == {"/mnt/a", "/mnt/b"}, "third path never spawned"
     finally:
         release.set()
+
+
+def test_bounded_link_target_waits_for_healthy_same_path_probe(monkeypatch):
+    import threading
+    import time
+
+    release = threading.Event()
+    started = threading.Event()
+    calls = []
+
+    def slow_islink(path):
+        calls.append(path)
+        started.set()
+        assert release.wait(2)
+        return False
+
+    monkeypatch.setattr(vr.os.path, "islink", slow_islink)
+    monkeypatch.setattr(vr, "_BOUNDED_LINK_PROBES", {})
+    monkeypatch.setattr(vr, "_ABANDONED_LINK_PROBES", set())
+    monkeypatch.setattr(vr, "_LINK_TARGET_CACHE", {})
+    results = []
+
+    first = threading.Thread(
+        target=lambda: results.append(vr._bounded_link_target("/home", timeout=1)),
+    )
+    second = threading.Thread(
+        target=lambda: results.append(vr._bounded_link_target("/home", timeout=1)),
+    )
+    first.start()
+    assert started.wait(1)
+    second.start()
+    time.sleep(0.05)
+    assert second.is_alive()
+    assert calls == ["/home"]
+    release.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert results == [None, None]
+    assert calls == ["/home"], "same-path waiter must reuse the completed outcome"
 
 
 def test_saturated_link_probes_fall_back_to_cached_real_mount(monkeypatch):

@@ -383,7 +383,9 @@ _MAX_SYMLINK_HOPS = 40
 
 
 _BOUNDED_LINK_LOCK = threading.Lock()
+_BOUNDED_LINK_CONDITION = threading.Condition(_BOUNDED_LINK_LOCK)
 _BOUNDED_LINK_PROBES = {}
+_ABANDONED_LINK_PROBES = set()
 _MAX_BOUNDED_LINK_PROBES = _MAX_NETWORK_PROBES
 # Returned by ``_bounded_link_target`` when it could not get an answer (probe
 # timed out, a probe for the path is still wedged, or the registry is full).
@@ -407,11 +409,19 @@ def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
     against a wedged prefix fail fast instead of stacking threads. UNC
     prefixes never reach here (callers skip them).
     """
-    with _BOUNDED_LINK_LOCK:
+    with _BOUNDED_LINK_CONDITION:
         existing = _BOUNDED_LINK_PROBES.get(path)
         if existing is not None:
             if existing.is_alive():
-                return INCONCLUSIVE
+                deadline = time.monotonic() + max(0, timeout)
+                while _BOUNDED_LINK_PROBES.get(path) is existing:
+                    if path in _ABANDONED_LINK_PROBES:
+                        return INCONCLUSIVE
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return INCONCLUSIVE
+                    _BOUNDED_LINK_CONDITION.wait(remaining)
+                return _LINK_TARGET_CACHE.get(path, INCONCLUSIVE)
             del _BOUNDED_LINK_PROBES[path]
         # Reap finished probes for other paths, then apply the global cap so
         # many distinct wedged prefixes cannot accumulate threads either.
@@ -431,9 +441,13 @@ def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
             except OSError:
                 outcome["inconclusive"] = True
             finally:
-                with _BOUNDED_LINK_LOCK:
+                with _BOUNDED_LINK_CONDITION:
+                    if not outcome.get("inconclusive"):
+                        _LINK_TARGET_CACHE[path] = outcome.get("target")
                     if _BOUNDED_LINK_PROBES.get(path) is thread:
                         del _BOUNDED_LINK_PROBES[path]
+                    _ABANDONED_LINK_PROBES.discard(path)
+                    _BOUNDED_LINK_CONDITION.notify_all()
 
         thread = threading.Thread(
             target=worker, name="vireo-mount-link-probe", daemon=True,
@@ -442,12 +456,14 @@ def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
         thread.start()
     thread.join(timeout)
     if thread.is_alive():
+        with _BOUNDED_LINK_CONDITION:
+            if _BOUNDED_LINK_PROBES.get(path) is thread:
+                _ABANDONED_LINK_PROBES.add(path)
+                _BOUNDED_LINK_CONDITION.notify_all()
         return INCONCLUSIVE
     if outcome.get("inconclusive"):
         return INCONCLUSIVE
     target = outcome.get("target")
-    with _BOUNDED_LINK_LOCK:
-        _LINK_TARGET_CACHE[path] = target
     return target
 
 

@@ -253,6 +253,118 @@ def test_module_level_constant_change_selects_tests_that_reference_it(tmp_path):
     assert "vireo/tests/test_unrelated.py" not in sel.files
 
 
+def test_function_body_edit_selects_tests_that_inspect_the_symbol(tmp_path):
+    """A test that inspects a declaration by imported symbol
+    (``inspect.signature(fn)`` / ``inspect.getsource(fn)``) executes no
+    line of the source file and never mentions its basename — the
+    ``vireo/tests/test_thumbnails.py::test_thumbnail_raw_fallbacks_honor_an_explicit_cache_name``
+    case that shipped this fix. The selector greps tests for each
+    touched function or class name so those tests are still selected
+    when the declaration changes.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _write(
+        repo,
+        "vireo/thumbnails.py",
+        "def _retry_thumbnail_with_companion(cache_name):\n"
+        "    return cache_name\n",
+    )
+    _write(
+        repo,
+        "vireo/tests/test_thumbnails.py",
+        "import inspect\n"
+        "import thumbnails as thumbnails_module\n"
+        "def test_signature():\n"
+        "    params = inspect.signature(thumbnails_module._retry_thumbnail_with_companion).parameters\n"
+        "    assert 'cache_name' in params\n",
+    )
+    _write(repo, "vireo/tests/test_unrelated.py", "def test_x(): pass\n")
+    base = _commit(repo, "base")
+
+    map_dir = repo / select_tests.MAP_DIR
+    map_dir.mkdir()
+    data = CoverageData(basename=str(map_dir / select_tests.MAP_DB))
+    # test_signature executes no line of thumbnails.py under a test
+    # context (it only reads the signature), so simulate that gap.
+    data.set_context("vireo/tests/test_unrelated.py::test_x|run")
+    data.add_lines({"vireo/tests/test_unrelated.py": [1]})
+    data.write()
+    (map_dir / select_tests.MAP_META).write_text(json.dumps({"sha": base, "root": str(repo)}))
+
+    _write(
+        repo,
+        "vireo/thumbnails.py",
+        "def _retry_thumbnail_with_companion(cache_name):\n"
+        "    return cache_name + '.jpg'\n",
+    )
+    _commit(repo, "extend companion helper")
+
+    sel = _select(repo)
+
+    # Greps tests for ``_retry_thumbnail_with_companion`` and finds
+    # test_thumbnails.py despite it never mentioning ``thumbnails.py``.
+    assert "vireo/tests/test_thumbnails.py" in sel.files
+    assert "vireo/tests/test_unrelated.py" not in sel.files
+
+
+def test_nested_function_edit_prefers_the_inner_symbol_name(tmp_path):
+    """For nested functions, the inner name is what tests grep for.
+
+    Grepping the outer ``create_app`` on every route-body change would
+    add every test that builds the app; the inner route name narrows to
+    tests that actually reference the specific declaration.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _write(
+        repo,
+        "vireo/app.py",
+        "def create_app():\n"
+        "    def api_photos_list():\n"
+        "        return []\n"
+        "    return api_photos_list\n",
+    )
+    _write(
+        repo,
+        "vireo/tests/test_api_photos_list.py",
+        "# targets api_photos_list specifically\n"
+        "def test_it(): pass\n",
+    )
+    _write(
+        repo,
+        "vireo/tests/test_builds_app.py",
+        "# builds create_app but doesn't care about routes\n"
+        "def test_it(): pass\n",
+    )
+    base = _commit(repo, "base")
+
+    map_dir = repo / select_tests.MAP_DIR
+    map_dir.mkdir()
+    data = CoverageData(basename=str(map_dir / select_tests.MAP_DB))
+    data.set_context("vireo/tests/test_builds_app.py::test_it|run")
+    data.add_lines({"vireo/tests/test_builds_app.py": [1]})
+    data.write()
+    (map_dir / select_tests.MAP_META).write_text(json.dumps({"sha": base, "root": str(repo)}))
+
+    _write(
+        repo,
+        "vireo/app.py",
+        "def create_app():\n"
+        "    def api_photos_list():\n"
+        "        return [1]\n"
+        "    return api_photos_list\n",
+    )
+    _commit(repo, "edit inner route body")
+
+    sel = _select(repo)
+
+    assert "vireo/tests/test_api_photos_list.py" in sel.files
+    assert "vireo/tests/test_builds_app.py" not in sel.files
+
+
 def test_comment_only_change_selects_nothing_from_map(repo):
     _write(repo, "vireo/app.py", APP_SRC.replace("    return x + 1", "    # tweak\n    return x + 1"))
     _commit(repo, "comment")

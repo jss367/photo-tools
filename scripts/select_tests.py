@@ -171,10 +171,20 @@ def _show(sha: str, path: str, cwd: Path) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
-def _grep_files(needle: str, rev: str, pathspecs: list[str], cwd: Path, regex: bool = False) -> list[str]:
-    """Paths (repo-relative) under ``pathspecs`` at ``rev`` containing ``needle``."""
+def _grep_files(
+    needle: str, rev: str, pathspecs: list[str], cwd: Path,
+    regex: bool = False, word: bool = False,
+) -> list[str]:
+    """Paths (repo-relative) under ``pathspecs`` at ``rev`` containing ``needle``.
+
+    ``word=True`` restricts to whole-word matches (``git grep -w``).
+    """
+    cmd = ["git", "grep", "-l", "-E" if regex else "-F"]
+    if word:
+        cmd.append("-w")
+    cmd += ["-e", needle, rev, "--", *pathspecs]
     result = subprocess.run(
-        ["git", "grep", "-l", "-E" if regex else "-F", "-e", needle, rev, "--", *pathspecs],
+        cmd,
         cwd=str(cwd),
         capture_output=True,
         text=True,
@@ -188,10 +198,21 @@ def _grep_files(needle: str, rev: str, pathspecs: list[str], cwd: Path, regex: b
     return out
 
 
-def _grep_lines(needle: str, rev: str, pathspecs: list[str], cwd: Path) -> dict[str, set[int]]:
-    """``{path: {lineno, ...}}`` for lines under ``pathspecs`` at ``rev`` containing ``needle``."""
+def _grep_lines(
+    needle: str, rev: str, pathspecs: list[str], cwd: Path, word: bool = False,
+) -> dict[str, set[int]]:
+    """``{path: {lineno, ...}}`` for lines under ``pathspecs`` at ``rev`` containing ``needle``.
+
+    ``word=True`` restricts to whole-word matches (``git grep -w``); use it
+    when grepping for a Python identifier so ``alpha`` doesn't pull in
+    ``test_alpha``.
+    """
+    cmd = ["git", "grep", "-n", "-F"]
+    if word:
+        cmd.append("-w")
+    cmd += ["-e", needle, rev, "--", *pathspecs]
     result = subprocess.run(
-        ["git", "grep", "-n", "-F", "-e", needle, rev, "--", *pathspecs],
+        cmd,
         cwd=str(cwd),
         capture_output=True,
         text=True,
@@ -638,6 +659,49 @@ def module_level_names(source: str, touched: set[int] | None) -> set[str]:
     return {n for n in names if len(n) >= 3}
 
 
+def touched_declaration_names(hunks: list[Hunk], source: str) -> set[str]:
+    """Names of the innermost function/class declarations a hunk touched.
+
+    Declaration-inspecting tests can import a helper by symbol and check
+    it with ``inspect.signature(fn)`` / ``inspect.getsource(fn)`` — for
+    example, ``vireo/tests/test_thumbnails.py::test_thumbnail_raw_fallbacks_honor_an_explicit_cache_name``
+    inspects ``_retry_thumbnail_with_companion`` and
+    ``_retry_thumbnail_with_working_copy`` without executing them or
+    naming ``thumbnails.py``. Neither the coverage lookup (the body
+    never runs under a test context) nor the basename fallback (the
+    file's name never appears in the test) selects such tests, so grep
+    for the touched symbol names as well.
+
+    For each touched line, pick the *innermost* enclosing function or
+    class span in the base source. Innermost matters for nested
+    functions (routes inside ``create_app``): the outer name would
+    match almost every test that builds the app, while the nested
+    name matches only the tests that reference that specific
+    declaration. Names shorter than 3 characters are dropped for the
+    same reason as ``module_level_names``.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    named_spans: list[tuple[str, int, int]] = []  # (name, start, end)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            start = min([d.lineno for d in node.decorator_list] + [node.lineno])
+            end = node.end_lineno or node.lineno
+            named_spans.append((node.name, start, end))
+    names: set[str] = set()
+    for _, lines in hunks:
+        for line in lines:
+            enclosing = [(n, s, e) for n, s, e in named_spans if s <= line <= e]
+            if not enclosing:
+                continue
+            name = min(enclosing, key=lambda item: item[2] - item[1])[0]
+            if len(name) >= 3:
+                names.add(name)
+    return names
+
+
 def _add_mention_selections(
     path: str,
     base: str,
@@ -647,6 +711,7 @@ def _add_mention_selections(
     test_specs: list[str],
     sel: Selection,
     needle: str | None = None,
+    word: bool = False,
 ) -> bool:
     """Select tests that mention ``needle`` (defaults to ``path``'s basename) in their source.
 
@@ -659,12 +724,13 @@ def _add_mention_selections(
     ``needle`` allows callers to grep for something other than the basename
     (for example, a module-level identifier name touched by the diff, so a
     test that imports the constant is selected even though it never runs
-    any line of the source file).
+    any line of the source file). ``word=True`` grep-matches whole words
+    only, so an identifier like ``alpha`` doesn't pull in ``test_alpha``.
     """
     if needle is None:
         needle = os.path.basename(path)
     mentioned = False
-    for test_file, linenos in _grep_lines(needle, base, test_specs, cwd).items():
+    for test_file, linenos in _grep_lines(needle, base, test_specs, cwd, word=word).items():
         if not is_unit_test_file(test_file):
             continue
         mentioned = True
@@ -679,7 +745,7 @@ def _add_mention_selections(
         else:
             sel.files.add(test_file)
             sel.note(f"{path}: {test_file} mentions '{needle}' (whole file)")
-    for test_file in _grep_files(needle, head, test_specs, cwd):
+    for test_file in _grep_files(needle, head, test_specs, cwd, word=word):
         if is_unit_test_file(test_file) and test_file not in sel.files and not _show(base, test_file, cwd):
             mentioned = True
             sel.files.add(test_file)
@@ -774,6 +840,19 @@ def select(
             # contract test.
             _add_mention_selections(path, base, head, cwd, impact, test_specs, sel)
 
+            # Symbol-inspecting tests import a helper and check it with
+            # ``inspect.signature`` / ``inspect.getsource`` without ever
+            # mentioning the source file's basename, so the fallback
+            # above misses them. For every touched function or class
+            # declaration, grep tests for its name too. Word-boundary
+            # so ``alpha`` doesn't sweep in ``test_alpha``.
+            if hunks:
+                for name in touched_declaration_names(hunks, source):
+                    _add_mention_selections(
+                        path, base, head, cwd, impact, test_specs, sel,
+                        needle=name, word=True,
+                    )
+
             if widened is None and hunks:
                 # Module-level change: tests that only read a module-level
                 # constant execute no source line under a test context —
@@ -784,7 +863,8 @@ def select(
                 touched_lines = {n for _, lns in hunks for n in lns}
                 for name in module_level_names(source, touched_lines):
                     _add_mention_selections(
-                        path, base, head, cwd, impact, test_specs, sel, needle=name
+                        path, base, head, cwd, impact, test_specs, sel,
+                        needle=name, word=True,
                     )
 
             if not impact.has_file(path):

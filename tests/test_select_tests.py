@@ -133,7 +133,16 @@ def test_change_inside_function_selects_only_its_tests(repo):
 
     assert sel.mode == "subset"
     assert sel.ids == {"vireo/tests/test_app.py::test_alpha"}
-    assert sel.files == set()
+    # Tests that executed unrelated functions of ``app.py`` (test_beta,
+    # test_browse) stay out: the map narrows a body-line edit to the
+    # tests that ran that body. ``test_comments.py`` — a test file that
+    # merely mentions ``app.py`` in a comment — is added separately via
+    # the source-file mention fallback; that is covered in a dedicated
+    # test below, so keep this assertion focused on the map lookup.
+    assert not sel.ids & {
+        "vireo/tests/test_app.py::test_beta",
+        "vireo/tests/test_pages.py::test_browse",
+    }
 
 
 def test_insertion_inside_function_uses_surrounding_lines(repo):
@@ -172,15 +181,76 @@ def test_module_level_change_selects_every_test_touching_the_file(repo):
     }
 
 
-def test_source_basename_mentions_in_tests_do_not_select(repo):
+def test_source_edit_selects_tests_that_mention_the_source_file(repo):
+    # Body-only edits can still trip source-parsing contract tests that
+    # read the file via ``ast.parse`` / ``Path.read_text`` — for example,
+    # ``test_every_prediction_decision_route_locks`` in this repo parses
+    # every route body without executing it. The selector runs the
+    # basename-mention fallback for every source-file change so those
+    # tests are picked up whether the edit lands on a header line or in
+    # the function body. False positives from bare comment mentions are
+    # the accepted trade-off: a missed structural regression is worse
+    # than one extra test file running.
     _write(repo, "vireo/app.py", APP_SRC.replace("return x + 1", "return x + 2"))
     _commit(repo, "edit alpha")
 
     sel = _select(repo)
 
-    # test_comments.py says "app.py" in a comment; the map is authoritative.
-    assert "vireo/tests/test_comments.py" not in sel.files
     assert sel.ids == {"vireo/tests/test_app.py::test_alpha"}
+    assert "vireo/tests/test_comments.py" in sel.files
+
+
+def test_module_level_constant_change_selects_tests_that_reference_it(tmp_path):
+    """A test that only reads a module-level constant executes no line of
+    the source file under a test context — the assignment runs at import
+    time — and is missing from ``tests_for_lines(path, None)``. The
+    selector greps for each touched module-level identifier so those
+    tests are still picked up.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _write(
+        repo,
+        "vireo/image_edits.py",
+        "EDIT_MATH_VERSION = 3\n\n\ndef bump():\n    return EDIT_MATH_VERSION + 1\n",
+    )
+    _write(
+        repo,
+        "vireo/tests/test_image_edits.py",
+        "from vireo.image_edits import EDIT_MATH_VERSION\n"
+        "def test_matches_client():\n"
+        "    assert EDIT_MATH_VERSION == 3\n",
+    )
+    _write(repo, "vireo/tests/test_unrelated.py", "def test_x(): pass\n")
+    base = _commit(repo, "base")
+
+    map_dir = repo / select_tests.MAP_DIR
+    map_dir.mkdir()
+    data = CoverageData(basename=str(map_dir / select_tests.MAP_DB))
+    # test_matches_client never touches a line of image_edits.py under a
+    # test context — the module-level assignment runs at import time,
+    # before any per-test context is active, and attribute access
+    # doesn't count as a line hit. Record only the unrelated test to
+    # simulate that gap.
+    data.set_context("vireo/tests/test_unrelated.py::test_x|run")
+    data.add_lines({"vireo/tests/test_unrelated.py": [1]})
+    data.write()
+    (map_dir / select_tests.MAP_META).write_text(json.dumps({"sha": base, "root": str(repo)}))
+
+    _write(
+        repo,
+        "vireo/image_edits.py",
+        "EDIT_MATH_VERSION = 4\n\n\ndef bump():\n    return EDIT_MATH_VERSION + 1\n",
+    )
+    _commit(repo, "bump math version")
+
+    sel = _select(repo)
+
+    # Grepping the tests for ``EDIT_MATH_VERSION`` finds test_image_edits.py,
+    # even though the map has no per-test coverage of image_edits.py.
+    assert "vireo/tests/test_image_edits.py" in sel.files
+    assert "vireo/tests/test_unrelated.py" not in sel.files
 
 
 def test_comment_only_change_selects_nothing_from_map(repo):
@@ -317,6 +387,54 @@ def test_added_test_file_runs_whole_file_and_added_source_selects_nothing_else(r
 
     assert sel.files == {"vireo/tests/test_newmod.py"}
     assert sel.ids == set()
+
+
+def test_modified_source_module_selects_source_scanning_contract_tests(tmp_path):
+    """Source-scanning contracts (``glob("*.py")``) read the file's bytes
+    without executing any of its lines, so a modification that swaps a
+    cached factory for a prohibited direct constructor is invisible to
+    them via coverage — the map's line hits on the edited function's
+    body don't reach a test that never runs any line of the file. The
+    selector runs the same fallback for modifications as for additions.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _write(repo, "vireo/app.py", "def alpha():\n    return 1\n")
+    _write(repo, "vireo/tests/test_app.py", "def test_alpha(): pass\n")
+    _write(
+        repo,
+        "vireo/tests/test_construction_contract.py",
+        "from pathlib import Path\n"
+        "def test_construction():\n"
+        "    for path in Path('vireo').glob('*.py'):\n"
+        "        assert path.is_file()\n",
+    )
+    _write(repo, "vireo/tests/test_unrelated.py", "def test_x(): pass\n")
+    base = _commit(repo, "base")
+
+    map_dir = repo / select_tests.MAP_DIR
+    map_dir.mkdir()
+    data = CoverageData(basename=str(map_dir / select_tests.MAP_DB))
+    data.set_context("vireo/tests/test_app.py::test_alpha|run")
+    data.add_lines({"vireo/app.py": [1, 2]})
+    data.set_context("vireo/tests/test_construction_contract.py::test_construction|run")
+    data.add_lines({"vireo/tests/test_construction_contract.py": [1, 2, 3, 4]})
+    data.set_context("vireo/tests/test_unrelated.py::test_x|run")
+    data.add_lines({"vireo/tests/test_unrelated.py": [1]})
+    data.write()
+    (map_dir / select_tests.MAP_META).write_text(json.dumps({"sha": base, "root": str(repo)}))
+
+    _write(repo, "vireo/app.py", "def alpha():\n    return 2\n")
+    _commit(repo, "modify alpha")
+
+    sel = _select(repo)
+
+    assert sel.mode == "subset"
+    assert "vireo/tests/test_construction_contract.py" in sel.files
+    # test_alpha still runs via the coverage-based path.
+    assert "vireo/tests/test_app.py::test_alpha" in sel.ids
+    assert "vireo/tests/test_unrelated.py" not in sel.files
 
 
 def test_added_source_module_selects_source_scanning_contract_tests(tmp_path):
@@ -587,9 +705,13 @@ def test_cli_writes_selection_and_prints_mode(repo):
     )
 
     assert result.stdout.strip() == "subset"
-    assert "selected: 0 whole files + 1 individual tests" in result.stderr
+    # The map lookup contributes ``test_alpha``; the basename-mention
+    # fallback contributes ``test_comments.py`` as a whole file because
+    # it references ``app.py``.
+    assert "selected: 1 whole files + 1 individual tests" in result.stderr
     selection = (repo / select_tests.MAP_DIR / select_tests.SELECTION_FILE).read_text()
     assert "vireo/tests/test_app.py::test_alpha" in selection
+    assert "vireo/tests/test_comments.py" in selection
 
 
 def test_cli_falls_back_to_full_when_map_commit_is_unreachable(repo):

@@ -10,16 +10,20 @@ turns a *test-impact map* (per-test line coverage recorded on ``main``) plus
 Selection is conservative and precise at the same time:
 
 * A change inside a Python function selects every test that executed any
-  line of that function (innermost enclosing ``def``) on ``main``. A
-  signature or decorator change additionally selects tests that reference
+  line of that function (innermost enclosing ``def``) on ``main``. Every
+  Python source-file change additionally selects tests that reference
   the source file's basename — declaration-inspecting tests (route
   contract snapshots, ``ast.parse`` of the source, ``app.url_map``
-  audits) never execute the body but must run when the header changes.
+  audits, route-decorator AST parsers) never execute the body but must
+  still catch structural regressions from any edit — and tests that
+  scan the source tree with ``glob("*.py")``/``rglob("*.py")``.
 * A change outside any function (imports, constants, class bodies, module
-  code) selects every test that executed any line of that file. A pure
-  insertion between functions (or at EOF beside a function) is treated
-  the same way: the new lines could be a new module- or class-level
-  statement that every importer sees.
+  code) selects every test that executed any line of that file, plus
+  tests that mention each touched module-level identifier: an assignment
+  like ``EDIT_MATH_VERSION = 3`` runs at import time, so a test that
+  only reads the constant is missing from the per-test coverage but
+  will grep-match. A pure insertion between functions (or at EOF beside
+  a function) is treated the same way.
 * A changed or added unit-test file runs in full.
 * Non-Python files (templates, static assets, data, shell scripts, docs)
   select every unit-test file that mentions their basename, plus the tests
@@ -343,8 +347,8 @@ def function_spans(source: str) -> list[Span]:
     builds an app — so counting them would turn any route edit into "every
     test". A change to the header (decorator, signature) is attributed to
     the body's tests instead, which is exactly the set that calls it, plus
-    (via ``impacted_lines``' ``header_touched`` flag) any test that inspects
-    the declaration by name — see the mention fallback in ``select()``.
+    any test that inspects the declaration by name — picked up by the
+    unconditional basename-mention fallback in ``select()``.
     """
     try:
         tree = ast.parse(source)
@@ -379,25 +383,24 @@ def _is_code(text_lines: list[str], line: int) -> bool:
     return bool(stripped) and not stripped.startswith("#")
 
 
-def impacted_lines(hunks: list[Hunk], source: str) -> tuple[set[int] | None, bool]:
+def impacted_lines(hunks: list[Hunk], source: str) -> set[int] | None:
     """Widen a file's hunks to the lines of their innermost enclosing functions.
 
-    Returns ``(widened, header_touched)``.
-
-    ``widened`` is ``None`` when some changed code sits outside every
-    function (imports, constants, class bodies, module-level registration)
-    or a pure insertion is ambiguous about which function it belongs to,
-    which the caller treats as "whole file". Blank and comment-only lines
-    are ignored, so a diff that only touches comments selects nothing from
+    Returns ``None`` when some changed code sits outside every function
+    (imports, constants, class bodies, module-level registration) or a
+    pure insertion is ambiguous about which function it belongs to, which
+    the caller treats as "whole file". Blank and comment-only lines are
+    ignored, so a diff that only touches comments selects nothing from
     the map.
 
-    ``header_touched`` is ``True`` when a modification lands on a function's
-    decorator or ``def`` line (anything before its body). The body-line
-    lookup catches every test that *called* the function, but a signature
-    or decorator change is also observable to tests that *inspect the
-    declaration* — route contract snapshots, ``ast.parse`` of the source,
-    ``app.url_map`` audits — which never run the body. The caller uses
-    this flag to widen through the basename-mention fallback.
+    Declaration-inspecting tests (route contract snapshots, ``ast.parse``
+    of the source, ``app.url_map`` audits) don't execute the changed
+    function's body but do reference the source file by name. The caller
+    picks them up unconditionally via a basename-mention fallback rather
+    than gating on a "header touched" flag: body-only edits can equally
+    trip a source-parsing contract, so limiting the fallback to
+    signature/decorator changes would still miss the tests specifically
+    built to catch structural regressions.
 
     A pure insertion is only attributed to a single function when both
     neighbouring old-side lines resolve to the same enclosing function.
@@ -411,7 +414,6 @@ def impacted_lines(hunks: list[Hunk], source: str) -> tuple[set[int] | None, boo
     spans = function_spans(source)
     text_lines = source.splitlines()
     widened: set[int] = set()
-    header_touched = False
     for kind, lines in hunks:
         if kind == "ins":
             if not lines:
@@ -427,17 +429,15 @@ def impacted_lines(hunks: list[Hunk], source: str) -> tuple[set[int] | None, boo
             ):
                 widened.update(_body_lines(candidates[0]))
                 continue
-            return None, header_touched
+            return None
         for n in lines:
             if not _is_code(text_lines, n):
                 continue
             span = innermost_span(n, spans)
             if span is None:
-                return None, header_touched
+                return None
             widened.update(_body_lines(span))
-            if n < span[2]:
-                header_touched = True
-    return widened, header_touched
+    return widened
 
 
 def expand_to_functions(lines: set[int], spans: list[Span]) -> set[int] | None:
@@ -561,15 +561,16 @@ def _reference_strings(path: str, base: str, cwd: Path) -> set[str]:
 
 # Tests that iterate the production source tree (contract scans of the
 # form ``vireo_dir.glob("*.py")`` or ``package_root.rglob("*.py")``) read
-# a module's source without executing any of its lines, so a *newly added*
-# production file — which has no history in the map — is invisible to
-# them via the normal coverage path. Anchor the pattern on ``glob("*.py")``
-# / ``rglob("*.py")``: a call inside a test that walks the source tree.
+# a module's source without executing any of its lines, so a production
+# file's presence in the map — added or not — is irrelevant: those tests
+# inspect the file bytes, not run its code. Anchor the pattern on
+# ``glob("*.py")`` / ``rglob("*.py")``: a call inside a test that walks
+# the source tree.
 _SOURCE_SCAN_RE = r"\b(r?glob)\(['\"]\*\.py['\"]\)"
 
 
 def _add_source_scanning_selections(
-    added_path: str,
+    source_path: str,
     base: str,
     cwd: Path,
     test_specs: list[str],
@@ -577,20 +578,64 @@ def _add_source_scanning_selections(
 ) -> None:
     """Select tests that iterate the production source tree.
 
-    A newly added ``vireo/`` or ``scripts/`` module can violate an AST-based
-    contract (``test_classifier_construction_contract``,
+    Both added *and modified* ``vireo/`` or ``scripts/`` modules can
+    violate an AST-based contract (``test_classifier_construction_contract``,
     ``test_production_onnx_sessions_use_budgeted_factory``,
     ``test_keyword_provenance_contract``) that the map has no way of
-    connecting to the new file — those tests read the source with
-    ``glob``/``rglob`` and never execute any of its lines, so the added
-    file's absence from the map matches nothing. Grep for the scan pattern
-    on ``base`` and add the whole test file (contract tests are small,
-    and their per-test bodies aren't worth mapping precisely).
+    connecting to the file's coverage — those tests read the source with
+    ``glob``/``rglob`` and never execute any of its lines, so the map's
+    line hits don't reach them. Replacing a cached factory with a
+    prohibited direct constructor is a modification, not an addition, and
+    must equally trip these contracts. Grep for the scan pattern on
+    ``base`` and add the whole test file (contract tests are small, and
+    their per-test bodies aren't worth mapping precisely).
     """
     for test_file in _grep_files(_SOURCE_SCAN_RE, base, test_specs, cwd, regex=True):
         if is_unit_test_file(test_file) and test_file not in sel.files:
             sel.files.add(test_file)
-            sel.note(f"{added_path}: added; source-scanning contract in {test_file}")
+            sel.note(f"{source_path}: source-scanning contract in {test_file}")
+
+
+def _collect_assign_names(target: ast.AST, names: set[str]) -> None:
+    if isinstance(target, ast.Name):
+        names.add(target.id)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            _collect_assign_names(elt, names)
+
+
+def module_level_names(source: str, touched: set[int] | None) -> set[str]:
+    """Module-level identifier names whose definition spans intersect ``touched``.
+
+    Used to catch tests that consume a module-level constant they never
+    otherwise execute a line of — ``EDIT_MATH_VERSION = 3`` runs at
+    import time, before any per-test context is active, so a test that
+    only reads ``image_edits.EDIT_MATH_VERSION`` never appears in
+    ``tests_for_lines(path, None)``. Grepping the tests for the
+    identifier name recovers them.
+
+    ``touched=None`` returns every module-level name. Identifiers shorter
+    than 3 characters are dropped to keep noise low (a bare ``x`` or ``f``
+    matches almost every test file).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: set[str] = set()
+    for node in tree.body:
+        end = getattr(node, "end_lineno", None) or node.lineno
+        node_lines = set(range(node.lineno, end + 1))
+        if touched is not None and node_lines.isdisjoint(touched):
+            continue
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                _collect_assign_names(target, names)
+        elif isinstance(node, ast.AnnAssign):
+            _collect_assign_names(node.target, names)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+    return {n for n in names if len(n) >= 3}
 
 
 def _add_mention_selections(
@@ -601,18 +646,25 @@ def _add_mention_selections(
     impact: ImpactMap,
     test_specs: list[str],
     sel: Selection,
+    needle: str | None = None,
 ) -> bool:
-    """Select tests that mention ``path``'s basename in their source.
+    """Select tests that mention ``needle`` (defaults to ``path``'s basename) in their source.
 
-    Returns ``True`` if any test file mentioned ``path``. Test files present
+    Returns ``True`` if any test file mentioned ``needle``. Test files present
     in the map narrow to the tests whose enclosing function contains the
     mention; module-level mentions widen to the whole test file. Test files
     that exist only on ``head`` are added whole (they are new and have no
     map history).
+
+    ``needle`` allows callers to grep for something other than the basename
+    (for example, a module-level identifier name touched by the diff, so a
+    test that imports the constant is selected even though it never runs
+    any line of the source file).
     """
-    basename = os.path.basename(path)
+    if needle is None:
+        needle = os.path.basename(path)
     mentioned = False
-    for test_file, linenos in _grep_lines(basename, base, test_specs, cwd).items():
+    for test_file, linenos in _grep_lines(needle, base, test_specs, cwd).items():
         if not is_unit_test_file(test_file):
             continue
         mentioned = True
@@ -623,15 +675,15 @@ def _add_mention_selections(
                 picked = impact.tests_for_lines(test_file, widened)
         if picked:
             sel.ids |= picked
-            sel.note(f"{path}: {test_file} mentions '{basename}' -> {len(picked)} tests")
+            sel.note(f"{path}: {test_file} mentions '{needle}' -> {len(picked)} tests")
         else:
             sel.files.add(test_file)
-            sel.note(f"{path}: {test_file} mentions '{basename}' (whole file)")
-    for test_file in _grep_files(basename, head, test_specs, cwd):
+            sel.note(f"{path}: {test_file} mentions '{needle}' (whole file)")
+    for test_file in _grep_files(needle, head, test_specs, cwd):
         if is_unit_test_file(test_file) and test_file not in sel.files and not _show(base, test_file, cwd):
             mentioned = True
             sel.files.add(test_file)
-            sel.note(f"{path}: new {test_file} mentions '{basename}'")
+            sel.note(f"{path}: new {test_file} mentions '{needle}'")
     return mentioned
 
 
@@ -673,12 +725,12 @@ def select(
             continue
 
         # Tests that mention the file by name run regardless of coverage.
-        # Not for ``vireo/**.py``: the map already knows exactly which tests
-        # executed a module, and "app.py" appears in comments everywhere.
-        # The source-file branch below re-enables this fallback narrowly for
-        # signature/decorator changes, which the body-line lookup misses.
+        # For ``vireo/**.py`` and ``scripts/**.py`` the mention fallback is
+        # handled inside the source-file branch below (alongside the map
+        # lookup and the source-scanning contract fallback), so avoid
+        # running it twice.
         mentioned = False
-        if kind != "source" or path.startswith("scripts/"):
+        if kind != "source":
             mentioned = _add_mention_selections(path, base, head, cwd, impact, test_specs, sel)
 
         if kind == "testasset":
@@ -687,34 +739,65 @@ def select(
             continue
 
         if kind == "source":
+            # Added modules have no diff hunks in the map's world, so
+            # fall through directly to the structural-contract fallbacks
+            # after noting the addition.
             if status == "A":
                 sel.note(f"{path}: added, no history in map")
                 _add_source_scanning_selections(path, base, cwd, test_specs, sel)
+                _add_mention_selections(path, base, head, cwd, impact, test_specs, sel)
                 continue
+
+            hunks = hunks_by_path.get(path)
+            source = _show(base, path, cwd) or ""
+            widened = None if (status == "D" or not hunks) else impacted_lines(hunks, source)
+
+            # A pure comment/whitespace edit alters no code path and no
+            # structural contract; skip every fallback so the diff stays
+            # ``mode: none``.
+            if hunks and widened is not None and not widened:
+                sel.note(f"{path}: comment/blank-only edit; selecting nothing")
+                continue
+
+            # Source-scanning contracts (``glob("*.py")``/``rglob("*.py")``)
+            # read the file's bytes without executing any of its lines, so
+            # both added and modified modules can trip them regardless of
+            # what the coverage map records for the file.
+            _add_source_scanning_selections(path, base, cwd, test_specs, sel)
+            # Declaration- and source-inspecting tests (route contract
+            # snapshots, ``ast.parse`` of the source, ``app.url_map``
+            # audits, tests that iterate route bodies via AST) never
+            # execute the affected function's body but do reference the
+            # source file by name. Include them for every source-file
+            # change: a signature or decorator edit misses them via body
+            # lookup, and a body edit can equally trip a source-parsing
+            # contract test.
+            _add_mention_selections(path, base, head, cwd, impact, test_specs, sel)
+
+            if widened is None and hunks:
+                # Module-level change: tests that only read a module-level
+                # constant execute no source line under a test context —
+                # the assignment runs at import time — and are absent from
+                # ``tests_for_lines(path, None)``. Grep for each touched
+                # module-level identifier so those tests are still selected,
+                # even for files with no coverage in the map.
+                touched_lines = {n for _, lns in hunks for n in lns}
+                for name in module_level_names(source, touched_lines):
+                    _add_mention_selections(
+                        path, base, head, cwd, impact, test_specs, sel, needle=name
+                    )
+
             if not impact.has_file(path):
                 sel.note(f"{path}: not in map (never imported by a test)")
                 continue
-            hunks = hunks_by_path.get(path)
-            if status == "D" or not hunks:
+
+            if widened is None:
                 picked = impact.tests_for_lines(path, None)
-                sel.note(f"{path}: whole file ({'deleted' if status == 'D' else 'no hunks'}) -> {len(picked)} tests")
+                reason = "deleted" if status == "D" else "no hunks" if not hunks else "module-level change"
+                sel.note(f"{path}: {reason} -> {len(picked)} tests (whole file)")
             else:
-                source = _show(base, path, cwd) or ""
-                widened, header_touched = impacted_lines(hunks, source)
-                if widened is None:
-                    picked = impact.tests_for_lines(path, None)
-                    sel.note(f"{path}: module-level change -> {len(picked)} tests (whole file)")
-                else:
-                    picked = impact.tests_for_lines(path, widened)
-                    sel.note(f"{path}: {len(hunks)} hunks in {len(widened)} function lines -> {len(picked)} tests")
-                if header_touched:
-                    # Declaration-inspecting tests (route contract snapshots,
-                    # ``ast.parse`` of the source, ``app.url_map`` audits)
-                    # don't execute the function's body but do reference the
-                    # source file by name. Include them via the mention
-                    # fallback so a decorator or signature change can't skip
-                    # the tests specifically built to catch it.
-                    _add_mention_selections(path, base, head, cwd, impact, test_specs, sel)
+                picked = impact.tests_for_lines(path, widened)
+                sel.note(f"{path}: {len(hunks)} hunks in {len(widened)} function lines -> {len(picked)} tests")
             sel.ids |= picked
             continue
 

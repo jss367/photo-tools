@@ -27,17 +27,20 @@ def _posix_shaped_inputs_stay_posix(monkeypatch):
     """
     import posixpath
 
+    # Capture originals first: on POSIX ``posixpath`` *is* ``os.path``, so
+    # calling ``posixpath.normpath`` after patching would recurse.
     real_abspath, real_normpath = os.path.abspath, os.path.normpath
+    posix_normpath = posixpath.normpath
 
     def abspath(p):
         p = os.fspath(p)
-        return p if p.startswith("/") else real_abspath(p)
+        return posix_normpath(p) if p.startswith("/") else real_abspath(p)
 
     def normpath(p):
         p = os.fspath(p)
         if p.startswith("//"):
-            return "//" + posixpath.normpath(p[2:]).lstrip("/")
-        return posixpath.normpath(p) if p.startswith("/") else real_normpath(p)
+            return "//" + posix_normpath(p[2:]).lstrip("/")
+        return posix_normpath(p) if p.startswith("/") else real_normpath(p)
 
     monkeypatch.setattr(vr.os.path, "abspath", abspath)
     monkeypatch.setattr(vr.os.path, "normpath", normpath)

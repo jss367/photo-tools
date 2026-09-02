@@ -84,6 +84,8 @@ def test_mount_root_candidates_empty_for_ordinary_local_paths(tmp_path):
 
 def test_mount_root_candidates_uses_mount_table_for_custom_root(monkeypatch):
     """A custom mount boundary is found without a direct lookup on it."""
+    if sys.platform == "win32":
+        pytest.skip("custom POSIX mount roots do not apply on Windows")
     monkeypatch.setattr(vr, "_system_mount_roots", lambda: {"/srv/photos"})
     monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
     bounded = []
@@ -104,6 +106,8 @@ def test_mount_root_candidates_uses_mount_table_for_custom_root(monkeypatch):
 
 def test_mount_root_candidates_uses_history_for_detached_custom_root(monkeypatch):
     """A custom root remains a safe boundary after it leaves the mount table."""
+    if sys.platform == "win32":
+        pytest.skip("custom POSIX mount roots do not apply on Windows")
     monkeypatch.setattr(vr, "_system_mount_roots", lambda: set())
     monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
     monkeypatch.setattr(vr, "_bounded_link_target", lambda path, timeout=None: None)

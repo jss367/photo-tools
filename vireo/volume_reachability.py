@@ -10,7 +10,8 @@ traceback rather than a "volume offline" state the user can act on.
 This module is the single place that answers *"is the volume under this
 path reachable right now?"*:
 
-* :func:`mount_root_candidates` extracts the mount-shaped prefix of a path
+* :func:`mount_root_candidates` extracts a path's mount prefix from safe OS
+  mount metadata, durable observations, or conventional mount shapes
   (``/Volumes/<name>``, ``/mnt/<name>``, ``/media/<user>/<name>``, a drive
   letter, or a UNC share).
 * :func:`network_root_reachable` is a bounded, out-of-process ``stat`` of a
@@ -32,6 +33,7 @@ import errno
 import json
 import logging
 import os
+import posixpath
 import subprocess
 import sys
 import threading
@@ -112,6 +114,117 @@ def _mount_shaped_candidate(posix_path: str) -> str | None:
     return None
 
 
+_MOUNT_TABLE_LOCK = threading.Lock()
+_MOUNT_TABLE_CACHE = (float("-inf"), frozenset())
+_MOUNT_TABLE_TTL_SECONDS = 30.0
+
+
+def _unescape_linux_mount_path(value):
+    """Decode the pathname escapes used by ``/proc/self/mountinfo``."""
+    for escaped, literal in (
+        ("\\040", " "), ("\\011", "\t"), ("\\012", "\n"),
+        ("\\134", "\\"),
+    ):
+        value = value.replace(escaped, literal)
+    return value
+
+
+def _linux_mount_table_roots(mountinfo_path="/proc/self/mountinfo"):
+    """Read live mount points from kernel metadata, never from the mounts."""
+    roots = set()
+    try:
+        with open(mountinfo_path, encoding="utf-8") as mountinfo:
+            for line in mountinfo:
+                left = line.rstrip("\n").partition(" - ")[0].split()
+                if len(left) >= 5:
+                    roots.add(_unescape_linux_mount_path(left[4]))
+    except OSError:
+        return set()
+    return roots
+
+
+def _darwin_mount_table_roots(run=subprocess.run):
+    """Read macOS's mount table with a timeout and return its mount points."""
+    try:
+        result = run(
+            ["/sbin/mount"], capture_output=True, text=True,
+            timeout=MOUNT_QUERY_TIMEOUT_SECS, **no_window_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if result.returncode != 0:
+        return set()
+    # Keep the platform-specific parser in one place. Importing lazily avoids
+    # adding the NAS setup module to startup paths that never query mounts.
+    import remote_setup
+
+    return {
+        row["mount_point"]
+        for row in remote_setup.parse_mount_table(result.stdout or "")
+        if row.get("mount_point")
+    }
+
+
+def _system_mount_roots(clock=time.monotonic):
+    """Cached live mount roots obtained without touching mounted filesystems."""
+    global _MOUNT_TABLE_CACHE
+
+    now = clock()
+    with _MOUNT_TABLE_LOCK:
+        recorded_at, roots = _MOUNT_TABLE_CACHE
+        if now - recorded_at <= _MOUNT_TABLE_TTL_SECONDS:
+            return set(roots)
+    if sys.platform.startswith("linux"):
+        fresh = _linux_mount_table_roots()
+    elif sys.platform == "darwin":
+        fresh = _darwin_mount_table_roots()
+    else:
+        fresh = set()
+    # The root filesystem is not a useful boundary: treating it as one would
+    # classify every ordinary absolute path as a volume-backed location.
+    fresh = {
+        posixpath.normpath(root.replace("\\", "/"))
+        for root in fresh
+        if isinstance(root, str) and root and root != "/"
+    }
+    with _MOUNT_TABLE_LOCK:
+        _MOUNT_TABLE_CACHE = (now, frozenset(fresh))
+    return fresh
+
+
+def _known_mount_boundaries():
+    """Live and historical custom mount roots safe to use as boundaries."""
+    # Drive letters, UNC shares, and junctions are handled by Windows-native
+    # logic below. POSIX-normalizing their persisted spellings would turn
+    # ``Z:/`` into the invalid root ``Z:`` and create a duplicate candidate.
+    if sys.platform == "win32":
+        return set()
+    live = _system_mount_roots()
+    with _MOUNT_BASELINE_LOCK:
+        for root in live:
+            _MOUNT_BASELINE[root] = True
+        known = {
+            posixpath.normpath(root.replace("\\", "/"))
+            for root, mounted in _MOUNT_BASELINE.items()
+            if mounted and isinstance(root, str) and root
+        }
+    return live | known
+
+
+def _custom_mount_candidate(posix_path, boundaries):
+    normalized = posixpath.normpath(posix_path)
+    return normalized if normalized in boundaries else None
+
+
+def _deepest_custom_mount(posix_path, boundaries):
+    normalized = posixpath.normpath(posix_path)
+    matches = [
+        root for root in boundaries
+        if normalized == root or normalized.startswith(root.rstrip("/") + "/")
+    ]
+    return max(matches, key=len, default=None)
+
+
 class MountRootCandidates(list):
     """Mount-root candidates plus whether the resolution was conclusive.
 
@@ -142,10 +255,11 @@ def mount_root_candidates(path: str) -> "MountRootCandidates":
     through to folder-scoped skips and classify would keep reissuing
     reads across the dead share instead of pausing for reconnection.
 
-    Both the raw expanded path and the normalized absolute form are
-    checked so relative or ``~``-prefixed paths still match. Duplicates
-    are collapsed, and paths not shaped like a mount root return no
-    candidates.
+    Custom POSIX locations are also matched against the OS mount table and
+    durable roots previously observed live, so paths such as ``/srv/photos``
+    or ``~/mnt/photos`` receive the same bounded treatment. Both the raw
+    expanded path and the normalized absolute form are checked so relative
+    or ``~``-prefixed paths still match. Duplicates are collapsed.
     """
     raw_posix = os.path.expanduser(path).replace("\\", "/")
     normalized = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
@@ -164,9 +278,17 @@ def mount_root_candidates(path: str) -> "MountRootCandidates":
     # mounted-to-unmounted guards never see it. Inspecting that prefix is the
     # one lookup that may land on a dead filesystem, so the resolver does it
     # through a time-bounded helper rather than a bare ``lstat``.
+    boundaries = _known_mount_boundaries()
+
+    def candidate(source):
+        return (
+            _mount_shaped_candidate(source)
+            or _custom_mount_candidate(source, boundaries)
+        )
+
     inconclusive: list[str] = []
     resolved = _resolve_symlinks_until_mount_shaped(
-        normalized, _mount_shaped_candidate, inconclusive=inconclusive,
+        normalized, candidate, inconclusive=inconclusive,
     )
     resolved_posix = (
         resolved.replace("\\", "/") if resolved else None
@@ -176,9 +298,12 @@ def mount_root_candidates(path: str) -> "MountRootCandidates":
     for source in (raw_posix, normalized_posix, resolved_posix):
         if source is None:
             continue
-        cand = _mount_shaped_candidate(source)
-        if cand and cand not in seen:
-            seen.append(cand)
+        for cand in (
+            _mount_shaped_candidate(source),
+            _deepest_custom_mount(source, boundaries),
+        ):
+            if cand and cand not in seen:
+                seen.append(cand)
     seen.conclusive = not inconclusive
     return seen
 
@@ -186,7 +311,7 @@ def mount_root_candidates(path: str) -> "MountRootCandidates":
 def resolve_alias_lexically(path):
     """Symlink-resolved form of ``path`` that never looks below a mount root.
 
-    Local components are followed like ``realpath`` would; a mount-shaped
+    Local components are followed like ``realpath`` would; a known mount
     prefix is inspected only through the bounded probe and everything after
     it is appended untouched. Callers use this to apply *name-based* rules
     (bundle exclusion) to an alias such as ``~/PhotoLib`` that points into a
@@ -194,7 +319,14 @@ def resolve_alias_lexically(path):
     the normalized input when nothing could be resolved.
     """
     normalized = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
-    resolved = _resolve_symlinks_until_mount_shaped(normalized, _mount_shaped_candidate)
+    boundaries = _known_mount_boundaries()
+    resolved = _resolve_symlinks_until_mount_shaped(
+        normalized,
+        lambda source: (
+            _mount_shaped_candidate(source)
+            or _custom_mount_candidate(source, boundaries)
+        ),
+    )
     return resolved or normalized
 
 
@@ -237,7 +369,8 @@ _LINK_TARGET_CACHE = {}
 def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
     """``readlink(path)`` if ``path`` is a symlink, else ``None`` — bounded.
 
-    Used only for mount-shaped prefixes (``/mnt/archive``, ``/Volumes/NAS``):
+    Used only for known mount prefixes (``/mnt/archive``, ``/Volumes/NAS``,
+    or a custom root obtained from mount metadata / durable history):
     if the prefix is a symlink it lives on the local root filesystem and the
     ``lstat`` is instant; if it is a real mount point the ``lstat`` may hang
     on a dead server, so it runs on a daemon thread and we give up after
@@ -348,7 +481,7 @@ def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
     Returns the (partially) resolved absolute path, or ``None`` when nothing
     could be resolved. Each accumulated prefix is tested with ``candidate``
     *before* it is ``lstat``-ed. Local components (``/``, ``/Volumes``,
-    ``/photos``) are inspected directly. A mount-shaped prefix is inspected
+    ``/photos``) are inspected directly. A known mount prefix is inspected
     only through :func:`_bounded_link_target`, so a symlinked alias such as
     ``/mnt/archive -> /mnt/NAS`` is still followed to the real mount while a
     dead mount point cannot hang the caller; once a mount-shaped prefix is
@@ -356,7 +489,7 @@ def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
     ``//server`` prefixes are never touched. Hop count is bounded so a
     symlink loop cannot spin.
 
-    When a mount-shaped prefix could not be inspected in time and no earlier
+    When a mount prefix could not be inspected in time and no earlier
     conclusive answer is cached, the prefix is kept as-is and
     ``inconclusive`` (a list, if given) receives that prefix so the caller
     can fail closed rather than trust a possibly-incomplete resolution.

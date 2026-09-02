@@ -70,6 +70,7 @@ from volume_reachability import (
 from volume_reachability import (
     record_known_mount_roots as _record_known_mount_roots,  # noqa: F401
 )
+from volume_reachability import seed_known_mount_roots as _seed_known_mount_roots
 
 log = logging.getLogger(__name__)
 
@@ -258,6 +259,10 @@ def _archive_mount_baseline(
     baseline stays False. See PR #1396 review (Codex P1 r3687401636).
     """
     known = known_mounted_roots or set()
+    # Custom mount locations (for example ``/srv/photos``) have no lexical
+    # marker. Install durable evidence before candidate resolution so a
+    # detached root is still recognised without touching its subtree.
+    _seed_known_mount_roots(known)
     baseline = {}
     candidates = _archive_mount_root_candidates(path)
     # Candidates and confidence come from the same resolution (the list

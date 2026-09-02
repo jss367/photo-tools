@@ -82,6 +82,78 @@ def test_mount_root_candidates_empty_for_ordinary_local_paths(tmp_path):
     assert vr.mount_root_candidates(str(tmp_path / "shoot")) == []
 
 
+def test_mount_root_candidates_uses_mount_table_for_custom_root(monkeypatch):
+    """A custom mount boundary is found without a direct lookup on it."""
+    monkeypatch.setattr(vr, "_system_mount_roots", lambda: {"/srv/photos"})
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
+    bounded = []
+    monkeypatch.setattr(
+        vr, "_bounded_link_target",
+        lambda path, timeout=None: bounded.append(path),
+    )
+    direct = []
+    monkeypatch.setattr(
+        vr, "_is_link_or_junction",
+        lambda path: direct.append(path) or False,
+    )
+
+    assert vr.mount_root_candidates("/srv/photos/2026/shoot") == ["/srv/photos"]
+    assert bounded == ["/srv/photos"]
+    assert not any(path.startswith("/srv/photos") for path in direct)
+
+
+def test_mount_root_candidates_uses_history_for_detached_custom_root(monkeypatch):
+    """A custom root remains a safe boundary after it leaves the mount table."""
+    monkeypatch.setattr(vr, "_system_mount_roots", lambda: set())
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
+    monkeypatch.setattr(vr, "_bounded_link_target", lambda path, timeout=None: None)
+    monkeypatch.setattr(
+        vr, "_is_link_or_junction",
+        lambda path: pytest.fail(f"direct lookup crossed custom mount: {path}")
+        if path.startswith("/Users/me/mnt/photos") else False,
+    )
+    vr.seed_known_mount_roots({"/Users/me/mnt/photos"})
+
+    assert vr.mount_root_candidates("/Users/me/mnt/photos/2026") == [
+        "/Users/me/mnt/photos"
+    ]
+
+
+def test_linux_mount_table_roots_decode_custom_mount_path(tmp_path):
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        "41 29 0:35 / / rw,relatime - ext4 /dev/root rw\n"
+        "57 41 0:52 / /srv/photo\\040archive rw - nfs server:/photos rw\n",
+        encoding="utf-8",
+    )
+
+    assert vr._linux_mount_table_roots(str(mountinfo)) == {
+        "/", "/srv/photo archive",
+    }
+
+
+def test_darwin_mount_table_roots_uses_metadata_command_not_mount_path():
+    from types import SimpleNamespace
+
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "map auto_home on /System/Volumes/Data/home (autofs, automounted)\n"
+                "server:/photos on /Users/me/mnt/photos (nfs)\n"
+            ),
+        )
+
+    assert vr._darwin_mount_table_roots(run=run) == {
+        "/System/Volumes/Data/home", "/Users/me/mnt/photos",
+    }
+    assert calls[0][0] == ["/sbin/mount"]
+    assert calls[0][1]["timeout"] == vr.MOUNT_QUERY_TIMEOUT_SECS
+
+
 def test_is_offline_error_classifies_volume_loss_not_missing_files():
     assert vr.is_offline_error(OSError(errno.ENOTCONN, "Socket is not connected"))
     assert vr.is_offline_error(OSError(errno.EIO, "Input/output error"))

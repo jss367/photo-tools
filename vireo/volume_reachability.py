@@ -309,6 +309,13 @@ def mount_root_candidates(path: str) -> "MountRootCandidates":
         ):
             if cand and cand not in seen:
                 seen.append(cand)
+    # A timeout on a prefix not present in mount metadata is itself the only
+    # safe candidate: carrying it lets every caller fail closed instead of
+    # interpreting an empty list as an ordinary reachable local path.
+    if not seen:
+        for unresolved_prefix in inconclusive:
+            if unresolved_prefix not in seen:
+                seen.append(unresolved_prefix)
     seen.conclusive = not inconclusive
     return seen
 
@@ -364,25 +371,22 @@ _MAX_BOUNDED_LINK_PROBES = _MAX_NETWORK_PROBES
 # Distinct from ``None`` ("conclusively not a symlink") so callers can fail
 # closed instead of mistaking saturation for a plain directory.
 INCONCLUSIVE = object()
-# path -> last *conclusive* answer (target string or None). Mount-prefix
-# symlink layout does not change while the process runs, so an answer
-# obtained at a healthy moment stands in when a later probe is inconclusive
-# — preserving the real mount behind an alias even under saturation.
+# path -> last *conclusive* answer (target string or None). An answer obtained
+# at a healthy moment stands in when a later probe is inconclusive, preserving
+# the real mount behind an alias even under saturation.
 _LINK_TARGET_CACHE = {}
 
 
 def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
     """``readlink(path)`` if ``path`` is a symlink, else ``None`` — bounded.
 
-    Used only for known mount prefixes (``/mnt/archive``, ``/Volumes/NAS``,
-    or a custom root obtained from mount metadata / durable history):
-    if the prefix is a symlink it lives on the local root filesystem and the
-    ``lstat`` is instant; if it is a real mount point the ``lstat`` may hang
-    on a dead server, so it runs on a daemon thread and we give up after
-    ``timeout`` (answering "not a link", which is also the right answer for a
-    real mount). One probe per path stays registered while it is alive so
-    repeated calls against a wedged mount fail fast instead of stacking
-    threads. UNC prefixes never reach here (callers skip them).
+    Every non-UNC path prefix uses this helper. Known mount metadata is not
+    guaranteed to be available, and a custom mount may already be stalled
+    before this process first observes it, so assuming an unknown prefix is
+    local would put an unbounded ``lstat`` ahead of the reachability gate.
+    One probe per path stays registered while it is alive so repeated calls
+    against a wedged prefix fail fast instead of stacking threads. UNC
+    prefixes never reach here (callers skip them).
     """
     with _BOUNDED_LINK_LOCK:
         existing = _BOUNDED_LINK_PROBES.get(path)
@@ -401,12 +405,12 @@ def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
 
         def worker():
             try:
-                if os.path.islink(path):
+                if _is_link_or_junction(path):
                     outcome["target"] = os.readlink(path)
                 else:
                     outcome["target"] = None
             except OSError:
-                outcome["target"] = None
+                outcome["inconclusive"] = True
             finally:
                 with _BOUNDED_LINK_LOCK:
                     if _BOUNDED_LINK_PROBES.get(path) is thread:
@@ -419,6 +423,8 @@ def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
         thread.start()
     thread.join(timeout)
     if thread.is_alive():
+        return INCONCLUSIVE
+    if outcome.get("inconclusive"):
         return INCONCLUSIVE
     target = outcome.get("target")
     with _BOUNDED_LINK_LOCK:
@@ -456,13 +462,10 @@ def _drive_is_remote(drive):
 def _is_link_or_junction(path):
     """``islink`` that also recognises Windows directory junctions, which
     ``os.path.islink`` does not report but ``os.readlink`` can follow."""
-    try:
-        if os.path.islink(path):
-            return True
-        isjunction = getattr(os.path, "isjunction", None)
-        return bool(isjunction and isjunction(path))
-    except OSError:
-        return False
+    if os.path.islink(path):
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    return bool(isjunction and isjunction(path))
 
 
 def _normalize_link_target(target):
@@ -485,9 +488,8 @@ def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
 
     Returns the (partially) resolved absolute path, or ``None`` when nothing
     could be resolved. Each accumulated prefix is tested with ``candidate``
-    *before* it is ``lstat``-ed. Local components (``/``, ``/Volumes``,
-    ``/photos``) are inspected directly. A known mount prefix is inspected
-    only through :func:`_bounded_link_target`, so a symlinked alias such as
+    *before* it is ``lstat``-ed. Every non-UNC component is inspected only
+    through :func:`_bounded_link_target`, so a symlinked alias such as
     ``/mnt/archive -> /mnt/NAS`` is still followed to the real mount while a
     dead mount point cannot hang the caller; once a mount-shaped prefix is
     not a link the walk stops and the remainder is appended untouched. UNC
@@ -533,32 +535,20 @@ def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
             # links, so no lookup is needed here.
             continue
         cand = candidate(nxt.replace("\\", "/"))
-        if cand is not None and not _is_drive_root(cand):
-            # Mount-shaped: the only lookup allowed here is the bounded one.
-            target = _bounded_link_target(nxt)
-            if target is INCONCLUSIVE:
-                with _BOUNDED_LINK_LOCK:
-                    target = _LINK_TARGET_CACHE.get(nxt, INCONCLUSIVE)
-            if target is INCONCLUSIVE:
-                if inconclusive is not None:
-                    inconclusive.append(nxt)
-                prefix = nxt
+        target = _bounded_link_target(nxt)
+        if target is INCONCLUSIVE:
+            with _BOUNDED_LINK_LOCK:
+                target = _LINK_TARGET_CACHE.get(nxt, INCONCLUSIVE)
+        if target is INCONCLUSIVE:
+            if inconclusive is not None:
+                inconclusive.append(nxt)
+            prefix = nxt
+            break
+        if target is None:
+            prefix = nxt
+            if cand is not None and not _is_drive_root(cand):
                 break
-            if target is None:
-                prefix = nxt
-                break
-        else:
-            # Local component (including anything under a local drive root):
-            # a plain lstat is safe here; junctions into a share are
-            # detected on the junction itself, never by touching the share.
-            if not _is_link_or_junction(nxt):
-                prefix = nxt
-                continue
-            try:
-                target = os.readlink(nxt)
-            except OSError:
-                prefix = nxt
-                continue
+            continue
         target = _normalize_link_target(target)
         hops += 1
         if hops > _MAX_SYMLINK_HOPS:
@@ -740,10 +730,18 @@ def record_known_mount_roots(db, baseline: dict[str, bool]) -> None:
     fresh = {root for root, live in baseline.items() if live}
     if not fresh:
         return
+    transaction_started = False
     try:
+        # Acquire SQLite's writer reservation before reading the JSON value.
+        # Concurrent Database connections then serialize the complete
+        # read/merge/write sequence instead of both reading the same old set
+        # and letting the later UPSERT discard the other's newly seen root.
+        db.conn.execute("BEGIN IMMEDIATE")
+        transaction_started = True
         existing = load_known_mount_roots(db)
         merged = existing | fresh
         if merged == existing:
+            db.conn.commit()
             return
         db.conn.execute(
             "INSERT INTO db_meta(key, value) VALUES (?, ?) "
@@ -752,6 +750,9 @@ def record_known_mount_roots(db, baseline: dict[str, bool]) -> None:
         )
         db.conn.commit()
     except Exception:
+        if transaction_started:
+            with contextlib.suppress(Exception):
+                db.conn.rollback()
         log.debug(
             "Could not persist known mount roots (%r); cold-start detached "
             "stub detection will lack that evidence next run.",

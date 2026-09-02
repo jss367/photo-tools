@@ -115,7 +115,7 @@ def test_mount_root_candidates_uses_mount_table_for_custom_root(monkeypatch):
     )
 
     assert vr.mount_root_candidates("/srv/photos/2026/shoot") == ["/srv/photos"]
-    assert bounded == ["/srv/photos"]
+    assert bounded == ["/srv", "/srv/photos"]
     assert not any(path.startswith("/srv/photos") for path in direct)
 
 
@@ -371,7 +371,10 @@ def test_mount_root_candidates_follows_local_alias_without_touching_share(tmp_pa
         return real_islink(p)
 
     monkeypatch.setattr(vr.os.path, "islink", spy_islink)
-    monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: None)
+    monkeypatch.setattr(
+        vr, "_bounded_link_target",
+        lambda p, timeout=None: "/Volumes/NAS/photos" if str(p) == str(alias) else None,
+    )
     assert vr.mount_root_candidates(str(alias / "2026" / "shoot")) == ["/Volumes/NAS"]
     assert not any(t.startswith("/Volumes/NAS") for t in touched), touched
     monkeypatch.setattr(vr.os.path, "realpath", lambda p: pytest.fail("realpath must not be used"))
@@ -386,10 +389,10 @@ def test_mount_root_candidates_symlink_loop_is_bounded(tmp_path):
     assert vr.mount_root_candidates(str(tmp_path / "a" / "x")) == []
 
 
-def test_mount_root_candidates_only_bounded_lookups_on_mount_shaped_prefixes(monkeypatch):
-    """Anything at or below a mount-shaped prefix may only be inspected via the
-    time-bounded helper — never a bare ``islink``/``realpath`` (unbounded on
-    a dead server). UNC prefixes are never inspected at all."""
+def test_mount_root_candidates_uses_only_bounded_link_lookups(monkeypatch):
+    """All POSIX components are bounded; UNC prefixes are never inspected."""
+    monkeypatch.setattr(vr, "_system_mount_roots", lambda: set())
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
     bounded = []
     monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: bounded.append(p))
     monkeypatch.setattr(vr.os.path, "realpath", lambda p: pytest.fail(f"realpath({p!r})"))
@@ -401,10 +404,75 @@ def test_mount_root_candidates_only_bounded_lookups_on_mount_shaped_prefixes(mon
     assert vr.mount_root_candidates("/Volumes/NAS/photos") == ["/Volumes/NAS"]
     assert vr.mount_root_candidates("/mnt/nas/photos") == ["/mnt/nas"]
     assert not any(p.startswith("//") for p in bounded), bounded
-    assert set(bounded) == {"/Volumes/NAS", "/mnt/nas"}
-    assert not any(
-        p.startswith(("/Volumes/NAS", "/mnt/nas", "//")) for p in direct
-    ), f"unbounded lookup on a mount-shaped path: {direct}"
+    assert set(bounded) == {"/Volumes", "/Volumes/NAS", "/mnt", "/mnt/nas"}
+    assert direct == [], f"unbounded link lookup: {direct}"
+
+
+def test_unknown_custom_root_timeout_fails_closed_without_direct_lookup(monkeypatch):
+    monkeypatch.setattr(vr, "_system_mount_roots", lambda: set())
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
+    monkeypatch.setattr(vr, "_LINK_TARGET_CACHE", {})
+    bounded = []
+
+    def bounded_target(path, timeout=None):
+        bounded.append(path)
+        return vr.INCONCLUSIVE if path == "/srv/photos" else None
+
+    monkeypatch.setattr(vr, "_bounded_link_target", bounded_target)
+    monkeypatch.setattr(
+        vr, "_is_link_or_junction",
+        lambda path: pytest.fail(f"direct link lookup: {path}"),
+    )
+
+    candidates = vr.mount_root_candidates("/srv/photos/2026")
+    assert candidates == ["/srv/photos"]
+    assert candidates.conclusive is False
+    assert bounded == ["/srv", "/srv/photos"]
+    assert vr.VolumeReachability().check("/srv/photos/2026") == (
+        "/srv/photos", False,
+    )
+
+
+def test_record_known_mount_roots_serializes_concurrent_merges(tmp_path, monkeypatch):
+    """Two catalog workers must not overwrite one another's mount evidence."""
+    import threading
+    import time
+
+    from db import Database
+
+    db_path = str(tmp_path / "test.db")
+    first = Database(db_path)
+    second = Database(db_path)
+    original_load = vr.load_known_mount_roots
+
+    def delayed_load(db):
+        roots = original_load(db)
+        # Before BEGIN IMMEDIATE guarded the read, this widened the race so
+        # both workers read [] and the second UPSERT reliably lost one root.
+        time.sleep(0.05)
+        return roots
+
+    monkeypatch.setattr(vr, "load_known_mount_roots", delayed_load)
+    start = threading.Barrier(2)
+
+    def record(db, root):
+        start.wait()
+        vr.record_known_mount_roots(db, {root: True})
+
+    workers = [
+        threading.Thread(target=record, args=(first, "/srv/photos")),
+        threading.Thread(target=record, args=(second, "/archive/nas")),
+    ]
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+        assert not any(worker.is_alive() for worker in workers)
+        assert original_load(first) == {"/srv/photos", "/archive/nas"}
+    finally:
+        first.close()
+        second.close()
 
 
 def test_mount_root_candidates_follows_mount_shaped_alias_to_real_mount(monkeypatch):
@@ -435,6 +503,19 @@ def test_bounded_link_target_reads_local_symlink_and_times_out_on_wedged_mount(t
         assert list(vr._BOUNDED_LINK_PROBES) == ["/mnt/stuck"]
     finally:
         release.set()
+
+
+def test_bounded_link_target_keeps_filesystem_errors_inconclusive(monkeypatch):
+    monkeypatch.setattr(vr, "_BOUNDED_LINK_PROBES", {})
+    monkeypatch.setattr(vr, "_LINK_TARGET_CACHE", {})
+
+    def fail(_path):
+        raise OSError(errno.EIO, "offline")
+
+    monkeypatch.setattr(vr.os.path, "islink", fail)
+
+    assert vr._bounded_link_target("/srv/photos", timeout=1) is vr.INCONCLUSIVE
+    assert "/srv/photos" not in vr._LINK_TARGET_CACHE
 
 
 def test_resolver_skips_unc_server_prefix(monkeypatch):
@@ -507,14 +588,20 @@ def test_saturated_link_probes_fall_back_to_cached_real_mount(monkeypatch):
     directory" (which would let an import write into a detached stub)."""
     monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: vr.INCONCLUSIVE)
     # Both prefixes answered conclusively earlier: full resolution, confident.
-    monkeypatch.setattr(vr, "_LINK_TARGET_CACHE", {"/mnt/archive": "/mnt/NAS", "/mnt/NAS": None})
+    monkeypatch.setattr(
+        vr, "_LINK_TARGET_CACHE",
+        {"/mnt": None, "/mnt/archive": "/mnt/NAS", "/mnt/NAS": None},
+    )
     cands, conclusive = vr.mount_root_candidates_checked("/mnt/archive/photos")
     assert cands == ["/mnt/archive", "/mnt/NAS"]
     assert conclusive is True
-    # Only the alias is cached: the real mount is still reported (so the
-    # pipeline guards see it) but the result is not confident, because the
-    # real mount's own prefix could not be inspected.
-    monkeypatch.setattr(vr, "_LINK_TARGET_CACHE", {"/mnt/archive": "/mnt/NAS"})
+    # The local parent and alias are cached, but the real mount is not: the
+    # real mount is still reported (so pipeline guards see it), while the
+    # result is not confident because that prefix could not be inspected.
+    monkeypatch.setattr(
+        vr, "_LINK_TARGET_CACHE",
+        {"/mnt": None, "/mnt/archive": "/mnt/NAS"},
+    )
     cands, conclusive = vr.mount_root_candidates_checked("/mnt/archive/photos")
     assert cands == ["/mnt/archive", "/mnt/NAS"]
     assert conclusive is False
@@ -670,7 +757,7 @@ def test_resolver_follows_junction_below_windows_drive_root(monkeypatch):
     links = {"C:/Photos": "\\\\?\\UNC\\server\\share"}
     monkeypatch.setattr(vr, "_is_link_or_junction", lambda p: p in links)
     monkeypatch.setattr(vr.os, "readlink", lambda p: links[p])
-    monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: pytest.fail(f"lookup on {p}"))
+    monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: links.get(p))
     resolved = vr._resolve_symlinks_until_mount_shaped("C:/Photos/2026", vr._mount_shaped_candidate)
     assert resolved == "//server/share/2026"
     # End to end, with abspath neutralised (POSIX host running a Windows-shaped path).

@@ -1,4 +1,5 @@
 """Detect image files present on disk but not yet ingested into a workspace."""
+import errno
 import logging
 import os
 import stat
@@ -380,7 +381,15 @@ def _walk_root_bounded(root, root_path, mount_root, known, seen_new_paths,
         # anything else (a permission-denied subfolder) is skipped the way
         # the scanner skips it, so the count stays a lower bound for the
         # same files a scan would ingest.
-        if volume_reachability.is_offline_error(exc):
+        error_path = getattr(exc, "filename", None)
+        root_disappeared = (
+            isinstance(exc, OSError)
+            and exc.errno == errno.ENOENT
+            and error_path is not None
+            and os.path.normcase(os.path.normpath(os.fspath(error_path)))
+            == os.path.normcase(os.path.normpath(root_path))
+        )
+        if volume_reachability.is_offline_error(exc) or root_disappeared:
             reachability.mark_offline(mount_root)
             raise _RootOffline(exc)
         log.debug("new-images: skipping unreadable path: %s", exc)

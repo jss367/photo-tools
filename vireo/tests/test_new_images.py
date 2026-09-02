@@ -1825,6 +1825,43 @@ def test_overlapping_waiter_rechecks_offline_verdict_before_second_walk(
     assert len(gate.checked) == 1
 
 
+def test_root_enoent_is_offline_but_descendant_enoent_is_tolerated(
+        tmp_path, monkeypatch):
+    import errno
+
+    import new_images as new_images_module
+
+    root_path = str(tmp_path / "share")
+    gate = _FakeReachability()
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
+
+    def missing_root(top, onerror=None, **_kwargs):
+        onerror(OSError(errno.ENOENT, "gone", top))
+        if False:
+            yield None
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", missing_root)
+    assert new_images_module._walk_root_bounded(
+        {"id": 1, "path": root_path}, root_path, gate.mount_root,
+        set(), set(), gate, 0, 0, None, 250, 0, 2,
+    ) is None
+    assert gate.marked_offline == [gate.mount_root]
+
+    gate.marked_offline.clear()
+
+    def missing_child(top, onerror=None, **_kwargs):
+        onerror(OSError(errno.ENOENT, "gone", os.path.join(top, "child")))
+        yield top, [], []
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", missing_child)
+    assert new_images_module._walk_root_bounded(
+        {"id": 1, "path": root_path}, root_path, gate.mount_root,
+        set(), set(), gate, 0, 0, None, 250, 0, 2,
+    ) == ([], 0, 0)
+    assert gate.marked_offline == []
+
+
 def test_count_progress_and_totals_unchanged_by_worker_thread(db_with_workspace):
     """The worker-thread walk keeps the caller-visible contract: exact totals,
     monotonic progress, final ``(checked, new)`` event, cross-root dedupe."""

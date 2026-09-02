@@ -839,6 +839,66 @@ def test_bounded_process_probe_waits_for_healthy_same_root_probe(monkeypatch):
     assert len(created) == 2
 
 
+def test_abandoned_probe_wakes_same_root_waiter(monkeypatch):
+    import threading
+    import time
+
+    root = "/srv/photos"
+    release_reaper = threading.Event()
+
+    class Process:
+        def communicate(self):
+            release_reaper.wait(2)
+            return "", ""
+
+        def kill(self):
+            return None
+
+    process = Process()
+    monkeypatch.setattr(vr, "_NETWORK_PROBES", {root: process})
+    monkeypatch.setattr(vr, "_ABANDONED_NETWORK_PROBES", set())
+    result = []
+    started = threading.Event()
+
+    def wait_for_root():
+        started.set()
+        before = time.monotonic()
+        result.append((vr._reserve_network_probe(root, wait_timeout=1), time.monotonic() - before))
+
+    waiter = threading.Thread(target=wait_for_root)
+    waiter.start()
+    assert started.wait(1)
+    time.sleep(0.05)
+    try:
+        vr._abandon_network_probe(root, process)
+        waiter.join(0.5)
+        assert not waiter.is_alive()
+        assert result[0][0] is False
+        assert result[0][1] < 0.5
+    finally:
+        release_reaper.set()
+
+
+def test_record_known_mount_roots_commits_pending_implicit_transaction(tmp_path):
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    try:
+        db.conn.execute(
+            "INSERT INTO db_meta(key, value) VALUES (?, ?)",
+            ("pending_before_mount_history", "preserved"),
+        )
+        assert db.conn.in_transaction
+
+        vr.record_known_mount_roots(db, {"/srv/photos": True})
+
+        assert not db.conn.in_transaction
+        assert db.get_meta("pending_before_mount_history") == "preserved"
+        assert vr.load_known_mount_roots(db) == {"/srv/photos"}
+    finally:
+        db.close()
+
+
 def test_resolver_follows_junction_below_windows_drive_root(monkeypatch):
     """``C:\\Photos -> \\\\server\\share`` (a junction): the drive root is a
     traversal start, not a terminal mount, so the UNC share is reported."""

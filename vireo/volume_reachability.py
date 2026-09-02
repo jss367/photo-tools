@@ -628,6 +628,7 @@ def _abandon_network_probe(root, process):
     with _NETWORK_PROBE_CONDITION:
         if _NETWORK_PROBES.get(root) is process:
             _ABANDONED_NETWORK_PROBES.add(root)
+            _NETWORK_PROBE_CONDITION.notify_all()
     with contextlib.suppress(OSError):
         process.kill()
     threading.Thread(
@@ -765,6 +766,11 @@ def record_known_mount_roots(db, baseline: dict[str, bool]) -> None:
         return
     transaction_started = False
     try:
+        # This helper has always committed at the end, so preserving pending
+        # caller DML is part of its existing contract. End an implicit legacy
+        # sqlite3 transaction before opening the explicit writer transaction.
+        if db.conn.in_transaction:
+            db.conn.commit()
         # Acquire SQLite's writer reservation before reading the JSON value.
         # Concurrent Database connections then serialize the complete
         # read/merge/write sequence instead of both reading the same old set

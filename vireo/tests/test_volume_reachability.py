@@ -487,3 +487,26 @@ def test_probe_root_uses_directory_read_on_darwin(monkeypatch):
     monkeypatch.setattr(vr, "network_root_reachable", lambda *a, **k: pytest.fail("stat-only probe must not decide"))
     assert vr.probe_root("/Volumes/NAS") is True
     assert seen == ["/Volumes/NAS"]
+
+
+def test_resolver_follows_junction_below_windows_drive_root(monkeypatch):
+    """``C:\\Photos -> \\\\server\\share`` (a junction): the drive root is a
+    traversal start, not a terminal mount, so the UNC share is reported."""
+    links = {"C:/Photos": "\\\\?\\UNC\\server\\share"}
+    monkeypatch.setattr(vr, "_is_link_or_junction", lambda p: p in links)
+    monkeypatch.setattr(vr.os, "readlink", lambda p: links[p])
+    monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: pytest.fail(f"lookup on {p}"))
+    resolved = vr._resolve_symlinks_until_mount_shaped("C:/Photos/2026", vr._mount_shaped_candidate)
+    assert resolved == "//server/share/2026"
+    # End to end, with abspath neutralised (POSIX host running a Windows-shaped path).
+    monkeypatch.setattr(vr.os.path, "abspath", lambda p: p)
+    monkeypatch.setattr(vr.os.path, "normpath", lambda p: p)
+    cands = vr.mount_root_candidates("C:/Photos/2026")
+    assert cands == ["C:/", "//server/share"]
+    assert cands.conclusive is True
+
+
+def test_normalize_link_target_strips_windows_prefixes():
+    assert vr._normalize_link_target("\\\\?\\UNC\\server\\share\\x") == "//server/share/x"
+    assert vr._normalize_link_target("\\\\?\\D:\\archive") == "D:/archive"
+    assert vr._normalize_link_target("/mnt/NAS") == "/mnt/NAS"

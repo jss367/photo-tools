@@ -1529,3 +1529,17 @@ def test_safe_scan_walk_iteration_error_without_onerror_is_swallowed(tmp_path, m
         lambda p: _Broken() if str(p) == str(root) else real_scandir(p),
     )
     assert list(safe_scan_walk(str(root))) == []
+
+
+def test_safe_scan_walk_on_entry_fires_for_every_entry(tmp_path):
+    from image_loader import safe_scan_walk
+
+    root = tmp_path / "photos"
+    root.mkdir()
+    for i in range(5):
+        (root / f"{i}.jpg").write_bytes(b"")
+    (root / "sub").mkdir()
+    (root / "sub" / "deep.jpg").write_bytes(b"")
+    beats = []
+    list(safe_scan_walk(str(root), on_entry=lambda: beats.append(1)))
+    assert len(beats) == 7, "one heartbeat per directory entry, including subdirectories"

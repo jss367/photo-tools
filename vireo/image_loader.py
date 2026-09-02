@@ -296,7 +296,8 @@ def safe_iter_dir(top, onerror=None):
         )
 
 
-def safe_scan_walk(top, onerror=None, cancel_check=None, on_scandir_batch=None):
+def safe_scan_walk(top, onerror=None, cancel_check=None, on_scandir_batch=None,
+                   on_entry=None):
     """Yield ``(dirpath, dirnames, filenames)`` like ``os.walk(top,
     followlinks=False)``, but never stat-following a symlinked excluded
     bundle.
@@ -332,6 +333,10 @@ def safe_scan_walk(top, onerror=None, cancel_check=None, on_scandir_batch=None):
     ``next()``; callers do not need a separate per-yield poll for that
     case.
 
+    ``on_entry`` is invoked (with no arguments) for *every* directory entry
+    received — a cheap liveness heartbeat for watchdogs that must tell a
+    slow-but-streaming network listing apart from one that is wedged.
+
     ``on_scandir_batch`` is invoked (with no arguments) at the same
     per-256-entry checkpoint. The Jobs UI's discovery heartbeat piggybacks
     on the outer per-yield loop, which cannot advance while the walker is
@@ -354,6 +359,8 @@ def safe_scan_walk(top, onerror=None, cancel_check=None, on_scandir_batch=None):
     try:
         with scandir_it:
             for i, entry in enumerate(scandir_it):
+                if on_entry is not None:
+                    on_entry()
                 # Poll cancellation while we're still filling the buffer.
                 # A directory with millions of entries would otherwise finish
                 # the whole ``scandir`` loop before yielding, leaving pause
@@ -412,7 +419,7 @@ def safe_scan_walk(top, onerror=None, cancel_check=None, on_scandir_batch=None):
     for subdir in dirs:
         yield from safe_scan_walk(
             os.path.join(top, subdir), onerror=onerror, cancel_check=cancel_check,
-            on_scandir_batch=on_scandir_batch,
+            on_scandir_batch=on_scandir_batch, on_entry=on_entry,
         )
 
 

@@ -267,8 +267,8 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
 
 # A root walk that makes no progress for this long — no directory entry
 # enumerated, no file checked — is treated as a wedged share. SMB stalls
-# freeze a syscall for minutes; a healthy listing of even a huge directory
-# heartbeats every 256 entries via ``on_scandir_batch``.
+# freeze a syscall for minutes; a healthy listing heartbeats on every
+# directory entry received via ``safe_scan_walk(on_entry=...)``.
 WALK_STALL_TIMEOUT_SECONDS = 60.0
 _WALK_POLL_SECONDS = 0.25
 # root_path -> worker thread abandoned mid-walk. While it is alive the root
@@ -345,8 +345,11 @@ def _walk_root_bounded(root, root_path, mount_root, known, seen_new_paths,
             # alone is enough to trip the macOS TCC prompt. Mirror what
             # scanner.scan() will eventually pick up, so the banner can't be
             # inflated by files the scanner will never ingest.
+            # ``on_entry`` heartbeats on every directory entry received, so a
+            # slow-but-streaming network listing (or a directory with fewer
+            # than 256 entries taking a while) is not mistaken for a stall.
             walk = safe_scan_walk(
-                root_path, onerror=_on_walk_error, on_scandir_batch=_beat,
+                root_path, onerror=_on_walk_error, on_entry=_beat,
             )
             _walk_root_for_new_images(
                 walk, known, local_seen, state["paths"],

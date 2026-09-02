@@ -287,6 +287,39 @@ def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
     return target
 
 
+def _is_drive_root(prefix):
+    """``C:`` / ``C:/`` — a local Windows drive root."""
+    p = prefix.replace("\\", "/").rstrip("/")
+    return len(p) == 2 and p[1] == ":" and p[0].isalpha()
+
+
+def _is_link_or_junction(path):
+    """``islink`` that also recognises Windows directory junctions, which
+    ``os.path.islink`` does not report but ``os.readlink`` can follow."""
+    try:
+        if os.path.islink(path):
+            return True
+        isjunction = getattr(os.path, "isjunction", None)
+        return bool(isjunction and isjunction(path))
+    except OSError:
+        return False
+
+
+def _normalize_link_target(target):
+    """Strip the Windows extended-path prefix from a ``readlink`` result.
+
+    A junction target comes back as the extended form (question-mark prefix,
+    optionally followed by ``UNC``); the resolver wants plain ``C:/...`` or
+    ``//server/share/...``.
+    """
+    t = target.replace("\\", "/")
+    if t.startswith("//?/UNC/"):
+        return "//" + t[len("//?/UNC/"):]
+    if t.startswith("//?/"):
+        return t[len("//?/"):]
+    return t
+
+
 def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
     """Follow symlinks in ``path`` component by component, stopping early.
 
@@ -324,7 +357,16 @@ def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
             if candidate(nxt.replace("\\", "/")) is not None:
                 break
             continue
-        if candidate(nxt.replace("\\", "/")) is not None:
+        if _is_drive_root(nxt):
+            # A local Windows drive (``C:``) is where traversal *starts*, not
+            # a terminal mount: junctions below it (``C:\Photos`` ->
+            # ``\\server\share``) still have to be followed so the real
+            # remote root is reported. Drive roots themselves are never
+            # links, so no lookup is needed here.
+            prefix = nxt
+            continue
+        cand = candidate(nxt.replace("\\", "/"))
+        if cand is not None and not _is_drive_root(cand):
             # Mount-shaped: the only lookup allowed here is the bounded one.
             target = _bounded_link_target(nxt)
             if target is INCONCLUSIVE:
@@ -339,11 +381,10 @@ def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
                 prefix = nxt
                 break
         else:
-            try:
-                is_link = os.path.islink(nxt)
-            except OSError:
-                is_link = False
-            if not is_link:
+            # Local component (including anything under a local drive root):
+            # a plain lstat is safe here; junctions into a share are
+            # detected on the junction itself, never by touching the share.
+            if not _is_link_or_junction(nxt):
                 prefix = nxt
                 continue
             try:
@@ -351,11 +392,12 @@ def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
             except OSError:
                 prefix = nxt
                 continue
+        target = _normalize_link_target(target)
         hops += 1
         if hops > _MAX_SYMLINK_HOPS:
             return None
-        if not os.path.isabs(target):
-            target = os.path.normpath(os.path.join(os.path.dirname(nxt), target))
+        if not (os.path.isabs(target) or target.startswith("//") or _is_drive_root(target[:2])):
+            target = os.path.normpath(os.path.join(os.path.dirname(nxt), target)).replace("\\", "/")
         # Restart from the target: its own components may be links too.
         target_parts = [part for part in target.replace("\\", "/").split("/") if part]
         remaining = target_parts + remaining

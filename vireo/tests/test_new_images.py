@@ -1450,3 +1450,34 @@ def test_count_uses_shared_gate_by_default(db_with_workspace, monkeypatch):
     result = count_new_images_for_workspace(db, ws_id)
     assert result["unreachable_roots"] == [str(root)]
     assert result["new_count"] == 0
+
+
+def test_count_probes_reachability_before_any_root_filesystem_check(
+    db_with_workspace, monkeypatch,
+):
+    """For a root the gate reports offline, neither the bundle-exclusion check
+    (which lstat's path components) nor ``isdir`` may run: on a dead mount
+    those are unbounded lookups and must stay behind the bounded probe."""
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    offline = tmp_path / "offline"
+    _touch_image(str(offline / "a.jpg"))
+    db.add_folder(str(offline), name="offline")
+
+    touched = []
+    monkeypatch.setattr(
+        new_images_module, "is_excluded_scan_path",
+        lambda p: touched.append(("excluded", p)) or False,
+    )
+    monkeypatch.setattr(
+        new_images_module.os.path, "isdir",
+        lambda p: touched.append(("isdir", p)) or True,
+    )
+    gate = _FakeReachability(offline_prefixes=(str(offline),))
+    result = count_new_images_for_workspace(db, ws_id, reachability=gate)
+
+    assert result["unreachable_roots"] == [str(offline)]
+    assert touched == [], f"filesystem checks ran on an offline root: {touched}"
+    assert gate.checked == [str(offline)]

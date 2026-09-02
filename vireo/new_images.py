@@ -189,17 +189,25 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
         # ``os.path.isdir`` — isdir follows symlinks and stat's the target,
         # so for a directly selected bundle (or a symlink to one) the
         # existence test alone is enough to trip the macOS TCC prompt.
-        if is_excluded_scan_path(root_path):
-            per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
-            continue
-        # Ask the shared gate before any filesystem call on the root. On a
-        # dropped SMB share ``os.path.isdir`` can answer from stale cached
-        # metadata (or hang), so the bounded probe — not isdir — decides
-        # whether this root is worth walking at all.
+        #
+        # The reachability gate runs *first*, before even that exclusion
+        # check: ``is_excluded_scan_path`` walks the path's components with
+        # ``os.path.islink``, which on a dead SMB mount is an unbounded
+        # lookup. The gate itself never touches a mount-shaped path — its
+        # bounded probe is the only filesystem access — so ordering it ahead
+        # keeps every lookup on this root behind the timeout. The exclusion
+        # check still precedes ``isdir`` (the TCC concern above) because a
+        # bundle root is local and the gate passes it through untouched.
         mount_root, reachable = reachability.check(root_path)
         if not reachable:
             _unreachable(root, mount_root)
             continue
+        if is_excluded_scan_path(root_path):
+            per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
+            continue
+        # On a dropped SMB share ``os.path.isdir`` can answer from stale
+        # cached metadata (or hang), so the bounded probe above — not isdir —
+        # decides whether this root is worth walking at all.
         if not os.path.isdir(root_path):
             per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
             continue

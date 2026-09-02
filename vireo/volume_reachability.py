@@ -78,6 +78,39 @@ def is_offline_error(exc):
     return isinstance(exc, OSError) and exc.errno in OFFLINE_ERRNOS
 
 
+def _mount_shaped_candidate(posix_path: str) -> str | None:
+    """Mount-shaped root implied by ``posix_path`` (see :func:`mount_root_candidates`)."""
+    parts = posix_path.split("/")
+    if len(parts) >= 3 and parts[0] == "" and parts[1] in {"Volumes", "mnt"}:
+        return f"/{parts[1]}/{parts[2]}"
+    if len(parts) >= 4 and parts[0] == "" and parts[1] == "media":
+        return f"/media/{parts[2]}/{parts[3]}"
+    # UNC share: ``\\server\share\...`` after backslash-normalization
+    # becomes ``//server/share/...``, so ``parts`` starts with two
+    # empty strings.
+    if (
+        len(parts) >= 4
+        and parts[0] == ""
+        and parts[1] == ""
+        and parts[2]
+        and parts[3]
+    ):
+        return f"//{parts[2]}/{parts[3]}"
+    # Windows drive letter: ``Z:\...`` after normalization becomes
+    # ``Z:/...``. ``os.path.ismount("Z:")`` (no separator) returns
+    # False even for a real mounted drive because Windows treats
+    # ``Z:`` as a relative path on drive Z, so return with a trailing
+    # separator that ismount accepts.
+    if (
+        parts
+        and len(parts[0]) == 2
+        and parts[0][1] == ":"
+        and parts[0][0].isalpha()
+    ):
+        return f"{parts[0].upper()}/"
+    return None
+
+
 def mount_root_candidates(path: str, _report_confidence=None) -> list[str]:
     """Return the plausible mount-root prefix(es) for ``path``, if any.
 
@@ -101,37 +134,6 @@ def mount_root_candidates(path: str, _report_confidence=None) -> list[str]:
     are collapsed, and paths not shaped like a mount root return no
     candidates.
     """
-    def _candidate(posix_path: str) -> str | None:
-        parts = posix_path.split("/")
-        if len(parts) >= 3 and parts[0] == "" and parts[1] in {"Volumes", "mnt"}:
-            return f"/{parts[1]}/{parts[2]}"
-        if len(parts) >= 4 and parts[0] == "" and parts[1] == "media":
-            return f"/media/{parts[2]}/{parts[3]}"
-        # UNC share: ``\\server\share\...`` after backslash-normalization
-        # becomes ``//server/share/...``, so ``parts`` starts with two
-        # empty strings.
-        if (
-            len(parts) >= 4
-            and parts[0] == ""
-            and parts[1] == ""
-            and parts[2]
-            and parts[3]
-        ):
-            return f"//{parts[2]}/{parts[3]}"
-        # Windows drive letter: ``Z:\...`` after normalization becomes
-        # ``Z:/...``. ``os.path.ismount("Z:")`` (no separator) returns
-        # False even for a real mounted drive because Windows treats
-        # ``Z:`` as a relative path on drive Z, so return with a trailing
-        # separator that ismount accepts.
-        if (
-            parts
-            and len(parts[0]) == 2
-            and parts[0][1] == ":"
-            and parts[0][0].isalpha()
-        ):
-            return f"{parts[0].upper()}/"
-        return None
-
     raw_posix = os.path.expanduser(path).replace("\\", "/")
     normalized = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
     normalized_posix = normalized.replace("\\", "/")
@@ -151,7 +153,7 @@ def mount_root_candidates(path: str, _report_confidence=None) -> list[str]:
     # through a time-bounded helper rather than a bare ``lstat``.
     inconclusive: list[str] = []
     resolved = _resolve_symlinks_until_mount_shaped(
-        normalized, _candidate, inconclusive=inconclusive,
+        normalized, _mount_shaped_candidate, inconclusive=inconclusive,
     )
     resolved_posix = (
         resolved.replace("\\", "/") if resolved else None
@@ -161,12 +163,27 @@ def mount_root_candidates(path: str, _report_confidence=None) -> list[str]:
     for source in (raw_posix, normalized_posix, resolved_posix):
         if source is None:
             continue
-        cand = _candidate(source)
+        cand = _mount_shaped_candidate(source)
         if cand and cand not in seen:
             seen.append(cand)
     if _report_confidence is not None:
         _report_confidence.append(not inconclusive)
     return seen
+
+
+def resolve_alias_lexically(path):
+    """Symlink-resolved form of ``path`` that never looks below a mount root.
+
+    Local components are followed like ``realpath`` would; a mount-shaped
+    prefix is inspected only through the bounded probe and everything after
+    it is appended untouched. Callers use this to apply *name-based* rules
+    (bundle exclusion) to an alias such as ``~/PhotoLib`` that points into a
+    share, without any filesystem access on the share itself. Falls back to
+    the normalized input when nothing could be resolved.
+    """
+    normalized = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+    resolved = _resolve_symlinks_until_mount_shaped(normalized, _mount_shaped_candidate)
+    return resolved or normalized
 
 
 def mount_root_resolution_conclusive(path):

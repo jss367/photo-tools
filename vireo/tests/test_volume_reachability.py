@@ -192,9 +192,10 @@ def test_generic_probe_reuses_wedged_thread_instead_of_stacking(monkeypatch):
         assert vr._probe_root_generic("/mnt/stuck", timeout=0.05) is False
         assert started == ["/mnt/stuck"], "second check must reuse the live probe"
         assert "/mnt/stuck" in vr._GENERIC_PROBES
+        probe = vr._GENERIC_PROBES["/mnt/stuck"]
     finally:
         release.set()
-    vr._GENERIC_PROBES["/mnt/stuck"].join(1)
+    probe.join(1)
     assert "/mnt/stuck" not in vr._GENERIC_PROBES, "finished probe unregisters itself"
 
 
@@ -296,23 +297,24 @@ def test_bounded_link_target_reads_local_symlink_and_times_out_on_wedged_mount(t
         release.set()
 
 
-def test_resolver_skips_unc_server_prefix():
+def test_resolver_skips_unc_server_prefix(monkeypatch):
     calls = []
-    import os as _os
-    real = _os.path.islink
+    real = os.path.islink
 
     def spy(p):
-        calls.append(p)
+        calls.append(str(p))
         return real(p)
 
-    vr.os.path.islink = spy
-    try:
-        vr._resolve_symlinks_until_mount_shaped(
-            "//server/share/photos", lambda p: "//x/y" if p.count("/") >= 3 and p.startswith("//") and len([q for q in p.split("/") if q]) >= 2 else None,
-        )
-    finally:
-        vr.os.path.islink = real
-    assert calls == [], f"UNC server prefix was stat'ed: {calls}"
+    monkeypatch.setattr(vr.os.path, "islink", spy)
+    monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: None)
+    vr._resolve_symlinks_until_mount_shaped(
+        "//server/share/photos",
+        lambda p: "//x/y" if p.startswith("//") and len([q for q in p.split("/") if q]) >= 2 else None,
+    )
+    # ``os.path`` is process-global and daemon probe threads from earlier
+    # tests may still be calling it, so assert only on UNC prefixes.
+    unc = [c for c in calls if c.startswith("//")]
+    assert unc == [], f"UNC server prefix was stat'ed: {unc}"
 
 
 def test_generic_probe_recognises_detached_mount_stub(monkeypatch):

@@ -211,7 +211,19 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
             # to children), and there is no ``isdir`` — a root that vanished
             # surfaces as an ``OSError`` from the walk's first ``scandir``
             # and is handled by ``_on_walk_error`` below.
-            if any(is_excluded_scan_dir(part) for part in root_path.split(os.sep)):
+            # The literal path *and* its alias-resolved form are both
+            # checked, so ``~/PhotoLib -> /Volumes/NAS/Photos Library.photoslibrary``
+            # is still excluded; resolution follows local symlinks only and
+            # never looks below the mount root.
+            lexical_forms = {
+                root_path,
+                volume_reachability.resolve_alias_lexically(root_path),
+            }
+            if any(
+                is_excluded_scan_dir(part)
+                for form in lexical_forms
+                for part in form.replace("\\", "/").split("/")
+            ):
                 per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
                 continue
         else:

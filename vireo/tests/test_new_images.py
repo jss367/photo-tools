@@ -1530,3 +1530,28 @@ def test_count_excludes_bundle_root_on_mount_lexically(db_with_workspace, monkey
     result = count_new_images_for_workspace(db, ws_id, reachability=gate)
     assert result["new_count"] == 0
     assert result["unreachable_roots"] == []
+
+
+def test_count_excludes_alias_into_bundle_on_mount(db_with_workspace, monkeypatch):
+    """``~/PhotoLib -> /Volumes/NAS/Photos Library.photoslibrary``: the literal
+    root has no excluded component, but its lexically resolved form does, so
+    the bundle is still excluded without touching the share."""
+    import sys
+
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    if sys.platform == "win32":
+        pytest.skip("POSIX symlinks")
+    db, ws_id, tmp_path = db_with_workspace
+    alias = tmp_path / "PhotoLib"
+    alias.symlink_to("/Volumes/Fake/Photos Library.photoslibrary")
+    db.add_folder(str(alias), name="lib")
+    monkeypatch.setattr(
+        new_images_module, "safe_scan_walk",
+        lambda *a, **k: pytest.fail("bundle alias must not be walked"),
+    )
+    gate = _FakeReachability(mount_root="/Volumes/Fake")
+    result = count_new_images_for_workspace(db, ws_id, reachability=gate)
+    assert result["new_count"] == 0
+    assert result["per_root"][0]["new_count"] == 0

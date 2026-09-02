@@ -271,8 +271,14 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
 # directory entry received via ``safe_scan_walk(on_entry=...)``.
 WALK_STALL_TIMEOUT_SECONDS = 60.0
 _WALK_POLL_SECONDS = 0.25
-# root_path -> worker thread abandoned mid-walk. While it is alive the root
-# is reported offline without starting another walk that would wedge too.
+# Bound the registry before starting a worker, not only after it stalls. That
+# reservation is what keeps several distinct shares that wedge concurrently
+# from all becoming permanently blocked daemon threads.
+_MAX_STALLED_WALKS = 8
+_WALK_RESERVED = object()
+# root_path -> reservation or worker thread. Healthy completed workers are
+# reaped before the next reservation; a wedged worker remains registered so
+# later checks fail closed without starting another one for the same root.
 _STALLED_WALKS = {}
 _STALLED_WALKS_LOCK = threading.Lock()
 
@@ -295,16 +301,29 @@ def _walk_root_bounded(root, root_path, mount_root, known, seen_new_paths,
     not corrupt a result that has already been published.
     """
     with _STALLED_WALKS_LOCK:
-        stale = _STALLED_WALKS.get(root_path)
-        if stale is not None:
-            if stale.is_alive():
+        existing = _STALLED_WALKS.get(root_path)
+        if existing is not None:
+            if existing is _WALK_RESERVED or existing.is_alive():
                 log.warning(
-                    "new-images: %s still has a wedged walk from an earlier "
-                    "check; reporting offline without walking again", root_path,
+                    "new-images: %s already has an active or wedged walk; "
+                    "reporting offline without walking again", root_path,
                 )
                 reachability.mark_offline(mount_root)
                 return None
             del _STALLED_WALKS[root_path]
+        # Finished workers for other roots do not consume capacity. Live
+        # workers do: any of them may be the next uninterruptible SMB stall.
+        for other_path, other in list(_STALLED_WALKS.items()):
+            if other is not _WALK_RESERVED and not other.is_alive():
+                del _STALLED_WALKS[other_path]
+        if len(_STALLED_WALKS) >= _MAX_STALLED_WALKS:
+            log.warning(
+                "new-images: root-walk limit reached while checking %s; "
+                "reporting offline without starting another worker", root_path,
+            )
+            reachability.mark_offline(mount_root)
+            return None
+        _STALLED_WALKS[root_path] = _WALK_RESERVED
 
     state = {
         "checked": 0, "paths": [], "last": time.monotonic(),
@@ -365,15 +384,20 @@ def _walk_root_bounded(root, root_path, mount_root, known, seen_new_paths,
     thread = threading.Thread(
         target=worker, daemon=True, name="new-images-walk-root",
     )
-    thread.start()
+    with _STALLED_WALKS_LOCK:
+        _STALLED_WALKS[root_path] = thread
+        try:
+            thread.start()
+        except Exception:
+            if _STALLED_WALKS.get(root_path) is thread:
+                del _STALLED_WALKS[root_path]
+            raise
     while True:
         thread.join(_WALK_POLL_SECONDS)
         if not thread.is_alive():
             break
         if time.monotonic() - state["last"] > stall_timeout:
             state["abandoned"] = True
-            with _STALLED_WALKS_LOCK:
-                _STALLED_WALKS[root_path] = thread
             log.warning(
                 "new-images: walk of %s made no progress for %.0fs; "
                 "treating volume %s as offline and abandoning the walk",

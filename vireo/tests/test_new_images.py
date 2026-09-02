@@ -1614,6 +1614,55 @@ def test_count_abandons_stalled_walk_and_reports_root_offline(db_with_workspace,
     new_images_module._STALLED_WALKS[str(wedged)].join(2)
 
 
+def test_count_caps_stalled_walks_globally(db_with_workspace, monkeypatch):
+    """Distinct wedged roots cannot accumulate workers past the global cap.
+
+    Slots are reserved before workers start, so the bound also holds when
+    several walks are active at once and all later become uninterruptible.
+    Once full, another root fails closed without spawning a thread.
+    """
+    import threading
+
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    roots = [tmp_path / name for name in ("wedged-a", "wedged-b", "wedged-c")]
+    for root in roots:
+        _touch_image(str(root / "a.jpg"))
+        db.add_folder(str(root), name=root.name)
+
+    release = threading.Event()
+    started = []
+
+    def walk_that_hangs(top, **_kwargs):
+        started.append(top)
+        yield top, [], ["a.jpg"]
+        release.wait(10)
+        yield top, [], []
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", walk_that_hangs)
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_MAX_STALLED_WALKS", 2)
+    workers = []
+    try:
+        result = count_new_images_for_workspace(
+            db, ws_id, reachability=_FakeReachability(), stall_timeout=0.05,
+        )
+        assert result["unreachable_roots"] == [str(root) for root in roots]
+        assert started == [str(root) for root in roots[:2]], (
+            "the saturated third root must not spawn a worker"
+        )
+        assert set(new_images_module._STALLED_WALKS) == {
+            str(root) for root in roots[:2]
+        }
+        workers = list(new_images_module._STALLED_WALKS.values())
+    finally:
+        release.set()
+    for worker in workers:
+        worker.join(2)
+
+
 def test_count_progress_and_totals_unchanged_by_worker_thread(db_with_workspace):
     """The worker-thread walk keeps the caller-visible contract: exact totals,
     monotonic progress, final ``(checked, new)`` event, cross-root dedupe."""

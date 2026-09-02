@@ -12,6 +12,10 @@ that information for interactive use.
 - Services own filesystem work, subprocesses, cache invalidation, and workflow
   coordination. A route should call a service rather than implement those
   operations itself.
+- Routes that launch a background job use `@background_job` from
+  `vireo/web/background_jobs.py`. The view receives a `JobLaunch` (runner,
+  active workspace id, worker-thread database factory) and returns
+  `ctx.start(job_type, work, ...)`; do not re-implement that prologue inline.
 - Repositories own SQL for one domain. `Database` remains a compatibility
   façade while photo, workspace, metadata, and job access is extracted.
 - Schema changes are ordered migrations in `vireo/schema.py`. They execute once

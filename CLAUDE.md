@@ -44,6 +44,7 @@ Tests use temp databases. `vireo/tests/test_app.py` isolates config via `cfg.CON
 - `vireo/duplicates.py` — Pure exact-duplicate resolver (winner/loser decision + metadata merge). Consumed by `db.apply_duplicate_resolution` and the scan job.
 - `vireo/import_dedup.py` — Metadata-first duplicate gate for imports (`CatalogIndex` + `DuplicateChecker`): match by (filename, size, EXIF capture time) with a content-hash fallback for missing/placeholder metadata; `verify_by_hash` restores hash-everything. Shared by `ingest()`, `/api/import/check-duplicates`, and the local-processing preflight so duplicate previews always agree with what ingest actually skips.
 - `vireo/jobs.py` — `JobRunner` for background tasks (scan, classify, thumbnails, etc.) with SSE progress streaming.
+- `vireo/web/background_jobs.py` — `@background_job` decorator + `JobLaunch` context. Every route that starts a job takes `ctx` as its first argument, opens worker DBs with `ctx.thread_db()`, and returns `ctx.start(job_type, work, ...)`.
 - `vireo/config.py` — Global config read/write from `~/.vireo/config.json`.
 - `vireo/templates/_navbar.html` — Shared navbar included by all pages. Contains workspace switcher, bottom panel, lightbox, theme system.
 - `vireo/templates/*.html` — One file per page, inline CSS and JS.

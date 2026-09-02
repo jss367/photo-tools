@@ -15,6 +15,34 @@ def _clear_shared_gate():
     vr.get_shared().clear()
 
 
+@pytest.fixture(autouse=True)
+def _posix_shaped_inputs_stay_posix(monkeypatch):
+    """Keep ``/Volumes/...``, ``/mnt/...`` and ``//server/share`` literals
+    POSIX-shaped on every host.
+
+    On Windows ``os.path.abspath("/mnt/archive")`` becomes ``D:\\mnt\\archive``,
+    which would add a spurious ``D:/`` drive candidate and double every probe
+    in these tests. Real Windows inputs (``tmp_path``, ``C:/...``) are left to
+    the real functions.
+    """
+    import posixpath
+
+    real_abspath, real_normpath = os.path.abspath, os.path.normpath
+
+    def abspath(p):
+        p = os.fspath(p)
+        return p if p.startswith("/") else real_abspath(p)
+
+    def normpath(p):
+        p = os.fspath(p)
+        if p.startswith("//"):
+            return "//" + posixpath.normpath(p[2:]).lstrip("/")
+        return posixpath.normpath(p) if p.startswith("/") else real_normpath(p)
+
+    monkeypatch.setattr(vr.os.path, "abspath", abspath)
+    monkeypatch.setattr(vr.os.path, "normpath", normpath)
+
+
 class _FakeScandir:
     def __init__(self, names):
         self._it = iter(names)

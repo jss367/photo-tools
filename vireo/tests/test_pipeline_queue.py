@@ -765,7 +765,18 @@ def test_cancel_queued_pipeline_after_promotion_finishes_marks_running(tmp_path,
         def close(self):
             return None
 
-    monkeypatch.setattr(sqlite3, "connect", lambda *args, **kwargs: FakeConnection())
+    # Fake only the runner's own database. ``sqlite3.connect`` is process
+    # global, and coverage.py flushes per-test contexts to its own SQLite
+    # file at every test boundary; handing coverage a FakeConnection kills
+    # the xdist worker and errors every later test on it.
+    original_connect = sqlite3.connect
+
+    def fake_connect(path, *args, **kwargs):
+        if str(path) == str(runner._db_path):
+            return FakeConnection()
+        return original_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
 
     assert runner.cancel_job(job_id) is True
     assert runner.is_cancelled(job_id)
@@ -823,11 +834,16 @@ def test_promotion_db_error_retries_queued_pipeline(tmp_path, monkeypatch):
     original_connect = sqlite3.connect
     calls = {"count": 0}
 
-    def fail_connect(*args, **kwargs):
+    def fail_connect(path, *args, **kwargs):
+        # Only the runner's database is "locked"; coverage.py's own SQLite
+        # data file (flushed at every test boundary under --cov-context)
+        # must keep connecting normally.
+        if str(path) != str(runner._db_path):
+            return original_connect(path, *args, **kwargs)
         calls["count"] += 1
         if calls["count"] == 1:
             raise sqlite3.OperationalError("database is locked")
-        return original_connect(*args, **kwargs)
+        return original_connect(path, *args, **kwargs)
 
     monkeypatch.setattr(sqlite3, "connect", fail_connect)
     runner._try_promote_queued()

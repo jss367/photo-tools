@@ -80,6 +80,26 @@ testpaths = ["tests", "vireo/tests"]
 markers = ["e2e: end-to-end browser tests (require Playwright)"]
 addopts = "--ignore=tests/e2e"
 
+[tool.coverage.run]
+# Store repo-relative paths in coverage data so the test-impact map built on
+# CI (``--cov-context=test``, see .github/workflows/test-main.yml) can be read
+# by ``scripts/select_tests.py`` from any checkout location.
+relative_files = true
+# The test-impact map needs per-test dynamic contexts. coverage's
+# ``sys.monitoring`` core (the default on Python 3.12+) disables a line's
+# event after its first hit, so a line executed again by a later test is never
+# attributed to that test and whole parametrized siblings vanish from the map.
+# The C tracer records every context correctly; the map validator in
+# ``scripts/select_tests.py build-map`` rejects the sysmon-shaped result.
+core = "ctrace"
+
+[tool.coverage.report]
+# test-main.yml measures ``tests/`` and ``scripts/`` so the impact map has a
+# context for every test, but the coverage percentage stays what it always
+# was: ``vireo/**`` (which includes ``vireo/tests``). Patterns are anchored
+# at the path start, so ``tests/*`` does not touch ``vireo/tests``.
+omit = ["tests/*", "scripts/*"]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 120

@@ -1,0 +1,120 @@
+name: Full tests
+
+# The complete unit suite on every OS, run after each merge instead of on
+# every PR push. PRs (test.yml) run only the tests their diff can affect,
+# selected from the per-test coverage map this workflow records on Linux.
+#
+# Why post-merge: the three OS legs take 11-23 minutes and most PR runs used
+# to be cancelled by the next push before finishing. Moving the full matrix
+# here keeps the platform coverage without making every push wait for it.
+#
+# The weekly schedule keeps the impact-map cache warm through quiet weeks
+# (Actions evicts caches untouched for 7 days) so PRs never silently fall
+# back to the full suite.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "41 7 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full-suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-python-tests
+        with:
+          hf-token: ${{ secrets.HF_TOKEN }}
+
+      # Linux is the canonical full run: it enforces the coverage threshold
+      # and records per-test contexts for the PR test selector. ``tests/``
+      # and ``scripts/`` are measured too so every test owns at least one
+      # recorded line (its own body) and the map validator can demand a
+      # context per executed test; ``[tool.coverage.report] omit`` keeps
+      # them out of the percentage, so the threshold basis is unchanged.
+      # Cap xdist workers at 2: with ``-n auto`` several heavy ML/pipeline
+      # tests can load models on parallel workers at once, spike memory, and
+      # trip the Linux OOM killer — which takes out the runner agent and
+      # surfaces as an intermittent ``The runner has received a shutdown
+      # signal`` cancellation rather than a test failure.
+      # Coverage is ratcheted to the measured 2026-07-10 baseline. Raise this
+      # number when coverage improves; do not replace it with a low evergreen
+      # floor.
+      #
+      # The exit code is captured so the map is published only after a fully
+      # successful test run. A failed test can exit before it exercises all of
+      # its usual production lines; counting test contexts cannot detect that
+      # incomplete coverage, so an exit-1 map is not safe for later selection.
+      - name: Run tests with coverage (Linux)
+        id: tests
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set +e
+          python -m pytest tests/ vireo/tests/ -n 2 -v --tb=short --timeout=120 --timeout-method=thread \
+            --cov=vireo --cov=tests --cov=scripts --cov-context=test --cov-report=term-missing --cov-fail-under=87 \
+            --junitxml=pytest-report.xml
+          code=$?
+          echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      # macOS/Windows verify platform-specific code paths. The coverage gate is
+      # skipped here because POSIX-only tests don't run on Windows, which would
+      # otherwise push coverage below the threshold for reasons unrelated to
+      # the change. These runners are smaller/slower, so cap xdist workers at
+      # 2 to avoid OOM worker crashes on the heavier ML tests.
+      - name: Run tests (macOS / Windows)
+        if: runner.os != 'Linux'
+        run: python -m pytest tests/ vireo/tests/ -n 2 -v --tb=short --timeout=120 --timeout-method=thread
+
+      # Package the coverage data as the test-impact map. ``build-map``
+      # refuses a map whose per-test contexts don't account for the tests
+      # the junit report says ran, so a worker crash can't publish a map
+      # that under-selects.
+      - name: Build test-impact map
+        id: build-map
+        if: >-
+          runner.os == 'Linux' && !cancelled()
+          && steps.tests.outputs.exit-code == '0'
+        run: >-
+          python scripts/select_tests.py build-map
+          --coverage-file .coverage --junit-xml pytest-report.xml --sha "$GITHUB_SHA"
+
+      # PRs restore the newest ``test-impact-map-*`` entry via restore-keys.
+      # Keys are immutable, so every merge publishes a fresh, SHA-suffixed one.
+      - name: Publish test-impact map to the Actions cache
+        if: ${{ !cancelled() && steps.build-map.outcome == 'success' }}
+        uses: actions/cache/save@v5
+        with:
+          path: .test-impact
+          key: test-impact-map-${{ github.sha }}
+
+      # Same map as a downloadable artifact for local use:
+      # ``python scripts/select_tests.py fetch-map``.
+      - name: Upload test-impact map
+        if: ${{ !cancelled() && steps.build-map.outcome == 'success' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-impact-map
+          path: .test-impact
+          include-hidden-files: true
+          retention-days: 30
+          if-no-files-found: error

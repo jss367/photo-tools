@@ -73,6 +73,24 @@ Then open [http://localhost:8080](http://localhost:8080).
 python -m pytest tests/ vireo/tests/ -q
 ```
 
+The full unit suite is ~7.5k tests (3-4 minutes locally on all cores). To run
+only the tests your branch can affect, download the per-test coverage map
+that the post-merge "Full tests" workflow publishes, then let the selector
+map your diff onto it:
+
+```bash
+python scripts/select_tests.py fetch-map          # once per day or so; needs `gh`
+python scripts/select_tests.py --run -- -n auto -q
+```
+
+`select_tests.py --explain` shows why each changed file selected what it
+did. PR CI runs the same selection on Linux; the complete suite on all three
+OSes runs after merge (`.github/workflows/test-main.yml`). Add the
+`ci-full-suite` label to a PR to force the full suite there. Module-level,
+structurally ambiguous, and test-harness changes also use the full-suite
+fallback because import-time dependencies cannot be narrowed safely from line
+coverage.
+
 ## Scripting & automation
 
 Vireo exposes a small stable HTTP API under `/api/v1` for scripts and agents. A running instance advertises its port and auth token via `~/.vireo/runtime.json`. See [docs/headless-api.md](docs/headless-api.md) for discovery, spawning a headless instance, authentication, and a worked `curl` example.

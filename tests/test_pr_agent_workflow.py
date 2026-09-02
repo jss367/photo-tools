@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/pr-agent.yml"
 TEST_WORKFLOW = ROOT / ".github/workflows/test.yml"
+FULL_TEST_WORKFLOW = ROOT / ".github/workflows/test-main.yml"
 FIRE_ACTION = ROOT / ".github/actions/fire-routine/action.yml"
 MERGE_ACTION = ROOT / ".github/actions/pr-merge-ready/action.yml"
 ROUTINE_PROMPT = ROOT / "docs/pr-agent-routine-prompt.md"
@@ -26,6 +27,23 @@ def test_automation_contract_inputs_run_the_python_suite():
     assert 'path.startsWith(".github/actions/")' in test_workflow
     assert 'path === ".github/workflows/pr-agent.yml"' in test_workflow
     assert 'path === "docs/pr-agent-routine-prompt.md"' in test_workflow
+
+
+def test_full_suite_label_overrides_path_classification():
+    workflow = _read(TEST_WORKFLOW)
+
+    assert workflow.index("const full =") < workflow.index("const python =")
+    assert "const python = full || touchesTestWorkflow ||" in workflow
+
+
+def test_impact_map_requires_success_and_uploads_from_hidden_directory():
+    workflow = _read(FULL_TEST_WORKFLOW)
+
+    assert "&& steps.tests.outputs.exit-code == '0'" in workflow
+    assert "steps.tests.outputs.exit-code == '1'" not in workflow
+    condition = "if: ${{ !cancelled() && steps.build-map.outcome == 'success' }}"
+    assert workflow.count(condition) == 2
+    assert "include-hidden-files: true" in workflow
 
 
 def test_review_events_are_collapsed_and_generated_feedback_is_ignored():

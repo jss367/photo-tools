@@ -1336,6 +1336,44 @@ class _FakeReachability:
         self.marked_offline.append(root)
 
 
+def test_count_seeds_and_records_durable_mount_history(db_with_workspace, monkeypatch):
+    """New-images probes consume and extend the catalog's mount evidence."""
+    import volume_reachability
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    root = tmp_path / "photos"
+    _touch_image(str(root / "a.jpg"))
+    db.add_folder(str(root), name="photos")
+    seeded = []
+    recorded = []
+
+    monkeypatch.setattr(
+        volume_reachability, "load_known_mount_roots",
+        lambda checked_db: {"/mnt/old"} if checked_db is db else set(),
+    )
+    monkeypatch.setattr(
+        volume_reachability, "seed_known_mount_roots",
+        lambda roots: seeded.append(set(roots)),
+    )
+    monkeypatch.setattr(
+        volume_reachability, "was_observed_mounted", lambda root: True,
+    )
+    monkeypatch.setattr(
+        volume_reachability, "record_known_mount_roots",
+        lambda checked_db, baseline: recorded.append((checked_db, baseline)),
+    )
+    gate = _FakeReachability(mount_root="/mnt/NAS")
+
+    result = count_new_images_for_workspace(
+        db, ws_id, reachability=gate,
+    )
+
+    assert result["new_count"] == 1
+    assert seeded == [{"/mnt/old"}]
+    assert recorded == [(db, {"/mnt/NAS": True})]
+
+
 def test_count_skips_root_on_offline_volume_and_reports_it(db_with_workspace):
     """A root whose volume the gate reports offline is skipped without any
     filesystem walk and named in the result, while other roots still count."""

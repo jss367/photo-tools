@@ -156,6 +156,9 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
         stall_timeout = WALK_STALL_TIMEOUT_SECONDS
     known = _known_paths_for_workspace(db, workspace_id)
     roots = mapped_roots(db, workspace_id)
+    volume_reachability.seed_known_mount_roots(
+        volume_reachability.load_known_mount_roots(db)
+    )
 
     per_root = []
     sample = []
@@ -164,6 +167,7 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
     files_checked = 0
     last_emitted = 0
     seen_new_paths = set()
+    live_mount_roots = set()
 
     def _unreachable(root, mount_root):
         log.warning(
@@ -200,6 +204,11 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
         if not reachable:
             _unreachable(root, mount_root)
             continue
+        if (
+            mount_root is not None
+            and volume_reachability.was_observed_mounted(mount_root)
+        ):
+            live_mount_roots.add(mount_root)
         if mount_root is not None:
             # Mount-shaped root: the gate's verdict may be up to 30s old and
             # the share can have dropped since, so no unbounded lookup may
@@ -255,6 +264,9 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
 
     if progress_callback is not None:
         progress_callback(files_checked, total)
+    volume_reachability.record_known_mount_roots(
+        db, {root: True for root in live_mount_roots}
+    )
 
     return {
         "new_count": total,

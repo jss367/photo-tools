@@ -472,6 +472,20 @@ def test_generic_probe_cold_start_accepts_empty_unmounted_root(monkeypatch):
     assert vr._MOUNT_BASELINE["/mnt/photos"] is False
 
 
+def test_generic_probe_rejects_empty_stub_from_persisted_mount_history(monkeypatch):
+    """Durable evidence disambiguates a detached stub after process restart."""
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
+    monkeypatch.setattr(vr, "_GENERIC_PROBES", {})
+    monkeypatch.setattr(vr.os.path, "isdir", lambda p: True)
+    monkeypatch.setattr(vr.os.path, "ismount", lambda p: False)
+    monkeypatch.setattr(vr.os, "scandir", lambda p: _FakeScandir([]))
+
+    vr.seed_known_mount_roots({"/mnt/NAS"})
+
+    assert vr._probe_root_generic("/mnt/NAS", timeout=1) is False
+    assert vr.was_observed_mounted("/mnt/NAS") is True
+
+
 def test_generic_probe_accepts_empty_alias_before_resolved_mount(monkeypatch):
     """A healthy empty share remains reachable through an unmounted alias."""
     monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})

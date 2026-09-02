@@ -29,6 +29,7 @@ sites and tests are unaffected.
 """
 import contextlib
 import errno
+import json
 import logging
 import os
 import subprocess
@@ -567,6 +568,71 @@ _MAX_GENERIC_PROBES = _MAX_NETWORK_PROBES
 # *used to be* a mount lets the stub be recognised. Roots that were never a
 # mount (an ordinary local ``/mnt/photos`` folder) stay plain directories.
 _MOUNT_BASELINE = {}
+_MOUNT_BASELINE_LOCK = threading.Lock()
+
+# Historical db_meta key used by pipeline mount guards. The reachability gate
+# now shares it so a new process can distinguish a readable detached stub from
+# a legitimate empty local directory without inventing a second persistence
+# format.
+KNOWN_MOUNT_ROOTS_KEY = "known_archive_mount_roots"
+
+
+def load_known_mount_roots(db) -> set[str]:
+    """Return mount roots previously observed live in this catalog."""
+    try:
+        row = db.conn.execute(
+            "SELECT value FROM db_meta WHERE key = ?",
+            (KNOWN_MOUNT_ROOTS_KEY,),
+        ).fetchone()
+    except Exception:
+        return set()
+    if row is None or row["value"] is None:
+        return set()
+    try:
+        entries = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(entries, list):
+        return set()
+    return {str(entry) for entry in entries if isinstance(entry, str)}
+
+
+def record_known_mount_roots(db, baseline: dict[str, bool]) -> None:
+    """Persist newly observed live roots, preserving all prior evidence."""
+    fresh = {root for root, live in baseline.items() if live}
+    if not fresh:
+        return
+    try:
+        existing = load_known_mount_roots(db)
+        merged = existing | fresh
+        if merged == existing:
+            return
+        db.conn.execute(
+            "INSERT INTO db_meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (KNOWN_MOUNT_ROOTS_KEY, json.dumps(sorted(merged))),
+        )
+        db.conn.commit()
+    except Exception:
+        log.debug(
+            "Could not persist known mount roots (%r); cold-start detached "
+            "stub detection will lack that evidence next run.",
+            sorted(fresh), exc_info=True,
+        )
+
+
+def seed_known_mount_roots(roots) -> None:
+    """Install durable mounted-root evidence before bounded probes run."""
+    with _MOUNT_BASELINE_LOCK:
+        for root in roots:
+            if isinstance(root, str) and root:
+                _MOUNT_BASELINE[root] = True
+
+
+def was_observed_mounted(root) -> bool:
+    """Whether ``root`` is durably known or was mounted in this process."""
+    with _MOUNT_BASELINE_LOCK:
+        return bool(_MOUNT_BASELINE.get(root))
 
 
 def _classify_generic_root(root):
@@ -591,16 +657,16 @@ def _classify_generic_root(root):
             next(it, None)
     except OSError:
         return False
-    if is_mount:
-        _MOUNT_BASELINE[root] = True
-        return True
-    if _MOUNT_BASELINE.get(root):
-        return False
-    # With no in-process mount history, a readable unmounted directory is a
-    # valid local root even when empty. Emptiness alone cannot distinguish it
-    # from a detached mount stub, and treating it as evidence would also reject
-    # a symlink alias before the resolved live mount candidate is probed.
-    _MOUNT_BASELINE.setdefault(root, False)
+    with _MOUNT_BASELINE_LOCK:
+        if is_mount:
+            _MOUNT_BASELINE[root] = True
+            return True
+        if _MOUNT_BASELINE.get(root):
+            return False
+        # With no durable or in-process mount history, a readable unmounted
+        # directory is a valid local root even when empty. Emptiness alone
+        # cannot distinguish it from a detached mount stub.
+        _MOUNT_BASELINE.setdefault(root, False)
     return True
 
 

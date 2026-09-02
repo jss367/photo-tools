@@ -62,7 +62,13 @@ from resource_ledger import (
     suspend_resource_wait_timing,
 )
 from volume_reachability import (
+    load_known_mount_roots as _load_known_mount_roots,  # noqa: F401
+)
+from volume_reachability import (
     mount_root_candidates as _archive_mount_root_candidates,
+)
+from volume_reachability import (
+    record_known_mount_roots as _record_known_mount_roots,  # noqa: F401
 )
 
 log = logging.getLogger(__name__)
@@ -271,68 +277,6 @@ def _archive_mount_baseline(
     for root in candidates:
         baseline[root] = root in known or os.path.ismount(root)
     return baseline
-
-
-_KNOWN_MOUNT_ROOTS_KEY = "known_archive_mount_roots"
-
-
-def _load_known_mount_roots(db) -> set[str]:
-    """Return the persistent set of mount roots ever observed as live.
-
-    Used by ``_archive_mount_baseline`` to seed True across runs: a share
-    that was live on a prior successful run and is detached now must be
-    treated as a mounted → unmounted transition, not as a plain local
-    dir that was never a mount. Read failures (missing key, malformed
-    JSON, DB gone) fall back to an empty set — a stale-history failure
-    is not a reason to refuse a fresh import.
-    """
-    try:
-        row = db.conn.execute(
-            "SELECT value FROM db_meta WHERE key = ?",
-            (_KNOWN_MOUNT_ROOTS_KEY,),
-        ).fetchone()
-    except Exception:
-        return set()
-    if row is None or row["value"] is None:
-        return set()
-    try:
-        entries = json.loads(row["value"])
-    except (TypeError, ValueError):
-        return set()
-    if not isinstance(entries, list):
-        return set()
-    return {str(e) for e in entries if isinstance(e, str)}
-
-
-def _record_known_mount_roots(db, baseline: dict[str, bool]) -> None:
-    """Merge any True baseline entries into the persistent known-mounted set.
-
-    Only additive — a root that was recorded once stays recorded, so a
-    share that is currently detached still gets its True → False
-    transition detected on the next run. If persistence itself fails
-    (DB locked, missing table on an ancient DB), silently give up: the
-    run has already captured its own within-run baseline and the cross-
-    run upgrade is best-effort. See PR #1396 review
-    (Codex P1 r3687401636).
-    """
-    fresh = {root for root, live in baseline.items() if live}
-    if not fresh:
-        return
-    try:
-        existing = _load_known_mount_roots(db)
-        merged = sorted(existing | fresh)
-        db.conn.execute(
-            "INSERT INTO db_meta(key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (_KNOWN_MOUNT_ROOTS_KEY, json.dumps(merged)),
-        )
-        db.conn.commit()
-    except Exception:
-        log.debug(
-            "Could not persist known archive mount roots (%r); "
-            "cross-run mount-baseline seeding will be skipped for the "
-            "next run.", sorted(fresh), exc_info=True,
-        )
 
 
 def _unmounted_since_baseline(baseline: dict[str, bool]) -> str | None:

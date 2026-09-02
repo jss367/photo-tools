@@ -144,14 +144,12 @@ def mount_root_candidates(path: str) -> list[str]:
     # would resolve every component — including ones on a dead SMB mount —
     # and can block indefinitely there, ahead of the bounded probe this
     # module exists to provide.
-    # Only a path that is *not already* mount-shaped needs alias resolution:
-    # a registered ``/Volumes/NAS/...`` or ``//server/share/...`` path names
-    # its mount root lexically, and resolving it would be the one place a
-    # filesystem call could reach the (possibly dead) server before the
-    # bounded probe runs.
-    resolved = None
-    if _candidate(raw_posix) is None and _candidate(normalized_posix) is None:
-        resolved = _resolve_symlinks_until_mount_shaped(normalized, _candidate)
+    # A mount-shaped prefix that is itself a symlink (``/mnt/archive`` ->
+    # ``/mnt/NAS``) still has to yield the *real* mount, or the pipeline's
+    # mounted-to-unmounted guards never see it. Inspecting that prefix is the
+    # one lookup that may land on a dead filesystem, so the resolver does it
+    # through a time-bounded helper rather than a bare ``lstat``.
+    resolved = _resolve_symlinks_until_mount_shaped(normalized, _candidate)
     resolved_posix = (
         resolved.replace("\\", "/") if resolved else None
     )
@@ -170,15 +168,66 @@ def mount_root_candidates(path: str) -> list[str]:
 _MAX_SYMLINK_HOPS = 40
 
 
+_BOUNDED_LINK_LOCK = threading.Lock()
+_BOUNDED_LINK_PROBES = {}
+
+
+def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
+    """``readlink(path)`` if ``path`` is a symlink, else ``None`` — bounded.
+
+    Used only for mount-shaped prefixes (``/mnt/archive``, ``/Volumes/NAS``):
+    if the prefix is a symlink it lives on the local root filesystem and the
+    ``lstat`` is instant; if it is a real mount point the ``lstat`` may hang
+    on a dead server, so it runs on a daemon thread and we give up after
+    ``timeout`` (answering "not a link", which is also the right answer for a
+    real mount). One probe per path stays registered while it is alive so
+    repeated calls against a wedged mount fail fast instead of stacking
+    threads. UNC prefixes never reach here (callers skip them).
+    """
+    with _BOUNDED_LINK_LOCK:
+        existing = _BOUNDED_LINK_PROBES.get(path)
+        if existing is not None:
+            if existing.is_alive():
+                return None
+            del _BOUNDED_LINK_PROBES[path]
+        outcome = {}
+
+        def worker():
+            try:
+                if os.path.islink(path):
+                    outcome["target"] = os.readlink(path)
+                else:
+                    outcome["target"] = None
+            except OSError:
+                outcome["target"] = None
+            finally:
+                with _BOUNDED_LINK_LOCK:
+                    if _BOUNDED_LINK_PROBES.get(path) is thread:
+                        del _BOUNDED_LINK_PROBES[path]
+
+        thread = threading.Thread(
+            target=worker, name="vireo-mount-link-probe", daemon=True,
+        )
+        _BOUNDED_LINK_PROBES[path] = thread
+        thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        return None
+    return outcome.get("target")
+
+
 def _resolve_symlinks_until_mount_shaped(path, candidate):
     """Follow symlinks in ``path`` component by component, stopping early.
 
     Returns the (partially) resolved absolute path, or ``None`` when nothing
     could be resolved. Each accumulated prefix is tested with ``candidate``
-    *before* it is ``lstat``-ed: the moment a prefix is mount-shaped the
-    walk stops and the remainder is appended untouched. That keeps every
-    filesystem call on local components (``/``, ``/Volumes``, ``/photos``)
-    and never touches a possibly-dead share. Hop count is bounded so a
+    *before* it is ``lstat``-ed. Local components (``/``, ``/Volumes``,
+    ``/photos``) are inspected directly. A mount-shaped prefix is inspected
+    only through :func:`_bounded_link_target`, so a symlinked alias such as
+    ``/mnt/archive -> /mnt/NAS`` is still followed to the real mount while a
+    dead mount point cannot hang the caller; once a mount-shaped prefix is
+    not a link the walk stops and the remainder is appended untouched. UNC
+    ``//server`` prefixes are never touched. Hop count is bounded so a
     symlink loop cannot spin.
     """
     remaining = [part for part in path.replace("\\", "/").split("/") if part]
@@ -192,29 +241,35 @@ def _resolve_symlinks_until_mount_shaped(path, candidate):
     while remaining:
         step = remaining.pop(0)
         nxt = prefix + step if prefix.endswith("/") or not prefix else prefix + "/" + step
-        if candidate(nxt.replace("\\", "/")) is not None:
-            prefix = nxt
-            break
         if nxt.startswith("//"):
-            # ``//server`` is not yet a share candidate but any ``lstat`` on
-            # it is a remote lookup; UNC prefixes are never symlinks anyway.
+            # UNC: ``//server`` and ``//server/share`` are remote lookups and
+            # never symlinks; classify lexically and stop at the share.
             prefix = nxt
+            if candidate(nxt.replace("\\", "/")) is not None:
+                break
             continue
-        try:
-            is_link = os.path.islink(nxt)
-        except OSError:
-            is_link = False
-        if not is_link:
-            prefix = nxt
-            continue
+        if candidate(nxt.replace("\\", "/")) is not None:
+            # Mount-shaped: the only lookup allowed here is the bounded one.
+            target = _bounded_link_target(nxt)
+            if target is None:
+                prefix = nxt
+                break
+        else:
+            try:
+                is_link = os.path.islink(nxt)
+            except OSError:
+                is_link = False
+            if not is_link:
+                prefix = nxt
+                continue
+            try:
+                target = os.readlink(nxt)
+            except OSError:
+                prefix = nxt
+                continue
         hops += 1
         if hops > _MAX_SYMLINK_HOPS:
             return None
-        try:
-            target = os.readlink(nxt)
-        except OSError:
-            prefix = nxt
-            continue
         if not os.path.isabs(target):
             target = os.path.normpath(os.path.join(os.path.dirname(nxt), target))
         # Restart from the target: its own components may be links too.

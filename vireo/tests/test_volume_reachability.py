@@ -214,6 +214,7 @@ def test_mount_root_candidates_follows_local_alias_without_touching_share(tmp_pa
         return real_islink(p)
 
     monkeypatch.setattr(vr.os.path, "islink", spy_islink)
+    monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: None)
     assert vr.mount_root_candidates(str(alias / "2026" / "shoot")) == ["/Volumes/NAS"]
     assert not any(t.startswith("/Volumes/NAS") for t in touched), touched
     monkeypatch.setattr(vr.os.path, "realpath", lambda p: pytest.fail("realpath must not be used"))
@@ -228,16 +229,55 @@ def test_mount_root_candidates_symlink_loop_is_bounded(tmp_path):
     assert vr.mount_root_candidates(str(tmp_path / "a" / "x")) == []
 
 
-def test_mount_root_candidates_never_stats_unc_or_mount_shaped_paths(monkeypatch):
-    """A path that already names its mount root (``//server/share/...``,
-    ``/Volumes/NAS/...``) must be classified lexically: no ``islink`` /
-    ``realpath`` call may run, because on a dead server that lookup is
-    unbounded and would run ahead of the bounded probe."""
-    monkeypatch.setattr(vr.os.path, "islink", lambda p: pytest.fail(f"islink({p!r})"))
+def test_mount_root_candidates_only_bounded_lookups_on_mount_shaped_prefixes(monkeypatch):
+    """Anything at or below a mount-shaped prefix may only be inspected via the
+    time-bounded helper — never a bare ``islink``/``realpath`` (unbounded on
+    a dead server). UNC prefixes are never inspected at all."""
+    bounded = []
+    monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: bounded.append(p))
     monkeypatch.setattr(vr.os.path, "realpath", lambda p: pytest.fail(f"realpath({p!r})"))
+    direct = []
+    real_islink = os.path.islink
+    monkeypatch.setattr(vr.os.path, "islink", lambda p: direct.append(p) or real_islink(p))
+
     assert vr.mount_root_candidates("//server/share/photos/2026") == ["//server/share"]
     assert vr.mount_root_candidates("/Volumes/NAS/photos") == ["/Volumes/NAS"]
     assert vr.mount_root_candidates("/mnt/nas/photos") == ["/mnt/nas"]
+    assert not any(p.startswith("//") for p in bounded), bounded
+    assert set(bounded) == {"/Volumes/NAS", "/mnt/nas"}
+    assert not any(
+        p.startswith(("/Volumes/NAS", "/mnt/nas", "//")) for p in direct
+    ), f"unbounded lookup on a mount-shaped path: {direct}"
+
+
+def test_mount_root_candidates_follows_mount_shaped_alias_to_real_mount(monkeypatch):
+    """``/mnt/archive -> /mnt/NAS``: both the alias and the real mount are
+    reported, so the pipeline's mounted-to-unmounted guards see the mount
+    that can actually detach."""
+    links = {"/mnt/archive": "/mnt/NAS"}
+    monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: links.get(p))
+    assert vr.mount_root_candidates("/mnt/archive/photos/2026") == ["/mnt/archive", "/mnt/NAS"]
+
+
+def test_bounded_link_target_reads_local_symlink_and_times_out_on_wedged_mount(tmp_path, monkeypatch):
+    if sys.platform == "win32":
+        pytest.skip("POSIX symlinks")
+    link = tmp_path / "archive"
+    link.symlink_to("/mnt/NAS")
+    assert vr._bounded_link_target(str(link)) == "/mnt/NAS"
+    assert vr._bounded_link_target(str(tmp_path)) is None
+
+    import threading
+    release = threading.Event()
+    monkeypatch.setattr(vr.os.path, "islink", lambda p: release.wait(5) or False)
+    monkeypatch.setattr(vr, "_BOUNDED_LINK_PROBES", {})
+    try:
+        assert vr._bounded_link_target("/mnt/stuck", timeout=0.05) is None
+        # Reused while alive: no second thread, immediate answer.
+        assert vr._bounded_link_target("/mnt/stuck", timeout=0.05) is None
+        assert list(vr._BOUNDED_LINK_PROBES) == ["/mnt/stuck"]
+    finally:
+        release.set()
 
 
 def test_resolver_skips_unc_server_prefix():

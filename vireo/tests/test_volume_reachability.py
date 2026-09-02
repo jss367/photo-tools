@@ -421,6 +421,26 @@ def test_mount_root_candidates_uses_only_bounded_link_lookups(monkeypatch):
     assert direct == [], f"unbounded link lookup: {direct}"
 
 
+def test_mount_resolution_never_probes_protected_bundle_components(monkeypatch):
+    """Direct and symlink-expanded bundle paths stop before their TCC boundary."""
+    monkeypatch.setattr(vr, "_system_mount_roots", lambda: set())
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
+    alias = "/Users/julius/PhotoLib"
+    bundle = "/Users/julius/Pictures/Photos Library.photoslibrary"
+    probed = []
+
+    def bounded_target(path, timeout=None):
+        probed.append(path)
+        assert ".photoslibrary" not in path.lower()
+        return bundle if path == alias else None
+
+    monkeypatch.setattr(vr, "_bounded_link_target", bounded_target)
+
+    assert vr.mount_root_candidates(f"{bundle}/originals") == []
+    assert vr.mount_root_candidates(f"{alias}/originals") == []
+    assert alias in probed
+
+
 def test_unknown_custom_root_timeout_fails_closed_without_direct_lookup(monkeypatch):
     monkeypatch.setattr(vr, "_system_mount_roots", lambda: set())
     monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})

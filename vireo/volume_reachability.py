@@ -40,6 +40,7 @@ import sys
 import threading
 import time
 
+from image_loader import is_excluded_scan_dir
 from proc import no_window_kwargs
 
 log = logging.getLogger(__name__)
@@ -523,6 +524,15 @@ def _normalize_link_target(target):
     return t
 
 
+def _contains_excluded_scan_component(path):
+    """True when ``path`` names an app-managed bundle component."""
+    return any(
+        is_excluded_scan_dir(part)
+        for part in path.replace("\\", "/").split("/")
+        if part
+    )
+
+
 def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
     """Follow symlinks in ``path`` component by component, stopping early.
 
@@ -574,6 +584,13 @@ def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
             # remote root is reported. Drive roots themselves are never
             # links, so no lookup is needed here.
             continue
+        # Never lstat an app-managed bundle or anything below it. Merely
+        # touching these components can trigger macOS's recurring TCC prompt.
+        # This also catches components introduced by a symlink target because
+        # target resolution restarts this same component-by-component loop.
+        if _contains_excluded_scan_component(nxt):
+            prefix = nxt
+            break
         cand = candidate(nxt.replace("\\", "/"))
         target = _bounded_link_target(nxt)
         if target is INCONCLUSIVE:

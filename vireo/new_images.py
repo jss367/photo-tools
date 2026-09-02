@@ -355,6 +355,14 @@ def _walk_root_bounded(root, root_path, mount_root, known, seen_new_paths,
             time.sleep(_WALK_POLL_SECONDS)
         else:
             wait_for.join(_WALK_POLL_SECONDS)
+            if not wait_for.is_alive():
+                # The predecessor may have published an offline verdict after
+                # our initial gate check. Re-read it before reserving a fresh
+                # worker so overlapping workspace polls do not immediately
+                # walk into the same disconnected share again.
+                _checked_root, still_reachable = reachability.check(root_path)
+                if not still_reachable:
+                    return None
 
     state = {
         "checked": 0, "paths": [], "last": time.monotonic(),

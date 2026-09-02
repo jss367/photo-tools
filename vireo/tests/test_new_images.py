@@ -1759,6 +1759,72 @@ def test_overlapping_healthy_walk_waits_without_marking_offline(tmp_path, monkey
     assert gates[0].marked_offline == gates[1].marked_offline == []
 
 
+def test_overlapping_waiter_rechecks_offline_verdict_before_second_walk(
+        tmp_path, monkeypatch):
+    """A predecessor's ENOTCONN verdict stops its waiter from walking again."""
+    import errno
+    import threading
+    import time
+
+    import new_images as new_images_module
+
+    root_path = str(tmp_path / "shared")
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls = []
+
+    class SharedReachability:
+        mount_root = "/Volumes/Fake"
+
+        def __init__(self):
+            self.offline = False
+            self.checked = []
+
+        def check(self, path):
+            self.checked.append(path)
+            return self.mount_root, not self.offline
+
+        def mark_offline(self, root):
+            assert root == self.mount_root
+            self.offline = True
+
+    def first_walk_goes_offline(top, onerror=None, **_kwargs):
+        calls.append(top)
+        if len(calls) == 1:
+            first_started.set()
+            release_first.wait(5)
+            onerror(OSError(errno.ENOTCONN, "offline", top))
+        if False:
+            yield None
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", first_walk_goes_offline)
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
+    gate = SharedReachability()
+    results = []
+
+    def invoke():
+        results.append(new_images_module._walk_root_bounded(
+            {"id": 1, "path": root_path}, root_path, gate.mount_root,
+            set(), set(), gate, 0, 0, None, 250, 0, 2,
+        ))
+
+    first = threading.Thread(target=invoke)
+    second = threading.Thread(target=invoke)
+    first.start()
+    assert first_started.wait(2)
+    second.start()
+    time.sleep(0.1)
+    release_first.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert results == [None, None]
+    assert calls == [root_path], "waiter must not start a second filesystem walk"
+    assert len(gate.checked) == 1
+
+
 def test_count_progress_and_totals_unchanged_by_worker_thread(db_with_workspace):
     """The worker-thread walk keeps the caller-visible contract: exact totals,
     monotonic progress, final ``(checked, new)`` event, cross-root dedupe."""

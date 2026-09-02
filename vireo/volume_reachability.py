@@ -32,6 +32,7 @@ import contextlib
 import errno
 import json
 import logging
+import ntpath
 import os
 import posixpath
 import subprocess
@@ -225,6 +226,17 @@ def _deepest_custom_mount(posix_path, boundaries):
     return max(matches, key=len, default=None)
 
 
+def _normalize_candidate_source(source):
+    """Lexically normalize while preserving a UNC path's share anchor."""
+    posix_source = source.replace("\\", "/")
+    if posix_source.startswith("//"):
+        # POSIX normalization allows ``..`` to climb from //server/share to
+        # //server, inventing a sibling share. Windows keeps the share as the
+        # anchor, which is the only meaningful interpretation of a UNC path.
+        return ntpath.normpath(posix_source).replace("\\", "/")
+    return posixpath.normpath(posix_source)
+
+
 class MountRootCandidates(list):
     """Mount-root candidates plus whether the resolution was conclusive.
 
@@ -261,9 +273,14 @@ def mount_root_candidates(path: str) -> "MountRootCandidates":
     expanded path and the normalized absolute form are checked so relative
     or ``~``-prefixed paths still match. Duplicates are collapsed.
     """
-    raw_posix = os.path.expanduser(path).replace("\\", "/")
-    normalized = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
-    normalized_posix = normalized.replace("\\", "/")
+    expanded = os.path.expanduser(path)
+    raw_posix = expanded.replace("\\", "/")
+    if raw_posix.startswith("//"):
+        normalized_posix = _normalize_candidate_source(raw_posix)
+        normalized = normalized_posix
+    else:
+        normalized = os.path.normpath(os.path.abspath(expanded))
+        normalized_posix = normalized.replace("\\", "/")
     # Also probe the symlink-resolved form so a catalog alias like
     # ``/photos`` pointing into ``/Volumes/NAS/photos`` retains its
     # mount-shaped prefix (Codex #1388 P2 r3664891998). Resolution is
@@ -302,7 +319,7 @@ def mount_root_candidates(path: str) -> "MountRootCandidates":
         # but it may contain ``.`` or ``..``. Collapse those lexically before
         # extracting roots so an unrelated volume named before ``..`` is not
         # probed (and cannot make a valid folder look offline).
-        source = posixpath.normpath(source)
+        source = _normalize_candidate_source(source)
         for cand in (
             _mount_shaped_candidate(source),
             _deepest_custom_mount(source, boundaries),

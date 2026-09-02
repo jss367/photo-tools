@@ -2927,6 +2927,38 @@ class Database:
             (folder_id,),
         ).fetchall()
 
+    def get_workspace_root_folder_ids(self, workspace_id=None):
+        """Return just the ids of the workspace's user-facing roots.
+
+        ``get_workspace_folder_roots`` computes a per-root subtree photo
+        count with a correlated prefix scan over ``photos`` — sub-second on
+        a small catalog, ~0.75s on an 88k-photo library. Pollers that only
+        need to know *which* roots exist (the Work Locally blocker poll runs
+        every 15s on Browse) must not pay for counts they discard.
+
+        Defaults to the active workspace (raising ``RuntimeError`` when none
+        is active, like every workspace-scoped accessor); an explicit
+        ``workspace_id`` is accepted for parity with
+        ``get_workspace_folder_roots``, whose callers already hold one.
+        """
+        if workspace_id is None:
+            workspace_id = self._ws_id()
+        # Preserve the recovery side effect of get_workspace_folder_roots:
+        # a descendant can be discovered after its recursive ancestor was
+        # linked, and blocker polling must make that relationship visible to
+        # workspace_local_root_ids even though this fast path skips photo
+        # counts. This only writes when an unmaterialized descendant exists.
+        self._materialize_workspace_descendants(workspace_id)
+        rows = self.conn.execute(
+            """SELECT f.id
+               FROM folders f
+               JOIN workspace_folders wf ON wf.folder_id = f.id
+               WHERE wf.workspace_id = ? AND wf.is_root = 1
+               ORDER BY f.path""",
+            (workspace_id,),
+        ).fetchall()
+        return [int(row["id"]) for row in rows]
+
     def get_workspace_folder_roots(self, workspace_id):
         """Return user-facing workspace roots, hiding covered descendants.
 

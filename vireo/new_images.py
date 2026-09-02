@@ -1,12 +1,16 @@
 """Detect image files present on disk but not yet ingested into a workspace."""
+import errno
 import logging
 import os
+import stat
 import threading
 import time
 from pathlib import Path
 
+import volume_reachability
 from image_loader import (
     SUPPORTED_EXTENSIONS,
+    is_excluded_scan_dir,
     is_excluded_scan_path,
     safe_scan_walk,
 )
@@ -102,13 +106,43 @@ def mapped_roots(db, workspace_id, *, include_missing=False):
     ]
 
 
+class _RootOffline(Exception):
+    """Raised from the walk's ``onerror`` to abandon one root's traversal."""
+
+    def __init__(self, exc):
+        super().__init__(str(exc))
+        self.exc = exc
+
+
 def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
                                    progress_callback=None,
-                                   progress_every=250):
-    """Return {'new_count': int, 'per_root': [...], 'sample': [abs_path, ...]}.
+                                   progress_every=250,
+                                   reachability=None,
+                                   stall_timeout=None):
+    """Return {'new_count': int, 'per_root': [...], 'sample': [abs_path, ...],
+    'unreachable_roots': [abs_path, ...]}.
 
     Walks each mapped root recursively, collects image files, and diffs against
     the set of photo paths already ingested into the workspace.
+
+    A root whose volume is offline is *reported*, never raised: it appears in
+    ``per_root`` with ``unreachable: True`` and in ``unreachable_roots``, and
+    the remaining roots are still walked. Two signals feed that verdict —
+    ``reachability`` (a :class:`volume_reachability.VolumeReachability`,
+    defaulting to the shared gate) is consulted before touching each root so
+    a known-dead share is skipped without any filesystem call, and an
+    offline-class ``OSError`` (``ENOTCONN``/``EIO``/…) raised mid-walk marks
+    the root offline in that gate for everyone else. ``new_count`` therefore
+    covers reachable roots only, and callers must say so when they show it.
+
+    Each root is walked on its own worker thread with a stall watchdog
+    (``stall_timeout`` seconds without a single directory entry or file
+    being processed; default :data:`WALK_STALL_TIMEOUT_SECONDS`). A share
+    that *blocks* instead of raising — the SMB failure mode Python cannot
+    interrupt — therefore ends as "root offline" rather than a compute that
+    never finishes and a banner stuck on "checking". The wedged thread is
+    left to die on its own; its root is reported offline immediately on
+    later walks while it is still alive.
 
     ``progress_callback``, if given, is invoked as
     ``progress_callback(files_checked, new_found)`` once every
@@ -117,23 +151,35 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
     Callers use this to surface live progress for transparency without
     needing to refactor the walk.
     """
+    if reachability is None:
+        reachability = volume_reachability.get_shared()
+    if stall_timeout is None:
+        stall_timeout = WALK_STALL_TIMEOUT_SECONDS
     known = _known_paths_for_workspace(db, workspace_id)
     roots = mapped_roots(db, workspace_id)
+    volume_reachability.seed_known_mount_roots(
+        volume_reachability.load_known_mount_roots(db)
+    )
 
     per_root = []
     sample = []
+    unreachable_roots = []
     total = 0
     files_checked = 0
     last_emitted = 0
     seen_new_paths = set()
+    live_mount_roots = set()
 
-    def _maybe_emit():
-        nonlocal last_emitted
-        if progress_callback is None:
-            return
-        if files_checked - last_emitted >= progress_every:
-            progress_callback(files_checked, total)
-            last_emitted = files_checked
+    def _unreachable(root, mount_root):
+        log.warning(
+            "new-images: skipping %s — volume %s is offline",
+            root["path"], mount_root or root["path"],
+        )
+        unreachable_roots.append(root["path"])
+        per_root.append({
+            "folder_id": root["id"], "path": root["path"],
+            "new_count": 0, "unreachable": True,
+        })
 
     for root in roots:
         root_path = root["path"]
@@ -146,66 +192,336 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
         # ``os.path.isdir`` — isdir follows symlinks and stat's the target,
         # so for a directly selected bundle (or a symlink to one) the
         # existence test alone is enough to trip the macOS TCC prompt.
-        if is_excluded_scan_path(root_path):
-            per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
+        #
+        # The reachability gate runs *first*, before even that exclusion
+        # check: ``is_excluded_scan_path`` walks the path's components with
+        # ``os.path.islink``, which on a dead SMB mount is an unbounded
+        # lookup. The gate itself never touches a mount-shaped path — its
+        # bounded probe is the only filesystem access — so ordering it ahead
+        # keeps every lookup on this root behind the timeout. The exclusion
+        # check still precedes ``isdir`` (the TCC concern above) because a
+        # bundle root is local and the gate passes it through untouched.
+        mount_root, reachable = reachability.check(root_path)
+        if not reachable:
+            _unreachable(root, mount_root)
             continue
-        if not os.path.isdir(root_path):
-            per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
+        if (
+            mount_root is not None
+            and volume_reachability.was_observed_mounted(mount_root)
+        ):
+            live_mount_roots.add(mount_root)
+        if mount_root is not None:
+            # Mount-shaped root: the gate's verdict may be up to 30s old and
+            # the share can have dropped since, so no unbounded lookup may
+            # run here. The bundle exclusion is decided lexically from the
+            # path's component names (the same name test the walker applies
+            # to children), and there is no ``isdir`` — a root that vanished
+            # surfaces as an ``OSError`` from the walk's first ``scandir``
+            # and is handled by ``_on_walk_error`` below.
+            # The literal path *and* its alias-resolved form are both
+            # checked, so ``~/PhotoLib -> /Volumes/NAS/Photos Library.photoslibrary``
+            # is still excluded; resolution follows local symlinks only and
+            # never looks below the mount root.
+            lexical_forms = {
+                root_path,
+                volume_reachability.resolve_alias_lexically(root_path),
+            }
+            if any(
+                is_excluded_scan_dir(part)
+                for form in lexical_forms
+                for part in form.replace("\\", "/").split("/")
+            ):
+                per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
+                continue
+        else:
+            if is_excluded_scan_path(root_path):
+                per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
+                continue
+            if not os.path.isdir(root_path):
+                per_root.append({"folder_id": root["id"], "path": root_path, "new_count": 0})
+                continue
+
+        outcome = _walk_root_bounded(
+            root, root_path, mount_root, known, seen_new_paths, reachability,
+            files_checked, total, progress_callback, progress_every,
+            last_emitted, stall_timeout,
+        )
+        if outcome is None:
+            # Offline (error or stall): nothing from this root is kept.
+            _unreachable(root, mount_root)
             continue
+        root_new_paths, checked, last_emitted = outcome
+        files_checked += checked
+        total += len(root_new_paths)
+        seen_new_paths.update(root_new_paths)
+        for path in root_new_paths:
+            if sample_limit is None or len(sample) < sample_limit:
+                sample.append(path)
 
-        root_new = 0
-        # safe_scan_walk skips other-app data bundles (e.g.
-        # "Photos Library.photoslibrary") without stat-following any
-        # symlinked child that points at one — the os.walk classification
-        # stat alone is enough to trip the macOS TCC prompt. Mirror what
-        # scanner.scan() will eventually pick up, so the "new images"
-        # banner can't be inflated by files the scanner will never ingest.
-        for dirpath, _dirnames, filenames in safe_scan_walk(root_path):
-            for name in filenames:
-                files_checked += 1
-                # Mirror ``vireo/scanner.py``: skip dotfiles (e.g. macOS
-                # AppleDouble sidecars ``._IMG_0001.JPG``) so we don't count
-                # files the scanner will never ingest, which would otherwise
-                # produce a stuck "new images" banner.
-                if name.startswith("."):
-                    _maybe_emit()
-                    continue
-                ext = Path(name).suffix.lower()
-                if ext not in SUPPORTED_EXTENSIONS:
-                    _maybe_emit()
-                    continue
-                full = os.path.join(dirpath, name)
-                if full in known:
-                    _maybe_emit()
-                    continue
-                # Mirror ``vireo/scanner.py``: os.walk lists broken symlinks
-                # in `filenames`, but scanner refuses to ingest them
-                # (os.path.isfile == False). Counting them as "new" would
-                # leave the banner stuck on files no scan can clear.
-                if not os.path.isfile(full):
-                    _maybe_emit()
-                    continue
-                if full in seen_new_paths:
-                    _maybe_emit()
-                    continue
-                seen_new_paths.add(full)
-                root_new += 1
-                total += 1
-                if sample_limit is None or len(sample) < sample_limit:
-                    sample.append(full)
-                _maybe_emit()
-
-        per_root.append({"folder_id": root["id"], "path": root_path, "new_count": root_new})
+        per_root.append({
+            "folder_id": root["id"], "path": root_path,
+            "new_count": len(root_new_paths),
+        })
 
     if progress_callback is not None:
         progress_callback(files_checked, total)
+    volume_reachability.record_known_mount_roots(
+        db, {root: True for root in live_mount_roots}
+    )
 
     return {
         "new_count": total,
         "per_root": per_root,
         "sample": sample,
         "sample_complete": sample_limit is None or len(sample) >= total,
+        "unreachable_roots": unreachable_roots,
     }
+
+
+# A root walk that makes no progress for this long — no directory entry
+# enumerated, no file checked — is treated as a wedged share. SMB stalls
+# freeze a syscall for minutes; a healthy listing heartbeats on every
+# directory entry received via ``safe_scan_walk(on_entry=...)``.
+WALK_STALL_TIMEOUT_SECONDS = 60.0
+_WALK_POLL_SECONDS = 0.25
+# Bound the registry before starting a worker, not only after it stalls. That
+# reservation is what keeps several distinct shares that wedge concurrently
+# from all becoming permanently blocked daemon threads.
+_MAX_STALLED_WALKS = 8
+_WALK_RESERVED = object()
+# root_path -> reservation or worker thread. The companion set distinguishes
+# genuinely stalled workers from healthy overlapping walks: another workspace
+# waits for the latter instead of poisoning the shared reachability cache.
+_STALLED_WALKS = {}
+_STALLED_WALK_PATHS = set()
+_STALLED_WALKS_LOCK = threading.Lock()
+
+
+class _WalkAbandoned(Exception):
+    """Raised inside an abandoned worker so it exits as soon as it wakes."""
+
+
+def _walk_root_bounded(root, root_path, mount_root, known, seen_new_paths,
+                       reachability, files_checked, total, progress_callback,
+                       progress_every, last_emitted, stall_timeout):
+    """Walk one root on a worker thread under a stall watchdog.
+
+    Returns ``(root_new_paths, files_checked_in_root, last_emitted)`` on
+    success, or ``None`` when the root is offline — either an offline-class
+    ``OSError`` surfaced through ``_RootOffline`` or the walk stalled for
+    ``stall_timeout`` seconds. The worker never mutates the caller's
+    counters or ``seen_new_paths``: it works on a snapshot and the caller
+    merges only on success, so an abandoned thread that wakes up later can
+    not corrupt a result that has already been published.
+    """
+    while True:
+        wait_for = None
+        with _STALLED_WALKS_LOCK:
+            existing = _STALLED_WALKS.get(root_path)
+            if existing is not None:
+                if existing is _WALK_RESERVED:
+                    wait_for = existing
+                elif existing.is_alive():
+                    if root_path in _STALLED_WALK_PATHS:
+                        log.warning(
+                            "new-images: %s still has a wedged walk from an "
+                            "earlier check; reporting offline without walking "
+                            "again", root_path,
+                        )
+                        reachability.mark_offline(mount_root)
+                        return None
+                    # Another workspace is walking the same root. Wait outside
+                    # the lock, then retry; an active healthy walk is not
+                    # evidence that the shared volume is offline.
+                    wait_for = existing
+                else:
+                    del _STALLED_WALKS[root_path]
+                    _STALLED_WALK_PATHS.discard(root_path)
+            if wait_for is None:
+                # Finished workers for other roots do not consume capacity.
+                # Live workers do: any may become an uninterruptible SMB stall.
+                for other_path, other in list(_STALLED_WALKS.items()):
+                    if other is not _WALK_RESERVED and not other.is_alive():
+                        del _STALLED_WALKS[other_path]
+                        _STALLED_WALK_PATHS.discard(other_path)
+                if len(_STALLED_WALKS) >= _MAX_STALLED_WALKS:
+                    log.warning(
+                        "new-images: root-walk limit reached while checking %s; "
+                        "not starting another worker", root_path,
+                    )
+                    return None
+                _STALLED_WALKS[root_path] = _WALK_RESERVED
+                break
+        if wait_for is _WALK_RESERVED:
+            time.sleep(_WALK_POLL_SECONDS)
+        else:
+            wait_for.join(_WALK_POLL_SECONDS)
+            if not wait_for.is_alive():
+                # The predecessor may have published an offline verdict after
+                # our initial gate check. Re-read it before reserving a fresh
+                # worker so overlapping workspace polls do not immediately
+                # walk into the same disconnected share again.
+                _checked_root, still_reachable = reachability.check(root_path)
+                if not still_reachable:
+                    return None
+
+    state = {
+        "checked": 0, "paths": [], "last": time.monotonic(),
+        "emitted": last_emitted, "abandoned": False, "offline": None,
+    }
+    local_seen = set(seen_new_paths)
+
+    def _beat():
+        if state["abandoned"]:
+            raise _WalkAbandoned()
+        state["last"] = time.monotonic()
+
+    def _on_walk_error(exc):
+        # Offline-class errors abort this root and publish the outage;
+        # anything else (a permission-denied subfolder) is skipped the way
+        # the scanner skips it, so the count stays a lower bound for the
+        # same files a scan would ingest.
+        error_path = getattr(exc, "filename", None)
+        root_disappeared = (
+            isinstance(exc, OSError)
+            and exc.errno == errno.ENOENT
+            and error_path is not None
+            and os.path.normcase(os.path.normpath(os.fspath(error_path)))
+            == os.path.normcase(os.path.normpath(root_path))
+        )
+        if volume_reachability.is_offline_error(exc) or root_disappeared:
+            reachability.mark_offline(mount_root)
+            raise _RootOffline(exc)
+        log.debug("new-images: skipping unreadable path: %s", exc)
+
+    def _on_file(is_new):
+        _beat()
+        state["checked"] += 1
+        if progress_callback is None:
+            return
+        checked_now = files_checked + state["checked"]
+        if checked_now - state["emitted"] >= progress_every:
+            progress_callback(checked_now, total + len(state["paths"]))
+            state["emitted"] = checked_now
+
+    def worker():
+        try:
+            # safe_scan_walk skips other-app data bundles (e.g. "Photos
+            # Library.photoslibrary") without stat-following any symlinked
+            # child that points at one — the os.walk classification stat
+            # alone is enough to trip the macOS TCC prompt. Mirror what
+            # scanner.scan() will eventually pick up, so the banner can't be
+            # inflated by files the scanner will never ingest.
+            # ``on_entry`` heartbeats on every directory entry received, so a
+            # slow-but-streaming network listing (or a directory with fewer
+            # than 256 entries taking a while) is not mistaken for a stall.
+            walk = safe_scan_walk(
+                root_path, onerror=_on_walk_error, on_entry=_beat,
+            )
+            _walk_root_for_new_images(
+                walk, known, local_seen, state["paths"],
+                on_file=_on_file, on_error=_on_walk_error,
+            )
+        except _RootOffline as exc:
+            state["offline"] = exc
+        except _WalkAbandoned:
+            pass
+        except Exception as exc:  # surfaced to the caller below
+            state["offline"] = exc
+
+    thread = threading.Thread(
+        target=worker, daemon=True, name="new-images-walk-root",
+    )
+    with _STALLED_WALKS_LOCK:
+        _STALLED_WALKS[root_path] = thread
+        try:
+            thread.start()
+        except Exception:
+            if _STALLED_WALKS.get(root_path) is thread:
+                del _STALLED_WALKS[root_path]
+                _STALLED_WALK_PATHS.discard(root_path)
+            raise
+    while True:
+        thread.join(_WALK_POLL_SECONDS)
+        if not thread.is_alive():
+            break
+        if time.monotonic() - state["last"] > stall_timeout:
+            state["abandoned"] = True
+            with _STALLED_WALKS_LOCK:
+                if _STALLED_WALKS.get(root_path) is thread:
+                    _STALLED_WALK_PATHS.add(root_path)
+            log.warning(
+                "new-images: walk of %s made no progress for %.0fs; "
+                "treating volume %s as offline and abandoning the walk",
+                root_path, stall_timeout, mount_root or root_path,
+            )
+            reachability.mark_offline(mount_root)
+            return None
+
+    failure = state["offline"]
+    if failure is not None:
+        if isinstance(failure, _RootOffline):
+            return None
+        raise failure
+    return state["paths"], state["checked"], state["emitted"]
+
+
+def _is_regular_file(path, on_error):
+    """``os.path.isfile`` that does not swallow volume-loss errors.
+
+    ``os.path.isfile`` returns False for *any* ``OSError``, which would let a
+    share that drops between ``scandir`` and the per-file ``stat`` look like
+    "no new files here" instead of "this root went offline". Route the error
+    through ``on_error`` (which raises :class:`_RootOffline` for the offline
+    class and merely logs the rest) and treat every failure as "not a file"
+    — a broken symlink's ``ENOENT`` still lands on the skip path.
+    """
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        on_error(exc)
+        return False
+    return stat.S_ISREG(st.st_mode)
+
+
+def _walk_root_for_new_images(walk, known, seen_new_paths, root_new_paths,
+                              on_file, on_error):
+    """Consume one root's ``safe_scan_walk`` and collect its new image paths.
+
+    Appends each newly discovered path to ``root_new_paths`` (and to the
+    cross-root ``seen_new_paths`` set) and calls ``on_file(is_new)`` once per
+    filename encountered so the caller can keep its progress counters. The
+    caller owns error handling: an offline-class ``OSError`` — from the walk's
+    ``onerror`` or from the per-file ``stat`` via ``on_error`` — surfaces as
+    :class:`_RootOffline` and unwinds this loop.
+    """
+    root_new = 0
+    for dirpath, _dirnames, filenames in walk:
+        for name in filenames:
+            is_new = False
+            # Mirror ``vireo/scanner.py``: skip dotfiles (e.g. macOS
+            # AppleDouble sidecars ``._IMG_0001.JPG``) so we don't count
+            # files the scanner will never ingest, which would otherwise
+            # produce a stuck "new images" banner.
+            if not name.startswith("."):
+                ext = Path(name).suffix.lower()
+                if ext in SUPPORTED_EXTENSIONS:
+                    full = os.path.join(dirpath, name)
+                    # Mirror ``vireo/scanner.py``: os.walk lists broken
+                    # symlinks in `filenames`, but scanner refuses to ingest
+                    # them (os.path.isfile == False). Counting them as "new"
+                    # would leave the banner stuck on files no scan can clear.
+                    if (
+                        full not in known
+                        and full not in seen_new_paths
+                        and _is_regular_file(full, on_error)
+                    ):
+                        seen_new_paths.add(full)
+                        root_new_paths.append(full)
+                        root_new += 1
+                        is_new = True
+            on_file(is_new)
+    return root_new
 
 
 class NewImagesCache:
@@ -233,6 +549,10 @@ class NewImagesCache:
     # navbar poll. Short enough that natural recovery is observable; long
     # enough that ten open tabs can't hot-loop the disk.
     ERROR_BACKOFF_SECONDS = 30
+    # Results that skipped an offline root live only this long, matching the
+    # ``VolumeReachability`` offline TTL so a reconnected share is re-walked
+    # on the same schedule it is re-probed.
+    PARTIAL_RESULT_TTL_SECONDS = 30
 
     def __init__(self, ttl_seconds=300):
         self._ttl = ttl_seconds
@@ -265,7 +585,15 @@ class NewImagesCache:
             if entry is None:
                 return None
             result, set_at = entry
-            if time.monotonic() - set_at > self._ttl:
+            ttl = self._ttl
+            if result.get("unreachable_roots"):
+                # A walk that skipped an offline volume is a *partial* answer.
+                # Holding it for the full TTL would keep reporting the folder
+                # offline (and hide its new files) for minutes after the share
+                # reconnects, so it expires at the reachability gate's own
+                # offline retry cadence instead.
+                ttl = min(ttl, self.PARTIAL_RESULT_TTL_SECONDS)
+            if time.monotonic() - set_at > ttl:
                 del self._entries[key]
                 return None
             return result

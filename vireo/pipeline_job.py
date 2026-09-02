@@ -61,6 +61,16 @@ from resource_ledger import (
     bind_resource_pure_cancel_check,
     suspend_resource_wait_timing,
 )
+from volume_reachability import (
+    load_known_mount_roots as _load_known_mount_roots,  # noqa: F401
+)
+from volume_reachability import (
+    mount_root_candidates as _archive_mount_root_candidates,
+)
+from volume_reachability import (
+    record_known_mount_roots as _record_known_mount_roots,  # noqa: F401
+)
+from volume_reachability import seed_known_mount_roots as _seed_known_mount_roots
 
 log = logging.getLogger(__name__)
 
@@ -209,91 +219,6 @@ class _StagedMaskFile:
             os.rmdir(self.stage_dir)
 
 
-def _archive_mount_root_candidates(path: str) -> list[str]:
-    """Return the plausible mount-root prefix(es) for ``path``, if any.
-
-    Extracts the mount-root component under each OS's mount conventions —
-    the first entry under ``/Volumes/`` or ``/mnt/`` (SMB/NFS style), the
-    first user/name pair under ``/media/<user>/``, a Windows drive letter
-    (``Z:/...`` — mapped SMB drives use this), or a UNC share
-    (``//server/share/...``). These shapes strongly imply the user
-    intended the location as a mount point; the caller decides what state
-    to require of it (missing entirely vs. present but not actually
-    mounted).
-
-    Windows mapped drives and UNC paths (Codex #1388 P2 r3663816324) are
-    documented storage layouts in ``docs/WINDOWS_SUPPORT.md``; without
-    detecting them, a disconnected SMB share on Windows would fall
-    through to folder-scoped skips and classify would keep reissuing
-    reads across the dead share instead of pausing for reconnection.
-
-    Both the raw expanded path and the normalized absolute form are
-    checked so relative or ``~``-prefixed paths still match. Duplicates
-    are collapsed, and paths not shaped like a mount root return no
-    candidates.
-    """
-    def _candidate(posix_path: str) -> str | None:
-        parts = posix_path.split("/")
-        if len(parts) >= 3 and parts[0] == "" and parts[1] in {"Volumes", "mnt"}:
-            return f"/{parts[1]}/{parts[2]}"
-        if len(parts) >= 4 and parts[0] == "" and parts[1] == "media":
-            return f"/media/{parts[2]}/{parts[3]}"
-        # UNC share: ``\\server\share\...`` after backslash-normalization
-        # becomes ``//server/share/...``, so ``parts`` starts with two
-        # empty strings.
-        if (
-            len(parts) >= 4
-            and parts[0] == ""
-            and parts[1] == ""
-            and parts[2]
-            and parts[3]
-        ):
-            return f"//{parts[2]}/{parts[3]}"
-        # Windows drive letter: ``Z:\...`` after normalization becomes
-        # ``Z:/...``. ``os.path.ismount("Z:")`` (no separator) returns
-        # False even for a real mounted drive because Windows treats
-        # ``Z:`` as a relative path on drive Z, so return with a trailing
-        # separator that ismount accepts.
-        if (
-            parts
-            and len(parts[0]) == 2
-            and parts[0][1] == ":"
-            and parts[0][0].isalpha()
-        ):
-            return f"{parts[0].upper()}/"
-        return None
-
-    raw_posix = os.path.expanduser(path).replace("\\", "/")
-    normalized = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
-    normalized_posix = normalized.replace("\\", "/")
-    # Also probe the symlink-resolved form so a catalog alias like
-    # ``/photos`` pointing into ``/Volumes/NAS/photos`` retains its
-    # mount-shaped prefix (Codex #1388 P2 r3664891998). Without this,
-    # neither the raw alias nor its ``abspath`` normalization has a
-    # ``/Volumes``/``/mnt``/``/media``/drive-letter/UNC prefix, so
-    # ``_source_offline_reason`` would classify a disconnected share
-    # reached via the alias as folder-scoped and classify would skip
-    # its photos instead of pausing for reconnection. ``realpath``
-    # only resolves symlinks (readlink), so it does not stat the
-    # target and stays safe even when the underlying mount is dead.
-    try:
-        resolved = os.path.realpath(os.path.expanduser(path))
-    except OSError:
-        resolved = None
-    resolved_posix = (
-        resolved.replace("\\", "/") if resolved else None
-    )
-
-    seen: list[str] = []
-    for source in (raw_posix, normalized_posix, resolved_posix):
-        if source is None:
-            continue
-        cand = _candidate(source)
-        if cand and cand not in seen:
-            seen.append(cand)
-    return seen
-
-
 def _archive_mount_baseline(
     path: str,
     known_mounted_roots: set[str] | None = None,
@@ -334,72 +259,29 @@ def _archive_mount_baseline(
     baseline stays False. See PR #1396 review (Codex P1 r3687401636).
     """
     known = known_mounted_roots or set()
+    # Custom mount locations (for example ``/srv/photos``) have no lexical
+    # marker. Install durable evidence before candidate resolution so a
+    # detached root is still recognised without touching its subtree.
+    _seed_known_mount_roots(known)
     baseline = {}
-    for root in _archive_mount_root_candidates(path):
-        baseline[root] = os.path.ismount(root) or root in known
+    candidates = _archive_mount_root_candidates(path)
+    # Candidates and confidence come from the same resolution (the list
+    # carries ``conclusive``); two calls could disagree under saturation.
+    conclusive = getattr(candidates, "conclusive", True)
+    if not conclusive:
+        # Do not encode uncertainty as a mounted baseline. Both consumers of
+        # True entries perform later synchronous filesystem probes
+        # (``_mount_identity_baseline`` and ``_unmounted_since_baseline``),
+        # which can hang on the same dead mount that made bounded alias
+        # resolution time out. Abort before either path can touch it.
+        root = candidates[-1] if candidates else path
+        raise RuntimeError(
+            f"Volume prefix {root} could not be inspected in time; "
+            "reconnect it and retry."
+        )
+    for root in candidates:
+        baseline[root] = root in known or os.path.ismount(root)
     return baseline
-
-
-_KNOWN_MOUNT_ROOTS_KEY = "known_archive_mount_roots"
-
-
-def _load_known_mount_roots(db) -> set[str]:
-    """Return the persistent set of mount roots ever observed as live.
-
-    Used by ``_archive_mount_baseline`` to seed True across runs: a share
-    that was live on a prior successful run and is detached now must be
-    treated as a mounted → unmounted transition, not as a plain local
-    dir that was never a mount. Read failures (missing key, malformed
-    JSON, DB gone) fall back to an empty set — a stale-history failure
-    is not a reason to refuse a fresh import.
-    """
-    try:
-        row = db.conn.execute(
-            "SELECT value FROM db_meta WHERE key = ?",
-            (_KNOWN_MOUNT_ROOTS_KEY,),
-        ).fetchone()
-    except Exception:
-        return set()
-    if row is None or row["value"] is None:
-        return set()
-    try:
-        entries = json.loads(row["value"])
-    except (TypeError, ValueError):
-        return set()
-    if not isinstance(entries, list):
-        return set()
-    return {str(e) for e in entries if isinstance(e, str)}
-
-
-def _record_known_mount_roots(db, baseline: dict[str, bool]) -> None:
-    """Merge any True baseline entries into the persistent known-mounted set.
-
-    Only additive — a root that was recorded once stays recorded, so a
-    share that is currently detached still gets its True → False
-    transition detected on the next run. If persistence itself fails
-    (DB locked, missing table on an ancient DB), silently give up: the
-    run has already captured its own within-run baseline and the cross-
-    run upgrade is best-effort. See PR #1396 review
-    (Codex P1 r3687401636).
-    """
-    fresh = {root for root, live in baseline.items() if live}
-    if not fresh:
-        return
-    try:
-        existing = _load_known_mount_roots(db)
-        merged = sorted(existing | fresh)
-        db.conn.execute(
-            "INSERT INTO db_meta(key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (_KNOWN_MOUNT_ROOTS_KEY, json.dumps(merged)),
-        )
-        db.conn.commit()
-    except Exception:
-        log.debug(
-            "Could not persist known archive mount roots (%r); "
-            "cross-run mount-baseline seeding will be skipped for the "
-            "next run.", sorted(fresh), exc_info=True,
-        )
 
 
 def _unmounted_since_baseline(baseline: dict[str, bool]) -> str | None:
@@ -474,7 +356,12 @@ def _missing_archive_mount_root(path: str) -> str | None:
     check that also treats a directory-still-there-but-not-mounted case
     as offline.
     """
-    for mount_root in _archive_mount_root_candidates(path):
+    candidates = _archive_mount_root_candidates(path)
+    if candidates and not getattr(candidates, "conclusive", True):
+        # Could not inspect the mount prefix in time: refuse rather than
+        # risk creating a stub and writing onto the local disk.
+        return candidates[0]
+    for mount_root in candidates:
         if not os.path.lexists(mount_root):
             return mount_root
     return None
@@ -581,7 +468,10 @@ def _source_offline_reason(
     # file" and letting classify keep hammering the dead share. A
     # successful root probe leaves the caller with the ordinary
     # "readable folder → per-photo failure" outcome below.
-    for mount_root in _archive_mount_root_candidates(image_path):
+    candidates = _archive_mount_root_candidates(image_path)
+    if candidates and not getattr(candidates, "conclusive", True):
+        return "mount", f"volume {candidates[0]} could not be inspected in time"
+    for mount_root in candidates:
         if _mount_root_offline(mount_root):
             return "mount", f"volume {mount_root} is not mounted"
     # No mount-root candidate is offline. A readable folder means the

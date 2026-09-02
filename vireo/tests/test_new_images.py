@@ -59,7 +59,7 @@ def test_count_new_images_deduplicates_repeated_walk_entries(
     _touch_image(str(photo))
     db.add_folder(str(root), name="USA2026")
 
-    def duplicate_walk(_root):
+    def duplicate_walk(_root, **_kwargs):
         yield str(root), [], ["IMG_0001.JPG", "IMG_0001.JPG", "IMG_0001.JPG"]
 
     monkeypatch.setattr(new_images, "safe_scan_walk", duplicate_walk)
@@ -1310,3 +1310,599 @@ def test_move_folders_to_workspace_invalidates_both_workspaces(tmp_path):
     assert db._new_images_cache.get(db._db_path, ws_b) is None, (
         "move_folders_to_workspace must invalidate the target workspace's cache"
     )
+
+
+# ---------------------------------------------------------------------------
+# Offline volumes: reported, never raised
+# ---------------------------------------------------------------------------
+
+class _FakeReachability:
+    """Scripted stand-in for ``volume_reachability.VolumeReachability``."""
+
+    def __init__(self, offline_prefixes=(), mount_root="/Volumes/Fake"):
+        self.offline_prefixes = tuple(offline_prefixes)
+        self.mount_root = mount_root
+        self.checked = []
+        self.marked_offline = []
+
+    def check(self, path):
+        self.checked.append(path)
+        for prefix in self.offline_prefixes:
+            if path.startswith(prefix):
+                return self.mount_root, False
+        return self.mount_root, True
+
+    def mark_offline(self, root):
+        self.marked_offline.append(root)
+
+
+def test_count_seeds_and_records_durable_mount_history(db_with_workspace, monkeypatch):
+    """New-images probes consume and extend the catalog's mount evidence."""
+    import volume_reachability
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    root = tmp_path / "photos"
+    _touch_image(str(root / "a.jpg"))
+    db.add_folder(str(root), name="photos")
+    seeded = []
+    recorded = []
+
+    monkeypatch.setattr(
+        volume_reachability, "load_known_mount_roots",
+        lambda checked_db: {"/mnt/old"} if checked_db is db else set(),
+    )
+    monkeypatch.setattr(
+        volume_reachability, "seed_known_mount_roots",
+        lambda roots: seeded.append(set(roots)),
+    )
+    monkeypatch.setattr(
+        volume_reachability, "was_observed_mounted", lambda root: True,
+    )
+    monkeypatch.setattr(
+        volume_reachability, "record_known_mount_roots",
+        lambda checked_db, baseline: recorded.append((checked_db, baseline)),
+    )
+    gate = _FakeReachability(mount_root="/mnt/NAS")
+
+    result = count_new_images_for_workspace(
+        db, ws_id, reachability=gate,
+    )
+
+    assert result["new_count"] == 1
+    assert seeded == [{"/mnt/old"}]
+    assert recorded == [(db, {"/mnt/NAS": True})]
+
+
+def test_count_skips_root_on_offline_volume_and_reports_it(db_with_workspace):
+    """A root whose volume the gate reports offline is skipped without any
+    filesystem walk and named in the result, while other roots still count."""
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    online = tmp_path / "online"
+    offline = tmp_path / "offline"
+    _touch_image(str(online / "a.jpg"))
+    _touch_image(str(offline / "b.jpg"))
+    db.add_folder(str(online), name="online")
+    db.add_folder(str(offline), name="offline")
+
+    gate = _FakeReachability(offline_prefixes=(str(offline),))
+    result = count_new_images_for_workspace(db, ws_id, reachability=gate)
+
+    assert result["new_count"] == 1
+    assert result["unreachable_roots"] == [str(offline)]
+    by_path = {r["path"]: r for r in result["per_root"]}
+    assert by_path[str(offline)]["unreachable"] is True
+    assert by_path[str(offline)]["new_count"] == 0
+    assert "unreachable" not in by_path[str(online)]
+    assert str(offline) in gate.checked
+
+
+def test_count_marks_root_offline_when_walk_raises_enotconn(
+    db_with_workspace, monkeypatch,
+):
+    """``ENOTCONN`` mid-walk (macOS SMB share dropping) abandons that root,
+    publishes the outage to the gate, and does not raise — the exact
+    failure that used to kill the walk with a traceback."""
+    import errno
+
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    healthy = tmp_path / "healthy"
+    flaky = tmp_path / "flaky"
+    _touch_image(str(healthy / "ok.jpg"))
+    _touch_image(str(flaky / "first.jpg"))
+    _touch_image(str(flaky / "second.jpg"))
+    db.add_folder(str(healthy), name="healthy")
+    db.add_folder(str(flaky), name="flaky")
+
+    real_walk = new_images_module.safe_scan_walk
+
+    def walk_that_drops(top, onerror=None, **kwargs):
+        if top == str(flaky):
+            # One file is yielded (and would have been counted) before the
+            # share disappears under the walk.
+            yield top, [], ["first.jpg"]
+            onerror(OSError(errno.ENOTCONN, "Socket is not connected", top))
+            yield top, [], ["second.jpg"]
+            return
+        yield from real_walk(top, onerror=onerror, **kwargs)
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", walk_that_drops)
+
+    gate = _FakeReachability()
+    result = count_new_images_for_workspace(db, ws_id, reachability=gate)
+
+    assert result["new_count"] == 1, "the abandoned root's partial count is dropped"
+    assert result["sample"] == [str(healthy / "ok.jpg")]
+    assert result["unreachable_roots"] == [str(flaky)]
+    assert gate.marked_offline == [gate.mount_root]
+    by_path = {r["path"]: r for r in result["per_root"]}
+    assert by_path[str(flaky)]["unreachable"] is True
+
+
+def test_count_keeps_walking_past_permission_errors(db_with_workspace, monkeypatch):
+    """Per-folder errors that are not volume loss (EACCES) are skipped the
+    way the scanner skips them; the root is neither abandoned nor flagged."""
+    import errno
+
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    root = tmp_path / "root"
+    _touch_image(str(root / "a.jpg"))
+    _touch_image(str(root / "b.jpg"))
+    db.add_folder(str(root), name="root")
+
+    def walk_with_denied_subdir(top, onerror=None, **kwargs):
+        yield top, ["denied"], ["a.jpg"]
+        onerror(OSError(errno.EACCES, "Permission denied", os.path.join(top, "denied")))
+        yield top, [], ["b.jpg"]
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", walk_with_denied_subdir)
+
+    gate = _FakeReachability()
+    result = count_new_images_for_workspace(db, ws_id, reachability=gate)
+
+    assert result["new_count"] == 2
+    assert result["unreachable_roots"] == []
+    assert gate.marked_offline == []
+
+
+def test_count_uses_shared_gate_by_default(db_with_workspace, monkeypatch):
+    import volume_reachability
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    root = tmp_path / "root"
+    _touch_image(str(root / "a.jpg"))
+    db.add_folder(str(root), name="root")
+
+    gate = _FakeReachability(offline_prefixes=(str(root),))
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+
+    result = count_new_images_for_workspace(db, ws_id)
+    assert result["unreachable_roots"] == [str(root)]
+    assert result["new_count"] == 0
+
+
+def test_count_probes_reachability_before_any_root_filesystem_check(
+    db_with_workspace, monkeypatch,
+):
+    """For a root the gate reports offline, neither the bundle-exclusion check
+    (which lstat's path components) nor ``isdir`` may run: on a dead mount
+    those are unbounded lookups and must stay behind the bounded probe."""
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    offline = tmp_path / "offline"
+    _touch_image(str(offline / "a.jpg"))
+    db.add_folder(str(offline), name="offline")
+
+    touched = []
+    monkeypatch.setattr(
+        new_images_module, "is_excluded_scan_path",
+        lambda p: touched.append(("excluded", p)) or False,
+    )
+    monkeypatch.setattr(
+        new_images_module.os.path, "isdir",
+        lambda p: touched.append(("isdir", p)) or True,
+    )
+    gate = _FakeReachability(offline_prefixes=(str(offline),))
+    result = count_new_images_for_workspace(db, ws_id, reachability=gate)
+
+    assert result["unreachable_roots"] == [str(offline)]
+    assert touched == [], f"filesystem checks ran on an offline root: {touched}"
+    assert gate.checked == [str(offline)]
+
+
+def test_count_does_no_unbounded_lookups_on_reachable_mount_shaped_root(
+    db_with_workspace, monkeypatch,
+):
+    """After the gate says a mount-shaped root is reachable, nothing may run
+    an unbounded lookup on it before the walk: no ``is_excluded_scan_path``
+    (component lstat's), no ``isdir``. The walk itself is the first touch."""
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    root = tmp_path / "nas"
+    _touch_image(str(root / "a.jpg"))
+    db.add_folder(str(root), name="nas")
+
+    touched = []
+    monkeypatch.setattr(
+        new_images_module, "is_excluded_scan_path",
+        lambda p: touched.append(("excluded", p)) or False,
+    )
+    monkeypatch.setattr(
+        new_images_module.os.path, "isdir",
+        lambda p: touched.append(("isdir", p)) or True,
+    )
+    gate = _FakeReachability(mount_root="/Volumes/Fake")  # everything reachable, mount-shaped
+    result = count_new_images_for_workspace(db, ws_id, reachability=gate)
+    assert result["new_count"] == 1
+    assert touched == [], f"unbounded lookups ran on a mount-shaped root: {touched}"
+
+
+def test_count_excludes_bundle_root_on_mount_lexically(db_with_workspace, monkeypatch):
+    """A Photos library registered as a root on a share is still excluded, by
+    name alone — no filesystem access."""
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    bundle = tmp_path / "Photos Library.photoslibrary"
+    _touch_image(str(bundle / "originals" / "a.jpg"))
+    db.add_folder(str(bundle), name="lib")
+    monkeypatch.setattr(
+        new_images_module, "safe_scan_walk",
+        lambda *a, **k: pytest.fail("bundle root must not be walked"),
+    )
+    gate = _FakeReachability(mount_root="/Volumes/Fake")
+    result = count_new_images_for_workspace(db, ws_id, reachability=gate)
+    assert result["new_count"] == 0
+    assert result["unreachable_roots"] == []
+
+
+def test_count_excludes_alias_into_bundle_on_mount(db_with_workspace, monkeypatch):
+    """``~/PhotoLib -> /Volumes/NAS/Photos Library.photoslibrary``: the literal
+    root has no excluded component, but its lexically resolved form does, so
+    the bundle is still excluded without touching the share."""
+    import sys
+
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    if sys.platform == "win32":
+        pytest.skip("POSIX symlinks")
+    db, ws_id, tmp_path = db_with_workspace
+    alias = tmp_path / "PhotoLib"
+    alias.symlink_to("/Volumes/Fake/Photos Library.photoslibrary")
+    db.add_folder(str(alias), name="lib")
+    monkeypatch.setattr(
+        new_images_module, "safe_scan_walk",
+        lambda *a, **k: pytest.fail("bundle alias must not be walked"),
+    )
+    gate = _FakeReachability(mount_root="/Volumes/Fake")
+    result = count_new_images_for_workspace(db, ws_id, reachability=gate)
+    assert result["new_count"] == 0
+    assert result["per_root"][0]["new_count"] == 0
+
+
+def test_count_abandons_stalled_walk_and_reports_root_offline(db_with_workspace, monkeypatch):
+    """A share that *blocks* in scandir (never raises) must not leave the
+    compute pending forever: after ``stall_timeout`` without progress the root
+    is reported offline, the gate is told, and the call returns."""
+    import threading
+    import time
+
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    healthy = tmp_path / "healthy"
+    wedged = tmp_path / "wedged"
+    _touch_image(str(healthy / "ok.jpg"))
+    _touch_image(str(wedged / "a.jpg"))
+    db.add_folder(str(healthy), name="healthy")
+    db.add_folder(str(wedged), name="wedged")
+
+    release = threading.Event()
+    real_walk = new_images_module.safe_scan_walk
+
+    def walk_that_hangs(top, onerror=None, **kwargs):
+        if top == str(wedged):
+            yield top, [], ["a.jpg"]
+            release.wait(10)  # simulates an uninterruptible SMB stall
+            yield top, [], []
+            return
+        yield from real_walk(top, onerror=onerror, **kwargs)
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", walk_that_hangs)
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
+    gate = _FakeReachability()
+    try:
+        t0 = time.monotonic()
+        result = count_new_images_for_workspace(
+            db, ws_id, reachability=gate, stall_timeout=0.3,
+        )
+        elapsed = time.monotonic() - t0
+        assert elapsed < 5, f"stalled walk held the compute for {elapsed:.1f}s"
+        assert result["new_count"] == 1, "partial count from the wedged root is dropped"
+        assert result["unreachable_roots"] == [str(wedged)]
+        assert gate.marked_offline == [gate.mount_root]
+        assert str(wedged) in new_images_module._STALLED_WALKS
+
+        # While the wedged thread is still alive, a second check reports the
+        # root offline at once instead of starting another walk into it.
+        gate2 = _FakeReachability()
+        again = count_new_images_for_workspace(
+            db, ws_id, reachability=gate2, stall_timeout=0.3,
+        )
+        assert again["unreachable_roots"] == [str(wedged)]
+        assert gate2.marked_offline == [gate2.mount_root]
+    finally:
+        release.set()
+    new_images_module._STALLED_WALKS[str(wedged)].join(2)
+
+
+def test_count_caps_stalled_walks_globally(db_with_workspace, monkeypatch):
+    """Distinct wedged roots cannot accumulate workers past the global cap.
+
+    Slots are reserved before workers start, so the bound also holds when
+    several walks are active at once and all later become uninterruptible.
+    Once full, another root fails closed without spawning a thread.
+    """
+    import threading
+
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    roots = [tmp_path / name for name in ("wedged-a", "wedged-b", "wedged-c")]
+    for root in roots:
+        _touch_image(str(root / "a.jpg"))
+        db.add_folder(str(root), name=root.name)
+
+    release = threading.Event()
+    started = []
+
+    def walk_that_hangs(top, **_kwargs):
+        started.append(top)
+        yield top, [], ["a.jpg"]
+        release.wait(10)
+        yield top, [], []
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", walk_that_hangs)
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
+    monkeypatch.setattr(new_images_module, "_MAX_STALLED_WALKS", 2)
+    workers = []
+    try:
+        result = count_new_images_for_workspace(
+            db, ws_id, reachability=_FakeReachability(), stall_timeout=0.05,
+        )
+        assert result["unreachable_roots"] == [str(root) for root in roots]
+        assert started == [str(root) for root in roots[:2]], (
+            "the saturated third root must not spawn a worker"
+        )
+        assert set(new_images_module._STALLED_WALKS) == {
+            str(root) for root in roots[:2]
+        }
+        workers = list(new_images_module._STALLED_WALKS.values())
+    finally:
+        release.set()
+    for worker in workers:
+        worker.join(2)
+
+
+def test_overlapping_healthy_walk_waits_without_marking_offline(tmp_path, monkeypatch):
+    """A second workspace sharing a root coordinates with its active walk.
+
+    Per-workspace caches can legitimately overlap. The second caller waits
+    and retries after the first healthy worker instead of treating ordinary
+    concurrency as proof that the process-wide volume is offline.
+    """
+    import threading
+    import time
+
+    import new_images as new_images_module
+
+    root_path = str(tmp_path / "shared")
+    photo_path = str(tmp_path / "shared" / "a.jpg")
+    _touch_image(photo_path)
+    first_paused = threading.Event()
+    release_first = threading.Event()
+    calls = []
+
+    def overlapping_walk(top, **_kwargs):
+        calls.append(top)
+        yield top, [], ["a.jpg"]
+        if len(calls) == 1:
+            first_paused.set()
+            release_first.wait(5)
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", overlapping_walk)
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
+    results = []
+    gates = [_FakeReachability(), _FakeReachability()]
+
+    def invoke(gate):
+        results.append(new_images_module._walk_root_bounded(
+            {"id": 1, "path": root_path}, root_path, gate.mount_root,
+            set(), set(), gate, 0, 0, None, 250, 0, 2,
+        ))
+
+    first = threading.Thread(target=invoke, args=(gates[0],))
+    second = threading.Thread(target=invoke, args=(gates[1],))
+    first.start()
+    assert first_paused.wait(2)
+    second.start()
+    time.sleep(0.1)
+    assert second.is_alive(), "the overlapping caller should wait for the active walk"
+    assert gates[1].marked_offline == []
+    release_first.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert len(calls) == 2
+    assert all(result is not None for result in results)
+    assert gates[0].marked_offline == gates[1].marked_offline == []
+
+
+def test_overlapping_waiter_rechecks_offline_verdict_before_second_walk(
+        tmp_path, monkeypatch):
+    """A predecessor's ENOTCONN verdict stops its waiter from walking again."""
+    import errno
+    import threading
+    import time
+
+    import new_images as new_images_module
+
+    root_path = str(tmp_path / "shared")
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls = []
+
+    class SharedReachability:
+        mount_root = "/Volumes/Fake"
+
+        def __init__(self):
+            self.offline = False
+            self.checked = []
+
+        def check(self, path):
+            self.checked.append(path)
+            return self.mount_root, not self.offline
+
+        def mark_offline(self, root):
+            assert root == self.mount_root
+            self.offline = True
+
+    def first_walk_goes_offline(top, onerror=None, **_kwargs):
+        calls.append(top)
+        if len(calls) == 1:
+            first_started.set()
+            release_first.wait(5)
+            onerror(OSError(errno.ENOTCONN, "offline", top))
+        if False:
+            yield None
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", first_walk_goes_offline)
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
+    gate = SharedReachability()
+    results = []
+
+    def invoke():
+        results.append(new_images_module._walk_root_bounded(
+            {"id": 1, "path": root_path}, root_path, gate.mount_root,
+            set(), set(), gate, 0, 0, None, 250, 0, 2,
+        ))
+
+    first = threading.Thread(target=invoke)
+    second = threading.Thread(target=invoke)
+    first.start()
+    assert first_started.wait(2)
+    second.start()
+    time.sleep(0.1)
+    release_first.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert results == [None, None]
+    assert calls == [root_path], "waiter must not start a second filesystem walk"
+    assert len(gate.checked) == 1
+
+
+def test_root_enoent_is_offline_but_descendant_enoent_is_tolerated(
+        tmp_path, monkeypatch):
+    import errno
+
+    import new_images as new_images_module
+
+    root_path = str(tmp_path / "share")
+    gate = _FakeReachability()
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
+
+    def missing_root(top, onerror=None, **_kwargs):
+        onerror(OSError(errno.ENOENT, "gone", top))
+        if False:
+            yield None
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", missing_root)
+    assert new_images_module._walk_root_bounded(
+        {"id": 1, "path": root_path}, root_path, gate.mount_root,
+        set(), set(), gate, 0, 0, None, 250, 0, 2,
+    ) is None
+    assert gate.marked_offline == [gate.mount_root]
+
+    gate.marked_offline.clear()
+
+    def missing_child(top, onerror=None, **_kwargs):
+        onerror(OSError(errno.ENOENT, "gone", os.path.join(top, "child")))
+        yield top, [], []
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", missing_child)
+    assert new_images_module._walk_root_bounded(
+        {"id": 1, "path": root_path}, root_path, gate.mount_root,
+        set(), set(), gate, 0, 0, None, 250, 0, 2,
+    ) == ([], 0, 0)
+    assert gate.marked_offline == []
+
+
+def test_descendant_windows_network_loss_aborts_root(tmp_path, monkeypatch):
+    import errno
+
+    import new_images as new_images_module
+
+    root_path = str(tmp_path / "share")
+    gate = _FakeReachability()
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
+
+    def disconnected_child(top, onerror=None, **_kwargs):
+        exc = OSError(errno.ENOENT, "network name deleted", os.path.join(top, "child"))
+        exc.winerror = 64
+        onerror(exc)
+        if False:
+            yield None
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", disconnected_child)
+    assert new_images_module._walk_root_bounded(
+        {"id": 1, "path": root_path}, root_path, gate.mount_root,
+        set(), set(), gate, 0, 0, None, 250, 0, 2,
+    ) is None
+    assert gate.marked_offline == [gate.mount_root]
+
+
+def test_count_progress_and_totals_unchanged_by_worker_thread(db_with_workspace):
+    """The worker-thread walk keeps the caller-visible contract: exact totals,
+    monotonic progress, final ``(checked, new)`` event, cross-root dedupe."""
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    for name in ("a", "b"):
+        root = tmp_path / name
+        for i in range(4):
+            _touch_image(str(root / f"IMG_{i}.JPG"))
+        db.add_folder(str(root), name=name)
+    events = []
+    result = count_new_images_for_workspace(
+        db, ws_id, progress_callback=lambda c, n: events.append((c, n)), progress_every=3,
+    )
+    assert result["new_count"] == 8
+    assert events[-1] == (8, 8)
+    for prev, nxt in zip(events, events[1:], strict=False):
+        assert nxt >= prev

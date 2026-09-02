@@ -198,3 +198,128 @@ def test_banner_click_during_walk_shows_preparing_state(fresh_server, page, monk
     expect(page.locator("#newImagesImportSource")).to_contain_text(
         "1 newly detected image", timeout=5000,
     )
+
+
+class _OfflineGate:
+    """Reachability stand-in: every path under ``offline_prefix`` is on a
+    volume that is unreachable; everything else is fine."""
+
+    def __init__(self, offline_prefix):
+        self.offline_prefix = str(offline_prefix)
+        self.marked = []
+
+    def check(self, path):
+        if str(path).startswith(self.offline_prefix):
+            return "/Volumes/NAS", False
+        return None, True
+
+    def mark_offline(self, root):
+        self.marked.append(root)
+
+
+def test_banner_reports_offline_folder_instead_of_failing(fresh_server, page, monkeypatch):
+    """When a registered folder's volume is offline, the user sees a banner
+    naming the folder as offline and unchecked — not a silent nothing and
+    not a failed job. There is nothing to import, so no import button."""
+    import volume_reachability
+
+    url = fresh_server["url"]
+    photo_dir = fresh_server["photo_dir"]
+    _write_jpeg(photo_dir / "IMG_0003.JPG")
+    monkeypatch.setattr(
+        volume_reachability, "get_shared", lambda: _OfflineGate(photo_dir),
+    )
+    _clear_new_images_cache()
+
+    page.goto(f"{url}/browse")
+    banner = page.locator("#newImagesBanner")
+    expect(banner).to_be_visible(timeout=5000)
+    msg = page.locator("#newImagesMsg")
+    expect(msg).to_contain_text("Couldn't check for new images")
+    expect(msg).to_contain_text(str(photo_dir))
+    expect(msg).to_contain_text("offline")
+    expect(page.locator("#newImagesBanner .banner-cta")).to_be_hidden()
+
+    # The walk itself completed rather than failing: no failed job.
+    jobs = fresh_server["app"]._job_runner.list_jobs()
+    walks = [j for j in jobs if j.get("type") == "new_images_walk"]
+    assert walks and all(j.get("status") != "failed" for j in walks), walks
+
+    # Dismissing sticks for this exact offline set across a reload.
+    page.locator("#newImagesBanner .banner-dismiss").click()
+    expect(banner).to_be_hidden()
+    page.reload()
+    page.wait_for_load_state("networkidle")
+    expect(banner).to_be_hidden()
+
+
+def test_banner_count_discloses_unchecked_offline_folder(fresh_server, page, monkeypatch):
+    """A count from the reachable folders is shown, but the banner says which
+    folder was offline and not checked, so a partial count is never read as
+    the whole library."""
+    import volume_reachability
+
+    url = fresh_server["url"]
+    db = fresh_server["db"]
+    photo_dir = fresh_server["photo_dir"]
+    nas_dir = photo_dir.parent / "nas"
+    nas_dir.mkdir()
+    _write_jpeg(nas_dir / "REMOTE.JPG")
+    _write_jpeg(photo_dir / "LOCAL.JPG")
+    ws_id = db._active_workspace_id
+    nas_id = db.add_folder(str(nas_dir), name="nas")
+    db.add_workspace_folder(ws_id, nas_id)
+
+    monkeypatch.setattr(
+        volume_reachability, "get_shared", lambda: _OfflineGate(nas_dir),
+    )
+    _clear_new_images_cache()
+
+    page.goto(f"{url}/browse")
+    banner = page.locator("#newImagesBanner")
+    expect(banner).to_be_visible(timeout=5000)
+    msg = page.locator("#newImagesMsg")
+    expect(msg).to_contain_text("1 new image detected")
+    expect(msg).to_contain_text(f"{nas_dir} is offline and not checked")
+    expect(page.locator("#newImagesBanner .banner-cta")).to_be_visible()
+
+    # Dismissing the mixed banner keeps it dismissed: it must not come back
+    # as the offline-only notice on the next poll.
+    page.locator("#newImagesBanner .banner-dismiss").click()
+    expect(banner).to_be_hidden()
+    page.reload()
+    page.wait_for_load_state("networkidle")
+    expect(banner).to_be_hidden()
+
+
+def test_dismissed_count_rearms_when_a_folder_goes_offline(fresh_server, page, monkeypatch):
+    """Dismissing "1 new image" must not also hide a later "1 new image, and
+    one folder is offline" — the offline set is part of what was dismissed."""
+    import volume_reachability
+
+    url = fresh_server["url"]
+    db = fresh_server["db"]
+    photo_dir = fresh_server["photo_dir"]
+    nas_dir = photo_dir.parent / "nas"
+    nas_dir.mkdir()
+    _write_jpeg(photo_dir / "LOCAL.JPG")
+    ws_id = db._active_workspace_id
+    nas_id = db.add_folder(str(nas_dir), name="nas")
+    db.add_workspace_folder(ws_id, nas_id)
+    _clear_new_images_cache()
+
+    page.goto(f"{url}/browse")
+    banner = page.locator("#newImagesBanner")
+    expect(banner).to_be_visible(timeout=5000)
+    expect(page.locator("#newImagesMsg")).to_contain_text("1 new image detected")
+    page.locator("#newImagesBanner .banner-dismiss").click()
+    expect(banner).to_be_hidden()
+
+    # Same reachable count, but the second folder's volume drops.
+    monkeypatch.setattr(
+        volume_reachability, "get_shared", lambda: _OfflineGate(nas_dir),
+    )
+    _clear_new_images_cache()
+    page.reload()
+    expect(banner).to_be_visible(timeout=5000)
+    expect(page.locator("#newImagesMsg")).to_contain_text("offline and not checked")

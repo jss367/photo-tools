@@ -123,6 +123,13 @@ from services.local_workspace import (
     has_local_workspace,
     stage_boundary_lock,
 )
+from volume_reachability import (  # noqa: F401  (re-exported for tests)
+    _NETWORK_PROBE_LOCK,
+    _NETWORK_PROBES,
+)
+from volume_reachability import (
+    network_root_reachable as _network_root_reachable,
+)
 from web.background_jobs import make_background_job
 from web.local_folder import LOCAL_FOLDER_JOB_TYPES, create_local_folder_blueprint
 from web.local_workspace import LOCAL_WORKSPACE_JOB_TYPES, create_local_workspace_blueprint
@@ -2039,10 +2046,6 @@ def _file_manager_labels():
 _FINDER_TRASH_TIMEOUT_SECS = 30
 _FINDER_TRASH_BATCH_SIZE = 20
 _MOUNT_QUERY_TIMEOUT_SECS = 5
-_MAX_NETWORK_PROBES = 8
-_NETWORK_PROBE_RESERVED = object()
-_NETWORK_PROBE_LOCK = threading.Lock()
-_NETWORK_PROBES = {}
 
 # Distinct from ``None`` so ``_trash_paths`` can tell "caller didn't pass
 # network_roots" (re-query is safe) apart from "caller's own mount query
@@ -2119,122 +2122,6 @@ def _network_volume_roots(run=subprocess.run):
         ),
         _mounted_volume_roots(mounts),
     )
-
-
-def _reserve_network_probe(root):
-    """Reserve a bounded probe slot, reusing one already active per root."""
-    with _NETWORK_PROBE_LOCK:
-        if root in _NETWORK_PROBES:
-            return False
-        if len(_NETWORK_PROBES) >= _MAX_NETWORK_PROBES:
-            return False
-        _NETWORK_PROBES[root] = _NETWORK_PROBE_RESERVED
-        return True
-
-
-def _release_network_probe(root, owner):
-    """Release ``root`` only when it is still owned by this probe."""
-    with _NETWORK_PROBE_LOCK:
-        if _NETWORK_PROBES.get(root) is owner:
-            _NETWORK_PROBES.pop(root, None)
-
-
-def _reap_abandoned_network_probe(root, process):
-    """Reap a timed-out probe away from the request path."""
-    try:
-        process.communicate()
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    finally:
-        _release_network_probe(root, process)
-
-
-def _abandon_network_probe(root, process):
-    """Kill a timed-out probe without synchronously waiting for it."""
-    try:
-        process.kill()
-    except OSError:
-        pass
-    threading.Thread(
-        target=_reap_abandoned_network_probe,
-        args=(root, process),
-        name="vireo-network-probe-reaper",
-        daemon=True,
-    ).start()
-
-
-def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
-                             run=None, popen=subprocess.Popen):
-    """Bounded, out-of-process reachability probe for a mounted network root.
-
-    ``mount`` listing a share and Finder reporting a file's absence are
-    not sufficient signals that the underlying server is actually reachable:
-    an SMB mount can remain in the kernel mount table while its server is
-    unreachable, and Finder's ``exists`` query can then return false from
-    cached parent metadata even though the photo will reappear on
-    reconnect. Repeating the same Finder query does not detect this — it
-    reuses the same cache. A ``stat`` on the mount root in a bounded
-    subprocess is an *independent* signal: it does not touch Finder. On
-    timeout the child is killed and reaped on a daemon thread so an
-    uninterruptible filesystem call cannot hold the request thread in
-    Python's usual synchronous kill-and-wait timeout cleanup. Active probes
-    are reused per root and globally capped so retries cannot accumulate an
-    unbounded number of stuck children and reaper threads.
-
-    Returns ``True`` only when ``stat`` completed in time and reported the
-    root as a directory. Any other outcome (timeout, non-zero exit, error)
-    is treated as unreachable so the caller fails closed.
-    """
-    if sys.platform != "darwin":
-        return False
-    argv = ["/usr/bin/stat", "-f", "%HT", root]
-    if run is not None:
-        try:
-            result = run(
-                argv, capture_output=True, text=True, timeout=timeout,
-                **no_window_kwargs(),
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return (
-            result.returncode == 0
-            and (result.stdout or "").strip() == "Directory"
-        )
-    try:
-        root_key = os.path.normcase(os.path.normpath(os.fspath(root)))
-    except (TypeError, ValueError):
-        return False
-    if not _reserve_network_probe(root_key):
-        return False
-
-    process = None
-    abandoned = False
-    try:
-        process = popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            **no_window_kwargs(),
-        )
-        with _NETWORK_PROBE_LOCK:
-            _NETWORK_PROBES[root_key] = process
-        stdout, _stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        abandoned = True
-        _abandon_network_probe(root_key, process)
-        return False
-    except (OSError, subprocess.SubprocessError):
-        if process is not None:
-            abandoned = True
-            _abandon_network_probe(root_key, process)
-        else:
-            _release_network_probe(root_key, _NETWORK_PROBE_RESERVED)
-        return False
-    finally:
-        if process is not None and not abandoned:
-            _release_network_probe(root_key, process)
-    return process.returncode == 0 and (stdout or "").strip() == "Directory"
 
 
 def _expand_first_symlink_prefix(filepath):
@@ -16750,9 +16637,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
     )
 
+    # How long a request that *starts* a new-images walk waits for it before
+    # answering ``pending``. Small libraries finish inside this window and
+    # get a real count synchronously. Kept under the 0.5s slow-request
+    # threshold so a normal cold probe never logs as a slow request.
+    _NEW_IMAGES_SYNC_WAIT_SECS = 0.4
+
     def _new_images_walk_fns(db, ws_id):
-        """Return ``(compute, on_spawn)`` for a transparent background
+        """Return ``(compute, on_spawn, spawned)`` for a transparent background
         new-images walk, shared by the navbar probe and the snapshot POST.
+
+        ``spawned()`` reports whether the most recent ``kickoff_compute`` that
+        received this ``on_spawn`` actually started a worker. Only that
+        request should block briefly for a result: while a multi-minute walk
+        over a NAS is in flight, every follow-up poll (the client re-polls
+        every 3s) used to sit out the full grace period too, so a single walk
+        produced hundreds of "slow request" warnings and tied up a Flask
+        worker per tab for nothing — the answer was always going to be
+        ``pending``.
 
         The walk always runs with ``sample_limit=None`` so the cached result
         carries the complete list of new-file paths. That is what lets a
@@ -16776,6 +16678,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # returns the error from ``get_recent_error`` — contradictory state
         # in the bottom panel.
         walk_error = {"exc": None}
+        walk_result = {"result": None}
+        spawn_state = {"spawned": False}
 
         def compute(progress_callback=None):
             # Close explicitly: this connection lives for the whole walk
@@ -16784,10 +16688,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             wdb = Database(db_path)
             try:
                 wdb.set_active_workspace(ws_id)
-                return count_new_images_for_workspace(
+                result = count_new_images_for_workspace(
                     wdb, ws_id, sample_limit=None,
                     progress_callback=progress_callback,
                 )
+                walk_result["result"] = result
+                return result
             except Exception as e:
                 walk_error["exc"] = e
                 raise
@@ -16804,6 +16710,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         runner = app._job_runner
 
         def on_spawn(spawn_event):
+            spawn_state["spawned"] = True
             progress_state = {"checked": 0, "found": 0}
             app._new_images_walk_progress[(db_path, ws_id)] = progress_state
 
@@ -16819,10 +16726,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 spawn_event.wait()
                 if walk_error["exc"] is not None:
                     raise walk_error["exc"]
-                return {
+                result = walk_result["result"] or {}
+                payload = {
                     "files_checked": progress_state["checked"],
                     "new_count": progress_state["found"],
                 }
+                # An offline volume is a completed walk with a caveat, not
+                # a failure: name the roots that were skipped so the Jobs
+                # panel tells the same story as the banner.
+                unreachable = result.get("unreachable_roots") or []
+                if unreachable:
+                    payload["unreachable_roots"] = list(unreachable)
+                    payload["phase"] = (
+                        f"{len(unreachable)} folder(s) offline, not checked"
+                    )
+                return payload
 
             job_id = runner.start(
                 "new_images_walk",
@@ -16853,7 +16771,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             return progress_callback
 
-        return compute, on_spawn
+        return compute, on_spawn, (lambda: spawn_state["spawned"])
 
     def _new_images_walk_progress_fields(db_path, ws_id):
         """Live totals of the current/most recent walk for pending payloads."""
@@ -16933,9 +16851,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # libraries (and the test suite's tmp_path filesystems) still
         # observe a real count synchronously; longer walks return
         # ``pending: true`` and the front-end re-polls.
-        compute, on_spawn = _new_images_walk_fns(db, ws_id)
+        compute, on_spawn, spawned = _new_images_walk_fns(db, ws_id)
         event = cache.kickoff_compute(db_path, ws_id, compute, on_spawn=on_spawn)
-        if event.wait(timeout=0.5):
+        if spawned() and event.wait(timeout=_NEW_IMAGES_SYNC_WAIT_SECS):
             cached = cache.get(db_path, ws_id)
             if cached is not None:
                 return jsonify(response_payload(cached))
@@ -17010,9 +16928,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # poll loops can never stack walks or restart one mid-flight.
         # ``on_spawn`` registers the same ephemeral bottom-panel job the
         # navbar probe gets, so a click-triggered walk is just as visible.
-        compute, on_spawn = _new_images_walk_fns(db, ws_id)
+        compute, on_spawn, spawned = _new_images_walk_fns(db, ws_id)
         event = cache.kickoff_compute(db_path, ws_id, compute, on_spawn=on_spawn)
-        if event.wait(timeout=0.5):
+        if spawned() and event.wait(timeout=_NEW_IMAGES_SYNC_WAIT_SECS):
             cached = cache.get(db_path, ws_id)
             if cached is not None and cached.get("sample_complete"):
                 return create_snapshot_from_result(cached)

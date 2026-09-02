@@ -62,7 +62,10 @@ from resource_ledger import (
     suspend_resource_wait_timing,
 )
 from volume_reachability import (
-    mount_root_candidates_checked as _archive_mount_root_candidates_checked,
+    mount_root_candidates as _archive_mount_root_candidates,
+)
+from volume_reachability import (
+    mount_root_resolution_conclusive as _archive_mount_resolution_conclusive,
 )
 
 log = logging.getLogger(__name__)
@@ -253,7 +256,8 @@ def _archive_mount_baseline(
     """
     known = known_mounted_roots or set()
     baseline = {}
-    candidates, conclusive = _archive_mount_root_candidates_checked(path)
+    candidates = _archive_mount_root_candidates(path)
+    conclusive = _archive_mount_resolution_conclusive(path)
     for root in candidates:
         # An inconclusive resolution (a mount-shaped prefix could not be
         # inspected in time) is read as "assume it was a mount": the later
@@ -397,8 +401,8 @@ def _missing_archive_mount_root(path: str) -> str | None:
     check that also treats a directory-still-there-but-not-mounted case
     as offline.
     """
-    candidates, conclusive = _archive_mount_root_candidates_checked(path)
-    if candidates and not conclusive:
+    candidates = _archive_mount_root_candidates(path)
+    if candidates and not _archive_mount_resolution_conclusive(path):
         # Could not inspect the mount prefix in time: refuse rather than
         # risk creating a stub and writing onto the local disk.
         return candidates[0]
@@ -509,8 +513,8 @@ def _source_offline_reason(
     # file" and letting classify keep hammering the dead share. A
     # successful root probe leaves the caller with the ordinary
     # "readable folder → per-photo failure" outcome below.
-    candidates, conclusive = _archive_mount_root_candidates_checked(image_path)
-    if candidates and not conclusive:
+    candidates = _archive_mount_root_candidates(image_path)
+    if candidates and not _archive_mount_resolution_conclusive(image_path):
         return "mount", f"volume {candidates[0]} could not be inspected in time"
     for mount_root in candidates:
         if _mount_root_offline(mount_root):

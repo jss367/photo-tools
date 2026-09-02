@@ -169,6 +169,13 @@ def mount_root_candidates(path: str, _report_confidence=None) -> list[str]:
     return seen
 
 
+def mount_root_resolution_conclusive(path):
+    """True when every mount-shaped prefix of ``path`` could be inspected in
+    time (or had a cached answer). Callers that already hold the candidate
+    list use this to decide whether to trust it; False means fail closed."""
+    return mount_root_candidates_checked(path)[1]
+
+
 def mount_root_candidates_checked(path):
     """``(candidates, conclusive)`` — like :func:`mount_root_candidates`, but
     also says whether every mount-shaped prefix could be inspected in time.

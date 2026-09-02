@@ -19409,10 +19409,8 @@ def test_pipeline_classifier_factory_uses_non_parking_cancel_probe():
 def test_archive_mount_baseline_assumes_mount_when_resolution_inconclusive(monkeypatch, tmp_path):
     import pipeline_job
 
-    monkeypatch.setattr(
-        pipeline_job, "_archive_mount_root_candidates_checked",
-        lambda p: (["/mnt/archive"], False),
-    )
+    monkeypatch.setattr(pipeline_job, "_archive_mount_root_candidates", lambda p: ["/mnt/archive"])
+    monkeypatch.setattr(pipeline_job, "_archive_mount_resolution_conclusive", lambda p: False)
     monkeypatch.setattr(pipeline_job.os.path, "ismount", lambda p: False)
     assert pipeline_job._archive_mount_baseline(str(tmp_path)) == {"/mnt/archive": True}
 
@@ -19420,10 +19418,8 @@ def test_archive_mount_baseline_assumes_mount_when_resolution_inconclusive(monke
 def test_missing_archive_mount_root_refuses_on_inconclusive_resolution(monkeypatch, tmp_path):
     import pipeline_job
 
-    monkeypatch.setattr(
-        pipeline_job, "_archive_mount_root_candidates_checked",
-        lambda p: (["/mnt/archive"], False),
-    )
+    monkeypatch.setattr(pipeline_job, "_archive_mount_root_candidates", lambda p: ["/mnt/archive"])
+    monkeypatch.setattr(pipeline_job, "_archive_mount_resolution_conclusive", lambda p: False)
     monkeypatch.setattr(pipeline_job.os.path, "lexists", lambda p: True)
     assert pipeline_job._missing_archive_mount_root(str(tmp_path)) == "/mnt/archive"
 
@@ -19431,10 +19427,8 @@ def test_missing_archive_mount_root_refuses_on_inconclusive_resolution(monkeypat
 def test_source_offline_reason_scopes_inconclusive_resolution_to_mount(monkeypatch, tmp_path):
     import pipeline_job
 
-    monkeypatch.setattr(
-        pipeline_job, "_archive_mount_root_candidates_checked",
-        lambda p: (["/mnt/archive"], False),
-    )
+    monkeypatch.setattr(pipeline_job, "_archive_mount_root_candidates", lambda p: ["/mnt/archive"])
+    monkeypatch.setattr(pipeline_job, "_archive_mount_resolution_conclusive", lambda p: False)
     scope, reason = pipeline_job._source_offline_reason(
         str(tmp_path), str(tmp_path / "img.jpg"),
     )

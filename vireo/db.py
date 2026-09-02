@@ -2943,6 +2943,12 @@ class Database:
         """
         if workspace_id is None:
             workspace_id = self._ws_id()
+        # Preserve the recovery side effect of get_workspace_folder_roots:
+        # a descendant can be discovered after its recursive ancestor was
+        # linked, and blocker polling must make that relationship visible to
+        # workspace_local_root_ids even though this fast path skips photo
+        # counts. This only writes when an unmaterialized descendant exists.
+        self._materialize_workspace_descendants(workspace_id)
         rows = self.conn.execute(
             """SELECT f.id
                FROM folders f

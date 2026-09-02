@@ -26639,12 +26639,26 @@ def test_get_workspace_root_folder_ids_matches_roots_without_counting_photos(tmp
     child = db.add_folder(
         str(tmp_path / "a" / "sub"), name="sub", parent_id=a, workspace_root=False,
     )
+    (tmp_path / "a" / "late").mkdir()
+    late_child = db.add_folder(
+        str(tmp_path / "a" / "late"), name="late", parent_id=a,
+        link_to_workspace=False,
+    )
+    assert db.conn.execute(
+        "SELECT 1 FROM workspace_folders WHERE workspace_id=? AND folder_id=?",
+        (ws_id, late_child),
+    ).fetchone() is None
 
     ids = db.get_workspace_root_folder_ids(ws_id)
+    assert db.conn.execute(
+        "SELECT is_root FROM workspace_folders WHERE workspace_id=? AND folder_id=?",
+        (ws_id, late_child),
+    ).fetchone()["is_root"] == 0
     full = sorted(int(r["id"]) for r in db.get_workspace_folder_roots(ws_id))
     assert sorted(ids) == full
     assert set(ids) == {a, b}, "only the two top-level roots are roots"
     assert child not in ids, "a nested, non-root folder must not be reported"
+    assert late_child not in ids, "a newly materialized descendant is not a root"
     # Defaults to the active workspace and refuses to run without one.
     assert db.get_workspace_root_folder_ids() == ids
     db._active_workspace_id = None

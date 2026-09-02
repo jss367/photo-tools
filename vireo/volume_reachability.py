@@ -298,6 +298,11 @@ def mount_root_candidates(path: str) -> "MountRootCandidates":
     for source in (raw_posix, normalized_posix, resolved_posix):
         if source is None:
             continue
+        # The raw expanded form is retained to preserve UNC / drive syntax,
+        # but it may contain ``.`` or ``..``. Collapse those lexically before
+        # extracting roots so an unrelated volume named before ``..`` is not
+        # probed (and cannot make a valid folder look offline).
+        source = posixpath.normpath(source)
         for cand in (
             _mount_shaped_candidate(source),
             _deepest_custom_mount(source, boundaries),

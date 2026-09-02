@@ -76,6 +76,21 @@ def test_mount_root_candidates_recognizes_mount_shaped_prefixes():
     assert vr.mount_root_candidates("//server/share/photos") == ["//server/share"]
 
 
+def test_mount_root_candidates_normalizes_dot_segments_before_extraction(monkeypatch):
+    monkeypatch.setattr(vr, "_system_mount_roots", lambda: set())
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
+    probed = []
+    monkeypatch.setattr(
+        vr, "_bounded_link_target",
+        lambda path, timeout=None: probed.append(path),
+    )
+
+    assert vr.mount_root_candidates("/mnt/NAS/../localphotos") == [
+        "/mnt/localphotos"
+    ]
+    assert "/mnt/NAS" not in probed
+
+
 def test_mount_root_candidates_empty_for_ordinary_local_paths(tmp_path):
     if sys.platform == "win32":
         pytest.skip("every absolute Windows path has a drive-letter candidate")

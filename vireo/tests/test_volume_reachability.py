@@ -204,9 +204,9 @@ def test_generic_probe_returns_isdir_result(tmp_path, monkeypatch):
     (tmp_path / "photo.jpg").write_bytes(b"")
     assert vr._probe_root_generic(str(tmp_path), timeout=1) is True
     assert vr._probe_root_generic(str(tmp_path / "nope"), timeout=1) is False
-    # An empty, unmounted directory is read as a detached share's stub.
+    # A readable empty directory with no prior mount history is a valid root.
     (tmp_path / "empty").mkdir()
-    assert vr._probe_root_generic(str(tmp_path / "empty"), timeout=1) is False
+    assert vr._probe_root_generic(str(tmp_path / "empty"), timeout=1) is True
 
 
 def test_app_reexports_probe_machinery_by_historical_names():
@@ -453,21 +453,42 @@ def test_conclusive_link_answers_are_cached(tmp_path, monkeypatch):
     assert {str(link): "/mnt/NAS", str(tmp_path): None} == vr._LINK_TARGET_CACHE
 
 
-def test_generic_probe_cold_start_treats_empty_unmounted_stub_as_offline(monkeypatch):
-    """No in-process history (Vireo started after the share detached): an
-    empty, unmounted mount-point directory is the detached share's stub and
-    reads offline; a populated unmounted directory is a real local root."""
+def test_generic_probe_cold_start_accepts_empty_unmounted_root(monkeypatch):
+    """An empty readable directory is not evidence of a detached share.
+
+    With no prior mounted baseline it may be a legitimate local root, so it
+    stays online just like a populated unmounted directory.
+    """
     monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
     monkeypatch.setattr(vr, "_GENERIC_PROBES", {})
     monkeypatch.setattr(vr.os.path, "isdir", lambda p: True)
     monkeypatch.setattr(vr.os.path, "ismount", lambda p: False)
-    contents = {"/mnt/NAS": [], "/mnt/photos": ["2026"]}
+    contents = {"/mnt/empty": [], "/mnt/photos": ["2026"]}
     monkeypatch.setattr(vr.os, "scandir", lambda p: _FakeScandir(contents[p]))
 
-    assert vr._probe_root_generic("/mnt/NAS", timeout=1) is False
-    assert "/mnt/NAS" not in vr._MOUNT_BASELINE, "a stub must not be recorded as a local dir"
+    assert vr._probe_root_generic("/mnt/empty", timeout=1) is True
+    assert vr._MOUNT_BASELINE["/mnt/empty"] is False
     assert vr._probe_root_generic("/mnt/photos", timeout=1) is True
     assert vr._MOUNT_BASELINE["/mnt/photos"] is False
+
+
+def test_generic_probe_accepts_empty_alias_before_resolved_mount(monkeypatch):
+    """A healthy empty share remains reachable through an unmounted alias."""
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
+    monkeypatch.setattr(vr, "_GENERIC_PROBES", {})
+    monkeypatch.setattr(vr.os.path, "isdir", lambda p: True)
+    monkeypatch.setattr(vr.os.path, "ismount", lambda p: p == "/mnt/NAS")
+    monkeypatch.setattr(vr.os, "scandir", lambda p: _FakeScandir([]))
+    monkeypatch.setattr(
+        vr, "mount_root_candidates_checked",
+        lambda p: (["/mnt/archive", "/mnt/NAS"], True),
+    )
+    gate = vr.VolumeReachability(
+        probe=lambda root: vr._probe_root_generic(root, timeout=1),
+    )
+
+    assert gate.check("/mnt/archive/photos") == ("/mnt/NAS", True)
+    assert vr._MOUNT_BASELINE == {"/mnt/archive": False, "/mnt/NAS": True}
 
 
 def test_generic_probe_requires_readable_listing_even_when_mounted(monkeypatch):

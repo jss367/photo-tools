@@ -123,6 +123,7 @@ from services.local_workspace import (
     has_local_workspace,
     stage_boundary_lock,
 )
+from web.background_jobs import make_background_job
 from web.local_folder import LOCAL_FOLDER_JOB_TYPES, create_local_folder_blueprint
 from web.local_workspace import LOCAL_WORKSPACE_JOB_TYPES, create_local_workspace_blueprint
 from web.pages import pages_blueprint
@@ -4573,6 +4574,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 initialize_schema=(db_path == ":memory:"),
             )
         return g.db
+
+    # Shared prologue for routes that launch background jobs. See
+    # web/background_jobs.py: the decorated view receives a ``JobLaunch``
+    # (runner + active workspace + worker-thread db factory) as its first
+    # argument and returns ``ctx.start(job_type, work, ...)``.
+    background_job = make_background_job(
+        lambda: app._job_runner, _get_db, db_path, Database
+    )
 
     def _requested_pair_source(photo, folder_path):
         """Resolve an explicit RAW/JPEG display choice for a paired photo.
@@ -13044,7 +13053,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify(result)
 
     @app.route("/api/jobs/batch-delete", methods=["POST"])
-    def api_job_batch_delete():
+    @background_job
+    def api_job_batch_delete(ctx):
         """Start a background delete job with phase progress."""
         body = request.get_json(silent=True) or {}
         photo_ids = body.get("photo_ids", [])
@@ -13057,13 +13067,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not photo_ids and not (mode == "disk_permanent" and paths):
             return json_error("photo_ids required")
 
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
-
         def work(job):
-            thread_db = Database(db_path)
-            if active_ws is not None:
-                thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
             started = time.time()
 
             def progress(payload):
@@ -13072,7 +13077,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 job["progress"]["current"] = current
                 job["progress"]["total"] = total
                 job["progress"]["current_file"] = payload.get("current_file", "")
-                runner.push_event(job["id"], "progress", {
+                ctx.runner.push_event(job["id"], "progress", {
                     **payload,
                     "rate": round(current / max(time.time() - started, 0.01), 1)
                     if current else 0,
@@ -13093,7 +13098,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             finally:
                 thread_db.conn.close()
 
-        job_id = runner.start(
+        return ctx.start(
             "batch-delete",
             work,
             config={
@@ -13102,9 +13107,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "include_companions": bool(include_companions),
                 "path_count": len(paths or []),
             },
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     # -- Undo --
 
@@ -22363,15 +22366,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
 
     @app.route("/api/jobs/precompute-embeddings", methods=["POST"])
-    def api_job_precompute_embeddings():
+    @background_job
+    def api_job_precompute_embeddings(ctx):
         body = request.get_json(silent=True) or {}
         model_id = body.get("model_id")
         labels_file = body.get("labels_file")
         if not model_id or not labels_file:
             return json_error("model_id and labels_file required")
-
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             from classifier import precompute_label_embeddings
@@ -22393,7 +22394,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "not use per-label embeddings — nothing to precompute."
                 )
 
-            runner.push_event(
+            ctx.runner.push_event(
                 job["id"],
                 "progress",
                 {
@@ -22413,7 +22414,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
 
             def _progress(current, total):
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -22431,19 +22432,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 model_str=model["model_str"],
                 pretrained_str=model["weights_path"],
                 progress_callback=_progress,
-                cancel_check=lambda: runner.is_cancelled(job["id"]),
+                cancel_check=lambda: ctx.runner.is_cancelled(job["id"]),
             )
 
             return {"labels": len(labels), "model": model["name"]}
 
-        job_id = runner.start(
+        return ctx.start(
             "precompute-embeddings",
             work,
             config={
                 "model_id": model_id,
                 "labels_file": labels_file,
             },
-            workspace_id=active_ws,
             runtime_warning=_build_cpu_runtime_warning(
                 "precompute-embeddings",
                 work_units=_runtime_warning_work_units(
@@ -22453,7 +22453,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 reason="large_embedding_precompute_cpu_only",
             ),
         )
-        return jsonify({"job_id": job_id})
 
     @app.route("/api/embedding-cache", methods=["DELETE"])
     def api_embedding_cache_clear():
@@ -23564,7 +23563,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify(build_summary(db))
 
     @app.route("/api/jobs/verify-hashes", methods=["POST"])
-    def api_job_verify_hashes():
+    @background_job
+    def api_job_verify_hashes(ctx):
         """Re-hash every photo file and compare against the stored SHA-256.
 
         Background job: flags silent corruption (content changed, mtime
@@ -23573,22 +23573,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         land in photos.hash_status; the audit page reads them via
         /api/audit/integrity.
         """
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             from audit import verify_hashes
 
-            thread_db = Database(db_path)
-            if active_ws is not None:
-                thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
 
             def progress_cb(current, total, filename):
                 # Throttle SSE events; hashing is per-file fast on small
                 # files and the stream doesn't need every one.
                 if current % 10 != 0 and current not in (1, total):
                     return
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -23602,14 +23598,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return verify_hashes(
                 thread_db,
                 progress_cb=progress_cb,
-                should_cancel=lambda: runner.is_cancelled(job["id"]),
+                should_cancel=lambda: ctx.runner.is_cancelled(job["id"]),
             )
 
-        job_id = runner.start("verify-hashes", work, workspace_id=active_ws)
-        return jsonify({"job_id": job_id})
+        return ctx.start("verify-hashes", work)
 
     @app.route("/api/card-cleanup/scan", methods=["POST"])
-    def api_card_cleanup_scan():
+    @background_job
+    def api_card_cleanup_scan(ctx):
         """Scan a removable-media source and write a manifest of files
         that are safely deletable (verified elsewhere in the archive).
 
@@ -23662,21 +23658,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         card_cleanup_dir = app.config["CARD_CLEANUP_DIR"]
         card_cleanup.prune_manifests(card_cleanup_dir)
 
-        runner = app._job_runner
-        active_ws = db._active_workspace_id
-
         def work(job):
-            thread_db = Database(db_path)
+            thread_db = ctx.thread_db()
             try:
-                if active_ws is not None:
-                    thread_db.set_active_workspace(active_ws)
 
                 def progress_cb(current, total, filename):
                     # Throttle SSE events; hashing is per-file fast on
                     # small files and the stream doesn't need every one.
                     if current % 10 != 0 and current not in (1, total):
                         return
-                    runner.push_event(job["id"], "progress", {
+                    ctx.runner.push_event(job["id"], "progress", {
                         "current": current, "total": total,
                         "current_file": filename,
                         "phase": "Verifying card files against the archive",
@@ -23686,7 +23677,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     thread_db, source, recursive, card_cleanup_dir,
                     job["id"],
                     progress_cb=progress_cb,
-                    should_cancel=lambda: runner.is_cancelled(job["id"]),
+                    should_cancel=lambda: ctx.runner.is_cancelled(job["id"]),
                 )
                 if manifest.get("cancelled"):
                     return {"cancelled": True}
@@ -23707,11 +23698,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             finally:
                 thread_db.close()
 
-        job_id = runner.start(
+        return ctx.start(
             "card-cleanup-scan", work,
-            config={"source": source, "recursive": recursive},
-            workspace_id=active_ws)
-        return jsonify({"job_id": job_id})
+            config={"source": source, "recursive": recursive})
 
     @app.route("/api/card-cleanup/<scan_job_id>/manifest")
     def api_card_cleanup_manifest(scan_job_id):
@@ -23771,7 +23760,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return None
 
     @app.route("/api/card-cleanup/verify", methods=["POST"])
-    def api_card_cleanup_verify():
+    @background_job
+    def api_card_cleanup_verify(ctx):
         """Verify only archive copies needed by a cleanup preview.
 
         Unlike the workspace-wide integrity audit, this reads at most one
@@ -23786,10 +23776,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error("scan_job_id required")
 
         db = _get_db()
-        runner = app._job_runner
-        active_ws = db._active_workspace_id
         _scan_job, err = _resolve_completed_card_cleanup_scan(
-            db, runner, scan_job_id)
+            db, ctx.runner, scan_job_id)
         if err is not None:
             return err
 
@@ -23806,7 +23794,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # promotions with entries the user never saw promoted.
         with _CARD_CLEANUP_JOB_LOCK:
             conflict = _card_cleanup_job_conflict_response(
-                runner, scan_job_id)
+                ctx.runner, scan_job_id)
             if conflict is not None:
                 return conflict
             try:
@@ -23823,13 +23811,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 return json_error("nothing needs archive verification")
 
             def work(job):
-                thread_db = Database(db_path)
+                thread_db = ctx.thread_db()
                 try:
-                    if active_ws is not None:
-                        thread_db.set_active_workspace(active_ws)
 
                     def progress_cb(current, total, filename):
-                        runner.push_event(job["id"], "progress", {
+                        ctx.runner.push_event(job["id"], "progress", {
                             "current": current, "total": total,
                             "current_file": filename,
                             "phase": "Verifying matching archive copies",
@@ -23838,26 +23824,26 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     return card_cleanup.verify_manifest_archives(
                         thread_db, manifest, card_cleanup_dir,
                         progress_cb=progress_cb,
-                        should_cancel=lambda: runner.is_cancelled(job["id"]),
+                        should_cancel=lambda: ctx.runner.is_cancelled(job["id"]),
                     )
                 finally:
                     thread_db.close()
 
-            job_id = runner.start(
+            job_id = ctx.start_job(
                 "card-cleanup-verify", work,
-                config={"scan_job_id": scan_job_id},
-                workspace_id=active_ws)
+                config={"scan_job_id": scan_job_id})
         return jsonify({"job_id": job_id})
 
     @app.route("/api/card-cleanup/delete", methods=["POST"])
-    def api_card_cleanup_delete():
+    @background_job
+    def api_card_cleanup_delete(ctx):
         """Delete the deletable bucket of a scan's manifest.
 
         Background job: re-verifies every file against the card and the
         archive immediately before each unlink (see card_cleanup.delete_
-        verified). Validates the referencing scan job via the live runner
+        verified). Validates the referencing scan job via the live ctx.runner
         first, falling back to job_history so a delete can still be
-        requested for a scan whose job fell out of the runner's in-memory
+        requested for a scan whose job fell out of the ctx.runner's in-memory
         table (e.g. after a process restart) as long as its manifest is
         still on disk.
         """
@@ -23868,11 +23854,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not scan_job_id or not isinstance(scan_job_id, str):
             return json_error("scan_job_id required")
         db = _get_db()
-        runner = app._job_runner
-        active_ws = db._active_workspace_id
 
         _scan_job, err = _resolve_completed_card_cleanup_scan(
-            db, runner, scan_job_id)
+            db, ctx.runner, scan_job_id)
         if err is not None:
             return err
         # Codex P1: the client must send the manifest revision it
@@ -23910,15 +23894,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error("nothing to delete — no verified files")
 
         def work(job):
-            thread_db = Database(db_path)
+            thread_db = ctx.thread_db()
             try:
-                if active_ws is not None:
-                    thread_db.set_active_workspace(active_ws)
 
                 def progress_cb(current, total, filename):
                     # Not throttled — deletions are the events the user
                     # watches, unlike the scan's per-file hashing.
-                    runner.push_event(job["id"], "progress", {
+                    ctx.runner.push_event(job["id"], "progress", {
                         "current": current, "total": total,
                         "current_file": filename,
                         "phase": "Deleting verified files from the card",
@@ -23927,7 +23909,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 summary = card_cleanup.delete_verified(
                     thread_db, manifest,
                     progress_cb=progress_cb,
-                    should_cancel=lambda: runner.is_cancelled(job["id"]),
+                    should_cancel=lambda: ctx.runner.is_cancelled(job["id"]),
                 )
                 # Bound the persisted result: skipped/failed can run to
                 # thousands of per-file entries on a wholesale-drifted
@@ -23948,13 +23930,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # new manifest under this delete.
         with _CARD_CLEANUP_JOB_LOCK:
             conflict = _card_cleanup_job_conflict_response(
-                runner, scan_job_id)
+                ctx.runner, scan_job_id)
             if conflict is not None:
                 return conflict
-            job_id = runner.start(
+            job_id = ctx.start_job(
                 "card-cleanup-delete", work,
-                config={"scan_job_id": scan_job_id},
-                workspace_id=active_ws)
+                config={"scan_job_id": scan_job_id})
         return jsonify({"job_id": job_id})
 
     @app.route("/api/audit/resolve", methods=["POST"])
@@ -24098,14 +24079,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify({"ok": True, "model_id": model_id})
 
     @app.route("/api/jobs/download-model", methods=["POST"])
-    def api_job_download_model():
+    @background_job
+    def api_job_download_model(ctx):
         body = request.get_json(silent=True) or {}
         model_id = body.get("model_id")
         if not model_id:
             return json_error("model_id required")
-
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             from models import download_model
@@ -24114,7 +24093,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 job["progress"]["current"] = current
                 job["progress"]["total"] = total
                 job["progress"]["current_file"] = msg
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -24129,11 +24108,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             path = download_model(model_id, progress_callback=progress_cb)
             return {"model_id": model_id, "weights_path": path}
 
-        job_id = runner.start("download-model", work, config={"model_id": model_id}, workspace_id=active_ws)
-        return jsonify({"job_id": job_id})
+        return ctx.start("download-model", work, config={"model_id": model_id})
 
     @app.route("/api/jobs/verify-all-models", methods=["POST"])
-    def api_job_verify_all_models():
+    @background_job
+    def api_job_verify_all_models(ctx):
         """Run SHA256 verification on every installed known model.
 
         Launches a background job that iterates get_models(), hashes each
@@ -24142,14 +24121,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         The UI can then show Repair for the bad ones via the existing
         state classifier path.
         """
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             import model_verify
 
             def progress_cb(msg):
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -24168,25 +24145,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "ok": [mid for mid, r in results.items() if r.ok],
             }
 
-        job_id = runner.start("verify-models", work, workspace_id=active_ws)
-        return jsonify({"job_id": job_id})
+        return ctx.start("verify-models", work)
 
     @app.route("/api/jobs/download-hf-model", methods=["POST"])
-    def api_job_download_hf_model():
+    @background_job
+    def api_job_download_hf_model(ctx):
         body = request.get_json(silent=True) or {}
         repo_id = body.get("repo_id", "").strip()
         if not repo_id:
             return json_error("repo_id required")
-
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             from models import download_hf_model
 
             def progress_cb(msg):
                 job["progress"]["current_file"] = msg
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -24200,8 +24174,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             result = download_hf_model(repo_id, progress_callback=progress_cb)
             return result
 
-        job_id = runner.start("download-model", work, config={"repo_id": repo_id}, workspace_id=active_ws)
-        return jsonify({"job_id": job_id})
+        return ctx.start("download-model", work, config={"repo_id": repo_id})
 
     @app.route("/api/taxonomy/info")
     def api_taxonomy_info():
@@ -24210,10 +24183,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify(get_taxonomy_info())
 
     @app.route("/api/jobs/download-taxonomy", methods=["POST"])
-    def api_job_download_taxonomy():
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
-
+    @background_job
+    def api_job_download_taxonomy(ctx):
         def work(job):
             from taxonomy import (
                 TAXONOMY_JSON_PATH,
@@ -24224,7 +24195,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
 
             def progress_cb(msg):
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -24237,8 +24208,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             download_taxonomy(TAXONOMY_JSON_PATH, progress_callback=progress_cb)
 
-            bg_db = Database(db_path)
-            bg_db.set_active_workspace(active_ws)
+            bg_db = ctx.thread_db()
 
             # Populate the SQLite taxa table from the same DWCA data so
             # add_keyword's auto-detect (which queries the DB, not the JSON)
@@ -24297,17 +24267,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 raise
             return {"ok": True, "keywords_retyped": updated}
 
-        job_id = runner.start("download-taxonomy", work, workspace_id=active_ws)
-        return jsonify({"job_id": job_id})
+        return ctx.start("download-taxonomy", work)
 
     @app.route("/api/jobs/download-darktable", methods=["POST"])
-    def api_job_download_darktable():
+    @background_job
+    def api_job_download_darktable(ctx):
         """Download the latest darktable build and hand it to the platform."""
         import darktable_install
         from job_contract import progress_event
-
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
 
         # Read the identity the user confirmed BEFORE any other check.  If a
         # download is already running and we are about to join it, the join
@@ -24462,7 +24429,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # so this must stay cheap — a queue put, never a DB write or
             # anything else that can stall the transfer.
             def on_bytes(done, total):
-                runner.push_event(job["id"], "progress", progress_event(
+                ctx.runner.push_event(job["id"], "progress", progress_event(
                     phase="Downloading darktable",
                     current=done,
                     total=total or asset.get("size") or 0,
@@ -24472,7 +24439,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             path, verify_detail = darktable_install.download(
                 asset,
                 byte_callback=on_bytes,
-                should_cancel=lambda: runner.is_cancelled(job["id"]),
+                should_cancel=lambda: ctx.runner.is_cancelled(job["id"]),
             )
 
             # total=0 on purpose: the UI treats a non-zero total as a byte
@@ -24480,7 +24447,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # verification detail. That detail is passed through verbatim —
             # it is the only thing that distinguishes "the digest matched"
             # from "GitHub published no digest to check against".
-            runner.push_event(job["id"], "progress", progress_event(
+            ctx.runner.push_event(job["id"], "progress", progress_event(
                 phase="Verifying", current=0, total=0, current_file=verify_detail,
             ))
 
@@ -24494,7 +24461,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # otherwise it enters the uninterruptible phase so a Cancel that
             # arrives during hand_off is rejected rather than flipping the
             # terminal status once the side effect has already committed.
-            if not runner.begin_uncancellable(job["id"]):
+            if not ctx.runner.begin_uncancellable(job["id"]):
                 raise DownloadCancelled("Download cancelled")
 
             result = darktable_install.hand_off(path)
@@ -24542,7 +24509,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # a DIFFERENT artifact (e.g. a new release published while an older
         # download is still in flight) can be rejected instead of quietly
         # joining a download of the wrong bytes.
-        job_id, joined, existing_snapshot = runner.start_singleton(
+        job_id, joined, existing_snapshot = ctx.runner.start_singleton(
             "download-darktable", work,
             singleton_key="darktable-download",
             config={
@@ -24551,7 +24518,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "asset_digest": asset.get("digest"),
                 "asset_size": asset.get("size"),
             },
-            workspace_id=active_ws,
+            workspace_id=ctx.workspace_id,
         )
         if joined:
             # Only join a running download whose artifact matches what THIS
@@ -24656,7 +24623,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify({"ok": True})
 
     @app.route("/api/jobs/fetch-labels", methods=["POST"])
-    def api_job_fetch_labels():
+    @background_job
+    def api_job_fetch_labels(ctx):
         body = request.get_json(silent=True) or {}
         place_id = body.get("place_id")
         place_name = body.get("place_name", "")
@@ -24673,9 +24641,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             filter_label = OBSERVATION_FILTERS[observation_filter]["name"]
             name = f"{place_name} {group_names} ({filter_label})".strip()
 
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
-
         def work(job):
             from labels import fetch_species_list, read_label_file, save_labels
 
@@ -24685,7 +24650,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     job["progress"]["current"] = current
                 if total is not None:
                     job["progress"]["total"] = total
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -24709,9 +24674,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 name, place_id, place_name, taxon_groups, species,
                 observation_filter=observation_filter,
             )
-            from db import Database
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
             thread_db.set_workspace_active_labels([labels_path])
 
             precompute = None
@@ -24755,7 +24718,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "embedding_precompute": precompute,
             }
 
-        job_id = runner.start(
+        return ctx.start(
             "fetch-labels",
             work,
             config={
@@ -24763,9 +24726,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "place_name": place_name,
                 "taxon_groups": taxon_groups,
             },
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     # -- iNaturalist --
 
@@ -24899,7 +24860,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify({"ok": True, "login": user.get("login")})
 
     @app.route("/api/inat/export", methods=["POST"])
-    def api_inat_export():
+    @background_job
+    def api_inat_export(ctx):
         """Export edited JPEGs with only the selected iNaturalist metadata."""
         import config as cfg
         from inat_export import (
@@ -24966,19 +24928,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         developed_dir = effective_cfg.get("darktable_output_dir", "") or ""
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
         reveal = bool(body.get("reveal", False))
-        active_ws = db._active_workspace_id
-        runner = app._job_runner
 
         def work(job):
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
             exported = []
             errors = []
             total = len(submissions)
             job["progress"]["total"] = total
             try:
                 for index, item in enumerate(submissions, start=1):
-                    if runner.is_cancelled(job["id"]):
+                    if ctx.runner.is_cancelled(job["id"]):
                         break
                     photo_id = item["photo_id"]
                     photo = thread_db.get_photo(
@@ -24990,7 +24949,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             "error": "Photo not found",
                         })
                         job["progress"]["current"] = index
-                        runner.push_event(job["id"], "progress", {
+                        ctx.runner.push_event(job["id"], "progress", {
                             "current": index,
                             "total": total,
                             "current_file": "",
@@ -25053,7 +25012,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     finally:
                         job["progress"]["current"] = index
                         job["progress"]["current_file"] = photo["filename"]
-                        runner.push_event(job["id"], "progress", {
+                        ctx.runner.push_event(job["id"], "progress", {
                             "current": index,
                             "total": total,
                             "current_file": photo["filename"],
@@ -25061,7 +25020,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         })
 
                 revealed = False
-                if exported and reveal and not runner.is_cancelled(job["id"]):
+                if exported and reveal and not ctx.runner.is_cancelled(job["id"]):
                     revealed = reveal_inat_exports(
                         [item["path"] for item in exported], destination,
                     )
@@ -25075,16 +25034,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             finally:
                 thread_db.close()
 
-        job_id = runner.start(
+        return ctx.start(
             "inat-export",
             work,
             config={
                 "photo_ids": [item["photo_id"] for item in submissions],
                 "destination": destination,
             },
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     def _inat_edit_recipe_source(photo, recipe, fallback_path):
         from image_loader import RAW_EXTENSIONS
@@ -25634,10 +25591,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify(info)
 
     @app.route("/api/megadetector/download", methods=["POST"])
-    def api_megadetector_download():
+    @background_job
+    def api_megadetector_download(ctx):
         """Download MegaDetector ONNX model as a background job."""
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             from detector import MEGADETECTOR_ONNX_DIR, MEGADETECTOR_ONNX_PATH
@@ -25646,7 +25602,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             os.makedirs(MEGADETECTOR_ONNX_DIR, exist_ok=True)
 
-            runner.push_event(job["id"], "progress", {
+            ctx.runner.push_event(job["id"], "progress", {
                 "phase": "Downloading MegaDetector ONNX model...",
                 "current": 0, "total": 1,
             })
@@ -25669,8 +25625,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             size_mb = round(os.path.getsize(dest) / 1024 / 1024, 1)
             return {"status": "downloaded", "size": f"{size_mb} MB", "path": dest}
 
-        job_id = runner.start("download-megadetector", work, workspace_id=active_ws)
-        return jsonify({"job_id": job_id})
+        return ctx.start("download-megadetector", work)
 
     @app.route("/api/megadetector/delete", methods=["POST"])
     def api_megadetector_delete():
@@ -25777,15 +25732,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify({"models": models})
 
     @app.route("/api/models/pipeline/download", methods=["POST"])
-    def api_models_pipeline_download():
+    @background_job
+    def api_models_pipeline_download(ctx):
         """Download a pipeline model (ONNX) by ID from jss367/vireo-onnx-models."""
         body = request.get_json(silent=True) or {}
         model_id = body.get("model_id")
         if not model_id:
             return json_error("model_id required")
-
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
 
         # Map each pipeline model ID to its HF subfolder and required files
         PIPELINE_MODELS = {
@@ -25840,7 +25793,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             total = len(files)
             for fi, filename in enumerate(files):
-                runner.push_event(job["id"], "progress", {
+                ctx.runner.push_event(job["id"], "progress", {
                     "phase": f"Downloading {fi + 1}/{total}: {filename}...",
                     "current": fi,
                     "total": total,
@@ -25868,20 +25821,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             "retrying in %ds...",
                             attempt, MAX_RETRIES, subfolder, filename, exc, wait,
                         )
-                        runner.push_event(job["id"], "progress", {
+                        ctx.runner.push_event(job["id"], "progress", {
                             "phase": f"Retrying {filename} in {wait}s "
                                      f"(attempt {attempt}/{MAX_RETRIES})...",
                             "current": fi, "total": total,
                         })
                         time.sleep(wait)
 
-            runner.push_event(job["id"], "progress", {
+            ctx.runner.push_event(job["id"], "progress", {
                 "phase": "Download complete", "current": total, "total": total,
             })
             return {"status": "downloaded", "model_id": model_id}
 
-        job_id = runner.start(f"download-{model_id}", work, config={"model_id": model_id}, workspace_id=active_ws)
-        return jsonify({"job_id": job_id})
+        return ctx.start(f"download-{model_id}", work, config={"model_id": model_id})
 
     @app.route("/api/models/pipeline/delete", methods=["POST"])
     def api_models_pipeline_delete():
@@ -26336,7 +26288,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return work
 
     @app.route("/api/jobs/scan", methods=["POST"])
-    def api_job_scan():
+    @background_job
+    def api_job_scan(ctx):
         """Queue a scan job.
 
         Body accepts either:
@@ -26406,9 +26359,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 raw["scan_roots"] = saved_roots
                 cfg.save(raw)
 
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
-
         # A workspace with active local state has its folder paths rebased
         # into the managed copy; scanner.scan() calls
         # db.add_folder(link_to_workspace=True) for every folder it discovers,
@@ -26422,14 +26372,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # local_workspaces — otherwise the scan enqueued in that window
         # could add unmanaged rows before the transition worker claims the
         # workspace.
-        if active_ws is not None:
+        if ctx.workspace_id is not None:
             with stage_boundary_lock():
-                if has_local_workspace(_get_db(), active_ws):
+                if has_local_workspace(_get_db(), ctx.workspace_id):
                     return json_error(
                         "Cannot scan folders while working locally. Sync or discard the local copy first.",
                         409,
                     )
-                pending = _pending_local_workspace_transition(active_ws)
+                pending = _pending_local_workspace_transition(ctx.workspace_id)
                 if pending:
                     return json_error(
                         f"Wait for the {pending['type']} job to finish before scanning; "
@@ -26438,7 +26388,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         409,
                     )
 
-        work = _build_scan_work(roots_list, incremental, active_ws)
+        work = _build_scan_work(roots_list, incremental, ctx.workspace_id)
 
         job_config = {"roots": roots_list, "incremental": incremental}
         # Back-compat: keep ``root`` in config when exactly one was given,
@@ -26446,14 +26396,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if len(roots_list) == 1:
             job_config["root"] = roots_list[0]
 
-        job_id = runner.start(
-            "scan", work, config=job_config, workspace_id=active_ws,
+        return ctx.start(
+            "scan", work, config=job_config,
             pausable=True,
         )
-        return jsonify({"job_id": job_id})
 
     @app.route("/api/folders/<int:folder_id>/rescan", methods=["POST"])
-    def api_folder_rescan(folder_id):
+    @background_job
+    def api_folder_rescan(ctx, folder_id):
         """Queue a scan job scoped to the given folder's path.
 
         Body (optional): {"incremental": bool}
@@ -26471,10 +26421,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # no claim on — otherwise a stale UI or crafted request could pollute
         # this workspace with scan output from an unrelated folder, and
         # add_folder's auto-link would silently attach it.
-        active_ws = db._active_workspace_id
         linked = db.conn.execute(
             "SELECT 1 FROM workspace_folders WHERE workspace_id = ? AND folder_id = ?",
-            (active_ws, folder_id),
+            (ctx.workspace_id, folder_id),
         ).fetchone()
         if not linked:
             return json_error("folder not found", 404)
@@ -26488,24 +26437,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
         if not os.path.isdir(root):
             return json_error(f"folder path no longer exists: {root}")
-        runner = app._job_runner
 
-        work = _build_scan_work(root, incremental, active_ws)
+        work = _build_scan_work(root, incremental, ctx.workspace_id)
 
-        job_id = runner.start(
+        return ctx.start(
             "scan", work,
             config={
                 "root": root,
                 "incremental": incremental,
                 "folder_id": folder_id,
             },
-            workspace_id=active_ws,
             pausable=True,
         )
-        return jsonify({"job_id": job_id})
 
     @app.route("/api/jobs/scan-workspace", methods=["POST"])
-    def api_job_scan_workspace():
+    @background_job
+    def api_job_scan_workspace(ctx):
         """Queue an incremental scan across every root folder of the active
         workspace.
 
@@ -26519,8 +26466,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         body = request.get_json(silent=True) or {}
         incremental = bool(body.get("incremental", True))
         db = _get_db()
-        active_ws = db._active_workspace_id
-        roots = [r["path"] for r in db.get_workspace_folder_roots(active_ws)]
+        roots = [r["path"] for r in db.get_workspace_folder_roots(ctx.workspace_id)]
         existing = [r for r in roots if os.path.isdir(r)]
         skipped = [r for r in roots if not os.path.isdir(r)]
         if not existing:
@@ -26528,16 +26474,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 return json_error("no workspace folders are currently on disk")
             return json_error("this workspace has no folders to rescan")
 
-        runner = app._job_runner
-        work = _build_scan_work(existing, incremental, active_ws)
+        work = _build_scan_work(existing, incremental, ctx.workspace_id)
         job_config = {"roots": existing, "incremental": incremental}
         if len(existing) == 1:
             job_config["root"] = existing[0]
-        job_id = runner.start(
-            "scan", work, config=job_config, workspace_id=active_ws,
+        return ctx.start(
+            "scan", work, config=job_config,
             pausable=True,
+            extra={"roots": existing, "skipped": skipped},
         )
-        return jsonify({"job_id": job_id, "roots": existing, "skipped": skipped})
 
     def _metadata_repair_count(db, workspace_id, root_paths=None):
         # Don't filter by ``folders.status``: that column is only refreshed
@@ -26679,7 +26624,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         })
 
     @app.route("/api/jobs/repair-metadata", methods=["POST"])
-    def api_job_repair_metadata():
+    @background_job
+    def api_job_repair_metadata(ctx):
         """Incrementally rescan reachable roots that contain missing EXIF."""
         from image_loader import is_excluded_scan_path
         from metadata import exiftool_status
@@ -26693,8 +26639,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             }), 409
 
         db = _get_db()
-        active_ws = db._active_workspace_id
-        roots = [r["path"] for r in db.get_workspace_folder_roots(active_ws)]
+        roots = [r["path"] for r in db.get_workspace_folder_roots(ctx.workspace_id)]
         # See api_import_readiness for why excluded bundles must be filtered
         # before os.path.isdir here (macOS TCC prompt on Photos Library).
         existing = [
@@ -26707,13 +26652,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # ``photo_count`` matches what the job will process. An unscoped
         # count could report photos under an offline sibling root that
         # this job will never touch.
-        repair_count = _metadata_repair_count(db, active_ws, existing)
+        repair_count = _metadata_repair_count(db, ctx.workspace_id, existing)
         if not repair_count:
             return json_error("no photos need metadata repair", 409)
 
-        runner = app._job_runner
         work = _build_scan_work(
-            existing, True, active_ws, repair_missing_metadata=True,
+            existing, True, ctx.workspace_id, repair_missing_metadata=True,
         )
         job_config = {
             "roots": existing,
@@ -26723,31 +26667,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         }
         if len(existing) == 1:
             job_config["root"] = existing[0]
-        job_id = runner.start(
-            "metadata-repair", work, config=job_config,
-            workspace_id=active_ws, pausable=True,
+        return ctx.start(
+            "metadata-repair", work, config=job_config, pausable=True,
+            extra={"photo_count": repair_count, "roots": existing},
         )
-        return jsonify({
-            "job_id": job_id,
-            "photo_count": repair_count,
-            "roots": existing,
-        })
 
     @app.route("/api/jobs/thumbnails", methods=["POST"])
-    def api_job_thumbnails():
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
-
+    @background_job
+    def api_job_thumbnails(ctx):
         def work(job):
             from thumbnails import generate_all
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
 
             def progress_cb(current, total):
                 job["progress"]["current"] = current
                 job["progress"]["total"] = total
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -26766,11 +26702,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 vireo_dir=vireo_dir,
             )
 
-        job_id = runner.start("thumbnails", work, workspace_id=active_ws)
-        return jsonify({"job_id": job_id})
+        return ctx.start("thumbnails", work)
 
     @app.route("/api/duplicates/scan", methods=["POST"])
-    def api_duplicates_scan():
+    @background_job
+    def api_duplicates_scan(ctx):
         """Start a background duplicate-detection job.
 
         Returns immediately with the job id. The job walks every file_hash
@@ -26784,21 +26720,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         or trash already-resolved loser files via
         /api/duplicates/delete-loser-files.
         """
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             from duplicate_scan import run_duplicate_scan
-            thread_db = Database(db_path)
-            if active_ws is not None:
-                thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
             try:
                 return run_duplicate_scan(job, thread_db, include_resolved=True)
             finally:
                 thread_db.conn.close()
 
-        job_id = runner.start("duplicate-scan", work, workspace_id=active_ws)
-        return jsonify({"job_id": job_id})
+        return ctx.start("duplicate-scan", work)
 
     @app.route("/api/duplicates/apply", methods=["POST"])
     def api_duplicates_apply():
@@ -27252,7 +27183,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         })
 
     @app.route("/api/jobs/previews", methods=["POST"])
-    def api_job_previews():
+    @background_job
+    def api_job_previews(ctx):
         body = request.get_json(silent=True) or {}
         collection_id = body.get("collection_id")
         requested_photo_ids = body.get("photo_ids")
@@ -27274,16 +27206,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         err = _reject_visual_collection(db, collection_id)
         if err is not None:
             return err
-        runner = app._job_runner
-        active_ws = db._active_workspace_id
 
         def work(job):
             import contextlib
 
             import config as cfg
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
             vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
             # Use workspace-effective config so per-workspace preview_max_size
             # overrides are honored — otherwise precompute warms the wrong
@@ -27381,7 +27310,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         else:
                             skipped += 1
 
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -27401,19 +27330,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             return {"generated": generated, "skipped": skipped, "total": total}
 
-        job_id = runner.start(
+        return ctx.start(
             "previews",
             work,
             config={
                 "collection_id": collection_id,
                 "photo_ids": requested_photo_ids,
             },
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     @app.route("/api/jobs/ingest", methods=["POST"])
-    def api_job_ingest():
+    @background_job
+    def api_job_ingest(ctx):
         body = request.get_json(silent=True) or {}
         source = body.get("source", "")
         destination = body.get("destination", "")
@@ -27439,14 +27367,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if folder_template and _is_unsafe_path(folder_template):
             return json_error("folder_template must be a relative path without '..' or backslashes")
 
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
-
         def work(job):
             from ingest import ingest as do_ingest
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
 
             job["_start_time"] = time.time()
 
@@ -27454,7 +27378,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 job["progress"]["current"] = current
                 job["progress"]["total"] = total
                 job["progress"]["current_file"] = filename
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -27480,7 +27404,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
             return result
 
-        job_id = runner.start(
+        return ctx.start(
             "ingest",
             work,
             config={
@@ -27489,14 +27413,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "file_types": file_types,
                 "folder_template": folder_template,
             },
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     # -- Move job routes --
 
     @app.route("/api/jobs/move-photos", methods=["POST"])
-    def api_job_move_photos():
+    @background_job
+    def api_job_move_photos(ctx):
         """Move selected photos to a destination directory."""
         body = request.get_json(silent=True) or {}
         photo_ids = body.get("photo_ids", [])
@@ -27510,8 +27433,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not os.path.isabs(destination):
             return json_error("destination must be an absolute path")
 
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
         import config as cfg
         effective_cfg = _get_db().get_effective_config(cfg.load())
         developed_dir = effective_cfg.get("darktable_output_dir", "") or ""
@@ -27519,8 +27440,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         def work(job):
             from move import move_photos
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
 
             job["_start_time"] = time.time()
             job["progress"]["total"] = len(photo_ids)
@@ -27529,7 +27449,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 job["progress"]["current"] = current
                 job["progress"]["total"] = total
                 job["progress"]["current_file"] = filename
-                runner.push_event(job["id"], "progress", {
+                ctx.runner.push_event(job["id"], "progress", {
                     "current": current,
                     "total": total,
                     "current_file": filename,
@@ -27560,12 +27480,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             return result
 
-        job_id = runner.start(
+        return ctx.start(
             "move-photos", work,
             config={"photo_ids": photo_ids, "destination": destination},
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     # -- Export presets --
 
@@ -27735,7 +27653,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         })
 
     @app.route("/api/jobs/export", methods=["POST"])
-    def api_job_export():
+    @background_job
+    def api_job_export(ctx):
         """Export selected photos to a destination directory."""
         body = request.get_json(silent=True) or {}
         raw_ids = body.get("photo_ids", [])
@@ -27784,8 +27703,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error(str(exc))
 
         db = _get_db()
-        runner = app._job_runner
-        active_ws = db._active_workspace_id
 
         # Filter to only photos visible in the active workspace,
         # preserving the caller's original ordering. Chunked so a large
@@ -27797,7 +27714,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 f"""SELECT p.id FROM photos p
                     JOIN workspace_folders wf ON wf.folder_id = p.folder_id
                     WHERE wf.workspace_id = ? AND p.id IN ({placeholders})""",
-                [active_ws] + list(chunk),
+                [ctx.workspace_id] + list(chunk),
             ).fetchall()
             visible_set.update(r["id"] for r in visible)
         photo_ids = [pid for pid in photo_ids if pid in visible_set]
@@ -27813,8 +27730,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         def work(job):
             from export import export_photos, reveal_exported_files
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
 
             job["_start_time"] = time.time()
             job["progress"]["total"] = len(photo_ids)
@@ -27823,7 +27739,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 job["progress"]["current"] = current
                 job["progress"]["total"] = total
                 job["progress"]["current_file"] = filename
-                runner.push_event(job["id"], "progress", {
+                ctx.runner.push_event(job["id"], "progress", {
                     "current": current,
                     "total": total,
                     "current_file": filename,
@@ -27856,12 +27772,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             result["revealed"] = bool(
                 reveal_after_export
                 and exported_files
-                and not runner.is_cancelled(job["id"])
+                and not ctx.runner.is_cancelled(job["id"])
                 and reveal_exported_files(exported_files)
             )
             return result
 
-        job_id = runner.start(
+        return ctx.start(
             "export", work,
             config={
                 "photo_ids": photo_ids,
@@ -27874,9 +27790,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "metadata_fields": metadata_fields,
                 "reveal_after_export": reveal_after_export,
             },
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     def _publish_site_bool(body, key, default):
         raw = body.get(key, default)
@@ -28047,7 +27961,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         })
 
     @app.route("/api/jobs/publish-site", methods=["POST"])
-    def api_job_publish_site():
+    @background_job
+    def api_job_publish_site(ctx):
         """Publish selected workspace website data and optimized photos."""
         options, error = _parse_publish_site_options(
             request.get_json(silent=True),
@@ -28065,8 +27980,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         import config as cfg
         db = _get_db()
-        runner = app._job_runner
-        active_ws = db._active_workspace_id
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
         effective_cfg = db.get_effective_config(cfg.load())
         wc_max_size = effective_cfg.get("working_copy_max_size", 4096)
@@ -28075,8 +27988,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         def work(job):
             from site_publish import publish_site
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
             job["_start_time"] = time.time()
 
             life_list, highlights = _build_publish_site_payloads(
@@ -28089,7 +28001,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 job["progress"]["current"] = current
                 job["progress"]["total"] = total
                 job["progress"]["current_file"] = filename
-                runner.push_event(job["id"], "progress", {
+                ctx.runner.push_event(job["id"], "progress", {
                     "current": current,
                     "total": total,
                     "current_file": filename,
@@ -28115,7 +28027,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 progress_cb=progress_cb,
             )
 
-        job_id = runner.start(
+        return ctx.start(
             "publish-site",
             work,
             config={
@@ -28128,12 +28040,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "quality": quality,
                 "include_locations": include_locations,
             },
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     @app.route("/api/jobs/offline-cache", methods=["POST"])
-    def api_job_offline_cache():
+    @background_job
+    def api_job_offline_cache(ctx):
         """Copy selected originals into Vireo's managed offline cache."""
         body = request.get_json(silent=True) or {}
         # Flask returns top-level JSON lists/numbers/strings as-is, so guard
@@ -28171,9 +28082,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             except (ValueError, TypeError):
                 return json_error("photo_ids must be integers")
 
-        runner = app._job_runner
-        active_ws = db._active_workspace_id
-
         visible_set = set()
         for chunk in _chunked(photo_ids):
             placeholders = ",".join("?" for _ in chunk)
@@ -28181,7 +28089,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 f"""SELECT p.id FROM photos p
                     JOIN workspace_folders wf ON wf.folder_id = p.folder_id
                     WHERE wf.workspace_id = ? AND p.id IN ({placeholders})""",
-                [active_ws, *chunk],
+                [ctx.workspace_id, *chunk],
             ).fetchall()
             visible_set.update(r["id"] for r in rows)
         photo_ids = [pid for pid in photo_ids if pid in visible_set]
@@ -28193,8 +28101,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         def work(job):
             from offline_cache import cache_photo_original
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
             photos_map = thread_db.get_photos_by_ids(photo_ids)
             folders = {f["id"]: f["path"] for f in thread_db.get_folder_tree()}
 
@@ -28232,7 +28139,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         job["errors"].append(f'{photo["filename"]}: {exc}')
                         log.warning("Offline cache failed for %s: %s", filename, exc)
 
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -28262,16 +28169,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 raise RuntimeError(first_err)
             return result
 
-        job_id = runner.start(
+        return ctx.start(
             "offline-cache",
             work,
             config={"photo_ids": photo_ids},
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     @app.route("/api/jobs/prepare-full-resolution", methods=["POST"])
-    def api_job_prepare_full_resolution():
+    @background_job
+    def api_job_prepare_full_resolution(ctx):
         """Prepare selected photos for uninterrupted full-resolution review.
 
         The job first copies source assets into Vireo's managed local cache,
@@ -28300,8 +28206,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 photo_ids.append(photo_id)
 
         db = _get_db()
-        runner = app._job_runner
-        active_ws = db._active_workspace_id
         visible_set = set()
         for chunk in _chunked(photo_ids):
             placeholders = ",".join("?" for _ in chunk)
@@ -28309,7 +28213,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 f"""SELECT p.id FROM photos p
                     JOIN workspace_folders wf ON wf.folder_id = p.folder_id
                     WHERE wf.workspace_id = ? AND p.id IN ({placeholders})""",
-                [active_ws, *chunk],
+                [ctx.workspace_id, *chunk],
             ).fetchall()
             visible_set.update(row["id"] for row in rows)
         photo_ids = [photo_id for photo_id in photo_ids if photo_id in visible_set]
@@ -28321,8 +28225,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         def work(job):
             from offline_cache import cache_photo_original
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
             try:
                 photos_map = thread_db.get_photos_by_ids(photo_ids)
                 folders = {
@@ -28339,7 +28242,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 job["progress"]["total"] = total
 
                 for index, photo_id in enumerate(photo_ids, start=1):
-                    if runner.is_cancelled(job["id"]):
+                    if ctx.runner.is_cancelled(job["id"]):
                         break
                     photo = photos_map.get(photo_id)
                     filename = photo["filename"] if photo else f"Photo {photo_id}"
@@ -28369,7 +28272,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                     f"/photos/{photo_id}/original"
                                 ):
                                     request_db = _get_db()
-                                    request_db.set_active_workspace(active_ws)
+                                    request_db.set_active_workspace(ctx.workspace_id)
                                     response = app.make_response(
                                         serve_original_photo(photo_id)
                                     )
@@ -28410,7 +28313,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         "phase": "Preparing full-resolution photos",
                     }
                     job["progress"].update(progress)
-                    runner.push_event(job["id"], "progress", progress)
+                    ctx.runner.push_event(job["id"], "progress", progress)
 
                 return {
                     "ok": failed == 0,
@@ -28425,13 +28328,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             finally:
                 thread_db.close()
 
-        job_id = runner.start(
+        return ctx.start(
             "prepare-full-resolution",
             work,
             config={"photo_ids": photo_ids},
-            workspace_id=active_ws,
+            extra={"total": len(photo_ids)},
         )
-        return jsonify({"job_id": job_id, "total": len(photo_ids)})
 
     def _move_folder_guard_error(guard_db, folder_id):
         """Return the error message blocking a folder move, or None.
@@ -28707,7 +28609,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
 
     @app.route("/api/jobs/move-folder", methods=["POST"])
-    def api_job_move_folder():
+    @background_job
+    def api_job_move_folder(ctx):
         """Move an entire folder to a destination."""
         body = request.get_json(silent=True)
         if not isinstance(body, dict):
@@ -28850,10 +28753,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 destination_name,
             )
 
-        runner = app._job_runner
-        active_ws = request_db._active_workspace_id
         job_id = _start_move_folder_job(
-            runner, active_ws,
+            ctx.runner, ctx.workspace_id,
             folder_id=folder_id,
             destination=destination,
             display_dest=display_dest,
@@ -29360,7 +29261,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify({"inside_mount": inside})
 
     @app.route("/api/jobs/import-full", methods=["POST"])
-    def api_job_import_full():
+    @background_job
+    def api_job_import_full(ctx):
         """Full-chain import: copy files -> scan -> create collection."""
         body = request.get_json(silent=True) or {}
         source = body.get("source", "")
@@ -29392,15 +29294,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if folder_template and _is_unsafe_path(folder_template):
                 return json_error("folder_template must be a relative path without '..' or backslashes")
 
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
-
         def work(job):
             from scanner import scan as do_scan
             from thumbnails import generate_all
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
             # Check folder health before scanning to prevent duplicate imports
             if thread_db.check_folder_health():
                 _invalidate_missing_originals_cache()
@@ -29424,19 +29322,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 {"id": "thumbnails", "label": "Generate thumbnails"},
                 {"id": "collection", "label": "Create collection"},
             ])
-            runner.set_steps(job["id"], steps)
+            ctx.runner.set_steps(job["id"], steps)
 
             if copy:
                 from ingest import ingest as do_ingest
 
                 # Phase 1: Copy files
-                runner.update_step(job["id"], "ingest", status="running")
+                ctx.runner.update_step(job["id"], "ingest", status="running")
 
                 def ingest_cb(current, total, filename):
                     job["progress"]["current"] = current
                     job["progress"]["total"] = total
                     job["progress"]["current_file"] = filename
-                    runner.push_event(job["id"], "progress", {
+                    ctx.runner.push_event(job["id"], "progress", {
                         "current": current, "total": total,
                         "current_file": filename,
                         "phase": "Importing photos",
@@ -29488,16 +29386,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         restrict_set.add(folder)
                 restrict_dirs = sorted(restrict_set)
 
-                runner.update_step(job["id"], "ingest", status="completed",
+                ctx.runner.update_step(job["id"], "ingest", status="completed",
                                    summary=f"{ingest_result.get('copied', 0)} copied")
 
             # Phase 2: Scan to index into DB
-            runner.update_step(job["id"], "scan", status="running")
+            ctx.runner.update_step(job["id"], "scan", status="running")
 
             def scan_cb(current, total):
                 job["progress"]["current"] = current
                 job["progress"]["total"] = total
-                runner.push_event(job["id"], "progress", {
+                ctx.runner.push_event(job["id"], "progress", {
                     "current": current, "total": total,
                     "current_file": "",
                     "phase": "Scanning photos",
@@ -29511,7 +29409,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # Same wiring the in-place import path picked up in
             # 37e0e3a0 for the identical reason.
             #
-            # ``runner.is_cancelled`` internally parks on Pause via
+            # ``ctx.runner.is_cancelled`` internally parks on Pause via
             # ``wait_if_paused``. Wrap the parking call in
             # ``suspend_resource_wait_timing`` so an hour-long pause
             # while a scan is waiting for CPU permits does not persist
@@ -29523,13 +29421,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             def scan_cancel_check():
                 from resource_ledger import suspend_resource_wait_timing
                 with suspend_resource_wait_timing():
-                    return runner.is_cancelled(job["id"])
+                    return ctx.runner.is_cancelled(job["id"])
 
             def scan_pause_check():
-                return runner.pause_requested(job["id"])
+                return ctx.runner.pause_requested(job["id"])
 
             def scan_cancel_only_check():
-                return runner.cancellation_requested(job["id"])
+                return ctx.runner.cancellation_requested(job["id"])
 
             vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
             try:
@@ -29573,12 +29471,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             metadata_warning = _scan_metadata_warning()
             if metadata_warning:
                 scan_summary += f" — {metadata_warning}"
-            runner.update_step(job["id"], "scan", status="completed",
+            ctx.runner.update_step(job["id"], "scan", status="completed",
                                summary=scan_summary)
 
             # Phase 3: Generate thumbnails
-            runner.update_step(job["id"], "thumbnails", status="running")
-            runner.push_event(job["id"], "progress", {
+            ctx.runner.update_step(job["id"], "thumbnails", status="running")
+            ctx.runner.push_event(job["id"], "progress", {
                 "current": 0, "total": 0,
                 "current_file": "Checking for new thumbnails...",
                 "phase": "Generating thumbnails",
@@ -29587,7 +29485,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             def thumb_cb(current, total):
                 job["progress"]["current"] = current
                 job["progress"]["total"] = total
-                runner.push_event(job["id"], "progress", {
+                ctx.runner.push_event(job["id"], "progress", {
                     "current": current, "total": total,
                     "current_file": "",
                     "phase": "Generating thumbnails",
@@ -29599,11 +29497,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 vireo_dir=vireo_dir,
             )
             from thumbnails import format_summary as thumb_summary
-            runner.update_step(job["id"], "thumbnails", status="completed",
+            ctx.runner.update_step(job["id"], "thumbnails", status="completed",
                                summary=thumb_summary(thumb_result))
 
             # Phase 4: Create collection
-            runner.update_step(job["id"], "collection", status="running")
+            ctx.runner.update_step(job["id"], "collection", status="running")
             photo_ids = []
             if copy:
                 # Collection from copied files (existing logic)
@@ -29645,7 +29543,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
 
             col_summary = collection_name if collection_name else "no photos"
-            runner.update_step(job["id"], "collection", status="completed",
+            ctx.runner.update_step(job["id"], "collection", status="completed",
                                summary=col_summary)
 
             result = {
@@ -29661,15 +29559,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             return result
 
-        job_id = runner.start(
+        return ctx.start(
             "import-full", work,
             config={"source": source, "destination": destination, "copy": copy, "file_types": file_types},
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     @app.route("/api/jobs/import", methods=["POST"])
-    def api_job_import():
+    @background_job
+    def api_job_import(ctx):
         body = request.get_json(silent=True) or {}
         catalogs = body.get("catalogs", [])
         strategy = body.get("strategy", "merge_all")
@@ -29677,19 +29574,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not catalogs:
             return json_error("catalogs required")
 
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
-
         def work(job):
             from importer import execute_import
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
 
             def progress_cb(current, total):
                 job["progress"]["current"] = current
                 job["progress"]["total"] = total
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -29706,11 +29599,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 progress_callback=progress_cb,
             )
 
-        job_id = runner.start(
+        return ctx.start(
             "import", work, config={"catalogs": catalogs, "strategy": strategy},
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     @app.route("/api/import/orphaned-staging", methods=["GET"])
     def api_import_orphaned_staging():
@@ -29721,7 +29612,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify({"items": discover_orphaned_staging(vireo_dir)})
 
     @app.route("/api/import/orphaned-staging/verify", methods=["POST"])
-    def api_import_orphaned_staging_verify():
+    @background_job
+    def api_import_orphaned_staging_verify(ctx):
         """Start a verification job for one old pipeline staging folder."""
         from staging_recovery import verify_orphaned_staging
 
@@ -29730,22 +29622,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not isinstance(path, str) or not path:
             return json_error("path required")
 
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
 
         def work(job):
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
             return verify_orphaned_staging(thread_db, vireo_dir, path)
 
-        job_id = runner.start(
+        return ctx.start(
             "staging-verify",
             work,
             config={"path": path},
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     @app.route("/api/import/orphaned-staging", methods=["DELETE"])
     def api_import_orphaned_staging_delete():
@@ -32499,9 +32386,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify(response)
 
     @app.route("/api/jobs/sync", methods=["POST"])
-    def api_job_sync():
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
+    @background_job
+    def api_job_sync(ctx):
         body = request.get_json(silent=True)
         if body is None:
             body = {}
@@ -32535,13 +32421,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         def work(job):
             from sync import sync_to_xmp
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
 
             def progress_cb(current, total):
                 job["progress"]["current"] = current
                 job["progress"]["total"] = total
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -32554,7 +32439,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             lock_acquired = app._sync_job_lock.acquire(blocking=False)
             if not lock_acquired:
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -32565,14 +32450,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     },
                 )
                 while not lock_acquired:
-                    if runner.is_cancelled(job["id"]):
+                    if ctx.runner.is_cancelled(job["id"]):
                         return {"synced": 0, "failed": 0, "failures": []}
                     lock_acquired = app._sync_job_lock.acquire(timeout=0.1)
 
             try:
-                if runner.is_cancelled(job["id"]):
+                if ctx.runner.is_cancelled(job["id"]):
                     return {"synced": 0, "failed": 0, "failures": []}
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -32591,11 +32476,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 app._sync_job_lock.release()
 
         config = {"change_ids": change_ids} if change_ids is not None else {}
-        job_id = runner.start("sync", work, config=config, workspace_id=active_ws)
-        return jsonify({"job_id": job_id})
+        return ctx.start("sync", work, config=config)
 
     @app.route("/api/jobs/capture-time", methods=["POST"])
-    def api_job_capture_time():
+    @background_job
+    def api_job_capture_time(ctx):
         """Adjust capture timestamps and timezone offsets for selected photos."""
         body = request.get_json(silent=True)
         if body is None:
@@ -32624,14 +32509,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         target_offset = body.get("target_offset")
         shift_minutes = body.get("shift_minutes")
         keep_backups = bool(body.get("keep_backups", True))
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             from capture_time import adjust_capture_time
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
             job["_start_time"] = time.time()
             job["progress"]["total"] = len(photo_ids)
 
@@ -32639,7 +32521,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 job["progress"]["current"] = current
                 job["progress"]["total"] = total
                 job["progress"]["current_file"] = filename
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -32661,10 +32543,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 shift_minutes=shift_minutes,
                 keep_backups=keep_backups,
                 progress_callback=progress_cb,
-                cancel_check=lambda: runner.is_cancelled(job["id"]),
+                cancel_check=lambda: ctx.runner.is_cancelled(job["id"]),
             )
 
-        job_id = runner.start(
+        return ctx.start(
             "capture-time",
             work,
             config={
@@ -32675,12 +32557,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "shift_minutes": shift_minutes,
                 "keep_backups": keep_backups,
             },
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     @app.route("/api/jobs/sharpness", methods=["POST"])
-    def api_job_sharpness():
+    @background_job
+    def api_job_sharpness(ctx):
         body = request.get_json(silent=True) or {}
         collection_id = body.get("collection_id")
         db = _get_db()
@@ -32688,29 +32569,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if err is not None:
             return err
 
-        runner = app._job_runner
-        active_ws = db._active_workspace_id
-
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
 
         def work(job):
             from sharpness import score_collection_photos
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
             job["_start_time"] = time.time()
 
-            runner.set_steps(job["id"], [
+            ctx.runner.set_steps(job["id"], [
                 {"id": "score", "label": "Score sharpness"},
                 {"id": "save", "label": "Save results & auto-flag"},
             ])
-            runner.update_step(job["id"], "score", status="running")
+            ctx.runner.update_step(job["id"], "score", status="running")
 
             def progress_cb(current, total, msg):
                 job["progress"]["current"] = current
                 job["progress"]["total"] = total
                 job["progress"]["current_file"] = msg
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -32730,12 +32607,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 progress_callback=progress_cb,
                 vireo_dir=vireo_dir,
             )
-            runner.update_step(job["id"], "score", status="completed",
+            ctx.runner.update_step(job["id"], "score", status="completed",
                                summary=f"{len(result['results'])} scored")
 
             # Save scores to database
-            runner.update_step(job["id"], "save", status="running")
-            runner.push_event(
+            ctx.runner.update_step(job["id"], "save", status="running")
+            ctx.runner.push_event(
                 job["id"],
                 "progress",
                 {
@@ -32758,24 +32635,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     best_count += 1
 
             result["auto_flagged"] = best_count
-            runner.update_step(job["id"], "save", status="completed",
+            ctx.runner.update_step(job["id"], "save", status="completed",
                                summary=f"{best_count} flagged")
             # Don't return the full results list (could be huge)
             del result["results"]
             return result
 
-        job_id = runner.start(
+        return ctx.start(
             "sharpness",
             work,
             config={
                 "collection_id": collection_id,
             },
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     @app.route("/api/jobs/classify", methods=["POST"])
-    def api_job_classify():
+    @background_job
+    def api_job_classify(ctx):
         import config as cfg
         from classify_job import ClassifyParams, run_classify_job
 
@@ -32805,8 +32681,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             reclassify=body.get("reclassify", False),
         )
 
-        runner = app._job_runner
-        active_ws = db._active_workspace_id
         vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
         work_units = _runtime_warning_work_units(
             "classify collection",
@@ -32820,22 +32694,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         def work(job):
             return run_classify_job(
-                job, runner, db_path, active_ws, params,
+                job, ctx.runner, db_path, ctx.workspace_id, params,
                 vireo_dir=vireo_dir,
                 computation_cache_dir=app.config["COMPUTATION_CACHE_DIR"],
             )
 
-        job_id = runner.start(
+        return ctx.start(
             "classify",
             work,
             config={
                 "collection_id": collection_id,
                 "model_name": params.model_name,
             },
-            workspace_id=active_ws,
             runtime_warning=runtime_warning,
         )
-        return jsonify({"job_id": job_id})
 
     def _strip_heavy_for_list(job):
         """Drop heavy fields from a job dict for the polling response.
@@ -33705,7 +33577,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     # -- Culling API --
 
     @app.route("/api/jobs/cull", methods=["POST"])
-    def api_job_cull():
+    @background_job
+    def api_job_cull(ctx):
         """Run culling analysis as a background job."""
         body = request.get_json(silent=True) or {}
         collection_id = body.get("collection_id")
@@ -33718,17 +33591,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         phash_threshold = body.get("phash_threshold", 19)
         cross_bucket_merge = body.get("cross_bucket_merge", False)
 
-        runner = app._job_runner
-        active_ws = db._active_workspace_id
-
         def work(job):
             from culling import analyze_for_culling
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
 
             def progress_cb(msg):
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -33757,7 +33626,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             import json as _json
 
             cache_path = os.path.join(
-                os.path.dirname(db_path), f"culling_results_ws{active_ws}.json"
+                os.path.dirname(db_path), f"culling_results_ws{ctx.workspace_id}.json"
             )
             with open(cache_path, "w") as f:
                 _json.dump(result, f)
@@ -33770,14 +33639,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "photos_missing_phash": result.get("photos_missing_phash", 0),
             }
 
-        job_id = runner.start(
+        return ctx.start(
             "cull", work, config={"collection_id": collection_id},
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     @app.route("/api/jobs/develop", methods=["POST"])
-    def api_job_develop():
+    @background_job
+    def api_job_develop(ctx):
         body = request.get_json(silent=True) or {}
         photo_ids = body.get("photo_ids", [])
         if not photo_ids:
@@ -33800,15 +33668,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         dng_converter_bin = body.get("dng_converter_bin") or cfg.get("dng_converter_bin") or ""
         width = body.get("width")
 
-        runner = app._job_runner
-        active_ws = _get_db()._active_workspace_id
-
         def work(job):
             from develop import develop_photo, output_path_for_photo
             from export import developed_folder_key
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
 
             photos = []
             for pid in photo_ids:
@@ -33865,7 +33729,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     job["errors"].append(f'{photo["filename"]}: {result["error"]}')
                     log.warning("Failed to develop %s: %s", photo["filename"], result["error"])
 
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -33902,7 +33766,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 raise RuntimeError(first_err)
             return result
 
-        job_id = runner.start(
+        return ctx.start(
             "develop",
             work,
             config={
@@ -33910,14 +33774,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "style": style,
                 "output_format": output_format,
             },
-            workspace_id=active_ws,
         )
-        return jsonify({"job_id": job_id})
 
     # -- Pipeline: SAM2 Mask Extraction --
 
     @app.route("/api/jobs/extract-masks", methods=["POST"])
-    def api_job_extract_masks():
+    @background_job
+    def api_job_extract_masks(ctx):
         """Run SAM2 mask extraction as a background job.
 
         Requires MegaDetector detections to already be computed (run classify first).
@@ -33944,8 +33807,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # below-threshold boxes — matching get_photos_missing_masks.
         min_detector_conf = effective_cfg.get("detector_confidence", 0.2)
 
-        runner = app._job_runner
-        active_ws = db._active_workspace_id
         work_units = _runtime_warning_work_units(
             "extract-masks collection" if collection_id else "extract-masks workspace",
             lambda: db.count_collection_photos(collection_id)
@@ -33976,8 +33837,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             from quality import compute_all_quality_features
             from resource_ledger import ResourceWaitCancelled
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
 
             masks_dir = os.path.join(os.path.dirname(db_path), "masks")
             os.makedirs(masks_dir, exist_ok=True)
@@ -34116,7 +33976,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                 photo_id, sam2_variant,
                             )
                             masked += 1
-                            runner.push_event(
+                            ctx.runner.push_event(
                                 job["id"],
                                 "progress",
                                 {
@@ -34269,7 +34129,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 finally:
                     photo_mask_lock.release()
 
-                runner.push_event(
+                ctx.runner.push_event(
                     job["id"],
                     "progress",
                     {
@@ -34309,7 +34169,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "unreadable": unreadable, "total": total,
                     "ok": not job_errors, "errors": job_errors}
 
-        job_id = runner.start(
+        return ctx.start(
             "extract-masks",
             work,
             config={
@@ -34318,13 +34178,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "dinov2_variant": dinov2_variant,
                 "proxy_longest_edge": proxy_longest_edge,
             },
-            workspace_id=active_ws,
             runtime_warning=runtime_warning,
         )
-        return jsonify({"job_id": job_id})
 
     @app.route("/api/jobs/regroup", methods=["POST"])
-    def api_job_regroup():
+    @background_job
+    def api_job_regroup(ctx):
         """Run pipeline stages 2-6 (grouping + scoring + triage) from cached features.
 
         This is fast (seconds) — no model inference, just math on stored features.
@@ -34342,9 +34201,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         effective_cfg = db.get_effective_config(cfg.load())
         pipeline_cfg = effective_cfg.get("pipeline", {})
 
-        runner = app._job_runner
-        active_ws = db._active_workspace_id
-
         def work(job):
             from pipeline import (
                 load_photo_features,
@@ -34352,17 +34208,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 save_results,
             )
 
-            thread_db = Database(db_path)
-            thread_db.set_active_workspace(active_ws)
+            thread_db = ctx.thread_db()
 
-            runner.set_steps(job["id"], [
+            ctx.runner.set_steps(job["id"], [
                 {"id": "load", "label": "Load features"},
                 {"id": "group", "label": "Group encounters & bursts"},
                 {"id": "save", "label": "Save results"},
             ])
 
-            runner.update_step(job["id"], "load", status="running")
-            runner.push_event(
+            ctx.runner.update_step(job["id"], "load", status="running")
+            ctx.runner.push_event(
                 job["id"],
                 "progress",
                 {"phase": "Loading features from database", "current": 0, "total": 3},
@@ -34370,14 +34225,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             photos = load_photo_features(thread_db, collection_id=collection_id, config=effective_cfg)
             if not photos:
-                runner.update_step(job["id"], "load", status="failed",
+                ctx.runner.update_step(job["id"], "load", status="failed",
                                    error="No photos with pipeline features found")
                 return {"error": "No photos with pipeline features found. Run extract-masks first."}
-            runner.update_step(job["id"], "load", status="completed",
+            ctx.runner.update_step(job["id"], "load", status="completed",
                                summary=f"{len(photos)} photos")
 
-            runner.update_step(job["id"], "group", status="running")
-            runner.push_event(
+            ctx.runner.update_step(job["id"], "group", status="running")
+            ctx.runner.push_event(
                 job["id"],
                 "progress",
                 {"phase": "Grouping encounters and bursts", "current": 1, "total": 3},
@@ -34389,24 +34244,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # slider). Cost is negligible (~300B per adjacent pair).
             results = run_full_pipeline(photos, config=pipeline_cfg, emit_trace=True)
             summary = results.get("summary", {})
-            runner.update_step(job["id"], "group", status="completed",
+            ctx.runner.update_step(job["id"], "group", status="completed",
                                summary=f"{summary.get('encounters', 0)} encounters")
 
-            runner.update_step(job["id"], "save", status="running")
-            runner.push_event(
+            ctx.runner.update_step(job["id"], "save", status="running")
+            ctx.runner.push_event(
                 job["id"],
                 "progress",
                 {"phase": "Saving results", "current": 2, "total": 3},
             )
 
             cache_dir = os.path.dirname(db_path)
-            save_results(results, cache_dir, active_ws)
-            runner.update_step(job["id"], "save", status="completed")
+            save_results(results, cache_dir, ctx.workspace_id)
+            ctx.runner.update_step(job["id"], "save", status="completed")
 
             return results["summary"]
 
-        job_id = runner.start("regroup", work, config={"pipeline": pipeline_cfg}, workspace_id=active_ws)
-        return jsonify({"job_id": job_id})
+        return ctx.start("regroup", work, config={"pipeline": pipeline_cfg})
 
     def _apply_no_model_auto_skip(params):
         """Auto-skip classify stages when no model is available.

@@ -516,13 +516,13 @@ def test_verify_endpoint_loads_manifest_inside_cleanup_job_lock():
     load_idx = verify_src.index("card_cleanup.load_manifest(")
     conflict_idx = verify_src.index(
         "_card_cleanup_job_conflict_response(")
-    start_idx = verify_src.index("runner.start(")
+    start_idx = verify_src.index("ctx.start_job(")
 
     assert lock_idx < conflict_idx < load_idx < start_idx, (
         "api_card_cleanup_verify must run these steps IN ORDER inside "
         "the _CARD_CLEANUP_JOB_LOCK critical section: (1) take the "
         "lock, (2) call _card_cleanup_job_conflict_response, (3) load "
-        "the manifest, (4) runner.start. Hoisting load_manifest above "
+        "the manifest, (4) ctx.start_job. Hoisting load_manifest above "
         "the `with` block reopens the load-before-lock window Codex "
         "P1 called out at commit ad9375db: a verify can enter after "
         "another verify has completed, see no conflict, and hand a "

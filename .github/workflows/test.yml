@@ -40,14 +40,22 @@ jobs:
             );
             const touchesTestWorkflow = paths.includes(".github/workflows/test.yml");
 
+            // Keep this predicate in sync with ``select_tests.py``'s
+            // ``FULL_SUITE_PATHS`` / ``FULL_SUITE_PREFIXES``: a path that
+            // forces the selector's full-suite fallback must also mark this
+            // PR as touching Python, otherwise the ``unit`` job takes its
+            // skip path and the fallback never runs. Notably, the root
+            // ``conftest.py`` registers the ``--selected-tests`` plugin and
+            // can alter every test; ``test-main.yml`` publishes the map.
             const python = touchesTestWorkflow || paths.some((path) =>
               path.startsWith("vireo/") ||
               path.startsWith("tests/") ||
               path.startsWith(".github/actions/") ||
               path === ".github/workflows/pr-agent.yml" ||
+              path === ".github/workflows/test-main.yml" ||
               path === "docs/pr-agent-routine-prompt.md" ||
               (path.startsWith("scripts/") && path.endsWith(".py")) ||
-              ["pyproject.toml", "uv.lock"].includes(path)
+              ["pyproject.toml", "uv.lock", "conftest.py"].includes(path)
             );
 
             const website = touchesTestWorkflow || paths.some((path) =>

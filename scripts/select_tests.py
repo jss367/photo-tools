@@ -559,6 +559,40 @@ def _reference_strings(path: str, base: str, cwd: Path) -> set[str]:
     return names
 
 
+# Tests that iterate the production source tree (contract scans of the
+# form ``vireo_dir.glob("*.py")`` or ``package_root.rglob("*.py")``) read
+# a module's source without executing any of its lines, so a *newly added*
+# production file — which has no history in the map — is invisible to
+# them via the normal coverage path. Anchor the pattern on ``glob("*.py")``
+# / ``rglob("*.py")``: a call inside a test that walks the source tree.
+_SOURCE_SCAN_RE = r"\b(r?glob)\(['\"]\*\.py['\"]\)"
+
+
+def _add_source_scanning_selections(
+    added_path: str,
+    base: str,
+    cwd: Path,
+    test_specs: list[str],
+    sel: Selection,
+) -> None:
+    """Select tests that iterate the production source tree.
+
+    A newly added ``vireo/`` or ``scripts/`` module can violate an AST-based
+    contract (``test_classifier_construction_contract``,
+    ``test_production_onnx_sessions_use_budgeted_factory``,
+    ``test_keyword_provenance_contract``) that the map has no way of
+    connecting to the new file — those tests read the source with
+    ``glob``/``rglob`` and never execute any of its lines, so the added
+    file's absence from the map matches nothing. Grep for the scan pattern
+    on ``base`` and add the whole test file (contract tests are small,
+    and their per-test bodies aren't worth mapping precisely).
+    """
+    for test_file in _grep_files(_SOURCE_SCAN_RE, base, test_specs, cwd, regex=True):
+        if is_unit_test_file(test_file) and test_file not in sel.files:
+            sel.files.add(test_file)
+            sel.note(f"{added_path}: added; source-scanning contract in {test_file}")
+
+
 def _add_mention_selections(
     path: str,
     base: str,
@@ -655,6 +689,7 @@ def select(
         if kind == "source":
             if status == "A":
                 sel.note(f"{path}: added, no history in map")
+                _add_source_scanning_selections(path, base, cwd, test_specs, sel)
                 continue
             if not impact.has_file(path):
                 sel.note(f"{path}: not in map (never imported by a test)")

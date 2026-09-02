@@ -319,6 +319,70 @@ def test_added_test_file_runs_whole_file_and_added_source_selects_nothing_else(r
     assert sel.ids == set()
 
 
+def test_added_source_module_selects_source_scanning_contract_tests(tmp_path):
+    """A newly added production module has no history in the map, so tests
+    that only *execute* it are correctly left out. But tests that iterate
+    the source tree with ``glob("*.py")`` / ``rglob("*.py")`` — AST-based
+    contract audits like ``test_classifier_construction_contract`` — read
+    the new file's source without ever running its lines and must still
+    catch a prohibited direct constructor in it. Those files are picked
+    up by grepping the base for the scan pattern.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _write(repo, "vireo/app.py", "def alpha():\n    return 1\n")
+    _write(repo, "vireo/tests/test_app.py", "def test_alpha(): pass\n")
+    _write(
+        repo,
+        "vireo/tests/test_construction_contract.py",
+        "from pathlib import Path\n"
+        "def test_construction():\n"
+        "    for path in Path('vireo').glob('*.py'):\n"
+        "        assert path.is_file()\n",
+    )
+    _write(
+        repo,
+        "vireo/tests/test_deep_contract.py",
+        "from pathlib import Path\n"
+        "def test_deep():\n"
+        "    for path in Path('vireo').rglob('*.py'):\n"
+        "        assert path.is_file()\n",
+    )
+    _write(repo, "vireo/tests/test_unrelated.py", "def test_x(): pass\n")
+    base = _commit(repo, "base")
+
+    map_dir = repo / select_tests.MAP_DIR
+    map_dir.mkdir()
+    data = CoverageData(basename=str(map_dir / select_tests.MAP_DB))
+    data.set_context("vireo/tests/test_app.py::test_alpha|run")
+    data.add_lines({"vireo/app.py": [1, 2]})
+    data.set_context("vireo/tests/test_construction_contract.py::test_construction|run")
+    data.add_lines({"vireo/tests/test_construction_contract.py": [1, 2, 3, 4]})
+    data.set_context("vireo/tests/test_deep_contract.py::test_deep|run")
+    data.add_lines({"vireo/tests/test_deep_contract.py": [1, 2, 3, 4]})
+    data.set_context("vireo/tests/test_unrelated.py::test_x|run")
+    data.add_lines({"vireo/tests/test_unrelated.py": [1]})
+    data.write()
+    (map_dir / select_tests.MAP_META).write_text(json.dumps({"sha": base, "root": str(repo)}))
+
+    _write(repo, "vireo/newmod.py", "def f():\n    return 1\n")
+    _commit(repo, "add new production module")
+
+    sel = _select(repo)
+
+    # Both source-scanning contract tests run whole; the coverage-executed
+    # tests don't (the added file has no map history and the unrelated
+    # test never scans the source tree).
+    assert sel.mode == "subset"
+    assert sel.files == {
+        "vireo/tests/test_construction_contract.py",
+        "vireo/tests/test_deep_contract.py",
+    }
+    assert "vireo/tests/test_unrelated.py" not in sel.files
+    assert sel.ids == set()
+
+
 def test_deleted_test_file_is_not_selected(repo):
     (repo / "vireo/tests/test_pages.py").unlink()
     _commit(repo, "drop test file")
@@ -389,8 +453,10 @@ def test_e2e_changes_are_ignored_for_unit_selection(repo):
     [
         "vireo/tests/conftest.py",
         "tests/conftest.py",
+        "conftest.py",
         "pyproject.toml",
         ".github/workflows/test.yml",
+        ".github/workflows/test-main.yml",
         ".github/actions/setup-python-tests/action.yml",
         "vireo/data/taxonomy.json",
         "vireo/tests/wait.py",

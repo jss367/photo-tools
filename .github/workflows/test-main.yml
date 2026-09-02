@@ -59,10 +59,10 @@ jobs:
       # number when coverage improves; do not replace it with a low evergreen
       # floor.
       #
-      # The exit code is captured so the map-building steps below can tell a
-      # completed run with failures (exit 1: map is still complete) from a
-      # crash or interruption (exit 2+: map may be partial and must not be
-      # published, or PRs would silently skip tests).
+      # The exit code is captured so the map is published only after a fully
+      # successful test run. A failed test can exit before it exercises all of
+      # its usual production lines; counting test contexts cannot detect that
+      # incomplete coverage, so an exit-1 map is not safe for later selection.
       - name: Run tests with coverage (Linux)
         id: tests
         if: runner.os == 'Linux'
@@ -93,7 +93,7 @@ jobs:
         id: build-map
         if: >-
           runner.os == 'Linux' && !cancelled()
-          && (steps.tests.outputs.exit-code == '0' || steps.tests.outputs.exit-code == '1')
+          && steps.tests.outputs.exit-code == '0'
         run: >-
           python scripts/select_tests.py build-map
           --coverage-file .coverage --junit-xml pytest-report.xml --sha "$GITHUB_SHA"

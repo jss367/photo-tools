@@ -36,9 +36,11 @@ def test_full_suite_label_overrides_path_classification():
     assert "const python = full || touchesTestWorkflow ||" in workflow
 
 
-def test_impact_map_is_published_after_test_failures_and_uploaded_from_hidden_directory():
+def test_impact_map_requires_success_and_uploads_from_hidden_directory():
     workflow = _read(FULL_TEST_WORKFLOW)
 
+    assert "&& steps.tests.outputs.exit-code == '0'" in workflow
+    assert "steps.tests.outputs.exit-code == '1'" not in workflow
     condition = "if: ${{ !cancelled() && steps.build-map.outcome == 'success' }}"
     assert workflow.count(condition) == 2
     assert "include-hidden-files: true" in workflow

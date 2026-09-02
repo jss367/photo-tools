@@ -226,3 +226,34 @@ def test_mount_root_candidates_symlink_loop_is_bounded(tmp_path):
     (tmp_path / "a").symlink_to(tmp_path / "b")
     (tmp_path / "b").symlink_to(tmp_path / "a")
     assert vr.mount_root_candidates(str(tmp_path / "a" / "x")) == []
+
+
+def test_mount_root_candidates_never_stats_unc_or_mount_shaped_paths(monkeypatch):
+    """A path that already names its mount root (``//server/share/...``,
+    ``/Volumes/NAS/...``) must be classified lexically: no ``islink`` /
+    ``realpath`` call may run, because on a dead server that lookup is
+    unbounded and would run ahead of the bounded probe."""
+    monkeypatch.setattr(vr.os.path, "islink", lambda p: pytest.fail(f"islink({p!r})"))
+    monkeypatch.setattr(vr.os.path, "realpath", lambda p: pytest.fail(f"realpath({p!r})"))
+    assert vr.mount_root_candidates("//server/share/photos/2026") == ["//server/share"]
+    assert vr.mount_root_candidates("/Volumes/NAS/photos") == ["/Volumes/NAS"]
+    assert vr.mount_root_candidates("/mnt/nas/photos") == ["/mnt/nas"]
+
+
+def test_resolver_skips_unc_server_prefix():
+    calls = []
+    import os as _os
+    real = _os.path.islink
+
+    def spy(p):
+        calls.append(p)
+        return real(p)
+
+    vr.os.path.islink = spy
+    try:
+        vr._resolve_symlinks_until_mount_shaped(
+            "//server/share/photos", lambda p: "//x/y" if p.count("/") >= 3 and p.startswith("//") and len([q for q in p.split("/") if q]) >= 2 else None,
+        )
+    finally:
+        vr.os.path.islink = real
+    assert calls == [], f"UNC server prefix was stat'ed: {calls}"

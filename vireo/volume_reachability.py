@@ -144,7 +144,14 @@ def mount_root_candidates(path: str) -> list[str]:
     # would resolve every component — including ones on a dead SMB mount —
     # and can block indefinitely there, ahead of the bounded probe this
     # module exists to provide.
-    resolved = _resolve_symlinks_until_mount_shaped(normalized, _candidate)
+    # Only a path that is *not already* mount-shaped needs alias resolution:
+    # a registered ``/Volumes/NAS/...`` or ``//server/share/...`` path names
+    # its mount root lexically, and resolving it would be the one place a
+    # filesystem call could reach the (possibly dead) server before the
+    # bounded probe runs.
+    resolved = None
+    if _candidate(raw_posix) is None and _candidate(normalized_posix) is None:
+        resolved = _resolve_symlinks_until_mount_shaped(normalized, _candidate)
     resolved_posix = (
         resolved.replace("\\", "/") if resolved else None
     )
@@ -188,6 +195,11 @@ def _resolve_symlinks_until_mount_shaped(path, candidate):
         if candidate(nxt.replace("\\", "/")) is not None:
             prefix = nxt
             break
+        if nxt.startswith("//"):
+            # ``//server`` is not yet a share candidate but any ``lstat`` on
+            # it is a remote lookup; UNC prefixes are never symlinks anyway.
+            prefix = nxt
+            continue
         try:
             is_link = os.path.islink(nxt)
         except OSError:

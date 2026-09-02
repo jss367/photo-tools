@@ -13264,10 +13264,12 @@ async function checkNewImages() {
       if (cta) cta.style.display = '';
       banner.dataset.count = String(data.new_count);
       banner.style.display = 'flex';
-    } else if (unreachable.length && wsId !== '' && !_isNewImagesDismissed(wsId, 0, unreachable)) {
+    } else if (data.new_count === 0 && unreachable.length && wsId !== '' && !_isNewImagesDismissed(wsId, 0, unreachable)) {
       // Nothing importable was found, but that is not a real zero: at least
       // one registered folder is on a volume that is offline right now.
       // Say that instead of silently hiding, and offer nothing to import.
+      // (Gated on a zero count: a dismissed *positive* banner with offline
+      // roots must stay dismissed, not fall through to this notice.)
       msg.textContent = `Couldn't check for new images: ${_offlineRootsPhrase(unreachable)} offline.`;
       if (cta) cta.style.display = 'none';
       banner.dataset.count = '0';

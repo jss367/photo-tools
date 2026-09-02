@@ -283,6 +283,14 @@ def test_banner_count_discloses_unchecked_offline_folder(fresh_server, page, mon
     expect(msg).to_contain_text(f"{nas_dir} is offline and not checked")
     expect(page.locator("#newImagesBanner .banner-cta")).to_be_visible()
 
+    # Dismissing the mixed banner keeps it dismissed: it must not come back
+    # as the offline-only notice on the next poll.
+    page.locator("#newImagesBanner .banner-dismiss").click()
+    expect(banner).to_be_hidden()
+    page.reload()
+    page.wait_for_load_state("networkidle")
+    expect(banner).to_be_hidden()
+
 
 def test_dismissed_count_rearms_when_a_folder_goes_offline(fresh_server, page, monkeypatch):
     """Dismissing "1 new image" must not also hide a later "1 new image, and

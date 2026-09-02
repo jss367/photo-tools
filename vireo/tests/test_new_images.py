@@ -1555,3 +1555,81 @@ def test_count_excludes_alias_into_bundle_on_mount(db_with_workspace, monkeypatc
     result = count_new_images_for_workspace(db, ws_id, reachability=gate)
     assert result["new_count"] == 0
     assert result["per_root"][0]["new_count"] == 0
+
+
+def test_count_abandons_stalled_walk_and_reports_root_offline(db_with_workspace, monkeypatch):
+    """A share that *blocks* in scandir (never raises) must not leave the
+    compute pending forever: after ``stall_timeout`` without progress the root
+    is reported offline, the gate is told, and the call returns."""
+    import threading
+    import time
+
+    import new_images as new_images_module
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    healthy = tmp_path / "healthy"
+    wedged = tmp_path / "wedged"
+    _touch_image(str(healthy / "ok.jpg"))
+    _touch_image(str(wedged / "a.jpg"))
+    db.add_folder(str(healthy), name="healthy")
+    db.add_folder(str(wedged), name="wedged")
+
+    release = threading.Event()
+    real_walk = new_images_module.safe_scan_walk
+
+    def walk_that_hangs(top, onerror=None, **kwargs):
+        if top == str(wedged):
+            yield top, [], ["a.jpg"]
+            release.wait(10)  # simulates an uninterruptible SMB stall
+            yield top, [], []
+            return
+        yield from real_walk(top, onerror=onerror, **kwargs)
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", walk_that_hangs)
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    gate = _FakeReachability()
+    try:
+        t0 = time.monotonic()
+        result = count_new_images_for_workspace(
+            db, ws_id, reachability=gate, stall_timeout=0.3,
+        )
+        elapsed = time.monotonic() - t0
+        assert elapsed < 5, f"stalled walk held the compute for {elapsed:.1f}s"
+        assert result["new_count"] == 1, "partial count from the wedged root is dropped"
+        assert result["unreachable_roots"] == [str(wedged)]
+        assert gate.marked_offline == [gate.mount_root]
+        assert str(wedged) in new_images_module._STALLED_WALKS
+
+        # While the wedged thread is still alive, a second check reports the
+        # root offline at once instead of starting another walk into it.
+        gate2 = _FakeReachability()
+        again = count_new_images_for_workspace(
+            db, ws_id, reachability=gate2, stall_timeout=0.3,
+        )
+        assert again["unreachable_roots"] == [str(wedged)]
+        assert gate2.marked_offline == [gate2.mount_root]
+    finally:
+        release.set()
+    new_images_module._STALLED_WALKS[str(wedged)].join(2)
+
+
+def test_count_progress_and_totals_unchanged_by_worker_thread(db_with_workspace):
+    """The worker-thread walk keeps the caller-visible contract: exact totals,
+    monotonic progress, final ``(checked, new)`` event, cross-root dedupe."""
+    from new_images import count_new_images_for_workspace
+
+    db, ws_id, tmp_path = db_with_workspace
+    for name in ("a", "b"):
+        root = tmp_path / name
+        for i in range(4):
+            _touch_image(str(root / f"IMG_{i}.JPG"))
+        db.add_folder(str(root), name=name)
+    events = []
+    result = count_new_images_for_workspace(
+        db, ws_id, progress_callback=lambda c, n: events.append((c, n)), progress_every=3,
+    )
+    assert result["new_count"] == 8
+    assert events[-1] == (8, 8)
+    for prev, nxt in zip(events, events[1:], strict=False):
+        assert nxt >= prev

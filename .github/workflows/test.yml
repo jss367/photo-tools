@@ -40,6 +40,17 @@ jobs:
             );
             const touchesTestWorkflow = paths.includes(".github/workflows/test.yml");
 
+            // Escape hatch: the ``ci-full-suite`` label forces the whole unit
+            // suite on this PR instead of the impact-selected subset. Read
+            // live (not from the event payload) so "Re-run all jobs" after
+            // labelling picks it up without a new push.
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            const full = pr.labels.some((label) => label.name === "ci-full-suite");
+
             // Keep this predicate in sync with ``select_tests.py``'s
             // ``FULL_SUITE_PATHS`` / ``FULL_SUITE_PREFIXES``: a path that
             // forces the selector's full-suite fallback must also mark this
@@ -47,7 +58,7 @@ jobs:
             // skip path and the fallback never runs. Notably, the root
             // ``conftest.py`` registers the ``--selected-tests`` plugin and
             // can alter every test; ``test-main.yml`` publishes the map.
-            const python = touchesTestWorkflow || paths.some((path) =>
+            const python = full || touchesTestWorkflow || paths.some((path) =>
               path.startsWith("vireo/") ||
               path.startsWith("tests/") ||
               path.startsWith(".github/actions/") ||
@@ -70,17 +81,6 @@ jobs:
               path === "package-lock.json" ||
               path === ".github/workflows/build-release.yml"
             );
-
-            // Escape hatch: the ``ci-full-suite`` label forces the whole unit
-            // suite on this PR instead of the impact-selected subset. Read
-            // live (not from the event payload) so "Re-run all jobs" after
-            // labelling picks it up without a new push.
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-            });
-            const full = pr.labels.some((label) => label.name === "ci-full-suite");
 
             core.setOutput("python", String(python));
             core.setOutput("website", String(website));

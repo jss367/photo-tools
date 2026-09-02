@@ -168,17 +168,14 @@ def test_decorator_line_belongs_to_its_function(repo):
     assert "vireo/tests/test_comments.py" in sel.files
 
 
-def test_module_level_change_selects_every_test_touching_the_file(repo):
+def test_module_level_change_falls_back_to_full_suite(repo):
     _write(repo, "vireo/app.py", APP_SRC.replace("LIMIT = 3", "LIMIT = 4"))
     _commit(repo, "bump constant")
 
     sel = _select(repo)
 
-    assert sel.ids == {
-        "vireo/tests/test_app.py::test_alpha",
-        "vireo/tests/test_app.py::test_beta",
-        "vireo/tests/test_pages.py::test_browse",
-    }
+    assert sel.mode == "full"
+    assert "module-level" in sel.full_reason
 
 
 def test_source_edit_selects_tests_that_mention_the_source_file(repo):
@@ -200,12 +197,12 @@ def test_source_edit_selects_tests_that_mention_the_source_file(repo):
     assert "vireo/tests/test_comments.py" in sel.files
 
 
-def test_module_level_constant_change_selects_tests_that_reference_it(tmp_path):
+def test_module_level_constant_change_falls_back_to_full_suite(tmp_path):
     """A test that only reads a module-level constant executes no line of
     the source file under a test context — the assignment runs at import
-    time — and is missing from ``tests_for_lines(path, None)``. The
-    selector greps for each touched module-level identifier so those
-    tests are still picked up.
+    time — and is missing from ``tests_for_lines(path, None)``. Import-time
+    values can also flow through production consumers, so no grep-based
+    subset is provably complete; module-level changes run the full suite.
     """
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -247,10 +244,51 @@ def test_module_level_constant_change_selects_tests_that_reference_it(tmp_path):
 
     sel = _select(repo)
 
-    # Grepping the tests for ``EDIT_MATH_VERSION`` finds test_image_edits.py,
-    # even though the map has no per-test coverage of image_edits.py.
-    assert "vireo/tests/test_image_edits.py" in sel.files
-    assert "vireo/tests/test_unrelated.py" not in sel.files
+    assert sel.mode == "full"
+    assert "module-level" in sel.full_reason
+
+
+def test_module_level_constant_change_covers_transitive_production_consumers(tmp_path):
+    """A defining-module constant can be copied into another module at import
+    time, then affect tests that mention and execute only that consumer. The
+    impact map cannot represent that collection-time dependency, so the safe
+    fallback is the full suite.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _write(repo, "vireo/repository.py", "VALID_COLORS = {'red'}\n")
+    _write(
+        repo,
+        "vireo/web.py",
+        "from vireo.repository import VALID_COLORS\n"
+        "def accepts(color):\n"
+        "    return color in VALID_COLORS\n",
+    )
+    _write(
+        repo,
+        "vireo/tests/test_web.py",
+        "from vireo.web import accepts\n"
+        "def test_orange_is_invalid():\n"
+        "    assert not accepts('orange')\n",
+    )
+    base = _commit(repo, "base")
+
+    map_dir = repo / select_tests.MAP_DIR
+    map_dir.mkdir()
+    data = CoverageData(basename=str(map_dir / select_tests.MAP_DB))
+    data.set_context("vireo/tests/test_web.py::test_orange_is_invalid|run")
+    data.add_lines({"vireo/web.py": [3]})
+    data.write()
+    (map_dir / select_tests.MAP_META).write_text(json.dumps({"sha": base, "root": str(repo)}))
+
+    _write(repo, "vireo/repository.py", "VALID_COLORS = {'red', 'orange'}\n")
+    _commit(repo, "allow orange")
+
+    sel = _select(repo)
+
+    assert sel.mode == "full"
+    assert "vireo/repository.py" in sel.full_reason
 
 
 def test_function_body_edit_selects_tests_that_inspect_the_symbol(tmp_path):
@@ -385,7 +423,44 @@ def test_comment_only_change_selects_nothing_from_map(repo):
     assert meta["sha"]  # map still intact
 
 
-def test_ambiguous_insertion_between_nested_functions_widens_to_whole_file(repo):
+def test_replacing_comment_with_code_selects_enclosing_function(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _write(
+        repo,
+        "vireo/app.py",
+        "def alpha():\n"
+        "    # side_effect()\n"
+        "    return 1\n",
+    )
+    _write(repo, "vireo/tests/test_app.py", "def test_alpha(): pass\n")
+    base = _commit(repo, "base")
+
+    map_dir = repo / select_tests.MAP_DIR
+    map_dir.mkdir()
+    data = CoverageData(basename=str(map_dir / select_tests.MAP_DB))
+    data.set_context("vireo/tests/test_app.py::test_alpha|run")
+    data.add_lines({"vireo/app.py": [3]})
+    data.write()
+    (map_dir / select_tests.MAP_META).write_text(json.dumps({"sha": base, "root": str(repo)}))
+
+    _write(
+        repo,
+        "vireo/app.py",
+        "def alpha():\n"
+        "    side_effect()\n"
+        "    return 1\n",
+    )
+    _commit(repo, "enable side effect")
+
+    sel = _select(repo)
+
+    assert sel.mode == "subset"
+    assert sel.ids == {"vireo/tests/test_app.py::test_alpha"}
+
+
+def test_ambiguous_insertion_between_nested_functions_falls_back_to_full_suite(repo):
     nested = textwrap.dedent(
         """
         def create_app():
@@ -416,37 +491,31 @@ def test_ambiguous_insertion_between_nested_functions_widens_to_whole_file(repo)
     # neighbours are the blank line 4 (create_app only) and line 5
     # (route_b's def, also inside create_app). The two neighbours resolve
     # to different function spans, so the insertion is treated as
-    # ambiguous — the new lines could just as easily be a new
-    # module-level statement — and the file widens to the whole file
-    # rather than guessing an enclosing function.
+    # ambiguous — the new lines could just as easily be import-time
+    # registration — and the selector falls back to the full suite rather
+    # than guessing an enclosing function.
     _write(repo, "vireo/nested.py", nested.replace("    def route_b", "    def route_new():\n        return 'n'\n\n    def route_b"))
     _commit(repo, "add route")
 
     sel = _select(repo)
 
-    assert sel.ids == {
-        "vireo/tests/test_nested.py::test_create_app",
-        "vireo/tests/test_nested.py::test_route_a",
-        "vireo/tests/test_nested.py::test_route_b",
-    }
+    assert sel.mode == "full"
+    assert "structurally ambiguous" in sel.full_reason
 
 
-def test_insertion_at_eof_widens_to_whole_file(repo):
+def test_insertion_at_eof_falls_back_to_full_suite(repo):
     # Insert a module-level statement after the last body line of
     # ``render_browse``. The first neighbour is inside render_browse and
     # the second is past EOF (no enclosing function), so the insertion
-    # cannot be safely attributed to render_browse and the file widens
-    # to the whole file.
+    # cannot be safely attributed to render_browse and selection falls back
+    # to the full suite.
     _write(repo, "vireo/app.py", APP_SRC.rstrip() + "\n\nEXTRA = 1\n")
     _commit(repo, "append module-level constant")
 
     sel = _select(repo)
 
-    assert sel.ids == {
-        "vireo/tests/test_app.py::test_alpha",
-        "vireo/tests/test_app.py::test_beta",
-        "vireo/tests/test_pages.py::test_browse",
-    }
+    assert sel.mode == "full"
+    assert "structurally ambiguous" in sel.full_reason
 
 
 def test_test_asset_runs_the_tests_that_name_it(repo):
@@ -470,14 +539,14 @@ def test_template_hyperlinks_are_not_followed(repo):
     assert sel.mode == "none", sel.notes
 
 
-def test_deleted_source_file_selects_everything_that_used_it(repo):
+def test_deleted_source_file_falls_back_to_full_suite(repo):
     (repo / "vireo/app.py").unlink()
     _commit(repo, "delete app")
 
     sel = _select(repo)
 
-    assert sel.mode == "subset"
-    assert len(sel.ids) == 3
+    assert sel.mode == "full"
+    assert "structurally ambiguous" in sel.full_reason
 
 
 def test_changed_test_file_runs_whole_file(repo):
@@ -800,6 +869,63 @@ def test_build_map_accepts_complete_coverage(repo, tmp_path):
     assert written["sha"] == "sha123"
 
 
+def test_fetch_map_failure_preserves_existing_map(tmp_path, monkeypatch):
+    map_dir = tmp_path / select_tests.MAP_DIR
+    map_dir.mkdir()
+    (map_dir / select_tests.MAP_META).write_text('{"sha": "old"}\n')
+    (map_dir / select_tests.MAP_DB).write_text("old database")
+
+    def fake_run(args, **kwargs):
+        if args[1:4] == ["run", "list", "--workflow"]:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout='[{"databaseId": 123, "conclusion": "success", "headSha": "new"}]',
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="download failed")
+
+    monkeypatch.setattr(select_tests.shutil, "which", lambda _: "/usr/bin/gh")
+    monkeypatch.setattr(select_tests.subprocess, "run", fake_run)
+
+    with pytest.raises(SystemExit, match="no downloadable"):
+        select_tests.fetch_map(map_dir, cwd=tmp_path)
+
+    assert (map_dir / select_tests.MAP_META).read_text() == '{"sha": "old"}\n'
+    assert (map_dir / select_tests.MAP_DB).read_text() == "old database"
+
+
+def test_fetch_map_replaces_existing_map_only_after_complete_download(tmp_path, monkeypatch):
+    map_dir = tmp_path / select_tests.MAP_DIR
+    map_dir.mkdir()
+    (map_dir / select_tests.MAP_META).write_text('{"sha": "old"}\n')
+    (map_dir / select_tests.MAP_DB).write_text("old database")
+    (map_dir / "old-only.txt").write_text("remove me")
+
+    def fake_run(args, **kwargs):
+        if args[1:4] == ["run", "list", "--workflow"]:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout='[{"databaseId": 123, "conclusion": "success", "headSha": "new"}]',
+                stderr="",
+            )
+        destination = Path(args[args.index("--dir") + 1])
+        destination.mkdir(parents=True)
+        (destination / select_tests.MAP_META).write_text('{"sha": "new", "contexts": 42}\n')
+        (destination / select_tests.MAP_DB).write_text("new database")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(select_tests.shutil, "which", lambda _: "/usr/bin/gh")
+    monkeypatch.setattr(select_tests.subprocess, "run", fake_run)
+
+    meta = select_tests.fetch_map(map_dir, cwd=tmp_path)
+
+    assert meta["sha"] == "new"
+    assert (map_dir / select_tests.MAP_DB).read_text() == "new database"
+    assert not (map_dir / "old-only.txt").exists()
+
+
 # --------------------------------------------------------------------------
 # CLI + pytest plugin end to end
 # --------------------------------------------------------------------------
@@ -839,6 +965,23 @@ def test_cli_falls_back_to_full_when_map_commit_is_unreachable(repo):
 
     assert result.stdout.strip() == "full"
     assert "not reachable" in result.stderr
+
+
+def test_cli_default_subcommand_accepts_equals_style_global_options(repo):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/select_tests.py"),
+            f"--repo={repo}",
+            f"--map-dir={select_tests.MAP_DIR}",
+            "--explain",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "none"
 
 
 def test_plugin_runs_only_listed_tests_and_ignores_missing_ids(tmp_path):

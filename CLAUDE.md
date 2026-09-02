@@ -39,7 +39,7 @@ Tests use temp databases. `vireo/tests/test_app.py` isolates config via `cfg.CON
 
 ### Impact-selected runs
 
-The full unit suite is ~7.5k tests. `scripts/select_tests.py` maps `git diff` onto a per-test coverage map recorded on `main` and runs only the tests that executed the changed functions (whole file for changed test files; templates/static/data resolved through the Python lines that reference them; harness changes fall back to the full suite).
+The full unit suite is ~7.5k tests. `scripts/select_tests.py` maps `git diff` onto a per-test coverage map recorded on `main` and runs only the tests that executed the changed functions (whole file for changed test files; templates/static/data resolved through the Python lines that reference them). Module-level, structurally ambiguous, and harness changes fall back to the full suite because import-time dependencies cannot be represented safely by line coverage.
 
 ```bash
 python scripts/select_tests.py fetch-map            # newest map from the "Full tests" workflow (needs gh)

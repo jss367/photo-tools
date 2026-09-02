@@ -101,7 +101,7 @@ jobs:
       # PRs restore the newest ``test-impact-map-*`` entry via restore-keys.
       # Keys are immutable, so every merge publishes a fresh, SHA-suffixed one.
       - name: Publish test-impact map to the Actions cache
-        if: steps.build-map.outcome == 'success'
+        if: ${{ !cancelled() && steps.build-map.outcome == 'success' }}
         uses: actions/cache/save@v5
         with:
           path: .test-impact
@@ -110,10 +110,11 @@ jobs:
       # Same map as a downloadable artifact for local use:
       # ``python scripts/select_tests.py fetch-map``.
       - name: Upload test-impact map
-        if: steps.build-map.outcome == 'success'
+        if: ${{ !cancelled() && steps.build-map.outcome == 'success' }}
         uses: actions/upload-artifact@v6
         with:
           name: test-impact-map
           path: .test-impact
+          include-hidden-files: true
           retention-days: 30
           if-no-files-found: error

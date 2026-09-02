@@ -18,12 +18,10 @@ Selection is conservative and precise at the same time:
   still catch structural regressions from any edit — and tests that
   scan the source tree with ``glob("*.py")``/``rglob("*.py")``.
 * A change outside any function (imports, constants, class bodies, module
-  code) selects every test that executed any line of that file, plus
-  tests that mention each touched module-level identifier: an assignment
-  like ``EDIT_MATH_VERSION = 3`` runs at import time, so a test that
-  only reads the constant is missing from the per-test coverage but
-  will grep-match. A pure insertion between functions (or at EOF beside
-  a function) is treated the same way.
+  code) falls back to the full suite. Import-time values can flow through
+  production modules without executing a line in the defining module under
+  a test context, so coverage cannot safely narrow them. A pure insertion
+  between functions (or at EOF beside a function) is treated the same way.
 * A changed or added unit-test file runs in full.
 * Non-Python files (templates, static assets, data, shell scripts, docs)
   select every unit-test file that mentions their basename, plus the tests
@@ -73,6 +71,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -255,7 +254,11 @@ def changed_files(base: str, head: str, cwd: Path) -> list[tuple[str, str]]:
     return out
 
 
-Hunk = tuple[str, tuple[int, ...]]  # ("mod", old lines) or ("ins", neighbour lines)
+Hunk = tuple[str, tuple[int, ...], bool]
+# ("mod", old lines, added_code) or ("ins", neighbour lines, added_code).
+# ``added_code`` distinguishes a comment reword from replacing a comment with
+# executable code; looking only at the base-side text would call both changes
+# comment-only and could skip affected tests.
 
 
 def old_side_hunks(base: str, head: str, cwd: Path) -> dict[str, list[Hunk]]:
@@ -265,25 +268,39 @@ def old_side_hunks(base: str, head: str, cwd: Path) -> dict[str, list[Hunk]]:
     deletion (``-a,b``) names the old lines it replaced. A pure insertion
     (``-a,0``) has no old lines of its own, so it names the two lines that
     surround it and lets ``impacted_lines`` decide which enclosing function
-    it belongs to.
+    it belongs to. The final flag records whether the new side contains code,
+    so replacing a comment with a statement is not mistaken for a comment-only
+    edit.
     """
     text = _git("diff", "-U0", "--no-color", "--no-ext-diff", "--no-renames", base, head, cwd=cwd)
     hunks: dict[str, list[Hunk]] = defaultdict(list)
     current: str | None = None
+    current_hunk: int | None = None
     for line in text.splitlines():
         header = _DIFF_HEADER_RE.match(line)
         if header:
             current = header.group(2)
+            current_hunk = None
             continue
         hunk = _HUNK_RE.match(line)
-        if not hunk or current is None:
+        if hunk and current is not None:
+            start = int(hunk.group(1))
+            count = int(hunk.group(2)) if hunk.group(2) is not None else 1
+            if count == 0:
+                lines = tuple(n for n in (start, start + 1) if n >= 1)
+                kind = "ins"
+            else:
+                lines = tuple(range(start, start + count))
+                kind = "mod"
+            hunks[current].append((kind, lines, False))
+            current_hunk = len(hunks[current]) - 1
             continue
-        start = int(hunk.group(1))
-        count = int(hunk.group(2)) if hunk.group(2) is not None else 1
-        if count == 0:
-            hunks[current].append(("ins", tuple(n for n in (start, start + 1) if n >= 1)))
-        else:
-            hunks[current].append(("mod", tuple(range(start, start + count))))
+        if current is None or current_hunk is None or not line.startswith("+"):
+            continue
+        added = line[1:].strip()
+        if added and not added.startswith("#"):
+            kind, lines, _ = hunks[current][current_hunk]
+            hunks[current][current_hunk] = (kind, lines, True)
     return hunks
 
 
@@ -410,7 +427,7 @@ def impacted_lines(hunks: list[Hunk], source: str) -> set[int] | None:
     Returns ``None`` when some changed code sits outside every function
     (imports, constants, class bodies, module-level registration) or a
     pure insertion is ambiguous about which function it belongs to, which
-    the caller treats as "whole file". Blank and comment-only lines are
+    the caller treats as "full suite". Blank and comment-only lines are
     ignored, so a diff that only touches comments selects nothing from
     the map.
 
@@ -428,14 +445,14 @@ def impacted_lines(hunks: list[Hunk], source: str) -> set[int] | None:
     Otherwise the new lines may be a new module- or class-level statement
     (a constant, a decorator-driven registration, a new function beside
     an existing one) that every test importing the file would see, so the
-    file widens to the whole file. At EOF the second neighbour is past the
+    selection widens to the full suite. At EOF the second neighbour is past the
     end of the base source and is treated as "outside every function" for
     the same reason.
     """
     spans = function_spans(source)
     text_lines = source.splitlines()
     widened: set[int] = set()
-    for kind, lines in hunks:
+    for kind, lines, added_code in hunks:
         if kind == "ins":
             if not lines:
                 continue  # insertion into an empty file
@@ -451,9 +468,13 @@ def impacted_lines(hunks: list[Hunk], source: str) -> set[int] | None:
                 widened.update(_body_lines(candidates[0]))
                 continue
             return None
-        for n in lines:
-            if not _is_code(text_lines, n):
-                continue
+        code_lines = [n for n in lines if _is_code(text_lines, n)]
+        # A hunk can replace only blank/comment lines on the old side with
+        # executable code. Attribute those old positions conservatively;
+        # otherwise the hunk would look comment-only and select nothing.
+        if added_code and len(code_lines) != len(lines):
+            code_lines = list(lines)
+        for n in code_lines:
             span = innermost_span(n, spans)
             if span is None:
                 return None
@@ -587,7 +608,11 @@ def _reference_strings(path: str, base: str, cwd: Path) -> set[str]:
 # inspect the file bytes, not run its code. Anchor the pattern on
 # ``glob("*.py")`` / ``rglob("*.py")``: a call inside a test that walks
 # the source tree.
-_SOURCE_SCAN_RE = r"\b(r?glob)\(['\"]\*\.py['\"]\)"
+# Do not use ``\b`` here: ``git grep -E`` delegates to platform regex
+# implementations, and macOS treats ``\b`` differently from GNU regex. The
+# call-shaped suffix is already specific enough; a false positive only runs an
+# extra contract test, while a false negative can let a contract violation pass.
+_SOURCE_SCAN_RE = r"(r?glob)\(['\"]\*\.py['\"]\)"
 
 
 def _add_source_scanning_selections(
@@ -617,48 +642,6 @@ def _add_source_scanning_selections(
             sel.note(f"{source_path}: source-scanning contract in {test_file}")
 
 
-def _collect_assign_names(target: ast.AST, names: set[str]) -> None:
-    if isinstance(target, ast.Name):
-        names.add(target.id)
-    elif isinstance(target, (ast.Tuple, ast.List)):
-        for elt in target.elts:
-            _collect_assign_names(elt, names)
-
-
-def module_level_names(source: str, touched: set[int] | None) -> set[str]:
-    """Module-level identifier names whose definition spans intersect ``touched``.
-
-    Used to catch tests that consume a module-level constant they never
-    otherwise execute a line of — ``EDIT_MATH_VERSION = 3`` runs at
-    import time, before any per-test context is active, so a test that
-    only reads ``image_edits.EDIT_MATH_VERSION`` never appears in
-    ``tests_for_lines(path, None)``. Grepping the tests for the
-    identifier name recovers them.
-
-    ``touched=None`` returns every module-level name. Identifiers shorter
-    than 3 characters are dropped to keep noise low (a bare ``x`` or ``f``
-    matches almost every test file).
-    """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return set()
-    names: set[str] = set()
-    for node in tree.body:
-        end = getattr(node, "end_lineno", None) or node.lineno
-        node_lines = set(range(node.lineno, end + 1))
-        if touched is not None and node_lines.isdisjoint(touched):
-            continue
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                _collect_assign_names(target, names)
-        elif isinstance(node, ast.AnnAssign):
-            _collect_assign_names(node.target, names)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-    return {n for n in names if len(n) >= 3}
-
-
 def touched_declaration_names(hunks: list[Hunk], source: str) -> set[str]:
     """Names of the innermost function/class declarations a hunk touched.
 
@@ -678,7 +661,7 @@ def touched_declaration_names(hunks: list[Hunk], source: str) -> set[str]:
     match almost every test that builds the app, while the nested
     name matches only the tests that reference that specific
     declaration. Names shorter than 3 characters are dropped for the
-    same reason as ``module_level_names``.
+    same reason module-level identifier searches avoid short names.
     """
     try:
         tree = ast.parse(source)
@@ -691,7 +674,7 @@ def touched_declaration_names(hunks: list[Hunk], source: str) -> set[str]:
             end = node.end_lineno or node.lineno
             named_spans.append((node.name, start, end))
     names: set[str] = set()
-    for _, lines in hunks:
+    for _, lines, _ in hunks:
         for line in lines:
             enclosing = [(n, s, e) for n, s, e in named_spans if s <= line <= e]
             if not enclosing:
@@ -721,11 +704,10 @@ def _add_mention_selections(
     that exist only on ``head`` are added whole (they are new and have no
     map history).
 
-    ``needle`` allows callers to grep for something other than the basename
-    (for example, a module-level identifier name touched by the diff, so a
-    test that imports the constant is selected even though it never runs
-    any line of the source file). ``word=True`` grep-matches whole words
-    only, so an identifier like ``alpha`` doesn't pull in ``test_alpha``.
+    ``needle`` allows callers to grep for something other than the basename,
+    such as a function imported and inspected by name. ``word=True``
+    grep-matches whole words only, so an identifier like ``alpha`` doesn't
+    pull in ``test_alpha``.
     """
     if needle is None:
         needle = os.path.basename(path)
@@ -853,31 +835,22 @@ def select(
                         needle=name, word=True,
                     )
 
-            if widened is None and hunks:
-                # Module-level change: tests that only read a module-level
-                # constant execute no source line under a test context —
-                # the assignment runs at import time — and are absent from
-                # ``tests_for_lines(path, None)``. Grep for each touched
-                # module-level identifier so those tests are still selected,
-                # even for files with no coverage in the map.
-                touched_lines = {n for _, lns in hunks for n in lns}
-                for name in module_level_names(source, touched_lines):
-                    _add_mention_selections(
-                        path, base, head, cwd, impact, test_specs, sel,
-                        needle=name, word=True,
-                    )
+            if widened is None:
+                # Coverage cannot safely narrow import-time changes. A constant
+                # may be copied into a production consumer during collection,
+                # then affect a test that executes only the consumer; neither
+                # the defining source nor direct test mentions establish that
+                # dependency in the map. Deletions, missing/invalid base
+                # source, and ambiguous insertions carry the same risk.
+                sel.force_full(f"{path}: module-level or structurally ambiguous change")
+                continue
 
             if not impact.has_file(path):
                 sel.note(f"{path}: not in map (never imported by a test)")
                 continue
 
-            if widened is None:
-                picked = impact.tests_for_lines(path, None)
-                reason = "deleted" if status == "D" else "no hunks" if not hunks else "module-level change"
-                sel.note(f"{path}: {reason} -> {len(picked)} tests (whole file)")
-            else:
-                picked = impact.tests_for_lines(path, widened)
-                sel.note(f"{path}: {len(hunks)} hunks in {len(widened)} function lines -> {len(picked)} tests")
+            picked = impact.tests_for_lines(path, widened)
+            sel.note(f"{path}: {len(hunks)} hunks in {len(widened)} function lines -> {len(picked)} tests")
             sel.ids |= picked
             continue
 
@@ -967,8 +940,12 @@ def build_map(
     shutil.copyfile(coverage_file, target)
     # Coverage's combine step leaves the sqlite file fragmented; compact it so
     # the cache/artifact upload is small.
-    with sqlite3.connect(str(target)) as conn:
-        conn.execute("VACUUM")
+    conn = sqlite3.connect(str(target))
+    try:
+        with conn:
+            conn.execute("VACUUM")
+    finally:
+        conn.close()
     impact = ImpactMap(target, str(cwd))
     if impact.context_count == 0:
         raise SystemExit(
@@ -1009,19 +986,45 @@ def fetch_map(map_dir: Path, cwd: Path = ROOT) -> dict:
     if listing.returncode != 0:
         raise SystemExit(f"gh run list failed: {listing.stderr.strip()}")
     runs = json.loads(listing.stdout or "[]")
-    if map_dir.exists():
-        shutil.rmtree(map_dir)
-    for run in runs:
-        if run.get("conclusion") == "cancelled":
-            continue
-        download = subprocess.run(
-            ["gh", "run", "download", str(run["databaseId"]), "--name", MAP_ARTIFACT, "--dir", str(map_dir)],
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-        )
-        if download.returncode == 0 and (map_dir / MAP_META).is_file():
-            meta = json.loads((map_dir / MAP_META).read_text(encoding="utf-8"))
+    map_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{map_dir.name}-fetch-", dir=map_dir.parent) as temp:
+        temp_dir = Path(temp)
+        for run in runs:
+            if run.get("conclusion") == "cancelled":
+                continue
+            attempt = temp_dir / str(run["databaseId"])
+            download = subprocess.run(
+                [
+                    "gh", "run", "download", str(run["databaseId"]),
+                    "--name", MAP_ARTIFACT, "--dir", str(attempt),
+                ],
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+            )
+            if (
+                download.returncode != 0
+                or not (attempt / MAP_META).is_file()
+                or not (attempt / MAP_DB).is_file()
+            ):
+                continue
+            try:
+                meta = json.loads((attempt / MAP_META).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+
+            # Keep the prior working map until a complete download has been
+            # validated. Move it into this temporary directory during the
+            # swap so any replacement failure can restore it immediately.
+            previous = temp_dir / "previous"
+            if map_dir.exists():
+                map_dir.rename(previous)
+            try:
+                attempt.rename(map_dir)
+            except Exception:
+                if previous.exists():
+                    previous.rename(map_dir)
+                raise
             print(
                 f"fetched {MAP_ARTIFACT} from run {run['databaseId']} "
                 f"(main @ {meta.get('sha', '?')[:10]}, {meta.get('contexts', '?')} tests) -> {map_dir}",
@@ -1127,7 +1130,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--sha", help="commit the coverage run tested (default: HEAD)")
     p_build.add_argument(
         "--junit-xml",
-        help="pytest --junitxml report of the same run; rejects a map that misses >5%% of executed tests",
+        help="pytest --junitxml report of the same run; rejects a map that misses >1%% of executed tests",
     )
     p_build.set_defaults(func=cmd_build_map)
 
@@ -1141,8 +1144,13 @@ def main(argv: list[str] | None = None) -> int:
     commands = {"select", "build-map", "fetch-map"}
     # ``select`` is the default subcommand; global options may precede it.
     idx = 0
-    while idx < len(argv) and argv[idx] in ("--repo", "--map-dir"):
-        idx += 2
+    while idx < len(argv):
+        if argv[idx] in ("--repo", "--map-dir"):
+            idx += 2
+        elif argv[idx].startswith(("--repo=", "--map-dir=")):
+            idx += 1
+        else:
+            break
     if idx >= len(argv) or argv[idx] not in commands and argv[idx] not in ("-h", "--help"):
         argv.insert(idx, "select")
     args = build_parser().parse_args(argv)

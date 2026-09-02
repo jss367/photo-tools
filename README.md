@@ -86,7 +86,10 @@ python scripts/select_tests.py --run -- -n auto -q
 `select_tests.py --explain` shows why each changed file selected what it
 did. PR CI runs the same selection on Linux; the complete suite on all three
 OSes runs after merge (`.github/workflows/test-main.yml`). Add the
-`ci-full-suite` label to a PR to force the full suite there.
+`ci-full-suite` label to a PR to force the full suite there. Module-level,
+structurally ambiguous, and test-harness changes also use the full-suite
+fallback because import-time dependencies cannot be narrowed safely from line
+coverage.
 
 ## Scripting & automation
 

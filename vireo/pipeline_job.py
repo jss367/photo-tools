@@ -62,7 +62,7 @@ from resource_ledger import (
     suspend_resource_wait_timing,
 )
 from volume_reachability import (
-    mount_root_candidates as _archive_mount_root_candidates,
+    mount_root_candidates_checked as _archive_mount_root_candidates_checked,
 )
 
 log = logging.getLogger(__name__)
@@ -253,8 +253,13 @@ def _archive_mount_baseline(
     """
     known = known_mounted_roots or set()
     baseline = {}
-    for root in _archive_mount_root_candidates(path):
-        baseline[root] = os.path.ismount(root) or root in known
+    candidates, conclusive = _archive_mount_root_candidates_checked(path)
+    for root in candidates:
+        # An inconclusive resolution (a mount-shaped prefix could not be
+        # inspected in time) is read as "assume it was a mount": the later
+        # mounted -> unmounted check then fires against the stub instead of
+        # the alias being accepted as a local directory.
+        baseline[root] = os.path.ismount(root) or root in known or not conclusive
     return baseline
 
 
@@ -392,7 +397,12 @@ def _missing_archive_mount_root(path: str) -> str | None:
     check that also treats a directory-still-there-but-not-mounted case
     as offline.
     """
-    for mount_root in _archive_mount_root_candidates(path):
+    candidates, conclusive = _archive_mount_root_candidates_checked(path)
+    if candidates and not conclusive:
+        # Could not inspect the mount prefix in time: refuse rather than
+        # risk creating a stub and writing onto the local disk.
+        return candidates[0]
+    for mount_root in candidates:
         if not os.path.lexists(mount_root):
             return mount_root
     return None
@@ -499,7 +509,10 @@ def _source_offline_reason(
     # file" and letting classify keep hammering the dead share. A
     # successful root probe leaves the caller with the ordinary
     # "readable folder → per-photo failure" outcome below.
-    for mount_root in _archive_mount_root_candidates(image_path):
+    candidates, conclusive = _archive_mount_root_candidates_checked(image_path)
+    if candidates and not conclusive:
+        return "mount", f"volume {candidates[0]} could not be inspected in time"
+    for mount_root in candidates:
         if _mount_root_offline(mount_root):
             return "mount", f"volume {mount_root} is not mounted"
     # No mount-root candidate is offline. A readable folder means the

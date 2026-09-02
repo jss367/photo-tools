@@ -19399,3 +19399,44 @@ def test_pipeline_classifier_factory_uses_non_parking_cancel_probe():
         "_construct_classifier's inner cancel_check must not call the "
         "parking _should_abort — use _should_abort_without_pause"
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Inconclusive mount-prefix resolution fails closed in every pipeline guard
+# ---------------------------------------------------------------------------
+
+def test_archive_mount_baseline_assumes_mount_when_resolution_inconclusive(monkeypatch, tmp_path):
+    import pipeline_job
+
+    monkeypatch.setattr(
+        pipeline_job, "_archive_mount_root_candidates_checked",
+        lambda p: (["/mnt/archive"], False),
+    )
+    monkeypatch.setattr(pipeline_job.os.path, "ismount", lambda p: False)
+    assert pipeline_job._archive_mount_baseline(str(tmp_path)) == {"/mnt/archive": True}
+
+
+def test_missing_archive_mount_root_refuses_on_inconclusive_resolution(monkeypatch, tmp_path):
+    import pipeline_job
+
+    monkeypatch.setattr(
+        pipeline_job, "_archive_mount_root_candidates_checked",
+        lambda p: (["/mnt/archive"], False),
+    )
+    monkeypatch.setattr(pipeline_job.os.path, "lexists", lambda p: True)
+    assert pipeline_job._missing_archive_mount_root(str(tmp_path)) == "/mnt/archive"
+
+
+def test_source_offline_reason_scopes_inconclusive_resolution_to_mount(monkeypatch, tmp_path):
+    import pipeline_job
+
+    monkeypatch.setattr(
+        pipeline_job, "_archive_mount_root_candidates_checked",
+        lambda p: (["/mnt/archive"], False),
+    )
+    scope, reason = pipeline_job._source_offline_reason(
+        str(tmp_path), str(tmp_path / "img.jpg"),
+    )
+    assert scope == "mount"
+    assert "/mnt/archive" in reason

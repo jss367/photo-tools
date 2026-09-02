@@ -15,6 +15,17 @@ def _clear_shared_gate():
     vr.get_shared().clear()
 
 
+class _FakeScandir:
+    def __init__(self, names):
+        self._it = iter(names)
+
+    def __enter__(self):
+        return self._it
+
+    def __exit__(self, *exc):
+        return False
+
+
 class _FakeClock:
     def __init__(self):
         self.now = 1000.0
@@ -139,9 +150,14 @@ def test_generic_probe_times_out_as_offline(monkeypatch):
         release.set()
 
 
-def test_generic_probe_returns_isdir_result(tmp_path):
+def test_generic_probe_returns_isdir_result(tmp_path, monkeypatch):
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
+    (tmp_path / "photo.jpg").write_bytes(b"")
     assert vr._probe_root_generic(str(tmp_path), timeout=1) is True
     assert vr._probe_root_generic(str(tmp_path / "nope"), timeout=1) is False
+    # An empty, unmounted directory is read as a detached share's stub.
+    (tmp_path / "empty").mkdir()
+    assert vr._probe_root_generic(str(tmp_path / "empty"), timeout=1) is False
 
 
 def test_app_reexports_probe_machinery_by_historical_names():
@@ -308,6 +324,7 @@ def test_generic_probe_recognises_detached_mount_stub(monkeypatch):
     monkeypatch.setattr(vr.os.path, "isdir", lambda p: True)
     mounted = {"/mnt/NAS": True}
     monkeypatch.setattr(vr.os.path, "ismount", lambda p: mounted.get(p, False))
+    monkeypatch.setattr(vr.os, "scandir", lambda p: _FakeScandir(["photo.jpg"]))
 
     assert vr._probe_root_generic("/mnt/NAS", timeout=1) is True
     assert vr._probe_root_generic("/mnt/photos", timeout=1) is True, "never a mount: plain dir is fine"
@@ -383,3 +400,20 @@ def test_conclusive_link_answers_are_cached(tmp_path, monkeypatch):
     assert vr._bounded_link_target(str(link)) == "/mnt/NAS"
     assert vr._bounded_link_target(str(tmp_path)) is None
     assert {str(link): "/mnt/NAS", str(tmp_path): None} == vr._LINK_TARGET_CACHE
+
+
+def test_generic_probe_cold_start_treats_empty_unmounted_stub_as_offline(monkeypatch):
+    """No in-process history (Vireo started after the share detached): an
+    empty, unmounted mount-point directory is the detached share's stub and
+    reads offline; a populated unmounted directory is a real local root."""
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
+    monkeypatch.setattr(vr, "_GENERIC_PROBES", {})
+    monkeypatch.setattr(vr.os.path, "isdir", lambda p: True)
+    monkeypatch.setattr(vr.os.path, "ismount", lambda p: False)
+    contents = {"/mnt/NAS": [], "/mnt/photos": ["2026"]}
+    monkeypatch.setattr(vr.os, "scandir", lambda p: _FakeScandir(contents[p]))
+
+    assert vr._probe_root_generic("/mnt/NAS", timeout=1) is False
+    assert "/mnt/NAS" not in vr._MOUNT_BASELINE, "a stub must not be recorded as a local dir"
+    assert vr._probe_root_generic("/mnt/photos", timeout=1) is True
+    assert vr._MOUNT_BASELINE["/mnt/photos"] is False

@@ -475,6 +475,22 @@ def _classify_generic_root(root):
         return True
     if _MOUNT_BASELINE.get(root):
         return False
+    # No in-process history (cold start after the share already detached):
+    # a mount-shaped directory that is not a mount point *and is empty* is
+    # exactly what a detached share leaves behind, so read it as offline
+    # rather than recording the stub as an ordinary local folder. A
+    # populated non-mount directory is a real local root and stays online.
+    try:
+        with os.scandir(root) as it:
+            populated = next(it, None) is not None
+    except OSError:
+        return False
+    if not populated:
+        log.warning(
+            "Volume %s is an empty, unmounted mount-point directory; "
+            "treating as a detached share", root,
+        )
+        return False
     _MOUNT_BASELINE.setdefault(root, False)
     return True
 

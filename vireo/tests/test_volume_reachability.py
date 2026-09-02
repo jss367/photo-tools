@@ -272,9 +272,9 @@ def test_bounded_link_target_reads_local_symlink_and_times_out_on_wedged_mount(t
     monkeypatch.setattr(vr.os.path, "islink", lambda p: release.wait(5) or False)
     monkeypatch.setattr(vr, "_BOUNDED_LINK_PROBES", {})
     try:
-        assert vr._bounded_link_target("/mnt/stuck", timeout=0.05) is None
-        # Reused while alive: no second thread, immediate answer.
-        assert vr._bounded_link_target("/mnt/stuck", timeout=0.05) is None
+        assert vr._bounded_link_target("/mnt/stuck", timeout=0.05) is vr.INCONCLUSIVE
+        # Reused while alive: no second thread, immediate (inconclusive) answer.
+        assert vr._bounded_link_target("/mnt/stuck", timeout=0.05) is vr.INCONCLUSIVE
         assert list(vr._BOUNDED_LINK_PROBES) == ["/mnt/stuck"]
     finally:
         release.set()
@@ -334,9 +334,52 @@ def test_bounded_link_target_global_cap(monkeypatch):
     monkeypatch.setattr(vr, "_BOUNDED_LINK_PROBES", {})
     monkeypatch.setattr(vr, "_MAX_BOUNDED_LINK_PROBES", 2)
     try:
-        assert vr._bounded_link_target("/mnt/a", timeout=0.02) is None
-        assert vr._bounded_link_target("/mnt/b", timeout=0.02) is None
-        assert vr._bounded_link_target("/mnt/c", timeout=0.02) is None
+        assert vr._bounded_link_target("/mnt/a", timeout=0.02) is vr.INCONCLUSIVE
+        assert vr._bounded_link_target("/mnt/b", timeout=0.02) is vr.INCONCLUSIVE
+        assert vr._bounded_link_target("/mnt/c", timeout=0.02) is vr.INCONCLUSIVE
         assert set(vr._BOUNDED_LINK_PROBES) == {"/mnt/a", "/mnt/b"}, "third path never spawned"
     finally:
         release.set()
+
+
+def test_saturated_link_probes_fall_back_to_cached_real_mount(monkeypatch):
+    """Under saturation the alias's real mount must still be reported when an
+    earlier conclusive answer exists — never silently downgraded to "plain
+    directory" (which would let an import write into a detached stub)."""
+    monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: vr.INCONCLUSIVE)
+    # Both prefixes answered conclusively earlier: full resolution, confident.
+    monkeypatch.setattr(vr, "_LINK_TARGET_CACHE", {"/mnt/archive": "/mnt/NAS", "/mnt/NAS": None})
+    cands, conclusive = vr.mount_root_candidates_checked("/mnt/archive/photos")
+    assert cands == ["/mnt/archive", "/mnt/NAS"]
+    assert conclusive is True
+    # Only the alias is cached: the real mount is still reported (so the
+    # pipeline guards see it) but the result is not confident, because the
+    # real mount's own prefix could not be inspected.
+    monkeypatch.setattr(vr, "_LINK_TARGET_CACHE", {"/mnt/archive": "/mnt/NAS"})
+    cands, conclusive = vr.mount_root_candidates_checked("/mnt/archive/photos")
+    assert cands == ["/mnt/archive", "/mnt/NAS"]
+    assert conclusive is False
+
+
+def test_inconclusive_prefix_without_cache_fails_closed_in_gate(monkeypatch):
+    monkeypatch.setattr(vr, "_LINK_TARGET_CACHE", {})
+    monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: vr.INCONCLUSIVE)
+    cands, conclusive = vr.mount_root_candidates_checked("/mnt/archive/photos")
+    assert cands == ["/mnt/archive"]
+    assert conclusive is False
+    probes = []
+    gate = vr.VolumeReachability(probe=lambda root: probes.append(root) or True)
+    assert gate.check("/mnt/archive/photos") == ("/mnt/archive", False)
+    assert probes == [], "no point probing a root whose prefix could not be inspected"
+
+
+def test_conclusive_link_answers_are_cached(tmp_path, monkeypatch):
+    if sys.platform == "win32":
+        pytest.skip("POSIX symlinks")
+    monkeypatch.setattr(vr, "_LINK_TARGET_CACHE", {})
+    monkeypatch.setattr(vr, "_BOUNDED_LINK_PROBES", {})
+    link = tmp_path / "archive"
+    link.symlink_to("/mnt/NAS")
+    assert vr._bounded_link_target(str(link)) == "/mnt/NAS"
+    assert vr._bounded_link_target(str(tmp_path)) is None
+    assert {str(link): "/mnt/NAS", str(tmp_path): None} == vr._LINK_TARGET_CACHE

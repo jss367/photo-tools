@@ -78,7 +78,7 @@ def is_offline_error(exc):
     return isinstance(exc, OSError) and exc.errno in OFFLINE_ERRNOS
 
 
-def mount_root_candidates(path: str) -> list[str]:
+def mount_root_candidates(path: str, _report_confidence=None) -> list[str]:
     """Return the plausible mount-root prefix(es) for ``path``, if any.
 
     Extracts the mount-root component under each OS's mount conventions —
@@ -149,7 +149,10 @@ def mount_root_candidates(path: str) -> list[str]:
     # mounted-to-unmounted guards never see it. Inspecting that prefix is the
     # one lookup that may land on a dead filesystem, so the resolver does it
     # through a time-bounded helper rather than a bare ``lstat``.
-    resolved = _resolve_symlinks_until_mount_shaped(normalized, _candidate)
+    inconclusive: list[str] = []
+    resolved = _resolve_symlinks_until_mount_shaped(
+        normalized, _candidate, inconclusive=inconclusive,
+    )
     resolved_posix = (
         resolved.replace("\\", "/") if resolved else None
     )
@@ -161,7 +164,20 @@ def mount_root_candidates(path: str) -> list[str]:
         cand = _candidate(source)
         if cand and cand not in seen:
             seen.append(cand)
+    if _report_confidence is not None:
+        _report_confidence.append(not inconclusive)
     return seen
+
+
+def mount_root_candidates_checked(path):
+    """``(candidates, conclusive)`` — like :func:`mount_root_candidates`, but
+    also says whether every mount-shaped prefix could be inspected in time.
+    ``conclusive`` is False when a prefix probe timed out or the probe
+    registry was saturated and no cached answer existed; the gate treats that
+    as offline rather than trusting a possibly-truncated resolution."""
+    confidence: list[bool] = []
+    candidates = mount_root_candidates(path, _report_confidence=confidence)
+    return candidates, (confidence[0] if confidence else True)
 
 
 
@@ -171,6 +187,16 @@ _MAX_SYMLINK_HOPS = 40
 _BOUNDED_LINK_LOCK = threading.Lock()
 _BOUNDED_LINK_PROBES = {}
 _MAX_BOUNDED_LINK_PROBES = _MAX_NETWORK_PROBES
+# Returned by ``_bounded_link_target`` when it could not get an answer (probe
+# timed out, a probe for the path is still wedged, or the registry is full).
+# Distinct from ``None`` ("conclusively not a symlink") so callers can fail
+# closed instead of mistaking saturation for a plain directory.
+INCONCLUSIVE = object()
+# path -> last *conclusive* answer (target string or None). Mount-prefix
+# symlink layout does not change while the process runs, so an answer
+# obtained at a healthy moment stands in when a later probe is inconclusive
+# — preserving the real mount behind an alias even under saturation.
+_LINK_TARGET_CACHE = {}
 
 
 def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
@@ -189,7 +215,7 @@ def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
         existing = _BOUNDED_LINK_PROBES.get(path)
         if existing is not None:
             if existing.is_alive():
-                return None
+                return INCONCLUSIVE
             del _BOUNDED_LINK_PROBES[path]
         # Reap finished probes for other paths, then apply the global cap so
         # many distinct wedged prefixes cannot accumulate threads either.
@@ -197,7 +223,7 @@ def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
             if not thread_.is_alive():
                 del _BOUNDED_LINK_PROBES[other]
         if len(_BOUNDED_LINK_PROBES) >= _MAX_BOUNDED_LINK_PROBES:
-            return None
+            return INCONCLUSIVE
         outcome = {}
 
         def worker():
@@ -220,11 +246,14 @@ def _bounded_link_target(path, timeout=MOUNT_QUERY_TIMEOUT_SECS):
         thread.start()
     thread.join(timeout)
     if thread.is_alive():
-        return None
-    return outcome.get("target")
+        return INCONCLUSIVE
+    target = outcome.get("target")
+    with _BOUNDED_LINK_LOCK:
+        _LINK_TARGET_CACHE[path] = target
+    return target
 
 
-def _resolve_symlinks_until_mount_shaped(path, candidate):
+def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
     """Follow symlinks in ``path`` component by component, stopping early.
 
     Returns the (partially) resolved absolute path, or ``None`` when nothing
@@ -237,6 +266,11 @@ def _resolve_symlinks_until_mount_shaped(path, candidate):
     not a link the walk stops and the remainder is appended untouched. UNC
     ``//server`` prefixes are never touched. Hop count is bounded so a
     symlink loop cannot spin.
+
+    When a mount-shaped prefix could not be inspected in time and no earlier
+    conclusive answer is cached, the prefix is kept as-is and
+    ``inconclusive`` (a list, if given) receives that prefix so the caller
+    can fail closed rather than trust a possibly-incomplete resolution.
     """
     remaining = [part for part in path.replace("\\", "/").split("/") if part]
     if path.startswith("//"):
@@ -259,6 +293,14 @@ def _resolve_symlinks_until_mount_shaped(path, candidate):
         if candidate(nxt.replace("\\", "/")) is not None:
             # Mount-shaped: the only lookup allowed here is the bounded one.
             target = _bounded_link_target(nxt)
+            if target is INCONCLUSIVE:
+                with _BOUNDED_LINK_LOCK:
+                    target = _LINK_TARGET_CACHE.get(nxt, INCONCLUSIVE)
+            if target is INCONCLUSIVE:
+                if inconclusive is not None:
+                    inconclusive.append(nxt)
+                prefix = nxt
+                break
             if target is None:
                 prefix = nxt
                 break
@@ -567,9 +609,17 @@ class VolumeReachability:
         apply (an alias resolving into a share), the first offline one is
         returned so callers can name it.
         """
-        candidates = mount_root_candidates(path)
+        candidates, conclusive = mount_root_candidates_checked(path)
         if not candidates:
             return None, True
+        if not conclusive:
+            # A mount-shaped prefix could not even be inspected in time: the
+            # only safe reading is that the volume is not reachable.
+            log.warning(
+                "Volume prefix of %s could not be inspected in time; "
+                "treating as offline", path,
+            )
+            return candidates[0], False
         for root in candidates:
             if not self.root_reachable(root):
                 return root, False

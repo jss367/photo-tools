@@ -758,11 +758,85 @@ def test_darwin_probe_requires_a_directory_listing():
 
 def test_probe_root_uses_directory_read_on_darwin(monkeypatch):
     monkeypatch.setattr(vr.sys, "platform", "darwin")
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {})
     seen = []
     monkeypatch.setattr(vr, "_probe_root_darwin", lambda root, timeout=None: seen.append(root) or True)
     monkeypatch.setattr(vr, "network_root_reachable", lambda *a, **k: pytest.fail("stat-only probe must not decide"))
     assert vr.probe_root("/Volumes/NAS") is True
     assert seen == ["/Volumes/NAS"]
+
+
+def test_probe_root_rejects_known_darwin_mount_missing_from_fresh_table(monkeypatch):
+    monkeypatch.setattr(vr.sys, "platform", "darwin")
+    monkeypatch.setattr(vr, "_MOUNT_BASELINE", {"/srv/photos": True})
+    monkeypatch.setattr(vr, "_probe_root_darwin", lambda root, timeout=None: True)
+    refreshes = []
+    monkeypatch.setattr(
+        vr, "_system_mount_roots",
+        lambda force_refresh=False: refreshes.append(force_refresh) or set(),
+    )
+
+    assert vr.probe_root("/srv/photos") is False
+    assert refreshes == [True]
+    monkeypatch.setattr(
+        vr, "_system_mount_roots",
+        lambda force_refresh=False: {"/srv/photos"},
+    )
+    assert vr.probe_root("/srv/photos") is True
+
+
+def test_bounded_process_probe_waits_for_healthy_same_root_probe(monkeypatch):
+    import threading
+    import time
+
+    monkeypatch.setattr(vr, "_NETWORK_PROBES", {})
+    monkeypatch.setattr(vr, "_ABANDONED_NETWORK_PROBES", set())
+    first_started = threading.Event()
+    release_first = threading.Event()
+    created = []
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, first):
+            self.first = first
+
+        def communicate(self, timeout=None):
+            if self.first:
+                first_started.set()
+                assert release_first.wait(2)
+            return "ok", ""
+
+        def kill(self):
+            return None
+
+    def popen(*_args, **_kwargs):
+        process = Process(not created)
+        created.append(process)
+        return process
+
+    results = []
+
+    def probe():
+        results.append(vr._bounded_process_probe(
+            ["probe"], "/srv/photos", 1,
+            accept=lambda stdout: stdout == "ok", popen=popen,
+        ))
+
+    first = threading.Thread(target=probe)
+    second = threading.Thread(target=probe)
+    first.start()
+    assert first_started.wait(1)
+    second.start()
+    time.sleep(0.05)
+    assert second.is_alive()
+    assert len(created) == 1, "same-root contender must wait before spawning"
+    release_first.set()
+    first.join(2)
+    second.join(2)
+
+    assert results == [True, True]
+    assert len(created) == 2
 
 
 def test_resolver_follows_junction_below_windows_drive_root(monkeypatch):

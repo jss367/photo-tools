@@ -48,7 +48,9 @@ MOUNT_QUERY_TIMEOUT_SECS = 5
 _MAX_NETWORK_PROBES = 8
 _NETWORK_PROBE_RESERVED = object()
 _NETWORK_PROBE_LOCK = threading.Lock()
+_NETWORK_PROBE_CONDITION = threading.Condition(_NETWORK_PROBE_LOCK)
 _NETWORK_PROBES = {}
+_ABANDONED_NETWORK_PROBES = set()
 
 # ``OSError`` errnos that mean the *volume* is gone, not that one file is
 # unreadable. ``ENOTCONN`` ("Socket is not connected") is what macOS raises
@@ -166,14 +168,14 @@ def _darwin_mount_table_roots(run=subprocess.run):
     }
 
 
-def _system_mount_roots(clock=time.monotonic):
+def _system_mount_roots(clock=time.monotonic, force_refresh=False):
     """Cached live mount roots obtained without touching mounted filesystems."""
     global _MOUNT_TABLE_CACHE
 
     now = clock()
     with _MOUNT_TABLE_LOCK:
         recorded_at, roots = _MOUNT_TABLE_CACHE
-        if now - recorded_at <= _MOUNT_TABLE_TTL_SECONDS:
+        if not force_refresh and now - recorded_at <= _MOUNT_TABLE_TTL_SECONDS:
             return set(roots)
     if sys.platform.startswith("linux"):
         fresh = _linux_mount_table_roots()
@@ -582,11 +584,20 @@ def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
     return prefix or None
 
 
-def _reserve_network_probe(root):
-    """Reserve a bounded probe slot, reusing one already active per root."""
-    with _NETWORK_PROBE_LOCK:
-        if root in _NETWORK_PROBES:
-            return False
+def _reserve_network_probe(root, wait_timeout=0):
+    """Reserve a slot, waiting boundedly for healthy same-root contention."""
+    deadline = time.monotonic() + max(0, wait_timeout)
+    with _NETWORK_PROBE_CONDITION:
+        while root in _NETWORK_PROBES:
+            # A timed-out process may stay in uninterruptible I/O while its
+            # reaper waits. It already proved the root unhealthy, so retries
+            # fail immediately instead of waiting another timeout.
+            if root in _ABANDONED_NETWORK_PROBES:
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            _NETWORK_PROBE_CONDITION.wait(remaining)
         if len(_NETWORK_PROBES) >= _MAX_NETWORK_PROBES:
             return False
         _NETWORK_PROBES[root] = _NETWORK_PROBE_RESERVED
@@ -595,9 +606,11 @@ def _reserve_network_probe(root):
 
 def _release_network_probe(root, owner):
     """Release ``root`` only when it is still owned by this probe."""
-    with _NETWORK_PROBE_LOCK:
+    with _NETWORK_PROBE_CONDITION:
         if _NETWORK_PROBES.get(root) is owner:
             _NETWORK_PROBES.pop(root, None)
+            _ABANDONED_NETWORK_PROBES.discard(root)
+            _NETWORK_PROBE_CONDITION.notify_all()
 
 
 def _reap_abandoned_network_probe(root, process):
@@ -612,6 +625,9 @@ def _reap_abandoned_network_probe(root, process):
 
 def _abandon_network_probe(root, process):
     """Kill a timed-out probe without synchronously waiting for it."""
+    with _NETWORK_PROBE_CONDITION:
+        if _NETWORK_PROBES.get(root) is process:
+            _ABANDONED_NETWORK_PROBES.add(root)
     with contextlib.suppress(OSError):
         process.kill()
     threading.Thread(
@@ -670,7 +686,7 @@ def _bounded_process_probe(argv, root, timeout, accept, run=None,
         root_key = os.path.normcase(os.path.normpath(os.fspath(root)))
     except (TypeError, ValueError):
         return False
-    if not _reserve_network_probe(root_key):
+    if not _reserve_network_probe(root_key, wait_timeout=timeout):
         return False
 
     process = None
@@ -897,7 +913,13 @@ def _probe_root_darwin(root, timeout=MOUNT_QUERY_TIMEOUT_SECS,
 def probe_root(root, timeout=MOUNT_QUERY_TIMEOUT_SECS):
     """Return True when the mount root answers a bounded liveness check."""
     if sys.platform == "darwin":
-        return _probe_root_darwin(root, timeout=timeout)
+        if not _probe_root_darwin(root, timeout=timeout):
+            return False
+        if not was_observed_mounted(root):
+            return True
+        live_roots = _system_mount_roots(force_refresh=True)
+        normalized_root = posixpath.normpath(root.replace("\\", "/"))
+        return normalized_root in live_roots
     return _probe_root_generic(root, timeout)
 
 

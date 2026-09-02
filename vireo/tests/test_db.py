@@ -26634,10 +26634,20 @@ def test_get_workspace_root_folder_ids_matches_roots_without_counting_photos(tmp
     a = db.add_folder(str(tmp_path / "a"), name="a")
     b = db.add_folder(str(tmp_path / "b"), name="b")
     (tmp_path / "a" / "sub").mkdir(parents=True)
-    child = db.add_folder(str(tmp_path / "a" / "sub"), name="sub", parent_id=a)
+    # A descendant linked as a *non-root* (how scans link subfolders under a
+    # user-chosen root) must not be reported by either accessor.
+    child = db.add_folder(
+        str(tmp_path / "a" / "sub"), name="sub", parent_id=a, workspace_root=False,
+    )
 
     ids = db.get_workspace_root_folder_ids(ws_id)
     full = sorted(int(r["id"]) for r in db.get_workspace_folder_roots(ws_id))
     assert sorted(ids) == full
-    assert set(ids) >= {a, b}
-    assert child not in ids or child in full
+    assert set(ids) == {a, b}, "only the two top-level roots are roots"
+    assert child not in ids, "a nested, non-root folder must not be reported"
+    # Defaults to the active workspace and refuses to run without one.
+    assert db.get_workspace_root_folder_ids() == ids
+    db._active_workspace_id = None
+    import pytest
+    with pytest.raises(RuntimeError):
+        db.get_workspace_root_folder_ids()

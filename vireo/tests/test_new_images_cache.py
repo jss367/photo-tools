@@ -430,3 +430,25 @@ def test_cache_generation_is_scoped_by_db_path():
     cache.set("/path/a.db", workspace_id=1,
               result={"new_count": 99}, generation=gen_a)
     assert cache.get("/path/a.db", 1) is None
+
+
+def test_partial_offline_results_expire_at_offline_retry_interval(monkeypatch):
+    """A result that skipped an offline root is held only for the short
+    partial TTL, so a reconnected share is re-walked within the same window
+    the reachability gate re-probes it — not after the full 300s TTL."""
+    import time as time_module
+
+    from new_images import NewImagesCache
+
+    now = [1000.0]
+    monkeypatch.setattr(time_module, "monotonic", lambda: now[0])
+    cache = NewImagesCache(ttl_seconds=300)
+    partial = {"new_count": 1, "per_root": [], "sample": [],
+               "unreachable_roots": ["/Volumes/NAS/shoot"]}
+    complete = {"new_count": 1, "per_root": [], "sample": [], "unreachable_roots": []}
+
+    cache.set("db", 1, partial)
+    cache.set("db", 2, complete)
+    now[0] += NewImagesCache.PARTIAL_RESULT_TTL_SECONDS + 1
+    assert cache.get("db", 1) is None, "partial result must expire early"
+    assert cache.get("db", 2) == complete, "complete result keeps the normal TTL"

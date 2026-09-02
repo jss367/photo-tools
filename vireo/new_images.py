@@ -1,6 +1,7 @@
 """Detect image files present on disk but not yet ingested into a workspace."""
 import logging
 import os
+import stat
 import threading
 import time
 from pathlib import Path
@@ -225,7 +226,8 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
         try:
             walk = safe_scan_walk(root_path, onerror=_on_walk_error)
             root_new = _walk_root_for_new_images(
-                walk, known, seen_new_paths, root_new_paths, on_file=_tick,
+                walk, known, seen_new_paths, root_new_paths,
+                on_file=_tick, on_error=_on_walk_error,
             )
         except _RootOffline:
             # Whatever this root had already contributed is dropped: a
@@ -253,15 +255,34 @@ def count_new_images_for_workspace(db, workspace_id, sample_limit=5,
     }
 
 
+def _is_regular_file(path, on_error):
+    """``os.path.isfile`` that does not swallow volume-loss errors.
+
+    ``os.path.isfile`` returns False for *any* ``OSError``, which would let a
+    share that drops between ``scandir`` and the per-file ``stat`` look like
+    "no new files here" instead of "this root went offline". Route the error
+    through ``on_error`` (which raises :class:`_RootOffline` for the offline
+    class and merely logs the rest) and treat every failure as "not a file"
+    — a broken symlink's ``ENOENT`` still lands on the skip path.
+    """
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        on_error(exc)
+        return False
+    return stat.S_ISREG(st.st_mode)
+
+
 def _walk_root_for_new_images(walk, known, seen_new_paths, root_new_paths,
-                              on_file):
+                              on_file, on_error):
     """Consume one root's ``safe_scan_walk`` and collect its new image paths.
 
     Appends each newly discovered path to ``root_new_paths`` (and to the
     cross-root ``seen_new_paths`` set) and calls ``on_file(is_new)`` once per
     filename encountered so the caller can keep its progress counters. The
-    caller owns error handling: an offline-class ``OSError`` surfaces through
-    the walk's ``onerror`` as :class:`_RootOffline` and unwinds this loop.
+    caller owns error handling: an offline-class ``OSError`` — from the walk's
+    ``onerror`` or from the per-file ``stat`` via ``on_error`` — surfaces as
+    :class:`_RootOffline` and unwinds this loop.
     """
     root_new = 0
     for dirpath, _dirnames, filenames in walk:
@@ -282,7 +303,7 @@ def _walk_root_for_new_images(walk, known, seen_new_paths, root_new_paths,
                     if (
                         full not in known
                         and full not in seen_new_paths
-                        and os.path.isfile(full)
+                        and _is_regular_file(full, on_error)
                     ):
                         seen_new_paths.add(full)
                         root_new_paths.append(full)
@@ -317,6 +338,10 @@ class NewImagesCache:
     # navbar poll. Short enough that natural recovery is observable; long
     # enough that ten open tabs can't hot-loop the disk.
     ERROR_BACKOFF_SECONDS = 30
+    # Results that skipped an offline root live only this long, matching the
+    # ``VolumeReachability`` offline TTL so a reconnected share is re-walked
+    # on the same schedule it is re-probed.
+    PARTIAL_RESULT_TTL_SECONDS = 30
 
     def __init__(self, ttl_seconds=300):
         self._ttl = ttl_seconds
@@ -349,7 +374,15 @@ class NewImagesCache:
             if entry is None:
                 return None
             result, set_at = entry
-            if time.monotonic() - set_at > self._ttl:
+            ttl = self._ttl
+            if result.get("unreachable_roots"):
+                # A walk that skipped an offline volume is a *partial* answer.
+                # Holding it for the full TTL would keep reporting the folder
+                # offline (and hide its new files) for minutes after the share
+                # reconnects, so it expires at the reachability gate's own
+                # offline retry cadence instead.
+                ttl = min(ttl, self.PARTIAL_RESULT_TTL_SECONDS)
+            if time.monotonic() - set_at > ttl:
                 del self._entries[key]
                 return None
             return result

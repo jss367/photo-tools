@@ -154,3 +154,75 @@ def test_app_reexports_probe_machinery_by_historical_names():
     assert app_module._NETWORK_PROBES is vr._NETWORK_PROBES
     assert app_module._NETWORK_PROBE_LOCK is vr._NETWORK_PROBE_LOCK
     assert pipeline_job._archive_mount_root_candidates is vr.mount_root_candidates
+
+
+def test_generic_probe_reuses_wedged_thread_instead_of_stacking(monkeypatch):
+    """A root whose ``isdir`` never returns must not accumulate one thread per
+    check: while the first probe is alive, later checks fail closed at once."""
+    import threading
+
+    release = threading.Event()
+    started = []
+
+    def slow_isdir(path):
+        started.append(path)
+        release.wait(5)
+        return True
+
+    monkeypatch.setattr(vr.os.path, "isdir", slow_isdir)
+    monkeypatch.setattr(vr, "_GENERIC_PROBES", {})
+    try:
+        assert vr._probe_root_generic("/mnt/stuck", timeout=0.05) is False
+        assert vr._probe_root_generic("/mnt/stuck", timeout=0.05) is False
+        assert started == ["/mnt/stuck"], "second check must reuse the live probe"
+        assert "/mnt/stuck" in vr._GENERIC_PROBES
+    finally:
+        release.set()
+    vr._GENERIC_PROBES["/mnt/stuck"].join(1)
+    assert "/mnt/stuck" not in vr._GENERIC_PROBES, "finished probe unregisters itself"
+
+
+def test_generic_probe_global_cap_fails_closed(monkeypatch):
+    import threading
+
+    release = threading.Event()
+    monkeypatch.setattr(vr.os.path, "isdir", lambda p: release.wait(5) or True)
+    monkeypatch.setattr(vr, "_GENERIC_PROBES", {})
+    monkeypatch.setattr(vr, "_MAX_GENERIC_PROBES", 2)
+    try:
+        assert vr._probe_root_generic("/mnt/a", timeout=0.02) is False
+        assert vr._probe_root_generic("/mnt/b", timeout=0.02) is False
+        assert vr._probe_root_generic("/mnt/c", timeout=0.02) is False
+        assert set(vr._GENERIC_PROBES) == {"/mnt/a", "/mnt/b"}, "third root never spawned"
+    finally:
+        release.set()
+
+
+def test_mount_root_candidates_follows_local_alias_without_touching_share(tmp_path, monkeypatch):
+    """An alias into a share resolves to the share's mount root, but resolution
+    stops at the mount-shaped prefix — nothing under it is ever stat'ed."""
+    if sys.platform == "win32":
+        pytest.skip("POSIX symlinks")
+    alias = tmp_path / "photos"
+    alias.symlink_to("/Volumes/NAS/photos")
+
+    touched = []
+    real_islink = os.path.islink
+
+    def spy_islink(p):
+        touched.append(str(p))
+        return real_islink(p)
+
+    monkeypatch.setattr(vr.os.path, "islink", spy_islink)
+    assert vr.mount_root_candidates(str(alias / "2026" / "shoot")) == ["/Volumes/NAS"]
+    assert not any(t.startswith("/Volumes/NAS") for t in touched), touched
+    monkeypatch.setattr(vr.os.path, "realpath", lambda p: pytest.fail("realpath must not be used"))
+    assert vr.mount_root_candidates(str(alias)) == ["/Volumes/NAS"]
+
+
+def test_mount_root_candidates_symlink_loop_is_bounded(tmp_path):
+    if sys.platform == "win32":
+        pytest.skip("POSIX symlinks")
+    (tmp_path / "a").symlink_to(tmp_path / "b")
+    (tmp_path / "b").symlink_to(tmp_path / "a")
+    assert vr.mount_root_candidates(str(tmp_path / "a" / "x")) == []

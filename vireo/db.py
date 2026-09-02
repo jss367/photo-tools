@@ -2927,7 +2927,7 @@ class Database:
             (folder_id,),
         ).fetchall()
 
-    def get_workspace_root_folder_ids(self, workspace_id):
+    def get_workspace_root_folder_ids(self, workspace_id=None):
         """Return just the ids of the workspace's user-facing roots.
 
         ``get_workspace_folder_roots`` computes a per-root subtree photo
@@ -2935,7 +2935,14 @@ class Database:
         a small catalog, ~0.75s on an 88k-photo library. Pollers that only
         need to know *which* roots exist (the Work Locally blocker poll runs
         every 15s on Browse) must not pay for counts they discard.
+
+        Defaults to the active workspace (raising ``RuntimeError`` when none
+        is active, like every workspace-scoped accessor); an explicit
+        ``workspace_id`` is accepted for parity with
+        ``get_workspace_folder_roots``, whose callers already hold one.
         """
+        if workspace_id is None:
+            workspace_id = self._ws_id()
         rows = self.conn.execute(
             """SELECT f.id
                FROM folders f

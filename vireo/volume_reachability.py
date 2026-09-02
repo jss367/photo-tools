@@ -137,18 +137,14 @@ def mount_root_candidates(path: str) -> list[str]:
     normalized_posix = normalized.replace("\\", "/")
     # Also probe the symlink-resolved form so a catalog alias like
     # ``/photos`` pointing into ``/Volumes/NAS/photos`` retains its
-    # mount-shaped prefix (Codex #1388 P2 r3664891998). Without this,
-    # neither the raw alias nor its ``abspath`` normalization has a
-    # ``/Volumes``/``/mnt``/``/media``/drive-letter/UNC prefix, so
-    # ``pipeline_job._source_offline_reason`` would classify a disconnected share
-    # reached via the alias as folder-scoped and classify would skip
-    # its photos instead of pausing for reconnection. ``realpath``
-    # only resolves symlinks (readlink), so it does not stat the
-    # target and stays safe even when the underlying mount is dead.
-    try:
-        resolved = os.path.realpath(os.path.expanduser(path))
-    except OSError:
-        resolved = None
+    # mount-shaped prefix (Codex #1388 P2 r3664891998). Resolution is
+    # *lexical up to the mount root*: components are followed one at a time
+    # and the walk stops as soon as the accumulated prefix is mount-shaped,
+    # so no ``lstat`` ever crosses into the share itself. ``os.path.realpath``
+    # would resolve every component — including ones on a dead SMB mount —
+    # and can block indefinitely there, ahead of the bounded probe this
+    # module exists to provide.
+    resolved = _resolve_symlinks_until_mount_shaped(normalized, _candidate)
     resolved_posix = (
         resolved.replace("\\", "/") if resolved else None
     )
@@ -163,6 +159,60 @@ def mount_root_candidates(path: str) -> list[str]:
     return seen
 
 
+
+_MAX_SYMLINK_HOPS = 40
+
+
+def _resolve_symlinks_until_mount_shaped(path, candidate):
+    """Follow symlinks in ``path`` component by component, stopping early.
+
+    Returns the (partially) resolved absolute path, or ``None`` when nothing
+    could be resolved. Each accumulated prefix is tested with ``candidate``
+    *before* it is ``lstat``-ed: the moment a prefix is mount-shaped the
+    walk stops and the remainder is appended untouched. That keeps every
+    filesystem call on local components (``/``, ``/Volumes``, ``/photos``)
+    and never touches a possibly-dead share. Hop count is bounded so a
+    symlink loop cannot spin.
+    """
+    remaining = [part for part in path.replace("\\", "/").split("/") if part]
+    if path.startswith("//"):
+        prefix = "//"
+    elif path.startswith("/"):
+        prefix = "/"
+    else:
+        prefix = ""
+    hops = 0
+    while remaining:
+        step = remaining.pop(0)
+        nxt = prefix + step if prefix.endswith("/") or not prefix else prefix + "/" + step
+        if candidate(nxt.replace("\\", "/")) is not None:
+            prefix = nxt
+            break
+        try:
+            is_link = os.path.islink(nxt)
+        except OSError:
+            is_link = False
+        if not is_link:
+            prefix = nxt
+            continue
+        hops += 1
+        if hops > _MAX_SYMLINK_HOPS:
+            return None
+        try:
+            target = os.readlink(nxt)
+        except OSError:
+            prefix = nxt
+            continue
+        if not os.path.isabs(target):
+            target = os.path.normpath(os.path.join(os.path.dirname(nxt), target))
+        # Restart from the target: its own components may be links too.
+        target_parts = [part for part in target.replace("\\", "/").split("/") if part]
+        remaining = target_parts + remaining
+        prefix = "//" if target.startswith("//") else ("/" if target.startswith("/") else "")
+    if remaining:
+        tail = "/".join(remaining)
+        prefix = prefix + tail if prefix.endswith("/") else prefix + "/" + tail
+    return prefix or None
 
 
 def _reserve_network_probe(root):
@@ -280,29 +330,52 @@ def network_root_reachable(root, timeout=MOUNT_QUERY_TIMEOUT_SECS,
 
 
 
+_GENERIC_PROBE_LOCK = threading.Lock()
+_GENERIC_PROBES = {}
+_MAX_GENERIC_PROBES = _MAX_NETWORK_PROBES
+
+
 def _probe_root_generic(root, timeout):
     """Bounded ``isdir`` for platforms without the macOS ``stat`` probe.
 
-    Runs the check on a daemon thread and gives up after ``timeout``; a
-    thread stuck in an uninterruptible call is leaked rather than joined,
-    which is the lesser evil compared to freezing the caller. Non-macOS
-    hosts (Linux, Windows) do not have the SMB-stall failure mode nearly as
-    often, so this is a safety net rather than the primary path.
+    Runs the check on a daemon thread and gives up after ``timeout``. A
+    thread stuck in an uninterruptible call cannot be killed, so it stays
+    registered under its root until it returns: while it is alive the root is
+    reported offline *without* spawning another thread, and the registry is
+    capped globally so many wedged roots cannot pile up threads either. This
+    mirrors the per-root reuse and global cap of the macOS subprocess probe.
+    Non-macOS hosts hit the SMB-stall failure mode far less often, so this is
+    a safety net rather than the primary path.
     """
-    outcome = {}
+    with _GENERIC_PROBE_LOCK:
+        existing = _GENERIC_PROBES.get(root)
+        if existing is not None:
+            if existing.is_alive():
+                return False
+            del _GENERIC_PROBES[root]
+        if len(_GENERIC_PROBES) >= _MAX_GENERIC_PROBES:
+            return False
+        outcome = {}
 
-    def worker():
-        try:
-            outcome["ok"] = os.path.isdir(root)
-        except OSError:
-            outcome["ok"] = False
+        def worker():
+            try:
+                outcome["ok"] = os.path.isdir(root)
+            except OSError:
+                outcome["ok"] = False
+            finally:
+                with _GENERIC_PROBE_LOCK:
+                    if _GENERIC_PROBES.get(root) is thread:
+                        del _GENERIC_PROBES[root]
 
-    thread = threading.Thread(
-        target=worker, name="vireo-volume-probe", daemon=True,
-    )
-    thread.start()
+        thread = threading.Thread(
+            target=worker, name="vireo-volume-probe", daemon=True,
+        )
+        _GENERIC_PROBES[root] = thread
+        thread.start()
     thread.join(timeout)
     if thread.is_alive():
+        # Left registered: the next check for this root finds it alive and
+        # fails closed instead of stacking another stuck thread.
         return False
     return bool(outcome.get("ok"))
 

@@ -44,6 +44,11 @@ from proc import no_window_kwargs
 
 log = logging.getLogger(__name__)
 
+# ``os.path`` is the shared ``ntpath`` module on Windows. Tests and callers
+# may monkeypatch ``os.path.normpath`` for path-shape isolation, so retain the
+# native UNC normalizer before that shared module can be modified.
+_NT_NORMPATH = ntpath.normpath
+
 MOUNT_QUERY_TIMEOUT_SECS = 5
 _MAX_NETWORK_PROBES = 8
 _NETWORK_PROBE_RESERVED = object()
@@ -235,7 +240,7 @@ def _normalize_candidate_source(source):
         # POSIX normalization allows ``..`` to climb from //server/share to
         # //server, inventing a sibling share. Windows keeps the share as the
         # anchor, which is the only meaningful interpretation of a UNC path.
-        return ntpath.normpath(posix_source).replace("\\", "/")
+        return _NT_NORMPATH(posix_source).replace("\\", "/")
     return posixpath.normpath(posix_source)
 
 

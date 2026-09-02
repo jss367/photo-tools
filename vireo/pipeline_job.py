@@ -262,7 +262,7 @@ def _archive_mount_baseline(
         # inspected in time) is read as "assume it was a mount": the later
         # mounted -> unmounted check then fires against the stub instead of
         # the alias being accepted as a local directory.
-        baseline[root] = os.path.ismount(root) or root in known or not conclusive
+        baseline[root] = not conclusive or root in known or os.path.ismount(root)
     return baseline
 
 

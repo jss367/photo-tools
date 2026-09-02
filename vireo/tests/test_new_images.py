@@ -1588,6 +1588,7 @@ def test_count_abandons_stalled_walk_and_reports_root_offline(db_with_workspace,
 
     monkeypatch.setattr(new_images_module, "safe_scan_walk", walk_that_hangs)
     monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
     gate = _FakeReachability()
     try:
         t0 = time.monotonic()
@@ -1643,6 +1644,7 @@ def test_count_caps_stalled_walks_globally(db_with_workspace, monkeypatch):
 
     monkeypatch.setattr(new_images_module, "safe_scan_walk", walk_that_hangs)
     monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
     monkeypatch.setattr(new_images_module, "_MAX_STALLED_WALKS", 2)
     workers = []
     try:
@@ -1661,6 +1663,62 @@ def test_count_caps_stalled_walks_globally(db_with_workspace, monkeypatch):
         release.set()
     for worker in workers:
         worker.join(2)
+
+
+def test_overlapping_healthy_walk_waits_without_marking_offline(tmp_path, monkeypatch):
+    """A second workspace sharing a root coordinates with its active walk.
+
+    Per-workspace caches can legitimately overlap. The second caller waits
+    and retries after the first healthy worker instead of treating ordinary
+    concurrency as proof that the process-wide volume is offline.
+    """
+    import threading
+    import time
+
+    import new_images as new_images_module
+
+    root_path = str(tmp_path / "shared")
+    photo_path = str(tmp_path / "shared" / "a.jpg")
+    _touch_image(photo_path)
+    first_paused = threading.Event()
+    release_first = threading.Event()
+    calls = []
+
+    def overlapping_walk(top, **_kwargs):
+        calls.append(top)
+        yield top, [], ["a.jpg"]
+        if len(calls) == 1:
+            first_paused.set()
+            release_first.wait(5)
+
+    monkeypatch.setattr(new_images_module, "safe_scan_walk", overlapping_walk)
+    monkeypatch.setattr(new_images_module, "_STALLED_WALKS", {})
+    monkeypatch.setattr(new_images_module, "_STALLED_WALK_PATHS", set())
+    results = []
+    gates = [_FakeReachability(), _FakeReachability()]
+
+    def invoke(gate):
+        results.append(new_images_module._walk_root_bounded(
+            {"id": 1, "path": root_path}, root_path, gate.mount_root,
+            set(), set(), gate, 0, 0, None, 250, 0, 2,
+        ))
+
+    first = threading.Thread(target=invoke, args=(gates[0],))
+    second = threading.Thread(target=invoke, args=(gates[1],))
+    first.start()
+    assert first_paused.wait(2)
+    second.start()
+    time.sleep(0.1)
+    assert second.is_alive(), "the overlapping caller should wait for the active walk"
+    assert gates[1].marked_offline == []
+    release_first.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert len(calls) == 2
+    assert all(result is not None for result in results)
+    assert gates[0].marked_offline == gates[1].marked_offline == []
 
 
 def test_count_progress_and_totals_unchanged_by_worker_thread(db_with_workspace):

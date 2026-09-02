@@ -510,3 +510,23 @@ def test_normalize_link_target_strips_windows_prefixes():
     assert vr._normalize_link_target("\\\\?\\UNC\\server\\share\\x") == "//server/share/x"
     assert vr._normalize_link_target("\\\\?\\D:\\archive") == "D:/archive"
     assert vr._normalize_link_target("/mnt/NAS") == "/mnt/NAS"
+
+
+def test_resolver_stops_at_mapped_network_drive_without_touching_it(monkeypatch):
+    """``Z:`` mapped to a share: the drive root is the mount, and no component
+    below it may be inspected (an lstat there can block while the server is
+    away). Local ``C:`` keeps being traversed."""
+    monkeypatch.setattr(vr, "_drive_is_remote", lambda d: d.upper().startswith("Z:"))
+    monkeypatch.setattr(vr, "_is_link_or_junction", lambda p: pytest.fail(f"lookup under mapped drive: {p}"))
+    monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: pytest.fail(f"lookup under mapped drive: {p}"))
+    assert vr._resolve_symlinks_until_mount_shaped("Z:/Photos/2026", vr._mount_shaped_candidate) == "Z:/Photos/2026"
+    monkeypatch.setattr(vr.os.path, "abspath", lambda p: p)
+    monkeypatch.setattr(vr.os.path, "normpath", lambda p: p)
+    cands = vr.mount_root_candidates("Z:/Photos/2026")
+    assert cands == ["Z:/"] and cands.conclusive is True
+
+
+def test_drive_is_remote_is_false_off_windows():
+    if sys.platform == "win32":
+        pytest.skip("Windows asks the mount manager")
+    assert vr._drive_is_remote("Z:") is False

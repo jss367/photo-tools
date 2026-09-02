@@ -293,6 +293,27 @@ def _is_drive_root(prefix):
     return len(p) == 2 and p[1] == ":" and p[0].isalpha()
 
 
+_DRIVE_REMOTE = 4  # winbase.h DRIVE_REMOTE
+
+
+def _drive_is_remote(drive):
+    """True when a Windows drive letter is a mapped network drive (or its type
+    cannot be determined). Uses ``GetDriveTypeW``, which asks the mount
+    manager and does not touch the drive itself. Always False off Windows."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        root = drive.replace("/", "\\").rstrip("\\") + "\\"
+        kind = ctypes.windll.kernel32.GetDriveTypeW(root)  # type: ignore[attr-defined]
+    except Exception:
+        return True
+    # DRIVE_UNKNOWN (0) / DRIVE_NO_ROOT_DIR (1) are not provably local:
+    # fail closed and treat them like a remote mount.
+    return kind in (0, 1, _DRIVE_REMOTE)
+
+
 def _is_link_or_junction(path):
     """``islink`` that also recognises Windows directory junctions, which
     ``os.path.islink`` does not report but ``os.readlink`` can follow."""
@@ -358,12 +379,19 @@ def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
                 break
             continue
         if _is_drive_root(nxt):
-            # A local Windows drive (``C:``) is where traversal *starts*, not
-            # a terminal mount: junctions below it (``C:\Photos`` ->
+            prefix = nxt
+            if _drive_is_remote(nxt):
+                # A mapped network drive (``Z:``) *is* the mount root. Stop
+                # here: every component below it lives on the share, and
+                # even an ``lstat`` there can block while the server is
+                # away. The drive type comes from the mount manager, not
+                # from touching the drive.
+                break
+            # A local drive (``C:``) is where traversal *starts*, not a
+            # terminal mount: junctions below it (``C:\Photos`` ->
             # ``\\server\share``) still have to be followed so the real
             # remote root is reported. Drive roots themselves are never
             # links, so no lookup is needed here.
-            prefix = nxt
             continue
         cand = candidate(nxt.replace("\\", "/"))
         if cand is not None and not _is_drive_root(cand):

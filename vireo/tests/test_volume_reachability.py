@@ -600,14 +600,15 @@ def test_saturated_link_probes_fall_back_to_cached_real_mount(monkeypatch):
     earlier conclusive answer exists — never silently downgraded to "plain
     directory" (which would let an import write into a detached stub)."""
     monkeypatch.setattr(vr, "_bounded_link_target", lambda p, timeout=None: vr.INCONCLUSIVE)
-    # Both prefixes answered conclusively earlier: full resolution, confident.
+    # Earlier answers preserve full alias resolution, but a fresh timeout must
+    # still make the current result inconclusive so synchronous guards abort.
     monkeypatch.setattr(
         vr, "_LINK_TARGET_CACHE",
         {"/mnt": None, "/mnt/archive": "/mnt/NAS", "/mnt/NAS": None},
     )
     cands, conclusive = vr.mount_root_candidates_checked("/mnt/archive/photos")
     assert cands == ["/mnt/archive", "/mnt/NAS"]
-    assert conclusive is True
+    assert conclusive is False
     # The local parent and alias are cached, but the real mount is not: the
     # real mount is still reported (so pipeline guards see it), while the
     # result is not confident because that prefix could not be inspected.

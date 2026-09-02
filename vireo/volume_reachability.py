@@ -513,10 +513,10 @@ def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
     ``//server`` prefixes are never touched. Hop count is bounded so a
     symlink loop cannot spin.
 
-    When a mount prefix could not be inspected in time and no earlier
-    conclusive answer is cached, the prefix is kept as-is and
-    ``inconclusive`` (a list, if given) receives that prefix so the caller
-    can fail closed rather than trust a possibly-incomplete resolution.
+    When a prefix could not be inspected in time, ``inconclusive`` (a list,
+    if given) receives that prefix so the caller can fail closed. A cached
+    target may still complete alias resolution, but never upgrades the
+    current lookup's confidence.
     """
     remaining = [part for part in path.replace("\\", "/").split("/") if part]
     if path.startswith("//"):
@@ -554,11 +554,11 @@ def _resolve_symlinks_until_mount_shaped(path, candidate, inconclusive=None):
         cand = candidate(nxt.replace("\\", "/"))
         target = _bounded_link_target(nxt)
         if target is INCONCLUSIVE:
+            if inconclusive is not None:
+                inconclusive.append(nxt)
             with _BOUNDED_LINK_LOCK:
                 target = _LINK_TARGET_CACHE.get(nxt, INCONCLUSIVE)
         if target is INCONCLUSIVE:
-            if inconclusive is not None:
-                inconclusive.append(nxt)
             prefix = nxt
             break
         if target is None:

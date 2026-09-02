@@ -19414,7 +19414,7 @@ def _inconclusive(roots):
     return out
 
 
-def test_archive_mount_baseline_assumes_mount_when_resolution_inconclusive(monkeypatch, tmp_path):
+def test_archive_mount_baseline_aborts_when_resolution_inconclusive(monkeypatch, tmp_path):
     import pipeline_job
 
     monkeypatch.setattr(pipeline_job, "_archive_mount_root_candidates", lambda p: _inconclusive(["/mnt/archive"]))
@@ -19422,7 +19422,8 @@ def test_archive_mount_baseline_assumes_mount_when_resolution_inconclusive(monke
         pipeline_job.os.path, "ismount",
         lambda p: pytest.fail("inconclusive resolution must short-circuit ismount"),
     )
-    assert pipeline_job._archive_mount_baseline(str(tmp_path)) == {"/mnt/archive": True}
+    with pytest.raises(RuntimeError, match="reconnect it and retry"):
+        pipeline_job._archive_mount_baseline(str(tmp_path))
 
 
 def test_missing_archive_mount_root_refuses_on_inconclusive_resolution(monkeypatch, tmp_path):

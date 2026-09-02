@@ -141,6 +141,24 @@ def test_mark_offline_short_circuits_subsequent_checks_without_probing():
     assert probes == []
 
 
+def test_alias_check_returns_resolved_mount_for_mid_walk_invalidation(monkeypatch):
+    probes = []
+
+    def candidates(path):
+        if path.startswith("/mnt/archive"):
+            return ["/mnt/archive", "/mnt/NAS"], True
+        return ["/mnt/NAS"], True
+
+    monkeypatch.setattr(vr, "mount_root_candidates_checked", candidates)
+    gate = vr.VolumeReachability(probe=lambda root: probes.append(root) or True)
+    mount_root, reachable = gate.check("/mnt/archive/photos")
+    assert (mount_root, reachable) == ("/mnt/NAS", True)
+
+    gate.mark_offline(mount_root)
+    assert gate.check("/mnt/NAS/photos") == ("/mnt/NAS", False)
+    assert probes == ["/mnt/archive", "/mnt/NAS"]
+
+
 def test_mark_offline_ignores_missing_root():
     gate = vr.VolumeReachability(probe=lambda root: True)
     gate.mark_offline(None)

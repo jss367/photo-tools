@@ -257,12 +257,19 @@ def _archive_mount_baseline(
     # Candidates and confidence come from the same resolution (the list
     # carries ``conclusive``); two calls could disagree under saturation.
     conclusive = getattr(candidates, "conclusive", True)
+    if not conclusive:
+        # Do not encode uncertainty as a mounted baseline. Both consumers of
+        # True entries perform later synchronous filesystem probes
+        # (``_mount_identity_baseline`` and ``_unmounted_since_baseline``),
+        # which can hang on the same dead mount that made bounded alias
+        # resolution time out. Abort before either path can touch it.
+        root = candidates[-1] if candidates else path
+        raise RuntimeError(
+            f"Volume prefix {root} could not be inspected in time; "
+            "reconnect it and retry."
+        )
     for root in candidates:
-        # An inconclusive resolution (a mount-shaped prefix could not be
-        # inspected in time) is read as "assume it was a mount": the later
-        # mounted -> unmounted check then fires against the stub instead of
-        # the alias being accepted as a local directory.
-        baseline[root] = not conclusive or root in known or os.path.ismount(root)
+        baseline[root] = root in known or os.path.ismount(root)
     return baseline
 
 

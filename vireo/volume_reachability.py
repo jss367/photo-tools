@@ -762,7 +762,9 @@ class VolumeReachability:
         ``mount_root`` is ``None`` (and ``reachable`` True) for paths that
         are not on a mount-shaped location. When several candidate roots
         apply (an alias resolving into a share), the first offline one is
-        returned so callers can name it.
+        returned so callers can name it. On success the deepest resolved
+        candidate is returned, so a later mid-walk outage invalidates the
+        canonical mount rather than only the alias used for this path.
         """
         candidates, conclusive = mount_root_candidates_checked(path)
         if not candidates:
@@ -778,7 +780,7 @@ class VolumeReachability:
         for root in candidates:
             if not self.root_reachable(root):
                 return root, False
-        return candidates[0], True
+        return candidates[-1], True
 
     def mark_offline(self, root):
         """Record that ``root`` was just observed offline (e.g. ``ENOTCONN``

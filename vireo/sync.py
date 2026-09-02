@@ -3,6 +3,7 @@
 import logging
 import os
 from collections import defaultdict
+from dataclasses import dataclass, field
 
 from db import KEYWORD_SOURCE_UNKNOWN
 from keyword_normalization import keyword_match_key
@@ -57,6 +58,182 @@ def _write_assigned_location_to_xmp_enabled(db):
         return False
 
 
+_KEYWORD_CHANGE_TYPES = ("keyword_add", "keyword_remove", "keyword_remove_flat")
+
+
+def _select_changes(changes, change_ids):
+    """Restrict ``changes`` to ``change_ids`` plus their paired keyword changes.
+
+    Auto-includes any unselected pending keyword_add / keyword_remove
+    changes that share a (photo_id, normalized key) with a selected one.
+    Both remove_keywords() (for keyword_remove) and the add-canonicalization
+    pass in ``_remove_planned_keywords`` match by normalized key, so a
+    rename's paired add(clean) + remove(legacy variant) split across two
+    syncs lets each half clobber the sidecar entry the other half writes --
+    the add-only sync strips the legacy ``<rdf:li>`` before writing the
+    clean spelling, and a later remove-only sync strips the clean spelling
+    under the same normalized match. Sync both sides together whenever the
+    user picks either.
+    """
+    selected_ids = {int(cid) for cid in change_ids}
+    kw_index = defaultdict(list)
+    for c in changes:
+        if c["change_type"] in _KEYWORD_CHANGE_TYPES and c["value"]:
+            key = (c["photo_id"], keyword_match_key(c["value"]))
+            kw_index[key].append(c["id"])
+    for c in changes:
+        if c["id"] not in selected_ids:
+            continue
+        if c["change_type"] not in _KEYWORD_CHANGE_TYPES or not c["value"]:
+            continue
+        key = (c["photo_id"], keyword_match_key(c["value"]))
+        selected_ids.update(kw_index[key])
+    return [c for c in changes if c["id"] in selected_ids]
+
+
+@dataclass
+class _PhotoSyncPlan:
+    """Everything one photo's pending changes ask us to write to its sidecar."""
+
+    keywords_to_add: set = field(default_factory=set)
+    keywords_to_remove: set = field(default_factory=set)
+    # ``keyword_remove_flat`` is queued by ``repair_duplicate_photo_species``
+    # when a detached root spelling still appears as an ancestor segment of a
+    # preserved hierarchy leaf. A regular hierarchical ``keyword_remove``
+    # would strip that preserved ``lr:hierarchicalSubject`` entry; flat-only
+    # removal touches only the stale ``dc:subject`` line.
+    keywords_to_remove_flat: set = field(default_factory=set)
+    rating: int | None = None
+    flag: str | None = None
+    edit_recipe_json: str | None = None
+    sync_location: bool = False
+    cleanup_location: bool = False
+    supported_ids: list = field(default_factory=list)
+    unsupported_changes: list = field(default_factory=list)
+
+
+def _plan_photo_sync(photo_changes, sync_flags, sync_locations):
+    """Fold one photo's pending changes into a ``_PhotoSyncPlan``."""
+    plan = _PhotoSyncPlan()
+    for c in photo_changes:
+        kind = c["change_type"]
+        if kind == "keyword_add":
+            plan.keywords_to_add.add(c["value"])
+        elif kind == "keyword_remove":
+            plan.keywords_to_remove.add(c["value"])
+        elif kind == "keyword_remove_flat":
+            plan.keywords_to_remove_flat.add(c["value"])
+        elif kind == "rating":
+            plan.rating = int(c["value"])
+        elif kind == "flag":
+            if not sync_flags:
+                plan.unsupported_changes.append(c)
+                continue
+            plan.flag = c["value"] or "none"
+        elif kind == "location":
+            if sync_locations:
+                plan.sync_location = True
+            else:
+                plan.cleanup_location = True
+        elif kind == "edit_recipe":
+            plan.edit_recipe_json = c["value"] or ""
+        else:
+            continue
+        plan.supported_ids.append(c["id"])
+    return plan
+
+
+def _remove_planned_keywords(xmp_path, plan):
+    """Strip sidecar keywords the plan removes or is about to re-add.
+
+    Removals run BEFORE additions. remove_keywords() compares by normalized
+    match key, so a remove of `‘apapane` matches any `<rdf:li>` whose text
+    normalizes to `apapane` -- including a clean `apapane` we would otherwise
+    have just added. A rename that queues remove `‘apapane` and add `apapane`
+    for the same photo would then have its newly-written clean entry stripped
+    along with the old quoted one, clearing pending changes and leaving the
+    sidecar without the keyword. Applying the remove first strips only the
+    pre-existing quoted variant; the subsequent write_sidecar then adds the
+    clean spelling.
+
+    Removals are split by whether they're paired with an add for the same
+    normalized key. A paired remove+add is a normalization-only rename (e.g.
+    remove `‘Birds` + add `Birds`); hierarchical mode would then strip
+    unrelated hierarchies like `Animals|Birds|Hawk` because remove_keywords()
+    matches by any pipe-segment key. Use flat-only removal for those paired
+    removes so the rename only touches the flat `dc:subject` legacy entry.
+    Solo removes keep hierarchical semantics so real keyword deletions still
+    drop pipe-segment matches.
+    """
+    if plan.keywords_to_remove or plan.keywords_to_remove_flat:
+        paired_keys = {keyword_match_key(kw) for kw in plan.keywords_to_add}
+        paired_keys.discard("")
+        paired_removes = {
+            kw for kw in plan.keywords_to_remove
+            if keyword_match_key(kw) in paired_keys
+        }
+        solo_removes = plan.keywords_to_remove - paired_removes
+        if solo_removes:
+            remove_keywords(xmp_path, solo_removes)
+        # Merge repair-queued flat-only removes with the rename-paired flat
+        # removes: both take exactly the ``hierarchical=False`` code path.
+        flat_removes = paired_removes | plan.keywords_to_remove_flat
+        if flat_removes:
+            remove_keywords(xmp_path, flat_removes, hierarchical=False)
+
+    # Strip any sidecar dc:subject entry that normalizes to a keyword we're
+    # about to add. write_sidecar() dedupes with an exact-string set
+    # difference, so a pure keyword_add for `apapane` against a legacy
+    # sidecar `‘apapane` would append a second <rdf:li>. Canonicalizing
+    # first collapses variants into the clean spelling that write_sidecar
+    # writes next. Use the flat-only mode: a hierarchical remove (which
+    # drops any entry whose segment matches) would delete unrelated
+    # hierarchies such as `Animals|Birds|Hawk` when we add flat `Birds`.
+    if plan.keywords_to_add:
+        remove_keywords(xmp_path, plan.keywords_to_add, hierarchical=False)
+
+
+def _write_photo_sync(db, photo_id, xmp_path, plan):
+    """Apply a ``_PhotoSyncPlan`` to the photo's sidecar, in dependency order."""
+    _remove_planned_keywords(xmp_path, plan)
+
+    # Write keyword additions after removals so a same-photo remove+add
+    # pair does not race (see _remove_planned_keywords).
+    if plan.keywords_to_add:
+        write_sidecar(
+            xmp_path, flat_keywords=plan.keywords_to_add, hierarchical_keywords=set()
+        )
+
+    # Write flag before rating: write_pick_flag creates a sidecar if needed,
+    # while write_rating intentionally only updates existing sidecars.
+    if plan.flag is not None:
+        write_pick_flag(xmp_path, plan.flag)
+
+    if plan.sync_location:
+        loc = db.get_assigned_photo_location(photo_id)
+        if loc and loc.get("latitude") is not None and loc.get("longitude") is not None:
+            write_gps_location(
+                xmp_path,
+                loc["latitude"],
+                loc["longitude"],
+                source=loc.get("source") or "assigned",
+            )
+        else:
+            remove_vireo_gps_location(xmp_path)
+    elif plan.cleanup_location:
+        remove_vireo_gps_location(xmp_path)
+
+    if plan.edit_recipe_json is not None:
+        write_edit_recipe(xmp_path, plan.edit_recipe_json)
+
+    # Write rating after every operation that can create a sidecar. Rating
+    # alone intentionally remains a no-op for missing XMP, but a selected
+    # keyword, flag, location, or edit write should make the same-photo
+    # rating persist rather than silently clear it.
+    if plan.rating is not None:
+        write_rating(xmp_path, plan.rating)
+
+
 def sync_to_xmp(db, progress_callback=None, change_ids=None):
     """Write pending changes to XMP sidecars.
 
@@ -71,40 +248,10 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
     """
     changes = db.get_pending_changes()
     if change_ids is not None:
-        selected_ids = {int(cid) for cid in change_ids}
-        # Auto-include any unselected pending keyword_add / keyword_remove
-        # changes that share a (photo_id, normalized key) with a selected
-        # one. Both remove_keywords() (for keyword_remove) and the
-        # add-canonicalization pass below match by normalized key, so a
-        # rename's paired add(clean) + remove(legacy variant) split across
-        # two syncs lets each half clobber the sidecar entry the other
-        # half writes -- the add-only sync strips the legacy `<rdf:li>`
-        # before writing the clean spelling, and a later remove-only sync
-        # strips the clean spelling under the same normalized match. Sync
-        # both sides together whenever the user picks either.
-        kw_index = defaultdict(list)
-        for c in changes:
-            if c["change_type"] in (
-                "keyword_add", "keyword_remove", "keyword_remove_flat",
-            ) and c["value"]:
-                key = (c["photo_id"], keyword_match_key(c["value"]))
-                kw_index[key].append(c["id"])
-        for c in changes:
-            if c["id"] not in selected_ids:
-                continue
-            if c["change_type"] not in (
-                "keyword_add", "keyword_remove", "keyword_remove_flat",
-            ):
-                continue
-            if not c["value"]:
-                continue
-            key = (c["photo_id"], keyword_match_key(c["value"]))
-            selected_ids.update(kw_index[key])
-        changes = [c for c in changes if c["id"] in selected_ids]
+        changes = _select_changes(changes, change_ids)
     if not changes:
         return {"synced": 0, "failed": 0, "failures": []}
 
-    # Group changes by photo_id
     by_photo = defaultdict(list)
     for c in changes:
         by_photo[c["photo_id"]].append(c)
@@ -112,7 +259,6 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
     sync_flags = _sync_flags_to_xmp_enabled(db)
     sync_locations = _write_assigned_location_to_xmp_enabled(db)
     synced = 0
-    failed = 0
     failures = []
     synced_ids = []
 
@@ -120,176 +266,33 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
     for i, (photo_id, photo_changes) in enumerate(by_photo.items()):
         xmp_path = _get_xmp_path_for_photo(db, photo_id)
         if not xmp_path:
-            failed += 1
             failures.append({"photo_id": photo_id, "error": "photo not found in DB"})
             continue
 
         # Check if the folder exists (NAS might be offline)
         folder = os.path.dirname(xmp_path)
         if not os.path.isdir(folder):
-            failed += 1
             failures.append(
                 {"photo_id": photo_id, "error": f"folder not accessible: {folder}"}
             )
             continue
 
         try:
-            # Collect keyword adds/removes and rating/flag changes
-            keywords_to_add = set()
-            keywords_to_remove = set()
-            # ``keyword_remove_flat`` is queued by
-            # ``repair_duplicate_photo_species`` when a detached root
-            # spelling still appears as an ancestor segment of a
-            # preserved hierarchy leaf. A regular hierarchical
-            # ``keyword_remove`` would strip that preserved
-            # ``lr:hierarchicalSubject`` entry; flat-only removal
-            # touches only the stale ``dc:subject`` line.
-            keywords_to_remove_flat = set()
-            new_rating = None
-            new_flag = None
-            edit_recipe_json = None
-            sync_location = False
-            cleanup_location = False
-            supported_ids = []
-            unsupported_changes = []
-
-            for c in photo_changes:
-                if c["change_type"] == "keyword_add":
-                    keywords_to_add.add(c["value"])
-                    supported_ids.append(c["id"])
-                elif c["change_type"] == "keyword_remove":
-                    keywords_to_remove.add(c["value"])
-                    supported_ids.append(c["id"])
-                elif c["change_type"] == "keyword_remove_flat":
-                    keywords_to_remove_flat.add(c["value"])
-                    supported_ids.append(c["id"])
-                elif c["change_type"] == "rating":
-                    new_rating = int(c["value"])
-                    supported_ids.append(c["id"])
-                elif c["change_type"] == "flag":
-                    if sync_flags:
-                        new_flag = c["value"] or "none"
-                        supported_ids.append(c["id"])
-                    else:
-                        unsupported_changes.append(c)
-                elif c["change_type"] == "location":
-                    supported_ids.append(c["id"])
-                    if sync_locations:
-                        sync_location = True
-                    else:
-                        cleanup_location = True
-                elif c["change_type"] == "edit_recipe":
-                    edit_recipe_json = c["value"] or ""
-                    supported_ids.append(c["id"])
-
-            # Apply keyword removals BEFORE additions. remove_keywords()
-            # compares by normalized match key, so a remove of `‘apapane`
-            # matches any `<rdf:li>` whose text normalizes to `apapane` --
-            # including a clean `apapane` we would otherwise have just added.
-            # A rename that queues remove `‘apapane` and add `apapane` for
-            # the same photo would then have its newly-written clean entry
-            # stripped along with the old quoted one, clearing pending
-            # changes and leaving the sidecar without the keyword. Applying
-            # the remove first strips only the pre-existing quoted variant;
-            # the subsequent write_sidecar then adds the clean spelling.
-            #
-            # Split removals by whether they're paired with an add for the
-            # same normalized key. A paired remove+add is a normalization-only
-            # rename (e.g. remove `‘Birds` + add `Birds`); hierarchical mode
-            # would then strip unrelated hierarchies like `Animals|Birds|Hawk`
-            # because remove_keywords() matches by any pipe-segment key. Use
-            # flat-only removal for those paired removes so the rename only
-            # touches the flat `dc:subject` legacy entry. Solo removes keep
-            # hierarchical semantics so real keyword deletions still drop
-            # pipe-segment matches.
-            if keywords_to_remove or keywords_to_remove_flat:
-                paired_keys = {
-                    keyword_match_key(kw) for kw in keywords_to_add
-                }
-                paired_keys.discard("")
-                paired_removes = {
-                    kw for kw in keywords_to_remove
-                    if keyword_match_key(kw) in paired_keys
-                }
-                solo_removes = keywords_to_remove - paired_removes
-                if solo_removes:
-                    remove_keywords(xmp_path, solo_removes)
-                # Merge repair-queued flat-only removes with the
-                # rename-paired flat removes: both take exactly the
-                # ``hierarchical=False`` code path.
-                flat_removes = paired_removes | keywords_to_remove_flat
-                if flat_removes:
-                    remove_keywords(
-                        xmp_path, flat_removes, hierarchical=False,
-                    )
-
-            # Strip any sidecar dc:subject entry that normalizes to a
-            # keyword we're about to add. write_sidecar() dedupes with an
-            # exact-string set difference, so a pure keyword_add for
-            # `apapane` against a legacy sidecar `‘apapane` would append a
-            # second <rdf:li>. Canonicalizing first collapses variants into
-            # the clean spelling that write_sidecar writes below. Use the
-            # flat-only mode: a hierarchical remove (which drops any entry
-            # whose segment matches) would delete unrelated hierarchies
-            # such as `Animals|Birds|Hawk` when we add flat `Birds`.
-            if keywords_to_add:
-                remove_keywords(xmp_path, keywords_to_add, hierarchical=False)
-
-            # Write keyword additions after removals so a same-photo
-            # remove+add pair does not race (see above).
-            if keywords_to_add:
-                write_sidecar(
-                    xmp_path, flat_keywords=keywords_to_add, hierarchical_keywords=set()
-                )
-
-            # Write flag before rating: write_pick_flag creates a sidecar if
-            # needed, while write_rating intentionally only updates existing
-            # sidecars.
-            if new_flag is not None:
-                write_pick_flag(xmp_path, new_flag)
-
-            if sync_location:
-                loc = db.get_assigned_photo_location(photo_id)
-                if loc and loc.get("latitude") is not None and loc.get("longitude") is not None:
-                    write_gps_location(
-                        xmp_path,
-                        loc["latitude"],
-                        loc["longitude"],
-                        source=loc.get("source") or "assigned",
-                    )
-                else:
-                    remove_vireo_gps_location(xmp_path)
-            elif cleanup_location:
-                remove_vireo_gps_location(xmp_path)
-
-            if edit_recipe_json is not None:
-                write_edit_recipe(xmp_path, edit_recipe_json)
-
-            # Write rating after every operation that can create a sidecar.
-            # Rating alone intentionally remains a no-op for missing XMP, but
-            # a selected keyword, flag, location, or edit write should make
-            # the same-photo rating persist rather than silently clear it.
-            if new_rating is not None:
-                write_rating(xmp_path, new_rating)
-
-            if supported_ids:
-                synced += 1
-                synced_ids.extend(supported_ids)
-
-            for c in unsupported_changes:
-                failed += 1
-                failures.append(
-                    {
-                        "photo_id": photo_id,
-                        "change_id": c["id"],
-                        "error": f"unsupported change type: {c['change_type']}",
-                    }
-                )
-
+            plan = _plan_photo_sync(photo_changes, sync_flags, sync_locations)
+            _write_photo_sync(db, photo_id, xmp_path, plan)
         except Exception as e:
-            failed += 1
             failures.append({"photo_id": photo_id, "error": str(e)})
             log.warning("Failed to sync photo %d: %s", photo_id, e)
+        else:
+            if plan.supported_ids:
+                synced += 1
+                synced_ids.extend(plan.supported_ids)
+            for c in plan.unsupported_changes:
+                failures.append({
+                    "photo_id": photo_id,
+                    "change_id": c["id"],
+                    "error": f"unsupported change type: {c['change_type']}",
+                })
 
         if progress_callback:
             progress_callback(i + 1, total)
@@ -300,6 +303,7 @@ def sync_to_xmp(db, progress_callback=None, change_ids=None):
             synced_ids, clear_equivalent_flat_removals=True,
         )
 
+    failed = len(failures)
     log.info("Sync complete: %d synced, %d failed", synced, failed)
     return {"synced": synced, "failed": failed, "failures": failures}
 

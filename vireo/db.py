@@ -20955,375 +20955,364 @@ class Database:
         self.conn.commit()
         return entry
 
+    # ------------------------------------------------------------------
+    # Undo / redo
+    #
+    # ``edit_history`` rows carry an ``action_type``; each ``edit_history_items``
+    # row holds the per-photo ``old_value`` / ``new_value``. Undo restores the
+    # old value, redo re-applies the new one. Plain per-photo fields share a
+    # setter and only differ in which value is used; keyword and prediction
+    # actions have asymmetric handlers because they also reverse the
+    # pending-sidecar queue and prediction review statuses.
+    # ------------------------------------------------------------------
+
     def _apply_undo(self, entry, items):
         """Reverse the effects of an edit entry."""
-        for item in items:
-            old_val = item['old_value']
-            pid = item['photo_id']
-            if entry['action_type'] == 'rating':
-                # Edit history is already workspace-scoped; skip re-verification
-                self.update_photo_rating(pid, int(old_val), verify_workspace=False)
-                if old_val != entry['new_value']:
-                    self.remove_pending_changes(pid, 'rating', entry['new_value'])
-                    self.queue_change(pid, 'rating', old_val)
-            elif entry['action_type'] == 'flag':
-                self.update_photo_flag(pid, old_val, verify_workspace=False)
-                self.queue_flag_change_if_enabled(pid, old_val)
-            elif entry['action_type'] == 'wildlife_excluded':
-                self.update_photo_wildlife_excluded(
-                    pid, old_val == "1", verify_workspace=False
-                )
-            elif entry['action_type'] == 'color_label':
-                if old_val:
-                    self.set_color_label(pid, old_val)
-                else:
-                    self.remove_color_label(pid)
-            elif entry['action_type'] == 'edit_recipe':
-                self.set_photo_edit_recipe(
-                    pid,
-                    old_val if old_val else None,
-                    verify_workspace=False,
-                )
-            elif entry['action_type'] in ('keyword_add', 'prediction_accept'):
-                old_meta = self._edit_old_value_meta(old_val)
-                # ``no_tag`` marks a prediction_accept where the photo
-                # already carried an equivalent species, so no tag was
-                # actually added. Undo must not untag a keyword the user
-                # deliberately kept — only the prediction status flip
-                # below is reversed.
-                _skip_tag_undo = (
-                    entry['action_type'] == 'prediction_accept'
-                    and old_meta.get('no_tag')
-                )
-                kw = self.conn.execute("SELECT name FROM keywords WHERE id = ?",
-                                       (int(entry['new_value']),)).fetchone()
-                if not _skip_tag_undo:
-                    self.untag_photo(pid, int(entry['new_value']))
-                    if kw:
-                        self.remove_pending_changes(pid, 'keyword_add', kw['name'])
-                if entry['action_type'] == 'keyword_add':
-                    self._restore_edit_prediction_status(old_meta)
-                    # Predicted-only relabels (no prior species tag)
-                    # record their action as `keyword_add` but still
-                    # carry a `curation` payload when the photo held
-                    # highlight/representative rows under other species.
-                    # Restore those rows here too, mirroring the
-                    # `species_replace` undo path.
-                    if kw:
-                        self._restore_relabel_curation(
-                            entry['workspace_id'], pid, kw['name'],
-                            old_meta.get('curation'),
-                        )
-                if entry['action_type'] == 'prediction_accept' and old_val:
-                    pred_ids = self._edit_prediction_ids(old_meta, old_val)
-                    if not pred_ids:
-                        continue
-                    ws = self._ws_id()
-                    # Restore predictions to pre-accept state. Scope by
-                    # labels_fingerprint too — without it, undoing an accept
-                    # in one label set would flip statuses of predictions
-                    # produced under a different fingerprint and could
-                    # promote the wrong fingerprint's top-confidence row
-                    # back to 'pending'.
-                    #
-                    # Accept-subject no-tag accepts can span multiple
-                    # classifier models on one detection, so iterate and
-                    # dedupe by (detection, model, fingerprint) so each
-                    # unique sibling scope is reset exactly once.
-                    seen_scopes = set()
-                    touched = False
-                    for pred_id in pred_ids:
-                        pred_row = self.conn.execute(
-                            """SELECT detection_id, classifier_model AS model,
-                                      labels_fingerprint
-                               FROM predictions WHERE id = ?""",
-                            (pred_id,),
-                        ).fetchone()
-                        if not pred_row:
-                            continue
-                        scope = (
-                            pred_row["detection_id"], pred_row["model"],
-                            pred_row["labels_fingerprint"],
-                        )
-                        if scope in seen_scopes:
-                            continue
-                        seen_scopes.add(scope)
-                        # Identify every sibling prediction for
-                        # (detection, classifier_model, labels_fingerprint).
-                        siblings = self.conn.execute(
-                            """SELECT id, confidence FROM predictions
-                               WHERE detection_id = ?
-                                 AND classifier_model = ?
-                                 AND labels_fingerprint = ?
-                               ORDER BY confidence DESC""",
-                            scope,
-                        ).fetchall()
-                        # Flip any accepted/rejected review rows in this
-                        # workspace back to 'alternative' — scoped to the
-                        # same fingerprint so other label sets' statuses
-                        # are preserved.
-                        self.conn.execute(
-                            """UPDATE prediction_review SET status = 'alternative',
-                                                          reviewed_at = datetime('now')
-                               WHERE workspace_id = ?
-                                 AND status IN ('accepted', 'rejected')
-                                 AND prediction_id IN (
-                                    SELECT id FROM predictions
-                                    WHERE detection_id = ?
-                                      AND classifier_model = ?
-                                      AND labels_fingerprint = ?
-                                 )""",
-                            (ws, *scope),
-                        )
-                        # Promote highest-confidence sibling back to 'pending'
-                        # in this workspace.
-                        if siblings:
-                            top_id = siblings[0]["id"]
-                            self.conn.execute(
-                                """INSERT INTO prediction_review
-                                     (prediction_id, workspace_id, status, reviewed_at)
-                                   VALUES (?, ?, 'pending', datetime('now'))
-                                   ON CONFLICT(prediction_id, workspace_id)
-                                   DO UPDATE SET status = 'pending',
-                                                 reviewed_at = datetime('now')""",
-                                (top_id, ws),
-                            )
-                        touched = True
-                    if touched:
-                        self.conn.commit()
-            elif entry['action_type'] == 'keyword_remove':
-                # Undo is an explicit request to restore the removed tag.
-                # Stamp the recreated association so durable authorship does
-                # not disappear merely because untagging deleted the row.
-                self.tag_photo(
-                    pid, int(entry['new_value']), source='manual',
-                )
-                kw = self.conn.execute("SELECT name FROM keywords WHERE id = ?",
-                                       (int(entry['new_value']),)).fetchone()
-                if kw:
-                    # Symmetric with `_queue_keyword_remove`: the original
-                    # remove either queued a `keyword_remove` or, when a
-                    # not-yet-synced `keyword_add` was pending, cancelled
-                    # that add. Reversing needs to restore whichever side
-                    # the remove touched — otherwise an add → remove → undo
-                    # flow leaves the tag on the photo with no pending
-                    # sidecar write, and the restored keyword never syncs.
-                    cancelled = self.remove_pending_changes(
-                        pid, 'keyword_remove', kw['name']
-                    )
-                    if cancelled == 0:
-                        self.queue_change(pid, 'keyword_add', kw['name'])
-            elif entry['action_type'] == 'species_replace':
-                # Atomic swap: the edit replaced old_value's species with
-                # new_value's. Undo untags the new species and retags the
-                # old one, symmetrically reversing the pending-change queue.
-                old_meta = self._edit_old_value_meta(old_val)
-                new_kid = int(item['new_value']) if item['new_value'] else None
-                old_kids = old_meta.get("keyword_ids") or []
-                new_kw_name = None
-                if new_kid:
-                    self.untag_photo(pid, new_kid)
-                    new_kw = self.conn.execute(
-                        "SELECT name FROM keywords WHERE id = ?", (new_kid,)
-                    ).fetchone()
-                    if new_kw:
-                        new_kw_name = new_kw['name']
-                        cancelled = self.remove_pending_changes(
-                            pid, 'keyword_add', new_kw['name']
-                        )
-                        if cancelled == 0:
-                            self.queue_change(pid, 'keyword_remove', new_kw['name'])
-                for old_kid in old_kids:
-                    self.tag_photo(pid, old_kid, source='manual')
-                    old_kw = self.conn.execute(
-                        "SELECT name FROM keywords WHERE id = ?", (old_kid,)
-                    ).fetchone()
-                    if old_kw:
-                        cancelled = self.remove_pending_changes(
-                            pid, 'keyword_remove', old_kw['name']
-                        )
-                        if cancelled == 0:
-                            self.queue_change(pid, 'keyword_add', old_kw['name'])
-                # Restore any species_highlights / photo_preferences rows the
-                # original relabel migrated to `new_kw_name`. Without this,
-                # the photo is back in its old species bucket but the
-                # curated Highlight/Representative rows stay stranded under
-                # the new species. See PR #1161.
-                if new_kw_name:
-                    self._restore_relabel_curation(
-                        entry['workspace_id'], pid, new_kw_name,
-                        old_meta.get('curation'),
-                    )
-                self._restore_edit_prediction_status(old_meta)
+        self._apply_edit_items(entry, items, undo=True)
 
     def _apply_redo(self, entry, items):
         """Re-apply the effects of an undone edit entry."""
+        self._apply_edit_items(entry, items, undo=False)
+
+    def _apply_edit_items(self, entry, items, *, undo):
+        action = entry['action_type']
+        setter = self._EDIT_FIELD_SETTERS.get(action)
+        handlers = self._UNDO_HANDLERS if undo else self._REDO_HANDLERS
+        handler = handlers.get(action)
+        value_key = 'old_value' if undo else 'new_value'
         for item in items:
-            new_val = item['new_value']
-            pid = item['photo_id']
-            if entry['action_type'] == 'rating':
-                # Edit history is already workspace-scoped; skip re-verification
-                self.update_photo_rating(pid, int(new_val) if new_val else 0, verify_workspace=False)
-                old_val = item['old_value']
-                if old_val != new_val:
-                    self.remove_pending_changes(pid, 'rating', old_val)
-                    self.queue_change(pid, 'rating', new_val)
-            elif entry['action_type'] == 'flag':
-                self.update_photo_flag(pid, new_val, verify_workspace=False)
-                self.queue_flag_change_if_enabled(pid, new_val)
-            elif entry['action_type'] == 'wildlife_excluded':
-                self.update_photo_wildlife_excluded(
-                    pid, new_val == "1", verify_workspace=False
+            if setter is not None:
+                setter(self, item['photo_id'], item[value_key])
+            elif handler is not None:
+                handler(self, entry, item)
+
+    # -- plain per-photo fields (same setter for undo and redo) ----------
+
+    def _edit_set_flag(self, pid, value):
+        # Edit history is already workspace-scoped; skip re-verification
+        self.update_photo_flag(pid, value, verify_workspace=False)
+        self.queue_flag_change_if_enabled(pid, value)
+
+    def _edit_set_wildlife_excluded(self, pid, value):
+        self.update_photo_wildlife_excluded(
+            pid, value == "1", verify_workspace=False
+        )
+
+    def _edit_set_color_label(self, pid, value):
+        if value:
+            self.set_color_label(pid, value)
+        else:
+            self.remove_color_label(pid)
+
+    def _edit_set_edit_recipe(self, pid, value):
+        self.set_photo_edit_recipe(
+            pid, value if value else None, verify_workspace=False,
+        )
+
+    # -- rating -----------------------------------------------------------
+
+    def _undo_rating(self, entry, item):
+        pid, old_val = item['photo_id'], item['old_value']
+        self.update_photo_rating(pid, int(old_val), verify_workspace=False)
+        if old_val != entry['new_value']:
+            self.remove_pending_changes(pid, 'rating', entry['new_value'])
+            self.queue_change(pid, 'rating', old_val)
+
+    def _redo_rating(self, entry, item):
+        pid, old_val, new_val = item['photo_id'], item['old_value'], item['new_value']
+        self.update_photo_rating(
+            pid, int(new_val) if new_val else 0, verify_workspace=False,
+        )
+        if old_val != new_val:
+            self.remove_pending_changes(pid, 'rating', old_val)
+            self.queue_change(pid, 'rating', new_val)
+
+    # -- keyword helpers shared by the keyword / species handlers ----------
+
+    def _keyword_name(self, keyword_id):
+        row = self.conn.execute(
+            "SELECT name FROM keywords WHERE id = ?", (keyword_id,)
+        ).fetchone()
+        return row['name'] if row else None
+
+    def _flip_pending_keyword_change(self, pid, name, cancel_type, queue_type):
+        """Reverse one side of the pending-sidecar queue for a keyword.
+
+        Symmetric with ``_queue_keyword_remove``: the original edit either
+        queued a change of ``cancel_type`` or, when a not-yet-synced change
+        of ``queue_type`` was pending, cancelled that one instead. Reversing
+        must restore whichever side the edit touched -- otherwise an
+        add -> remove -> undo flow leaves the tag on the photo with no
+        pending sidecar write, and the restored keyword never syncs.
+        """
+        if self.remove_pending_changes(pid, cancel_type, name) == 0:
+            self.queue_change(pid, queue_type, name)
+
+    def _retag_for_edit(self, pid, keyword_id):
+        """Re-add a keyword removed by an edit; returns the keyword name."""
+        # Stamp the recreated association so durable authorship does not
+        # disappear merely because untagging deleted the row.
+        self.tag_photo(pid, keyword_id, source='manual')
+        name = self._keyword_name(keyword_id)
+        if name:
+            self._flip_pending_keyword_change(
+                pid, name, 'keyword_remove', 'keyword_add',
+            )
+        return name
+
+    def _untag_for_edit(self, pid, keyword_id):
+        """Remove a keyword added by an edit; returns the keyword name."""
+        self.untag_photo(pid, keyword_id)
+        name = self._keyword_name(keyword_id)
+        if name:
+            self._flip_pending_keyword_change(
+                pid, name, 'keyword_add', 'keyword_remove',
+            )
+        return name
+
+    def _prediction_scope(self, pred_id):
+        """``(detection_id, classifier_model, labels_fingerprint)`` or None."""
+        row = self.conn.execute(
+            """SELECT detection_id, classifier_model AS model, labels_fingerprint
+               FROM predictions WHERE id = ?""",
+            (pred_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return (row["detection_id"], row["model"], row["labels_fingerprint"])
+
+    # -- keyword_remove ---------------------------------------------------
+
+    def _undo_keyword_remove(self, entry, item):
+        # Undo is an explicit request to restore the removed tag.
+        self._retag_for_edit(item['photo_id'], int(entry['new_value']))
+
+    def _redo_keyword_remove(self, entry, item):
+        # Mirror the undo path: if undo re-queued a `keyword_add`, redo
+        # cancels it rather than stacking a conflicting `keyword_remove`.
+        self._untag_for_edit(item['photo_id'], int(entry['new_value']))
+
+    # -- keyword_add / prediction_accept ----------------------------------
+    #
+    # ``no_tag`` marks a prediction_accept where the photo already carried
+    # an equivalent species, so no tag was actually added. Undo must not
+    # untag a keyword the user deliberately kept, and redo must not re-tag
+    # or re-queue a keyword that was never touched -- only the prediction
+    # status flip is reversed / re-applied.
+    #
+    # Predicted-only relabels (no prior species tag) record their action as
+    # `keyword_add` but still carry a `curation` payload when the photo held
+    # highlight/representative rows under other species. Those rows are
+    # restored / re-applied here too, mirroring the `species_replace` path.
+
+    def _undo_keyword_add(self, entry, item):
+        pid, old_val = item['photo_id'], item['old_value']
+        action = entry['action_type']
+        old_meta = self._edit_old_value_meta(old_val)
+        kid = int(entry['new_value'])
+        kw_name = self._keyword_name(kid)
+        skip_tag = action == 'prediction_accept' and old_meta.get('no_tag')
+        if not skip_tag:
+            self.untag_photo(pid, kid)
+            if kw_name:
+                self.remove_pending_changes(pid, 'keyword_add', kw_name)
+        if action == 'keyword_add':
+            self._restore_edit_prediction_status(old_meta)
+            if kw_name:
+                self._restore_relabel_curation(
+                    entry['workspace_id'], pid, kw_name,
+                    old_meta.get('curation'),
                 )
-            elif entry['action_type'] == 'color_label':
-                if new_val:
-                    self.set_color_label(pid, new_val)
-                else:
-                    self.remove_color_label(pid)
-            elif entry['action_type'] == 'edit_recipe':
-                self.set_photo_edit_recipe(
-                    pid,
-                    new_val if new_val else None,
-                    verify_workspace=False,
+        if action == 'prediction_accept' and old_val:
+            self._undo_prediction_accept_statuses(old_meta, old_val)
+
+    def _redo_keyword_add(self, entry, item):
+        pid, old_val = item['photo_id'], item['old_value']
+        action = entry['action_type']
+        old_meta = self._edit_old_value_meta(old_val)
+        kid = int(entry['new_value'])
+        kw_name = self._keyword_name(kid)
+        skip_tag = action == 'prediction_accept' and old_meta.get('no_tag')
+        if not skip_tag:
+            self.tag_photo(pid, kid, source='manual')
+            if kw_name:
+                self.queue_change(pid, 'keyword_add', kw_name)
+        if action == 'keyword_add':
+            self._reject_edit_prediction(old_meta)
+            if kw_name:
+                self._reapply_relabel_curation(
+                    entry['workspace_id'], pid, kw_name,
+                    old_meta.get('curation'),
                 )
-            elif entry['action_type'] in ('keyword_add', 'prediction_accept'):
-                old_meta = self._edit_old_value_meta(item['old_value'])
-                # Symmetric with the undo branch: a ``no_tag``
-                # prediction_accept records only the status flip, so
-                # redo must not re-tag or re-queue a keyword that was
-                # never touched — the photo already carried the species
-                # through an equivalent hierarchical/root row.
-                _skip_tag_redo = (
-                    entry['action_type'] == 'prediction_accept'
-                    and old_meta.get('no_tag')
+        if action == 'prediction_accept' and old_val:
+            self._redo_prediction_accept_statuses(old_meta, old_val)
+
+    def _undo_prediction_accept_statuses(self, old_meta, old_val):
+        """Restore predictions to their pre-accept review state.
+
+        Scope by labels_fingerprint too -- without it, undoing an accept in
+        one label set would flip statuses of predictions produced under a
+        different fingerprint and could promote the wrong fingerprint's
+        top-confidence row back to 'pending'.
+
+        Accept-subject no-tag accepts can span multiple classifier models on
+        one detection, so iterate and dedupe by (detection, model,
+        fingerprint) so each unique sibling scope is reset exactly once.
+        """
+        pred_ids = self._edit_prediction_ids(old_meta, old_val)
+        if not pred_ids:
+            return
+        ws = self._ws_id()
+        seen_scopes = set()
+        for pred_id in pred_ids:
+            scope = self._prediction_scope(pred_id)
+            if scope is None or scope in seen_scopes:
+                continue
+            seen_scopes.add(scope)
+            siblings = self.conn.execute(
+                """SELECT id, confidence FROM predictions
+                   WHERE detection_id = ?
+                     AND classifier_model = ?
+                     AND labels_fingerprint = ?
+                   ORDER BY confidence DESC""",
+                scope,
+            ).fetchall()
+            # Flip any accepted/rejected review rows in this workspace back
+            # to 'alternative' -- scoped to the same fingerprint so other
+            # label sets' statuses are preserved.
+            self.conn.execute(
+                """UPDATE prediction_review SET status = 'alternative',
+                                              reviewed_at = datetime('now')
+                   WHERE workspace_id = ?
+                     AND status IN ('accepted', 'rejected')
+                     AND prediction_id IN (
+                        SELECT id FROM predictions
+                        WHERE detection_id = ?
+                          AND classifier_model = ?
+                          AND labels_fingerprint = ?
+                     )""",
+                (ws, *scope),
+            )
+            # Promote highest-confidence sibling back to 'pending'.
+            if siblings:
+                self.conn.execute(
+                    """INSERT INTO prediction_review
+                         (prediction_id, workspace_id, status, reviewed_at)
+                       VALUES (?, ?, 'pending', datetime('now'))
+                       ON CONFLICT(prediction_id, workspace_id)
+                       DO UPDATE SET status = 'pending',
+                                     reviewed_at = datetime('now')""",
+                    (siblings[0]["id"], ws),
                 )
-                kw = self.conn.execute("SELECT name FROM keywords WHERE id = ?",
-                                       (int(entry['new_value']),)).fetchone()
-                if not _skip_tag_redo:
-                    self.tag_photo(
-                        pid, int(entry['new_value']), source='manual',
-                    )
-                    if kw:
-                        self.queue_change(pid, 'keyword_add', kw['name'])
-                if entry['action_type'] == 'keyword_add':
-                    self._reject_edit_prediction(old_meta)
-                    # Mirror of the `keyword_add` undo branch: predicted-
-                    # only relabels record curation on `keyword_add`, so
-                    # redo must re-apply it here rather than only in
-                    # `species_replace`.
-                    if kw:
-                        self._reapply_relabel_curation(
-                            entry['workspace_id'], pid, kw['name'],
-                            old_meta.get('curation'),
-                        )
-                if entry['action_type'] == 'prediction_accept' and item['old_value']:
-                    pred_ids = self._edit_prediction_ids(old_meta, item['old_value'])
-                    if not pred_ids:
-                        continue
-                    ws = self._ws_id()
-                    # Accept-subject no-tag accepts can span multiple
-                    # classifier models on one detection, so re-accept
-                    # every recorded id and reject its siblings within
-                    # that classifier's fingerprint scope. Track which
-                    # ids acted as the accepted row per scope so we
-                    # don't reject a prediction that was itself part of
-                    # the original accept batch.
-                    accepted_by_scope = {}
-                    for pred_id in pred_ids:
-                        pred_row = self.conn.execute(
-                            """SELECT detection_id, classifier_model AS model,
-                                      labels_fingerprint
-                               FROM predictions WHERE id = ?""",
-                            (pred_id,),
-                        ).fetchone()
-                        if not pred_row:
-                            continue
-                        scope = (
-                            pred_row["detection_id"], pred_row["model"],
-                            pred_row["labels_fingerprint"],
-                        )
-                        self.update_prediction_status(pred_id, 'accepted')
-                        accepted_by_scope.setdefault(scope, set()).add(pred_id)
-                    for scope, accepted_ids in accepted_by_scope.items():
-                        placeholders = ",".join("?" * len(accepted_ids))
-                        # Re-reject siblings, scoped to the same
-                        # labels_fingerprint so the redo matches the
-                        # original accept's scope and doesn't touch
-                        # predictions from other label sets. Exclude
-                        # every id that was itself accepted in this batch.
-                        sibs = self.conn.execute(
-                            f"""SELECT pr.id FROM predictions pr
-                               LEFT JOIN prediction_review pr_rev
-                                 ON pr_rev.prediction_id = pr.id
-                                AND pr_rev.workspace_id = ?
-                               WHERE pr.detection_id = ?
-                                 AND pr.classifier_model = ?
-                                 AND pr.labels_fingerprint = ?
-                                 AND pr.id NOT IN ({placeholders})
-                                 AND COALESCE(pr_rev.status, 'pending')
-                                     IN ('pending', 'alternative')""",
-                            (ws, *scope, *accepted_ids),
-                        ).fetchall()
-                        for s in sibs:
-                            self.conn.execute(
-                                """INSERT INTO prediction_review
-                                     (prediction_id, workspace_id, status, reviewed_at)
-                                   VALUES (?, ?, 'rejected', datetime('now'))
-                                   ON CONFLICT(prediction_id, workspace_id)
-                                   DO UPDATE SET status = 'rejected',
-                                                 reviewed_at = datetime('now')""",
-                                (s["id"], ws),
-                            )
-                    if accepted_by_scope:
-                        self.conn.commit()
-            elif entry['action_type'] == 'keyword_remove':
-                self.untag_photo(pid, int(entry['new_value']))
-                kw = self.conn.execute("SELECT name FROM keywords WHERE id = ?",
-                                       (int(entry['new_value']),)).fetchone()
-                if kw:
-                    # Mirror the undo path: if undo re-queued a
-                    # `keyword_add`, redo should cancel it rather than
-                    # stack a conflicting `keyword_remove` alongside it.
-                    cancelled = self.remove_pending_changes(
-                        pid, 'keyword_add', kw['name']
-                    )
-                    if cancelled == 0:
-                        self.queue_change(pid, 'keyword_remove', kw['name'])
-            elif entry['action_type'] == 'species_replace':
-                # Re-apply the swap: untag old, retag new, mirror pending queue.
-                old_meta = self._edit_old_value_meta(item['old_value'])
-                new_kid = int(new_val) if new_val else None
-                old_kids = old_meta.get("keyword_ids") or []
-                new_kw_name = None
-                for old_kid in old_kids:
-                    self.untag_photo(pid, old_kid)
-                    old_kw = self.conn.execute(
-                        "SELECT name FROM keywords WHERE id = ?", (old_kid,)
-                    ).fetchone()
-                    if old_kw:
-                        cancelled = self.remove_pending_changes(
-                            pid, 'keyword_add', old_kw['name']
-                        )
-                        if cancelled == 0:
-                            self.queue_change(pid, 'keyword_remove', old_kw['name'])
-                if new_kid:
-                    self.tag_photo(pid, new_kid, source='manual')
-                    new_kw = self.conn.execute(
-                        "SELECT name FROM keywords WHERE id = ?", (new_kid,)
-                    ).fetchone()
-                    if new_kw:
-                        new_kw_name = new_kw['name']
-                        cancelled = self.remove_pending_changes(
-                            pid, 'keyword_remove', new_kw['name']
-                        )
-                        if cancelled == 0:
-                            self.queue_change(pid, 'keyword_add', new_kw['name'])
-                if new_kw_name:
-                    self._reapply_relabel_curation(
-                        entry['workspace_id'], pid, new_kw_name,
-                        old_meta.get('curation'),
-                    )
-                self._reject_edit_prediction(old_meta)
+        if seen_scopes:
+            self.conn.commit()
+
+    def _redo_prediction_accept_statuses(self, old_meta, old_val):
+        """Re-accept every recorded prediction and re-reject its siblings.
+
+        Siblings are scoped to the same labels_fingerprint so the redo
+        matches the original accept's scope and doesn't touch predictions
+        from other label sets. Every id accepted in this batch is excluded
+        from rejection, since a no-tag accept can hold several ids in one
+        scope.
+        """
+        pred_ids = self._edit_prediction_ids(old_meta, old_val)
+        if not pred_ids:
+            return
+        ws = self._ws_id()
+        accepted_by_scope = {}
+        for pred_id in pred_ids:
+            scope = self._prediction_scope(pred_id)
+            if scope is None:
+                continue
+            self.update_prediction_status(pred_id, 'accepted')
+            accepted_by_scope.setdefault(scope, set()).add(pred_id)
+        for scope, accepted_ids in accepted_by_scope.items():
+            placeholders = ",".join("?" * len(accepted_ids))
+            sibs = self.conn.execute(
+                f"""SELECT pr.id FROM predictions pr
+                   LEFT JOIN prediction_review pr_rev
+                     ON pr_rev.prediction_id = pr.id
+                    AND pr_rev.workspace_id = ?
+                   WHERE pr.detection_id = ?
+                     AND pr.classifier_model = ?
+                     AND pr.labels_fingerprint = ?
+                     AND pr.id NOT IN ({placeholders})
+                     AND COALESCE(pr_rev.status, 'pending')
+                         IN ('pending', 'alternative')""",
+                (ws, *scope, *accepted_ids),
+            ).fetchall()
+            for s in sibs:
+                self.conn.execute(
+                    """INSERT INTO prediction_review
+                         (prediction_id, workspace_id, status, reviewed_at)
+                       VALUES (?, ?, 'rejected', datetime('now'))
+                       ON CONFLICT(prediction_id, workspace_id)
+                       DO UPDATE SET status = 'rejected',
+                                     reviewed_at = datetime('now')""",
+                    (s["id"], ws),
+                )
+        if accepted_by_scope:
+            self.conn.commit()
+
+    # -- species_replace --------------------------------------------------
+    #
+    # Atomic swap: the edit replaced old_value's species with new_value's.
+    # Undo untags the new species and retags the old ones; redo does the
+    # reverse. Both mirror the pending-change queue, and restore / re-apply
+    # any species_highlights / photo_preferences rows the original relabel
+    # migrated to the new species -- otherwise the photo lands back in its
+    # old species bucket while the curated Highlight/Representative rows
+    # stay stranded under the new one (see PR #1161).
+
+    def _undo_species_replace(self, entry, item):
+        pid = item['photo_id']
+        old_meta = self._edit_old_value_meta(item['old_value'])
+        new_kid = int(item['new_value']) if item['new_value'] else None
+        new_kw_name = self._untag_for_edit(pid, new_kid) if new_kid else None
+        for old_kid in old_meta.get("keyword_ids") or []:
+            self._retag_for_edit(pid, old_kid)
+        if new_kw_name:
+            self._restore_relabel_curation(
+                entry['workspace_id'], pid, new_kw_name,
+                old_meta.get('curation'),
+            )
+        self._restore_edit_prediction_status(old_meta)
+
+    def _redo_species_replace(self, entry, item):
+        pid = item['photo_id']
+        old_meta = self._edit_old_value_meta(item['old_value'])
+        new_kid = int(item['new_value']) if item['new_value'] else None
+        for old_kid in old_meta.get("keyword_ids") or []:
+            self._untag_for_edit(pid, old_kid)
+        new_kw_name = self._retag_for_edit(pid, new_kid) if new_kid else None
+        if new_kw_name:
+            self._reapply_relabel_curation(
+                entry['workspace_id'], pid, new_kw_name,
+                old_meta.get('curation'),
+            )
+        self._reject_edit_prediction(old_meta)
+
+    _EDIT_FIELD_SETTERS = {
+        'flag': _edit_set_flag,
+        'wildlife_excluded': _edit_set_wildlife_excluded,
+        'color_label': _edit_set_color_label,
+        'edit_recipe': _edit_set_edit_recipe,
+    }
+    _UNDO_HANDLERS = {
+        'rating': _undo_rating,
+        'keyword_add': _undo_keyword_add,
+        'prediction_accept': _undo_keyword_add,
+        'keyword_remove': _undo_keyword_remove,
+        'species_replace': _undo_species_replace,
+    }
+    _REDO_HANDLERS = {
+        'rating': _redo_rating,
+        'keyword_add': _redo_keyword_add,
+        'prediction_accept': _redo_keyword_add,
+        'keyword_remove': _redo_keyword_remove,
+        'species_replace': _redo_species_replace,
+    }
 
     def _restore_relabel_curation(
         self, workspace_id, photo_id, new_species, curation,

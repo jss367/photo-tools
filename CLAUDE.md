@@ -37,6 +37,20 @@ python -m pytest vireo/tests/test_db.py -v
 
 Tests use temp databases. `vireo/tests/test_app.py` isolates config via `cfg.CONFIG_PATH = str(tmp_path / "config.json")` to avoid polluting `~/.vireo/config.json`.
 
+### Impact-selected runs
+
+The full unit suite is ~7.5k tests. `scripts/select_tests.py` maps `git diff` onto a per-test coverage map recorded on `main` and runs only the tests that executed the changed functions (whole file for changed test files; templates/static/data resolved through the Python lines that reference them; harness changes fall back to the full suite).
+
+```bash
+python scripts/select_tests.py fetch-map            # newest map from the "Full tests" workflow (needs gh)
+python scripts/select_tests.py --run -- -n auto -q   # run the selection
+python scripts/select_tests.py --explain             # just print what would run and why
+```
+
+CI does the same: PRs (`test.yml`) run the selected subset on Linux; every push to `main` (`test-main.yml`) runs the complete suite on Linux/macOS/Windows, enforces the coverage threshold, and publishes a fresh map to the Actions cache and as the `test-impact-map` artifact. The `ci-full-suite` PR label forces the full suite on a PR.
+
+Do not monkeypatch `sqlite3.connect` globally in tests: coverage flushes per-test contexts to its own SQLite file at every test boundary, so a global fake crashes the xdist worker. Fake only the connection for the database path under test (see `test_pipeline_queue.py`).
+
 ## Architecture
 
 - `vireo/app.py` — Flask app with all routes. Created via `create_app(db_path, thumb_cache_dir)`.
@@ -63,7 +77,7 @@ Each workspace scopes predictions, collections, pending changes, and visible fol
 
 1. Create a worktree and feature branch for the task.
 2. Do all implementation work in the worktree.
-3. Run tests before finishing: `python -m pytest tests/test_workspaces.py vireo/tests/test_db.py vireo/tests/test_app.py vireo/tests/test_photos_api.py vireo/tests/test_edits_api.py vireo/tests/test_jobs_api.py vireo/tests/test_darktable_api.py vireo/tests/test_config.py -v`
+3. Run tests before finishing. Preferred: `python scripts/select_tests.py --run -- -n auto -q` (after `fetch-map`), which runs exactly what your diff can affect. Fallback when no map is available: `python -m pytest tests/test_workspaces.py vireo/tests/test_db.py vireo/tests/test_app.py vireo/tests/test_photos_api.py vireo/tests/test_edits_api.py vireo/tests/test_jobs_api.py vireo/tests/test_darktable_api.py vireo/tests/test_config.py -v`
 4. **Create a PR** using `gh pr create`. Include what changed and test results in the PR description.
 5. When review feedback arrives, push fixes to the **same branch**. The review bot re-reviews automatically on push.
 6. Squash-merge when approved.

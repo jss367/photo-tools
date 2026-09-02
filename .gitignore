@@ -213,3 +213,6 @@ docs/plans/
 node_modules/
 output/
 */.DS_Store
+
+# Test-impact map + selection written by scripts/select_tests.py
+.test-impact/

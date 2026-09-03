@@ -2,8 +2,10 @@
 
 These enrichers are shared by Browse, Highlights, Misses, Predictions and
 the Process Review payloads. Each takes the request ``Database`` and a list
-of photo-like dicts (``id`` or ``photo_id``) and batches its lookups so a
-page of results costs a handful of queries, not one per photo.
+of photo dicts keyed by ``id`` and batches its lookups so a page of results
+costs a handful of queries, not one per photo. Only
+``attach_species_representatives`` and ``attach_nested_edit_recipes`` also
+accept the ``photo_id`` shape used by cached pipeline results.
 """
 
 

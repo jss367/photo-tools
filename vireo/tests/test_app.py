@@ -4360,6 +4360,35 @@ def test_api_detections_endpoint(app_and_db):
     assert data[0]["box_x"] == 0.1
 
 
+def test_api_pipeline_photo_detail_in_workspace(app_and_db):
+    """GET /api/pipeline/photo/<id> returns feature detail for a visible photo."""
+    app, db = app_and_db
+    pid = db.conn.execute("SELECT id FROM photos").fetchone()["id"]
+    client = app.test_client()
+    resp = client.get(f"/api/pipeline/photo/{pid}")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["id"] == pid
+    assert "subject_tenengrad" in data
+    assert "edit_recipe" in data
+    assert "detection_box" in data
+
+
+def test_api_pipeline_photo_detail_rejects_other_workspace(app_and_db):
+    """GET /api/pipeline/photo/<id> must 404 for photos whose folder is not
+    linked to the active workspace, matching /api/photos/<id>/pipeline."""
+    app, db = app_and_db
+    default_ws = db._active_workspace_id
+    other_ws = db.create_workspace("Other")
+    db.set_active_workspace(other_ws)
+    other_fid = db.add_folder('/secret/ws', name='secret')
+    other_pid = db.add_photo(other_fid, 'hidden.jpg', '.jpg', 1000, 0.0)
+    db.set_active_workspace(default_ws)
+    client = app.test_client()
+    resp = client.get(f"/api/pipeline/photo/{other_pid}")
+    assert resp.status_code == 404
+
+
 def test_api_photo_pipeline_detections(app_and_db):
     """GET /api/photos/<id>/pipeline returns detections and predictions with box data."""
     app, db = app_and_db

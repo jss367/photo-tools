@@ -1520,6 +1520,11 @@ def create_pipeline_blueprint(
     def api_pipeline_photo_detail(photo_id):
         """Return full pipeline feature detail for a single photo."""
         db = get_db()
+        # Workspace gate before the raw lookup below, matching
+        # /api/photos/<id>/pipeline: the response exposes sharpness
+        # features and the edit recipe for any global photo id.
+        if db.get_photo(photo_id, verify_workspace=True) is None:
+            return json_error("Photo not found", 404)
         row = db.conn.execute(
             """SELECT id, filename, timestamp, width, height,
                       mask_path, subject_tenengrad, bg_tenengrad,

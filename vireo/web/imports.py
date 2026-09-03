@@ -7,9 +7,10 @@ injected through the factory instead of captured from ``create_app``:
 - ``invalidate_missing_originals`` / ``reject_visual_collection`` /
   ``metadata_repair_count`` / ``bulk_gps_location_payload`` still live in
   ``app.py`` because other domains call them too.
-- ``resolve_remote_archive_target``, ``enqueue_process_job`` and
-  ``chain_after_move`` are the pipeline / move-folder machinery the
-  after-import chain hands off to; they move with those domains.
+- ``enqueue_process_job`` and ``chain_after_move`` come from
+  ``services.pipeline_launch.PipelineChain``, the job-thread side of the
+  after-import chain; ``resolve_remote_archive_target`` is imported from
+  the same service.
 
 The request-parsing halves of ``api_job_import_photos`` and
 ``api_job_import_in_place`` are the next extraction target (a pure
@@ -36,6 +37,7 @@ from flask import Blueprint, Response, abort, jsonify, make_response, request
 from keyword_normalization import keyword_match_key, normalize_keyword_display
 from metadata import scan_metadata_warning
 from new_images import invalidate_new_images_after_scan
+from services.pipeline_launch import resolve_remote_archive_target
 from web.background_jobs import make_background_job
 
 log = logging.getLogger(__name__)
@@ -163,7 +165,6 @@ def create_imports_blueprint(
     invalidate_missing_originals,
     reject_visual_collection,
     metadata_repair_count,
-    resolve_remote_archive_target,
     enqueue_process_job,
     chain_after_move,
     bulk_gps_location_payload,
@@ -3561,7 +3562,8 @@ def create_imports_blueprint(
             # move-folder endpoints).
             remote_archive_config, rsync_bin, err = (
                 resolve_remote_archive_target(
-                    remote_target_id, remote_subpath,
+                    get_db(), remote_target_id, remote_subpath,
+                    json_error=json_error,
                 )
             )
             if err is not None:

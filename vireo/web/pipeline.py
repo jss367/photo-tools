@@ -1,9 +1,9 @@
-"""Pipeline launch: the process job, its plan, saved processes and config.
+"""Pipeline domain: launching process runs and the Process Review endpoints.
 
-Step 3 of the ``create_app`` split (launch half). Everything here moved
-verbatim out of ``app.py``. The review-side pipeline endpoints (results,
-reflow, regroup-live, detach, group state/apply, mask variant) are the
-next slice.
+Step 3 of the ``create_app`` split. Everything here moved verbatim out of
+``app.py``: the launch side (process job, plan, saved processes, config)
+and the Process Review side (cached results, reflow / regroup-live,
+detach, burst-group state and apply, mask variant, per-photo debug).
 """
 
 from __future__ import annotations
@@ -13,8 +13,19 @@ import json
 import logging
 import os
 
+from db import _chunks, commit_with_retry
 from flask import Blueprint, jsonify, request
 from jobs import SLOT_CAP
+from photo_payload import (
+    attach_edit_recipes,
+    attach_nested_edit_recipes,
+    attach_species_representatives,
+)
+from pipeline_results import (
+    candidate_species_override,
+    compute_time_range,
+    rebuild_encounter_species_label,
+)
 from runtime_warnings import build_cpu_runtime_warning, runtime_warning_work_units
 from services.pipeline_launch import (
     apply_no_model_auto_skip,
@@ -1298,5 +1309,1011 @@ def create_pipeline_blueprint(
             raw["pipeline"].update(coerced)
             cfg.save(raw)
         return jsonify({"saved": coerced})
+
+    @blueprint.route("/api/pipeline/page-init")
+    def api_pipeline_page_init():
+        """Combined endpoint for pipeline page initial load."""
+        db = get_db()
+        total_photos = db.count_photos()
+
+        import config as cfg
+        from pipeline import (
+            compute_group_fingerprint,
+            compute_review_readiness,
+            load_results,
+            prune_missing_photos,
+        )
+        cache_dir = os.path.dirname(db_path)
+        prune_missing_photos(cache_dir, db._active_workspace_id, db)
+        results = load_results(cache_dir, db._active_workspace_id)
+        if results and results.get("photos"):
+            # Cached pipeline rows predate edit recipes, which live in their
+            # own table. Enrich them before Process Review positions overlays
+            # against rendered previews so geometric edits can disable stale
+            # source-coordinate markers.
+            attach_nested_edit_recipes(db, results)
+            photo_ids = [p["id"] for p in results["photos"]]
+            # Chunked: cached pipeline results can span the whole workspace,
+            # exceeding SQLite's bound-parameter cap in one IN clause.
+            live_photo_map = {}
+            for chunk in _chunks(photo_ids):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = db.conn.execute(
+                    f"""SELECT id, flag, rating,
+                               eye_x, eye_y, eye_conf, eye_tenengrad
+                          FROM photos WHERE id IN ({placeholders})""",
+                    chunk,
+                ).fetchall()
+                live_photo_map.update({r["id"]: r for r in rows})
+            for p in results["photos"]:
+                live = live_photo_map.get(p["id"])
+                p["flag"] = live["flag"] if live else "none"
+                p["rating"] = live["rating"] if live else 0
+                if live:
+                    p["eye_x"] = live["eye_x"]
+                    p["eye_y"] = live["eye_y"]
+                    p["eye_conf"] = live["eye_conf"]
+                    p["eye_tenengrad"] = live["eye_tenengrad"]
+            # Overlay representative state onto the cached results so
+            # pipeline cards render the badge after a page reload. The
+            # cache is written before eligibility runs (and by pipeline
+            # runs that predate the badge), so is_species_representative
+            # is otherwise absent and every card renders unbadged even
+            # when the DB says the photo is the species rep. The flag
+            # live overlay above is what makes this call correct — the shared
+            # attacher short-circuits rejected photos, and the overlay
+            # ensures p["flag"] reflects the live DB, not a stale cache.
+            attach_species_representatives(db, results["photos"])
+
+        effective_cfg = db.get_effective_config(cfg.load())
+        pipeline_cfg = effective_cfg.get("pipeline", {})
+
+        results_cache_info = None
+        if results is not None:
+            cached_photo_ids = {
+                p.get("id")
+                for p in results.get("photos", [])
+                if p.get("id") is not None
+            }
+            row = db.conn.execute(
+                "SELECT last_group_fingerprint FROM workspaces WHERE id = ?",
+                (db._active_workspace_id,),
+            ).fetchone()
+            last_group_fp = row["last_group_fingerprint"] if row else None
+            current_group_fp = compute_group_fingerprint(effective_cfg)
+            if not last_group_fp:
+                fp_status = "untracked"
+            elif last_group_fp == current_group_fp:
+                fp_status = "current"
+            else:
+                fp_status = "outdated"
+            results_cache_info = {
+                "workspace_photo_count": total_photos,
+                "cached_photo_count": len(cached_photo_ids),
+                "missing_photo_count": max(
+                    total_photos - len(cached_photo_ids), 0,
+                ),
+                "is_partial": len(cached_photo_ids) < total_photos,
+                "group_fingerprint_status": fp_status,
+                "review_mode": results.get("review_mode"),
+            }
+
+        # Variant must match the active DINOv2 variant so embedding coverage
+        # reflects what /api/pipeline/regroup-live would actually consume —
+        # mismatched-variant embeddings are dropped at load time, so counting
+        # them here would lie about readiness.
+        dinov2_variant = pipeline_cfg.get("dinov2_variant")
+        sam2_variant = pipeline_cfg.get("sam2_variant")
+        proxy_longest_edge = pipeline_cfg.get("proxy_longest_edge")
+        review_readiness = compute_review_readiness(
+            db, dinov2_variant=dinov2_variant,
+        )
+        if results is not None:
+            # Cache exists — even if features have changed underneath,
+            # the page can render. enhancing_missing still reflects the
+            # current gap so the degraded banner can surface accurately.
+            review_readiness["state"] = "ready"
+            # When the cache lets the page render, missing_required no
+            # longer represents a block — fold any blocking gaps into
+            # enhancing_missing so the degraded banner surfaces them.
+            for missing in review_readiness["missing_required"]:
+                if missing == "masks" and "masks_partial" not in review_readiness["enhancing_missing"]:
+                    review_readiness["enhancing_missing"].insert(0, "masks_partial")
+            review_readiness["missing_required"] = []
+
+        ws = db.get_workspace(db._active_workspace_id)
+        ws_overrides = {}
+        if ws and ws["config_overrides"]:
+            with contextlib.suppress(Exception):
+                ws_overrides = json.loads(ws["config_overrides"]) if isinstance(ws["config_overrides"], str) else ws["config_overrides"]
+
+        # "Available" must mean *usable*, not just *file exists*: a 0-byte
+        # stub from a failed download passed os.path.exists and hid the
+        # "Download taxonomy" checkbox in the pipeline page, leaving the
+        # user no in-app path to recovery. get_taxonomy_info() owns the
+        # actual integrity check.
+        from models import get_taxonomy_info
+        taxonomy_available = get_taxonomy_info()["available"]
+
+        return jsonify({
+            "total_photos": total_photos,
+            "taxonomy_available": taxonomy_available,
+            "pipeline_config": {
+                "sam2_variant": sam2_variant,
+                "dinov2_variant": dinov2_variant,
+                "proxy_longest_edge": proxy_longest_edge,
+                "eye_detect_enabled": pipeline_cfg.get("eye_detect_enabled", False),
+                "preview_max_size": effective_cfg.get("preview_max_size", 1920),
+            },
+            "mask_variant_coverage": db.mask_variant_coverage(),
+            "sam_variant_warning": db.sam_variant_rerun_warning(sam2_variant),
+            "results": results,
+            "results_cache_info": results_cache_info,
+            "review_readiness": review_readiness,
+            "workspace_overrides": ws_overrides,
+        })
+
+    @blueprint.route("/api/pipeline/selection-results", methods=["POST"])
+    def api_pipeline_selection_results():
+        """Return a temporary Pipeline Review result for selected photo IDs."""
+        db = get_db()
+        body = request.get_json(silent=True) or {}
+        raw_ids = body.get("photo_ids", [])
+        if not isinstance(raw_ids, list):
+            return json_error("photo_ids must be a list", 400)
+        if not raw_ids:
+            return json_error("photo_ids required", 400)
+        if len(raw_ids) > 500:
+            return json_error("too many photo_ids", 400)
+
+        photo_ids = []
+        seen = set()
+        for raw in raw_ids:
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                return json_error("photo_ids must be integers", 400)
+            if raw in seen:
+                continue
+            seen.add(raw)
+            photo_ids.append(raw)
+
+        import config as cfg
+        from pipeline import (
+            load_photo_features,
+            run_selected_batch_review,
+            serialize_results,
+        )
+
+        effective_cfg = db.get_effective_config(cfg.load())
+        loaded = load_photo_features(db, config=effective_cfg, photo_ids=photo_ids)
+        by_id = {p["id"]: p for p in loaded}
+        photos = [by_id[pid] for pid in photo_ids if pid in by_id]
+        if len(photos) < 2:
+            return json_error("at least two selected photos are required", 400)
+
+        results = serialize_results(
+            run_selected_batch_review(photos, config=effective_cfg)
+        )
+        attach_edit_recipes(db, results.get("photos", []))
+        results["source"] = "browse-selection"
+        return jsonify(results)
+
+    @blueprint.route("/api/pipeline/results")
+    def api_pipeline_results():
+        """Return the most recent pipeline triage results for the active workspace."""
+        from pipeline import load_results, prune_missing_photos
+
+        db = get_db()
+        cache_dir = os.path.dirname(db_path)
+        # Self-heal: caches written before commit 5ad83fa (which wired
+        # cache pruning into db.delete_photos) can still reference photos
+        # that were deleted afterwards through other paths. Reconcile
+        # against the DB at read time so the review page never renders
+        # orphan cards that 404 on /thumbnails/<id>.jpg.
+        prune_missing_photos(cache_dir, db._active_workspace_id, db)
+        results = load_results(cache_dir, db._active_workspace_id)
+        if results is None:
+            return json_error("No pipeline results found. Run regroup first.", 404)
+        attach_nested_edit_recipes(db, results)
+        return jsonify(results)
+
+    @blueprint.route("/api/pipeline/photo/<int:photo_id>")
+    def api_pipeline_photo_detail(photo_id):
+        """Return full pipeline feature detail for a single photo."""
+        db = get_db()
+        # Workspace gate before the raw lookup below, matching
+        # /api/photos/<id>/pipeline: the response exposes sharpness
+        # features and the edit recipe for any global photo id.
+        if db.get_photo(photo_id, verify_workspace=True) is None:
+            return json_error("Photo not found", 404)
+        row = db.conn.execute(
+            """SELECT id, filename, timestamp, width, height,
+                      mask_path, subject_tenengrad, bg_tenengrad,
+                      crop_complete, bg_separation,
+                      subject_clip_high, subject_clip_low, subject_y_median,
+                      phash_crop, subject_size
+               FROM photos WHERE id = ?""",
+            (photo_id,),
+        ).fetchone()
+        if not row:
+            return json_error("Photo not found", 404)
+        result = dict(row)
+        result["edit_recipe"] = db.get_photo_edit_recipe(photo_id)
+        # Get primary detection from global detections table (threshold
+        # resolved from workspace-effective config inside get_detections).
+        dets = db.get_detections(photo_id)
+        if dets:
+            det = dets[0]
+            result["detection_box"] = {
+                "x": det["box_x"], "y": det["box_y"],
+                "w": det["box_w"], "h": det["box_h"],
+            }
+            result["detection_conf"] = det["detector_confidence"]
+        else:
+            result["detection_box"] = None
+            result["detection_conf"] = None
+        return jsonify(result)
+
+    @blueprint.route("/api/pipeline/reflow", methods=["POST"])
+    def api_pipeline_reflow():
+        """Re-run stages 4-6 with new scoring/selection thresholds.
+
+        Instant (milliseconds) — no model inference, no regrouping.
+        Takes threshold overrides in the request body, re-scores and
+        re-triages the existing encounter/burst grouping.
+
+        When ``collection_id`` is provided, photos are scoped to that
+        collection and results are NOT saved to the workspace cache (so
+        Cull's ephemeral scoped run doesn't clobber pipeline-review's
+        workspace-wide cached state).
+        """
+        from pipeline import (
+            load_photo_features,
+            load_results_raw,
+            reflow,
+            run_grouping,
+            save_results,
+            serialize_results,
+        )
+
+        body = request.get_json(silent=True) or {}
+        overrides = body.get("config", {})
+        collection_id = coerce_collection_id(body.get("collection_id"))
+        if collection_id is False:
+            return json_error("collection_id must be an integer")
+        photo_ids = body.get("photo_ids")
+        if photo_ids is not None:
+            if not isinstance(photo_ids, list):
+                return json_error("photo_ids must be a list")
+            for pid in photo_ids:
+                if isinstance(pid, bool) or not isinstance(pid, int):
+                    return json_error("photo_ids entries must be integers")
+            if collection_id is not None:
+                return json_error("photo_ids cannot be combined with collection_id")
+        save_cache = body.get("save_cache", True)
+        if not isinstance(save_cache, bool):
+            return json_error("save_cache must be boolean")
+
+        import config as cfg
+
+        db = get_db()
+        err = reject_visual_collection(db, collection_id)
+        if err is not None:
+            return err
+        effective_cfg = db.get_effective_config(cfg.load())
+        pipeline_cfg = {**effective_cfg.get("pipeline", {}), **overrides}
+
+        # Load features and re-group (grouping is fast, seconds)
+        # We re-group to have the full photo dicts with numpy arrays
+        # (the cached JSON doesn't have embeddings)
+        photos = load_photo_features(
+            db,
+            collection_id=collection_id,
+            config=effective_cfg,
+            photo_ids=photo_ids,
+        )
+        if not photos:
+            return json_error("No photos with pipeline features", 404)
+
+        # emit_trace=True so the pipeline-review sidebar's algorithm-trace
+        # panel can show per-cut-point details for each encounter on the
+        # very first load (not only after the user drags a live-tuning
+        # slider). Cost is negligible (~300B per adjacent pair).
+        encounters = run_grouping(photos, config=pipeline_cfg, emit_trace=True)
+        results = reflow(encounters, config=pipeline_cfg)
+
+        # Carry the miss-recomputation marker through so the review UI's
+        # "Review misses" shortcut stays visible after a threshold
+        # tweak. reflow/regroup-live do not recompute misses themselves.
+        cache_dir = os.path.dirname(db_path)
+        existing = load_results_raw(cache_dir, db._active_workspace_id)
+        if existing and existing.get("miss_computed_at"):
+            results["miss_computed_at"] = existing["miss_computed_at"]
+
+        if save_cache and collection_id is None and photo_ids is None:
+            save_results(results, cache_dir, db._active_workspace_id)
+
+        serialized = serialize_results(results)
+        attach_nested_edit_recipes(db, serialized)
+        return jsonify(serialized)
+
+    @blueprint.route("/api/pipeline/regroup-live", methods=["POST"])
+    def api_pipeline_regroup_live():
+        """Re-run stages 2-6 with new grouping thresholds.
+
+        Slightly slower than reflow (seconds) because it re-runs encounter
+        segmentation and burst clustering in addition to scoring/triage.
+
+        When ``collection_id`` is provided, photos are scoped to that
+        collection and results are NOT saved to the workspace cache (so
+        Cull's ephemeral scoped run doesn't clobber pipeline-review's
+        workspace-wide cached state).
+        """
+        from pipeline import (
+            load_photo_features,
+            load_results_raw,
+            run_full_pipeline,
+            save_results,
+            serialize_results,
+        )
+
+        body = request.get_json(silent=True) or {}
+        overrides = body.get("config", {})
+        collection_id = coerce_collection_id(body.get("collection_id"))
+        if collection_id is False:
+            return json_error("collection_id must be an integer")
+        photo_ids = body.get("photo_ids")
+        if photo_ids is not None:
+            if not isinstance(photo_ids, list):
+                return json_error("photo_ids must be a list")
+            for pid in photo_ids:
+                if isinstance(pid, bool) or not isinstance(pid, int):
+                    return json_error("photo_ids entries must be integers")
+            if collection_id is not None:
+                return json_error("photo_ids cannot be combined with collection_id")
+        save_cache = body.get("save_cache", True)
+        if not isinstance(save_cache, bool):
+            return json_error("save_cache must be boolean")
+
+        import config as cfg
+
+        db = get_db()
+        err = reject_visual_collection(db, collection_id)
+        if err is not None:
+            return err
+        effective_cfg = db.get_effective_config(cfg.load())
+        pipeline_cfg = {**effective_cfg.get("pipeline", {}), **overrides}
+
+        photos = load_photo_features(
+            db,
+            collection_id=collection_id,
+            config=effective_cfg,
+            photo_ids=photo_ids,
+        )
+        if not photos:
+            return json_error("No photos with pipeline features", 404)
+
+        # emit_trace=True so the pipeline-review sidebar's algorithm-trace
+        # panel can show per-cut-point details for each encounter. Cost is
+        # negligible (~300B per adjacent pair).
+        results = run_full_pipeline(photos, config=pipeline_cfg, emit_trace=True)
+
+        # Carry the miss-recomputation marker through so the review UI's
+        # "Review misses" shortcut stays visible after a threshold
+        # tweak. regroup-live does not rerun the miss stage itself.
+        cache_dir = os.path.dirname(db_path)
+        existing = load_results_raw(cache_dir, db._active_workspace_id)
+        if existing and existing.get("miss_computed_at"):
+            results["miss_computed_at"] = existing["miss_computed_at"]
+
+        if save_cache and collection_id is None and photo_ids is None:
+            save_results(results, cache_dir, db._active_workspace_id)
+
+        serialized = serialize_results(results)
+        attach_nested_edit_recipes(db, serialized)
+        return jsonify(serialized)
+
+    @blueprint.route("/api/pipeline/detach-burst", methods=["POST"])
+    def api_pipeline_detach_burst():
+        """Detach a burst from its encounter, creating a new standalone encounter."""
+        from pipeline import load_results_raw, rebuild_species_predictions, save_results_raw
+
+        body = request.get_json(silent=True) or {}
+        enc_idx = body.get("encounter_index")
+        burst_idx = body.get("burst_index")
+        if enc_idx is None or burst_idx is None:
+            return json_error("encounter_index and burst_index are required")
+        if isinstance(enc_idx, bool) or not isinstance(enc_idx, int):
+            return json_error("Invalid encounter_index")
+        if isinstance(burst_idx, bool) or not isinstance(burst_idx, int):
+            return json_error("Invalid burst_index")
+
+        db = get_db()
+        cache_dir = os.path.dirname(db_path)
+        results = load_results_raw(cache_dir, db._active_workspace_id)
+        if results is None:
+            return json_error("No pipeline results found", 404)
+
+        encounters = results["encounters"]
+        if enc_idx < 0 or enc_idx >= len(encounters):
+            return json_error("Invalid encounter_index")
+        enc = encounters[enc_idx]
+        bursts = enc.get("bursts", [])
+        if burst_idx < 0 or burst_idx >= len(bursts):
+            return json_error("Invalid burst_index")
+
+        # Remove burst from encounter
+        detached = bursts.pop(burst_idx)
+        detached_ids = detached["photo_ids"]
+        photos_by_id = {p["id"]: p for p in results.get("photos", [])}
+
+        if len(bursts) == 0:
+            # Last burst — remove the encounter entirely, detached becomes the encounter
+            encounters.pop(enc_idx)
+        else:
+            # Update encounter metadata and recalculate species predictions
+            enc["photo_ids"] = [pid for pid in enc["photo_ids"] if pid not in detached_ids]
+            enc["photo_count"] = len(enc["photo_ids"])
+            enc["burst_count"] = len(bursts)
+            # Photos left, so the remaining range can only shrink; recompute it
+            # (mirrors _auto_detach_burst_for_species) instead of leaving a stale,
+            # too-wide range that would misplace this encounter under time sorts.
+            enc["time_range"] = compute_time_range(photos_by_id, enc["photo_ids"])
+            enc["species_predictions"] = rebuild_species_predictions(results, enc["photo_ids"])
+            # No fallback: if the remaining photos have no predictions the
+            # source encounter's stale label was likely inherited from the
+            # burst we just detached, so keeping it would advertise the
+            # detached burst's species as a one-click candidate on an
+            # unrelated group of photos.
+            enc["species"] = rebuild_encounter_species_label(
+                results, enc["photo_ids"]
+            )
+            # Pair indices in trace reference the original photo composition;
+            # drop it so the algorithm-trace panel renders an honest "needs
+            # recompute" state instead of stale rows.
+            enc.pop("trace", None)
+            # Recalculate remaining burst predictions too
+            for b in bursts:
+                b["species_predictions"] = rebuild_species_predictions(results, b["photo_ids"])
+
+        # Create new encounter from detached burst
+        new_enc_predictions = rebuild_species_predictions(results, detached_ids)
+        # No fallback: predictionless detached photos must not inherit the
+        # parent encounter's species — that is exactly the stale-label bug
+        # the surrounding PR is fixing.
+        new_enc_species = rebuild_encounter_species_label(
+            results, detached_ids
+        )
+        # Also refresh the detached burst's own predictions
+        detached["species_predictions"] = new_enc_predictions
+        detached_override = detached.get("species_override") or {}
+        detached_confirmed = bool(detached_override.get("confirmed"))
+        new_enc = {
+            "species": new_enc_species,
+            "confirmed_species": detached_override.get("species") if detached_confirmed else None,
+            "species_predictions": new_enc_predictions,
+            "species_confirmed": detached_confirmed,
+            "photo_count": len(detached_ids),
+            "burst_count": 1,
+            # Compute from the detached photos' timestamps. A [None, None] range
+            # here would sort to the extremes under the encounter time sorts and
+            # render a blank time label in the encounter header.
+            "time_range": compute_time_range(photos_by_id, detached_ids),
+            "photo_ids": detached_ids,
+            "bursts": [detached],
+        }
+        encounters.append(new_enc)
+
+        # Update summary
+        results["summary"]["encounter_count"] = len(encounters)
+        results["summary"]["burst_count"] = sum(
+            e.get("burst_count", 0) for e in encounters
+        )
+
+        save_results_raw(results, cache_dir, db._active_workspace_id)
+        return jsonify({"ok": True, "encounters": encounters, "summary": results["summary"]})
+
+    @blueprint.route("/api/pipeline/detach-photo", methods=["POST"])
+    def api_pipeline_detach_photo():
+        """Detach a photo from its burst, creating a new single-photo burst."""
+        from pipeline import load_results_raw, rebuild_species_predictions, save_results_raw
+
+        body = request.get_json(silent=True) or {}
+        enc_idx = body.get("encounter_index")
+        burst_idx = body.get("burst_index")
+        photo_id = body.get("photo_id")
+        if enc_idx is None or burst_idx is None or photo_id is None:
+            return json_error("encounter_index, burst_index, and photo_id are required")
+        if isinstance(enc_idx, bool) or not isinstance(enc_idx, int):
+            return json_error("Invalid encounter_index")
+        if isinstance(burst_idx, bool) or not isinstance(burst_idx, int):
+            return json_error("Invalid burst_index")
+
+        db = get_db()
+        cache_dir = os.path.dirname(db_path)
+        results = load_results_raw(cache_dir, db._active_workspace_id)
+        if results is None:
+            return json_error("No pipeline results found", 404)
+
+        encounters = results["encounters"]
+        if enc_idx < 0 or enc_idx >= len(encounters):
+            return json_error("Invalid encounter_index")
+        enc = encounters[enc_idx]
+        bursts = enc.get("bursts", [])
+        if burst_idx < 0 or burst_idx >= len(bursts):
+            return json_error("Invalid burst_index")
+
+        burst = bursts[burst_idx]
+        if photo_id not in burst["photo_ids"]:
+            return json_error("photo_id not in burst")
+        source_override = burst.get("species_override") or {}
+
+        # Remove photo from burst
+        burst["photo_ids"].remove(photo_id)
+
+        if len(burst["photo_ids"]) == 0:
+            # Last photo — remove the empty burst
+            bursts.pop(burst_idx)
+        else:
+            # Recalculate source burst predictions without the removed photo
+            burst["species_predictions"] = rebuild_species_predictions(results, burst["photo_ids"])
+
+        # Create new single-photo burst in the same encounter
+        new_burst_predictions = rebuild_species_predictions(results, [photo_id])
+        new_burst_species = rebuild_encounter_species_label(results, [photo_id])
+        if source_override.get("confirmed") and source_override.get("species"):
+            new_burst_override = {
+                "species": source_override["species"],
+                "confirmed": True,
+            }
+        elif enc.get("confirmed_species"):
+            # Inherit the encounter's prior confirmed species by leaving the
+            # override empty. Also covers the mixed/partial state where
+            # species_confirmed is False but confirmed_species records the
+            # dominant prior species (pipeline.py builds encounter payloads
+            # this way for encounters whose photos disagree on confirmed
+            # species). A classifier-guess override here would mask that
+            # prior tag: the confirm endpoint reads species_override.species
+            # without inspecting the confirmed flag, so a later burst confirm
+            # would target the guess as previous_species instead of the real
+            # prior species and leave both keywords on the photo.
+            new_burst_override = None
+        else:
+            new_burst_override = candidate_species_override(new_burst_species)
+        new_burst = {
+            "photo_ids": [photo_id],
+            "species_predictions": new_burst_predictions,
+            "species_override": new_burst_override,
+        }
+        bursts.append(new_burst)
+        enc["burst_count"] = len(bursts)
+        # Recalculate encounter-level predictions
+        enc["species_predictions"] = rebuild_species_predictions(results, enc["photo_ids"])
+        # Encounter composition didn't change but burst structure did; trace
+        # is pair-level only, so it remains valid. No trace mutation needed.
+
+        # Update summary
+        results["summary"]["burst_count"] = sum(
+            e.get("burst_count", 0) for e in encounters
+        )
+
+        save_results_raw(results, cache_dir, db._active_workspace_id)
+        return jsonify({"ok": True, "encounters": encounters, "summary": results["summary"]})
+
+    @blueprint.route("/api/pipeline/save-cache", methods=["POST"])
+    def api_pipeline_save_cache():
+        """Save pipeline results back to cache (used by undo)."""
+        from pipeline import save_results_raw
+
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body.get("encounters"), list) or not isinstance(body.get("photos"), list):
+            return json_error("Invalid pipeline results structure")
+        db = get_db()
+        cache_dir = os.path.dirname(db_path)
+        save_results_raw(body, cache_dir, db._active_workspace_id)
+        return jsonify({"ok": True})
+
+    @blueprint.route("/api/pipeline/group/state", methods=["POST"])
+    def api_pipeline_group_state():
+        """Return current DB state for a set of photos in a pipeline burst.
+
+        Used by the burst-review modal on open so it can seed picks/rejects
+        from the live `photos.flag` value (rather than the stale cached value
+        in pipelineResults) and show whether each photo already has the
+        consensus species keyword applied.
+
+        Body: {photo_ids: [int], species: str}
+        Returns: {photos: {pid: {flag, has_species_keyword,
+                  is_species_representative}}, species_kid: int|None}
+        """
+        db = get_db()
+        body = request.get_json(silent=True) or {}
+        photo_ids = list(body.get("photo_ids", []) or [])
+        species = (body.get("species") or "").strip()
+
+        species_kid = None
+        if species:
+            # Read-only mirror of the species-aware lookup in db.add_keyword(
+            # species, is_species=True): match top-level taxonomy/general rows
+            # case-insensitively, prefer taxonomy. Excludes homonym rows of
+            # other deliberate types (individual, location, genre) so a person
+            # tag named like a species doesn't get reported as the species
+            # keyword for has_species_keyword / Apply-label purposes.
+            row = db.conn.execute(
+                "SELECT id FROM keywords WHERE name = ? COLLATE NOCASE "
+                "AND parent_id IS NULL AND type IN ('taxonomy', 'general') "
+                "ORDER BY (type = 'taxonomy') DESC, id ASC LIMIT 1",
+                (species,),
+            ).fetchone()
+            if row:
+                species_kid = row["id"]
+
+        # Gate the badge on the same eligibility rules the shared payload
+        # attachers use, so a stale preference row (photo later rejected or
+        # no longer carrying the species keyword) doesn't light up the modal
+        # while browse/highlights hide it.
+        representatives = db.get_species_representatives(eligible_only=True)
+        photos = {}
+        for pid in photo_ids:
+            # Same workspace guard the apply endpoint uses, so a malicious
+            # or buggy client can't read flag/keyword state for photos that
+            # don't belong to the active workspace.
+            if not db._photo_in_workspace(pid):
+                continue
+            row = db.get_photo(pid)
+            if not row:
+                continue
+            has_kw = False
+            if species_kid is not None:
+                has_kw = any(k["id"] == species_kid for k in db.get_photo_keywords(pid))
+            photos[pid] = {
+                "flag": row["flag"] or "none",
+                "has_species_keyword": has_kw,
+                "is_species_representative": bool(
+                    species and representatives.get(species) == pid
+                ),
+            }
+        return jsonify({"photos": photos, "species_kid": species_kid})
+
+    @blueprint.route("/api/pipeline/group/apply", methods=["POST"])
+    def api_pipeline_group_apply():
+        """Apply pick/reject/candidate flag decisions to a pipeline burst group.
+
+        Flags-only: species confirmation now routes through a dedicated path
+        (`/api/encounters/species`), so this endpoint no longer tags any species
+        keyword. Diff-based: only writes flag changes for photos whose flag
+        actually changes, and clears flags on photos moved to candidates that
+        were previously flagged/rejected. Returns per-photo new flag state so
+        the client can update its rendered cards without reloading.
+        """
+        db = get_db()
+        body = request.get_json(silent=True) or {}
+        picks = list(body.get("picks", []) or [])
+        rejects = list(body.get("rejects", []) or [])
+        candidates = list(body.get("candidates", []) or [])
+
+        # The same photo can't be in two zones. Reject conflicting input.
+        seen = set()
+        for pid in picks + rejects + candidates:
+            if pid in seen:
+                return json_error(f"Photo {pid} appears in more than one zone", 400)
+            seen.add(pid)
+
+        # All photos must be in the active workspace.
+        for pid in picks + rejects + candidates:
+            if not db._photo_in_workspace(pid):
+                return json_error(f"Photo {pid} is not in the active workspace", 403)
+
+        # Capture current state for diffing + edit history.
+        old_flags = {}
+        for pid in picks + rejects + candidates:
+            row = db.get_photo(pid)
+            if row:
+                old_flags[pid] = row["flag"] or "none"
+
+        try:
+            # Apply target flags. We rely on update_photo_flag's own write
+            # being a no-op at the SQL level when the value matches, but we
+            # still skip when unchanged so we don't record useless history.
+            flag_items = []
+            for pid in picks:
+                old = old_flags.get(pid, "none")
+                if old != "flagged":
+                    db.update_photo_flag(pid, "flagged")
+                    flag_items.append({"photo_id": pid, "old_value": old, "new_value": "flagged"})
+            for pid in rejects:
+                old = old_flags.get(pid, "none")
+                if old != "rejected":
+                    db.update_photo_flag(pid, "rejected")
+                    flag_items.append({"photo_id": pid, "old_value": old, "new_value": "rejected"})
+            for pid in candidates:
+                old = old_flags.get(pid, "none")
+                if old in ("flagged", "rejected"):
+                    db.update_photo_flag(pid, "none")
+                    flag_items.append({"photo_id": pid, "old_value": old, "new_value": "none"})
+        except ValueError as e:
+            return json_error(str(e), 403)
+
+        if flag_items:
+            for item in flag_items:
+                db.queue_flag_change_if_enabled(
+                    item["photo_id"], item["new_value"], _commit=False
+                )
+            db.conn.commit()
+            desc = (
+                f"Pipeline burst group: flagged {len(picks)}, rejected {len(rejects)}, "
+                f"cleared {sum(1 for it in flag_items if it['new_value'] == 'none')}"
+            )
+            db.record_edit("flag", desc, "pipeline_group_apply", flag_items,
+                           is_batch=len(flag_items) > 1)
+
+        # Return new per-photo state so the client can update without a reload.
+        # `has_species_keyword` is kept in the payload (now always False) so the
+        # client cache-sync code need not change shape; this endpoint no longer
+        # tags species.
+        result_photos = {}
+        for pid in picks + rejects + candidates:
+            row = db.get_photo(pid)
+            if not row:
+                continue
+            result_photos[pid] = {
+                "flag": row["flag"] or "none",
+                "has_species_keyword": False,
+            }
+        return jsonify({"ok": True, "photos": result_photos})
+
+    @blueprint.route("/api/pipeline/active-mask-variant", methods=["POST"])
+    def api_pipeline_active_mask_variant():
+        """Switch the active mask variant for every photo in the workspace
+        that has a row for ``variant`` in ``photo_masks``.
+
+        This is the bulk version of ``Database.set_active_mask_variant``:
+        it walks the workspace's photos, finds the ones with a mask row
+        for the requested variant, and denormalizes that variant's
+        path/features into the ``photos`` row so downstream readers
+        (scoring, lightbox overlay) see the new active mask.
+
+        Body: ``{"variant": "<sam2-variant>"}``.
+        Refuses ``"unknown"`` because it's a migration sentinel, not a
+        user-selectable variant.
+        """
+        body = request.get_json(silent=True) or {}
+        variant = (body.get("variant") or "").strip()
+        if not variant:
+            return json_error("variant required")
+        if variant == "unknown":
+            return json_error(
+                "'unknown' is a migration sentinel and cannot be set active",
+                400,
+            )
+        db = get_db()
+        ws = db._ws_id()
+        rows = db.conn.execute(
+            """
+            SELECT pm.photo_id
+              FROM photo_masks pm
+              JOIN photos p ON p.id = pm.photo_id
+              JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+             WHERE wf.workspace_id = ? AND pm.variant = ?
+            """,
+            (ws, variant),
+        ).fetchall()
+        updated = 0
+        # Batch: skip the per-row commit_with_retry inside
+        # set_active_mask_variant and commit once after the loop. A
+        # workspace with 10K photos would otherwise pay 10K WAL fsyncs
+        # per request — multiple seconds with no progress indicator.
+        for r in rows:
+            try:
+                db.set_active_mask_variant(
+                    r["photo_id"], variant, _commit=False,
+                )
+                updated += 1
+            except ValueError as e:
+                # Race: row was deleted between SELECT and UPDATE. Skip
+                # rather than 500 — the user just asked to "make this
+                # the active variant where possible". Log the skip so
+                # the cause is visible if the count looks off.
+                log.warning(
+                    "active-mask-variant skip photo %d: %s",
+                    r["photo_id"], e,
+                )
+                continue
+        commit_with_retry(db.conn)
+        log.info(
+            "Switched active mask variant to %s for %d workspace photo(s)",
+            variant, updated,
+        )
+        return jsonify({"ok": True, "updated": updated})
+
+    @blueprint.route("/api/photos/<int:photo_id>/pipeline")
+    def api_photo_pipeline(photo_id):
+        """Return full pipeline debug info for a single photo."""
+        db = get_db()
+        # Workspace gate before the raw join below: the response exposes
+        # folder_path and full photo metadata (mirrors serve_thumbnail).
+        if db.get_photo(photo_id, verify_workspace=True) is None:
+            return json_error("Photo not found", 404)
+        photo = db.conn.execute(
+            """SELECT p.*, f.path as folder_path FROM photos p
+               JOIN folders f ON f.id = p.folder_id WHERE p.id = ?""",
+            (photo_id,),
+        ).fetchone()
+        if not photo:
+            return json_error("Photo not found", 404)
+
+        result = dict(photo)
+        # Remove binary embedding and dead detection columns from response.
+        # The inspector only needs display/debug fields; returning BLOBs makes
+        # jsonify fail once the extract stage has populated DINO embeddings.
+        result.pop("embedding", None)
+        result.pop("dino_subject_embedding", None)
+        result.pop("dino_global_embedding", None)
+        result.pop("detection_box", None)
+        result.pop("detection_conf", None)
+
+        # Get detections for this photo. The main inspector view honors the
+        # workspace-effective detector threshold, but the diagnostics keep raw
+        # counts so the UI can distinguish "not run" from "hidden by threshold".
+        import config as cfg
+        ws = db._active_workspace_id
+        min_conf = db.get_effective_config(cfg.load()).get(
+            "detector_confidence", 0.2
+        )
+        try:
+            min_conf = float(min_conf)
+        except (TypeError, ValueError):
+            min_conf = 0.2
+        raw_dets = [
+            d for d in db.get_detections(photo_id, min_conf=0)
+            if d["detector_model"] != "full-image"
+        ]
+        dets = [d for d in raw_dets if d["detector_confidence"] >= min_conf]
+        result["detections"] = [dict(d) for d in dets]
+
+        # Primary detection = highest-confidence above threshold.
+        if dets:
+            primary = dets[0]
+            result["detection_box"] = {
+                "x": primary["box_x"], "y": primary["box_y"],
+                "w": primary["box_w"], "h": primary["box_h"],
+            }
+            result["detection_conf"] = primary["detector_confidence"]
+
+        # Get predictions for this photo (through detections JOIN).  Per-
+        # workspace review state (status, group_id, individual, vote counts)
+        # is left-joined from prediction_review; absent rows are 'pending'.
+        #
+        # Apply the same workspace-effective detector_confidence floor used
+        # by `db.get_detections` above so result["predictions"] stays in
+        # sync with result["detections"]. Otherwise raising the threshold
+        # leaves stale species rows for detections the UI is meant to hide.
+        # Also pin to the most recent labels_fingerprint per
+        # (detection, classifier_model) so a workspace that rotated label
+        # sets doesn't see a debug payload mixing stale and current labels.
+        preds = db.conn.execute(
+            """SELECT pr.species, pr.confidence, pr.classifier_model AS model,
+                      pr.category,
+                      COALESCE(pr_rev.status, 'pending') AS status,
+                      pr_rev.individual AS individual,
+                      pr_rev.group_id AS group_id,
+                      pr_rev.vote_count AS vote_count,
+                      pr_rev.total_votes AS total_votes,
+                      d.box_x, d.box_y, d.box_w, d.box_h, d.detector_confidence
+               FROM predictions pr
+               JOIN detections d ON d.id = pr.detection_id
+               LEFT JOIN prediction_review pr_rev
+                 ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+               WHERE d.photo_id = ?
+                 AND d.detector_confidence >= ?
+                 AND d.detector_model != 'full-image'
+                 AND pr.labels_fingerprint = (
+                    SELECT pr2.labels_fingerprint FROM predictions pr2
+                    WHERE pr2.detection_id = pr.detection_id
+                      AND pr2.classifier_model = pr.classifier_model
+                    ORDER BY pr2.created_at DESC, pr2.id DESC
+                    LIMIT 1
+                 )
+               ORDER BY pr.confidence DESC""",
+            (ws, photo_id, min_conf),
+        ).fetchall()
+        result["predictions"] = [dict(p) for p in preds]
+
+        current_pred_rows = db.conn.execute(
+            """SELECT pr.id, d.detector_confidence
+               FROM predictions pr
+               JOIN detections d ON d.id = pr.detection_id
+               WHERE d.photo_id = ?
+                 AND d.detector_model != 'full-image'
+                 AND pr.labels_fingerprint = (
+                    SELECT pr2.labels_fingerprint FROM predictions pr2
+                    WHERE pr2.detection_id = pr.detection_id
+                      AND pr2.classifier_model = pr.classifier_model
+                    ORDER BY pr2.created_at DESC, pr2.id DESC
+                    LIMIT 1
+                 )""",
+            (photo_id,),
+        ).fetchall()
+        classifier_runs = db.conn.execute(
+            """SELECT cr.prediction_count, d.detector_confidence
+               FROM classifier_runs cr
+               JOIN detections d ON d.id = cr.detection_id
+               WHERE d.photo_id = ?
+                 AND d.detector_model != 'full-image'""",
+            (photo_id,),
+        ).fetchall()
+        full_image_pred_rows = db.conn.execute(
+            """SELECT pr.id
+               FROM predictions pr
+               JOIN detections d ON d.id = pr.detection_id
+               WHERE d.photo_id = ?
+                 AND d.detector_model = 'full-image'
+                 AND pr.labels_fingerprint = (
+                    SELECT pr2.labels_fingerprint FROM predictions pr2
+                    WHERE pr2.detection_id = pr.detection_id
+                      AND pr2.classifier_model = pr.classifier_model
+                    ORDER BY pr2.created_at DESC, pr2.id DESC
+                    LIMIT 1
+                 )""",
+            (photo_id,),
+        ).fetchall()
+        full_image_classifier_runs = db.conn.execute(
+            """SELECT cr.prediction_count
+               FROM classifier_runs cr
+               JOIN detections d ON d.id = cr.detection_id
+               WHERE d.photo_id = ?
+                 AND d.detector_model = 'full-image'""",
+            (photo_id,),
+        ).fetchall()
+        max_raw_conf = (
+            max(d["detector_confidence"] for d in raw_dets)
+            if raw_dets else None
+        )
+        result["classification_diagnostics"] = {
+            "detector_confidence_threshold": min_conf,
+            "raw_detection_count": len(raw_dets),
+            "visible_detection_count": len(dets),
+            "hidden_detection_count": max(0, len(raw_dets) - len(dets)),
+            "max_detector_confidence": max_raw_conf,
+            "current_prediction_count": len(current_pred_rows),
+            "visible_prediction_count": len(preds),
+            "hidden_prediction_count": sum(
+                1
+                for p in current_pred_rows
+                if p["detector_confidence"] < min_conf
+            ),
+            "classifier_run_count": len(classifier_runs),
+            "full_image_prediction_count": len(full_image_pred_rows),
+            "full_image_classifier_run_count": len(full_image_classifier_runs),
+            "hidden_classifier_run_count": sum(
+                1
+                for r in classifier_runs
+                if r["detector_confidence"] < min_conf
+            ),
+            "zero_prediction_classifier_run_count": sum(
+                1
+                for r in classifier_runs
+                if r["prediction_count"] == 0
+            ),
+        }
+
+        # Get keywords
+        keywords = db.get_photo_keywords(photo_id)
+        result["keywords"] = [dict(k) for k in keywords]
+
+        # Compute crop info from primary detection (highest confidence)
+        primary_det = dets[0] if dets else None
+        if primary_det:
+            import config as cfg
+            box = {"x": primary_det["box_x"], "y": primary_det["box_y"],
+                   "w": primary_det["box_w"], "h": primary_det["box_h"]}
+            pad = cfg.load().get("detection_padding", 0.2)
+            result["crop_box"] = {
+                "x": max(0, box["x"] - box["w"] * pad),
+                "y": max(0, box["y"] - box["h"] * pad),
+                "w": min(1.0, box["w"] * (1 + 2 * pad)),
+                "h": min(1.0, box["h"] * (1 + 2 * pad)),
+            }
+
+        return jsonify(result)
 
     return blueprint

@@ -240,7 +240,7 @@ def test_check_duplicates_slow_check_yields_per_file(
     """When a per-file check exceeds the flush window, each file gets its
     own event so an aborted preview stops within one file's worth of work
     (rather than draining a fixed batch first)."""
-    import app as vireo_app
+    import web.imports as vireo_app
 
     app, _db, _fid = app_and_db
 
@@ -279,7 +279,7 @@ def test_check_duplicates_prep_phase_yields_between_batches(
     to notice a superseded browser request during the (potentially long)
     EXIF-batching phase — chunking with a yield puts a cancellation
     point every prep-batch worth of I/O."""
-    import app as vireo_app
+    import web.imports as vireo_app
 
     app, _db, _fid = app_and_db
 

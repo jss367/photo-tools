@@ -505,9 +505,9 @@ def test_verify_endpoint_loads_manifest_inside_cleanup_job_lock():
     """
     import inspect
 
-    import app as app_module
+    from web.card_cleanup import create_card_cleanup_blueprint
 
-    src = inspect.getsource(app_module.create_app)
+    src = inspect.getsource(create_card_cleanup_blueprint)
     start = src.index("def api_card_cleanup_verify(")
     end = src.index("def api_card_cleanup_delete(", start)
     verify_src = src[start:end]

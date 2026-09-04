@@ -1010,6 +1010,48 @@ def test_incremental_scan_skips_unchanged(tmp_path):
     assert 'new.jpg' in filenames
 
 
+@pytest.mark.parametrize("requested_count", [0, 1, 401])
+def test_incremental_index_reads_only_requested_photos(tmp_path, requested_count):
+    """Lookup cost follows the manifest, including across query batches."""
+    from db import Database
+    from scanner import _incremental_photo_index
+
+    with Database(str(tmp_path / "test.db")) as db:
+        folder = tmp_path / "archive_%"
+        folder_id = db.add_folder(str(folder), name=folder.name)
+        requested = [folder / f"photo-{i}.jpg" for i in range(requested_count)]
+        db.conn.executemany(
+            "INSERT INTO photos(folder_id, filename, file_size, file_mtime, "
+            "file_hash, exif_data) VALUES (?, ?, 123, 456, 'known-hash', '{}')",
+            [(folder_id, path.name) for path in requested],
+        )
+        # Many unrelated photos in the SAME folder must not be loaded either.
+        db.conn.executemany(
+            "INSERT INTO photos(folder_id, filename) VALUES (?, ?)",
+            [(folder_id, f"unrelated-{i}.jpg") for i in range(10000)],
+        )
+        db.conn.commit()
+        new_ws = db.create_workspace("Empty workspace")
+        db.set_active_workspace(new_ws)
+
+        operations = 0
+
+        def count_operations():
+            nonlocal operations
+            operations += 100
+            return 0
+
+        db.conn.set_progress_handler(count_operations, 100)
+        try:
+            result = _incremental_photo_index(db, requested)
+        finally:
+            db.conn.set_progress_handler(None, 0)
+
+        assert set(result) == {str(path) for path in requested}
+        assert all(row["file_hash"] == "known-hash" for row in result.values())
+        assert operations < 2000 + requested_count * 100
+
+
 def test_incremental_scan_converges_after_file_change(tmp_path):
     """A changed file is re-processed once, then skipped on later scans.
 

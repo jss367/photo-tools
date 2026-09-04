@@ -6376,7 +6376,9 @@ def test_import_in_place_no_destination_required(app_and_db, tmp_path):
     assert [p["id"] for p in photos] == result["photo_ids"]
 
 
-@pytest.mark.parametrize("change", [None, "content", "missing_metadata"])
+@pytest.mark.parametrize("change", [
+    None, "content", "content_preserving_mtime", "missing_metadata",
+])
 def test_import_in_place_reuses_catalog_across_workspaces(
     app_and_db, tmp_path, monkeypatch, change,
 ):
@@ -6399,16 +6401,19 @@ def test_import_in_place_reuses_catalog_across_workspaces(
     original = {
         row["filename"]: dict(row)
         for row in db.conn.execute(
-            "SELECT id, filename, file_hash, file_mtime FROM photos WHERE folder_id="
+            "SELECT id, filename, file_hash, file_mtime, file_size FROM photos WHERE folder_id="
             "(SELECT id FROM folders WHERE path=?)", (str(source),),
         )
     }
 
     expected_reads = set()
-    if change == "content":
+    if change in {"content", "content_preserving_mtime"}:
         Image.new("RGB", (32, 32), "blue").save(other)
-        mtime = original[other.name]["file_mtime"] + 10
+        mtime = original[other.name]["file_mtime"]
+        if change == "content":
+            mtime += 10
         os.utime(other, (mtime, mtime))
+        assert other.stat().st_size != original[other.name]["file_size"]
         new_photo = source / "new.jpg"
         Image.new("RGB", (16, 16), "yellow").save(new_photo)
         expected_reads = {str(other), str(new_photo)}
@@ -6447,7 +6452,7 @@ def test_import_in_place_reuses_catalog_across_workspaces(
     assert set(metadata_reads) == expected_reads
 
     result = job["result"]
-    expected_count = 3 if change == "content" else 2
+    expected_count = 3 if change in {"content", "content_preserving_mtime"} else 2
     assert result["ok"] is True
     assert result["indexed"] == expected_count
     assert job["steps"][0]["progress"] == {
@@ -6456,7 +6461,7 @@ def test_import_in_place_reuses_catalog_across_workspaces(
     rows = {
         row["filename"]: dict(row)
         for row in db.conn.execute(
-            "SELECT id, filename, file_hash FROM photos WHERE folder_id="
+            "SELECT id, filename, file_hash, file_size, width FROM photos WHERE folder_id="
             "(SELECT id FROM folders WHERE path=?)", (str(source),),
         )
     }
@@ -6464,8 +6469,10 @@ def test_import_in_place_reuses_catalog_across_workspaces(
     for name, previous in original.items():
         assert rows[name]["id"] == previous["id"]
     assert rows[unchanged.name]["file_hash"] == original[unchanged.name]["file_hash"]
-    if change == "content":
+    if change in {"content", "content_preserving_mtime"}:
         assert rows[other.name]["file_hash"] != original[other.name]["file_hash"]
+        assert rows[other.name]["file_size"] == other.stat().st_size
+        assert rows[other.name]["width"] == 32
     assert set(result["photo_ids"]) == {row["id"] for row in rows.values()}
     new_ws = job["workspace_id"]
     assert new_ws != old_ws

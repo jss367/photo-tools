@@ -2727,7 +2727,13 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                 full_path_str = str(image_path)
                 existing = existing_by_path.get(full_path_str)
                 if existing:
-                    file_unchanged = existing["file_mtime"] == file_mtime
+                    # Copies/restores can preserve mtime even when the
+                    # original is replaced. Check size from the same stat
+                    # before reusing metadata, hashes, and derived caches.
+                    file_unchanged = (
+                        existing["file_mtime"] == file_mtime
+                        and existing["file_size"] == stat.st_size
+                    )
                     xmp_unchanged = existing["xmp_mtime"] == xmp_mtime
                     # Re-process if ExifTool never ran for this photo (both
                     # timestamp and exif_data are NULL). Photos with genuinely

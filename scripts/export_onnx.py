@@ -4,6 +4,9 @@
 This is a dev-only script. It requires the [export] optional dependencies:
     pip install -e ".[export]"
 
+RTMPose and SuperAnimal require standalone NumPy 1 environments instead;
+see scripts/model-export/README.md for their installation commands.
+
 Usage:
     # Export a single model
     python scripts/export_onnx.py --model bioclip-vit-b-16

@@ -17275,6 +17275,7 @@ def test_api_exiftool_status_reports_missing(app_and_db, monkeypatch):
     app, db = app_and_db
     import metadata
     monkeypatch.setattr(metadata.shutil, "which", lambda name: None)
+    monkeypatch.setattr(metadata, "_find_standard_homebrew_tool", lambda name: None)
 
     client = app.test_client()
     resp = client.get('/api/exiftool/status')

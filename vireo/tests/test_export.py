@@ -6,8 +6,10 @@ import json
 import os
 import sys
 import threading
+import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -3686,3 +3688,54 @@ def test_move_folder_descendant_query_ignores_like_wildcard_matches(tmp_path, mo
         f"relocate_developed_dir was called against the unrelated folder; "
         f"calls={calls}"
     )
+
+
+def test_cancelled_export_discards_derivatives_awaiting_metadata(export_env, monkeypatch):
+    import export as export_module
+
+    env = export_env
+    cancelled = False
+
+    def progress(*_args):
+        nonlocal cancelled
+        cancelled = True
+
+    def unexpected_start(*_args, **_kwargs):
+        pytest.fail("cancelled export started ExifTool")
+
+    monkeypatch.setattr(export_module.subprocess, "Popen", unexpected_start)
+    result = export_photos(
+        db=env["db"], vireo_dir=env["vireo_dir"], photo_ids=[env["p1"], env["p2"]],
+        destination=env["dest"], options={"metadata_fields": ["capture_date"], "collect_files": True},
+        progress_cb=progress, cancel_check=lambda: cancelled,
+    )
+    assert result["exported"] == 0
+    assert result["files"] == []
+    assert not list(Path(env["dest"]).glob("*.jpg"))
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_export_metadata_subprocess_can_be_cancelled(tmp_path, monkeypatch, cancel):
+    import export as export_module
+    import metadata
+
+    ready = tmp_path / "ready"
+    output = tmp_path / "bird.jpg"
+    output.write_bytes(b"rendered")
+    script = (
+        "import pathlib, sys, time; sys.stdin.read(); "
+        f"pathlib.Path({str(ready)!r}).write_text('ready'); "
+        + ("time.sleep(30)" if cancel else "print('VIREO_METADATA_STATUS_1_0')")
+    )
+    monkeypatch.setattr(metadata, "find_exiftool", lambda: "test-exiftool")
+    monkeypatch.setattr(metadata, "_exiftool_command", lambda _: [sys.executable, "-c", script])
+    started = time.monotonic()
+    count, errors = export_module._write_export_metadata_batch(
+        [(str(output), output.name, ["-XMP-dc:Subject=Bird"])],
+        cancel_check=lambda: cancel and ready.exists(),
+    )
+    assert ready.exists()
+    assert time.monotonic() - started < 10
+    assert count == (0 if cancel else 1)
+    assert bool(errors) == cancel
+    assert output.exists() != cancel

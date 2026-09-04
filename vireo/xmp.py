@@ -6,6 +6,10 @@ All XMP namespace constants and helpers live here as the single source of truth.
 
 import logging
 import math
+import os
+import stat
+import sys
+import uuid
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -39,6 +43,80 @@ ET.register_namespace("vireo", NS_VIREO)
 
 
 # ── Private helpers ─────────────────────────────────────────────────────
+
+def _preserve_sidecar_access(source, destination, source_stat):
+    """Copy access metadata, failing before replacement if preservation fails."""
+    if os.name == "posix":
+        destination_stat = destination.stat()
+        if (destination_stat.st_uid, destination_stat.st_gid) != (
+            source_stat.st_uid, source_stat.st_gid,
+        ):
+            os.chown(destination, source_stat.st_uid, source_stat.st_gid)
+
+    os.chmod(destination, stat.S_IMODE(source_stat.st_mode))
+    if sys.platform == "darwin":
+        # macOS ACLs are not exposed through Python's xattr API. copyfile(3)
+        # copies them natively; omit COPYFILE_DATA and COPYFILE_STAT so the
+        # newly serialized content and its modification time stay intact.
+        import ctypes
+
+        copyfile = ctypes.CDLL(None, use_errno=True).copyfile
+        copyfile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p,
+                             ctypes.c_uint32]
+        copyfile.restype = ctypes.c_int
+        copyfile_acl_xattr = (1 << 0) | (1 << 2)
+        if copyfile(os.fsencode(source), os.fsencode(destination), None,
+                    copyfile_acl_xattr) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), str(source))
+    elif hasattr(os, "listxattr"):
+        # Linux exposes POSIX ACLs as system.posix_acl_access. Unlike
+        # shutil.copystat, do not silently ignore permission-copy failures.
+        attributes = {name: os.getxattr(source, name) for name in os.listxattr(source)}
+        for name in set(os.listxattr(destination)) - attributes.keys():
+            os.removexattr(destination, name)
+        for name, value in attributes.items():
+            os.setxattr(destination, name, value)
+
+    if hasattr(source_stat, "st_flags"):
+        os.chflags(destination, source_stat.st_flags)
+
+
+def _write_tree_atomic(tree, xmp_path):
+    """Publish a complete sidecar without truncating the previous version.
+
+    Keep the temporary file on the same filesystem for atomic replacement,
+    preserve existing permissions, and follow sidecar symlinks just as the
+    former direct write did. Failed writes leave the original intact.
+    """
+    path = Path(xmp_path).resolve()
+    try:
+        source_stat = path.stat()
+    except FileNotFoundError:
+        source_stat = None
+    if source_stat is not None:
+        # Replacing a directory entry bypasses the file's write protection on
+        # POSIX. Probe write access without truncation to retain the previous
+        # writer's permission checks, including ACLs and read-only flags.
+        os.close(os.open(path, os.O_WRONLY))
+    temp_path = None
+    try:
+        candidate = path.parent / f".vireo-xmp-{uuid.uuid4().hex}.tmp"
+        # 0666 lets the process umask set permissions for new sidecars,
+        # matching a direct write (mkstemp would silently restrict to 0600).
+        fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        temp_path = candidate
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            tree.write(stream, xml_declaration=True, encoding="unicode")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if source_stat is not None:
+            _preserve_sidecar_access(path, temp_path, source_stat)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
 
 def _get_or_create_bag(parent, tag_ns, tag_name):
     """Find or create an rdf:Bag under a namespaced element."""
@@ -335,7 +413,7 @@ def write_sidecar(xmp_path, flat_keywords, hierarchical_keywords):
 
     # Write with XML declaration
     ET.indent(tree, space="  ")
-    tree.write(xmp_path, xml_declaration=True, encoding="unicode")
+    _write_tree_atomic(tree, xmp_path)
 
 
 def write_rating(xmp_path, rating):
@@ -359,7 +437,7 @@ def write_rating(xmp_path, rating):
     if desc is not None:
         desc.set(f"{{{NS_XMP}}}Rating", str(rating))
         ET.indent(tree, space="  ")
-        tree.write(xmp_path, xml_declaration=True, encoding="unicode")
+        _write_tree_atomic(tree, xmp_path)
 
 
 def write_pick_flag(xmp_path, flag):
@@ -381,7 +459,7 @@ def write_pick_flag(xmp_path, flag):
     desc = _get_or_create_description(root)
     desc.set(f"{{{NS_XMPDM}}}pick", values[flag])
     ET.indent(tree, space="  ")
-    tree.write(xmp_path, xml_declaration=True, encoding="unicode")
+    _write_tree_atomic(tree, xmp_path)
 
 
 def write_gps_location(xmp_path, latitude, longitude, source="assigned"):
@@ -422,7 +500,7 @@ def write_gps_location(xmp_path, latitude, longitude, source="assigned"):
     desc.set(exif_attrs["GPSVersionID"], "2.3.0.0")
     desc.set(marker, source or "assigned")
     ET.indent(tree, space="  ")
-    tree.write(xmp_path, xml_declaration=True, encoding="unicode")
+    _write_tree_atomic(tree, xmp_path)
 
 
 def remove_vireo_gps_location(xmp_path):
@@ -458,7 +536,7 @@ def remove_vireo_gps_location(xmp_path):
 
     if removed:
         ET.indent(tree, space="  ")
-        tree.write(xmp_path, xml_declaration=True, encoding="unicode")
+        _write_tree_atomic(tree, xmp_path)
     return removed
 
 
@@ -490,7 +568,7 @@ def write_edit_recipe(xmp_path, recipe_json):
             return False
 
     ET.indent(tree, space="  ")
-    tree.write(xmp_path, xml_declaration=True, encoding="unicode")
+    _write_tree_atomic(tree, xmp_path)
     return True
 
 
@@ -558,5 +636,5 @@ def remove_keywords(xmp_path, keywords_to_remove, *, hierarchical=True):
 
     if removed:
         ET.indent(tree, space="  ")
-        tree.write(xmp_path, xml_declaration=True, encoding="unicode")
+        _write_tree_atomic(tree, xmp_path)
         log.info("Removed keywords from %s: %s", xmp_path, removed)

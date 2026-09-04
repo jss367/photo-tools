@@ -1,5 +1,8 @@
 import json
+import os
+import threading
 
+import pytest
 from PIL import Image
 from wait import wait_for_job_via_client
 
@@ -295,3 +298,269 @@ def test_publish_site_job_rejects_relative_destination(app_and_db):
         "destination": "relative/out",
     })
     assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("source", ["original", "default_developed", "custom_developed"])
+@pytest.mark.parametrize("cropped", [False, True])
+def test_publish_renders_saved_edits_and_developed_images(tmp_path, monkeypatch, source, cropped):
+    import config as cfg
+    from export import developed_folder_key
+
+    app, db, meta = _seed_publish_app(tmp_path, monkeypatch)
+    if cropped:
+        db.set_photo_edit_recipe(meta["p1"], {"crop": {"x": 0, "y": 0, "w": 0.5, "h": 1}})
+    if source != "original":
+        if source == "custom_developed":
+            output = tmp_path / "custom-developed"
+            cfg.save({"darktable_output_dir": str(output)})
+            developed = output / developed_folder_key(str(meta["photos_dir"]))
+        else:
+            developed = meta["photos_dir"] / "developed"
+        developed.mkdir(parents=True)
+        Image.new("RGB", (1200, 800), (0, 0, 255)).save(developed / "cardinal.jpg")
+
+    client = app.test_client()
+    destination = tmp_path / "published"
+    response = client.post("/api/jobs/publish-site", json={
+        "destination": str(destination), "max_size": 800,
+    })
+    job = wait_for_job_via_client(client, response.get_json()["job_id"])
+    assert job["status"] == "completed"
+    assert job["result"]["errors"] == []
+    manifest = json.loads((destination / "data/life-list.json").read_text())
+    cardinal = next(s for s in manifest["species"] if s["species"] == "Northern Cardinal")
+    with Image.open(destination / cardinal["best"]["image"]) as image:
+        assert image.size == ((600, 800) if cropped else (800, 533))
+        red, _, blue = image.getpixel((0, 0))
+        assert (red > blue) if source == "original" else (blue > red)
+    db.close()
+
+
+@pytest.mark.parametrize("job_type", ["export", "publish-site"])
+def test_export_jobs_stop_between_photos_when_cancelled(tmp_path, monkeypatch, job_type):
+    import export
+
+    app, db, _meta = _seed_publish_app(tmp_path, monkeypatch)
+    started, release = threading.Event(), threading.Event()
+    original_load = export.load_image
+    loaded = []
+
+    def controlled_load(path, *args, **kwargs):
+        loaded.append(path)
+        if len(loaded) == 1:
+            started.set()
+            assert release.wait(10), "cancel request never arrived"
+        return original_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(export, "load_image", controlled_load)
+    client = app.test_client()
+    destination = tmp_path / "cancelled"
+    destination.mkdir()
+    data = destination / "data"
+    data.mkdir()
+    (data / "site.json").write_text('{"previous":true}')
+    options = {"destination": str(destination), "max_size": 512}
+    if job_type == "export":
+        options["photo_ids"] = [r["id"] for r in db.conn.execute("SELECT id FROM photos")]
+    response = client.post(f"/api/jobs/{job_type}", json=options)
+    assert response.status_code == 200
+    job_id = response.get_json()["job_id"]
+    try:
+        assert started.wait(10), "export never started"
+        assert client.post(f"/api/jobs/{job_id}/cancel").status_code == 200
+    finally:
+        release.set()
+    job = wait_for_job_via_client(client, job_id)
+    assert job["status"] == "cancelled"
+    assert len(loaded) == 1
+    assert len(list(destination.rglob("*.jpg"))) == (1 if job_type == "export" else 0)
+    count_key = "exported" if job_type == "export" else "exported_images"
+    assert job["result"][count_key] == 1
+    assert (data / "site.json").read_text() == '{"previous":true}'
+    db.close()
+
+
+@pytest.mark.parametrize("boundary", [
+    "before_commit", "site.json", "life-list.json", "highlights.json",
+])
+def test_publish_cancellation_is_coordinated_with_manifest_commit(
+    tmp_path, monkeypatch, boundary,
+):
+    import site_publish
+    from jobs import JobRunner
+
+    app, db, _meta = _seed_publish_app(tmp_path, monkeypatch)
+    reached, release = threading.Event(), threading.Event()
+    original_begin = JobRunner.begin_uncancellable
+    original_copy = site_publish.shutil.copyfile
+
+    def wait_for_cancel():
+        reached.set()
+        assert release.wait(10), "cancel request never arrived"
+
+    def controlled_begin(runner, job_id):
+        if boundary == "before_commit":
+            wait_for_cancel()
+        return original_begin(runner, job_id)
+
+    def controlled_copy(source, destination):
+        if getattr(destination, "name", None) == boundary:
+            wait_for_cancel()
+        return original_copy(source, destination)
+
+    monkeypatch.setattr(JobRunner, "begin_uncancellable", controlled_begin)
+    monkeypatch.setattr(site_publish.shutil, "copyfile", controlled_copy)
+    destination = tmp_path / "published"
+    data = destination / "data"
+    data.mkdir(parents=True)
+    filenames = ["site.json", "life-list.json", "highlights.json"]
+    for filename in filenames:
+        (data / filename).write_text('{"previous":true}')
+
+    client = app.test_client()
+    response = client.post("/api/jobs/publish-site", json={
+        "destination": str(destination), "max_size": 512,
+    })
+    assert response.status_code == 200
+    job_id = response.get_json()["job_id"]
+    try:
+        assert reached.wait(10), "publish never reached the commit boundary"
+        cancelled = client.post(f"/api/jobs/{job_id}/cancel")
+        assert cancelled.status_code == (200 if boundary == "before_commit" else 404)
+    finally:
+        release.set()
+
+    job = wait_for_job_via_client(client, job_id)
+    if boundary == "before_commit":
+        assert job["status"] == "cancelled"
+        assert job["result"]["data_files"] == []
+        for filename in filenames:
+            assert (data / filename).read_text() == '{"previous":true}'
+    else:
+        assert job["status"] == "completed"
+        assert job["result"]["data_files"] == [f"data/{name}" for name in filenames]
+        manifests = [json.loads((data / name).read_text()) for name in filenames]
+        assert manifests[0]["generated_at"] == manifests[1]["meta"]["generated_at"]
+        assert manifests[0]["generated_at"] == manifests[2]["meta"]["generated_at"]
+    db.close()
+
+
+@pytest.mark.parametrize("phase", ["image", "manifest"])
+@pytest.mark.parametrize("outcome", ["cancel", "complete", "error"])
+def test_republish_stages_files_until_commit(tmp_path, monkeypatch, phase, outcome):
+    import site_publish
+
+    app, db, meta = _seed_publish_app(tmp_path, monkeypatch)
+    client = app.test_client()
+    destination = tmp_path / "published"
+    options = {"destination": str(destination), "max_size": 512}
+    response = client.post("/api/jobs/publish-site", json=options)
+    job = wait_for_job_via_client(client, response.get_json()["job_id"])
+    assert job["status"] == "completed"
+    previous = {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*") if path.is_file()
+    }
+    for path in meta["photos_dir"].glob("*.jpg"):
+        Image.new("RGB", (1200, 800), (0, 0, 255)).save(path)
+
+    reached, release = threading.Event(), threading.Event()
+    original_export = site_publish._export_image
+    original_write = site_publish._write_json
+
+    def pause_once():
+        if reached.is_set():
+            return
+        reached.set()
+        assert release.wait(10), "publish was never released"
+        if outcome == "error":
+            raise OSError("staging write failed")
+
+    def controlled_export(*args, **kwargs):
+        result = original_export(*args, **kwargs)
+        if phase == "image":
+            pause_once()
+        return result
+
+    def controlled_write(path, payload):
+        result = original_write(path, payload)
+        if phase == "manifest":
+            pause_once()
+        return result
+
+    monkeypatch.setattr(site_publish, "_export_image", controlled_export)
+    monkeypatch.setattr(site_publish, "_write_json", controlled_write)
+    response = client.post("/api/jobs/publish-site", json=options)
+    job_id = response.get_json()["job_id"]
+    try:
+        assert reached.wait(10), "republish never reached staging"
+        for path, contents in previous.items():
+            assert (destination / path).read_bytes() == contents
+        if outcome == "cancel":
+            assert client.post(f"/api/jobs/{job_id}/cancel").status_code == 200
+    finally:
+        release.set()
+
+    job = wait_for_job_via_client(client, job_id)
+    assert job["status"] == {
+        "cancel": "cancelled", "complete": "completed", "error": "failed",
+    }[outcome]
+    assert not list(destination.glob(".vireo-publish-*"))
+    current = {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*") if path.is_file()
+    }
+    assert current.keys() == previous.keys()
+    if outcome == "complete":
+        for path, contents in previous.items():
+            assert current[path] != contents
+        for path in destination.rglob("*.jpg"):
+            with Image.open(path) as image:
+                red, _, blue = image.getpixel((0, 0))
+                assert blue > red
+    else:
+        assert current == previous
+    db.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX write permissions")
+@pytest.mark.parametrize("protection", ["directories", "manifest"])
+def test_republish_checks_access_before_commit(tmp_path, monkeypatch, protection):
+    app, db, meta = _seed_publish_app(tmp_path, monkeypatch)
+    client = app.test_client()
+    destination = tmp_path / "published"
+    options = {"destination": str(destination), "max_size": 512}
+    response = client.post("/api/jobs/publish-site", json=options)
+    job = wait_for_job_via_client(client, response.get_json()["job_id"])
+    assert job["status"] == "completed"
+    previous = {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*") if path.is_file()
+    }
+    for path in meta["photos_dir"].glob("*.jpg"):
+        Image.new("RGB", (1200, 800), (0, 0, 255)).save(path)
+
+    protected = (
+        [destination / "data", destination / "images/photos"]
+        if protection == "directories" else [destination / "data/highlights.json"]
+    )
+    try:
+        for path in protected:
+            path.chmod(0o555 if path.is_dir() else 0o444)
+            if os.access(path, os.W_OK):
+                pytest.skip("current user can bypass write protection")
+        response = client.post("/api/jobs/publish-site", json=options)
+        job = wait_for_job_via_client(client, response.get_json()["job_id"])
+        if protection == "directories":
+            assert job["status"] == "completed"
+            for path, contents in previous.items():
+                assert (destination / path).read_bytes() != contents
+        else:
+            assert job["status"] == "failed"
+            for path, contents in previous.items():
+                assert (destination / path).read_bytes() == contents
+        assert not list(destination.glob(".vireo-publish-*"))
+    finally:
+        for path in protected:
+            path.chmod(0o755 if path.is_dir() else 0o644)
+        db.close()

@@ -2,6 +2,7 @@
 
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -55,6 +56,66 @@ def sample_xmp(tmp_path):
 def missing_xmp(tmp_path):
     """Return a path to a non-existent XMP file."""
     return str(tmp_path / "does_not_exist.xmp")
+
+
+@pytest.mark.parametrize("writer,args", [
+    (write_sidecar, ({"Eagle"}, set())),
+    (write_rating, (5,)),
+    (write_pick_flag, ("flagged",)),
+    (write_gps_location, (10, 20)),
+    (remove_vireo_gps_location, ()),
+    (write_edit_recipe, ('{"exposure":1}',)),
+    (remove_keywords, ({"Bird"},)),
+])
+@pytest.mark.parametrize("failure", ["serialize", "replace"])
+def test_failed_sidecar_update_preserves_original(sample_xmp, monkeypatch, writer, args, failure):
+    import xmp
+
+    write_gps_location(sample_xmp, 30, 40)
+    path = Path(sample_xmp)
+    original = path.read_bytes()
+
+    def failed_serializer(write, *args, **kwargs):
+        write("<partial")
+        raise OSError(28, "disk full")
+
+    def failed_replace(*args):
+        raise OSError("replacement failed")
+
+    if failure == "serialize":
+        monkeypatch.setitem(xmp.ET._serialize, "xml", failed_serializer)
+    else:
+        monkeypatch.setattr(xmp.os, "replace", failed_replace)
+    with pytest.raises(OSError):
+        writer(sample_xmp, *args)
+
+    assert path.read_bytes() == original
+    assert set(path.parent.iterdir()) == {path}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits and symlinks")
+def test_atomic_sidecar_update_preserves_mode_and_symlink(sample_xmp, tmp_path):
+    import stat
+
+    path = Path(sample_xmp)
+    path.chmod(0o640)
+    link = tmp_path / "linked.xmp"
+    link.symlink_to(path)
+    write_rating(link, 5)
+    assert link.is_symlink()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    assert read_sync_preview_metadata(path)["rating"] == "5"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX umask")
+def test_new_sidecar_uses_normal_creation_permissions(tmp_path):
+    import stat
+
+    reference = tmp_path / "reference.txt"
+    reference.write_text("normal file")
+    sidecar = tmp_path / "photo.xmp"
+    write_sidecar(sidecar, {"Bird"}, set())
+    assert stat.S_IMODE(sidecar.stat().st_mode) == stat.S_IMODE(reference.stat().st_mode)
 
 
 # ── read_keywords ───────────────────────────────────────────────────────
@@ -416,3 +477,106 @@ def test_remove_keywords_flat_only_preserves_hierarchies(sample_xmp):
     hier = read_hierarchical_keywords(sample_xmp)
     assert "Animals|Birds|Raptor" in hier
     assert "Location|Forest" in hier
+
+
+@pytest.mark.parametrize("writer,args", [
+    (write_sidecar, ({"Eagle"}, set())),
+    (write_rating, (5,)),
+    (write_pick_flag, ("flagged",)),
+    (write_gps_location, (10, 20)),
+    (remove_vireo_gps_location, ()),
+    (write_edit_recipe, ('{"exposure":1}',)),
+    (remove_keywords, ({"Bird"},)),
+])
+def test_sidecar_writers_respect_read_only_files(sample_xmp, writer, args):
+    write_gps_location(sample_xmp, 30, 40)
+    path = Path(sample_xmp)
+    original = path.read_bytes()
+    path.chmod(0o444)
+    try:
+        if os.access(path, os.W_OK):
+            pytest.skip("current user can bypass read-only permissions")
+        with pytest.raises(PermissionError):
+            writer(sample_xmp, *args)
+        assert path.read_bytes() == original
+        assert set(path.parent.iterdir()) == {path}
+    finally:
+        path.chmod(0o644)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX extended attributes")
+def test_atomic_sidecar_preserves_extended_attributes(sample_xmp):
+    name = "com.vireo.test" if sys.platform == "darwin" else "user.vireo-test"
+    if sys.platform == "darwin":
+        import subprocess
+
+        subprocess.run(["xattr", "-w", name, "shared metadata", sample_xmp], check=True)
+    else:
+        os.setxattr(sample_xmp, name, b"shared metadata")
+    before = os.stat(sample_xmp)
+    write_rating(sample_xmp, 5)
+    after = os.stat(sample_xmp)
+    if sys.platform == "darwin":
+        value = subprocess.check_output(["xattr", "-p", name, sample_xmp]).strip()
+    else:
+        value = os.getxattr(sample_xmp, name)
+    assert value == b"shared metadata"
+    assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
+    assert read_sync_preview_metadata(sample_xmp)["rating"] == "5"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX group ownership")
+def test_atomic_sidecar_preserves_nondefault_group(sample_xmp):
+    original_gid = os.stat(sample_xmp).st_gid
+    group = next((gid for gid in os.getgroups() if gid != original_gid), None)
+    if group is None:
+        pytest.skip("current user has no supplementary group")
+    os.chown(sample_xmp, -1, group)
+    write_rating(sample_xmp, 5)
+    assert os.stat(sample_xmp).st_gid == group
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS ACL API")
+def test_atomic_sidecar_preserves_macos_acl(sample_xmp):
+    import subprocess
+
+    subprocess.run(["chmod", "+a", "group:everyone allow read", sample_xmp], check=True)
+
+    def acl():
+        return subprocess.check_output(["ls", "-le", sample_xmp], text=True).splitlines()[1:]
+
+    before = acl()
+    assert before
+    write_rating(sample_xmp, 5)
+    assert acl() == before
+    assert read_sync_preview_metadata(sample_xmp)["rating"] == "5"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux POSIX ACL attributes")
+def test_atomic_sidecar_preserves_linux_acl(sample_xmp):
+    import struct
+
+    # Linux POSIX ACL v2: owner, named user, owning group, mask, other.
+    entries = [(1, 6, 0xFFFFFFFF), (2, 4, 65534), (4, 4, 0xFFFFFFFF),
+               (16, 4, 0xFFFFFFFF), (32, 0, 0xFFFFFFFF)]
+    acl = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *e) for e in entries)
+    os.setxattr(sample_xmp, "system.posix_acl_access", acl)
+    write_rating(sample_xmp, 5)
+    assert os.getxattr(sample_xmp, "system.posix_acl_access") == acl
+    assert read_sync_preview_metadata(sample_xmp)["rating"] == "5"
+
+
+def test_failed_access_metadata_copy_preserves_sidecar(sample_xmp, monkeypatch):
+    import xmp
+
+    path = Path(sample_xmp)
+    original = path.read_bytes()
+
+    def fail_copy(*args):
+        raise PermissionError("cannot preserve ownership or ACL")
+
+    monkeypatch.setattr(xmp, "_preserve_sidecar_access", fail_copy)
+    with pytest.raises(PermissionError):
+        write_rating(sample_xmp, 5)
+    assert path.read_bytes() == original
+    assert set(path.parent.iterdir()) == {path}

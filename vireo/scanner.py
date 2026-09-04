@@ -2408,12 +2408,15 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                         _emit_status(
                             f"Discovering files... ({len(image_files)} found)"
                         )
-                    if (f.is_file()
-                            and f.suffix.lower() in SUPPORTED_EXTENSIONS
+                    # Filter restricted imports before statting a sibling:
+                    # an unreadable collision candidate is unrelated to
+                    # the successfully landed files we are cataloging.
+                    if (f.suffix.lower() in SUPPORTED_EXTENSIONS
                             and not f.name.startswith(".")
                             and (skip_paths is None or str(f) not in skip_paths)
                             and (restrict_files_set is None
-                                 or str(f) in restrict_files_set)):
+                                 or str(f) in restrict_files_set)
+                            and f.is_file()):
                         image_files.append(f)
     else:
         if recursive:

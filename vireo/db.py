@@ -20657,7 +20657,9 @@ class Database:
     def queue_change(self, photo_id, change_type, value, workspace_id=None, _commit=True):
         """Add a change to the sync queue (skips if already queued).
 
-        Returns the inserted pending change token, or None if an identical row already exists.
+        Returns the inserted pending change token, or None if already queued.
+        A rating only deduplicates against its latest queued value: 1 -> 2 -> 1
+        must retain the last 1 so chronological sync writes the current rating.
         If workspace_id is not provided, uses the active workspace.
 
         Args:
@@ -20675,10 +20677,18 @@ class Database:
             if not value:
                 return None
         ws_id = workspace_id if workspace_id is not None else self._ws_id()
-        existing = self.conn.execute(
-            "SELECT id FROM pending_changes WHERE photo_id = ? AND change_type = ? AND value = ? AND workspace_id = ?",
-            (photo_id, change_type, value, ws_id),
-        ).fetchone()
+        if change_type == "rating":
+            latest = self.conn.execute(
+                "SELECT value FROM pending_changes WHERE photo_id = ? "
+                "AND change_type = 'rating' AND workspace_id = ? ORDER BY id DESC LIMIT 1",
+                (photo_id, ws_id),
+            ).fetchone()
+            existing = latest is not None and latest["value"] == value
+        else:
+            existing = self.conn.execute(
+                "SELECT id FROM pending_changes WHERE photo_id = ? AND change_type = ? AND value = ? AND workspace_id = ?",
+                (photo_id, change_type, value, ws_id),
+            ).fetchone()
         if existing:
             return None
         change_token = str(uuid.uuid4())
@@ -20693,7 +20703,7 @@ class Database:
     def get_pending_changes(self):
         """Return all pending changes ordered by creation time."""
         return self.conn.execute(
-            "SELECT * FROM pending_changes WHERE workspace_id = ? ORDER BY created_at",
+            "SELECT * FROM pending_changes WHERE workspace_id = ? ORDER BY created_at, id",
             (self._ws_id(),),
         ).fetchall()
 

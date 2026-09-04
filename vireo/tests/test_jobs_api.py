@@ -6378,7 +6378,7 @@ def test_import_in_place_no_destination_required(app_and_db, tmp_path):
 
 @pytest.mark.parametrize("change", [
     None, "content", "content_preserving_mtime", "missing_metadata",
-    "partial_metadata", "missing_hash",
+    "partial_metadata", "missing_hash", "trailing_separator",
 ])
 def test_import_in_place_reuses_catalog_across_workspaces(
     app_and_db, tmp_path, monkeypatch, change,
@@ -6440,6 +6440,12 @@ def test_import_in_place_reuses_catalog_across_workspaces(
         )
         db.conn.commit()
         expected_reads = {str(other)}
+    elif change == "trailing_separator":
+        db.conn.execute(
+            "UPDATE folders SET path=? WHERE path=?",
+            (str(source) + os.sep, str(source)),
+        )
+        db.conn.commit()
 
     feature_reads = []
     metadata_reads = []
@@ -6478,7 +6484,7 @@ def test_import_in_place_reuses_catalog_across_workspaces(
         row["filename"]: dict(row)
         for row in db.conn.execute(
             "SELECT id, filename, file_hash, file_size, width FROM photos WHERE folder_id="
-            "(SELECT id FROM folders WHERE path=?)", (str(source),),
+            "(SELECT folder_id FROM photos WHERE id=?)", (original[unchanged.name]["id"],),
         )
     }
     assert len(rows) == expected_count
@@ -6501,7 +6507,7 @@ def test_import_in_place_reuses_catalog_across_workspaces(
     linked_workspaces = {
         row["workspace_id"] for row in db.conn.execute(
             "SELECT workspace_id FROM workspace_folders WHERE folder_id="
-            "(SELECT id FROM folders WHERE path=?)", (str(source),),
+            "(SELECT folder_id FROM photos WHERE id=?)", (original[unchanged.name]["id"],),
         )
     }
     assert {old_ws, new_ws} <= linked_workspaces

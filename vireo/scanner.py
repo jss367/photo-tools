@@ -2049,9 +2049,12 @@ def _incremental_photo_index(db, image_files):
             "AND p.camera_model IS NULL AND p.lens IS NULL "
             "AND p.aperture IS NULL AND p.shutter_speed IS NULL "
             "AND p.iso IS NULL) AS summary_needs_extract "
-            "FROM requested r JOIN folders f ON f.path = r.folder_path "
+            # Preserve os.path.join's match for legacy folder paths ending
+            # in a separator, while retaining indexed equality lookups.
+            "FROM requested r JOIN folders f "
+            "ON f.path IN (r.folder_path, r.folder_path || ?) "
             "JOIN photos p ON p.folder_id = f.id AND p.filename = r.filename",
-            params,
+            [*params, os.sep],
         )
         for row in rows:
             result[os.path.join(row["folder_path"], row["filename"])] = row

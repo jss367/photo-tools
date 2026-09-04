@@ -102,7 +102,7 @@ def _strip_private_photo_fields(highlights):
 
 
 def publish_site(db, vireo_dir, destination, life_list, highlights=None, options=None,
-                 progress_cb=None, cancel_check=None):
+                 progress_cb=None, cancel_check=None, begin_commit=None):
     """Write JSON manifests and optimized photos for a static website.
 
     Args:
@@ -115,6 +115,9 @@ def publish_site(db, vireo_dir, destination, life_list, highlights=None, options
             include_locations.
         progress_cb: optional callback(current, total, current_file).
         cancel_check: optional callable; stop before the next photo when true.
+        begin_commit: optional callable that atomically rejects pending cancellation
+            or prevents later cancellation through job completion; false aborts
+            before writing any manifests.
     """
     options = options or {}
     highlights = highlights or {"buckets": [], "meta": {}}
@@ -199,6 +202,13 @@ def publish_site(db, vireo_dir, destination, life_list, highlights=None, options
     }
     published_life_list.setdefault("meta", {})["generated_at"] = generated_at
     published_highlights.setdefault("meta", {})["generated_at"] = generated_at
+
+    # Coordinate the commit boundary with the job runner's cancellation lock.
+    # A separate probe cannot prevent a late Stop from marking a committed
+    # publish as cancelled while these manifests are being written.
+    if begin_commit is not None and not begin_commit():
+        return {"destination": destination, "data_files": [],
+                "exported_images": exported, "errors": errors}
 
     _write_json(data_dir / "site.json", site_manifest)
     _write_json(data_dir / "life-list.json", published_life_list)

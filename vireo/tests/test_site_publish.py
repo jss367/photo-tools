@@ -377,3 +377,68 @@ def test_export_jobs_stop_between_photos_when_cancelled(tmp_path, monkeypatch, j
     assert job["result"][count_key] == 1
     assert (data / "site.json").read_text() == '{"previous":true}'
     db.close()
+
+
+@pytest.mark.parametrize("boundary", [
+    "before_commit", "site.json", "life-list.json", "highlights.json",
+])
+def test_publish_cancellation_is_coordinated_with_manifest_commit(
+    tmp_path, monkeypatch, boundary,
+):
+    import site_publish
+    from jobs import JobRunner
+
+    app, db, _meta = _seed_publish_app(tmp_path, monkeypatch)
+    reached, release = threading.Event(), threading.Event()
+    original_begin = JobRunner.begin_uncancellable
+    original_write = site_publish._write_json
+
+    def wait_for_cancel():
+        reached.set()
+        assert release.wait(10), "cancel request never arrived"
+
+    def controlled_begin(runner, job_id):
+        if boundary == "before_commit":
+            wait_for_cancel()
+        return original_begin(runner, job_id)
+
+    def controlled_write(path, payload):
+        if path.name == boundary:
+            wait_for_cancel()
+        return original_write(path, payload)
+
+    monkeypatch.setattr(JobRunner, "begin_uncancellable", controlled_begin)
+    monkeypatch.setattr(site_publish, "_write_json", controlled_write)
+    destination = tmp_path / "published"
+    data = destination / "data"
+    data.mkdir(parents=True)
+    filenames = ["site.json", "life-list.json", "highlights.json"]
+    for filename in filenames:
+        (data / filename).write_text('{"previous":true}')
+
+    client = app.test_client()
+    response = client.post("/api/jobs/publish-site", json={
+        "destination": str(destination), "max_size": 512,
+    })
+    assert response.status_code == 200
+    job_id = response.get_json()["job_id"]
+    try:
+        assert reached.wait(10), "publish never reached the commit boundary"
+        cancelled = client.post(f"/api/jobs/{job_id}/cancel")
+        assert cancelled.status_code == (200 if boundary == "before_commit" else 404)
+    finally:
+        release.set()
+
+    job = wait_for_job_via_client(client, job_id)
+    if boundary == "before_commit":
+        assert job["status"] == "cancelled"
+        assert job["result"]["data_files"] == []
+        for filename in filenames:
+            assert (data / filename).read_text() == '{"previous":true}'
+    else:
+        assert job["status"] == "completed"
+        assert job["result"]["data_files"] == [f"data/{name}" for name in filenames]
+        manifests = [json.loads((data / name).read_text()) for name in filenames]
+        assert manifests[0]["generated_at"] == manifests[1]["meta"]["generated_at"]
+        assert manifests[0]["generated_at"] == manifests[2]["meta"]["generated_at"]
+    db.close()

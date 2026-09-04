@@ -352,8 +352,204 @@ def resolve_template(template, photo, species=None, seq=1):
     return result
 
 
+def load_export_image(photo, vireo_dir, folders, *, recipe=None, exif_data=None,
+                      max_size=None, wc_max=4096, developed_dir="",
+                      developed_index=None, output_ext="jpg"):
+    """Load the final export pixels, including edits and source fallbacks.
+
+    The caller owns the returned image and must close it. Both photo exports
+    and website publishing use this renderer so working-copy sizing, RAW
+    fallback, local masks, and developed-output selection stay consistent.
+    """
+    pid = photo["id"]
+    if developed_index is None:
+        developed_index = _DevelopedDirIndex()
+    # Resolve source path.  Precedence:
+    #   1. darktable-developed output ("perfected" rendering) — takes
+    #      priority over RAW so Export ships what the user sees after
+    #      Develop, not a fresh libraw decode of the RAW.
+    #   2. working copy when resizing to a size it can satisfy.
+    #   3. original file (default; also used for full-res exports).
+    folder_path = folders.get(photo["folder_id"], "")
+    load_max_size = (
+        None if recipe and recipe.get("crop") else (max_size or None)
+    )
+
+    def _load_selected_source(
+        path, *, _recipe=recipe, _load_max_size=load_max_size,
+    ):
+        is_raw = os.path.splitext(path)[1].lower() in RAW_EXTENSIONS
+        raw_decode = (
+            RAW_DECODE_PRESERVE_HIGHLIGHTS if _recipe and is_raw else None
+        )
+        load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
+        return (
+            load_image(path, max_size=_load_max_size, **load_kwargs),
+            is_raw,
+        )
+
+    original_abs = os.path.join(folder_path, photo["filename"])
+    wc_rel = photo["working_copy_path"]
+    wc_abs = os.path.join(vireo_dir, wc_rel) if wc_rel else None
+    pin_offline_working_copy = bool(
+        wc_abs and not os.path.isfile(original_abs)
+    )
+    source_guard = (
+        working_copy_publication_guard()
+        if pin_offline_working_copy else contextlib.nullcontext()
+    )
+    pinned_img = None
+    pinned_source_is_raw = False
+    pinned_decode_attempted = False
+    with source_guard:
+        source_path = _select_export_source(
+            photo=photo,
+            folder_path=folder_path,
+            folders=folders,
+            recipe=recipe,
+            max_size=max_size,
+            wc_max=wc_max,
+            vireo_dir=vireo_dir,
+            developed_dir=developed_dir,
+            developed_index=developed_index,
+            output_ext=output_ext,
+            exif_data=exif_data,
+        )
+        if source_path and not os.path.isfile(source_path):
+            # A working copy can be evicted between _select_export_source
+            # returning and this pre-loop existence check (concurrent
+            # scanner/on-demand write, a config-driven quota shrink).
+            # Fall back to the primary source so a photo whose original
+            # is on disk is never dropped as "source file missing" merely
+            # because its resized-export shortcut vanished mid-flight.
+            fallback = _fallback_source_after_wc_eviction(
+                source_path, photo, folder_path, vireo_dir,
+            )
+            if fallback:
+                log.info(
+                    "Working copy %s evicted before export of %s; using "
+                    "primary source %s",
+                    source_path, photo["filename"], fallback,
+                )
+                source_path = fallback
+        if (
+            pin_offline_working_copy
+            and source_path
+            and os.path.abspath(source_path) == os.path.abspath(wc_abs)
+            and os.path.isfile(source_path)
+        ):
+            # The original volume is offline, so retry-to-original cannot
+            # recover if quota eviction wins after source selection. Keep
+            # the working copy pinned through validation and decode; the
+            # resulting PIL image is independent of the path afterward.
+            pinned_decode_attempted = True
+            pinned_img, pinned_source_is_raw = _load_selected_source(
+                source_path,
+            )
+    if (
+        not source_path
+        or (pinned_img is None and not os.path.isfile(source_path))
+    ):
+        raise FileNotFoundError("source file missing")
+
+    img = None
+    try:
+        if pinned_decode_attempted:
+            img = pinned_img
+            source_is_raw = pinned_source_is_raw
+        else:
+            img, source_is_raw = _load_selected_source(source_path)
+        if img is None:
+            fallback_source = _fallback_source_after_wc_eviction(
+                source_path, photo, folder_path, vireo_dir,
+            )
+            if fallback_source:
+                log.info(
+                    "Working copy for %s vanished mid-export; "
+                    "falling back to original %s",
+                    photo["filename"], fallback_source,
+                )
+                source_path = fallback_source
+                img, source_is_raw = _load_selected_source(source_path)
+        if source_is_raw:
+            # RAW decode either failed outright (`img is None`) or
+            # silently fell back to the embedded JPEG. ``_load_raw``
+            # returns ``raw.extract_thumb()`` when libraw cannot
+            # demosaic the RAW; that preview can be much smaller than
+            # the full-size companion JPEG, so the export would
+            # quietly produce undersized bytes for unsupported RAW+JPEG
+            # files. Compare *both* loaded dimensions against the
+            # source's expected dimensions (capped by
+            # ``load_max_size`` when set) — a long-edge-only check
+            # accepts e.g. 6000x3376 embedded previews for 6000x4000
+            # photos, dropping short-edge content.
+            needs_companion = img is None
+            expected_w, expected_h = 0, 0
+            if img is not None:
+                expected_w, expected_h = scaled_recipe_source_dimensions(
+                    photo, load_max_size, exif_data,
+                )
+                if image_is_smaller_than_expected(img, expected_w, expected_h):
+                    needs_companion = True
+            if needs_companion:
+                companion_fallback = _companion_can_satisfy_export(
+                    photo, folder_path, recipe, max_size,
+                    exif_data=exif_data, skip_raw_primary=False,
+                )
+                if companion_fallback:
+                    companion_img = load_image(
+                        companion_fallback, max_size=load_max_size,
+                    )
+                    # Prefer companion when it covers img on both
+                    # axes — a long-edge-only check misses cases
+                    # like a 6000x3376 embedded preview "tying" a
+                    # 6000x4000 sidecar and losing the short-edge
+                    # content.
+                    if companion_image_can_replace_raw_result(
+                        companion_img, img, expected_w, expected_h,
+                    ):
+                        if img is None:
+                            log.info(
+                                "RAW decode failed for %s; falling back "
+                                "to companion JPEG",
+                                photo["filename"],
+                            )
+                        else:
+                            log.info(
+                                "RAW decode fell back to undersized "
+                                "embedded JPEG (%dx%d, expected %dx%d) "
+                                "for %s; using companion JPEG (%dx%d) "
+                                "instead",
+                                img.size[0], img.size[1],
+                                expected_w, expected_h,
+                                photo["filename"],
+                                companion_img.size[0],
+                                companion_img.size[1],
+                            )
+                            img.close()
+                        img = companion_img
+                    elif companion_img is not None:
+                        companion_img.close()
+        if img is None:
+            raise ValueError("failed to load image")
+        if recipe:
+            import local_masks
+            img = apply_recipe_to_loaded_image(
+                img, recipe, max_size=max_size,
+                native_size=_recipe_source_dimensions(photo, exif_data),
+                local_mask=local_masks.load_snapshot(
+                    vireo_dir, pid, recipe,
+                ),
+            )
+        return img
+    except BaseException:
+        if img is not None:
+            img.close()
+        raise
+
+
 def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
-                  progress_cb=None):
+                  progress_cb=None, cancel_check=None):
     """Export photos with optional resize and renaming.
 
     Args:
@@ -397,6 +593,7 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
                 Defaults to false so large background exports keep a compact
                 job result.
         progress_cb: optional callback(current, total, current_file)
+        cancel_check: optional callable; stop before the next photo when true.
 
     Returns:
         dict with the export count, errors, destination mode, and resolved
@@ -474,104 +671,13 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
     developed_index = _DevelopedDirIndex()
 
     for i, pid in enumerate(photo_ids):
+        if cancel_check and cancel_check():
+            break
         photo = photos_map.get(pid)
         if not photo:
             errors.append(f"Photo {pid} not found in database")
             if progress_cb:
                 progress_cb(i + 1, len(photo_ids), "")
-            continue
-
-        # Resolve source path.  Precedence:
-        #   1. darktable-developed output ("perfected" rendering) — takes
-        #      priority over RAW so Export ships what the user sees after
-        #      Develop, not a fresh libraw decode of the RAW.
-        #   2. working copy when resizing to a size it can satisfy.
-        #   3. original file (default; also used for full-res exports).
-        folder_path = folders.get(photo["folder_id"], "")
-        recipe = edit_recipes.get(pid)
-        exif_data = exif_data_map.get(pid)
-        load_max_size = (
-            None if recipe and recipe.get("crop") else (max_size or None)
-        )
-
-        def _load_selected_source(
-            path, *, _recipe=recipe, _load_max_size=load_max_size,
-        ):
-            is_raw = os.path.splitext(path)[1].lower() in RAW_EXTENSIONS
-            raw_decode = (
-                RAW_DECODE_PRESERVE_HIGHLIGHTS if _recipe and is_raw else None
-            )
-            load_kwargs = {"raw_decode": raw_decode} if raw_decode else {}
-            return (
-                load_image(path, max_size=_load_max_size, **load_kwargs),
-                is_raw,
-            )
-
-        original_abs = os.path.join(folder_path, photo["filename"])
-        wc_rel = photo["working_copy_path"]
-        wc_abs = os.path.join(vireo_dir, wc_rel) if wc_rel else None
-        pin_offline_working_copy = bool(
-            wc_abs and not os.path.isfile(original_abs)
-        )
-        source_guard = (
-            working_copy_publication_guard()
-            if pin_offline_working_copy else contextlib.nullcontext()
-        )
-        pinned_img = None
-        pinned_source_is_raw = False
-        pinned_decode_attempted = False
-        with source_guard:
-            source_path = _select_export_source(
-                photo=photo,
-                folder_path=folder_path,
-                folders=folders,
-                recipe=recipe,
-                max_size=max_size,
-                wc_max=wc_max,
-                vireo_dir=vireo_dir,
-                developed_dir=developed_dir,
-                developed_index=developed_index,
-                output_ext=output_ext,
-                exif_data=exif_data,
-            )
-            if source_path and not os.path.isfile(source_path):
-                # A working copy can be evicted between _select_export_source
-                # returning and this pre-loop existence check (concurrent
-                # scanner/on-demand write, a config-driven quota shrink).
-                # Fall back to the primary source so a photo whose original
-                # is on disk is never dropped as "source file missing" merely
-                # because its resized-export shortcut vanished mid-flight.
-                fallback = _fallback_source_after_wc_eviction(
-                    source_path, photo, folder_path, vireo_dir,
-                )
-                if fallback:
-                    log.info(
-                        "Working copy %s evicted before export of %s; using "
-                        "primary source %s",
-                        source_path, photo["filename"], fallback,
-                    )
-                    source_path = fallback
-            if (
-                pin_offline_working_copy
-                and source_path
-                and os.path.abspath(source_path) == os.path.abspath(wc_abs)
-                and os.path.isfile(source_path)
-            ):
-                # The original volume is offline, so retry-to-original cannot
-                # recover if quota eviction wins after source selection. Keep
-                # the working copy pinned through validation and decode; the
-                # resulting PIL image is independent of the path afterward.
-                pinned_decode_attempted = True
-                pinned_img, pinned_source_is_raw = _load_selected_source(
-                    source_path,
-                )
-        if (
-            not source_path
-            or (pinned_img is None and not os.path.isfile(source_path))
-        ):
-            errors.append(f"{photo['filename']}: source file missing")
-            if progress_cb:
-                progress_cb(i + 1, len(photo_ids), photo["filename"])
             continue
 
         # Get species (first species keyword, or None)
@@ -647,96 +753,12 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
         # Load, resize, and save
         claimed_out_path = None
         try:
-            if pinned_decode_attempted:
-                img = pinned_img
-                source_is_raw = pinned_source_is_raw
-            else:
-                img, source_is_raw = _load_selected_source(source_path)
-            if img is None:
-                fallback_source = _fallback_source_after_wc_eviction(
-                    source_path, photo, folder_path, vireo_dir,
-                )
-                if fallback_source:
-                    log.info(
-                        "Working copy for %s vanished mid-export; "
-                        "falling back to original %s",
-                        photo["filename"], fallback_source,
-                    )
-                    source_path = fallback_source
-                    img, source_is_raw = _load_selected_source(source_path)
-            if source_is_raw:
-                # RAW decode either failed outright (`img is None`) or
-                # silently fell back to the embedded JPEG. ``_load_raw``
-                # returns ``raw.extract_thumb()`` when libraw cannot
-                # demosaic the RAW; that preview can be much smaller than
-                # the full-size companion JPEG, so the export would
-                # quietly produce undersized bytes for unsupported RAW+JPEG
-                # files. Compare *both* loaded dimensions against the
-                # source's expected dimensions (capped by
-                # ``load_max_size`` when set) — a long-edge-only check
-                # accepts e.g. 6000x3376 embedded previews for 6000x4000
-                # photos, dropping short-edge content.
-                needs_companion = img is None
-                expected_w, expected_h = 0, 0
-                if img is not None:
-                    expected_w, expected_h = scaled_recipe_source_dimensions(
-                        photo, load_max_size, exif_data,
-                    )
-                    if image_is_smaller_than_expected(img, expected_w, expected_h):
-                        needs_companion = True
-                if needs_companion:
-                    companion_fallback = _companion_can_satisfy_export(
-                        photo, folder_path, recipe, max_size,
-                        exif_data=exif_data, skip_raw_primary=False,
-                    )
-                    if companion_fallback:
-                        companion_img = load_image(
-                            companion_fallback, max_size=load_max_size,
-                        )
-                        # Prefer companion when it covers img on both
-                        # axes — a long-edge-only check misses cases
-                        # like a 6000x3376 embedded preview "tying" a
-                        # 6000x4000 sidecar and losing the short-edge
-                        # content.
-                        if companion_image_can_replace_raw_result(
-                            companion_img, img, expected_w, expected_h,
-                        ):
-                            if img is None:
-                                log.info(
-                                    "RAW decode failed for %s; falling back "
-                                    "to companion JPEG",
-                                    photo["filename"],
-                                )
-                            else:
-                                log.info(
-                                    "RAW decode fell back to undersized "
-                                    "embedded JPEG (%dx%d, expected %dx%d) "
-                                    "for %s; using companion JPEG (%dx%d) "
-                                    "instead",
-                                    img.size[0], img.size[1],
-                                    expected_w, expected_h,
-                                    photo["filename"],
-                                    companion_img.size[0],
-                                    companion_img.size[1],
-                                )
-                                img.close()
-                            img = companion_img
-                        elif companion_img is not None:
-                            companion_img.close()
-            if img is None:
-                errors.append(f"{photo['filename']}: failed to load image")
-                if progress_cb:
-                    progress_cb(i + 1, len(photo_ids), photo["filename"])
-                continue
-            if recipe:
-                import local_masks
-                img = apply_recipe_to_loaded_image(
-                    img, recipe, max_size=max_size,
-                    native_size=_recipe_source_dimensions(photo, exif_data),
-                    local_mask=local_masks.load_snapshot(
-                        vireo_dir, pid, recipe,
-                    ),
-                )
+            img = load_export_image(
+                photo, vireo_dir, folders, recipe=edit_recipes.get(pid),
+                exif_data=exif_data_map.get(pid), max_size=max_size,
+                wc_max=wc_max, developed_dir=developed_dir,
+                developed_index=developed_index, output_ext=output_ext,
+            )
             try:
                 out_path, output_stream = _claim_export_path(out_path)
                 claimed_out_path = out_path

@@ -59,6 +59,18 @@ cd vireo
 pip install -e ".[dev]"
 ```
 
+For a development environment using the committed dependency versions:
+
+```bash
+uv sync --locked --extra dev
+```
+
+With this environment, prefix the Python commands below with
+`uv run --locked --extra dev`.
+
+Pose model conversion requires separate environments; see the
+[pose model export setup](scripts/model-export/README.md).
+
 ### Run
 
 ```bash

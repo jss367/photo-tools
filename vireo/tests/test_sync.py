@@ -4,6 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+import pytest
 from PIL import Image
 
 
@@ -25,6 +26,33 @@ def _setup_photo_with_xmp(tmp_path, db, keywords=None):
                        file_size=100, file_mtime=os.path.getmtime(img_path),
                        xmp_mtime=os.path.getmtime(xmp_path))
     return pid, xmp_path
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("history", ["none", "undo", "redo"])
+def test_rating_return_to_previous_value_syncs_latest(tmp_path, db, batch, history):
+    from services.photo_review import PhotoReviewService
+    from sync import sync_to_xmp
+    from xmp import read_sync_preview_metadata
+
+    db.set_active_workspace(db.ensure_default_workspace())
+    pid, xmp_path = _setup_photo_with_xmp(tmp_path, db)
+    service = PhotoReviewService(db)
+    for rating in (1, 2, 1):
+        if batch:
+            service.set_ratings([pid], rating)
+        else:
+            service.set_rating(pid, rating)
+    if history != "none":
+        db.undo_last_edit()
+    if history == "redo":
+        db.redo_last_undo()
+
+    expected_rating = 2 if history == "undo" else 1
+    assert db.get_photo(pid)["rating"] == expected_rating
+    assert sync_to_xmp(db) == {"synced": 1, "failed": 0, "failures": []}
+    assert read_sync_preview_metadata(xmp_path)["rating"] == str(expected_rating)
+    assert not db.get_pending_changes()
 
 
 def test_sync_to_xmp_writes_keyword_add(tmp_path):

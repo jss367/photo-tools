@@ -10,12 +10,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from export import (
-    _developed_can_satisfy_size,
     _DevelopedDirIndex,
-    _find_developed_output,
-    _resolve_source,
+    _get_photo_exif_data,
+    load_export_image,
 )
-from image_loader import load_image
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _PRIVATE_PHOTO_FIELDS = {"mask_path"}
@@ -60,48 +58,22 @@ def _rel_image_path(photo, context):
     return f"images/photos/{prefix}-{photo['id']}-{name}.jpg"
 
 
-def _developed_required_size(photo, max_size):
-    if max_size is None:
-        return None
-    original_w = photo.get("width")
-    original_h = photo.get("height")
-    if original_w and original_h:
-        return min(max_size, max(original_w, original_h))
-    return max_size
-
-
-def _export_image(db, vireo_dir, photo, rel_path, destination, options, folders, index):
-    source = None
-    folder_path = folders.get(photo.get("folder_id"), "")
-    developed_dir = options.get("developed_dir") or ""
+def _export_image(vireo_dir, photo, rel_path, destination, options, folders, index,
+                  recipe, exif_data):
     max_size = options.get("max_size")
     if max_size is not None:
         max_size = int(max_size)
-    if developed_dir:
-        source = _find_developed_output(
-            photo.get("filename") or "",
-            folder_path,
-            developed_dir,
-            index,
-        )
-        required_size = _developed_required_size(photo, max_size)
-        if source and not _developed_can_satisfy_size(source, photo, required_size):
-            source = None
-
-    if not source:
-        wc_max = int(options.get("working_copy_max_size", 4096))
-        use_working_copy = bool(max_size) and max_size <= wc_max
-        source = _resolve_source(photo, vireo_dir, folders, use_working_copy)
-
-    if not source or not os.path.isfile(source):
-        return False, f"{photo.get('filename') or photo.get('id')}: source file missing"
-
-    out_path = Path(destination) / rel_path
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    img = load_image(source, max_size=max_size)
-    if img is None:
-        return False, f"{photo.get('filename') or photo.get('id')}: failed to load image"
     try:
+        img = load_export_image(
+            photo, vireo_dir, folders, recipe=recipe, exif_data=exif_data,
+            max_size=max_size, wc_max=int(options.get("working_copy_max_size", 4096)),
+            developed_dir=options.get("developed_dir") or "", developed_index=index,
+        )
+    except Exception as exc:
+        return False, f"{photo.get('filename') or photo.get('id')}: {exc}"
+    try:
+        out_path = Path(destination) / rel_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         img.save(out_path, "JPEG", quality=int(options.get("quality", 88)))
     finally:
         img.close()
@@ -129,7 +101,8 @@ def _strip_private_photo_fields(highlights):
             photo.pop(field, None)
 
 
-def publish_site(db, vireo_dir, destination, life_list, highlights=None, options=None, progress_cb=None):
+def publish_site(db, vireo_dir, destination, life_list, highlights=None, options=None,
+                 progress_cb=None, cancel_check=None):
     """Write JSON manifests and optimized photos for a static website.
 
     Args:
@@ -141,6 +114,7 @@ def publish_site(db, vireo_dir, destination, life_list, highlights=None, options
         options: max_size, quality, working_copy_max_size, developed_dir,
             include_locations.
         progress_cb: optional callback(current, total, current_file).
+        cancel_check: optional callable; stop before the next photo when true.
     """
     options = options or {}
     highlights = highlights or {"buckets": [], "meta": {}}
@@ -160,6 +134,8 @@ def publish_site(db, vireo_dir, destination, life_list, highlights=None, options
     refs = _photo_refs(published_life_list, published_highlights)
     photo_ids = sorted(refs)
     photos_map = db.get_photos_by_ids(photo_ids) if photo_ids else {}
+    recipes = db.get_photo_edit_recipes(photo_ids)
+    exif_data = _get_photo_exif_data(db, photo_ids)
     folders = {f["id"]: f["path"] for f in db.get_folder_tree()}
     index = _DevelopedDirIndex()
     exported = 0
@@ -167,6 +143,8 @@ def publish_site(db, vireo_dir, destination, life_list, highlights=None, options
 
     total = len(photo_ids)
     for i, photo_id in enumerate(photo_ids, start=1):
+        if cancel_check and cancel_check():
+            break
         db_photo_row = photos_map.get(photo_id)
         if not db_photo_row:
             errors.append(f"Photo {photo_id} not found in database")
@@ -178,7 +156,6 @@ def publish_site(db, vireo_dir, destination, life_list, highlights=None, options
         context = refs[photo_id][0][1]
         rel_path = _rel_image_path(db_photo, context)
         ok, err = _export_image(
-            db,
             vireo_dir,
             db_photo,
             rel_path,
@@ -186,6 +163,8 @@ def publish_site(db, vireo_dir, destination, life_list, highlights=None, options
             options,
             folders,
             index,
+            recipes.get(photo_id),
+            exif_data.get(photo_id),
         )
         if ok:
             exported += 1
@@ -196,6 +175,12 @@ def publish_site(db, vireo_dir, destination, life_list, highlights=None, options
 
         if progress_cb:
             progress_cb(i, total, db_photo.get("filename") or "")
+
+    # Keep the previous manifests when cancellation leaves this publish
+    # incomplete; otherwise they would advertise photos we never exported.
+    if cancel_check and cancel_check():
+        return {"destination": destination, "data_files": [],
+                "exported_images": exported, "errors": errors}
 
     generated_at = datetime.now(UTC).isoformat()
     site_manifest = {

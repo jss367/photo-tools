@@ -1,7 +1,7 @@
 """Scenario: visit the pipeline (process) page.
 
 Verifies that /pipeline renders, the stage cards are present (Source,
-Scan & Index, etc.), and the "Start Pipeline" button exists. We do not
+Check metadata, etc.), and the "Start Pipeline" button exists. We do not
 trigger an actual scan because that requires real photo files and ML models.
 """
 
@@ -10,13 +10,13 @@ def run(session):
     session.goto("/pipeline")
     session.screenshot("pipeline-initial")
 
-    # Stage cards should be present (at least Source, Scan & Index, Previews)
+    # Stage cards should be present (at least Source, Check metadata, Previews)
     stage_count = session.eval(
         "document.querySelectorAll('.stage-card').length"
     )
     session.assert_that(stage_count >= 3, f"expected at least 3 stage cards, got {stage_count}")
 
-    # Stage names should include Source and Scan & Index. Destination was
+    # Stage names should include Source and Check metadata. Destination was
     # removed in the import/process split — copying files is Import's job.
     stage_names = session.eval(
         """Array.from(document.querySelectorAll('.stage-name')).map(el => el.textContent.trim())"""
@@ -30,8 +30,8 @@ def run(session):
         f"'Destination' should be gone from the process page, got {stage_names!r}",
     )
     session.assert_that(
-        "Scan & Index" in stage_names,
-        f"expected 'Scan & Index' in stage names, got {stage_names!r}",
+        "Check metadata" in stage_names,
+        f"expected 'Check metadata' in stage names, got {stage_names!r}",
     )
 
     # The "Start Pipeline" button should exist

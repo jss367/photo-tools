@@ -35,17 +35,8 @@ export = [
     "open_clip_torch>=2.0",
     "onnx>=1.17",
     "onnxscript>=0.1",
-    # RTMPose-animal / SuperAnimal keypoint model export (eye-focus detection).
-    # mmpose 1.x depends on mmengine; mmdeploy performs the torch -> ONNX
-    # conversion with simcc-aware graph surgery.
-    "mmengine>=0.10",
-    "mmcv>=2.1",
-    "mmpose>=1.3",
-    "mmdeploy>=1.3",
-    # SuperAnimal-Quadruped / SuperAnimal-Bird: the export builds a DLC 3.x
-    # PoseModel and loads raw snapshots from DeepLabCut's HuggingFace org.
-    # 3.0 is still pre-release (install with pip --pre).
-    "deeplabcut>=3.0.0rc14",
+    # Pose model exporters have incompatible NumPy requirements. Install
+    # their standalone environments from scripts/model-export/ instead.
 ]
 dev = [
     "pytest>=9.0",

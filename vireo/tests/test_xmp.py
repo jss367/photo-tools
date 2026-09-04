@@ -2,6 +2,7 @@
 
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -55,6 +56,66 @@ def sample_xmp(tmp_path):
 def missing_xmp(tmp_path):
     """Return a path to a non-existent XMP file."""
     return str(tmp_path / "does_not_exist.xmp")
+
+
+@pytest.mark.parametrize("writer,args", [
+    (write_sidecar, ({"Eagle"}, set())),
+    (write_rating, (5,)),
+    (write_pick_flag, ("flagged",)),
+    (write_gps_location, (10, 20)),
+    (remove_vireo_gps_location, ()),
+    (write_edit_recipe, ('{"exposure":1}',)),
+    (remove_keywords, ({"Bird"},)),
+])
+@pytest.mark.parametrize("failure", ["serialize", "replace"])
+def test_failed_sidecar_update_preserves_original(sample_xmp, monkeypatch, writer, args, failure):
+    import xmp
+
+    write_gps_location(sample_xmp, 30, 40)
+    path = Path(sample_xmp)
+    original = path.read_bytes()
+
+    def failed_serializer(write, *args, **kwargs):
+        write("<partial")
+        raise OSError(28, "disk full")
+
+    def failed_replace(*args):
+        raise OSError("replacement failed")
+
+    if failure == "serialize":
+        monkeypatch.setitem(xmp.ET._serialize, "xml", failed_serializer)
+    else:
+        monkeypatch.setattr(xmp.os, "replace", failed_replace)
+    with pytest.raises(OSError):
+        writer(sample_xmp, *args)
+
+    assert path.read_bytes() == original
+    assert set(path.parent.iterdir()) == {path}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits and symlinks")
+def test_atomic_sidecar_update_preserves_mode_and_symlink(sample_xmp, tmp_path):
+    import stat
+
+    path = Path(sample_xmp)
+    path.chmod(0o640)
+    link = tmp_path / "linked.xmp"
+    link.symlink_to(path)
+    write_rating(link, 5)
+    assert link.is_symlink()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    assert read_sync_preview_metadata(path)["rating"] == "5"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX umask")
+def test_new_sidecar_uses_normal_creation_permissions(tmp_path):
+    import stat
+
+    reference = tmp_path / "reference.txt"
+    reference.write_text("normal file")
+    sidecar = tmp_path / "photo.xmp"
+    write_sidecar(sidecar, {"Bird"}, set())
+    assert stat.S_IMODE(sidecar.stat().st_mode) == stat.S_IMODE(reference.stat().st_mode)
 
 
 # ── read_keywords ───────────────────────────────────────────────────────

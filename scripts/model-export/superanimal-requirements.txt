@@ -1,0 +1,10 @@
+# Standalone exporter; do not install Vireo into this environment.
+numpy>=1.26,<2
+torch>=2.6
+torchvision>=0.21
+onnx>=1.17
+onnxscript>=0.1
+onnxruntime>=1.22
+huggingface_hub>=1.4.1
+PyYAML>=6
+deeplabcut>=3.0.0rc14

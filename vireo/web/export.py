@@ -311,6 +311,7 @@ def create_export_blueprint(
                     "collect_files": reveal_after_export,
                 },
                 progress_cb=progress_cb,
+                cancel_check=lambda: ctx.runner.is_cancelled(job["id"]),
             )
             exported_files = result.pop("files", [])
             result["revealed"] = bool(
@@ -569,6 +570,7 @@ def create_export_blueprint(
                     "include_locations": include_locations,
                 },
                 progress_cb=progress_cb,
+                cancel_check=lambda: ctx.runner.is_cancelled(job["id"]),
             )
 
         return ctx.start(

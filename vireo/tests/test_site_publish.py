@@ -1,5 +1,7 @@
 import json
+import threading
 
+import pytest
 from PIL import Image
 from wait import wait_for_job_via_client
 
@@ -295,3 +297,83 @@ def test_publish_site_job_rejects_relative_destination(app_and_db):
         "destination": "relative/out",
     })
     assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("source", ["original", "default_developed", "custom_developed"])
+@pytest.mark.parametrize("cropped", [False, True])
+def test_publish_renders_saved_edits_and_developed_images(tmp_path, monkeypatch, source, cropped):
+    import config as cfg
+    from export import developed_folder_key
+
+    app, db, meta = _seed_publish_app(tmp_path, monkeypatch)
+    if cropped:
+        db.set_photo_edit_recipe(meta["p1"], {"crop": {"x": 0, "y": 0, "w": 0.5, "h": 1}})
+    if source != "original":
+        if source == "custom_developed":
+            output = tmp_path / "custom-developed"
+            cfg.save({"darktable_output_dir": str(output)})
+            developed = output / developed_folder_key(str(meta["photos_dir"]))
+        else:
+            developed = meta["photos_dir"] / "developed"
+        developed.mkdir(parents=True)
+        Image.new("RGB", (1200, 800), (0, 0, 255)).save(developed / "cardinal.jpg")
+
+    client = app.test_client()
+    destination = tmp_path / "published"
+    response = client.post("/api/jobs/publish-site", json={
+        "destination": str(destination), "max_size": 800,
+    })
+    job = wait_for_job_via_client(client, response.get_json()["job_id"])
+    assert job["status"] == "completed"
+    assert job["result"]["errors"] == []
+    manifest = json.loads((destination / "data/life-list.json").read_text())
+    cardinal = next(s for s in manifest["species"] if s["species"] == "Northern Cardinal")
+    with Image.open(destination / cardinal["best"]["image"]) as image:
+        assert image.size == ((600, 800) if cropped else (800, 533))
+        red, _, blue = image.getpixel((0, 0))
+        assert (red > blue) if source == "original" else (blue > red)
+    db.close()
+
+
+@pytest.mark.parametrize("job_type", ["export", "publish-site"])
+def test_export_jobs_stop_between_photos_when_cancelled(tmp_path, monkeypatch, job_type):
+    import export
+
+    app, db, _meta = _seed_publish_app(tmp_path, monkeypatch)
+    started, release = threading.Event(), threading.Event()
+    original_load = export.load_image
+    loaded = []
+
+    def controlled_load(path, *args, **kwargs):
+        loaded.append(path)
+        if len(loaded) == 1:
+            started.set()
+            assert release.wait(10), "cancel request never arrived"
+        return original_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(export, "load_image", controlled_load)
+    client = app.test_client()
+    destination = tmp_path / "cancelled"
+    destination.mkdir()
+    data = destination / "data"
+    data.mkdir()
+    (data / "site.json").write_text('{"previous":true}')
+    options = {"destination": str(destination), "max_size": 512}
+    if job_type == "export":
+        options["photo_ids"] = [r["id"] for r in db.conn.execute("SELECT id FROM photos")]
+    response = client.post(f"/api/jobs/{job_type}", json=options)
+    assert response.status_code == 200
+    job_id = response.get_json()["job_id"]
+    try:
+        assert started.wait(10), "export never started"
+        assert client.post(f"/api/jobs/{job_id}/cancel").status_code == 200
+    finally:
+        release.set()
+    job = wait_for_job_via_client(client, job_id)
+    assert job["status"] == "cancelled"
+    assert len(loaded) == 1
+    assert len(list(destination.rglob("*.jpg"))) == 1
+    count_key = "exported" if job_type == "export" else "exported_images"
+    assert job["result"][count_key] == 1
+    assert (data / "site.json").read_text() == '{"previous":true}'
+    db.close()

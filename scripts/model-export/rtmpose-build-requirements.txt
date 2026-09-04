@@ -1,0 +1,8 @@
+# Install these before the native pose packages, without build isolation.
+# MMCV needs torch and pkg_resources; chumpy's setup.py imports pip.
+pip
+setuptools<81
+wheel
+numpy>=1.26,<2
+torch==2.1.2
+torchvision==0.16.2

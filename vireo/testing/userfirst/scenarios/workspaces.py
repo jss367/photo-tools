@@ -45,11 +45,11 @@ def run(session):
     )
     session.assert_that(has_new_ws_btn, "expected '+ New Workspace' button on workspace page")
 
-    # The "+ Add Folder" link should exist and point to /pipeline
-    has_add_folder = session.eval(
-        """!!document.querySelector('a.btn[href="/pipeline"]')"""
+    # Adding photos now starts in Import rather than Process.
+    has_import_photos = session.eval(
+        """!!document.querySelector('.content a.btn[href="/import"]')"""
     )
-    session.assert_that(has_add_folder, "expected '+ Add Folder' link to /pipeline")
+    session.assert_that(has_import_photos, "expected '+ Import Photos' link to /import")
 
     # The workspaces section should show at least the Default workspace
     # (rendered dynamically by loadWorkspaces JS)

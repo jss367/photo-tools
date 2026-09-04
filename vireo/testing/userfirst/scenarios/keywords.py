@@ -37,11 +37,11 @@ def run(session):
     )
     session.assert_that(active_filter == "all", f"expected 'all' filter active, got {active_filter!r}")
 
-    # The keyword table should have rows (browse_seed has 4 keywords)
+    # browse_seed creates three species keywords.
     row_count = session.eval(
         "document.querySelectorAll('#kwBody tr').length"
     )
-    session.assert_that(row_count >= 4, f"expected at least 4 keyword rows, got {row_count}")
+    session.assert_that(row_count >= 3, f"expected at least 3 keyword rows, got {row_count}")
 
     # Stats should show keyword count
     stats_text = session.eval(

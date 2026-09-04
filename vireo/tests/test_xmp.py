@@ -477,3 +477,28 @@ def test_remove_keywords_flat_only_preserves_hierarchies(sample_xmp):
     hier = read_hierarchical_keywords(sample_xmp)
     assert "Animals|Birds|Raptor" in hier
     assert "Location|Forest" in hier
+
+
+@pytest.mark.parametrize("writer,args", [
+    (write_sidecar, ({"Eagle"}, set())),
+    (write_rating, (5,)),
+    (write_pick_flag, ("flagged",)),
+    (write_gps_location, (10, 20)),
+    (remove_vireo_gps_location, ()),
+    (write_edit_recipe, ('{"exposure":1}',)),
+    (remove_keywords, ({"Bird"},)),
+])
+def test_sidecar_writers_respect_read_only_files(sample_xmp, writer, args):
+    write_gps_location(sample_xmp, 30, 40)
+    path = Path(sample_xmp)
+    original = path.read_bytes()
+    path.chmod(0o444)
+    try:
+        if os.access(path, os.W_OK):
+            pytest.skip("current user can bypass read-only permissions")
+        with pytest.raises(PermissionError):
+            writer(sample_xmp, *args)
+        assert path.read_bytes() == original
+        assert set(path.parent.iterdir()) == {path}
+    finally:
+        path.chmod(0o644)

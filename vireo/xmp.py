@@ -55,6 +55,11 @@ def _write_tree_atomic(tree, xmp_path):
         mode = stat.S_IMODE(path.stat().st_mode)
     except FileNotFoundError:
         mode = None
+    if mode is not None:
+        # Replacing a directory entry bypasses the file's write protection on
+        # POSIX. Probe write access without truncation to retain the previous
+        # writer's permission checks, including ACLs and read-only flags.
+        os.close(os.open(path, os.O_WRONLY))
     temp_path = None
     try:
         candidate = path.parent / f".vireo-xmp-{uuid.uuid4().hex}.tmp"

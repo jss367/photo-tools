@@ -606,7 +606,9 @@ def test_analyze_for_culling_with_predictions(tmp_path):
     assert sg["photo_count"] == 4
     assert len(sg["scene_groups"]) >= 1
     assert len(sg["redundancy_clusters"]) >= 1
-    assert isinstance(sg["embedding_sims"], dict)
+    # The pairwise similarity map was O(n^2) per species group, written into
+    # the culling results file, and read by nothing — it must stay gone.
+    assert "embedding_sims" not in sg
 
 
 def test_analyze_for_culling_no_embeddings(tmp_path):

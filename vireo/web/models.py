@@ -12,6 +12,51 @@ from web.background_jobs import make_background_job
 
 log = logging.getLogger(__name__)
 
+# Pipeline models (ONNX) by ID: the HF subfolder under ``jss367/vireo-onnx-models``
+# and the local directory name under ``~/.vireo/models``, plus the files each
+# needs. Download and delete both key off this table, so an ID that isn't
+# listed here can neither fetch nor remove anything on disk.
+PIPELINE_MODELS = {
+    "megadetector-v6": {
+        "subfolder": "megadetector-v6",
+        "files": ["model.onnx"],
+    },
+    "sam2-tiny": {
+        "subfolder": "sam2-tiny",
+        "files": ["image_encoder.onnx", "mask_decoder.onnx"],
+    },
+    "sam2-small": {
+        "subfolder": "sam2-small",
+        "files": ["image_encoder.onnx", "mask_decoder.onnx"],
+    },
+    "sam2-base-plus": {
+        "subfolder": "sam2-base-plus",
+        "files": ["image_encoder.onnx", "mask_decoder.onnx"],
+    },
+    "sam2-large": {
+        "subfolder": "sam2-large",
+        "files": ["image_encoder.onnx", "mask_decoder.onnx"],
+    },
+    "vit-s14": {
+        "subfolder": "dinov2-vit-s14",
+        "files": ["model.onnx", "model.onnx.data"],
+    },
+    "vit-b14": {
+        "subfolder": "dinov2-vit-b14",
+        "files": ["model.onnx", "model.onnx.data"],
+    },
+    "vit-l14": {
+        "subfolder": "dinov2-vit-l14",
+        "files": ["model.onnx", "model.onnx.data"],
+    },
+}
+
+
+def pipeline_models_dir():
+    """Directory holding downloaded pipeline model weights."""
+    return os.path.expanduser("~/.vireo/models")
+
+
 
 def create_models_blueprint(
     get_db,
@@ -559,7 +604,7 @@ def create_models_blueprint(
     @blueprint.route("/api/models/pipeline")
     def api_models_pipeline():
         """Return download status of all pipeline models (MegaDetector, SAM2, DINOv2)."""
-        models_dir = os.path.expanduser("~/.vireo/models")
+        models_dir = pipeline_models_dir()
         models = []
 
         # MegaDetector — check for ONNX model in ~/.vireo/models/megadetector-v6/
@@ -651,42 +696,6 @@ def create_models_blueprint(
         if not model_id:
             return json_error("model_id required")
 
-        # Map each pipeline model ID to its HF subfolder and required files
-        PIPELINE_MODELS = {
-            "megadetector-v6": {
-                "subfolder": "megadetector-v6",
-                "files": ["model.onnx"],
-            },
-            "sam2-tiny": {
-                "subfolder": "sam2-tiny",
-                "files": ["image_encoder.onnx", "mask_decoder.onnx"],
-            },
-            "sam2-small": {
-                "subfolder": "sam2-small",
-                "files": ["image_encoder.onnx", "mask_decoder.onnx"],
-            },
-            "sam2-base-plus": {
-                "subfolder": "sam2-base-plus",
-                "files": ["image_encoder.onnx", "mask_decoder.onnx"],
-            },
-            "sam2-large": {
-                "subfolder": "sam2-large",
-                "files": ["image_encoder.onnx", "mask_decoder.onnx"],
-            },
-            "vit-s14": {
-                "subfolder": "dinov2-vit-s14",
-                "files": ["model.onnx", "model.onnx.data"],
-            },
-            "vit-b14": {
-                "subfolder": "dinov2-vit-b14",
-                "files": ["model.onnx", "model.onnx.data"],
-            },
-            "vit-l14": {
-                "subfolder": "dinov2-vit-l14",
-                "files": ["model.onnx", "model.onnx.data"],
-            },
-        }
-
         if model_id not in PIPELINE_MODELS:
             return json_error(f"Unknown pipeline model: {model_id}")
 
@@ -699,7 +708,7 @@ def create_models_blueprint(
             spec = PIPELINE_MODELS[model_id]
             subfolder = spec["subfolder"]
             files = spec["files"]
-            model_dir = os.path.join(os.path.expanduser("~/.vireo/models"), subfolder)
+            model_dir = os.path.join(pipeline_models_dir(), subfolder)
             os.makedirs(model_dir, exist_ok=True)
 
             total = len(files)
@@ -748,42 +757,40 @@ def create_models_blueprint(
 
     @blueprint.route("/api/models/pipeline/delete", methods=["POST"])
     def api_models_pipeline_delete():
-        """Delete a pipeline model's ONNX files from ~/.vireo/models/."""
+        """Delete a pipeline model's ONNX files from ~/.vireo/models/.
+
+        ``model_id`` must be a key of :data:`PIPELINE_MODELS`; the directory
+        removed is that entry's ``subfolder``, never a path built from the
+        request. A prefix check alone let ``sam2-large/../..`` resolve to the
+        parent of the models directory and rmtree the whole Vireo data dir.
+        """
         import shutil
 
         body = request.get_json(silent=True) or {}
         model_id = body.get("model_id")
-        if not model_id:
+        if not model_id or not isinstance(model_id, str):
             return json_error("model_id required")
+        spec = PIPELINE_MODELS.get(model_id)
+        if spec is None:
+            return json_error(f"Unknown pipeline model: {model_id}", status=404)
 
-        models_dir = os.path.expanduser("~/.vireo/models")
+        model_dir = os.path.join(pipeline_models_dir(), spec["subfolder"])
         removed = []
+        if os.path.isdir(model_dir):
+            shutil.rmtree(model_dir)
+            removed.append(model_dir)
 
+        # Clear the cached session singletons so the next use reloads (or
+        # reports the model as missing) instead of serving stale weights.
         if model_id == "megadetector-v6":
-            model_dir = os.path.join(models_dir, "megadetector-v6")
-            if os.path.isdir(model_dir):
-                shutil.rmtree(model_dir)
-                removed.append(model_dir)
             import detector
             detector._session = None
-
         elif model_id.startswith("sam2-"):
-            model_dir = os.path.join(models_dir, model_id)
-            if os.path.isdir(model_dir):
-                shutil.rmtree(model_dir)
-                removed.append(model_dir)
-            # Clear singleton
             import masking
             masking._encoder_session = None
             masking._decoder_session = None
             masking._sam2_variant_loaded = None
-
         elif model_id.startswith("vit-"):
-            model_dir = os.path.join(models_dir, f"dinov2-{model_id}")
-            if os.path.isdir(model_dir):
-                shutil.rmtree(model_dir)
-                removed.append(model_dir)
-            # Clear singleton
             import dino_embed as dinov2_mod
             dinov2_mod._session = None
             dinov2_mod._variant_loaded = None

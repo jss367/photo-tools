@@ -268,16 +268,6 @@ def analyze_for_culling(
             scene_clusters, redundancy_clusters, photo_data, timestamps, filenames
         )
 
-        # Pre-compute pairwise embedding similarities for dev mode overlay
-        embedding_sims = {}
-        emb_pids = list(sp_embeddings.keys())
-        for i in range(len(emb_pids)):
-            for j in range(i + 1, len(emb_pids)):
-                a, b = emb_pids[i], emb_pids[j]
-                sim = _embedding_sim(sp_embeddings[a], sp_embeddings[b])
-                key = f"{min(a,b)}-{max(a,b)}"
-                embedding_sims[key] = round(sim, 3)
-
         species_groups.append({
             "species": group_key,
             "photo_count": len(pids),
@@ -287,7 +277,6 @@ def analyze_for_culling(
             # Raw data for client-side regrouping
             "photos_data": photo_data,
             "redundancy_clusters": [[pid for pid in c] for c in redundancy_clusters],
-            "embedding_sims": embedding_sims,
         })
         total_keepers += sp_keepers
         total_rejects += sp_rejects

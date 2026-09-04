@@ -372,7 +372,7 @@ def test_export_jobs_stop_between_photos_when_cancelled(tmp_path, monkeypatch, j
     job = wait_for_job_via_client(client, job_id)
     assert job["status"] == "cancelled"
     assert len(loaded) == 1
-    assert len(list(destination.rglob("*.jpg"))) == 1
+    assert len(list(destination.rglob("*.jpg"))) == (1 if job_type == "export" else 0)
     count_key = "exported" if job_type == "export" else "exported_images"
     assert job["result"][count_key] == 1
     assert (data / "site.json").read_text() == '{"previous":true}'
@@ -391,7 +391,7 @@ def test_publish_cancellation_is_coordinated_with_manifest_commit(
     app, db, _meta = _seed_publish_app(tmp_path, monkeypatch)
     reached, release = threading.Event(), threading.Event()
     original_begin = JobRunner.begin_uncancellable
-    original_write = site_publish._write_json
+    original_replace = site_publish.os.replace
 
     def wait_for_cancel():
         reached.set()
@@ -402,13 +402,13 @@ def test_publish_cancellation_is_coordinated_with_manifest_commit(
             wait_for_cancel()
         return original_begin(runner, job_id)
 
-    def controlled_write(path, payload):
-        if path.name == boundary:
+    def controlled_replace(source, destination):
+        if getattr(destination, "name", None) == boundary:
             wait_for_cancel()
-        return original_write(path, payload)
+        return original_replace(source, destination)
 
     monkeypatch.setattr(JobRunner, "begin_uncancellable", controlled_begin)
-    monkeypatch.setattr(site_publish, "_write_json", controlled_write)
+    monkeypatch.setattr(site_publish.os, "replace", controlled_replace)
     destination = tmp_path / "published"
     data = destination / "data"
     data.mkdir(parents=True)
@@ -441,4 +441,82 @@ def test_publish_cancellation_is_coordinated_with_manifest_commit(
         manifests = [json.loads((data / name).read_text()) for name in filenames]
         assert manifests[0]["generated_at"] == manifests[1]["meta"]["generated_at"]
         assert manifests[0]["generated_at"] == manifests[2]["meta"]["generated_at"]
+    db.close()
+
+
+@pytest.mark.parametrize("phase", ["image", "manifest"])
+@pytest.mark.parametrize("outcome", ["cancel", "complete", "error"])
+def test_republish_stages_files_until_commit(tmp_path, monkeypatch, phase, outcome):
+    import site_publish
+
+    app, db, meta = _seed_publish_app(tmp_path, monkeypatch)
+    client = app.test_client()
+    destination = tmp_path / "published"
+    options = {"destination": str(destination), "max_size": 512}
+    response = client.post("/api/jobs/publish-site", json=options)
+    job = wait_for_job_via_client(client, response.get_json()["job_id"])
+    assert job["status"] == "completed"
+    previous = {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*") if path.is_file()
+    }
+    for path in meta["photos_dir"].glob("*.jpg"):
+        Image.new("RGB", (1200, 800), (0, 0, 255)).save(path)
+
+    reached, release = threading.Event(), threading.Event()
+    original_export = site_publish._export_image
+    original_write = site_publish._write_json
+
+    def pause_once():
+        if reached.is_set():
+            return
+        reached.set()
+        assert release.wait(10), "publish was never released"
+        if outcome == "error":
+            raise OSError("staging write failed")
+
+    def controlled_export(*args, **kwargs):
+        result = original_export(*args, **kwargs)
+        if phase == "image":
+            pause_once()
+        return result
+
+    def controlled_write(path, payload):
+        result = original_write(path, payload)
+        if phase == "manifest":
+            pause_once()
+        return result
+
+    monkeypatch.setattr(site_publish, "_export_image", controlled_export)
+    monkeypatch.setattr(site_publish, "_write_json", controlled_write)
+    response = client.post("/api/jobs/publish-site", json=options)
+    job_id = response.get_json()["job_id"]
+    try:
+        assert reached.wait(10), "republish never reached staging"
+        for path, contents in previous.items():
+            assert (destination / path).read_bytes() == contents
+        if outcome == "cancel":
+            assert client.post(f"/api/jobs/{job_id}/cancel").status_code == 200
+    finally:
+        release.set()
+
+    job = wait_for_job_via_client(client, job_id)
+    assert job["status"] == {
+        "cancel": "cancelled", "complete": "completed", "error": "failed",
+    }[outcome]
+    assert not list(destination.glob(".vireo-publish-*"))
+    current = {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*") if path.is_file()
+    }
+    assert current.keys() == previous.keys()
+    if outcome == "complete":
+        for path, contents in previous.items():
+            assert current[path] != contents
+        for path in destination.rglob("*.jpg"):
+            with Image.open(path) as image:
+                red, _, blue = image.getpixel((0, 0))
+                assert blue > red
+    else:
+        assert current == previous
     db.close()

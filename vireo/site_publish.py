@@ -8,6 +8,7 @@ import os
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from export import (
     _DevelopedDirIndex,
@@ -117,15 +118,26 @@ def publish_site(db, vireo_dir, destination, life_list, highlights=None, options
         cancel_check: optional callable; stop before the next photo when true.
         begin_commit: optional callable that atomically rejects pending cancellation
             or prevents later cancellation through job completion; false aborts
-            before writing any manifests.
+            before replacing any published files.
     """
+    Path(destination).mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=".vireo-publish-", dir=destination) as staging:
+        return _publish_site(
+            db, vireo_dir, destination, staging, life_list, highlights, options,
+            progress_cb, cancel_check, begin_commit,
+        )
+
+
+def _publish_site(db, vireo_dir, destination, staging, life_list, highlights,
+                  options, progress_cb, cancel_check, begin_commit):
     options = options or {}
     highlights = highlights or {"buckets": [], "meta": {}}
     include_locations = bool(options.get("include_locations", False))
 
     destination_path = Path(destination)
-    data_dir = destination_path / "data"
-    destination_path.mkdir(parents=True, exist_ok=True)
+    staging_path = Path(staging)
+    data_dir = staging_path / "data"
+    image_paths = []
 
     published_life_list = copy.deepcopy(life_list)
     published_highlights = copy.deepcopy(highlights)
@@ -162,7 +174,7 @@ def publish_site(db, vireo_dir, destination, life_list, highlights=None, options
             vireo_dir,
             db_photo,
             rel_path,
-            destination,
+            staging,
             options,
             folders,
             index,
@@ -171,6 +183,7 @@ def publish_site(db, vireo_dir, destination, life_list, highlights=None, options
         )
         if ok:
             exported += 1
+            image_paths.append(rel_path)
             for ref, _context in refs[photo_id]:
                 ref["image"] = rel_path
         elif err:
@@ -203,24 +216,28 @@ def publish_site(db, vireo_dir, destination, life_list, highlights=None, options
     published_life_list.setdefault("meta", {})["generated_at"] = generated_at
     published_highlights.setdefault("meta", {})["generated_at"] = generated_at
 
-    # Coordinate the commit boundary with the job runner's cancellation lock.
-    # A separate probe cannot prevent a late Stop from marking a committed
-    # publish as cancelled while these manifests are being written.
-    if begin_commit is not None and not begin_commit():
-        return {"destination": destination, "data_files": [],
-                "exported_images": exported, "errors": errors}
-
     _write_json(data_dir / "site.json", site_manifest)
     _write_json(data_dir / "life-list.json", published_life_list)
     _write_json(data_dir / "highlights.json", published_highlights)
 
+    # Keep staging cancellable, then coordinate replacement with the job
+    # runner's lock so a late Stop cannot interrupt the published files.
+    can_commit = begin_commit() if begin_commit is not None else not (
+        cancel_check and cancel_check()
+    )
+    if not can_commit:
+        return {"destination": destination, "data_files": [],
+                "exported_images": exported, "errors": errors}
+
+    data_files = ["data/site.json", "data/life-list.json", "data/highlights.json"]
+    for rel_path in image_paths + data_files:
+        out_path = destination_path / rel_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging_path / rel_path, out_path)
+
     return {
         "destination": destination,
-        "data_files": [
-            "data/site.json",
-            "data/life-list.json",
-            "data/highlights.json",
-        ],
+        "data_files": data_files,
         "exported_images": exported,
         "errors": errors,
     }

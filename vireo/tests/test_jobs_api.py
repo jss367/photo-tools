@@ -6376,6 +6376,112 @@ def test_import_in_place_no_destination_required(app_and_db, tmp_path):
     assert [p["id"] for p in photos] == result["photo_ids"]
 
 
+@pytest.mark.parametrize("change", [None, "content", "missing_metadata"])
+def test_import_in_place_reuses_catalog_across_workspaces(
+    app_and_db, tmp_path, monkeypatch, change,
+):
+    """Link known photos without rereading them; still process new/changed files."""
+    import scanner
+
+    app, db = app_and_db
+    client = app.test_client()
+    old_ws = db._active_workspace_id
+    source = tmp_path / "archive"
+    source.mkdir()
+    unchanged = source / "unchanged.jpg"
+    other = source / "other.jpg"
+    Image.new("RGB", (16, 16), "red").save(unchanged)
+    Image.new("RGB", (16, 16), "green").save(other)
+    scanner.scan(str(source), db)
+    # Stand in for successful metadata extraction when ExifTool is absent.
+    db.conn.execute("UPDATE photos SET exif_data = '{}' WHERE exif_data IS NULL")
+    db.conn.commit()
+    original = {
+        row["filename"]: dict(row)
+        for row in db.conn.execute(
+            "SELECT id, filename, file_hash, file_mtime FROM photos WHERE folder_id="
+            "(SELECT id FROM folders WHERE path=?)", (str(source),),
+        )
+    }
+
+    expected_reads = set()
+    if change == "content":
+        Image.new("RGB", (32, 32), "blue").save(other)
+        mtime = original[other.name]["file_mtime"] + 10
+        os.utime(other, (mtime, mtime))
+        new_photo = source / "new.jpg"
+        Image.new("RGB", (16, 16), "yellow").save(new_photo)
+        expected_reads = {str(other), str(new_photo)}
+    elif change == "missing_metadata":
+        db.conn.execute(
+            "UPDATE photos SET exif_data=NULL, timestamp=NULL WHERE id=?",
+            (original[other.name]["id"],),
+        )
+        db.conn.commit()
+        expected_reads = {str(other)}
+
+    feature_reads = []
+    metadata_reads = []
+    real_features = scanner._compute_file_features
+    real_metadata = scanner.extract_metadata
+
+    def compute_features(path):
+        feature_reads.append(path)
+        return real_features(path)
+
+    def extract_metadata(paths, **kwargs):
+        metadata_reads.extend(paths)
+        return real_metadata(paths, **kwargs)
+
+    monkeypatch.setattr(scanner, "_compute_file_features", compute_features)
+    monkeypatch.setattr(scanner, "extract_metadata", extract_metadata)
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+        "new_workspace_name": "April photos",
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+    assert job["status"] == "completed", job
+    assert set(feature_reads) == expected_reads
+    assert set(metadata_reads) == expected_reads
+
+    result = job["result"]
+    expected_count = 3 if change == "content" else 2
+    assert result["ok"] is True
+    assert result["indexed"] == expected_count
+    assert job["steps"][0]["progress"] == {
+        "current": expected_count, "total": expected_count,
+    }
+    rows = {
+        row["filename"]: dict(row)
+        for row in db.conn.execute(
+            "SELECT id, filename, file_hash FROM photos WHERE folder_id="
+            "(SELECT id FROM folders WHERE path=?)", (str(source),),
+        )
+    }
+    assert len(rows) == expected_count
+    for name, previous in original.items():
+        assert rows[name]["id"] == previous["id"]
+    assert rows[unchanged.name]["file_hash"] == original[unchanged.name]["file_hash"]
+    if change == "content":
+        assert rows[other.name]["file_hash"] != original[other.name]["file_hash"]
+    assert set(result["photo_ids"]) == {row["id"] for row in rows.values()}
+    new_ws = job["workspace_id"]
+    assert new_ws != old_ws
+    db.set_active_workspace(new_ws)
+    assert {p["id"] for p in db.get_collection_photos(
+        result["collection_id"], per_page=999999,
+    )} == set(result["photo_ids"])
+    linked_workspaces = {
+        row["workspace_id"] for row in db.conn.execute(
+            "SELECT workspace_id FROM workspace_folders WHERE folder_id="
+            "(SELECT id FROM folders WHERE path=?)", (str(source),),
+        )
+    }
+    assert {old_ws, new_ws} <= linked_workspaces
+
+
 def test_import_in_place_overall_total_is_stable_across_sources(
     app_and_db, tmp_path,
 ):

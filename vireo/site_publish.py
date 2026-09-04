@@ -6,9 +6,10 @@ import copy
 import json
 import os
 import re
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, TemporaryFile
 
 from export import (
     _DevelopedDirIndex,
@@ -220,8 +221,23 @@ def _publish_site(db, vireo_dir, destination, staging, life_list, highlights,
     _write_json(data_dir / "life-list.json", published_life_list)
     _write_json(data_dir / "highlights.json", published_highlights)
 
-    # Keep staging cancellable, then coordinate replacement with the job
-    # runner's lock so a late Stop cannot interrupt the published files.
+    data_files = ["data/site.json", "data/life-list.json", "data/highlights.json"]
+    # Check every destination before modifying any published content. Existing
+    # files may be writable even when their directories cannot be modified.
+    for rel_path in image_paths + data_files:
+        if cancel_check and cancel_check():
+            return {"destination": destination, "data_files": [],
+                    "exported_images": exported, "errors": errors}
+        out_path = destination_path / rel_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if out_path.exists():
+            os.close(os.open(out_path, os.O_WRONLY))
+        else:
+            with TemporaryFile(dir=out_path.parent):
+                pass
+
+    # Keep staging cancellable, then coordinate writes with the job runner's
+    # lock so a late Stop cannot interrupt the published files.
     can_commit = begin_commit() if begin_commit is not None else not (
         cancel_check and cancel_check()
     )
@@ -229,11 +245,11 @@ def _publish_site(db, vireo_dir, destination, staging, life_list, highlights,
         return {"destination": destination, "data_files": [],
                 "exported_images": exported, "errors": errors}
 
-    data_files = ["data/site.json", "data/life-list.json", "data/highlights.json"]
     for rel_path in image_paths + data_files:
         out_path = destination_path / rel_path
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(staging_path / rel_path, out_path)
+        # Retain the original writable-file behavior and its inode ownership,
+        # ACLs, and mode; directory-entry replacement would discard those.
+        shutil.copyfile(staging_path / rel_path, out_path)
 
     return {
         "destination": destination,

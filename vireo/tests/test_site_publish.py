@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 
 import pytest
@@ -391,7 +392,7 @@ def test_publish_cancellation_is_coordinated_with_manifest_commit(
     app, db, _meta = _seed_publish_app(tmp_path, monkeypatch)
     reached, release = threading.Event(), threading.Event()
     original_begin = JobRunner.begin_uncancellable
-    original_replace = site_publish.os.replace
+    original_copy = site_publish.shutil.copyfile
 
     def wait_for_cancel():
         reached.set()
@@ -402,13 +403,13 @@ def test_publish_cancellation_is_coordinated_with_manifest_commit(
             wait_for_cancel()
         return original_begin(runner, job_id)
 
-    def controlled_replace(source, destination):
+    def controlled_copy(source, destination):
         if getattr(destination, "name", None) == boundary:
             wait_for_cancel()
-        return original_replace(source, destination)
+        return original_copy(source, destination)
 
     monkeypatch.setattr(JobRunner, "begin_uncancellable", controlled_begin)
-    monkeypatch.setattr(site_publish.os, "replace", controlled_replace)
+    monkeypatch.setattr(site_publish.shutil, "copyfile", controlled_copy)
     destination = tmp_path / "published"
     data = destination / "data"
     data.mkdir(parents=True)
@@ -520,3 +521,46 @@ def test_republish_stages_files_until_commit(tmp_path, monkeypatch, phase, outco
     else:
         assert current == previous
     db.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX write permissions")
+@pytest.mark.parametrize("protection", ["directories", "manifest"])
+def test_republish_checks_access_before_commit(tmp_path, monkeypatch, protection):
+    app, db, meta = _seed_publish_app(tmp_path, monkeypatch)
+    client = app.test_client()
+    destination = tmp_path / "published"
+    options = {"destination": str(destination), "max_size": 512}
+    response = client.post("/api/jobs/publish-site", json=options)
+    job = wait_for_job_via_client(client, response.get_json()["job_id"])
+    assert job["status"] == "completed"
+    previous = {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*") if path.is_file()
+    }
+    for path in meta["photos_dir"].glob("*.jpg"):
+        Image.new("RGB", (1200, 800), (0, 0, 255)).save(path)
+
+    protected = (
+        [destination / "data", destination / "images/photos"]
+        if protection == "directories" else [destination / "data/highlights.json"]
+    )
+    try:
+        for path in protected:
+            path.chmod(0o555 if path.is_dir() else 0o444)
+            if os.access(path, os.W_OK):
+                pytest.skip("current user can bypass write protection")
+        response = client.post("/api/jobs/publish-site", json=options)
+        job = wait_for_job_via_client(client, response.get_json()["job_id"])
+        if protection == "directories":
+            assert job["status"] == "completed"
+            for path, contents in previous.items():
+                assert (destination / path).read_bytes() != contents
+        else:
+            assert job["status"] == "failed"
+            for path, contents in previous.items():
+                assert (destination / path).read_bytes() == contents
+        assert not list(destination.glob(".vireo-publish-*"))
+    finally:
+        for path in protected:
+            path.chmod(0o755 if path.is_dir() else 0o644)
+        db.close()

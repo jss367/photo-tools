@@ -3056,6 +3056,11 @@ def create_imports_blueprint(
                     source_scan_counts = {}
                     do_scan(
                         source, thread_db,
+                        # Photos are cataloged globally. Reuse unchanged
+                        # records when linking them into another workspace
+                        # instead of rereading metadata and hashes over NAS.
+                        incremental=True,
+                        repair_missing_metadata=True,
                         progress_callback=progress_cb,
                         extract_full_metadata=pipeline_cfg.get(
                             "extract_full_metadata", True,

@@ -2028,6 +2028,39 @@ _EMPTY_SCAN_COUNTS = {
 }
 
 
+def _incremental_photo_index(db, image_files):
+    """Load scan baselines for the requested paths across all workspaces.
+
+    Indexed folder/filename lookups avoid repeatedly reading the entire
+    catalog for every source in a multi-folder import. Bound each query
+    below SQLite's parameter limit, and keep EXIF payloads out of memory.
+    """
+    result = {}
+    for start in range(0, len(image_files), 200):
+        batch = image_files[start:start + 200]
+        placeholders = ",".join("(?, ?)" for _ in batch)
+        params = [part for path in batch for part in (str(path.parent), path.name)]
+        rows = db.conn.execute(
+            f"WITH requested(folder_path, filename) AS (VALUES {placeholders}) "
+            "SELECT f.path AS folder_path, p.id, p.filename, p.extension, "
+            "p.file_size, p.file_mtime, p.xmp_mtime, p.timestamp, p.width, "
+            "p.file_hash, p.exif_data IS NOT NULL AS exif_extracted, "
+            "(p.exif_data IS NULL AND p.camera_make IS NULL "
+            "AND p.camera_model IS NULL AND p.lens IS NULL "
+            "AND p.aperture IS NULL AND p.shutter_speed IS NULL "
+            "AND p.iso IS NULL) AS summary_needs_extract "
+            # Preserve os.path.join's match for legacy folder paths ending
+            # in a separator, while retaining indexed equality lookups.
+            "FROM requested r JOIN folders f "
+            "ON f.path IN (r.folder_path, r.folder_path || ?) "
+            "JOIN photos p ON p.folder_id = f.id AND p.filename = r.filename",
+            [*params, os.sep],
+        )
+        for row in rows:
+            result[os.path.join(row["folder_path"], row["filename"])] = row
+    return result
+
+
 def scan(root, db, progress_callback=None, incremental=False, extract_full_metadata=True, photo_callback=None, skip_paths=None, status_callback=None, recursive=True, restrict_dirs=None, restrict_files=None, vireo_dir=None, thumb_cache_dir=None, permission_error_callback=None, cancel_check=None, pause_check=None, cancel_only_check=None, skip_working_copies=False, repair_missing_metadata=False, register_restrict_dirs_as_roots=True, allow_photo_inserts=True, counts=None, discovered_files=None):
     """Walk a folder tree, discover photos, read metadata, populate database.
 
@@ -2035,7 +2068,9 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         root: path to the root folder to scan
         db: Database instance
         progress_callback: optional callable(current, total) for progress reporting
-        incremental: if True, skip files unchanged since last scan
+        incremental: if True, reuse complete records with matching file size
+            and mtime. This does not verify byte identity; use a full scan
+            to detect replacements that preserve both signals.
         repair_missing_metadata: in incremental mode, force rows whose
             ExifTool payload is NULL through metadata extraction even when a
             fallback timestamp was available during the original scan
@@ -2463,68 +2498,9 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     if progress_callback:
         progress_callback(excluded_frozen, total)
 
-    # Build existing photo lookup for incremental mode
-    existing_photos = {}
-    existing_file_hashes = {}
-    exif_extracted = set()  # photo IDs where ExifTool has already run
-    summary_needs_extract = set()  # rows needing Phase-1 EXIF summary re-extraction
-    if incremental:
-        all_photos = db.get_photos(per_page=999999)
-        for p in all_photos:
-            # Key by folder_id + filename won't work easily, so use a second lookup
-            existing_photos[p["id"]] = p
-        existing_file_hashes = {
-            row["id"]: row["file_hash"]
-            for row in db.conn.execute("SELECT id, file_hash FROM photos")
-        }
-        # Path-based lookup keyed by absolute path, driving the
-        # incremental "skip on mtime" fast path. Queried GLOBALLY (not
-        # workspace-scoped, unlike ``db.get_photos()`` / ``db.get_folder_tree()``)
-        # so a twin already in the catalog still hits the skip path even
-        # when its folder is not yet linked as a ``workspace_folders``
-        # row in the active workspace. That is exactly the case the
-        # import job's duplicate-folder link scan exists to repair:
-        # scoping the lookup to the active workspace re-opened and
-        # re-hashed every already-known twin just to link the folder
-        # (PR #1385 Codex review). The sibling lookups above
-        # (``existing_file_hashes``, ``exif_extracted``,
-        # ``summary_needs_extract`` below) are already global for the
-        # same reason.
-        existing_by_path = {}
-        folder_paths = {
-            row["id"]: row["path"]
-            for row in db.conn.execute("SELECT id, path FROM folders")
-        }
-        for row in db.conn.execute(
-            "SELECT id, folder_id, filename, extension, file_size, "
-            "file_mtime, xmp_mtime, timestamp, width, height FROM photos"
-        ):
-            folder_path = folder_paths.get(row["folder_id"], "")
-            if not folder_path:
-                continue
-            existing_by_path[os.path.join(folder_path, row["filename"])] = row
-        # Track which photos have had ExifTool metadata extracted (exif_data
-        # is non-NULL). Photos with NULL exif_data need re-extraction.
-        for row in db.conn.execute("SELECT id FROM photos WHERE exif_data IS NOT NULL"):
-            exif_extracted.add(row["id"])
-        # Rows whose Phase-1 promoted EXIF columns (camera_make etc.) were
-        # never populated need one re-extraction so those universal filter
-        # fields work. The DB migration clears the ``'{}'`` marker to NULL
-        # for photos scanned before Phase 1 shipped, and this query picks
-        # them up on the next incremental pass. Without this trigger the
-        # standard ``metadata_missing`` check would still skip these rows
-        # (their timestamp is populated, so none of the existing reasons —
-        # repair mode, missing timestamp, suspect dims — fire). After
-        # re-extraction the scanner writes the promoted columns and
-        # rewrites ``exif_data`` (JSON or ``'{}'`` marker), so the row no
-        # longer matches this query — no perpetual retry.
-        for row in db.conn.execute(
-            "SELECT id FROM photos WHERE exif_data IS NULL "
-            "AND camera_make IS NULL AND camera_model IS NULL "
-            "AND lens IS NULL AND aperture IS NULL "
-            "AND shutter_speed IS NULL AND iso IS NULL"
-        ):
-            summary_needs_extract.add(row["id"])
+    existing_by_path = (
+        _incremental_photo_index(db, image_files) if incremental else {}
+    )
 
     # Build folder cache: path -> folder_id
     folder_cache = {}
@@ -2727,7 +2703,13 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                 full_path_str = str(image_path)
                 existing = existing_by_path.get(full_path_str)
                 if existing:
-                    file_unchanged = existing["file_mtime"] == file_mtime
+                    # Copies/restores can preserve mtime even when the
+                    # original is replaced. Check size from the same stat
+                    # before reusing metadata, hashes, and derived caches.
+                    file_unchanged = (
+                        existing["file_mtime"] == file_mtime
+                        and existing["file_size"] == stat.st_size
+                    )
                     xmp_unchanged = existing["xmp_mtime"] == xmp_mtime
                     # Re-process if ExifTool never ran for this photo (both
                     # timestamp and exif_data are NULL). Photos with genuinely
@@ -2743,23 +2725,25 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                         and existing["width"] < 1000
                     )
                     metadata_missing = (
-                        existing["id"] not in exif_extracted
+                        not existing["exif_extracted"]
                         and (
                             repair_missing_metadata
                             or existing["timestamp"] is None
                             or dims_suspect
                         )
-                    ) or existing["id"] in summary_needs_extract
-                    existing_file_hash = existing_file_hashes.get(existing["id"])
-                    empty_hash_needs_repair = (
+                    ) or existing["summary_needs_extract"]
+                    existing_file_hash = existing["file_hash"]
+                    hash_needs_repair = (
                         existing["file_size"] == 0
                         and existing_file_hash == EMPTY_FILE_SHA256
+                    ) or (
+                        stat.st_size > 0 and existing_file_hash is None
                     )
 
                     if (
                         file_unchanged and xmp_unchanged
                         and not metadata_missing
-                        and not empty_hash_needs_repair
+                        and not hash_needs_repair
                     ):
                         processed_count += 1
                         counts["indexed"] += 1
@@ -2792,7 +2776,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                     if (
                         file_unchanged
                         and not metadata_missing
-                        and not empty_hash_needs_repair
+                        and not hash_needs_repair
                     ):
                         processed_count += 1
                         counts["indexed"] += 1

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import re
 import shutil
@@ -16,6 +17,8 @@ from export import (
     _get_photo_exif_data,
     load_export_image,
 )
+
+log = logging.getLogger(__name__)
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _PRIVATE_PHOTO_FIELDS = {"mask_path"}
@@ -245,11 +248,44 @@ def _publish_site(db, vireo_dir, destination, staging, life_list, highlights,
         return {"destination": destination, "data_files": [],
                 "exported_images": exported, "errors": errors}
 
+    # Snapshot the existing published files inside the staging tree before
+    # any commit-time truncation. If a copy later fails midway (a full disk
+    # is the plausible case), restore snapshots so the site never appears
+    # as a mixture of old and new generations. Snapshots live under staging
+    # so the TemporaryDirectory removes them with the rest.
+    rollback_dir = staging_path / "_rollback"
+    plan = []  # (rel_path, out_path, backup_or_None)
     for rel_path in image_paths + data_files:
         out_path = destination_path / rel_path
-        # Retain the original writable-file behavior and its inode ownership,
-        # ACLs, and mode; directory-entry replacement would discard those.
-        shutil.copyfile(staging_path / rel_path, out_path)
+        if out_path.exists():
+            backup = rollback_dir / rel_path
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(out_path, backup)
+        else:
+            backup = None
+        plan.append((rel_path, out_path, backup))
+
+    committed = 0
+    try:
+        for rel_path, out_path, _backup in plan:
+            # Retain the original writable-file behavior and its inode ownership,
+            # ACLs, and mode; directory-entry replacement would discard those.
+            shutil.copyfile(staging_path / rel_path, out_path)
+            committed += 1
+    except Exception:
+        # Include the file that raised so a truncated destination is restored
+        # to its previous content or removed if it did not exist before.
+        touched = min(committed + 1, len(plan))
+        for i in range(touched):
+            _rel, out_path, backup = plan[i]
+            try:
+                if backup is not None:
+                    shutil.copyfile(backup, out_path)
+                elif out_path.exists():
+                    out_path.unlink()
+            except OSError:
+                log.warning("Failed to roll back %s after commit failure", out_path)
+        raise
 
     return {
         "destination": destination,

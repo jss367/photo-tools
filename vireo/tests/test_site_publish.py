@@ -564,3 +564,55 @@ def test_republish_checks_access_before_commit(tmp_path, monkeypatch, protection
         for path in protected:
             path.chmod(0o755 if path.is_dir() else 0o644)
         db.close()
+
+
+def test_commit_failure_restores_previous_generation(tmp_path, monkeypatch):
+    """A commit-time copy failure must leave every destination at the prior
+    generation, not a mixture of old and new files."""
+    import shutil
+
+    import site_publish
+
+    app, db, meta = _seed_publish_app(tmp_path, monkeypatch)
+    client = app.test_client()
+    destination = tmp_path / "published"
+    options = {"destination": str(destination), "max_size": 512}
+    response = client.post("/api/jobs/publish-site", json=options)
+    job = wait_for_job_via_client(client, response.get_json()["job_id"])
+    assert job["status"] == "completed"
+    previous = {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*") if path.is_file()
+    }
+    for path in meta["photos_dir"].glob("*.jpg"):
+        Image.new("RGB", (1200, 800), (0, 0, 255)).save(path)
+
+    real_copyfile = shutil.copyfile
+    counter = {"n": 0}
+
+    def flaky_copyfile(src, dst, *args, **kwargs):
+        src_path = os.fspath(src)
+        dst_path = os.fspath(dst)
+        # Only intercept commit-time copies from staging into destination;
+        # backups from destination into staging must still succeed.
+        if str(destination) in dst_path and ".vireo-publish-" in src_path:
+            counter["n"] += 1
+            if counter["n"] == 2:
+                # Simulate a full disk after truncating the destination.
+                with open(dst_path, "wb"):
+                    pass
+                raise OSError(28, "No space left on device")
+        return real_copyfile(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(site_publish.shutil, "copyfile", flaky_copyfile)
+    response = client.post("/api/jobs/publish-site", json=options)
+    job = wait_for_job_via_client(client, response.get_json()["job_id"])
+    assert job["status"] == "failed"
+    current = {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*") if path.is_file()
+    }
+    # Prior generation intact — no mixed old/new content.
+    assert current == previous
+    assert not list(destination.glob(".vireo-publish-*"))
+    db.close()

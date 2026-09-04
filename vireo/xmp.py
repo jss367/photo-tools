@@ -82,12 +82,44 @@ def _preserve_sidecar_access(source, destination, source_stat):
         os.chflags(destination, source_stat.st_flags)
 
 
+def _serialize_tree(tree):
+    """Serialize an ElementTree to text before touching the sidecar.
+
+    Serializing in memory means a broken tree cannot truncate an existing
+    sidecar in either the atomic or the in-place write path.
+    """
+    import io
+
+    buffer = io.StringIO()
+    tree.write(buffer, xml_declaration=True, encoding="unicode")
+    return buffer.getvalue()
+
+
+def _write_tree_in_place(content, path):
+    """Rewrite an existing sidecar without moving its directory entry.
+
+    Used only as a fallback when the containing directory is read-only but
+    the sidecar itself is writable, a POSIX layout the former direct writer
+    supported. The inode is preserved, so ownership, ACLs, and extended
+    attributes stay with the file.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 def _write_tree_atomic(tree, xmp_path):
     """Publish a complete sidecar without truncating the previous version.
 
     Keep the temporary file on the same filesystem for atomic replacement,
     preserve existing permissions, and follow sidecar symlinks just as the
-    former direct write did. Failed writes leave the original intact.
+    former direct write did. Failed writes leave the original intact. If the
+    parent directory forbids creating the temporary file but the existing
+    sidecar is writable, fall back to an in-place rewrite so the former
+    direct writer's support for writable sidecars in read-only directories
+    is not regressed.
     """
     path = Path(xmp_path).resolve()
     try:
@@ -99,15 +131,22 @@ def _write_tree_atomic(tree, xmp_path):
         # POSIX. Probe write access without truncation to retain the previous
         # writer's permission checks, including ACLs and read-only flags.
         os.close(os.open(path, os.O_WRONLY))
+    content = _serialize_tree(tree)
     temp_path = None
     try:
         candidate = path.parent / f".vireo-xmp-{uuid.uuid4().hex}.tmp"
-        # 0666 lets the process umask set permissions for new sidecars,
-        # matching a direct write (mkstemp would silently restrict to 0600).
-        fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        try:
+            # 0666 lets the process umask set permissions for new sidecars,
+            # matching a direct write (mkstemp would silently restrict to 0600).
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except PermissionError:
+            if source_stat is None:
+                raise
+            _write_tree_in_place(content, path)
+            return
         temp_path = candidate
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            tree.write(stream, xml_declaration=True, encoding="unicode")
+            stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
         if source_stat is not None:

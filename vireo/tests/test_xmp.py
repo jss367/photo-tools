@@ -580,3 +580,85 @@ def test_failed_access_metadata_copy_preserves_sidecar(sample_xmp, monkeypatch):
         write_rating(sample_xmp, 5)
     assert path.read_bytes() == original
     assert set(path.parent.iterdir()) == {path}
+
+
+def test_writable_sidecar_falls_back_when_temp_creation_denied(sample_xmp, monkeypatch):
+    """When the parent directory rejects the sibling temp file, the writer
+    must rewrite the existing sidecar in place instead of failing."""
+    import xmp
+
+    path = Path(sample_xmp)
+    real_open = os.open
+
+    def denied_open(name, *args, **kwargs):
+        name_str = os.fspath(name)
+        if ".vireo-xmp-" in name_str and name_str.endswith(".tmp"):
+            raise PermissionError("directory not writable")
+        return real_open(name, *args, **kwargs)
+
+    monkeypatch.setattr(xmp.os, "open", denied_open)
+    write_rating(sample_xmp, 5)
+    assert read_sync_preview_metadata(path)["rating"] == "5"
+    assert set(path.parent.iterdir()) == {path}
+
+
+def test_missing_sidecar_denies_fallback_when_temp_creation_fails(tmp_path, monkeypatch):
+    """No fallback for a nonexistent sidecar — the writer cannot invent an
+    inode to rewrite, so the permission error must propagate."""
+    import xmp
+
+    sidecar = tmp_path / "photo.xmp"
+    real_open = os.open
+
+    def denied_open(name, *args, **kwargs):
+        name_str = os.fspath(name)
+        if ".vireo-xmp-" in name_str and name_str.endswith(".tmp"):
+            raise PermissionError("directory not writable")
+        return real_open(name, *args, **kwargs)
+
+    monkeypatch.setattr(xmp.os, "open", denied_open)
+    with pytest.raises(PermissionError):
+        write_sidecar(str(sidecar), {"Eagle"}, set())
+    assert not sidecar.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions")
+def test_writable_sidecar_updates_in_read_only_directory(sample_xmp):
+    """The atomic writer must not regress writable sidecars in read-only dirs.
+
+    The former direct writer supported this common POSIX layout (a
+    collection of writable sidecars in a directory the current user cannot
+    modify). The atomic path fails to create its sibling temp file there,
+    so the writer falls back to an in-place rewrite that preserves the
+    inode's ownership, ACLs, and extended attributes.
+    """
+    path = Path(sample_xmp)
+    parent = path.parent
+    parent.chmod(0o555)
+    try:
+        if os.access(parent, os.W_OK):
+            pytest.skip("current user can bypass directory permissions")
+        write_rating(sample_xmp, 5)
+        assert read_sync_preview_metadata(path)["rating"] == "5"
+        assert set(parent.iterdir()) == {path}
+    finally:
+        parent.chmod(0o755)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions")
+def test_read_only_sidecar_in_read_only_directory_still_raises(sample_xmp):
+    """The in-place fallback must still honor the sidecar's own write bit."""
+    path = Path(sample_xmp)
+    parent = path.parent
+    original = path.read_bytes()
+    path.chmod(0o444)
+    parent.chmod(0o555)
+    try:
+        if os.access(path, os.W_OK):
+            pytest.skip("current user can bypass read-only permissions")
+        with pytest.raises(PermissionError):
+            write_rating(sample_xmp, 5)
+        assert path.read_bytes() == original
+    finally:
+        parent.chmod(0o755)
+        path.chmod(0o644)

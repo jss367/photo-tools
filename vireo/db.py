@@ -20897,7 +20897,11 @@ class Database:
                LIMIT ? OFFSET ?""",
             (self._ws_id(), limit, offset),
         ).fetchall()
-        return [dict(r) for r in rows]
+        entries = [dict(r) for r in rows]
+        for entry in entries:
+            if entry['action_type'] == 'pipeline_grouping':
+                entry['new_value'] = None
+        return entries
 
     # Action types that appear in history but cannot be reversed
     _NON_UNDOABLE = (
@@ -20934,10 +20938,16 @@ class Database:
             (entry['id'],),
         ).fetchall()
 
-        self._apply_undo(entry, items)
+        if entry['action_type'] == 'pipeline_grouping':
+            from services.grouping_history import restore_grouping_edit
 
-        self.conn.execute("UPDATE edit_history SET undone = 1 WHERE id = ?", (entry['id'],))
-        self.conn.commit()
+            with restore_grouping_edit(self, entry, undo=True):
+                self.conn.execute("UPDATE edit_history SET undone = 1 WHERE id = ?", (entry['id'],))
+                self.conn.commit()
+        else:
+            self._apply_undo(entry, items)
+            self.conn.execute("UPDATE edit_history SET undone = 1 WHERE id = ?", (entry['id'],))
+            self.conn.commit()
         return entry
 
     def redo_last_undo(self):
@@ -20959,10 +20969,16 @@ class Database:
             (entry['id'],),
         ).fetchall()
 
-        self._apply_redo(entry, items)
+        if entry['action_type'] == 'pipeline_grouping':
+            from services.grouping_history import restore_grouping_edit
 
-        self.conn.execute("UPDATE edit_history SET undone = 0 WHERE id = ?", (entry['id'],))
-        self.conn.commit()
+            with restore_grouping_edit(self, entry, undo=False):
+                self.conn.execute("UPDATE edit_history SET undone = 0 WHERE id = ?", (entry['id'],))
+                self.conn.commit()
+        else:
+            self._apply_redo(entry, items)
+            self.conn.execute("UPDATE edit_history SET undone = 0 WHERE id = ?", (entry['id'],))
+            self.conn.commit()
         return entry
 
     # ------------------------------------------------------------------

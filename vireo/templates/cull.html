@@ -677,6 +677,12 @@ async function runCulling() {
   }
 }
 
+document.addEventListener('vireo:edit-history-changed', function(event) {
+  var result = event.detail.result;
+  document.getElementById('cullStatus').textContent =
+    (event.detail.operation === 'undo' ? 'Undone: ' + result.undone : 'Redone: ' + result.redone);
+});
+
 async function loadCullingResults() {
   try {
     var data = await safeFetch('/api/pipeline/page-init', {}, { toast: false });
@@ -1048,7 +1054,7 @@ async function applyCulling() {
     });
   });
 
-  if (!confirm('Apply culling decisions?\n\n' + keepers.length + ' photos flagged as keepers\n' + rejects.length + ' photos flagged as rejected\n\nThis sets the flag on each photo. You can undo in the Browse view.')) return;
+  if (!confirm('Apply culling decisions?\n\n' + keepers.length + ' photos flagged as keepers\n' + rejects.length + ' photos flagged as rejected\n\nThis sets the flag on each photo. Use Undo below to restore the previous flags.')) return;
 
   try {
     await safeFetch('/api/culling/apply', {

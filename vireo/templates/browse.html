@@ -10252,29 +10252,18 @@ function clearSelection() {
 
 /* ---------- Undo / Redo ---------- */
 async function undoLast() {
-  try {
-    var data = await safeFetch('/api/undo', { method: 'POST' });
-    showToast('Undone: ' + data.undone + ' — Ctrl+Shift+Z to redo', 'success');
-    if (typeof window.vireoRefreshEditRecipeCache === 'function') {
-      window.vireoRefreshEditRecipeCache(data.edit_recipes);
-    }
+  if (await window.doUndo()) {
     resetAndLoad();
     scheduleCollectionCountsRefresh();
     refreshPendingSyncBanner();
-  } catch(e) {}
+  }
 }
-
 async function redoLast() {
-  try {
-    var data = await safeFetch('/api/redo', { method: 'POST' });
-    showToast('Redone: ' + data.redone, 'success');
-    if (typeof window.vireoRefreshEditRecipeCache === 'function') {
-      window.vireoRefreshEditRecipeCache(data.edit_recipes);
-    }
+  if (await window.doRedo()) {
     resetAndLoad();
     scheduleCollectionCountsRefresh();
     refreshPendingSyncBanner();
-  } catch(e) {}
+  }
 }
 
 async function showUndoToast() {

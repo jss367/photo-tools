@@ -9,9 +9,11 @@ detach, burst-group state and apply, mask variant, per-photo debug).
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import logging
 import os
+from functools import wraps
 
 from db import _chunks, commit_with_retry
 from flask import Blueprint, jsonify, request
@@ -58,6 +60,21 @@ def create_pipeline_blueprint(
     destinations and process deletion clears the global default).
     """
     blueprint = Blueprint("pipeline", __name__)
+
+    def grouping_edit(fn):
+        @wraps(fn)
+        def wrapped():
+            from pipeline_locks import acquire_workspace_regroup
+
+            db = get_db()
+            with acquire_workspace_regroup(db._ws_id()):
+                db.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    return fn()
+                finally:
+                    if db.conn.in_transaction:
+                        db.conn.rollback()
+        return wrapped
 
     @blueprint.route("/api/pipeline/slots")
     def api_pipeline_slots():
@@ -1713,9 +1730,11 @@ def create_pipeline_blueprint(
         return jsonify(serialized)
 
     @blueprint.route("/api/pipeline/detach-burst", methods=["POST"])
+    @grouping_edit
     def api_pipeline_detach_burst():
         """Detach a burst from its encounter, creating a new standalone encounter."""
-        from pipeline import load_results_raw, rebuild_species_predictions, save_results_raw
+        from pipeline import load_results_raw, rebuild_species_predictions
+        from services.grouping_history import save_grouping_edit
 
         body = request.get_json(silent=True) or {}
         enc_idx = body.get("encounter_index")
@@ -1733,6 +1752,7 @@ def create_pipeline_blueprint(
         if results is None:
             return json_error("No pipeline results found", 404)
 
+        before = copy.deepcopy(results)
         encounters = results["encounters"]
         if enc_idx < 0 or enc_idx >= len(encounters):
             return json_error("Invalid encounter_index")
@@ -1809,13 +1829,15 @@ def create_pipeline_blueprint(
             e.get("burst_count", 0) for e in encounters
         )
 
-        save_results_raw(results, cache_dir, db._active_workspace_id)
+        save_grouping_edit(db, before, results, "Burst detached from encounter")
         return jsonify({"ok": True, "encounters": encounters, "summary": results["summary"]})
 
     @blueprint.route("/api/pipeline/detach-photo", methods=["POST"])
+    @grouping_edit
     def api_pipeline_detach_photo():
         """Detach a photo from its burst, creating a new single-photo burst."""
-        from pipeline import load_results_raw, rebuild_species_predictions, save_results_raw
+        from pipeline import load_results_raw, rebuild_species_predictions
+        from services.grouping_history import save_grouping_edit
 
         body = request.get_json(silent=True) or {}
         enc_idx = body.get("encounter_index")
@@ -1834,6 +1856,7 @@ def create_pipeline_blueprint(
         if results is None:
             return json_error("No pipeline results found", 404)
 
+        before = copy.deepcopy(results)
         encounters = results["encounters"]
         if enc_idx < 0 or enc_idx >= len(encounters):
             return json_error("Invalid encounter_index")
@@ -1896,7 +1919,7 @@ def create_pipeline_blueprint(
             e.get("burst_count", 0) for e in encounters
         )
 
-        save_results_raw(results, cache_dir, db._active_workspace_id)
+        save_grouping_edit(db, before, results, "Photo detached from burst")
         return jsonify({"ok": True, "encounters": encounters, "summary": results["summary"]})
 
     @blueprint.route("/api/pipeline/save-cache", methods=["POST"])

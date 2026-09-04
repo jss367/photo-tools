@@ -11651,7 +11651,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             undone.append(entry)
             return None
 
-        early = _under_prediction_decision_lock(db, _apply)
+        from services.grouping_history import GroupingHistoryConflict
+
+        try:
+            early = _under_prediction_decision_lock(db, _apply)
+        except GroupingHistoryConflict as exc:
+            return json_error(str(exc), 409)
         if early is not None:
             return early
         result = undone[0]
@@ -11687,6 +11692,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify({
             "available": True,
             "description": latest["description"],
+            "id": latest["id"],
             "count": total,
         })
 
@@ -11706,7 +11712,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             redone.append(entry)
             return None
 
-        early = _under_prediction_decision_lock(db, _apply)
+        from services.grouping_history import GroupingHistoryConflict
+
+        try:
+            early = _under_prediction_decision_lock(db, _apply)
+        except GroupingHistoryConflict as exc:
+            return json_error(str(exc), 409)
         if early is not None:
             return early
         result = redone[0]

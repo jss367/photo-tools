@@ -87,7 +87,7 @@ def test_reject_burst_and_undo_restores_prior_flags(live_server, page):
 
     burst_buttons.first.click()
 
-    expect(page.locator("#undoMsg")).to_have_text("Rejected 2 photos in burst")
+    expect(page.locator("#undoMsg")).to_have_text("Set flag to rejected on 2 photos")
     expect(page.get_by_test_id("reject-burst").first).to_have_attribute(
         "aria-label", "Clear rejects"
     )
@@ -101,7 +101,7 @@ def test_reject_burst_and_undo_restores_prior_flags(live_server, page):
     expect(page.get_by_test_id("reject-burst").first).to_have_attribute(
         "aria-label", "Reject burst"
     )
-    expect(page.get_by_text("Restored previous flags for burst", exact=True)).to_be_visible()
+    expect(page.get_by_text("Undone: Set flag to rejected on 2 photos", exact=True)).to_be_visible()
     assert _flags(db, photo_ids) == ["flagged", "none", "none", "none"]
 
 
@@ -117,14 +117,14 @@ def test_reject_and_clear_full_encounter(live_server, page):
     encounter_button.click()
 
     expect(encounter_button).to_have_attribute("aria-label", "Clear rejects")
-    expect(page.locator("#undoMsg")).to_have_text("Rejected 4 photos in encounter")
+    expect(page.locator("#undoMsg")).to_have_text("Set flag to rejected on 4 photos")
     assert _flags(db, photo_ids) == ["rejected"] * 4
 
     encounter_button.click()
 
     expect(encounter_button).to_have_attribute("aria-label", "Reject encounter")
     expect(page.locator("#undoMsg")).to_have_text(
-        "Cleared rejects from 4 photos in encounter"
+        "Set flag to none on 4 photos"
     )
     assert _flags(db, photo_ids) == ["none"] * 4
 
@@ -214,7 +214,7 @@ def test_encounter_reject_skips_hidden_confirmed_bursts(live_server, page):
     encounter_button.click()
 
     expect(encounter_button).to_have_attribute("aria-label", "Clear rejects")
-    expect(page.locator("#undoMsg")).to_have_text("Rejected 2 photos in encounter")
+    expect(page.locator("#undoMsg")).to_have_text("Set flag to rejected on 2 photos")
     # First (confirmed, hidden) burst must be untouched; only the visible
     # unconfirmed burst's photos are rejected.
     assert _flags(db, photo_ids) == ["none", "none", "rejected", "rejected"]
@@ -223,7 +223,7 @@ def test_encounter_reject_skips_hidden_confirmed_bursts(live_server, page):
 
     expect(encounter_button).to_have_attribute("aria-label", "Reject encounter")
     expect(page.locator("#undoMsg")).to_have_text(
-        "Cleared rejects from 2 photos in encounter"
+        "Set flag to none on 2 photos"
     )
     assert _flags(db, photo_ids) == ["none"] * 4
 
@@ -307,7 +307,7 @@ def test_burst_reject_respects_active_label_filter(live_server, page):
     burst_button = page.get_by_test_id("reject-burst")
     burst_button.click()
 
-    expect(page.locator("#undoMsg")).to_have_text("Rejected 2 photos in burst")
+    expect(page.locator("#undoMsg")).to_have_text("Set flag to rejected on 2 photos")
     expect(burst_button).to_have_attribute("aria-label", "Clear rejects")
     # The hidden KEEP frames must be untouched; only the visible REVIEW frames
     # are rejected.
@@ -348,14 +348,14 @@ def test_clear_rejects_reads_live_db_flags(live_server, page):
     # Only the truly-rejected photo in the burst is cleared. The live pick
     # is preserved; the second burst is untouched.
     expect(page.locator("#undoMsg")).to_have_text(
-        "Cleared rejects from 1 photo in burst"
+        "Set flag to none on 1 photos"
     )
     assert _flags(db, photo_ids) == ["flagged", "none", "none", "none"]
 
     page.locator("#undoToast .undo-toast-btn").click()
 
     expect(
-        page.get_by_text("Restored previous flags for burst", exact=True)
+        page.get_by_text("Undone: Set flag to none on 1 photos", exact=True)
     ).to_be_visible()
     # Undo restores what was actually in the DB when the bulk action ran —
     # the second photo goes back to 'rejected', and the live pick stays a
@@ -416,7 +416,7 @@ def test_burst_reject_blocked_while_encounter_reject_pending(live_server, page):
     # real endpoint (the batch-flag call is not intercepted).
     held["route"].continue_()
 
-    expect(page.locator("#undoMsg")).to_have_text("Rejected 4 photos in encounter")
+    expect(page.locator("#undoMsg")).to_have_text("Set flag to rejected on 4 photos")
     assert _flags(db, photo_ids) == ["rejected"] * 4
 
 
@@ -462,7 +462,7 @@ def test_single_photo_flag_blocked_while_bulk_reject_pending(live_server, page):
 
     held["route"].continue_()
 
-    expect(page.locator("#undoMsg")).to_have_text("Rejected 4 photos in encounter")
+    expect(page.locator("#undoMsg")).to_have_text("Set flag to rejected on 4 photos")
     assert _flags(db, photo_ids) == ["rejected"] * 4
 
 
@@ -535,7 +535,7 @@ def test_burst_modal_apply_blocked_while_bulk_reject_pending(live_server, page):
 
     held["route"].continue_()
 
-    expect(page.locator("#undoMsg")).to_have_text("Rejected 2 photos in burst")
+    expect(page.locator("#undoMsg")).to_have_text("Set flag to rejected on 2 photos")
     assert _flags(db, photo_ids) == ["rejected", "rejected", "none", "none"]
 
 
@@ -549,7 +549,7 @@ def test_single_photo_flag_blocked_while_bulk_undo_pending(live_server, page):
     page.goto(f"{live_server['url']}/pipeline/review")
     burst_button = page.get_by_test_id("reject-burst").first
     burst_button.click()
-    expect(page.locator("#undoMsg")).to_have_text("Rejected 2 photos in burst")
+    expect(page.locator("#undoMsg")).to_have_text("Set flag to rejected on 2 photos")
     assert _flags(db, photo_ids) == ["rejected", "rejected", "none", "none"]
 
     held = {}
@@ -560,13 +560,13 @@ def test_single_photo_flag_blocked_while_bulk_undo_pending(live_server, page):
             return
         route.continue_()
 
-    page.route("**/api/batch/flag", handle_batch_flag)
+    page.route("**/api/undo", handle_batch_flag)
     page.locator("#undoToast .undo-toast-btn").click()
 
     deadline = time.time() + 5
     while "route" not in held and time.time() < deadline:
         page.wait_for_timeout(50)
-    assert "route" in held, "expected the undo batch write to be held"
+    assert "route" in held, "expected the undo request to be held"
 
     page.evaluate(
         "([photoId]) => window.setFlagFor(photoId, 'flagged')",
@@ -575,7 +575,7 @@ def test_single_photo_flag_blocked_while_bulk_undo_pending(live_server, page):
 
     expect(
         page.get_by_text(
-            "A bulk reject for this photo is still finishing", exact=False
+            "Undo or redo is still finishing", exact=False
         )
     ).to_be_visible()
     assert _flags(db, photo_ids) == ["rejected", "rejected", "none", "none"]
@@ -583,7 +583,7 @@ def test_single_photo_flag_blocked_while_bulk_undo_pending(live_server, page):
     held["route"].continue_()
 
     expect(
-        page.get_by_text("Restored previous flags for burst", exact=True)
+        page.get_by_text("Undone: Set flag to rejected on 2 photos", exact=True)
     ).to_be_visible()
     assert _flags(db, photo_ids) == ["none"] * 4
 
@@ -627,7 +627,7 @@ def test_encounter_reject_respects_active_label_filter(live_server, page):
     encounter_button = page.get_by_test_id("reject-encounter")
     encounter_button.click()
 
-    expect(page.locator("#undoMsg")).to_have_text("Rejected 2 photos in encounter")
+    expect(page.locator("#undoMsg")).to_have_text("Set flag to rejected on 2 photos")
     expect(encounter_button).to_have_attribute("aria-label", "Clear rejects")
     assert _flags(db, photo_ids) == ["none", "none", "rejected", "rejected"]
 
@@ -635,7 +635,7 @@ def test_encounter_reject_respects_active_label_filter(live_server, page):
 
     expect(encounter_button).to_have_attribute("aria-label", "Reject encounter")
     expect(page.locator("#undoMsg")).to_have_text(
-        "Cleared rejects from 2 photos in encounter"
+        "Set flag to none on 2 photos"
     )
     assert _flags(db, photo_ids) == ["none"] * 4
 
@@ -2739,3 +2739,158 @@ def test_native_rating_and_wildlife_writes_rejected_through_held_apply(
         page.evaluate(
             "() => { window.safeFetch = window.__originalSafeFetchForApplyRating; }"
         )
+
+
+def test_history_survives_delay_reload_and_repeated_undo_redo(live_server, page):
+    db = live_server['db']
+    ids = live_server['data']['photos'][:4]
+    _write_grouped_pipeline_cache(live_server, ids)
+    page.goto(f"{live_server['url']}/pipeline/review")
+    page.get_by_test_id('reject-burst').first.click()
+    expect(page.locator('#undoMsg')).to_have_text('Set flag to rejected on 2 photos')
+    page.get_by_test_id('reject-burst').nth(1).click()
+    expect(page.get_by_test_id('reject-burst').nth(1)).to_have_attribute('aria-label', 'Clear rejects')
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    assert _flags(db, ids) == ['rejected'] * 4
+
+    # The old page-local history expired after five seconds.
+    page.clock.install()
+    page.clock.fast_forward(6000)
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    page.reload()
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    page.locator('#historyUndoBtn').click()
+    expect(page.get_by_test_id('reject-burst').nth(1)).to_have_attribute('aria-label', 'Reject burst')
+    assert _flags(db, ids) == ['rejected', 'rejected', 'none', 'none']
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    page.keyboard.press('Control+z')
+    expect(page.get_by_test_id('reject-burst').first).to_have_attribute('aria-label', 'Reject burst')
+    assert _flags(db, ids) == ['none'] * 4
+    expect(page.locator('#historyUndoBtn')).to_be_disabled()
+    expect(page.locator('#historyRedoBtn')).to_be_enabled()
+    page.keyboard.press('Meta+Shift+z')
+    expect(page.get_by_test_id('reject-burst').first).to_have_attribute('aria-label', 'Clear rejects')
+    expect(page.locator('#historyRedoBtn')).to_be_enabled()
+    page.locator('#historyRedoBtn').click()
+    expect(page.get_by_test_id('reject-burst').nth(1)).to_have_attribute('aria-label', 'Clear rejects')
+    assert _flags(db, ids) == ['rejected'] * 4
+    expect(page.locator('#historyRedoBtn')).to_be_disabled()
+
+
+def test_grouping_and_photo_edit_undo_in_order_in_browser(live_server, page):
+    db = live_server['db']
+    ids = live_server['data']['photos'][:4]
+    _write_grouped_pipeline_cache(live_server, ids)
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.get_by_test_id('reject-burst')).to_have_count(2)
+    page.evaluate('detachBurst(0, 0)')
+    expect(page.get_by_test_id('reject-encounter')).to_have_count(2)
+    page.evaluate('(id) => setPipelineReviewFlag(id, "flagged")', ids[0])
+    expect(page.locator('#undoMsg')).to_have_text('Set flag to flagged')
+    page.locator('#historyUndoBtn').click()
+    expect(page.locator('#undoMsg')).to_have_text('Burst detached from encounter')
+    assert db.get_photo(ids[0])['flag'] == 'none'
+    expect(page.get_by_test_id('reject-encounter')).to_have_count(2)
+    page.locator('#historyUndoBtn').click()
+    expect(page.get_by_test_id('reject-encounter')).to_have_count(1)
+    expect(page.locator('#historyUndoBtn')).to_be_disabled()
+
+
+def test_failed_undo_remains_retryable_and_double_click_is_serialized(live_server, page):
+    db = live_server['db']
+    ids = live_server['data']['photos'][:4]
+    _write_grouped_pipeline_cache(live_server, ids)
+    page.goto(f"{live_server['url']}/pipeline/review")
+    page.get_by_test_id('reject-burst').first.click()
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    page.route('**/api/undo', lambda route: route.fulfill(
+        status=503, content_type='application/json', body='{"error":"Try again"}'
+    ))
+    page.locator('#historyUndoBtn').click()
+    expect(page.get_by_text('Try again', exact=True)).to_be_visible()
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    assert _flags(db, ids) == ['rejected', 'rejected', 'none', 'none']
+    page.unroute('**/api/undo')
+    requests = []
+    page.on('request', lambda request: requests.append(request.url) if request.url.endswith('/api/undo') else None)
+    page.evaluate('Promise.all([doUndo(), doUndo()])')
+    assert len(requests) == 1
+    expect(page.get_by_test_id('reject-burst').first).to_have_attribute('aria-label', 'Reject burst')
+    expect(page.locator('#historyUndoBtn')).to_be_disabled()
+    assert _flags(db, ids) == ['none'] * 4
+
+
+def test_text_undo_does_not_undo_photos(live_server, page):
+    db = live_server['db']
+    ids = live_server['data']['photos'][:4]
+    _write_grouped_pipeline_cache(live_server, ids)
+    page.goto(f"{live_server['url']}/pipeline/review")
+    page.get_by_test_id('reject-burst').first.click()
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    field = page.locator('#speciesFilterInput')
+    field.focus()
+    field.press_sequentially('bird')
+    field.press('Control+z')
+    assert _flags(db, ids) == ['rejected', 'rejected', 'none', 'none']
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+
+
+def test_culling_can_be_undone_without_leaving_the_page(live_server, page):
+    db = live_server['db']
+    ids = live_server['data']['photos'][:4]
+    db.update_photo_flag(ids[0], 'flagged')
+    _write_grouped_pipeline_cache(live_server, ids)
+    path = os.path.join(os.path.dirname(db._db_path), f'pipeline_results_ws{db._ws_id()}.json')
+    with open(path) as cache_file:
+        cache = json.load(cache_file)
+    for photo in cache['photos']:
+        photo['label'] = 'KEEP' if photo['id'] == ids[1] else 'REJECT'
+    with open(path, 'w') as cache_file:
+        json.dump(cache, cache_file)
+    page.goto(f"{live_server['url']}/cull")
+    page.on('dialog', lambda dialog: dialog.accept())
+    page.locator('#applyBtn').click()
+    expect(page.locator('#cullStatus')).to_contain_text('Applied!')
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    assert _flags(db, ids) == ['rejected', 'flagged', 'rejected', 'rejected']
+    page.locator('#historyUndoBtn').click()
+    expect(page.locator('#cullStatus')).to_contain_text('Undone: Culling')
+    assert page.url.endswith('/cull')
+    assert _flags(db, ids) == ['flagged', 'none', 'none', 'none']
+    expect(page.locator('#historyRedoBtn')).to_be_enabled()
+    page.locator('#historyRedoBtn').click()
+    expect(page.locator('#cullStatus')).to_contain_text('Redone: Culling')
+    assert _flags(db, ids) == ['rejected', 'flagged', 'rejected', 'rejected']
+
+
+def test_history_panel_undo_labels_the_actual_reversible_edit(live_server, page):
+    db = live_server['db']
+    ids = live_server['data']['photos'][:4]
+    _write_grouped_pipeline_cache(live_server, ids)
+    page.goto(f"{live_server['url']}/pipeline/review")
+    page.get_by_test_id('reject-burst').first.click()
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    db.record_edit('prediction_reject', 'Declined a suggestion', '', [])
+    page.evaluate("toggleBottomPanel(); switchBpTab('history')")
+    row = page.locator('.bp-history-row').filter(has_text='Set flag to rejected')
+    expect(row.get_by_role('button', name='Undo', exact=True)).to_be_visible()
+    declined = page.locator('.bp-history-row').filter(has_text='Declined a suggestion')
+    expect(declined.get_by_role('button', name='Undo', exact=True)).to_have_count(0)
+    row.get_by_role('button', name='Undo', exact=True).click()
+    expect(page.locator('#historyUndoBtn')).to_be_disabled()
+    assert _flags(db, ids) == ['none'] * 4
+
+
+def test_undo_refreshes_open_lightbox_flag(live_server, page):
+    db = live_server['db']
+    ids = live_server['data']['photos'][:4]
+    _write_grouped_pipeline_cache(live_server, ids)
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.get_by_test_id('reject-burst')).to_have_count(2)
+    page.evaluate('(id) => setPipelineReviewFlag(id, "flagged")', ids[0])
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    page.evaluate('(id) => openLightbox(id, "hawk1.jpg", [{id: id, flag: "flagged"}])', ids[0])
+    expect(page.locator('#lightboxFlagBtn')).to_have_attribute('aria-pressed', 'true')
+    page.keyboard.press('Meta+z')
+    expect(page.locator('#lightboxFlagBtn')).to_have_attribute('aria-pressed', 'false')
+    assert db.get_photo(ids[0])['flag'] == 'none'

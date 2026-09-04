@@ -1069,36 +1069,6 @@ input[type="range"]::-moz-range-thumb {
 .burst-strip:hover .detach-btn { opacity: 1; }
 .photo-card:hover .detach-btn { opacity: 1; }
 
-/* Undo toast */
-.undo-toast {
-  position: fixed;
-  bottom: 60px;
-  left: 50%;
-  transform: translateX(-50%);
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-secondary);
-  border-radius: 8px;
-  padding: 12px 20px;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  font-size: 13px;
-  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-  z-index: 200;
-  transition: opacity 0.3s;
-}
-.undo-toast.hidden { opacity: 0; pointer-events: none; }
-.undo-toast-btn {
-  background: var(--accent);
-  color: var(--accent-text);
-  border: none;
-  border-radius: 4px;
-  padding: 4px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
 /* ---------- Group Review Modal ---------- */
 .grm-overlay {
   display: none;
@@ -1908,10 +1878,7 @@ input[type="range"]::-moz-range-thumb {
   <div class="inspect-panel" id="inspectPanel"></div>
 </div>
 
-<div class="undo-toast hidden" id="undoToast">
-  <span id="undoMsg"></span>
-  <button class="undo-toast-btn" onclick="undoLastAction()">Undo</button>
-</div>
+
 
 <!-- Photo organization dialogs opened from the Process Review context menu. -->
 <div class="modal-overlay" id="pipelineKeywordModal"
@@ -3869,13 +3836,10 @@ function findEncounterForPhoto(photoId) {
 var inspectPhotoId = null;
 var pipelineReviewGroupFlagInFlight = {};
 // Photo IDs that any in-flight bulk reject/clear is currently mutating. We
-// check for overlap in setPipelineReviewGroupFlag so an encounter-level
-// action and one of its burst-level actions can't run concurrently: each
-// snapshots previousFlags from its own /api/pipeline/group/state read, so
-// two overlapping writes would let the later Undo restore shared photos to
-// the pre-first-action state, silently rolling back part of the earlier
-// action. Non-overlapping bulk actions (different bursts, different
-// encounters) still proceed in parallel.
+// check for overlap so an encounter action and one of its burst actions
+// cannot make competing decisions from the same live-state read. The server
+// records each completed write in history. Disjoint groups can still proceed
+// in parallel.
 var pipelineReviewGroupFlagInFlightPhotoIds = new Set();
 // Direct per-photo flag writes can already be in flight when Group Review
 // opens. Track them by photo so Apply can wait before persisting a newer
@@ -3990,48 +3954,6 @@ function groupFlagTarget(encIdx, burstIdx) {
   };
 }
 
-function restorePipelineReviewFlags(previousFlags, noun) {
-  var byFlag = {none: [], flagged: [], rejected: []};
-  Object.keys(previousFlags).forEach(function(pid) {
-    var flag = normalizedPipelineReviewFlag(previousFlags[pid]);
-    byFlag[flag].push(parseInt(pid, 10));
-  });
-  var ids = Object.keys(previousFlags).map(function(pid) { return parseInt(pid, 10); });
-  // Undo is another bulk flag write and must hold the same photo-ID lock as
-  // the forward action. Otherwise a pick/reject started while these restore
-  // requests are running can be overwritten by the older snapshot.
-  var overlaps = ids.some(function(pid) {
-    return pipelineReviewGroupFlagInFlightPhotoIds.has(pid);
-  });
-  if (overlaps) {
-    showToast('Another flag change is still finishing — try Undo again in a moment', 'error');
-    return Promise.resolve();
-  }
-  ids.forEach(function(pid) { pipelineReviewGroupFlagInFlightPhotoIds.add(pid); });
-  var sequence = Promise.resolve();
-  ['none', 'flagged', 'rejected'].forEach(function(flag) {
-    if (!byFlag[flag].length) return;
-    sequence = sequence.then(function() {
-      return safeFetch('/api/batch/flag', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({photo_ids: byFlag[flag], flag: flag}),
-      }).then(function() {
-        byFlag[flag].forEach(function(pid) {
-          updatePipelineReviewPhotoFlag(findPhotoInResults(pid), flag);
-        });
-      });
-    });
-  });
-  return sequence.then(function() {
-    renderResults();
-    showToast('Restored previous flags for ' + noun, 'success');
-    refreshLatestScopeSnapshotIfCurrent();
-  }).finally(function() {
-    ids.forEach(function(pid) { pipelineReviewGroupFlagInFlightPhotoIds.delete(pid); });
-  });
-}
-
 function setPipelineReviewGroupFlag(target, flag) {
   if (!target || pipelineReviewGroupFlagInFlight[target.key]) return Promise.resolve();
   if (isScopedReviewView()) {
@@ -4045,9 +3967,8 @@ function setPipelineReviewGroupFlag(target, flag) {
 
   // Block bulk actions whose photos overlap an in-flight bulk action — e.g.,
   // clicking Reject burst while the parent encounter's Reject is still
-  // running. Both requests would snapshot previousFlags from the pre-first
-  // DB read, and the later Undo could restore the shared photos to 'none',
-  // silently reverting part of the earlier action.
+  // running. Both requests would otherwise make their decisions from the
+  // state before the first write completed.
   var overlaps = ids.some(function(pid) {
     return pipelineReviewGroupFlagInFlightPhotoIds.has(pid);
   });
@@ -4097,10 +4018,6 @@ function setPipelineReviewGroupFlag(target, flag) {
       renderResults();
       return;
     }
-    var previousFlags = {};
-    changedIds.forEach(function(pid) {
-      previousFlags[pid] = liveFlagFor(pid);
-    });
     return safeFetch('/api/batch/flag', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -4115,9 +4032,7 @@ function setPipelineReviewGroupFlag(target, flag) {
       var message = flag === 'rejected'
         ? 'Rejected ' + count + ' photo' + (count === 1 ? '' : 's') + ' in ' + target.noun
         : 'Cleared rejects from ' + count + ' photo' + (count === 1 ? '' : 's') + ' in ' + target.noun;
-      showUndo(message, function() {
-        restorePipelineReviewFlags(previousFlags, target.noun);
-      });
+      showToast(message, 'success');
     });
   }).finally(function() {
     delete pipelineReviewGroupFlagInFlight[target.key];
@@ -4187,6 +4102,10 @@ function batchSetFlag(flag) {
 }
 
 function setPipelineReviewFlag(photoId, flag) {
+  if (window.vireoHistoryBusy && window.vireoHistoryBusy()) {
+    showToast('Undo or redo is still finishing — try again in a moment', 'warning');
+    return Promise.resolve(false);
+  }
   if (flag !== 'flagged' && flag !== 'rejected' && flag !== 'none') return Promise.resolve();
   photoId = parseInt(photoId, 10);
   if (!photoId) return Promise.resolve();
@@ -5236,45 +5155,35 @@ async function clearBurstOverride(event, encIdx, burstIdx) {
   refreshLatestScopeSnapshotIfCurrent();
 }
 
-// -- Detach & Undo --
-
-var undoStack = [];
-var _undoTimer = null;
-
-function showUndo(msg, undoFn) {
-  // Clear previous
-  clearTimeout(_undoTimer);
-  undoStack = [undoFn];
-
-  var toast = document.getElementById('undoToast');
-  var msgEl = document.getElementById('undoMsg');
-  if (!toast || !msgEl) return;
-  msgEl.textContent = msg;
-  toast.classList.remove('hidden');
-
-  _undoTimer = setTimeout(function() {
-    toast.classList.add('hidden');
-    undoStack = [];
-  }, 5000);
-}
-
-function undoLastAction() {
-  clearTimeout(_undoTimer);
-  var toast = document.getElementById('undoToast');
-  if (toast) toast.classList.add('hidden');
-  if (undoStack.length > 0) {
-    var fn = undoStack.pop();
-    fn();
+// Grouping, flags and other photo edits share the durable workspace history.
+window.beforeHistoryChange = function() {
+  if (Object.keys(pipelineReviewGroupFlagInFlight).length) {
+    showToast('A photo edit is still finishing — try again in a moment', 'info');
+    return false;
   }
-}
+  if (document.querySelector('.grm-overlay.open, .inspect-overlay.open')) {
+    showToast('Finish or close Group Review before undoing saved edits', 'info');
+    return false;
+  }
+  return true;
+};
+
+window.afterHistoryChange = async function() {
+  var seq = ++reviewScopeRequestSeq;
+  var data = await safeFetch('/api/pipeline/page-init', {}, {toast: false});
+  if (seq !== reviewScopeRequestSeq || !data || !data.results) return;
+  var results = data.results;
+  cachedPipelineResults = cloneReviewData(results);
+  cachedResultsCacheInfo = cloneReviewData(data.results_cache_info);
+  if (reviewScopeMode === 'cache') applyReviewResults(results, data.results_cache_info);
+  else loadReviewScopeResults();
+};
 
 async function detachBurst(encIdx, burstIdx) {
   if (isScopedReviewView()) {
     notifyReadOnlyScopedView();
     return;
   }
-  // Save state for undo
-  var snapshot = JSON.parse(JSON.stringify(pipelineResults));
 
   var resp = await safeFetch('/api/pipeline/detach-burst', {
     method: 'POST',
@@ -5289,19 +5198,7 @@ async function detachBurst(encIdx, burstIdx) {
   updateSummaryBar(pipelineResults.summary);
   refreshLatestScopeSnapshotIfCurrent();
 
-  showUndo('Burst detached from encounter', function() {
-    // Restore from snapshot
-    pipelineResults = snapshot;
-    // Re-save to cache
-    safeFetch('/api/pipeline/save-cache', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(pipelineResults),
-    });
-    renderResults();
-    updateSummaryBar(pipelineResults.summary);
-    refreshLatestScopeSnapshotIfCurrent();
-  });
+  showToast('Burst detached from encounter', 'success');
 }
 
 async function detachPhoto(encIdx, burstIdx, photoId) {
@@ -5309,7 +5206,6 @@ async function detachPhoto(encIdx, burstIdx, photoId) {
     notifyReadOnlyScopedView();
     return;
   }
-  var snapshot = JSON.parse(JSON.stringify(pipelineResults));
 
   var resp = await safeFetch('/api/pipeline/detach-photo', {
     method: 'POST',
@@ -5324,17 +5220,7 @@ async function detachPhoto(encIdx, burstIdx, photoId) {
   updateSummaryBar(pipelineResults.summary);
   refreshLatestScopeSnapshotIfCurrent();
 
-  showUndo('Photo detached from burst', function() {
-    pipelineResults = snapshot;
-    safeFetch('/api/pipeline/save-cache', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(pipelineResults),
-    });
-    renderResults();
-    updateSummaryBar(pipelineResults.summary);
-    refreshLatestScopeSnapshotIfCurrent();
-  });
+  showToast('Photo detached from burst', 'success');
 }
 
 /* ==================== Group Review Modal ==================== */

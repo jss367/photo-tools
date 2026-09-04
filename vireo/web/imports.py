@@ -3060,6 +3060,7 @@ def create_imports_blueprint(
                         # records when linking them into another workspace
                         # instead of rereading metadata and hashes over NAS.
                         incremental=True,
+                        repair_missing_metadata=True,
                         progress_callback=progress_cb,
                         extract_full_metadata=pipeline_cfg.get(
                             "extract_full_metadata", True,

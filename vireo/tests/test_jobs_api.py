@@ -6377,7 +6377,8 @@ def test_import_in_place_no_destination_required(app_and_db, tmp_path):
 
 
 @pytest.mark.parametrize("change", [
-    None, "content", "content_preserving_mtime", "missing_metadata", "missing_hash",
+    None, "content", "content_preserving_mtime", "missing_metadata",
+    "partial_metadata", "missing_hash",
 ])
 def test_import_in_place_reuses_catalog_across_workspaces(
     app_and_db, tmp_path, monkeypatch, change,
@@ -6420,6 +6421,14 @@ def test_import_in_place_reuses_catalog_across_workspaces(
     elif change == "missing_metadata":
         db.conn.execute(
             "UPDATE photos SET exif_data=NULL, timestamp=NULL WHERE id=?",
+            (original[other.name]["id"],),
+        )
+        db.conn.commit()
+        expected_reads = {str(other)}
+    elif change == "partial_metadata":
+        db.conn.execute(
+            "UPDATE photos SET exif_data=NULL, timestamp='2026-04-03T12:00:00', "
+            "camera_make='Nikon' WHERE id=?",
             (original[other.name]["id"],),
         )
         db.conn.commit()

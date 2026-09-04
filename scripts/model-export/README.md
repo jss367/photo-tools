@@ -33,6 +33,8 @@ On Windows, use `Scripts/python.exe` instead of `bin/python`. MMCV includes
 native extensions; its build requires a compiler. The bootstrap pins PyTorch
 for this older converter stack, and setuptools retains the `pkg_resources`
 module required by [MMCV's build script](https://github.com/open-mmlab/mmcv/blob/v2.1.0/setup.py).
+Chumpy is pinned to an upstream revision that supports NumPy 1.26 and Python
+3.11; its PyPI 0.70 release uses removed NumPy aliases and `inspect.getargspec`.
 Model conversion also downloads model weights.
 
 Other models continue to use `pip install -e ".[export]"`. Export individual

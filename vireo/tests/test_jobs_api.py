@@ -6377,7 +6377,7 @@ def test_import_in_place_no_destination_required(app_and_db, tmp_path):
 
 
 @pytest.mark.parametrize("change", [
-    None, "content", "content_preserving_mtime", "missing_metadata",
+    None, "content", "content_preserving_mtime", "missing_metadata", "missing_hash",
 ])
 def test_import_in_place_reuses_catalog_across_workspaces(
     app_and_db, tmp_path, monkeypatch, change,
@@ -6420,6 +6420,13 @@ def test_import_in_place_reuses_catalog_across_workspaces(
     elif change == "missing_metadata":
         db.conn.execute(
             "UPDATE photos SET exif_data=NULL, timestamp=NULL WHERE id=?",
+            (original[other.name]["id"],),
+        )
+        db.conn.commit()
+        expected_reads = {str(other)}
+    elif change == "missing_hash":
+        db.conn.execute(
+            "UPDATE photos SET file_hash=NULL WHERE id=?",
             (original[other.name]["id"],),
         )
         db.conn.commit()
@@ -6473,6 +6480,8 @@ def test_import_in_place_reuses_catalog_across_workspaces(
         assert rows[other.name]["file_hash"] != original[other.name]["file_hash"]
         assert rows[other.name]["file_size"] == other.stat().st_size
         assert rows[other.name]["width"] == 32
+    elif change == "missing_hash":
+        assert rows[other.name]["file_hash"] == original[other.name]["file_hash"]
     assert set(result["photo_ids"]) == {row["id"] for row in rows.values()}
     new_ws = job["workspace_id"]
     assert new_ws != old_ws

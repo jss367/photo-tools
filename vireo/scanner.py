@@ -2035,7 +2035,9 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         root: path to the root folder to scan
         db: Database instance
         progress_callback: optional callable(current, total) for progress reporting
-        incremental: if True, skip files unchanged since last scan
+        incremental: if True, reuse complete records with matching file size
+            and mtime. This does not verify byte identity; use a full scan
+            to detect replacements that preserve both signals.
         repair_missing_metadata: in incremental mode, force rows whose
             ExifTool payload is NULL through metadata extraction even when a
             fallback timestamp was available during the original scan
@@ -2757,15 +2759,17 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                         )
                     ) or existing["id"] in summary_needs_extract
                     existing_file_hash = existing_file_hashes.get(existing["id"])
-                    empty_hash_needs_repair = (
+                    hash_needs_repair = (
                         existing["file_size"] == 0
                         and existing_file_hash == EMPTY_FILE_SHA256
+                    ) or (
+                        stat.st_size > 0 and existing_file_hash is None
                     )
 
                     if (
                         file_unchanged and xmp_unchanged
                         and not metadata_missing
-                        and not empty_hash_needs_repair
+                        and not hash_needs_repair
                     ):
                         processed_count += 1
                         counts["indexed"] += 1
@@ -2798,7 +2802,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                     if (
                         file_unchanged
                         and not metadata_missing
-                        and not empty_hash_needs_repair
+                        and not hash_needs_repair
                     ):
                         processed_count += 1
                         counts["indexed"] += 1

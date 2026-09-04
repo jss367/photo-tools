@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 from image_edits import apply_recipe_to_loaded_image
 from image_loader import RAW_DECODE_PRESERVE_HIGHLIGHTS, RAW_EXTENSIONS, load_image
@@ -808,7 +809,7 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
 
     if metadata_jobs:
         metadata_exported, metadata_errors = _write_export_metadata_batch(
-            metadata_jobs,
+            metadata_jobs, cancel_check=cancel_check,
         )
         exported += metadata_exported
         errors.extend(metadata_errors)
@@ -1043,9 +1044,41 @@ def _exiftool_argfile_path(path):
     return f"#[CSTR]{escaped}"
 
 
-def _write_export_metadata_batch(jobs):
+def _run_cancellable_metadata(command, payload, timeout, cancel_check):
+    """Run ExifTool while polling cancellation, and always reap its process."""
+    with subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, encoding="utf-8", **no_window_kwargs(),
+    ) as process:
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                if cancel_check():
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    stdout, stderr = process.communicate(
+                        input=payload, timeout=min(0.1, remaining),
+                    )
+                except subprocess.TimeoutExpired:
+                    # communicate retains its buffered input across retries.
+                    payload = None
+                    continue
+                return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
+
+
+def _write_export_metadata_batch(jobs, cancel_check=None):
     """Write per-file metadata commands through one ExifTool process."""
     from metadata import _exiftool_command, find_exiftool
+
+    if cancel_check and cancel_check():
+        return _fail_export_metadata_jobs(jobs, "Export cancelled before metadata completed")
 
     exiftool = find_exiftool()
     if not exiftool:
@@ -1067,15 +1100,22 @@ def _write_export_metadata_batch(jobs):
 
     timeout = max(120, min(3600, len(jobs) * 5))
     try:
-        result = subprocess.run(
-            [*_exiftool_command(exiftool), "-@", "-"],
-            input="\n".join(argfile_lines) + "\n",
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=timeout,
-            **no_window_kwargs(),
-        )
+        command = [*_exiftool_command(exiftool), "-@", "-"]
+        payload = "\n".join(argfile_lines) + "\n"
+        if cancel_check is not None:
+            result = _run_cancellable_metadata(command, payload, timeout, cancel_check)
+            if result is None:
+                for out_path, _filename, _args in jobs:
+                    with contextlib.suppress(OSError):
+                        os.unlink(out_path + "_exiftool_tmp")
+                return _fail_export_metadata_jobs(
+                    jobs, "Export cancelled before metadata completed",
+                )
+        else:
+            result = subprocess.run(
+                command, input=payload, capture_output=True, text=True,
+                encoding="utf-8", timeout=timeout, **no_window_kwargs(),
+            )
     except subprocess.TimeoutExpired:
         return _fail_export_metadata_jobs(jobs, "ExifTool metadata write timed out")
     except OSError as exc:

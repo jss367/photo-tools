@@ -408,3 +408,13 @@ def test_api_lookup_cannot_reintroduce_ambiguous_names(tmp_path):
         assert tax.api_lookup("Parrot") is None
     request.assert_not_called()
     assert tax.lookup("Parrot") is None
+
+
+def test_stored_id_only_prediction_retains_source_identity(db, tmp_path, taxonomy):
+    _, det = _photo(db, tmp_path)
+    db.add_prediction(det, "Red-crowned Amazon", .9, "BioCLIP", labels_fingerprint="custom",
+                      taxonomy={"taxon_id": BROWED["taxon_id"]})
+    row = db.conn.execute("SELECT * FROM predictions").fetchone()
+    for resolver in (SpeciesResolver(db=db), SpeciesResolver(taxonomy=taxonomy), SpeciesResolver()):
+        assert resolver.prediction(row).key == "taxon:18997"
+    assert load_photo_features(db)[0]["species_top5"][0][0] == BROWED["common_name"]

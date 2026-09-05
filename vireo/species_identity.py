@@ -155,8 +155,8 @@ class SpeciesResolver:
         model = row.get("classifier_model", row.get("model", "")) or ""
         native = row.get("labels_fingerprint") == "tol" or model.startswith("iNat")
         source = None
-        if row.get("source_taxon_id") and row.get("scientific_name"):
-            source = {"taxon_id": row["source_taxon_id"], "scientific_name": row["scientific_name"]}
+        if row.get("source_taxon_id"):
+            source = {"taxon_id": row["source_taxon_id"], "scientific_name": row.get("scientific_name")}
         return self.resolve(row.get("species"), row.get("scientific_name") if native else None, source)
 
 

@@ -3471,6 +3471,12 @@ function toggleEncounter(idx) {
     if (collapsed) collapsedEncounters.add(key);
     else collapsedEncounters.delete(key);
   }
+  // The cached markup was captured for the pre-toggle collapse state, but
+  // this mutation only touched the live DOM. Invalidate it so a later
+  // reconcile — including one after applyReviewResults() resets
+  // collapsedEncounters — always rebuilds this card to match state.
+  var rendered = pipelineReviewRenderedCards.get(idx);
+  if (rendered) rendered.html = null;
 }
 
 function setFilter(f) {
@@ -4970,6 +4976,11 @@ function toggleSpeciesDropdown(event, encIdx, burstIdx, pos) {
 function closeAllDropdowns() {
   document.querySelectorAll('.species-dropdown.open').forEach(function(d) {
     d.classList.remove('open');
+    // Drop the lazily built controls and prediction rows so the DOM matches
+    // the empty-dropdown markup the card cache captured. Otherwise every
+    // menu the user peeks at keeps its inputs and rows forever, defeating
+    // the point of building them lazily.
+    d.innerHTML = '';
   });
   activeDropdown = null;
 }

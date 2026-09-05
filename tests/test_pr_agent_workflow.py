@@ -305,6 +305,10 @@ def test_routine_contract_is_state_based_quiet_and_resolves_addressed_threads():
     assert "resolveReviewThread" in prompt
     assert "blanket-resolve threads" in prompt
     assert "<!-- pr-agent-generated -->" in prompt
+    # Thread replies are posted under the owner's identity; without the marker
+    # the merge gate counts them as human feedback newer than a Codex 👍.
+    assert "ending each reply with `<!-- pr-agent-generated -->`" in prompt
+    assert "top-level or inline thread reply, must end" in prompt
     assert "separate top-level success summary" in prompt
 
 

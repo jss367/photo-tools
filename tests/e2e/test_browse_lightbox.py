@@ -3721,8 +3721,9 @@ def test_browse_lightbox_one_to_one_nav_falls_back_when_original_fails(live_serv
     assert "/full" in page.locator("#lightboxImg").get_attribute("src")
 
 
+@pytest.mark.parametrize("late_metadata", [False, True], ids=["early-metadata", "late-metadata"])
 def test_browse_lightbox_restored_pending_one_to_one_waits_for_fallback_after_initial_original_fails(
-    live_server, page
+    live_server, page, late_metadata
 ):
     """A restored pending 1:1 must not snap on /full after initial /original fails."""
     page.add_init_script(
@@ -3740,9 +3741,12 @@ def test_browse_lightbox_restored_pending_one_to_one_waits_for_fallback_after_in
         "**/photos/*/full",
         lambda route: route.fulfill(body=full_svg, content_type="image/svg+xml"),
     )
-    page.route(
-        "**/api/photos/1",
-        lambda route: route.fulfill(
+    held_initial = {}
+    page.route("**/photos/1/full", lambda route: held_initial.update(full=route))
+    page.route("**/api/photos/1", lambda route: held_initial.update(metadata=route))
+
+    def release_metadata():
+        held_initial.pop("metadata").fulfill(
             json={
                 "id": 1,
                 "filename": "restored-pending.jpg",
@@ -3751,8 +3755,9 @@ def test_browse_lightbox_restored_pending_one_to_one_waits_for_fallback_after_in
                 "flag": "none",
                 "wildlife_excluded": False,
             }
-        ),
-    )
+        )
+        page.wait_for_function("window._lbPhotoW === 4000")
+
     page.route("**/photos/*/original*", lambda route: route.abort())
     held_fallback = {}
 
@@ -3785,6 +3790,14 @@ def test_browse_lightbox_restored_pending_one_to_one_waits_for_fallback_after_in
     )
     expect(page.locator("#lightboxOverlay")).to_have_class("lightbox-overlay active")
 
+    deadline = time.monotonic() + 5
+    while len(held_initial) < 2 and time.monotonic() < deadline:
+        page.wait_for_timeout(25)
+    assert "full" in held_initial and "metadata" in held_initial
+    if not late_metadata:
+        release_metadata()
+    held_initial.pop("full").fulfill(body=full_svg, content_type="image/svg+xml")
+
     deadline = time.time() + 3
     while "route" not in held_fallback and time.time() < deadline:
         page.wait_for_timeout(25)
@@ -3801,6 +3814,11 @@ def test_browse_lightbox_restored_pending_one_to_one_waits_for_fallback_after_in
             naturalWidth: document.getElementById('lightboxImg')?.naturalWidth,
         })"""
     )
+
+    # Metadata arriving while the sharper preview is held must not resolve
+    # 1:1 from the small /full bitmap and cancel the fallback upgrade.
+    if late_metadata:
+        release_metadata()
 
     waiting = page.evaluate(
         """() => ({

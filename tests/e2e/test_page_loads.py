@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from playwright.sync_api import expect
 
@@ -52,7 +54,11 @@ def test_storage_page_reports_health_and_safety(live_server, page):
     expect(page.locator("#storageReclaimableSize")).not_to_have_text("-")
     expect(page.locator("#storageUpdatedAt")).to_contain_text("Updated")
     expect(page.locator("#storageLocations code").first).not_to_have_text("")
-    expect(page.locator("#storageGrid .stat-label", has_text="Database")).to_have_count(1)
+    # Exact match: the auxiliary breakdown also lists "Database support
+    # files" (WAL/SHM), which a substring filter would count too.
+    expect(
+        page.locator("#storageGrid .stat-label", has_text=re.compile(r"^Database$"))
+    ).to_have_count(1)
     expect(page.get_by_text("Safe to clear", exact=True).first).to_be_visible()
     expect(page.get_by_role("button", name="Open folder").first).to_be_visible()
     assert separate_mask_requests == []

@@ -636,15 +636,30 @@ def test_settings_import_reloads_page_when_config_refetch_fails(live_server, pag
 
     # Fail the /api/config GET that loadConfig() issues after the import
     # commits, but let the POST for /api/settings/import (the actual import)
-    # and any config POSTs through.
-    def _fail_config_get_only(route, request):
-        if request.method == "GET":
+    # and any config POSTs through. Stop failing once the page reloads: the
+    # framenavigated event is delivered before the reloaded document's
+    # subresource requests, so flipping the flag there is race-free. The
+    # route stays registered for the rest of the test on purpose. Unrouting
+    # while the reload is in flight changes the browser's interception
+    # patterns mid-navigation, which intermittently wedged one of the
+    # reloaded page's blocking script requests and left the document
+    # half-parsed (navbar present, settings form never rendered).
+    reloaded = {"seen": False}
+
+    def _note_reload(frame):
+        if frame == page.main_frame:
+            reloaded["seen"] = True
+
+    page.on("framenavigated", _note_reload)
+
+    def _fail_config_get_until_reload(route, request):
+        if request.method == "GET" and not reloaded["seen"]:
             route.fulfill(status=500, content_type="application/json",
                           body='{"error": "reload failed"}')
         else:
             route.continue_()
 
-    page.route("**/api/config", _fail_config_get_only)
+    page.route("**/api/config", _fail_config_get_until_reload)
 
     payload = page.request.get(f"{url}/api/settings/export").json()
     payload["keyword_case"] = "title"
@@ -666,7 +681,6 @@ def test_settings_import_reloads_page_when_config_refetch_fails(live_server, pag
 
     # After the reload, the form is rebuilt from disk (the import
     # committed), not from any stale in-memory snapshot.
-    page.unroute("**/api/config", _fail_config_get_only)
     _wait_for_settings_idle(page)
     expect(page.locator("#cfgKeywordCase")).to_have_value("title")
     cfg = page.request.get(f"{url}/api/config").json()

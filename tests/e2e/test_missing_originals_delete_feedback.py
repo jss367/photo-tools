@@ -39,8 +39,16 @@ def test_missing_originals_delete_shows_busy_and_success_feedback(live_server, p
 
     page.evaluate(
         """() => {
+          // safeFetch is the page-wide fetch helper, so only count calls to
+          // the remove endpoint. Unrelated page code (navbar refreshes,
+          // photo loads) also goes through safeFetch and would otherwise
+          // inflate the count under a slow full-suite run.
+          const realSafeFetch = window.safeFetch;
           window.__missingRemoveCallCount = 0;
-          window.safeFetch = () => {
+          window.safeFetch = (url, ...rest) => {
+            if (!String(url).startsWith('/api/photos/missing/remove')) {
+              return realSafeFetch(url, ...rest);
+            }
             window.__missingRemoveCallCount += 1;
             return new Promise(resolve => {
               window.__resolveMissingRemove = resolve;

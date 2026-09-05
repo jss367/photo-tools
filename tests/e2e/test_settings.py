@@ -1,3 +1,5 @@
+import re
+
 from playwright.sync_api import expect
 
 
@@ -57,3 +59,83 @@ def test_settings_text_search_ignores_hidden_update_section(live_server, page):
 
     expect(page.locator(".settings-find-mark")).to_have_count(0)
     expect(page.locator("#settingsFindStatus")).to_have_text("0 results")
+
+
+def _wait_for_settings_idle(page):
+    """Let the initial config load (and any migration autosave) settle."""
+    status = page.locator("#settingsSaveStatus")
+    expect(page.locator("#cfgKeywordCase")).to_be_visible()
+    expect(status).not_to_have_attribute("data-state", "saving", timeout=10_000)
+    return status
+
+
+def test_settings_autosave_shows_saved_confirmation(live_server, page):
+    """Changing a curated field reports Saving… and then a persistent Saved ✓ time."""
+    url = live_server["url"]
+    page.goto(f"{url}/settings", timeout=5000)
+    status = _wait_for_settings_idle(page)
+
+    with page.expect_request(
+        lambda r: r.url.endswith("/api/config") and r.method == "POST"
+    ):
+        page.select_option("#cfgKeywordCase", "title")
+        # The write is debounced 500 ms; the pill must already say so.
+        expect(status).to_have_attribute("data-state", "saving")
+        expect(status).to_have_text("Saving…")
+
+    expect(status).to_have_attribute("data-state", "saved", timeout=10_000)
+    expect(status).to_contain_text("Saved ✓")
+    # A wall-clock time so the confirmation still means something after the
+    # transient flash is gone.
+    expect(status).to_have_text(re.compile(r"Saved ✓ \d{1,2}:\d{2}:\d{2}"))
+
+    # The page must agree with what is actually on disk.
+    cfg = page.request.get(f"{url}/api/config").json()
+    assert cfg["keyword_case"] == "title"
+
+
+def test_settings_autosave_failure_is_visible(live_server, page):
+    """A rejected save is reported in the pill instead of looking like success."""
+    url = live_server["url"]
+    page.goto(f"{url}/settings", timeout=5000)
+    status = _wait_for_settings_idle(page)
+
+    def _fail_post(route, request):
+        if request.method == "POST":
+            route.fulfill(status=500, content_type="application/json",
+                          body='{"error": "disk full"}')
+        else:
+            route.continue_()
+
+    page.route("**/api/config", _fail_post)
+    page.select_option("#cfgKeywordCase", "lower")
+    expect(status).to_have_attribute("data-state", "error", timeout=10_000)
+    expect(status).to_contain_text("Save failed")
+
+    # The next successful write clears the failure.
+    page.unroute("**/api/config", _fail_post)
+    page.select_option("#cfgKeywordCase", "title")
+    expect(status).to_have_attribute("data-state", "saved", timeout=10_000)
+    expect(status).to_contain_text("Saved ✓")
+    cfg = page.request.get(f"{url}/api/config").json()
+    assert cfg["keyword_case"] == "title"
+
+
+def test_settings_workspace_override_autosave_shows_saved(live_server, page):
+    """The workspace-overrides form reports through the same pill."""
+    url = live_server["url"]
+    page.goto(f"{url}/settings", timeout=5000)
+    status = _wait_for_settings_idle(page)
+
+    checkbox = page.locator("#wsOverride_classification_threshold")
+    expect(checkbox).to_be_visible()
+    with page.expect_request(
+        lambda r: r.url.endswith("/api/workspaces/active/config") and r.method == "POST"
+    ):
+        checkbox.check()
+        expect(status).to_have_attribute("data-state", "saving")
+
+    expect(status).to_have_attribute("data-state", "saved", timeout=10_000)
+    expect(status).to_contain_text("Saved ✓")
+    overrides = page.request.get(f"{url}/api/workspaces/active/config").json()
+    assert "classification_threshold" in overrides

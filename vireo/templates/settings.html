@@ -102,6 +102,33 @@
     background: var(--accent);
     color: var(--accent-text);
   }
+
+  /* Autosave status pill. Every curated field on this page writes through
+   * on change (no Save button), so the page has to say so out loud:
+   * "Saving…" while a write is queued or in flight, then "Saved ✓ HH:MM:SS"
+   * that stays put so the confirmation is still there after the 500 ms
+   * debounce window. A failed write stays red until a later write lands. */
+  .settings-save-status {
+    position: fixed;
+    top: 58px;
+    right: 18px;
+    z-index: 150;
+    display: none;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    color: var(--text-dim);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+    transition: color 0.3s, border-color 0.3s;
+  }
+  .settings-save-status[data-state] { display: flex; }
+  .settings-save-status[data-state="saving"] { color: var(--text-secondary); }
+  .settings-save-status[data-state="saved"].flash { color: var(--success); border-color: var(--success); }
+  .settings-save-status[data-state="error"] { color: var(--danger); border-color: var(--danger); }
 </style>
 </head>
 <body>
@@ -115,6 +142,8 @@
   <button type="button" onclick="moveSettingsFind(1)" title="Next match" aria-label="Next match">v</button>
   <button type="button" onclick="closeSettingsFind()" title="Close find" aria-label="Close find">x</button>
 </div>
+
+<div class="settings-save-status" id="settingsSaveStatus" role="status" aria-live="polite"></div>
 
 <div class="content">
 
@@ -1478,6 +1507,7 @@ function saveWsConfig() {
   // wipe persisted state we never displayed. Bail out instead.
   if (!_wsOverridesLoaded) return;
   clearTimeout(_wsSaveTimer);
+  _saveStatusMark('workspace', 'pending');
   _wsSaveTimer = setTimeout(async function() {
     var overrides = {};
     var needsResync = false;
@@ -1508,17 +1538,90 @@ function saveWsConfig() {
         overrides[key] = null;
       }
     });
+    _saveStatusMark('workspace', 'inflight');
     try {
       await safeFetch('/api/workspaces/active/config', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(overrides)
       });
-    } catch(e) {}
+      _saveStatusMark('workspace', 'ok');
+    } catch(e) {
+      _saveStatusMark('workspace', 'error');
+    }
     // Restore any field left empty/invalid to the server's persisted value
     // (or uncheck it if no override actually exists server-side).
     if (needsResync) loadWsOverrides();
   }, 500);
+}
+
+// ---------- Autosave status ----------
+// The curated forms on this page (global config and workspace overrides)
+// autosave on every change. Each save path reports its lifecycle here so
+// the pill at the top-right answers "did my edit persist?" honestly:
+//   pending  — a debounced write is queued but not yet sent
+//   inflight — the POST is on the wire
+//   ok       — the server accepted it
+//   error    — the server rejected it or the network failed
+// Paths are tracked separately so a failed config save is not masked by a
+// later successful workspace-override save (they persist to different
+// places; only a retry of the SAME path clears its failure).
+var _saveStatus = { pending: {}, inflight: {}, failed: {}, lastSavedAt: null };
+var _saveStatusFlashTimer = null;
+
+function _saveStatusMark(path, phase) {
+  if (phase === 'pending') {
+    _saveStatus.pending[path] = true;
+  } else if (phase === 'inflight') {
+    delete _saveStatus.pending[path];
+    _saveStatus.inflight[path] = true;
+  } else if (phase === 'ok') {
+    delete _saveStatus.pending[path];
+    delete _saveStatus.inflight[path];
+    delete _saveStatus.failed[path];
+    _saveStatus.lastSavedAt = new Date();
+  } else if (phase === 'error') {
+    delete _saveStatus.pending[path];
+    delete _saveStatus.inflight[path];
+    _saveStatus.failed[path] = true;
+  } else if (phase === 'cancel') {
+    // A queued write was dropped on purpose (settings import replaces the
+    // whole config). Nothing was persisted, so don't claim a save happened.
+    delete _saveStatus.pending[path];
+  }
+  _renderSaveStatus();
+}
+
+function _renderSaveStatus() {
+  var el = document.getElementById('settingsSaveStatus');
+  if (!el) return;
+  var busy = Object.keys(_saveStatus.pending).length > 0 ||
+             Object.keys(_saveStatus.inflight).length > 0;
+  var failed = Object.keys(_saveStatus.failed).length > 0;
+  clearTimeout(_saveStatusFlashTimer);
+  el.classList.remove('flash');
+  if (busy) {
+    el.setAttribute('data-state', 'saving');
+    el.textContent = 'Saving\u2026';
+    el.title = 'Your change is being written to disk.';
+  } else if (failed) {
+    el.setAttribute('data-state', 'error');
+    el.textContent = 'Save failed \u2014 changes not saved';
+    el.title = 'The last save was rejected. Edit the field again to retry.';
+  } else if (_saveStatus.lastSavedAt) {
+    var t = _saveStatus.lastSavedAt.toLocaleTimeString([], {
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+    el.setAttribute('data-state', 'saved');
+    el.textContent = 'Saved \u2713 ' + t;
+    el.title = 'All changes on this page are saved automatically. Last saved at ' + t + '.';
+    el.classList.add('flash');
+    _saveStatusFlashTimer = setTimeout(function() { el.classList.remove('flash'); }, 2000);
+  } else {
+    el.removeAttribute('data-state');
+    el.textContent = '';
+    el.title = '';
+  }
 }
 
 var _saveTimer = null;
@@ -2572,7 +2675,9 @@ async function _saveConfigNow() {
     var keywordCase = document.getElementById('cfgKeywordCase').value;
     var maxEditHistory = parseInt(document.getElementById('cfgMaxEditHistory').value, 10);
     if (isNaN(maxEditHistory)) maxEditHistory = 1000;
-    await safeFetch('/api/config', {
+    _saveStatusMark('config', 'inflight');
+    try {
+      await safeFetch('/api/config', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -2674,6 +2779,11 @@ async function _saveConfigNow() {
           },
         }),
       });
+    } catch (e) {
+      _saveStatusMark('config', 'error');
+      throw e;
+    }
+    _saveStatusMark('config', 'ok');
     if (typeof loadPreviewCacheStatus === 'function') loadPreviewCacheStatus();
     // Drop the cached editor list so the next "Open in Editor" action
     // sees changes to the editors list without a page reload.
@@ -2683,12 +2793,13 @@ async function _saveConfigNow() {
 }
 
 function saveConfig() {
-  // Debounced fire-and-forget for the settings-page inline handlers. Errors
-  // are silent — the network layer already toasts on failure and the next
-  // change re-tries. Callers that need to KNOW the write landed (e.g. the
-  // NAS wizard, before it tears down its modal) must call _saveConfigNow()
-  // directly and await it.
+  // Debounced fire-and-forget for the settings-page inline handlers. The
+  // outcome is reported through the autosave pill (_saveStatusMark) and the
+  // network layer toasts on failure; the next change re-tries. Callers that
+  // need to KNOW the write landed (e.g. the NAS wizard, before it tears down
+  // its modal) must call _saveConfigNow() directly and await it.
   clearTimeout(_saveTimer);
+  _saveStatusMark('config', 'pending');
   _saveTimer = setTimeout(function() {
     _saveConfigNow().catch(function() {});
   }, 500);
@@ -4829,10 +4940,12 @@ async function importSettingsFile(file) {
   if (typeof _saveTimer !== 'undefined' && _saveTimer) {
     clearTimeout(_saveTimer);
     _saveTimer = null;
+    _saveStatusMark('config', 'cancel');
   }
   if (typeof _wsSaveTimer !== 'undefined' && _wsSaveTimer) {
     clearTimeout(_wsSaveTimer);
     _wsSaveTimer = null;
+    _saveStatusMark('workspace', 'cancel');
   }
   var confirmedEviction = false;
   try {

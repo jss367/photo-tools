@@ -10555,6 +10555,10 @@ function _lbPrimeAdjacentPhotos(sourceKey) {
   if (!overlay || !overlay.classList.contains('active') ||
       _lbVisualTransitionPending || !visibleImg ||
       !visibleImg.complete || !visibleImg.naturalWidth) return;
+  // The old bitmap remains visible during a zoom source upgrade. Give that
+  // interactive request priority over queued neighbors of the outgoing tier.
+  // The source-load handler resumes warmups once the new pixels are ready.
+  if (_lbDesiredSrcKey && _lbDesiredSrcKey !== _lbCurrentSrcKey) return;
   if (_lightboxPhotoList.length < 2 || _lightboxCurrentId == null) {
     _lbClearAdjacentPreloads();
     return;

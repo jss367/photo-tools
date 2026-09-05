@@ -2137,6 +2137,62 @@ def test_browse_lightbox_queues_warmups_and_continues_past_failures(live_server,
     assert requests[:4] == [failing_id, ids[0], ids[3], ids[4]]
 
 
+def test_browse_lightbox_pauses_fit_warmups_during_source_upgrade(live_server, page):
+    """Finishing a Fit warmup cannot queue more work ahead of a pending zoom image."""
+    held_fit = []
+    held_original = []
+    fit_requests = []
+    original_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="4000" height="2000">'
+        '<rect width="4000" height="2000" fill="#274"/></svg>'
+    )
+
+    def serve_full(route):
+        """Hold the first neighboring preview until the zoom upgrade is pending."""
+        if "prefetch=1" in route.request.url:
+            fit_requests.append(route.request.url)
+            if len(fit_requests) == 1:
+                held_fit.append(route)
+                return
+        route.fulfill(body=base64.b64decode(_PNG_1X1), content_type="image/png")
+
+    def serve_original(route):
+        """Stall the visible upgrade while allowing later original warmups."""
+        if "prefetch=1" not in route.request.url and not held_original:
+            held_original.append(route)
+            return
+        route.fulfill(body=original_svg, content_type="image/svg+xml")
+
+    page.route("**/photos/*/full*", serve_full)
+    page.route("**/photos/*/original*", serve_original)
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").nth(1).dblclick()
+    page.wait_for_function(
+        """_lbFullUsesOriginal === false && Object.values(_lbAdjacentPreloads).some(
+            entry => entry.status === 'loading'
+        )"""
+    )
+    page.evaluate("_lbSetZoom(2)")
+    page.wait_for_timeout(200)
+    assert len(held_original) == 1
+    assert page.evaluate("_lbCurrentSrcKey") == "full"
+    assert page.evaluate("_lbDesiredSrcKey") == "original"
+    assert len(held_fit) == 1
+    held_fit.pop().fulfill(body=base64.b64decode(_PNG_1X1), content_type="image/png")
+    page.wait_for_function(
+        "Object.values(_lbAdjacentPreloads).some(entry => entry.status === 'decoded')"
+    )
+    page.wait_for_timeout(200)
+    assert len(fit_requests) == 1
+
+    held_original[0].fulfill(body=original_svg, content_type="image/svg+xml")
+    page.wait_for_function(
+        """_lbCurrentSrcKey === 'original' && Object.values(_lbAdjacentPreloads).some(
+            entry => entry.sourceKey === 'original' && entry.status === 'decoded'
+        )"""
+    )
+
+
 def test_browse_lightbox_close_discards_pending_warmup_queue(live_server, page):
     """A late image completion after close cannot start the remaining warmups."""
     held = []

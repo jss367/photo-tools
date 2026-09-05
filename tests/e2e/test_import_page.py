@@ -2547,14 +2547,15 @@ def test_import_after_move_recovers_when_archive_root_is_created(
     expect(hint).to_contain_text("does not exist on this machine")
     expect(row).to_be_hidden()
 
-    # The folder now exists on disk. Expire the throttle (the test should
-    # not have to sleep through it) and touch the destination like the
-    # native picker does — an input event, not a reload.
+    # The folder now exists on disk. Touch the destination once, like the
+    # native picker does — a single input event, no reload. This lands
+    # inside the presence throttle window that started at page load, which
+    # is exactly the case where the one trigger must not be dropped: the
+    # refresh is deferred to the end of the window, not skipped.
     state["present"] = True
-    page.evaluate("() => { _archiveRootPresenceCheckedAt = 0; }")
     page.locator("#destInput").dispatch_event("input")
 
-    expect(row).to_be_visible()
+    expect(row).to_be_visible(timeout=10000)
     expect(hint).to_be_hidden()
     assert state["fetches"] >= 2
 

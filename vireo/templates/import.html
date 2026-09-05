@@ -1741,10 +1741,30 @@ function afterMoveUnavailableReason(destination) {
 // and re-render if anything changed.
 let _archiveRootPresenceRefresh = null;
 let _archiveRootPresenceCheckedAt = 0;
+let _archiveRootPresenceTimer = null;
+let _archiveRootPresenceRerun = false;
 const ARCHIVE_ROOT_PRESENCE_TTL_MS = 5000;
 function refreshArchiveRootPresence() {
-  if (_archiveRootPresenceRefresh) return;
-  if (Date.now() - _archiveRootPresenceCheckedAt < ARCHIVE_ROOT_PRESENCE_TTL_MS) return;
+  if (_archiveRootPresenceRefresh) {
+    // A trigger arrived mid-fetch; the in-flight result predates it, so
+    // run once more when it lands (the throttle will space it out).
+    _archiveRootPresenceRerun = true;
+    return;
+  }
+  const wait = ARCHIVE_ROOT_PRESENCE_TTL_MS - (Date.now() - _archiveRootPresenceCheckedAt);
+  if (wait > 0) {
+    // Throttled — but never drop the trigger. The native picker fires a
+    // single input event; if the user created and picked the folder within
+    // the TTL of the last check, that one event is the only signal we get,
+    // so schedule a trailing refresh for when the window expires.
+    if (!_archiveRootPresenceTimer) {
+      _archiveRootPresenceTimer = setTimeout(() => {
+        _archiveRootPresenceTimer = null;
+        refreshArchiveRootPresence();
+      }, wait);
+    }
+    return;
+  }
   _archiveRootPresenceRefresh = fetch('/api/remote-targets')
     .then((r) => (r.ok ? r.json() : null))
     .then((data) => {
@@ -1762,7 +1782,13 @@ function refreshArchiveRootPresence() {
       if (changed) updateAfterMoveUI();
     })
     .catch(() => {})
-    .finally(() => { _archiveRootPresenceRefresh = null; });
+    .finally(() => {
+      _archiveRootPresenceRefresh = null;
+      if (_archiveRootPresenceRerun) {
+        _archiveRootPresenceRerun = false;
+        refreshArchiveRootPresence();
+      }
+    });
 }
 
 function updateAfterMoveUI() {

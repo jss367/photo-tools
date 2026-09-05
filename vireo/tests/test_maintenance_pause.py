@@ -202,3 +202,64 @@ FUNCTION
 '''.replace("FUNCTION", template[start:end])
     result = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, json.dumps({"stdout": result.stdout, "stderr": result.stderr})
+
+
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+def test_sharpness_auto_flags_observe_pause_and_cancel(
+    client_with_photo, monkeypatch, action,
+):
+    import sharpness
+    from db import Database
+
+    app, db, first = client_with_photo
+    second = _second_photo(db, first)
+    runner = app._job_runner
+    client = app.test_client()
+    entered = threading.Event()
+    release = threading.Event()
+    flagged = []
+    original = Database.update_photo_flag
+
+    monkeypatch.setattr(sharpness, "score_collection_photos", lambda *args, **kwargs: {
+        "results": [
+            {"photo_id": pid, "sharpness": 100, "group_size": 2, "is_best": True}
+            for pid in (first, second)
+        ],
+    })
+
+    def flag_photo(worker_db, photo_id, flag, **kwargs):
+        if not flagged:
+            entered.set()
+            assert release.wait(5)
+        original(worker_db, photo_id, flag, **kwargs)
+        flagged.append(photo_id)
+
+    monkeypatch.setattr(Database, "update_photo_flag", flag_photo)
+    response = client.post("/api/jobs/sharpness", json={})
+    assert response.status_code == 200
+    job_id = response.get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert client.post(f"/api/jobs/{job_id}/pause").status_code == 200
+        assert runner.get(job_id)["status"] == "pausing"
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        assert flagged == [first]
+        assert db.get_photo(first)["flag"] == "flagged"
+        assert db.get_photo(second)["flag"] == "none"
+        # The first flag's transaction must finish before the next checkpoint.
+        db.conn.execute("UPDATE photos SET rating=3 WHERE id=?", (second,))
+        db.conn.commit()
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        finished = wait_for_job_via_client(client, job_id)
+        if action == "resume":
+            assert finished["status"] == "completed", finished
+            assert finished["result"]["auto_flagged"] == 2
+            assert flagged == [first, second]
+        else:
+            assert finished["status"] == "cancelled", finished
+            assert flagged == [first]
+            assert db.get_photo(second)["flag"] == "none"
+    finally:
+        release.set()
+        runner.cancel_job(job_id)

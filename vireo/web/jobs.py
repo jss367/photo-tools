@@ -696,6 +696,7 @@ def create_jobs_blueprint(
             # Auto-flag: flag best in each group, suggest reject for worst
             best_count = 0
             for r in result["results"]:
+                ctx.checkpoint(job)
                 if r["group_size"] > 1 and r["is_best"]:
                     thread_db.update_photo_flag(r["photo_id"], "flagged",
                                                 verify_workspace=False)

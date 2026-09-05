@@ -16,7 +16,7 @@ not a checkpoint that survives restarting the application.
 | Verify photo hashes | Between files, after committing the completed batch prefix |
 | Adjust capture time | Between photos, after the metadata write and catalog update |
 | Scan for duplicates | Between duplicate groups |
-| Score sharpness | Between burst groups and saved scores |
+| Score sharpness | Between burst groups, saved scores, and automatic flags |
 | Analyze photos for culling | Between scene-hash calculations and species groups |
 | Regroup encounters and bursts | Between loading, grouping, and saving stages |
 | Verify installed models | Between models |

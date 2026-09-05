@@ -580,3 +580,60 @@ def test_unknown_accepted_source_id_survives_name_changes_and_taxonomy_import(db
                           (accepted[0],)).fetchone()
     assert row["inat_id"] == 900001
     assert row["name"] == keyword["name"]
+
+
+@pytest.mark.parametrize("same_taxon", [False, True])
+def test_review_keeps_homonymous_predictions_and_confirmed_tags_distinct(db, tmp_path, same_taxon):
+    from encounters import encounter_species_label
+    from pipeline import attach_species_identities, serialize_results
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is required to execute review comparisons")
+    display = "Sharedus species"
+    db.conn.execute("UPDATE taxa SET name = ?, common_name = NULL WHERE inat_id IN (18976, 18997)", (display,))
+    tids = [18976, 18976 if same_taxon else 18997]
+    pids = []
+    for i, tid in enumerate(tids):
+        pid, det = _photo(db, tmp_path, f"homonym-{i}.jpg")
+        pids.append(pid)
+        db.add_prediction(det, display, .99, "BioCLIP", labels_fingerprint="custom", taxonomy={"taxon_id": tid})
+
+    def payload():
+        photos = load_photo_features(db)
+        result = serialize_results({"photos": photos, "summary": {}, "encounters": [
+            {"photos": photos, "species": encounter_species_label(photos), "bursts": [photos]},
+        ]})
+        attach_species_identities(result, SpeciesResolver(db=db))
+        return result
+
+    data = payload()
+    assert all(p["species_top5"][0][0] == display for p in data["photos"])
+    if not same_taxon:
+        assert data["species_identities"][display]["key"] not in {"taxon:18976", "taxon:18997"}
+    html = (Path(__file__).parents[1] / "templates/pipeline_review.html").read_text()
+    source = html[html.index("var SPECIES_CONFLICT_THRESHOLDS"):html.index("function formatSpeciesConfidence")]
+    script = ("var pipelineResults = " + json.dumps(data) + ";\n" + source
+              + "\nvar photoMap = {}; pipelineResults.photos.forEach(function(p) { photoMap[p.id] = p; });"
+                "process.stdout.write(JSON.stringify(buildSpeciesConflictEvidence(photoMap)));")
+    result = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True, timeout=15)
+    evidence = json.loads(result.stdout)
+    assert evidence[str(pids[1])]["severity"] == (None if same_taxon else "strong")
+    # Legacy/manual same-name keywords can still refer to different taxa.
+    for pid, tid in zip(pids, tids, strict=True):
+        kid = db.conn.execute(
+            "INSERT INTO keywords (name, is_species, type, taxon_id, source_taxon_id) "
+            "SELECT ?, 1, 'taxonomy', id, inat_id FROM taxa WHERE inat_id = ?", (display, tid),
+        ).lastrowid
+        db.tag_photo(pid, kid)
+    data = payload()
+    assert data["encounters"][0]["species_confirmed"] == same_taxon
+    rapid = (Path(__file__).parents[1] / "templates/pipeline_rapid_review.html").read_text()
+    function = rapid[rapid.index("function hasMixedSpecies"):rapid.index("function needsSpecies")]
+    script = ("var data = " + json.dumps(data) + "; var rapid = {results:data};\n"
+              "function queueIncludedPhotos() { return data.photos; }\n"
+              "function photoSpeciesList(p) { return p.confirmed_species_list; }\n"
+              "function speciesKey(s) { return s.toLowerCase(); }\n" + function
+              + "\nprocess.stdout.write(JSON.stringify(hasMixedSpecies({})));\n")
+    result = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True, timeout=15)
+    assert json.loads(result.stdout) == (not same_taxon)

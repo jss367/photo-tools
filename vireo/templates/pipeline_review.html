@@ -2892,17 +2892,24 @@ function speciesCandidateForReviewUnit(enc, burst) {
   return null;
 }
 
-function analyzePhotoSpeciesConflict(photo, expectedSpecies) {
-  var expectedKey = normalizedSpeciesName(expectedSpecies);
+function analyzePhotoSpeciesConflict(photo, expectedSpecies, expectedIdentityKey) {
+  var expectedKey = expectedIdentityKey || normalizedSpeciesName(expectedSpecies);
+  if (!expectedIdentityKey && photo) {
+    var confirmed = (photo.confirmed_species_identities || []).filter(function(entry) { return entry.name === expectedSpecies; });
+    if (confirmed.length === 1) expectedKey = confirmed[0].key;
+  }
   var top5 = (photo && photo.species_top5) || [];
   if (!expectedKey || top5.length === 0) return null;
 
   // A model may contribute several detections/crops. Retain its strongest
   // confidence for each species so repeated detections do not inflate support.
   var byModel = {};
+  var displayNames = {};
   top5.forEach(function(entry) {
     if (!entry || entry.length < 2) return;
-    var species = String(entry[0] || '').trim();
+    var display = String(entry[0] || '').trim();
+    var species = entry[3] || normalizedSpeciesName(display);
+    displayNames[species] = display;
     var confidence = Number(entry[1]);
     var model = String(entry[2] || 'unknown');
     if (!species || !isFinite(confidence) || confidence < 0 || confidence > 1) return;
@@ -2916,7 +2923,7 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies) {
   var speciesNames = {};
   models.forEach(function(model) {
     Object.keys(byModel[model]).forEach(function(species) {
-      if (normalizedSpeciesName(species) !== expectedKey) speciesNames[species] = true;
+      if (species !== expectedKey) speciesNames[species] = true;
     });
   });
 
@@ -2925,7 +2932,7 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies) {
     models.forEach(function(model) {
       var best = 0;
       Object.keys(byModel[model]).forEach(function(species) {
-        if (normalizedSpeciesName(species) === speciesKey) {
+        if (species === speciesKey) {
           best = Math.max(best, byModel[model][species]);
         }
       });
@@ -2938,7 +2945,7 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies) {
   var alternative = null;
   var alternativeSupport = 0;
   Object.keys(speciesNames).forEach(function(species) {
-    var support = averageSupport(normalizedSpeciesName(species));
+    var support = averageSupport(species);
     if (support > alternativeSupport) {
       alternative = species;
       alternativeSupport = support;
@@ -2951,7 +2958,7 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies) {
     severity: null,
   };
 
-  var alternativeKey = normalizedSpeciesName(alternative);
+  var alternativeKey = alternative;
   var alternativeModelWins = 0;
   models.forEach(function(model) {
     var topSpecies = null;
@@ -2963,7 +2970,7 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies) {
         topConfidence = confidence;
       }
     });
-    if (normalizedSpeciesName(topSpecies) === alternativeKey) alternativeModelWins++;
+    if (topSpecies === alternativeKey) alternativeModelWins++;
   });
 
   var margin = alternativeSupport - expectedSupport;
@@ -2985,13 +2992,27 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies) {
   return {
     expectedSpecies: expectedSpecies,
     expectedSupport: expectedSupport,
-    alternativeSpecies: alternative,
+    alternativeSpecies: displayNames[alternative],
+    alternativeKey: alternativeKey,
     alternativeSupport: alternativeSupport,
     alternativeModelWins: alternativeModelWins,
     modelCount: models.length,
     margin: margin,
     severity: severity,
   };
+}
+
+function speciesCandidateKeyForReviewUnit(enc, burst, expected) {
+  var override = burst && burst.species_override;
+  if ((override && (override.confirmed || Array.isArray(override.species_list))) ||
+      (!override && enc && enc.confirmed_species)) return null;
+  var candidates = (burst && burst.species_predictions) || (enc && enc.species_predictions) || [];
+  var winner = null;
+  candidates.forEach(function(candidate) {
+    if (candidate.species !== expected || !candidate.species_key) return;
+    if (!winner || candidate.count * candidate.avg_confidence > winner.count * winner.avg_confidence) winner = candidate;
+  });
+  return winner && winner.species_key;
 }
 
 function buildSpeciesConflictEvidence(photoMap) {
@@ -3002,14 +3023,14 @@ function buildSpeciesConflictEvidence(photoMap) {
         var expected = speciesCandidateForReviewUnit(enc, burst);
         (burst.photo_ids || burst || []).forEach(function(pid) {
           var photo = photoMap[pid];
-          if (photo) evidence[pid] = analyzePhotoSpeciesConflict(photo, expected);
+          if (photo) evidence[pid] = analyzePhotoSpeciesConflict(photo, expected, speciesCandidateKeyForReviewUnit(enc, burst, expected));
         });
       });
     } else {
       var expected = speciesCandidateForReviewUnit(enc, null);
       (enc.photo_ids || []).forEach(function(pid) {
         var photo = photoMap[pid];
-        if (photo) evidence[pid] = analyzePhotoSpeciesConflict(photo, expected);
+        if (photo) evidence[pid] = analyzePhotoSpeciesConflict(photo, expected, speciesCandidateKeyForReviewUnit(enc, null, expected));
       });
     }
   });
@@ -3043,7 +3064,7 @@ function summarizeSpeciesConflicts(photoIds, evidence) {
 
   var groups = {};
   issues.forEach(function(issue) {
-    var key = normalizedSpeciesName(issue.alternativeSpecies);
+    var key = issue.alternativeKey || normalizedSpeciesName(issue.alternativeSpecies);
     if (!groups[key]) groups[key] = {species: issue.alternativeSpecies, count: 0, strong: 0};
     groups[key].count++;
     if (issue.severity === 'strong') groups[key].strong++;

@@ -495,9 +495,8 @@ def load_photo_features(db, collection_id=None, config=None,
     # encounter confirmation flag all key off the same string. For
     # photos with multiple species tags we keep the alphabetically-first
     # entry so the choice stays deterministic across runs.
-    species_names_by_photo = db.get_species_keywords_for_photos(
-        photo_ids_for_dets,
-    )
+    confirmed_identities = db.get_species_keywords_for_photos(photo_ids_for_dets, include_identities=True)
+    species_names_by_photo = {pid: [entry["name"] for entry in entries] for pid, entries in confirmed_identities.items()}
     confirmed_by_photo = {
         pid: names[0]
         for pid, names in species_names_by_photo.items()
@@ -644,6 +643,7 @@ def load_photo_features(db, collection_id=None, config=None,
             "dino_subject_embedding": subj_emb,
             "dino_global_embedding": global_emb,
             "species_top5": species_by_photo.get(pid, []),
+            "confirmed_species_identities": confirmed_identities.get(pid, []),
             "subjects": subjects_by_photo.get(pid, []),
             "confirmed_species": confirmed_by_photo.get(pid),
             "confirmed_species_list": confirmed_list_by_photo.get(pid, []),
@@ -864,31 +864,27 @@ def _make_summary(encounters, all_photos):
     }
 
 
-def _photo_species_keysets(photos):
-    """Per-photo identity sets of confirmed species (empty set = unconfirmed)."""
-    from pipeline_results import photo_confirmed_species_list, species_key_set
-
-    return [
-        frozenset(species_key_set(photo_confirmed_species_list(p)))
-        for p in photos
-    ]
-
-
-def _shared_confirmed_species(photos):
-    """Species carried by every *tagged* photo, in the first tagged photo's
-    order (empty when the tagged photos share nothing or none is tagged)."""
+def _confirmed_species_entries(photo):
     from keyword_normalization import keyword_match_key
     from pipeline_results import photo_confirmed_species_list
 
-    tagged = [
-        lst for lst in (photo_confirmed_species_list(p) for p in photos) if lst
-    ]
+    identities = {entry["name"]: entry["key"] for entry in photo.get("confirmed_species_identities") or []}
+    return [(name, identities.get(name, "name:" + keyword_match_key(name)))
+            for name in photo_confirmed_species_list(photo)]
+
+
+def _photo_species_keysets(photos):
+    """Per-photo identity sets of confirmed species (empty set = unconfirmed)."""
+    return [frozenset(key for _, key in _confirmed_species_entries(photo)) for photo in photos]
+
+
+def _shared_confirmed_species(photos):
+    """Shared confirmed identities, retaining the first tagged photo's names."""
+    tagged = [entries for photo in photos if (entries := _confirmed_species_entries(photo))]
     if not tagged:
         return []
-    common = set.intersection(*(
-        {keyword_match_key(s) for s in lst} for lst in tagged
-    ))
-    return [s for s in tagged[0] if keyword_match_key(s) in common]
+    common = set.intersection(*({key for _, key in entries} for entries in tagged))
+    return [name for name, key in tagged[0] if key in common]
 
 
 def derive_burst_override(photos, preferred_order=None):
@@ -1342,7 +1338,13 @@ def save_results(results, cache_dir, workspace_id, preserve_miss_marker=True):
 def attach_species_identities(data, resolver):
     """Give review comparisons a stable key while retaining editable keyword text."""
     names = set()
-    source_identities = {}
+    source_keys = defaultdict(set)
+    if resolver.db is not None:
+        by_photo = resolver.db.get_species_keywords_for_photos(
+            [p["id"] for p in data.get("photos", [])], include_identities=True,
+        )
+        for photo in data.get("photos", []):
+            photo["confirmed_species_identities"] = by_photo.get(photo["id"], [])
 
     def collect(container):
         for field in ("confirmed_species",):
@@ -1353,7 +1355,7 @@ def attach_species_identities(data, resolver):
             if entry:
                 names.add(entry[0])
                 if len(entry) > 3:
-                    source_identities[entry[0]] = {"key": entry[3], "display_name": entry[0]}
+                    source_keys[entry[0]].add(entry[3])
         for entry in container.get("species_predictions") or []:
             if entry.get("species"):
                 names.add(entry["species"])
@@ -1370,6 +1372,10 @@ def attach_species_identities(data, resolver):
             if override.get("species"):
                 names.add(override["species"])
             names.update(override.get("species_list") or [])
+    source_identities = {
+        name: {"key": next(iter(keys)), "display_name": name}
+        for name, keys in source_keys.items() if len(keys) == 1
+    }
     data["species_identities"] = {
         name: source_identities.get(name) or {"key": resolver.resolve(name).key, "display_name": resolver.resolve(name).display_name}
         for name in names if name

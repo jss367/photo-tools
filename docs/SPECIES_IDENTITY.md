@@ -80,3 +80,7 @@ reassigned; a distinct name is used when necessary. IDs missing from the local
 taxonomy remain on the keyword and are linked after a later taxonomy import,
 without renaming already confirmed keywords. Label-set metadata updates for the
 same source ID do not make the prompt ambiguous.
+
+Process Review compares each prediction's identity key, and confirmed keywords
+carry their own keys into both review views. Different taxa that share a display
+name remain separate in conflict evidence and mixed-species detection.

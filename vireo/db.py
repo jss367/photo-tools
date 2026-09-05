@@ -14859,10 +14859,12 @@ class Database:
                 result.setdefault(r["photo_id"], []).append(dict(r))
         return result
 
-    def get_species_keywords_for_photos(self, photo_ids):
+    def get_species_keywords_for_photos(self, photo_ids, include_identities=False):
         """Return deduplicated species-rank keyword names for photos.
 
         Returns a dict mapping photo_id -> list of species name strings.
+        With include_identities, each entry contains the stored name and a
+        source-aware identity key for comparisons that must preserve homonyms.
 
         A linked taxon must actually have rank ``species``; linked family,
         genus, and other ancestor keywords remain taxonomy keywords but are
@@ -14887,11 +14889,12 @@ class Database:
         # in a later chunk would double-append it under setdefault.
         photo_ids = list(dict.fromkeys(photo_ids))
         chosen = {}
+        source_keys = {}
         for chunk in _chunks(photo_ids):
             placeholders = ",".join("?" for _ in chunk)
             rows = self.conn.execute(
                 f"""SELECT pk.photo_id, k.id, k.name, k.parent_id,
-                           k.taxon_id, t.rank AS taxon_rank
+                           k.taxon_id, k.source_taxon_id, t.inat_id, t.name AS scientific_name, t.rank AS taxon_rank
                     FROM photo_keywords pk
                     JOIN keywords k ON k.id = pk.keyword_id
                     LEFT JOIN taxa t ON t.id = k.taxon_id
@@ -14923,6 +14926,12 @@ class Database:
                 chosen.setdefault(r["photo_id"], {}).setdefault(
                     identity, (r["name"], is_root)
                 )
+                source_id = r["source_taxon_id"] or r["inat_id"]
+                key = f"taxon:{source_id}" if source_id else (
+                    "scientific:" + r["scientific_name"].casefold() if r["scientific_name"]
+                    else "name:" + keyword_match_key(r["name"])
+                )
+                source_keys.setdefault((r["photo_id"], identity), key)
         taxon_ids = {
             identity[1]
             for by_identity in chosen.values()
@@ -14948,10 +14957,9 @@ class Database:
             names = []
             for identity, (name, is_root) in by_identity.items():
                 if identity[0] == "taxon" and not is_root:
-                    names.append(canonical_roots.get(identity[1], name))
-                else:
-                    names.append(name)
-            result[photo_id] = sorted(names, key=lambda n: keyword_match_key(n))
+                    name = canonical_roots.get(identity[1], name)
+                names.append({"name": name, "key": source_keys[(photo_id, identity)]} if include_identities else name)
+            result[photo_id] = sorted(names, key=lambda n: keyword_match_key(n["name"] if include_identities else n))
         return result
 
     def get_photos_with_equivalent_species(

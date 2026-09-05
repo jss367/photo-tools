@@ -418,3 +418,61 @@ def test_stored_id_only_prediction_retains_source_identity(db, tmp_path, taxonom
     for resolver in (SpeciesResolver(db=db), SpeciesResolver(taxonomy=taxonomy), SpeciesResolver()):
         assert resolver.prediction(row).key == "taxon:18997"
     assert load_photo_features(db)[0]["species_top5"][0][0] == BROWED["common_name"]
+
+
+@pytest.mark.parametrize("same_taxon", [False, True])
+def test_pipeline_serialization_keeps_unresolved_source_keys(db, tmp_path, same_taxon):
+    from encounters import _confident_species_conflict, encounter_species_label, sim_species
+    from pipeline import _build_species_predictions, attach_species_identities, serialize_results
+
+    for i, tid in enumerate([900001, 900001 if same_taxon else 900002]):
+        _, det = _photo(db, tmp_path, f"unknown-{i}.jpg")
+        db.add_prediction(det, "Unknown parrot", .99, "BioCLIP", labels_fingerprint="custom",
+                          taxonomy={"taxon_id": tid})
+    photos = load_photo_features(db)
+    entries = [p["species_top5"][0] for p in photos]
+    assert (entries[0][3] == entries[1][3]) == same_taxon
+    assert (sim_species([entries[0]], [entries[1]]) > 0) == same_taxon
+    assert (_confident_species_conflict(*photos) is None) == same_taxon
+    predictions = _build_species_predictions(photos)
+    assert len(predictions) == (1 if same_taxon else 2)
+    assert {p["species_key"] for p in predictions} == {e[3] for e in entries}
+    data = serialize_results({"photos": photos, "summary": {}, "encounters": [
+        {"photos": photos, "species": encounter_species_label(photos), "bursts": [photos]},
+    ]})
+    data = json.loads(json.dumps(data))
+    resolver = SpeciesResolver(db=db)
+    normalize_cached_species(data, resolver)
+    attach_species_identities(data, resolver)
+    normalize_cached_species(data, resolver)
+    for photo, entry in zip(data["photos"], entries, strict=True):
+        assert photo["species_top5"][0] == list(entry)
+        assert data["species_identities"][entry[0]]["key"] == entry[3]
+    assert len(data["encounters"][0]["species_predictions"]) == (1 if same_taxon else 2)
+    node = shutil.which("node")
+    if node:
+        html = (Path(__file__).parents[1] / "templates/pipeline_review.html").read_text()
+        source = html[html.index("var SPECIES_CONFLICT_THRESHOLDS"):html.index("function buildSpeciesConflictEvidence")]
+        script = ("var pipelineResults = " + json.dumps(data) + ";\n" + source
+                  + "\nprocess.stdout.write(JSON.stringify(analyzePhotoSpeciesConflict("
+                    "pipelineResults.photos[1], pipelineResults.photos[0].species_top5[0][0])));")
+        result = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True, timeout=15)
+        assert json.loads(result.stdout)["severity"] == (None if same_taxon else "strong")
+
+
+@pytest.mark.parametrize("same_taxon", [False, True])
+def test_culling_groups_unresolved_taxa_by_id(db, tmp_path, same_taxon):
+    from culling import analyze_for_culling
+
+    for i, tid in enumerate([900001, 900001 if same_taxon else 900002]):
+        pid, det = _photo(db, tmp_path, f"cull-{i}.jpg")
+        db.add_prediction(det, "Unknown parrot", .99, "BioCLIP", labels_fingerprint="custom",
+                          taxonomy={"taxon_id": tid})
+        db.conn.execute("UPDATE photos SET phash = '0000000000000000' WHERE id = ?", (pid,))
+        db.upsert_photo_embedding(pid, "BioCLIP", np.ones(4, dtype=np.float32).tobytes())
+    db.conn.commit()
+    result = analyze_for_culling(db)
+    assert len(result["species_groups"]) == (1 if same_taxon else 2)
+    assert len({g["species_key"] for g in result["species_groups"]}) == (1 if same_taxon else 2)
+    if not same_taxon:
+        assert result["suggested_rejects"] == 0

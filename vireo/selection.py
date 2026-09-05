@@ -153,7 +153,8 @@ def _get_species(photo):
     """Get the top species for a photo, or None."""
     top5 = photo.get("species_top5")
     if top5 and len(top5) > 0:
-        return top5[0][0]
+        from species_identity import species_entry_key
+        return species_entry_key(top5[0])
     return None
 
 

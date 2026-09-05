@@ -361,9 +361,8 @@ def load_photo_features(db, collection_id=None, config=None,
     # backing detection passes the workspace threshold — lowering the
     # threshold in workspace config should surface more predictions without
     # rewriting any rows.
-    # NOTE: pr.classifier_model aliased to "model" for back-compat with
-    # species_top5 tuple shape consumed downstream. Prediction review
-    # fields (status/group_id/individual) are Task 25 scope.
+    # Keep name/confidence/model in the first three tuple positions and
+    # append the identity key for grouping and serialized review evidence.
     #
     # Fingerprint filter: a detection + classifier_model can have predictions
     # from multiple label sets (fingerprints) when the user rotates labels.
@@ -428,13 +427,14 @@ def load_photo_features(db, collection_id=None, config=None,
         )
         if pr["detector_confidence"] < min_conf and not is_contextual_weak:
             continue
-        species = species_resolver.prediction(pr).display_name
+        identity = species_resolver.prediction(pr)
+        species = identity.display_name
         if len(species_by_photo[pid]) < top_k:
-            species_by_photo[pid].append((species, pr["confidence"], pr["model"]))
+            species_by_photo[pid].append((species, pr["confidence"], pr["model"], identity.key))
         subject = subjects_by_detection.get(pr["detection_id"])
         if subject is not None and len(subject["predictions"]) < top_k:
             subject["predictions"].append(
-                (species, pr["confidence"], pr["model"])
+                (species, pr["confidence"], pr["model"], identity.key)
             )
 
     # Load primary detection per photo (highest confidence) via the global
@@ -1062,10 +1062,16 @@ def _build_species_predictions(photos):
     Returns a list of dicts sorted by total count descending, each with:
         species, count, avg_confidence, models: [{model, confidence, photo_count}]
     """
+    from species_identity import species_entry_key
     model_data = defaultdict(lambda: defaultdict(lambda: {"confs": [], "count": 0}))
+    display_names = {}
+    identity_keys = set()
     for p in photos:
         for entry in (p.get("species_top5") or []):
-            sp_name = entry[0]
+            sp_name = species_entry_key(entry)
+            display_names[sp_name] = entry[0]
+            if len(entry) > 3:
+                identity_keys.add(sp_name)
             sp_conf = entry[1]
             sp_model = entry[2] if len(entry) > 2 else "unknown"
             model_data[sp_name][sp_model]["confs"].append(sp_conf)
@@ -1090,7 +1096,8 @@ def _build_species_predictions(photos):
             total_conf_sum += sum(data["confs"])
             total_conf_count += len(data["confs"])
         result.append({
-            "species": sp_name,
+            "species": display_names[sp_name],
+            **({"species_key": sp_name} if sp_name in identity_keys else {}),
             "count": total_count,
             "avg_confidence": round(total_conf_sum / total_conf_count, 4) if total_conf_count else 0,
             "models": models,
@@ -1335,6 +1342,7 @@ def save_results(results, cache_dir, workspace_id, preserve_miss_marker=True):
 def attach_species_identities(data, resolver):
     """Give review comparisons a stable key while retaining editable keyword text."""
     names = set()
+    source_identities = {}
 
     def collect(container):
         for field in ("confirmed_species",):
@@ -1344,6 +1352,8 @@ def attach_species_identities(data, resolver):
         for entry in container.get("species_top5") or []:
             if entry:
                 names.add(entry[0])
+                if len(entry) > 3:
+                    source_identities[entry[0]] = {"key": entry[3], "display_name": entry[0]}
         for entry in container.get("species_predictions") or []:
             if entry.get("species"):
                 names.add(entry["species"])
@@ -1361,7 +1371,7 @@ def attach_species_identities(data, resolver):
                 names.add(override["species"])
             names.update(override.get("species_list") or [])
     data["species_identities"] = {
-        name: {"key": resolver.resolve(name).key, "display_name": resolver.resolve(name).display_name}
+        name: source_identities.get(name) or {"key": resolver.resolve(name).key, "display_name": resolver.resolve(name).display_name}
         for name in names if name
     }
 
@@ -1379,7 +1389,17 @@ def normalize_cached_species(data, resolver):
             entries = container.get(field) or []
             normalized = []
             for entry in entries:
-                name = resolver.resolve(entry[0]).display_name
+                # A serialized key is primary evidence; never re-infer its
+                # taxon from the display label during a cache read.
+                key = entry[3] if len(entry) > 3 else ""
+                if key.startswith("taxon:"):
+                    tid = int(key.split(":", 1)[1])
+                    raw_name = entry[0].removesuffix(f" (taxon {tid})")
+                    name = resolver.resolve(raw_name, source={"taxon_id": tid}).display_name
+                elif key.startswith("scientific:"):
+                    name = resolver.resolve(entry[0], scientific_name=key.split(":", 1)[1]).display_name
+                else:
+                    name = resolver.resolve(entry[0]).display_name
                 changed |= name != entry[0]
                 normalized.append([name, *entry[1:]])
             if entries:

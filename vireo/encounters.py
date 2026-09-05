@@ -14,6 +14,7 @@ from collections import defaultdict
 from datetime import datetime
 
 import numpy as np
+from species_identity import species_entry_key
 
 log = logging.getLogger(__name__)
 
@@ -170,6 +171,8 @@ def _has_similarity_signal(photo):
     )
 
 
+
+
 def sim_species(species_a, species_b):
     """Species similarity via Bhattacharyya coefficient on shared top-5 species.
 
@@ -182,8 +185,8 @@ def sim_species(species_a, species_b):
     """
     if not species_a or not species_b:
         return 0.0
-    dict_a = {s[0]: s[1] for s in species_a}
-    dict_b = {s[0]: s[1] for s in species_b}
+    dict_a = {species_entry_key(s): s[1] for s in species_a}
+    dict_b = {species_entry_key(s): s[1] for s in species_b}
     shared = set(dict_a.keys()) & set(dict_b.keys())
     if not shared:
         return 0.0
@@ -226,7 +229,7 @@ def _confident_species_prediction(photo, config=None):
         if not entry or len(entry) < 2:
             continue
         name = str(entry[0] or "").strip()
-        key = _normalized_species_name(name)
+        key = _normalized_species_name(species_entry_key(entry))
         try:
             confidence = float(entry[1])
         except (TypeError, ValueError):
@@ -707,7 +710,7 @@ def _segment_mean_species(segment):
     species_scores = defaultdict(list)
     for p in segment:
         for entry in (p.get("species_top5") or []):
-            species_scores[entry[0]].append(entry[1])
+            species_scores[species_entry_key(entry)].append(entry[1])
     if not species_scores:
         return []
     return sorted(
@@ -838,9 +841,12 @@ def encounter_species_label(photos):
         (species_name, confidence) or (None, 0.0) if no predictions
     """
     species_weights = defaultdict(float)
+    display_names = {}
     for p in photos:
         for entry in (p.get("species_top5") or []):
-            species_weights[entry[0]] += entry[1]
+            key = species_entry_key(entry)
+            species_weights[key] += entry[1]
+            display_names[key] = entry[0]
 
     if not species_weights:
         return (None, 0.0)
@@ -849,9 +855,9 @@ def encounter_species_label(photos):
     # Normalize confidence: total weight / (number of photos * max possible per photo)
     n_photos = len([p for p in photos if p.get("species_top5")])
     if n_photos == 0:
-        return (winner, 0.0)
+        return (display_names[winner], 0.0)
     avg_conf = species_weights[winner] / n_photos
-    return (winner, round(avg_conf, 4))
+    return (display_names[winner], round(avg_conf, 4))
 
 
 # -- Full encounter segmentation pipeline --

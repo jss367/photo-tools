@@ -125,8 +125,10 @@ def analyze_for_culling(
             (pid,),
         ).fetchone()
         if pred:
+            identity = species_resolver.prediction(pred)
             predictions[pid] = {
-                "species": species_resolver.prediction(pred).display_name,
+                "species": identity.display_name,
+                "species_key": identity.key,
                 "confidence": pred["confidence"],
                 "classifier_model": pred["classifier_model"],
             }
@@ -235,12 +237,10 @@ def analyze_for_culling(
         if pid not in predictions:
             continue
         sp = predictions[pid]["species"]
-        if separate_file_types:
-            key = sp + " [" + _file_type(pid) + "]"
-        else:
-            key = sp
+        suffix = " [" + _file_type(pid) + "]" if separate_file_types else ""
+        key = predictions[pid]["species_key"] + suffix
         if key not in species_map:
-            species_map[key] = {"species": sp, "pids": []}
+            species_map[key] = {"species": sp + suffix, "pids": []}
         species_map[key]["pids"].append(pid)
 
     # Analyze each species group
@@ -283,7 +283,8 @@ def analyze_for_culling(
         )
 
         species_groups.append({
-            "species": group_key,
+            "species": species,
+            "species_key": group_key,
             "photo_count": len(pids),
             "scene_groups": scene_groups,
             "keepers": sp_keepers,

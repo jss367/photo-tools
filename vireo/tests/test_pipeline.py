@@ -1806,7 +1806,8 @@ def test_load_photo_features_includes_model_in_species(tmp_path):
     # _setup_db_with_photos adds predictions — check model is present
     for p in photos:
         for entry in p.get("species_top5", []):
-            assert len(entry) == 3, f"Expected (species, confidence, model), got {entry}"
+            assert len(entry) == 4, f"Expected (species, confidence, model, identity), got {entry}"
+            assert isinstance(entry[3], str)
             assert isinstance(entry[2], str), f"Model should be a string, got {type(entry[2])}"
 
 
@@ -1853,7 +1854,7 @@ def test_load_photo_features_preserves_subject_boxes_and_predictions(tmp_path):
         "x": 0.05, "y": 0.4, "w": 0.2, "h": 0.3,
     }
     assert photo["subjects"][0]["predictions"] == [
-        ("American Wigeon", 0.98, "bioclip"),
+        ("American Wigeon", 0.98, "bioclip", "name:american wigeon"),
     ]
     assert photo["subjects"][1]["predictions"] == []
 
@@ -1863,7 +1864,7 @@ def test_load_photo_features_preserves_subject_boxes_and_predictions(tmp_path):
     )
     photo = load_photo_features(db)[0]
     assert photo["subjects"][1]["predictions"] == [
-        ("Blue-winged Teal", 0.91, "bioclip"),
+        ("Blue-winged Teal", 0.91, "bioclip", "name:blue-winged teal"),
     ]
     assert {row[0] for row in photo["species_top5"]} == {
         "American Wigeon", "Blue-winged Teal",

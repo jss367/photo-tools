@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from keyword_normalization import keyword_match_key
 
-RESOLUTION_VERSION = "species-identity-v2"
+RESOLUTION_VERSION = "species-identity-v3"
 
 # Verified against iNaturalist taxon 18976 and Cornell's A. viridigenalis
 # account. Older DWCA snapshots assign this English name to A. rhodocorytha.
@@ -132,6 +132,10 @@ class SpeciesResolver:
             tid = taxon.get("taxon_id")
             sci = taxon.get("scientific_name")
             display = taxon.get("common_name") or sci or name
+            if tid and not sci:
+                # The source distinguishes these taxa even when this catalog
+                # cannot name them. Make that distinction visible in review.
+                display = f"{name} (taxon {tid})"
             if evidence and sci and display != sci and (self.taxonomy is not None or self.db is not None):
                 display_taxon = self._lookup(display)
                 if (not display_taxon or display_taxon.get("scientific_name") != sci):
@@ -166,3 +170,8 @@ def correct_common_name_index(by_common, by_scientific):
         entry = by_scientific.get(evidence["scientific_name"].lower())
         if entry and entry.get("taxon_id") == evidence["taxon_id"]:
             by_common[name] = entry
+
+
+def species_entry_key(entry):
+    """Read the optional identity key on a serialized prediction tuple."""
+    return entry[3] if len(entry) > 3 and entry[3] else entry[0]

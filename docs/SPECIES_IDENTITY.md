@@ -67,3 +67,9 @@ those unverified common names retain their raw text instead of inferring a taxon
 explicit source IDs, scientific names, and the verified red-crowned correction
 continue to resolve. Downloads carry a common-name identity format version, and
 imports preserve the ambiguity exclusions for database-backed review and culling.
+
+Pipeline prediction tuples retain their identity key alongside display name,
+confidence, and model through serialization and cache refresh. Encounter scoring,
+consensus, rarity protection, and culling use that key. If an explicit source ID
+has no scientific name in the catalog, review labels include the taxon number so
+different unresolved taxa with the same common name remain distinguishable.

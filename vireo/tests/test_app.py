@@ -17484,6 +17484,354 @@ def test_import_page_surfaces_remote_target_load_failure(app_and_db):
     assert "/api/jobs/import-photos" in html
 
 
+def _remote_target_body(**over):
+    body = {"host": "nas", "user": "julius", "remote_path": "/volume1/Photos",
+            "mount_path": "/Volumes/Photos", "name": "Photo NAS"}
+    body.update(over)
+    return body
+
+
+def _fake_remote_probe(monkeypatch):
+    """Stub every subprocess-touching helper the remote-target test
+    endpoint calls so the archive-root check can be exercised alone."""
+    import move
+    monkeypatch.setattr(move, "resolve_rsync_bin", lambda _: "/usr/bin/rsync")
+    monkeypatch.setattr(move, "is_gnu_rsync", lambda _: True)
+    monkeypatch.setattr(move, "resolve_ssh_bin", lambda _: "/usr/bin/ssh")
+    monkeypatch.setattr(move, "test_remote_connection", lambda *_: {
+        "ok": True, "ssh": True, "remote_path_writable": True,
+        "rsync_ok": True, "remote_rsync_ok": True,
+        "message": "Connection OK \u2014 SSH, remote path, and rsync all good.",
+    })
+
+
+def test_remote_target_test_flags_missing_local_archive_root(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """Issue #1377: a typo'd/missing local_archive_root used to get a bare
+    green "Connection OK" from Test connection, and the misconfiguration
+    only surfaced on the Import page as a hint blaming the destination.
+    The connection genuinely is OK (ok stays true) but the message must
+    name the archive root and the result must carry a machine-readable
+    archive_root_present so the UI can downgrade it to a warning."""
+    app, _ = app_and_db
+    _fake_remote_probe(monkeypatch)
+    missing = str(tmp_path / "Vireo_Archive")
+    resp = app.test_client().post(
+        "/api/remote-targets/test",
+        json=_remote_target_body(local_archive_root=missing))
+    assert resp.status_code == 200
+    res = resp.get_json()
+    assert res["ok"] is True
+    assert res["archive_root"] == missing
+    assert res["archive_root_present"] is False
+    assert res["message"].startswith("Connection OK, but")
+    assert missing in res["message"]
+    assert "does not exist" in res["message"]
+
+
+def test_remote_target_test_keeps_plain_ok_when_archive_root_exists(
+    app_and_db, monkeypatch, tmp_path,
+):
+    app, _ = app_and_db
+    _fake_remote_probe(monkeypatch)
+    root = tmp_path / "Vireo Archive"
+    root.mkdir()
+    resp = app.test_client().post(
+        "/api/remote-targets/test",
+        json=_remote_target_body(local_archive_root=str(root)))
+    res = resp.get_json()
+    assert res["ok"] is True
+    assert res["archive_root_present"] is True
+    assert res["message"] == (
+        "Connection OK \u2014 SSH, remote path, and rsync all good.")
+
+
+def test_remote_target_test_archive_root_present_is_none_when_unset(
+    app_and_db, monkeypatch,
+):
+    """"Not configured" must stay distinguishable from "configured but
+    missing" \u2014 a target with no archive root simply never offers the
+    chained move and should not be warned about."""
+    app, _ = app_and_db
+    _fake_remote_probe(monkeypatch)
+    resp = app.test_client().post(
+        "/api/remote-targets/test", json=_remote_target_body())
+    res = resp.get_json()
+    assert res["ok"] is True
+    assert res["archive_root"] is None
+    assert res["archive_root_invalid"] is False
+    assert res["archive_root_present"] is None
+    assert res["message"].startswith("Connection OK \u2014")
+
+
+def test_remote_target_test_missing_archive_root_does_not_mask_ssh_failure(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """When the connection itself failed, that failure is the message; the
+    archive-root note must not overwrite it."""
+    import move
+    app, _ = app_and_db
+    _fake_remote_probe(monkeypatch)
+    monkeypatch.setattr(move, "test_remote_connection", lambda *_: {
+        "ok": False, "ssh": False, "remote_path_writable": False,
+        "rsync_ok": True, "remote_rsync_ok": False,
+        "message": "SSH connection failed",
+    })
+    resp = app.test_client().post(
+        "/api/remote-targets/test",
+        json=_remote_target_body(local_archive_root=str(tmp_path / "nope")))
+    res = resp.get_json()
+    assert res["ok"] is False
+    assert res["message"] == "SSH connection failed"
+    assert res["archive_root_present"] is False
+
+
+def test_remote_target_test_reports_rejected_archive_root(
+    app_and_db, monkeypatch,
+):
+    """A submitted archive root that _coerce_remote_target blanks (relative,
+    or inside mount_path) must not read as "not configured" and get a green
+    result: the save would silently clear it and the chained move would
+    never be offered. Report it as invalid, naming the submitted value."""
+    app, _ = app_and_db
+    _fake_remote_probe(monkeypatch)
+    client = app.test_client()
+    for bad in ("Pictures/Vireo Archive", "/Volumes/Photos/archive"):
+        res = client.post(
+            "/api/remote-targets/test",
+            json=_remote_target_body(local_archive_root=bad)).get_json()
+        assert res["ok"] is True, bad
+        assert res["archive_root_invalid"] is True, bad
+        assert res["archive_root"] == bad
+        assert res["archive_root_present"] is False, bad
+        assert res["message"].startswith("Connection OK, but"), bad
+        assert bad in res["message"]
+        assert "not valid" in res["message"]
+
+
+class _OfflineGate:
+    """Stand-in for volume_reachability.get_shared(): every path is on an
+    unreachable mount. Records what was asked so a test can assert the
+    filesystem was never touched for it."""
+    def __init__(self):
+        self.asked = []
+
+    def check(self, path):
+        self.asked.append(path)
+        return "/Volumes/Archive", False
+
+
+def test_remote_target_test_reports_unreachable_archive_root_volume(
+    app_and_db, monkeypatch,
+):
+    """A root on a stale SMB/NFS share must not be os.path.isdir'd (that
+    can hang a worker); the bounded reachability gate answers first and
+    the result says the volume is unreachable rather than guessing."""
+    import volume_reachability
+    app, _ = app_and_db
+    _fake_remote_probe(monkeypatch)
+    gate = _OfflineGate()
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+    calls = []
+    real_isdir = os.path.isdir
+    monkeypatch.setattr(os.path, "isdir",
+                        lambda p: calls.append(p) or real_isdir(p))
+    resp = app.test_client().post(
+        "/api/remote-targets/test",
+        json=_remote_target_body(local_archive_root="/Volumes/Archive/staging"))
+    res = resp.get_json()
+    assert res["ok"] is True
+    assert res["archive_root_volume_offline"] is True
+    assert res["archive_root_present"] is None
+    assert res["message"].startswith("Connection OK, but the volume")
+    assert "/Volumes/Archive/staging" in res["message"]
+    assert "/Volumes/Archive/staging" in gate.asked
+    assert "/Volumes/Archive/staging" not in calls
+    # The mount path goes through the same gate.
+    assert "/Volumes/Photos" in gate.asked
+    assert "/Volumes/Photos" not in calls
+    assert res["mount_present"] is False
+
+
+def test_remote_targets_list_reports_unreachable_archive_root_volume(
+    app_and_db, monkeypatch,
+):
+    import config as cfg
+    import move
+    import volume_reachability
+    app, _ = app_and_db
+    monkeypatch.setattr(move, "resolve_rsync_bin", lambda _: "/usr/bin/rsync")
+    monkeypatch.setattr(move, "is_gnu_rsync", lambda _: True)
+    monkeypatch.setattr(move, "resolve_ssh_bin", lambda _: "/usr/bin/ssh")
+    gate = _OfflineGate()
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+    cfg.save({"remote_targets": [
+        _remote_target_body(id="a", local_archive_root="/Volumes/Archive/staging"),
+    ]})
+    t = app.test_client().get("/api/remote-targets").get_json()["targets"][0]
+    assert t["local_archive_root_present"] is None
+    assert t["local_archive_root_volume_offline"] is True
+
+
+def test_remote_targets_list_bounds_aggregate_probe_time(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """Several archive roots on distinct dead volumes must not add up
+    serially past the Import page's client abort: roots are probed
+    concurrently under one budget, a root still unanswered at the budget
+    is reported as unreachable, and roots that answered in time keep
+    their real state."""
+    import threading
+    import time
+
+    import config as cfg
+    import move
+    import volume_reachability
+    app, _ = app_and_db
+    monkeypatch.setattr(move, "resolve_rsync_bin", lambda _: "/usr/bin/rsync")
+    monkeypatch.setattr(move, "is_gnu_rsync", lambda _: True)
+    monkeypatch.setattr(move, "resolve_ssh_bin", lambda _: "/usr/bin/ssh")
+    app.config["REMOTE_TARGET_PROBE_BUDGET_SECS"] = 0.4
+    release = threading.Event()
+
+    class Gate:
+        def check(self, path):
+            if path.startswith("/Volumes/Dead"):
+                # A hung probe: far longer than the budget.
+                release.wait(5)
+                return "/Volumes/Dead", False
+            return None, True
+
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: Gate())
+    present = tmp_path / "present"
+    present.mkdir()
+    cfg.save({"remote_targets": [
+        _remote_target_body(id="dead1", local_archive_root="/Volumes/Dead1/a"),
+        _remote_target_body(id="dead2", local_archive_root="/Volumes/Dead2/b"),
+        _remote_target_body(id="ok", local_archive_root=str(present)),
+    ]})
+    started = time.monotonic()
+    try:
+        resp = app.test_client().get("/api/remote-targets")
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+    assert resp.status_code == 200
+    assert elapsed < 3.0, elapsed
+    by_id = {t["id"]: t for t in resp.get_json()["targets"]}
+    assert by_id["dead1"]["local_archive_root_volume_offline"] is True
+    assert by_id["dead1"]["local_archive_root_present"] is None
+    assert by_id["dead2"]["local_archive_root_volume_offline"] is True
+    assert by_id["ok"]["local_archive_root_present"] is True
+    assert by_id["ok"]["local_archive_root_volume_offline"] is False
+
+
+def test_remote_targets_list_reports_archive_root_presence(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """GET /api/remote-targets tells the Import page whether each
+    configured archive root exists, so its "Move to NAS unavailable" hint
+    can say "the root does not exist" instead of blaming the destination."""
+    import config as cfg
+    import move
+    app, _ = app_and_db
+    monkeypatch.setattr(move, "resolve_rsync_bin", lambda _: "/usr/bin/rsync")
+    monkeypatch.setattr(move, "is_gnu_rsync", lambda _: True)
+    monkeypatch.setattr(move, "resolve_ssh_bin", lambda _: "/usr/bin/ssh")
+    present = tmp_path / "present"
+    present.mkdir()
+    cfg.save({"remote_targets": [
+        _remote_target_body(id="a", local_archive_root=str(present)),
+        _remote_target_body(id="b", local_archive_root=str(tmp_path / "gone")),
+        _remote_target_body(id="c"),
+    ]})
+    resp = app.test_client().get("/api/remote-targets")
+    assert resp.status_code == 200
+    by_id = {t["id"]: t for t in resp.get_json()["targets"]}
+    assert by_id["a"]["local_archive_root_present"] is True
+    assert by_id["b"]["local_archive_root_present"] is False
+    assert by_id["c"]["local_archive_root_present"] is None
+    assert all(v["local_archive_root_volume_offline"] is False
+               for v in by_id.values())
+
+
+def test_import_page_after_move_hint_names_the_archive_root(app_and_db):
+    """The Import hint distinguishes no-root / root-missing / outside-root
+    and shows the configured path, so a typo is visible at a glance."""
+    app, _ = app_and_db
+    html = app.test_client().get("/import").data.decode()
+    assert "function afterMoveUnavailableReason(destination)" in html
+    assert "no remote target has a local archive root configured" in html
+    assert "does not exist on this machine" in html
+    assert "the destination is outside the local archive root of" in html
+    assert "local_archive_root_present === false" in html
+    assert "volume not reachable right now" in html
+    # The old destination-blaming wording is gone.
+    assert "the destination is not inside any remote" not in html
+
+
+def test_settings_page_test_connection_warns_on_missing_archive_root(
+    app_and_db,
+):
+    app, _ = app_and_db
+    html = app.test_client().get("/settings").data.decode()
+    assert "archive_root_present === false" in html
+    assert "res.archive_root_invalid" in html
+    assert "res.archive_root_volume_offline" in html
+    assert "Create folder" in html
+
+
+def test_import_page_after_move_eligibility_requires_existing_root(
+    app_and_db,
+):
+    """A destination lexically inside a root that does not exist must not
+    make the target eligible \u2014 that would offer the chained move through
+    a typo'd root and contradict the Settings warning."""
+    app, _ = app_and_db
+    html = app.test_client().get("/import").data.decode()
+    start = html.index("function afterMoveEligibleTargets()")
+    body = html[start:html.index("}", start)]
+    assert "t.local_archive_root_present !== false" in body
+    assert "!t.local_archive_root_volume_offline" in body
+    # Targets are re-fetched (throttled) whenever the unavailable hint
+    # renders and merged whole, so creating the folder or correcting the
+    # root in Settings mid-session does not require a reload.
+    assert "function refreshAfterMoveTargets()" in html
+    assert "refreshAfterMoveTargets();" in html
+    # The refreshed list replaces the held one (legacy entries change id
+    # when Settings re-saves them, so an id-keyed merge would miss them)
+    # and the dropdown is rebuilt with the selection preserved.
+    assert "function renderImportDestModes()" in html
+    # The refresh compares whole entries (Start posts only the id; the
+    # server resolves every field), and a selected SSH destination follows
+    # a legacy id change by connection tuple instead of dropping to Local.
+    assert "return JSON.stringify(t, Object.keys(t).sort());" in html
+    assert "function migratedRemoteTarget(prev, targets, previousTargets)" in html
+    assert "!known.has(t.id)" in html
+    assert html.count("migratedRemoteTarget(") >= 3
+    assert "const prevReplaced = _previousRemoteTargets.find" in html
+    assert '"Then move to NAS" was unchecked: ' in html
+    assert "t.remote_path === prev.remote_path" in html
+    assert "sameHost" not in html
+    assert "function noteRemoteSelectionLost(name)" in html
+    # Both the initial load and the background refresh go through one
+    # bounded fetch (10s abort) and one apply step that also sets the
+    # rsync/ssh availability flags and clears the load-error banner.
+    assert html.count("fetch('/api/remote-targets'") == 1
+    assert "function fetchImportRemoteTargets()" in html
+    assert "_afterMoveTargetsRefresh = fetchImportRemoteTargets()" in html
+    assert html.count("applyImportRemoteTargets(") >= 3
+    # Responses carry a sequence number; an older one never overwrites
+    # state applied from a newer request, whichever arrives first.
+    assert "function remoteTargetsResponseIsStale(res)" in html
+    assert html.count("remoteTargetsResponseIsStale(res)") >= 3
+    assert "renderRemoteTargetsError(false);" in html
+    # Returning to the tab re-evaluates the gate.
+    assert "document.addEventListener('visibilitychange', _afterMoveOnReturn);" in html
+    assert "window.addEventListener('focus', _afterMoveOnReturn);" in html
+
+
 def test_import_page_surfaces_destination_errors_and_recovery_actions(
     app_and_db,
 ):

@@ -2367,6 +2367,743 @@ def test_import_new_workspace_forwards_explicit_after_import(live_server, page):
     assert body["after_import"] == identify_id
 
 
+def test_import_after_move_hint_blames_the_right_field(live_server, page):
+    """Issue #1377: with a typo'd archive root (Vireo_Archive vs the real
+    "Vireo Archive"), the old hint said the *destination* was outside every
+    archive root, so the user re-typed a destination that was never the
+    problem. The hint must name the configured root and say which of the
+    three situations applies."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+
+    def remote_targets(route):
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": [{
+                    "id": "nas1",
+                    "name": "Photo NAS",
+                    "user": "photo",
+                    "host": "nas.local",
+                    "remote_path": "/volume1/Photography",
+                    "mount_path": "/Volumes/Photography",
+                    "local_archive_root": "/Users/me/Pictures/Vireo_Archive",
+                    "local_archive_root_present": False,
+                }],
+            }),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    hint = page.locator("#afterMoveUnavailable")
+    row = page.locator("#afterMoveRow")
+
+    # Typo'd root: the destination is lexically outside it, so this is the
+    # "outside" case, but the missing root is annotated inline so the
+    # underscore-vs-space mismatch is visible in one line.
+    expect(hint).to_be_visible()
+    expect(hint).to_contain_text("the destination is outside the local archive root of")
+    expect(hint).to_contain_text(
+        "Photo NAS (/Users/me/Pictures/Vireo_Archive — does not exist on this machine)"
+    )
+    expect(hint).not_to_contain_text("destination is not inside")
+    expect(row).to_be_hidden()
+
+    # Root exists but the destination genuinely is outside it: no annotation.
+    page.evaluate(
+        """
+        () => {
+          importRemoteTargets[0].local_archive_root_present = true;
+          updateAfterMoveUI();
+        }
+        """
+    )
+    expect(hint).to_contain_text("the destination is outside the local archive root of")
+    expect(hint).to_contain_text("Photo NAS (/Users/me/Pictures/Vireo_Archive)")
+    expect(hint).not_to_contain_text("does not exist")
+
+    # A second target with a missing root that does not contain the
+    # destination is listed, but the user is not told to create it.
+    page.evaluate(
+        """
+        () => {
+          importRemoteTargets.push({
+            id: "nas2", name: "Backup NAS", user: "photo", host: "backup.local",
+            remote_path: "/volume1/Backup", mount_path: "/Volumes/Backup",
+            local_archive_root: "/archive-b", local_archive_root_present: false,
+          });
+          updateAfterMoveUI();
+        }
+        """
+    )
+    expect(hint).to_contain_text("the destination is outside the local archive root of")
+    expect(hint).to_contain_text("Backup NAS (/archive-b — does not exist on this machine)")
+    expect(hint).not_to_contain_text("Create it")
+    page.evaluate("() => { importRemoteTargets.pop(); }")
+
+    # No target has a root at all.
+    page.evaluate(
+        """
+        () => {
+          importRemoteTargets[0].local_archive_root = "";
+          updateAfterMoveUI();
+        }
+        """
+    )
+    expect(hint).to_contain_text("no remote target has a local archive root configured")
+
+    # Destination inside a root that does not exist yet: creating the root
+    # is the fix, and the prefix match alone must not show the move row.
+    page.evaluate(
+        """
+        () => {
+          importRemoteTargets[0].local_archive_root = "/Users/me/Pictures/Vireo Archive";
+          importRemoteTargets[0].local_archive_root_present = false;
+          updateAfterMoveUI();
+        }
+        """
+    )
+    expect(hint).to_be_visible()
+    expect(hint).to_contain_text(
+        "the local archive root for Photo NAS (/Users/me/Pictures/Vireo Archive "
+        "— does not exist on this machine). Create it"
+    )
+    expect(row).to_be_hidden()
+
+    # Once the root exists, the same destination makes the row appear.
+    page.evaluate(
+        """
+        () => {
+          importRemoteTargets[0].local_archive_root_present = true;
+          updateAfterMoveUI();
+        }
+        """
+    )
+    expect(hint).to_be_hidden()
+    expect(row).to_be_visible()
+
+    # The root's volume dropped (external drive / share): the server could
+    # not probe it, so the gate says so instead of guessing.
+    page.evaluate(
+        """
+        () => {
+          importRemoteTargets[0].local_archive_root_present = null;
+          importRemoteTargets[0].local_archive_root_volume_offline = true;
+          updateAfterMoveUI();
+        }
+        """
+    )
+    expect(hint).to_contain_text(
+        "the volume holding the local archive root for Photo NAS "
+        "(/Users/me/Pictures/Vireo Archive — volume not reachable right now)"
+    )
+    expect(row).to_be_hidden()
+
+
+def test_import_after_move_recovers_when_archive_root_is_created(
+    live_server, page,
+):
+    """Archive-root presence is fetched with the target list; if the user
+    creates the folder mid-session (Finder, the Settings "Create folder"
+    button), the gate must re-check instead of insisting the root is
+    missing until a full reload."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+    state = {"present": False, "fetches": 0}
+
+    def remote_targets(route):
+        state["fetches"] += 1
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": [{
+                    "id": "nas1",
+                    "name": "Photo NAS",
+                    "user": "photo",
+                    "host": "nas.local",
+                    "remote_path": "/volume1/Photography",
+                    "mount_path": "/Volumes/Photography",
+                    "local_archive_root": "/Users/me/Pictures/Vireo Archive",
+                    "local_archive_root_present": state["present"],
+                }],
+            }),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    hint = page.locator("#afterMoveUnavailable")
+    row = page.locator("#afterMoveRow")
+    expect(hint).to_contain_text("does not exist on this machine")
+    expect(row).to_be_hidden()
+
+    # The folder now exists on disk. Touch the destination once, like the
+    # native picker does — a single input event, no reload. This lands
+    # inside the refresh throttle window that started at page load, which
+    # is exactly the case where the one trigger must not be dropped: the
+    # refresh is deferred to the end of the window, not skipped.
+    state["present"] = True
+    page.locator("#destInput").dispatch_event("input")
+
+    expect(row).to_be_visible(timeout=10000)
+    expect(hint).to_be_hidden()
+    assert state["fetches"] >= 2
+
+
+def test_import_after_move_recovers_when_archive_root_is_corrected(
+    live_server, page,
+):
+    """The hint sends the user to Settings to fix a typo'd root. Doing so
+    in another tab must be picked up by the still-open Import page when
+    the user comes back to it — even for a legacy target whose id changes
+    when Settings re-saves it, and without touching the form again."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+    state = {
+        "id": "photo@nas.local:/volume1/Photography",
+        "root": "/Users/me/Pictures/Vireo_Archive",
+        "present": False,
+    }
+
+    def remote_targets(route):
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": [{
+                    "id": state["id"],
+                    "name": "Photo NAS",
+                    "user": "photo",
+                    "host": "nas.local",
+                    "remote_path": "/volume1/Photography",
+                    "mount_path": "/Volumes/Photography",
+                    "local_archive_root": state["root"],
+                    "local_archive_root_present": state["present"],
+                }],
+            }),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    hint = page.locator("#afterMoveUnavailable")
+    row = page.locator("#afterMoveRow")
+    expect(hint).to_contain_text("Vireo_Archive — does not exist on this machine")
+    expect(row).to_be_hidden()
+
+    # Let the refresh that the hint triggered settle on the unchanged list,
+    # so what follows is not riding on that first fetch.
+    page.wait_for_function("() => _afterMoveTargetsCheckedAt > 0")
+
+    # The user fixes the underscore in Settings (another tab). Settings
+    # re-saves the legacy entry under a generated id. They come back to
+    # this tab without touching the form.
+    state["id"] = "rt-9f3a"
+    state["root"] = "/Users/me/Pictures/Vireo Archive"
+    state["present"] = True
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+
+    expect(row).to_be_visible(timeout=10000)
+    expect(hint).to_be_hidden()
+    # The dropdown was rebuilt with the new id and the selection kept.
+    expect(page.locator("#destMode option")).to_have_count(2)
+    assert page.locator("#destMode").input_value() == "local"
+
+
+def test_import_after_move_refresh_recovers_failed_initial_target_load(
+    live_server, page,
+):
+    """If the initial /api/remote-targets request fails but a later
+    background refresh succeeds, that success is a full recovery: the
+    SSH destinations come back, the rsync/ssh availability flags are
+    applied (so picking one is not falsely blocked), and the load-error
+    banner clears."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+    state = {"calls": 0}
+
+    def remote_targets(route):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            route.fulfill(status=500, content_type="text/plain", body="boom")
+            return
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": [{
+                    "id": "nas1",
+                    "name": "Photo NAS",
+                    "user": "photo",
+                    "host": "nas.local",
+                    "remote_path": "/volume1/Photography",
+                    "mount_path": "/Volumes/Photography",
+                    "local_archive_root": "/Users/me/Pictures/Vireo Archive",
+                    "local_archive_root_present": True,
+                }],
+            }),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    banner = page.locator("#remoteTargetsError")
+    expect(banner).to_be_visible()
+    expect(page.locator("#destMode option")).to_have_count(1)
+
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    # The hint renders (no targets known), which triggers the background
+    # refresh; the deferred refresh succeeds and recovers everything.
+    expect(page.locator("#afterMoveRow")).to_be_visible(timeout=10000)
+    expect(banner).to_be_hidden()
+    expect(page.locator("#destMode option")).to_have_count(2)
+    assert page.evaluate("importRsyncAvailable && importSshAvailable")
+
+
+def test_import_after_move_drops_eligibility_when_root_changes_elsewhere(
+    live_server, page,
+):
+    """A target eligible at page load must stop being offered when its
+    archive root is changed in Settings (another tab) and the user comes
+    back — otherwise Start posts an id the server rejects against the new
+    root. The tab-return refresh applies even when the snapshot looks
+    eligible."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+    state = {"root": "/Users/me/Pictures/Vireo Archive"}
+
+    def remote_targets(route):
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": [{
+                    "id": "nas1",
+                    "name": "Photo NAS",
+                    "user": "photo",
+                    "host": "nas.local",
+                    "remote_path": "/volume1/Photography",
+                    "mount_path": "/Volumes/Photography",
+                    "local_archive_root": state["root"],
+                    "local_archive_root_present": True,
+                }],
+            }),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    hint = page.locator("#afterMoveUnavailable")
+    row = page.locator("#afterMoveRow")
+    expect(row).to_be_visible()
+    expect(hint).to_be_hidden()
+
+    # Root moved in Settings; user returns to this tab without editing.
+    state["root"] = "/Users/me/Pictures/Staging"
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+
+    expect(row).to_be_hidden(timeout=10000)
+    expect(hint).to_contain_text(
+        "the destination is outside the local archive root of "
+        "Photo NAS (/Users/me/Pictures/Staging)"
+    )
+
+
+def test_import_remote_selection_survives_target_refresh(live_server, page):
+    """A background refresh replaces the target list. A selected SSH
+    destination must follow its target across a legacy id change (matched
+    by user/host/remote_path), transfer-defining fields must be refreshed
+    even when the after-move gate fields did not change, and a target that
+    disappeared must fall back to Local *visibly*."""
+    url = live_server["url"]
+    state = {
+        "id": "photo@nas.local:/volume1/Photography",
+        "remote_path": "/volume1/Photography",
+        "targets": True,
+    }
+
+    def remote_targets(route):
+        targets = [] if not state["targets"] else [{
+            "id": state["id"],
+            "name": "Photo NAS",
+            "user": "photo",
+            "host": "nas.local",
+            "remote_path": state["remote_path"],
+            "mount_path": "/Volumes/Photography",
+            "local_archive_root": "",
+            "local_archive_root_present": None,
+        }]
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": targets,
+            }),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destMode").select_option("remote:" + state["id"])
+    page.locator("#remoteSubpath").fill("2026/kenya")
+    expect(page.locator("#remoteSubpathError")).to_be_hidden()
+
+    # Settings re-saved the legacy entry under a generated id; user, host
+    # and remote path are unchanged, so the match is unambiguous.
+    state["id"] = "rt-9f3a"
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+
+    expect(page.locator("#destMode")).to_have_value("remote:rt-9f3a", timeout=10000)
+    assert page.evaluate("resolvedCopyDestination()") == (
+        "/Volumes/Photography/2026/kenya"
+    )
+    expect(page.locator("#remoteTargetsError")).to_be_hidden()
+
+    # A field the after-move gate never reads changes under the same id:
+    # the page's copy must still be refreshed (Start posts only the id and
+    # the server will use the new value).
+    state["remote_path"] = "/volume1/Photos"
+    page.evaluate("() => { _afterMoveTargetsCheckedAt = 0; }")
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+    page.wait_for_function(
+        "() => importRemoteTargets[0].remote_path === '/volume1/Photos'",
+        timeout=10000,
+    )
+    expect(page.locator("#destMode")).to_have_value("remote:rt-9f3a")
+
+    # The selected target is replaced by a *different* one on the same
+    # host (deleted + re-added with another remote path): that is not a
+    # migration. Fall back to Local, and say so.
+    state["id"] = "rt-0000"
+    state["remote_path"] = "/volume1/Other"
+    page.evaluate("() => { _afterMoveTargetsCheckedAt = 0; }")
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+    expect(page.locator("#destMode")).to_have_value("local", timeout=10000)
+    banner = page.locator("#remoteTargetsError")
+    expect(banner).to_be_visible()
+    expect(banner).to_contain_text('"Photo NAS" is no longer configured')
+
+
+def test_import_after_move_target_pick_survives_refresh_or_unchecks(
+    live_server, page,
+):
+    """With several eligible targets and "Then move to NAS" checked, a
+    refresh that re-saves the picked target under a new id must keep the
+    pick (unambiguous match), and one that removes it must uncheck the box
+    with a note rather than silently move the post-processing move to a
+    different NAS."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+    state = {"nas2_id": "photo@backup.local:/volume1/Backup", "nas2": True}
+
+    def target(tid, name, host, remote_path, root):
+        return {
+            "id": tid, "name": name, "user": "photo", "host": host,
+            "remote_path": remote_path, "mount_path": "/Volumes/" + name,
+            "local_archive_root": root, "local_archive_root_present": True,
+        }
+
+    def remote_targets(route):
+        targets = [target("nas1", "Photo NAS", "nas.local",
+                          "/volume1/Photography", "/Users/me/Pictures")]
+        if state["nas2"]:
+            targets.append(target(state["nas2_id"], "Backup NAS", "backup.local",
+                                  "/volume1/Backup",
+                                  "/Users/me/Pictures/Vireo Archive"))
+        route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"rsync_available": True, "ssh_available": True,
+                             "targets": targets}),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    sel = page.locator("#afterMoveTarget")
+    chk = page.locator("#chkAfterMove")
+    expect(sel.locator("option")).to_have_count(2)
+    sel.select_option(state["nas2_id"])
+    chk.check()
+    expect(page.locator("#afterMovePreview")).to_contain_text("/volume1/Backup")
+
+    # Legacy id migration for the picked target: pick follows it.
+    state["nas2_id"] = "rt-b4ck"
+    page.evaluate("() => { _afterMoveTargetsCheckedAt = 0; }")
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+    expect(sel).to_have_value("rt-b4ck", timeout=10000)
+    expect(chk).to_be_checked()
+    expect(page.locator("#afterMovePreview")).to_contain_text("/volume1/Backup")
+
+    # The picked target is deleted: another eligible target remains, but
+    # the move must not silently retarget to it.
+    state["nas2"] = False
+    page.evaluate("() => { _afterMoveTargetsCheckedAt = 0; }")
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+    expect(chk).not_to_be_checked(timeout=10000)
+    note = page.locator("#afterMoveUnavailable")
+    # Visible, not merely present: the refresh re-renders twice and the
+    # second pass must not hide the only explanation of the state change.
+    expect(note).to_be_visible()
+    expect(note).to_contain_text(
+        '"Then move to NAS" was unchecked: Backup NAS is no longer available'
+    )
+    expect(page.locator("#afterMovePreview")).to_be_hidden()
+    assert page.evaluate("afterMoveRequest()") is None
+    # The note survives an unrelated re-render, and clears once the user
+    # re-checks the box (acknowledging it) — the remaining target is then
+    # offered normally.
+    page.locator("#destInput").dispatch_event("input")
+    expect(note).to_be_visible()
+    chk.check()
+    expect(note).to_be_hidden()
+    expect(sel).to_have_value("nas1")
+    expect(page.locator("#afterMovePreview")).to_contain_text("/volume1/Photography")
+
+
+def test_import_remote_selection_does_not_migrate_to_preexisting_twin(
+    live_server, page,
+):
+    """Two saved targets can share user/host/remote_path (different port or
+    key). Deleting the selected one must not hand the selection to its
+    pre-existing twin as if it were an id migration; a migration is a
+    *new* id replacing the old one."""
+    url = live_server["url"]
+    state = {"keep_a": True}
+
+    def target(tid, port):
+        return {
+            "id": tid, "name": "NAS " + tid, "user": "photo", "host": "nas.local",
+            "port": port, "remote_path": "/volume1/Photography",
+            "mount_path": "/Volumes/Photography",
+            "local_archive_root": "", "local_archive_root_present": None,
+        }
+
+    def remote_targets(route):
+        targets = ([target("a", 22)] if state["keep_a"] else []) + [target("b", 2222)]
+        route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"rsync_available": True, "ssh_available": True,
+                             "targets": targets}),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destMode").select_option("remote:a")
+    page.locator("#remoteSubpath").fill("2026/kenya")
+
+    state["keep_a"] = False
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+
+    expect(page.locator("#destMode")).to_have_value("local", timeout=10000)
+    banner = page.locator("#remoteTargetsError")
+    expect(banner).to_be_visible()
+    expect(banner).to_contain_text('"NAS a" is no longer configured')
+
+
+def test_import_slow_initial_target_load_does_not_overwrite_newer_refresh(
+    live_server, page,
+):
+    """The initial /api/remote-targets request and a background refresh
+    can be in flight together. If the target changed in between and the
+    older (initial) response lands last, it must be discarded rather than
+    overwrite the newer snapshot the page already applied."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+    state = {"calls": 0, "held": None}
+
+    def body(root):
+        return json.dumps({
+            "rsync_available": True,
+            "ssh_available": True,
+            "targets": [{
+                "id": "nas1", "name": "Photo NAS", "user": "photo",
+                "host": "nas.local", "remote_path": "/volume1/Photography",
+                "mount_path": "/Volumes/Photography",
+                "local_archive_root": root, "local_archive_root_present": True,
+            }],
+        })
+
+    def remote_targets(route):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            # Hold the initial load; it will be answered (stale) later.
+            state["held"] = route
+            return
+        route.fulfill(status=200, content_type="application/json",
+                      body=body("/Users/me/Pictures/Vireo Archive"))
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    # The hint (no targets known yet) triggers the refresh, which completes
+    # first with the current configuration.
+    expect(page.locator("#afterMoveRow")).to_be_visible(timeout=10000)
+    assert state["held"] is not None
+
+    # Now the delayed initial response arrives with the OLD root.
+    state["held"].fulfill(status=200, content_type="application/json",
+                          body=body("/Users/me/Pictures/Vireo_Archive"))
+    page.wait_for_timeout(700)
+
+    assert page.evaluate("importRemoteTargets[0].local_archive_root") == (
+        "/Users/me/Pictures/Vireo Archive"
+    )
+    expect(page.locator("#afterMoveRow")).to_be_visible()
+    expect(page.locator("#afterMoveUnavailable")).to_be_hidden()
+
+
+def test_import_after_move_destination_change_unchecks_instead_of_retargeting(
+    live_server, page,
+):
+    """No refresh at all: two targets share user/host/remote_path with
+    nested archive roots. The picked (inner) target stops being eligible
+    when the destination moves up a level. The pick must not slide to the
+    outer twin (same tuple, different port) — that is not a migration —
+    the box unchecks with a note."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+
+    def target(tid, port, root):
+        return {
+            "id": tid, "name": "NAS " + tid, "user": "photo", "host": "nas.local",
+            "port": port, "remote_path": "/volume1/Photography",
+            "mount_path": "/Volumes/Photography",
+            "local_archive_root": root, "local_archive_root_present": True,
+        }
+
+    def remote_targets(route):
+        route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"rsync_available": True, "ssh_available": True,
+                             "targets": [
+                                 target("outer", 22, "/Users/me/Pictures"),
+                                 target("inner", 2222, "/Users/me/Pictures/Vireo Archive"),
+                             ]}),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    sel = page.locator("#afterMoveTarget")
+    chk = page.locator("#chkAfterMove")
+    expect(sel.locator("option")).to_have_count(2)
+    sel.select_option("inner")
+    chk.check()
+
+    # Destination moves out of the inner root; only the outer twin remains.
+    page.locator("#destInput").fill("/Users/me/Pictures/2026")
+    expect(chk).not_to_be_checked()
+    note = page.locator("#afterMoveUnavailable")
+    expect(note).to_be_visible()
+    expect(note).to_contain_text(
+        '"Then move to NAS" was unchecked: NAS inner is no longer available'
+    )
+    assert page.evaluate("afterMoveRequest()") is None
+
+
 def test_import_new_workspace_shows_target_default_in_after_import_display(
     live_server, page
 ):

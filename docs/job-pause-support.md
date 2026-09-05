@@ -12,7 +12,7 @@ not a checkpoint that survives restarting the application.
 | --- | --- |
 | Prepare full resolution, generate previews, cache originals for offline use | Between photos |
 | Generate thumbnails, develop photos, extract subject masks | Between photos |
-| Export photos, export for iNaturalist, move selected photos | Between photos; active metadata subprocesses finish before a pause is confirmed |
+| Export photos, export for iNaturalist, move selected photos | Between photos and after export metadata finishes; active subprocesses finish before a pause is confirmed |
 | Verify photo hashes | Between files, after committing the completed batch prefix |
 | Adjust capture time | Between photos, after the metadata write and catalog update |
 | Scan for duplicates | Between duplicate groups |
@@ -21,7 +21,7 @@ not a checkpoint that survives restarting the application.
 | Regroup encounters and bursts | Between loading, grouping, and saving stages |
 | Verify installed models | Between models |
 | Fetch regional species labels | Between request progress updates |
-| Import and organize photos | Between files; combined imports also use the scanner's pause coordination |
+| Import and organize photos | During discovery, between metadata batches of at most 100 files, and between copies; combined imports also use the scanner's pause coordination |
 | Import Lightroom catalog keywords | Between photos, after committing completed keyword writes |
 | Verify abandoned import staging folders | Between files |
 | Scan memory cards, verify archive copies, delete verified card files | Between files or archive hash groups |

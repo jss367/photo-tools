@@ -2805,6 +2805,12 @@ function _saveConfigNow(gen) {
     // one here. Threading a fresh gen through inflight/ok/error keeps the
     // autosave pill honest when this call overlaps a debounced write.
     if (gen === undefined) gen = _nextSaveGen();
+    // Settings import is replacing the whole config; a direct flush would
+    // post the pre-import form over it. Refuse so the caller reports a
+    // failed save instead of the import being silently overwritten.
+    if (_autosaveSuspended) {
+      return Promise.reject(new Error('Settings import in progress; try again in a moment.'));
+    }
     return _serializedSave('config', function() { return _postConfigSnapshot(gen); });
 }
 

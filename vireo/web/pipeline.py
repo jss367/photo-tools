@@ -1864,7 +1864,7 @@ def create_pipeline_blueprint(
     @grouping_edit
     def api_pipeline_detach_photo():
         """Detach a photo from its burst, creating a new single-photo burst."""
-        from pipeline import load_results_raw, rebuild_species_predictions
+        from pipeline import load_results_raw
         from services.grouping_history import save_grouping_edit
 
         body = request.get_json(silent=True) or {}
@@ -1893,9 +1893,24 @@ def create_pipeline_blueprint(
         if burst_idx < 0 or burst_idx >= len(bursts):
             return json_error("Invalid burst_index")
 
-        burst = bursts[burst_idx]
-        if photo_id not in burst["photo_ids"]:
+        if photo_id not in bursts[burst_idx]["photo_ids"]:
             return json_error("photo_id not in burst")
+        detach_review_photo(results, enc_idx, burst_idx, photo_id)
+
+        save_grouping_edit(db, before, results, "Photo detached from burst")
+        return jsonify({"ok": True, "encounters": encounters, "summary": results["summary"]})
+
+    def detach_review_photo(results, enc_idx, burst_idx, photo_id):
+        """Apply a validated photo removal to a canonical pipeline snapshot."""
+        from pipeline import rebuild_species_predictions
+
+        encounters = results["encounters"]
+        enc = encounters[enc_idx]
+        bursts = enc["bursts"]
+        burst = bursts[burst_idx]
+        if isinstance(burst, list):
+            burst = {"photo_ids": burst}
+            bursts[burst_idx] = burst
         source_override = burst.get("species_override") or {}
 
         # Remove photo from burst
@@ -1947,21 +1962,67 @@ def create_pipeline_blueprint(
             e.get("burst_count", 0) for e in encounters
         )
 
-        save_grouping_edit(db, before, results, "Photo detached from burst")
-        return jsonify({"ok": True, "encounters": encounters, "summary": results["summary"]})
+    def sync_review_photo_flags(db, results, photo_ids):
+        """Refresh cached review labels from the authoritative database flags."""
+        from pipeline import refresh_serialized_summary
+
+        for photo in results.get("photos", []):
+            if photo["id"] not in photo_ids:
+                continue
+            row = db.get_photo(photo["id"])
+            if row is not None:
+                flag = row["flag"] or "none"
+                photo["flag"] = flag
+                photo["label"] = {"flagged": "KEEP", "rejected": "REJECT"}.get(flag, "REVIEW")
+        refresh_serialized_summary(results)
+
+    def review_decision_signature(encounters):
+        return [
+            (enc.get("photo_ids"), enc.get("confirmed_species"), bool(enc.get("species_confirmed")),
+             [(b.get("photo_ids"), b.get("species_override")) if isinstance(b, dict) else (b, None)
+              for b in enc.get("bursts", [])])
+            for enc in encounters
+        ]
 
     @blueprint.route("/api/pipeline/save-cache", methods=["POST"])
+    @grouping_edit
     def api_pipeline_save_cache():
-        """Save pipeline results back to cache (used by undo)."""
-        from pipeline import save_results_raw
+        """Refresh cached flags, or clear one burst override against its baseline.
+
+        Whole browser snapshots never replace server-owned groups or metadata.
+        Old snapshots are rejected before any write so a delayed request cannot
+        overwrite an undo or a grouping change in another window.
+        """
+        from pipeline import load_results_raw
+        from services.grouping_history import save_grouping_edit
 
         body = request.get_json(silent=True) or {}
-        if not isinstance(body.get("encounters"), list) or not isinstance(body.get("photos"), list):
-            return json_error("Invalid pipeline results structure")
         db = get_db()
         cache_dir = os.path.dirname(db_path)
-        save_results_raw(body, cache_dir, db._active_workspace_id)
-        return jsonify({"ok": True})
+        current = load_results_raw(cache_dir, db._ws_id())
+        if current is None:
+            return json_error("No pipeline results found", 404)
+        restored = copy.deepcopy(current)
+        clear = body.get("clear_override")
+        if clear is not None:
+            if not isinstance(clear, dict):
+                return json_error("Invalid burst label change")
+            enc = next((e for e in restored["encounters"]
+                        if e.get("photo_ids") == clear.get("encounter_photo_ids")), None)
+            burst = next((b for b in (enc or {}).get("bursts", [])
+                          if b.get("photo_ids") == clear.get("burst_photo_ids")), None)
+            if burst is None or burst.get("species_override") != clear.get("expected_override"):
+                return json_error("The burst label or grouping changed. Reload before applying.", 409)
+            burst["species_override"] = None
+            save_grouping_edit(db, current, restored, "Use encounter label for burst", label_edit=True)
+        else:
+            if not isinstance(body.get("encounters"), list) or not isinstance(body.get("photos"), list):
+                return json_error("Invalid pipeline results structure")
+            if review_decision_signature(body["encounters"]) != review_decision_signature(current["encounters"]):
+                return json_error("The photo groups changed. Reload before saving.", 409)
+            # All photo changes were already persisted by their narrow endpoints.
+            # This legacy acknowledgement never writes a browser snapshot.
+        return jsonify({"ok": True, "encounters": restored["encounters"], "summary": restored.get("summary", {})})
 
     @blueprint.route("/api/pipeline/group/state", methods=["POST"])
     def api_pipeline_group_state():
@@ -2026,16 +2087,20 @@ def create_pipeline_blueprint(
         return jsonify({"photos": photos, "species_kid": species_kid})
 
     @blueprint.route("/api/pipeline/group/apply", methods=["POST"])
+    @grouping_edit
     def api_pipeline_group_apply():
-        """Apply pick/reject/candidate flag decisions to a pipeline burst group.
+        """Apply flag decisions and photo removals as one history action.
 
-        Flags-only: species confirmation now routes through a dedicated path
+        Species confirmation routes through a dedicated path
         (`/api/encounters/species`), so this endpoint no longer tags any species
         keyword. Diff-based: only writes flag changes for photos whose flag
         actually changes, and clears flags on photos moved to candidates that
         were previously flagged/rejected. Returns per-photo new flag state so
         the client can update its rendered cards without reloading.
         """
+        from pipeline import load_results_raw, save_results_raw
+        from services.grouping_history import save_grouping_edit
+
         db = get_db()
         body = request.get_json(silent=True) or {}
         picks = list(body.get("picks", []) or [])
@@ -2054,6 +2119,31 @@ def create_pipeline_blueprint(
             if not db._photo_in_workspace(pid):
                 return json_error(f"Photo {pid} is not in the active workspace", 403)
 
+        results = load_results_raw(os.path.dirname(db_path), db._ws_id())
+        before = copy.deepcopy(results)
+        removed = body.get("removed", [])
+        if not isinstance(removed, list) or any(type(pid) is not int for pid in removed):
+            return json_error("Invalid removed photo IDs")
+        if len(set(removed)) != len(removed) or set(removed) & seen:
+            return json_error("Removed photos must not appear in another zone")
+        if removed:
+            enc_idx, burst_idx = body.get("encounter_index"), body.get("burst_index")
+            if (results is None or type(enc_idx) is not int or type(burst_idx) is not int
+                    or enc_idx < 0 or enc_idx >= len(results["encounters"])):
+                return json_error("The photo groups changed. Reload before applying.", 409)
+            enc = results["encounters"][enc_idx]
+            bursts = enc.get("bursts", [])
+            if burst_idx < 0 or burst_idx >= len(bursts):
+                return json_error("The photo groups changed. Reload before applying.", 409)
+            source = bursts[burst_idx]
+            ids = source["photo_ids"] if isinstance(source, dict) else source
+            if body.get("expected_burst_photo_ids") != ids or not set(removed) <= set(ids):
+                return json_error("The photo groups changed. Reload before applying.", 409)
+            for pid in removed:
+                if not db._photo_in_workspace(pid):
+                    return json_error(f"Photo {pid} is not in the active workspace", 403)
+                detach_review_photo(results, enc_idx, burst_idx, pid)
+
         # Capture current state for diffing + edit history.
         old_flags = {}
         for pid in picks + rejects + candidates:
@@ -2069,17 +2159,17 @@ def create_pipeline_blueprint(
             for pid in picks:
                 old = old_flags.get(pid, "none")
                 if old != "flagged":
-                    db.update_photo_flag(pid, "flagged")
+                    db.update_photo_flag(pid, "flagged", _commit=False)
                     flag_items.append({"photo_id": pid, "old_value": old, "new_value": "flagged"})
             for pid in rejects:
                 old = old_flags.get(pid, "none")
                 if old != "rejected":
-                    db.update_photo_flag(pid, "rejected")
+                    db.update_photo_flag(pid, "rejected", _commit=False)
                     flag_items.append({"photo_id": pid, "old_value": old, "new_value": "rejected"})
             for pid in candidates:
                 old = old_flags.get(pid, "none")
                 if old in ("flagged", "rejected"):
-                    db.update_photo_flag(pid, "none")
+                    db.update_photo_flag(pid, "none", _commit=False)
                     flag_items.append({"photo_id": pid, "old_value": old, "new_value": "none"})
         except ValueError as e:
             return json_error(str(e), 403)
@@ -2089,13 +2179,34 @@ def create_pipeline_blueprint(
                 db.queue_flag_change_if_enabled(
                     item["photo_id"], item["new_value"], _commit=False
                 )
-            db.conn.commit()
-            desc = (
-                f"Pipeline burst group: flagged {len(picks)}, rejected {len(rejects)}, "
-                f"cleared {sum(1 for it in flag_items if it['new_value'] == 'none')}"
+        desc = (
+            f"Pipeline burst group: flagged {len(picks)}, rejected {len(rejects)}, "
+            f"cleared {sum(1 for it in flag_items if it['new_value'] == 'none')}"
+        )
+        if results is not None:
+            sync_review_photo_flags(db, results, seen)
+        if removed:
+            save_grouping_edit(
+                db, before, results, desc + f", detached {len(removed)}",
+                photo_edit={"action_type": "flag", "new_value": "pipeline_group_apply"} if flag_items else None,
+                items=flag_items,
             )
-            db.record_edit("flag", desc, "pipeline_group_apply", flag_items,
-                           is_batch=len(flag_items) > 1)
+        else:
+            if flag_items:
+                db.record_edit("flag", desc, "pipeline_group_apply", flag_items,
+                               is_batch=len(flag_items) > 1, _commit=False)
+            saved = False
+            try:
+                if results is not None:
+                    save_results_raw(results, os.path.dirname(db_path), db._ws_id())
+                    saved = True
+                db.conn.commit()
+            except Exception:
+                db.conn.rollback()
+                if saved:
+                    save_results_raw(before, os.path.dirname(db_path), db._ws_id())
+                raise
+            db._prune_edit_history()
 
         # Return new per-photo state so the client can update without a reload.
         # `has_species_keyword` is kept in the payload (now always False) so the
@@ -2110,7 +2221,10 @@ def create_pipeline_blueprint(
                 "flag": row["flag"] or "none",
                 "has_species_keyword": False,
             }
-        return jsonify({"ok": True, "photos": result_photos})
+        response = {"ok": True, "photos": result_photos}
+        if results is not None:
+            response.update(encounters=results["encounters"], summary=results.get("summary", {}))
+        return jsonify(response)
 
     @blueprint.route("/api/pipeline/active-mask-variant", methods=["POST"])
     def api_pipeline_active_mask_variant():

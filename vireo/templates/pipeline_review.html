@@ -5143,13 +5143,21 @@ async function clearBurstOverride(event, encIdx, burstIdx) {
   }
   var enc = pipelineResults.encounters[encIdx];
   if (!enc || !enc.bursts || !enc.bursts[burstIdx]) return;
-  enc.bursts[burstIdx].species_override = null;
-  // Persist to cache
-  safeFetch('/api/pipeline/save-cache', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(pipelineResults),
-  });
+  var burst = enc.bursts[burstIdx];
+  try {
+    var response = await safeFetch('/api/pipeline/save-cache', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({clear_override: {
+        encounter_photo_ids: enc.photo_ids,
+        burst_photo_ids: burst.photo_ids,
+        expected_override: burst.species_override || null,
+      }}),
+    });
+    if (response.encounters) pipelineResults.encounters = response.encounters;
+    if (response.summary) pipelineResults.summary = response.summary;
+  } catch (_) { return; }
+
   renderResults();
   updateSummaryBar(refreshLocalSummaryCounts());
   refreshLatestScopeSnapshotIfCurrent();
@@ -8281,6 +8289,7 @@ async function grmApply() {
       // pipeline cache and the DB can't drift apart — the prior fire-and-forget
       // save-cache + no-DB-write was the bug behind this whole change.
       var applyResp;
+      var sourceBurst = ((pipelineResults.encounters[grmState.encIdx] || {}).bursts || [])[grmState.burstIdx];
       try {
         applyResp = await safeFetch('/api/pipeline/group/apply', {
           method: 'POST',
@@ -8289,6 +8298,14 @@ async function grmApply() {
             picks: picksArr,
             rejects: rejectsArr,
             candidates: candidatesArr,
+            removed: grmState.source === 'browse-selection' ? [] : Array.from(grmState.removed).filter(function(pid) {
+              return grmState.appliedRemovalSessionId !== applySessionId ||
+                !(grmState.appliedRemovalIds || []).includes(pid);
+            }),
+            encounter_index: grmState.encIdx,
+            burst_index: grmState.burstIdx,
+            expected_burst_photo_ids: grmState.source === 'browse-selection' ? [] :
+              (Array.isArray(sourceBurst) ? sourceBurst : sourceBurst?.photo_ids || []),
           }),
         });
       } catch (e) {
@@ -8377,85 +8394,16 @@ async function grmApply() {
       // its purpose, so drop it. A later reload degrades to normal review;
       // the in-memory group stays reopenable via the Reopen button.
       clearBrowseBurstHandoff();
-    } else if (grmState.removed.size > 0) {
-      // Detach removed photos from the burst into new single-photo bursts.
-      var enc = pipelineResults.encounters[grmState.encIdx];
-      var burst = enc.bursts[grmState.burstIdx];
-      var burstIds = burst.photo_ids || burst;
-      // Whether the source burst is the modern object shape (carries its own
-      // predictions) vs a legacy raw photo-id array (no predictions field).
-      var srcHasPreds = burst && Array.isArray(burst.species_predictions);
-      grmState.removed.forEach(function(pid) {
-        var idx = burstIds.indexOf(pid);
-        if (idx >= 0) burstIds.splice(idx, 1);
-        // New single-photo burst: rebuild its consensus from just this photo so it
-        // doesn't inherit the source burst's predictions for photos it no longer
-        // contains (the loupe and the saved cache both trust burst.species_predictions).
-        var photo = findPhotoInResults(pid);
-        // Preserve a burst-specific confirmed species: if the source burst had
-        // a species_override differing from the encounter default, the detached
-        // single-photo burst must keep it (shallow clone so it doesn't alias the
-        // source), or a flags-only apply would silently revert this photo to the
-        // encounter species and drop the burst-specific confirmation.
-        var detachedPhotos = photo ? [photo] : [];
-        var detachedConsensus = buildBurstConsensus(detachedPhotos);
-        var sourceOverride = burst && burst.species_override;
-        // Match the server detach-photo elif (vireo/app.py): fall through to
-        // a null override whenever the encounter tracks any confirmed_species,
-        // including the mixed/partial state (species_confirmed=false but
-        // confirmed_species set) where a classifier-guess override would
-        // mask the real prior tag for a later burst-confirm.
-        enc.bursts.push({
-          photo_ids: [pid],
-          species_predictions: detachedConsensus,
-          species_override: sourceOverride && sourceOverride.confirmed === true
-            ? Object.assign({}, sourceOverride)
-            : (enc.confirmed_species
-              ? null
-              : candidateSpeciesOverrideFromPhotos(detachedPhotos)),
-        });
-      });
-      // Recompute the shortened source burst's consensus from its remaining
-      // photos, so it no longer reflects the detached ones. Skip legacy array
-      // bursts (no predictions field to maintain).
-      if (srcHasPreds) {
-        burst.species_predictions = buildBurstConsensus(
-          burstIds.map(function(id) { return findPhotoInResults(id); }).filter(Boolean)
-        );
-      }
-      // Clean up empty burst
-      if (burstIds.length === 0) {
-        enc.bursts.splice(grmState.burstIdx, 1);
-      }
-      enc.burst_count = enc.bursts.length;
+    } else {
+      if (applyResp.encounters) pipelineResults.encounters = applyResp.encounters;
+      if (applyResp.summary) pipelineResults.summary = applyResp.summary;
+      grmState.appliedRemovalSessionId = applySessionId;
+      grmState.appliedRemovalIds = Array.from(grmState.removed);
     }
   }
 
-  // Save the updated pipeline cache (label + flag changes + detached bursts)
-  // BEFORE confirming species: /api/encounters/species reloads the cache from
-  // disk and validates photo_ids ⊆ bursts[burst_index], so the structure the
-  // user sees must be persisted first.
-  //
-  // Skip for browse-selection: pipelineResults there is a *temporary* ad-hoc
-  // selection set, not the real pipeline run, and save_results_raw would
-  // clobber the actual per-workspace cache. Its species path uses
-  // /api/batch/keyword (no cache read), so there is no ordering dependency.
-  //
-  // Also skip when flags weren't committed: the only local mutations to
-  // pipelineResults (label/flag sync + removed→detach) live under the
-  // checks.flags block above, so with flags unchecked there is nothing new to
-  // persist. The species-only path relies on the SERVER to save the cache —
-  // /api/encounters/species loads the on-disk cache and re-saves it itself
-  // (we adopt resp.encounters after) — so a local save-cache here would be a
-  // no-op write on the wire.
-    if (grmState.source !== 'browse-selection' && checks.flags) {
-      await safeFetch('/api/pipeline/save-cache', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(pipelineResults),
-      });
-      if (!sessionIsActive()) return false;
-    }
+  // Group Apply has already saved flags and removals from its canonical cache.
+  // Species confirmation below reads that committed structure.
 
   // --- Species side ---
   // Server-owned now: tag all remaining (non-removed) burst frames + mark the
@@ -8478,7 +8426,7 @@ async function grmApply() {
         // already committed idempotently above, so a retry re-runs only the
         // species side. No try/catch — propagating the throw is the desired
         // "keep modal open" behavior.
-        await grmConfirmSpeciesCall(species, memberIds);
+        if (memberIds.length) await grmConfirmSpeciesCall(species, memberIds);
         if (!sessionIsActive()) return false;
       }
     }

@@ -77,3 +77,28 @@ def test_first_lightbox_adjustment_enables_undo(live_server, page):
     expect(page.locator('#historyRedoBtn')).to_be_enabled()
     page.evaluate('doRedo()')
     expect(exposure).to_have_value('1')
+
+
+def test_pending_cache_save_blocks_undo(live_server, page):
+    photo_id = live_server['data']['photos'][0]
+    page.goto(live_server['url'] + '/browse')
+    page.evaluate('''async photoId => {
+      await fetch('/api/photos/' + photoId + '/flag', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({flag: 'rejected'})
+      });
+    }''', photo_id)
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    held = []
+    page.route('**/api/pipeline/save-cache', lambda route: held.append(route))
+    page.evaluate('''() => {
+      window.pendingCacheSave = fetch('/api/pipeline/save-cache', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'
+      }).catch(() => {});
+    }''')
+    expect(page.locator('#historyUndoBtn')).to_be_disabled()
+    page.evaluate('doUndo()')
+    assert live_server['db'].get_photo(photo_id)['flag'] == 'rejected'
+    held.pop().abort()
+    page.evaluate('window.pendingCacheSave')
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()

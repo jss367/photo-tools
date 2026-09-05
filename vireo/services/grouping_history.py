@@ -40,6 +40,7 @@ def _grouping_signature(encounters):
         }
         stripped["bursts"] = [
             {k: v for k, v in b.items() if k not in _CACHE_SPECIES_BURST_FIELDS}
+            if isinstance(b, dict) else {"photo_ids": b}
             for b in enc.get("bursts", [])
         ]
         signature.append(stripped)
@@ -48,11 +49,11 @@ def _grouping_signature(encounters):
 
 def _photo_ids_key(entry):
     """Stable dict key for the photo composition of an encounter or burst."""
-    ids = entry.get("photo_ids") if isinstance(entry, dict) else None
+    ids = entry.get("photo_ids") if isinstance(entry, dict) else entry
     return tuple(ids or ())
 
 
-def _preserve_cleared_species_overrides(target, current):
+def _preserve_cleared_species_overrides(target, current, expected):
     """Carry ``clearBurstOverride`` clears from current into the restored target.
 
     ``clearBurstOverride`` writes ``species_override = None`` straight through
@@ -69,6 +70,10 @@ def _preserve_cleared_species_overrides(target, current):
     (values that ``current`` shows explicitly as ``None``) get carried
     forward.
     """
+    expected_encs = {_photo_ids_key(e): e for e in expected or []}
+    expected_bursts = {
+        _photo_ids_key(b): b for e in expected or [] for b in e.get("bursts", []) if isinstance(b, dict)
+    }
     current_bursts = {}
     current_encs = {}
     for enc in current or []:
@@ -82,10 +87,13 @@ def _preserve_cleared_species_overrides(target, current):
         if not isinstance(enc, dict):
             continue
         cur_enc = current_encs.get(_photo_ids_key(enc))
+        expected_enc = expected_encs.get(_photo_ids_key(enc), {})
         if cur_enc is not None:
-            if "confirmed_species" in cur_enc and cur_enc.get("confirmed_species") is None:
+            if ("confirmed_species" in cur_enc and cur_enc.get("confirmed_species") is None
+                    and expected_enc.get("confirmed_species") is not None):
                 enc["confirmed_species"] = None
-            if "species_confirmed" in cur_enc and not cur_enc.get("species_confirmed"):
+            if ("species_confirmed" in cur_enc and not cur_enc.get("species_confirmed")
+                    and expected_enc.get("species_confirmed")):
                 enc["species_confirmed"] = False
         for b in enc.get("bursts", []) or []:
             if not isinstance(b, dict):
@@ -93,7 +101,8 @@ def _preserve_cleared_species_overrides(target, current):
             cur_burst = current_bursts.get(_photo_ids_key(b))
             if cur_burst is None:
                 continue
-            if "species_override" in cur_burst and cur_burst.get("species_override") is None:
+            if ("species_override" in cur_burst and cur_burst.get("species_override") is None
+                    and expected_bursts.get(_photo_ids_key(b), {}).get("species_override") is not None):
                 b["species_override"] = None
 
 
@@ -118,7 +127,7 @@ def _restored_summary(current_summary, encounters):
     return summary
 
 
-def save_grouping_edit(db, before, after, description):
+def save_grouping_edit(db, before, after, description, *, photo_edit=None, items=(), label_edit=False):
     """Save a detach and its history together, restoring the cache on failure.
 
     Callers hold the workspace regroup lock and SQLite writer transaction.
@@ -130,10 +139,13 @@ def save_grouping_edit(db, before, after, description):
     cache_dir = os.path.dirname(db._db_path)
     if before["encounters"] == after["encounters"]:
         return
+    change = {"before": before["encounters"], "after": after["encounters"]}
+    if label_edit:
+        change["label_edit"] = True
+    if photo_edit:
+        change["photo_edit"] = photo_edit
     db.record_edit(
-        "pipeline_grouping", description,
-        json.dumps({"before": before["encounters"], "after": after["encounters"]}),
-        [], _commit=False,
+        "pipeline_grouping", description, json.dumps(change), items, _commit=False,
     )
     saved = False
     try:
@@ -339,16 +351,18 @@ def restore_grouping_edit(db, entry, *, undo):
         change = json.loads(entry["new_value"])
         expected = change["after" if undo else "before"]
         target = change["before" if undo else "after"]
-        if current is None or _grouping_signature(current.get("encounters")) != _grouping_signature(expected):
+        signature = (lambda value: value) if change.get("label_edit") else _grouping_signature
+        if current is None or signature(current.get("encounters")) != signature(expected):
             raise GroupingHistoryStale(
                 "The photo groups have changed since this edit. "
                 "These groups cannot be restored without replacing newer work."
             )
         restored = copy.deepcopy(current)
         restored["encounters"] = copy.deepcopy(target)
-        _preserve_cleared_species_overrides(
-            restored["encounters"], current.get("encounters"),
-        )
+        if not change.get("label_edit"):
+            _preserve_cleared_species_overrides(
+                restored["encounters"], current.get("encounters"), expected,
+            )
         restored["summary"] = _restored_summary(
             current.get("summary"), restored["encounters"],
         )
@@ -367,3 +381,33 @@ def restore_grouping_edit(db, entry, *, undo):
             raise
     finally:
         lock.release()
+
+
+def apply_grouping_photo_edit(db, entry, items, *, undo):
+    """Replay the photo half of a grouping action without releasing its transaction."""
+    change = json.loads(entry["new_value"]).get("photo_edit")
+    if not change:
+        return
+    action = change["action_type"]
+    for item in items:
+        pid = item["photo_id"]
+        if action == "flag":
+            value = item["old_value" if undo else "new_value"]
+            db.update_photo_flag(pid, value, _commit=False)
+            db.queue_flag_change_if_enabled(pid, value, _commit=False)
+            continue
+        if action not in ("keyword_add", "species_replace"):
+            raise ValueError("Unsupported photo edit in grouping history")
+        old_ids = db._edit_old_value_meta(item["old_value"]).get("keyword_ids") or []
+        new_ids = [int(item["new_value"])] if item["new_value"] else []
+        remove_ids, add_ids = (new_ids, old_ids) if undo else (old_ids, new_ids)
+        for kid in remove_ids:
+            db.untag_photo(pid, kid, _commit=False)
+            name = db._keyword_name(kid)
+            if name and db.remove_pending_changes(pid, 'keyword_add', name, _commit=False) == 0:
+                db.queue_change(pid, 'keyword_remove', name, _commit=False)
+        for kid in add_ids:
+            db.tag_photo(pid, kid, source='manual', _commit=False)
+            name = db._keyword_name(kid)
+            if name and db.remove_pending_changes(pid, 'keyword_remove', name, _commit=False) == 0:
+                db.queue_change(pid, 'keyword_add', name, _commit=False)

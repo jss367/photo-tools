@@ -20958,11 +20958,13 @@ class Database:
             if entry['action_type'] == 'pipeline_grouping':
                 from services.grouping_history import (
                     GroupingHistoryStale,
+                    apply_grouping_photo_edit,
                     restore_grouping_edit,
                 )
 
                 try:
                     with restore_grouping_edit(self, entry, undo=True):
+                        apply_grouping_photo_edit(self, entry, items, undo=True)
                         self.conn.execute("UPDATE edit_history SET undone = 1 WHERE id = ?", (entry['id'],))
                         self.conn.commit()
                 except GroupingHistoryStale:
@@ -21018,11 +21020,13 @@ class Database:
             if entry['action_type'] == 'pipeline_grouping':
                 from services.grouping_history import (
                     GroupingHistoryStale,
+                    apply_grouping_photo_edit,
                     restore_grouping_edit,
                 )
 
                 try:
                     with restore_grouping_edit(self, entry, undo=False):
+                        apply_grouping_photo_edit(self, entry, items, undo=False)
                         self.conn.execute("UPDATE edit_history SET undone = 0 WHERE id = ?", (entry['id'],))
                         self.conn.commit()
                 except GroupingHistoryStale:
@@ -21067,6 +21071,18 @@ class Database:
         which would violate LIFO ordering. The caller commits together with
         the eventual undo/redo, or once no candidate remains.
         """
+        row = self.conn.execute(
+            "SELECT action_type, new_value FROM edit_history WHERE id = ?", (entry_id,),
+        ).fetchone()
+        if row and row['action_type'] == 'pipeline_grouping':
+            photo_edit = json.loads(row['new_value']).get('photo_edit')
+            if photo_edit:
+                # A recompute invalidates structure, not the recorded photo edit.
+                self.conn.execute(
+                    "UPDATE edit_history SET action_type = ?, new_value = ? WHERE id = ?",
+                    (photo_edit['action_type'], photo_edit['new_value'], entry_id),
+                )
+                return
         self.conn.execute("DELETE FROM edit_history WHERE id = ?", (entry_id,))
 
     # ------------------------------------------------------------------

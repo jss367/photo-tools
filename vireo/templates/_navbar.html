@@ -12298,7 +12298,7 @@ function formatDuration(seconds) {
     var url = input instanceof Request ? input.url : String(input);
     var method = (opts && opts.method) || (input instanceof Request ? input.method : 'GET');
     var mutation = /^(POST|PUT|PATCH|DELETE)$/i.test(method);
-    var historyWrite = mutation && /\/(rating|flag|color_label|keywords|edit-recipe|batch\/|predictions\/|culling\/|misses\/reject|highlights\/(confirm|relabel)|species\/label-cluster|encounters\/species|sync\/discard|pipeline\/(detach-|group\/apply)|photos\/\d+\/(wildlife_excluded|location))/.test(url);
+    var historyWrite = mutation && /\/(rating|flag|color_label|keywords|edit-recipe|batch\/|predictions\/|culling\/|misses\/reject|highlights\/(confirm|relabel)|species\/label-cluster|encounters\/species|sync\/discard|pipeline\/(detach-|group\/apply|save-cache)|photos\/\d+\/(wildlife_excluded|location))/.test(url);
     if (historyWrite && historyBusy) {
       var error = new Error('Undo or redo is still finishing — try again in a moment');
       error.code = 'history_busy';

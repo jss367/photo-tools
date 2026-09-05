@@ -26899,6 +26899,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     pid, species, workspace_id=ws_id, _commit=False,
                 )
 
+            photo_edit_id = None
             if is_replacement and had_old:
                 # Photos that actually changed: had the old keyword (so the
                 # remove side fired) and/or newly gained the new one. Use the
@@ -26922,7 +26923,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         "old_value": old_value,
                         "new_value": str(kid) if pid in newly_set else "",
                     })
-                db.record_edit(
+                photo_edit_id = db.record_edit(
                     "species_replace",
                     f'Replaced species "{previous_species}" with "{species}" on {len(changed)} photos',
                     str(kid),
@@ -26935,7 +26936,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     {"photo_id": pid, "old_value": "", "new_value": str(kid)}
                     for pid in newly_tagged
                 ]
-                db.record_edit(
+                photo_edit_id = db.record_edit(
                     "keyword_add",
                     f'Confirmed species "{species}" on {len(newly_tagged)} photos',
                     str(kid),
@@ -27034,18 +27035,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         auto_detach_burst_for_species(
                             cached, target_enc_idx, burst_index, species
                         )
-                        if cache_only_write:
-                            # One user action includes both confirmation and
-                            # splitting. Snapshot before either mutation and
-                            # commit its history with the common cache save.
+                        change = {
+                            "before": before_cached["encounters"],
+                            "after": cached["encounters"],
+                        }
+                        if photo_edit_id is not None:
+                            photo_edit = db.conn.execute(
+                                "SELECT action_type, new_value FROM edit_history WHERE id = ?",
+                                (photo_edit_id,),
+                            ).fetchone()
+                            change["photo_edit"] = dict(photo_edit)
+                            db.conn.execute(
+                                "UPDATE edit_history SET action_type = 'pipeline_grouping', new_value = ? WHERE id = ?",
+                                (json.dumps(change), photo_edit_id),
+                            )
+                        else:
                             db.record_edit(
                                 "pipeline_grouping",
                                 f'Confirmed species "{species}" on 1 burst',
-                                json.dumps({
-                                    "before": before_cached["encounters"],
-                                    "after": cached["encounters"],
-                                }),
-                                [], _commit=False,
+                                json.dumps(change), [], _commit=False,
                             )
                 else:
                     target_enc["species_confirmed"] = True
@@ -27057,7 +27065,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         except Exception:
             db.conn.rollback()
             if cache_saved:
-                save_results_raw(before_cached, cache_dir, db._active_workspace_id)
+                try:
+                    save_results_raw(before_cached, cache_dir, db._active_workspace_id)
+                except Exception:
+                    log.exception("Failed to restore pipeline cache after species confirmation failed")
             raise
         # Prune oldest edit-history rows now that the transaction has landed.
         db._prune_edit_history()

@@ -486,7 +486,7 @@ def test_confirm_history_preserves_cleared_override(app_and_db, undo_before_clea
         cleared['encounters'][0]['bursts'][0]['species_override'] = None
     else:
         cleared['encounters'][0].update(confirmed_species=None, species_confirmed=False)
-    assert client.post('/api/pipeline/save-cache', json=cleared).status_code == 200
+    save_results_raw(cleared, os.path.dirname(db._db_path), db._ws_id())
     cleared = _load(db)
 
     # A superseded confirmation is retired, never made redoable by a no-op undo.
@@ -564,3 +564,123 @@ def test_species_confirmation_restores_cache_on_commit_failure(
     assert {pid: db.get_photo_keywords(pid) for pid in ids} == keywords_before
     assert [dict(row) for row in db.conn.execute('SELECT * FROM pending_changes')] == pending_before
     assert client.post('/api/encounters/species', json=payload).status_code == 200
+
+
+@pytest.mark.parametrize('replacement', [False, True])
+def test_keyword_changing_auto_detach_is_one_atomic_history_action(app_and_db, replacement):
+    app, db = app_and_db
+    client = app.test_client()
+    ids, before = _seed(db)
+    before['encounters'][0].update(confirmed_species='Sparrow', species_confirmed=True)
+    if replacement:
+        old_kid = db.add_keyword('Sparrow', is_species=True)
+        for pid in ids[:2]:
+            db.tag_photo(pid, old_kid)
+    save_results_raw(before, os.path.dirname(db._db_path), db._ws_id())
+    keywords_before = {pid: [row["id"] for row in db.get_photo_keywords(pid)] for pid in ids}
+    assert client.post('/api/encounters/species', json={
+        'species': 'Cardinal', 'photo_ids': ids[:2], 'burst_index': 0,
+    }).status_code == 200
+    after = _load(db)
+    keywords_after = {pid: [row["id"] for row in db.get_photo_keywords(pid)] for pid in ids}
+    assert len(after['encounters']) == 2
+    assert client.get('/api/undo/status').json['count'] == 1
+    assert client.post('/api/undo').status_code == 200
+    assert _load(db)['encounters'] == before['encounters']
+    assert {pid: [row["id"] for row in db.get_photo_keywords(pid)] for pid in ids} == keywords_before
+    assert client.post('/api/redo').status_code == 200
+    assert _load(db)['encounters'] == after['encounters']
+    assert {pid: [row["id"] for row in db.get_photo_keywords(pid)] for pid in ids} == keywords_after
+
+
+@pytest.mark.parametrize('change_flags', [False, True])
+def test_group_review_removal_and_flags_share_one_history_action(app_and_db, change_flags):
+    app, db = app_and_db
+    client = app.test_client()
+    ids, before = _seed(db)
+    payload = {
+        'picks': [ids[0]] if change_flags else [], 'rejects': [],
+        'candidates': [] if change_flags else [ids[0]], 'removed': [ids[1]],
+        'encounter_index': 0, 'burst_index': 0, 'expected_burst_photo_ids': ids[:2],
+    }
+    response = client.post('/api/pipeline/group/apply', json=payload)
+    assert response.status_code == 200, response.json
+    after = _load(db)
+    assert after['encounters'][0]['burst_count'] == 3
+    assert client.get('/api/undo/status').json['count'] == 1
+    assert client.post('/api/undo').status_code == 200
+    assert _load(db)['encounters'] == before['encounters']
+    assert db.get_photo(ids[0])['flag'] == 'none'
+    assert client.post('/api/redo').status_code == 200
+    assert _load(db)['encounters'] == after['encounters']
+    assert db.get_photo(ids[0])['flag'] == ('flagged' if change_flags else 'none')
+
+
+def test_delayed_cache_snapshot_cannot_overwrite_undo(app_and_db):
+    app, db = app_and_db
+    client = app.test_client()
+    _seed(db)
+    _detach(client)
+    delayed = _load(db)
+    assert client.post('/api/undo').status_code == 200
+    restored = _load(db)
+    assert client.post('/api/pipeline/save-cache', json=delayed).status_code == 409
+    assert _load(db) == restored
+    assert client.get('/api/redo/status').json['available'] is True
+
+
+def test_override_clear_is_checked_and_undoable(app_and_db):
+    app, db = app_and_db
+    client = app.test_client()
+    ids, before = _seed(db)
+    override = {'species': 'Cardinal', 'confirmed': True}
+    before['encounters'][0]['bursts'][0]['species_override'] = override
+    save_results_raw(before, os.path.dirname(db._db_path), db._ws_id())
+    payload = {'clear_override': {
+        'encounter_photo_ids': ids, 'burst_photo_ids': ids[:2], 'expected_override': override,
+    }}
+    assert client.post('/api/pipeline/save-cache', json=payload).status_code == 200
+    assert _load(db)['encounters'][0]['bursts'][0]['species_override'] is None
+    assert client.post('/api/pipeline/save-cache', json=payload).status_code == 409
+    assert client.post('/api/undo').status_code == 200
+    assert _load(db)['encounters'] == before['encounters']
+    assert client.post('/api/redo').status_code == 200
+    assert _load(db)['encounters'][0]['bursts'][0]['species_override'] is None
+
+
+@pytest.mark.parametrize('undo', [False, True])
+def test_combined_history_failure_rolls_back_photos_and_cache(app_and_db, monkeypatch, undo):
+    from services import grouping_history
+
+    app, db = app_and_db
+    client = app.test_client()
+    ids, before = _seed(db)
+    before['encounters'][0].update(confirmed_species='Sparrow', species_confirmed=True)
+    before['encounters'][0]['bursts'][0]['species_override'] = None
+    save_results_raw(before, os.path.dirname(db._db_path), db._ws_id())
+    assert client.post('/api/encounters/species', json={
+        'species': 'Cardinal', 'photo_ids': ids[:2], 'burst_index': 0,
+    }).status_code == 200
+    if not undo:
+        assert client.post('/api/undo').status_code == 200
+    cache_before = _load(db)
+    keywords_before = {pid: list(db.get_photo_keywords(pid)) for pid in ids}
+    pending_before = list(db.conn.execute('SELECT * FROM pending_changes'))
+    history_before = list(db.conn.execute('SELECT * FROM edit_history'))
+    apply = grouping_history.apply_grouping_photo_edit
+
+    def fail_after_photo_write(*args, **kwargs):
+        apply(*args, **kwargs)
+        raise OSError('Database write failed')
+
+    route = '/api/undo' if undo else '/api/redo'
+    with monkeypatch.context() as patch:
+        patch.setattr(grouping_history, 'apply_grouping_photo_edit', fail_after_photo_write)
+        assert client.post(route).status_code == 500
+    assert _load(db) == cache_before
+    assert {pid: list(db.get_photo_keywords(pid)) for pid in ids} == keywords_before
+    assert list(db.conn.execute('SELECT * FROM pending_changes')) == pending_before
+    assert list(db.conn.execute('SELECT * FROM edit_history')) == history_before
+    assert client.post(route).status_code == 200
+    if not undo:
+        assert _load(db)['encounters'][-1]['bursts'][0]['species_override']['confirmed'] is True

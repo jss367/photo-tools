@@ -2894,3 +2894,23 @@ def test_undo_refreshes_open_lightbox_flag(live_server, page):
     page.keyboard.press('Meta+z')
     expect(page.locator('#lightboxFlagBtn')).to_have_attribute('aria-pressed', 'false')
     assert db.get_photo(ids[0])['flag'] == 'none'
+
+
+def test_group_review_removal_is_undoable_without_a_flag_change(live_server, page):
+    ids = live_server['data']['photos'][:4]
+    _write_grouped_pipeline_cache(live_server, ids)
+    page.goto(live_server['url'] + '/pipeline/review')
+    expect(page.locator('.photo-card[data-photo-id]')).to_have_count(4)
+    page.evaluate('openGroupReview(0, 0)')
+    page.wait_for_function('grmState.seeded === true')
+    page.evaluate('(pid) => grmRemoveFromGroup([pid])', ids[1])
+    page.locator('#grmConfirmSpeciesChk').uncheck()
+    page.locator('#grmApplyFlagsChk').check()
+    page.evaluate('grmApply()')
+    expect(page.locator('#grmOverlay')).not_to_have_class(re.compile(r'\bopen\b'))
+    expect(page.get_by_test_id('reject-burst')).to_have_count(3)
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    page.locator('#historyUndoBtn').click()
+    expect(page.get_by_test_id('reject-burst')).to_have_count(2)
+    page.locator('#historyRedoBtn').click()
+    expect(page.get_by_test_id('reject-burst')).to_have_count(3)

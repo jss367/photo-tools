@@ -817,3 +817,135 @@ def test_ingest_pauses_between_metadata_batches(
     finally:
         release.set()
         runner.cancel_job(job_id)
+
+
+def test_snapshot_backed_import_in_place_is_not_pausable(app_and_db, tmp_path):
+    """Snapshot-backed in-place imports serialize on a shared per-snapshot
+    lock for the entire worker call. Pausing inside that critical section
+    would sleep while holding the lock, so a queued second import for the
+    same snapshot would block on the bare lock acquisition and could not
+    reach any runner checkpoint — cancelling it would be a no-op until the
+    first import resumed. Confirm this mode advertises pausable=False; the
+    plain in-place import (no snapshot) stays pausable.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    runner = app._job_runner
+
+    plain_source = tmp_path / "plain"
+    plain_source.mkdir()
+    Image.new("RGB", (8, 8), "green").save(plain_source / "plain.jpg")
+    plain_resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(plain_source)],
+        "after_import": None,
+    })
+    assert plain_resp.status_code == 200, plain_resp.get_json()
+    plain_job_id = plain_resp.get_json()["job_id"]
+    wait_for_job_via_client(client, plain_job_id)
+    assert runner.get(plain_job_id).get("pausable") is True
+
+    snap_root = tmp_path / "snap"
+    snap_root.mkdir()
+    frozen = snap_root / "frozen.jpg"
+    Image.new("RGB", (8, 8), "red").save(frozen)
+    db.add_folder(str(snap_root), name="snap")
+    snap_id = db.create_new_images_snapshot([str(frozen)])
+    snap_resp = client.post("/api/jobs/import-in-place", json={
+        "source_snapshot_id": snap_id,
+        "after_import": None,
+    })
+    assert snap_resp.status_code == 200, snap_resp.get_json()
+    snap_job_id = snap_resp.get_json()["job_id"]
+    wait_for_job_via_client(client, snap_job_id)
+    assert runner.get(snap_job_id).get("pausable") is False
+
+
+def test_import_photos_checkpoints_before_after_import_chain(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A Pause requested between run_import_job's last checkpoint and the
+    after-import chain must be observed. Without tags/GPS,
+    ``_apply_import_tags`` returns without probing the runner, so a cancel
+    that lands during that pause would otherwise still let
+    ``_chain_after_import`` create the import collection and enqueue the
+    child Process job. The pre-chain checkpoint sleeps through the pause and
+    sees the cancellation, so no collection is created.
+    """
+    import import_job
+
+    app, db = app_and_db
+    client = app.test_client()
+    runner = app._job_runner
+
+    folder = tmp_path / "archive"
+    folder.mkdir()
+    photo_path = folder / "landed.jpg"
+    Image.new("RGB", (8, 8), "red").save(photo_path)
+    folder_id = db.add_folder(str(folder), name="archive")
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="landed.jpg", extension=".jpg",
+        file_size=os.path.getsize(photo_path),
+        file_mtime=os.path.getmtime(photo_path),
+        width=8, height=8,
+    )
+    previous_collections = db.conn.execute(
+        "SELECT COUNT(*) FROM collections",
+    ).fetchone()[0]
+    cull_ready_id = next(
+        pr["id"] for pr in db.get_saved_processes()
+        if pr["name"] == "Cull-ready"
+    )
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def fake_run_import_job(job, runner_arg, db_path_arg, workspace_id, params):
+        # Park at run_import_job's own pause-safe boundary. The main thread
+        # requests pause here so that when this fake returns, ``_apply_import_tags``
+        # (with no tags configured) does not probe the runner and the new
+        # pre-chain checkpoint is the first place the pause is observed.
+        entered.set()
+        assert release.wait(5)
+        return {
+            "ok": True,
+            "photo_ids": [photo_id],
+            "discovered": 1,
+            "copied": 0,
+            "skipped_duplicate": 0,
+            "failed": 0,
+            "total": 1,
+            "safe_to_format": True,
+        }
+
+    monkeypatch.setattr(import_job, "run_import_job", fake_run_import_job)
+
+    card = tmp_path / "card"
+    card.mkdir()
+    Image.new("RGB", (8, 8), "blue").save(card / "src.jpg")
+    resp = client.post("/api/jobs/import-photos", json={
+        "sources": [str(card)],
+        "destination": str(folder),
+        "after_import": cull_ready_id,
+        "trust_likely_duplicates": True,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job_id = resp.get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM collections",
+        ).fetchone()[0] == previous_collections
+        assert runner.cancel_job(job_id)
+        finished = wait_for_job_via_client(client, job_id)
+        assert finished["status"] == "cancelled", finished
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM collections",
+        ).fetchone()[0] == previous_collections
+        assert finished["result"]["after_import_skipped"] == "import cancelled"
+        assert "process_job_id" not in finished["result"]
+    finally:
+        release.set()
+        runner.cancel_job(job_id)

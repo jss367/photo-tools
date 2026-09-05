@@ -3438,9 +3438,17 @@ def create_imports_blueprint(
             "workspace_id": active_ws,
             "created_workspace": created_workspace,
         }
+        # Snapshot-backed imports serialize on ``snapshot_import_lock`` for
+        # the entire worker call. Pausing inside that critical section would
+        # sleep while holding the shared lock, so a queued second import for
+        # the same snapshot would block on the bare lock acquisition and
+        # could not reach any runner checkpoint — cancelling it would have
+        # no effect until the first import resumed. Keep this mode
+        # non-pausable while the lock is in play; other in-place imports
+        # remain pausable.
         job_id = runner.start(
             "import-in-place", work, config=job_config, workspace_id=active_ws,
-            pausable=True,
+            pausable=snapshot_import_lock is None,
         )
         response = {"job_id": job_id}
         if created_workspace is not None:
@@ -4341,6 +4349,20 @@ def create_imports_blueprint(
                     active_ws, result.get("photo_ids") or [], import_tags,
                     location_from_gps, result, job=job, runner=runner,
                 )
+                # Honor pauses before launching the after-import chain.
+                # ``_apply_import_tags`` returns without probing the runner
+                # when neither tags nor GPS locations are requested (the
+                # common case), so a Pause arriving after
+                # ``run_import_job``'s last checkpoint would otherwise let
+                # ``_chain_after_import`` create the import collection and
+                # enqueue the child Process job while this parent shows
+                # ``pausing`` — cancelling the paused parent would not
+                # cancel that child. ``runner.is_cancelled`` sleeps through
+                # a live pause request and reports cancellation on wake, so
+                # ``_chain_after_import`` sees the same
+                # ``result["cancelled"]`` gate it uses everywhere else.
+                if runner.is_cancelled(job["id"]):
+                    result["cancelled"] = True
                 _chain_after_import(job, result)
                 return result
             finally:

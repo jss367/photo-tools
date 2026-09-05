@@ -17547,6 +17547,70 @@ def test_remote_target_test_reports_rejected_archive_root(
         assert "not valid" in res["message"]
 
 
+class _OfflineGate:
+    """Stand-in for volume_reachability.get_shared(): every path is on an
+    unreachable mount. Records what was asked so a test can assert the
+    filesystem was never touched for it."""
+    def __init__(self):
+        self.asked = []
+
+    def check(self, path):
+        self.asked.append(path)
+        return "/Volumes/Archive", False
+
+
+def test_remote_target_test_reports_unreachable_archive_root_volume(
+    app_and_db, monkeypatch,
+):
+    """A root on a stale SMB/NFS share must not be os.path.isdir'd (that
+    can hang a worker); the bounded reachability gate answers first and
+    the result says the volume is unreachable rather than guessing."""
+    import volume_reachability
+    app, _ = app_and_db
+    _fake_remote_probe(monkeypatch)
+    gate = _OfflineGate()
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+    calls = []
+    real_isdir = os.path.isdir
+    monkeypatch.setattr(os.path, "isdir",
+                        lambda p: calls.append(p) or real_isdir(p))
+    resp = app.test_client().post(
+        "/api/remote-targets/test",
+        json=_remote_target_body(local_archive_root="/Volumes/Archive/staging"))
+    res = resp.get_json()
+    assert res["ok"] is True
+    assert res["archive_root_volume_offline"] is True
+    assert res["archive_root_present"] is None
+    assert res["message"].startswith("Connection OK, but the volume")
+    assert "/Volumes/Archive/staging" in res["message"]
+    assert "/Volumes/Archive/staging" in gate.asked
+    assert "/Volumes/Archive/staging" not in calls
+    # The mount path goes through the same gate.
+    assert "/Volumes/Photos" in gate.asked
+    assert "/Volumes/Photos" not in calls
+    assert res["mount_present"] is False
+
+
+def test_remote_targets_list_reports_unreachable_archive_root_volume(
+    app_and_db, monkeypatch,
+):
+    import config as cfg
+    import move
+    import volume_reachability
+    app, _ = app_and_db
+    monkeypatch.setattr(move, "resolve_rsync_bin", lambda _: "/usr/bin/rsync")
+    monkeypatch.setattr(move, "is_gnu_rsync", lambda _: True)
+    monkeypatch.setattr(move, "resolve_ssh_bin", lambda _: "/usr/bin/ssh")
+    gate = _OfflineGate()
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: gate)
+    cfg.save({"remote_targets": [
+        _remote_target_body(id="a", local_archive_root="/Volumes/Archive/staging"),
+    ]})
+    t = app.test_client().get("/api/remote-targets").get_json()["targets"][0]
+    assert t["local_archive_root_present"] is None
+    assert t["local_archive_root_volume_offline"] is True
+
+
 def test_remote_targets_list_reports_archive_root_presence(
     app_and_db, monkeypatch, tmp_path,
 ):
@@ -17572,6 +17636,8 @@ def test_remote_targets_list_reports_archive_root_presence(
     assert by_id["a"]["local_archive_root_present"] is True
     assert by_id["b"]["local_archive_root_present"] is False
     assert by_id["c"]["local_archive_root_present"] is None
+    assert all(v["local_archive_root_volume_offline"] is False
+               for v in by_id.values())
 
 
 def test_import_page_after_move_hint_names_the_archive_root(app_and_db):
@@ -17584,6 +17650,7 @@ def test_import_page_after_move_hint_names_the_archive_root(app_and_db):
     assert "does not exist on this machine" in html
     assert "the destination is outside the local archive root of" in html
     assert "local_archive_root_present === false" in html
+    assert "volume not reachable right now" in html
     # The old destination-blaming wording is gone.
     assert "the destination is not inside any remote" not in html
 
@@ -17595,6 +17662,7 @@ def test_settings_page_test_connection_warns_on_missing_archive_root(
     html = app.test_client().get("/settings").data.decode()
     assert "archive_root_present === false" in html
     assert "res.archive_root_invalid" in html
+    assert "res.archive_root_volume_offline" in html
     assert "Create folder" in html
 
 
@@ -17609,6 +17677,7 @@ def test_import_page_after_move_eligibility_requires_existing_root(
     start = html.index("function afterMoveEligibleTargets()")
     body = html[start:html.index("}", start)]
     assert "t.local_archive_root_present !== false" in body
+    assert "!t.local_archive_root_volume_offline" in body
     # Targets are re-fetched (throttled) whenever the unavailable hint
     # renders and merged whole, so creating the folder or correcting the
     # root in Settings mid-session does not require a reload.

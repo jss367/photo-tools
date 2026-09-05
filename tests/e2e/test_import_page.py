@@ -2496,6 +2496,23 @@ def test_import_after_move_hint_blames_the_right_field(live_server, page):
     expect(hint).to_be_hidden()
     expect(row).to_be_visible()
 
+    # The root's volume dropped (external drive / share): the server could
+    # not probe it, so the gate says so instead of guessing.
+    page.evaluate(
+        """
+        () => {
+          importRemoteTargets[0].local_archive_root_present = null;
+          importRemoteTargets[0].local_archive_root_volume_offline = true;
+          updateAfterMoveUI();
+        }
+        """
+    )
+    expect(hint).to_contain_text(
+        "the volume holding the local archive root for Photo NAS "
+        "(/Users/me/Pictures/Vireo Archive — volume not reachable right now)"
+    )
+    expect(row).to_be_hidden()
+
 
 def test_import_after_move_recovers_when_archive_root_is_created(
     live_server, page,

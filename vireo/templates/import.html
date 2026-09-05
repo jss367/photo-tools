@@ -1723,6 +1723,7 @@ function afterMoveEligibleTargets() {
   return importRemoteTargets.filter(
     (t) => t.local_archive_root
       && t.local_archive_root_present !== false
+      && !t.local_archive_root_volume_offline
       && afterMovePathInsideRoot(destination, t.local_archive_root));
 }
 
@@ -1745,8 +1746,17 @@ function afterMoveUnavailableReason(destination) {
     return 'no remote target has a local archive root configured. ';
   }
   const describe = (t) => t.name + ' (' + t.local_archive_root
-    + (t.local_archive_root_present === false ? ' — does not exist on this machine' : '')
+    + (t.local_archive_root_volume_offline ? ' — volume not reachable right now'
+      : t.local_archive_root_present === false ? ' — does not exist on this machine' : '')
     + ')';
+  const offlineHere = configured.filter(
+    (t) => t.local_archive_root_volume_offline
+      && afterMovePathInsideRoot(destination, t.local_archive_root));
+  if (offlineHere.length) {
+    return 'the volume holding the local archive root for '
+      + offlineHere.map(describe).join(', ') + '. Reconnect it, or change '
+      + 'the root under Settings › Remote targets. ';
+  }
   const missingHere = configured.filter(
     (t) => t.local_archive_root_present === false
       && afterMovePathInsideRoot(destination, t.local_archive_root));
@@ -1774,7 +1784,8 @@ let _afterMoveTargetsTimer = null;
 let _afterMoveTargetsRerun = false;
 const AFTER_MOVE_TARGETS_TTL_MS = 5000;
 function afterMoveTargetKey(t) {
-  return JSON.stringify([t.id, t.name, t.local_archive_root, t.local_archive_root_present]);
+  return JSON.stringify([t.id, t.name, t.local_archive_root,
+    t.local_archive_root_present, !!t.local_archive_root_volume_offline]);
 }
 function refreshAfterMoveTargets() {
   if (_afterMoveTargetsRefresh) {

@@ -24682,13 +24682,32 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             result["preview"] = preview_merge(folder["path"], resolved)
         return jsonify(result)
 
-    def _archive_root_present(target):
-        """None when the target has no ``local_archive_root`` configured,
-        else whether that directory currently exists on this machine."""
+    def _archive_root_state(target):
+        """``(present, volume_offline)`` for the target's local archive root.
+
+        ``present`` is None when no root is configured or when it cannot be
+        determined, else whether the directory exists. ``volume_offline`` is
+        True when the root sits on a mount-shaped volume that failed the
+        bounded reachability probe. The filesystem is only touched after
+        that probe passes: a plain ``os.path.isdir`` on a stale SMB/NFS
+        share can block a Flask worker indefinitely, and this runs on
+        every ``/api/remote-targets`` call (page loads and the Import
+        page's after-move refresh), so one dead root must not be able to
+        hang the endpoint. Ordinary local folders have no mount-shaped
+        prefix and skip the probe entirely.
+        """
+        import volume_reachability
+
         root = (target.get("local_archive_root") or "").strip()
         if not root:
-            return None
-        return os.path.isdir(root)
+            return None, False
+        _, reachable = volume_reachability.get_shared().check(root)
+        if not reachable:
+            return None, True
+        return os.path.isdir(root), False
+
+    def _archive_root_present(target):
+        return _archive_root_state(target)[0]
 
     @app.route("/api/remote-targets")
     def api_remote_targets_list():
@@ -24705,7 +24724,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             effective_cfg.get("ssh_bin", "") or "")
         targets = cfg.get_remote_targets()
         for t in targets:
-            t["local_archive_root_present"] = _archive_root_present(t)
+            present, offline = _archive_root_state(t)
+            t["local_archive_root_present"] = present
+            t["local_archive_root_volume_offline"] = offline
         return jsonify({
             "targets": targets,
             "rsync_available": usable,
@@ -24748,9 +24769,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             effective_cfg.get("ssh_bin", "") or "")
         target["ssh_bin"] = ssh_bin
         res = move_mod.test_remote_connection(target, rsync_bin)
+        import volume_reachability
+
         mount = target.get("mount_path")
         res["mount_path"] = mount
-        res["mount_present"] = bool(mount and os.path.isdir(mount))
+        # Same bounded gate as the archive root: the mount is the NAS share
+        # itself, the most likely path to be stale, so probe before isdir.
+        res["mount_present"] = bool(
+            mount and volume_reachability.get_shared().check(mount)[1]
+            and os.path.isdir(mount))
         # _coerce_remote_target blanks an invalid archive root (relative,
         # or inside mount_path) rather than rejecting the target, and the
         # save path does the same. Compare against what was actually
@@ -24761,11 +24788,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         archive_root_invalid = bool(submitted_root and not archive_root)
         res["archive_root"] = (archive_root or submitted_root) or None
         res["archive_root_invalid"] = archive_root_invalid
-        res["archive_root_present"] = (
-            False if archive_root_invalid else _archive_root_present(target))
+        if archive_root_invalid:
+            present, volume_offline = False, False
+        else:
+            present, volume_offline = _archive_root_state(target)
+        res["archive_root_present"] = present
+        res["archive_root_volume_offline"] = volume_offline
         res["rsync_bin"] = rsync_bin or None
         res["ssh_bin"] = ssh_bin
-        if res.get("ok") and archive_root_invalid:
+        if res.get("ok") and volume_offline:
+            res["message"] = (
+                f"Connection OK, but the volume holding the local archive "
+                f"root '{archive_root}' is not reachable right now, so "
+                f"whether the folder exists can't be checked. The Import "
+                f"page won't offer \"Then move to NAS\" for this target "
+                f"until it is.")
+        elif res.get("ok") and archive_root_invalid:
             res["message"] = (
                 f"Connection OK, but the local archive root "
                 f"'{submitted_root}' is not valid: it must be an absolute "

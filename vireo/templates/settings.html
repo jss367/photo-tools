@@ -1760,15 +1760,17 @@ async function testRemoteTarget(i, btn, statusEl) {
     // the one-line fix inline, since the folder is the user's own staging
     // area and creating it is always safe.
     var archiveRootInvalid = !!(res.ok && res.archive_root_invalid);
-    var archiveRootMissing = !!(res.ok && !archiveRootInvalid && res.archive_root
-      && res.archive_root_present === false);
-    var archiveRootProblem = archiveRootInvalid || archiveRootMissing;
+    var archiveRootOffline = !!(res.ok && res.archive_root_volume_offline);
+    var archiveRootMissing = !!(res.ok && !archiveRootInvalid && !archiveRootOffline
+      && res.archive_root && res.archive_root_present === false);
+    var archiveRootProblem = archiveRootInvalid || archiveRootOffline || archiveRootMissing;
     statusEl.textContent = (res.ok && !archiveRootProblem ? '✓ ' : '⚠ ') + (res.message || '')
       + (res.mount_path && !res.mount_present
           ? ' (mount path not currently present — fine if the NAS just isn’t mounted right now.)' : '');
     statusEl.style.color = res.ok && !archiveRootProblem ? 'var(--success, #4caf50)' : 'var(--warning)';
     // Only a missing-but-valid root can be fixed by creating it; an invalid
-    // one needs the path changed.
+    // one needs the path changed, and an unreachable volume needs
+    // reconnecting (creating a folder on it would hang or fail).
     if (archiveRootMissing) {
       statusEl.appendChild(document.createTextNode(' '));
       var mk = document.createElement('button');

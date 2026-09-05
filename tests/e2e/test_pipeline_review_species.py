@@ -326,6 +326,13 @@ def test_predictionless_pipeline_encounter_can_add_species(live_server, page):
     ).fetchall()
     assert {r["id"] for r in rows} == set(photo_ids)
 
+    page.locator('#historyUndoBtn').click()
+    expect(species_name).to_have_text('Add species')
+    page.locator('#historyRedoBtn').click()
+    expect(species_name).to_have_text('Yellow-breasted Chat')
+    page.reload()
+    expect(species_name).to_have_text('Yellow-breasted Chat')
+
 
 def test_pipeline_review_encounter_time_range_includes_capture_date(
     live_server, page

@@ -27050,17 +27050,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             "before": before_cached["encounters"],
                             "after": cached["encounters"],
                         }
-                        if photo_edit_id is not None:
-                            photo_edit = db.conn.execute(
-                                "SELECT action_type, new_value FROM edit_history WHERE id = ?",
-                                (photo_edit_id,),
-                            ).fetchone()
-                            change["photo_edit"] = dict(photo_edit)
-                            db.conn.execute(
-                                "UPDATE edit_history SET action_type = 'pipeline_grouping', new_value = ? WHERE id = ?",
-                                (json.dumps(change), photo_edit_id),
-                            )
-                        else:
+                        if photo_edit_id is None:
                             db.record_edit(
                                 "pipeline_grouping",
                                 f'Confirmed species "{species}" on 1 burst',
@@ -27069,6 +27059,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 else:
                     target_enc["species_confirmed"] = True
                     target_enc["confirmed_species"] = species
+                if photo_edit_id is not None and before_cached["encounters"] != cached["encounters"]:
+                    # Labels and confirmation counts are part of the same user
+                    # action even when no burst moves to another encounter.
+                    photo_edit = db.conn.execute(
+                        "SELECT action_type, new_value FROM edit_history WHERE id = ?",
+                        (photo_edit_id,),
+                    ).fetchone()
+                    change = {
+                        "before": before_cached["encounters"],
+                        "after": cached["encounters"],
+                        "photo_edit": dict(photo_edit),
+                    }
+                    db.conn.execute(
+                        "UPDATE edit_history SET action_type = 'pipeline_grouping', new_value = ? WHERE id = ?",
+                        (json.dumps(change), photo_edit_id),
+                    )
                 save_results_raw(cached, cache_dir, db._active_workspace_id)
                 cache_saved = True
 

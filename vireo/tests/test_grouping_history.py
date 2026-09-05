@@ -767,3 +767,37 @@ def test_stale_combined_photo_history_retains_writer_lock(app_and_db, monkeypatc
     assert response.status_code == 200
     assert checked == [True]
     assert _load(db) == newer
+
+
+@pytest.mark.parametrize('burst', [False, True])
+@pytest.mark.parametrize('replacement', [False, True])
+def test_species_confirmation_without_split_restores_labels_and_keywords(app_and_db, burst, replacement):
+    app, db = app_and_db
+    client = app.test_client()
+    ids, before = _seed(db)
+    before['encounters'][0]['bursts'] = [{'photo_ids': ids, 'species_override': None}]
+    before['encounters'][0]['burst_count'] = 1
+    if replacement:
+        kid = db.add_keyword('Sparrow', is_species=True)
+        for pid in ids:
+            db.tag_photo(pid, kid)
+        before['encounters'][0].update(confirmed_species='Sparrow', species_confirmed=True)
+    save_results_raw(before, os.path.dirname(db._db_path), db._ws_id())
+    before = _load(db)
+    keywords_before = {pid: [k['id'] for k in db.get_photo_keywords(pid)] for pid in ids}
+    payload = {'species': 'Cardinal', 'photo_ids': ids}
+    if burst:
+        payload['burst_index'] = 0
+    assert client.post('/api/encounters/species', json=payload).status_code == 200
+    after = _load(db)
+    assert len(after['encounters']) == 1
+    keywords_after = {pid: [k['id'] for k in db.get_photo_keywords(pid)] for pid in ids}
+    assert client.get('/api/undo/status').json['count'] == 1
+    assert client.post('/api/undo').status_code == 200
+    assert _load(db)['encounters'] == before['encounters']
+    restored = client.get('/api/pipeline/page-init').json['results']
+    assert restored['summary']['confirmed_count'] == before['summary']['confirmed_count']
+    assert {pid: [k['id'] for k in db.get_photo_keywords(pid)] for pid in ids} == keywords_before
+    assert client.post('/api/redo').status_code == 200
+    assert _load(db)['encounters'] == after['encounters']
+    assert {pid: [k['id'] for k in db.get_photo_keywords(pid)] for pid in ids} == keywords_after

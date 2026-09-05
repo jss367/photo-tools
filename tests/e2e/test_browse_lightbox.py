@@ -2242,6 +2242,12 @@ def test_browse_lightbox_resumes_warmups_after_source_failure(
             entry => entry.sourceKey === 'original' && entry.status === 'loading'
         )"""
     )
+    # Chromium serves a repeated <img> URL straight from the renderer's
+    # in-memory image cache without any network request, so re-requesting the
+    # /full tier the lightbox opened with would never reach the route (and so
+    # could never fail). Stamp a fresh edit version on the photo so the tier
+    # under test is genuinely fetched, as it is after an edit or cache eviction.
+    page.evaluate("_lbEditVersionByPhoto[String(_lightboxCurrentId)] = 'retry'")
     failure_enabled = True
     target = "/full" if failed_tier == "full" else f"size={failed_tier}"
     with page.expect_request(lambda request: target in request.url and "prefetch=1" not in request.url):

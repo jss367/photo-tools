@@ -24,8 +24,11 @@ from photo_payload import (
     attach_species_representatives,
 )
 from pipeline_results import (
+    build_species_override,
+    burst_species_list,
     candidate_species_override,
     compute_time_range,
+    empty_species_override,
     rebuild_encounter_species_label,
 )
 from runtime_warnings import build_cpu_runtime_warning, runtime_warning_work_units
@@ -1531,8 +1534,12 @@ def create_pipeline_blueprint(
             flag = row["flag"] or "none"
             photo["flag"] = flag
             photo["rating"] = row["rating"] or 0
-            names = species.get(photo["id"], [])
+            names = [n for n in species.get(photo["id"], []) if n]
             photo["confirmed_species"] = names[0] if names else None
+            # The list is what Rapid Review reads first (photoSpeciesList),
+            # so a stale one would keep showing a removed second species
+            # and mis-derive "Mixed species" after an edit, undo, or redo.
+            photo["confirmed_species_list"] = list(names)
 
     @blueprint.route("/api/pipeline/results")
     def api_pipeline_results():
@@ -1686,7 +1693,7 @@ def create_pipeline_blueprint(
             if writes_cache:
                 save_results(results, cache_dir, db._active_workspace_id)
 
-        serialized = serialize_results(results)
+        serialized = serialize_results(results, prior_results=existing)
         attach_nested_edit_recipes(db, serialized)
         return jsonify(serialized)
 
@@ -1774,7 +1781,7 @@ def create_pipeline_blueprint(
             if writes_cache:
                 save_results(results, cache_dir, db._active_workspace_id)
 
-        serialized = serialize_results(results)
+        serialized = serialize_results(results, prior_results=existing)
         attach_nested_edit_recipes(db, serialized)
         return jsonify(serialized)
 
@@ -1856,9 +1863,13 @@ def create_pipeline_blueprint(
         detached["species_predictions"] = new_enc_predictions
         detached_override = detached.get("species_override") or {}
         detached_confirmed = bool(detached_override.get("confirmed"))
+        # The burst's own list (confirmed, mixed-but-edited, or empty); a
+        # candidate override contributes nothing.
+        detached_list = burst_species_list({}, detached)
         new_enc = {
             "species": new_enc_species,
-            "confirmed_species": detached_override.get("species") if detached_confirmed else None,
+            "confirmed_species": detached_list[0] if detached_list else None,
+            "confirmed_species_list": detached_list,
             "species_predictions": new_enc_predictions,
             "species_confirmed": detached_confirmed,
             "photo_count": len(detached_ids),
@@ -1949,11 +1960,33 @@ def create_pipeline_blueprint(
         # Create new single-photo burst in the same encounter
         new_burst_predictions = rebuild_species_predictions(results, [photo_id])
         new_burst_species = rebuild_encounter_species_label(results, [photo_id])
-        if source_override.get("confirmed") and source_override.get("species"):
-            new_burst_override = {
-                "species": source_override["species"],
-                "confirmed": True,
-            }
+        source_list = (
+            source_override.get("species_list")
+            if isinstance(source_override, dict) else None
+        )
+        source_has_authoritative_list = isinstance(source_list, list)
+        source_legacy_confirmed = bool(
+            source_override.get("confirmed") and source_override.get("species")
+        )
+        if source_has_authoritative_list or source_legacy_confirmed:
+            # Copy the source burst's authoritative set — including the
+            # explicit-empty sentinel a remove leaves behind AND the
+            # mixed-but-edited shape ({confirmed: False, species_list: [A]})
+            # a set edit leaves on a still-mixed burst. Every array-valued
+            # species_list is authoritative (burst_species_list), so a null
+            # override on the split-off photo would let it inherit the
+            # encounter's stale baseline and resurrect a species this edit
+            # already dropped.
+            copied_list = burst_species_list({}, burst)
+            if copied_list:
+                # Preserve the source's confirmed flag: True for a genuinely
+                # confirmed burst, False for a mixed-but-edited baseline.
+                new_burst_override = build_species_override(
+                    copied_list,
+                    confirmed=bool(source_override.get("confirmed")),
+                )
+            else:
+                new_burst_override = empty_species_override()
         elif enc.get("confirmed_species"):
             # Inherit the encounter's prior confirmed species by leaving the
             # override empty. Also covers the mixed/partial state where
@@ -2055,17 +2088,27 @@ def create_pipeline_blueprint(
         in pipelineResults) and show whether each photo already has the
         consensus species keyword applied.
 
-        Body: {photo_ids: [int], species: str}
+        Body: {photo_ids: [int], species: str, species_list: [str]}
         Returns: {photos: {pid: {flag, has_species_keyword,
+                  has_species_keywords: {name: bool},
                   is_species_representative}}, species_kid: int|None}
+
+        ``species_list`` covers multi-species bursts: every listed name is
+        resolved independently and reported per photo in
+        ``has_species_keywords``. ``species`` (single) keeps feeding the
+        legacy ``has_species_keyword`` flag and the representative badge.
         """
         db = get_db()
         body = request.get_json(silent=True) or {}
         photo_ids = list(body.get("photo_ids", []) or [])
         species = (body.get("species") or "").strip()
+        species_list = [
+            str(name).strip()
+            for name in (body.get("species_list") or [])
+            if str(name).strip()
+        ]
 
-        species_kid = None
-        if species:
+        def _species_kid(name):
             # Read-only mirror of the species-aware lookup in db.add_keyword(
             # species, is_species=True): match top-level taxonomy/general rows
             # case-insensitively, prefer taxonomy. Excludes homonym rows of
@@ -2076,10 +2119,12 @@ def create_pipeline_blueprint(
                 "SELECT id FROM keywords WHERE name = ? COLLATE NOCASE "
                 "AND parent_id IS NULL AND type IN ('taxonomy', 'general') "
                 "ORDER BY (type = 'taxonomy') DESC, id ASC LIMIT 1",
-                (species,),
+                (name,),
             ).fetchone()
-            if row:
-                species_kid = row["id"]
+            return row["id"] if row else None
+
+        species_kid = _species_kid(species) if species else None
+        list_kids = {name: _species_kid(name) for name in species_list}
 
         # Gate the badge on the same eligibility rules the shared payload
         # attachers use, so a stale preference row (photo later rejected or
@@ -2097,11 +2142,19 @@ def create_pipeline_blueprint(
             if not row:
                 continue
             has_kw = False
-            if species_kid is not None:
-                has_kw = any(k["id"] == species_kid for k in db.get_photo_keywords(pid))
+            has_kws = {}
+            if species_kid is not None or list_kids:
+                attached = {k["id"] for k in db.get_photo_keywords(pid)}
+                if species_kid is not None:
+                    has_kw = species_kid in attached
+                has_kws = {
+                    name: (kid is not None and kid in attached)
+                    for name, kid in list_kids.items()
+                }
             photos[pid] = {
                 "flag": row["flag"] or "none",
                 "has_species_keyword": has_kw,
+                "has_species_keywords": has_kws,
                 "is_species_representative": bool(
                     species and representatives.get(species) == pid
                 ),

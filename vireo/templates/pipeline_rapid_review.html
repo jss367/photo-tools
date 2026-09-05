@@ -606,8 +606,8 @@
           </div>
         </div>
         <div class="species-field">
-          <label for="speciesInput">Species keyword for picks</label>
-          <input id="speciesInput" type="text" oninput="rapidOnSpeciesInput()">
+          <label for="speciesInput">Species keywords (comma-separated for two subjects)</label>
+          <input id="speciesInput" type="text" placeholder="Green-winged Teal, American Wigeon" oninput="rapidOnSpeciesInput()">
         </div>
         <div class="decision-grid">
           <button class="decision-btn pick" onclick="decideCurrent('pick')" title="Pick and advance">Pick</button>
@@ -806,17 +806,150 @@ function burstIds(burst) {
   return (burst && burst.photo_ids) ? burst.photo_ids : (burst || []);
 }
 
-function burstSpecies(enc, burst) {
-  if (burst && burst.species_override && burst.species_override.species) {
-    return burst.species_override.species;
+// -- Multi-species helpers --
+//
+// A burst can hold two confirmed species (two subjects in frame). The cache
+// keeps the legacy single-valued fields (confirmed_species,
+// species_override.species) as the primary and adds list-valued siblings
+// (confirmed_species_list, species_override.species_list). The species field
+// edits the whole set: comma-separated names, compared case-insensitively.
+
+// Identity key for comparing species names. Mirrors the backend's
+// keyword_match_key: whitespace-collapsed and ASCII-only case folded, the
+// same equivalence SQLite's NOCASE gives add_keyword(). A Unicode-aware
+// toLowerCase() would merge names the database keeps distinct (Éclair vs
+// éclair) and make a replace/remove skip the tag it should drop.
+function speciesKey(name) {
+  return (name || '').trim().replace(/\s+/g, ' ').replace(/[A-Z]/g, function(ch) {
+    return ch.toLowerCase();
+  });
+}
+
+// Split the field into names. Names are separated by commas or semicolons;
+// a name that itself contains a delimiter or a quote is written in double
+// quotes, CSV style ("" inside quotes is a literal quote). joinSpecies()
+// produces exactly this encoding, so a stored keyword such as
+// `Mallard, domestic` round-trips through the field untouched.
+function parseSpeciesList(text) {
+  var out = [];
+  var seen = {};
+  var parts = [];
+  var buf = '';
+  var quoted = false;
+  var str = text || '';
+  for (var i = 0; i < str.length; i++) {
+    var ch = str[i];
+    if (quoted) {
+      if (ch === '"') {
+        if (str[i + 1] === '"') { buf += '"'; i++; }
+        else quoted = false;
+      } else {
+        buf += ch;
+      }
+    } else if (ch === '"') {
+      quoted = true;
+    } else if (ch === ',' || ch === ';') {
+      parts.push(buf);
+      buf = '';
+    } else {
+      buf += ch;
+    }
   }
-  if (enc && enc.confirmed_species) return enc.confirmed_species;
-  if (enc && enc.species && enc.species.length) return enc.species[0];
-  return '';
+  parts.push(buf);
+  parts.forEach(function(part) {
+    var name = part.trim();
+    if (!name) return;
+    var key = speciesKey(name);
+    if (seen[key]) return;
+    seen[key] = true;
+    out.push(name);
+  });
+  return out;
+}
+
+function quoteSpeciesName(name) {
+  if (/[,;"]/.test(name)) return '"' + name.replace(/"/g, '""') + '"';
+  return name;
+}
+
+function joinSpecies(list) {
+  return (list || []).map(quoteSpeciesName).join(', ');
+}
+
+function sameSpeciesSet(a, b) {
+  if (a.length !== b.length) return false;
+  var keys = {};
+  a.forEach(function(name) { keys[speciesKey(name)] = true; });
+  return b.every(function(name) { return !!keys[speciesKey(name)]; });
+}
+
+function overrideSpeciesList(ovr) {
+  if (!ovr) return [];
+  if (Array.isArray(ovr.species_list)) return ovr.species_list.filter(Boolean);
+  return ovr.species ? [ovr.species] : [];
+}
+
+// An override speaks for the burst's confirmed set only when it is
+// confirmed, or when it is the explicit-empty sentinel a remove leaves
+// behind ({confirmed: false, species_list: []}). A detach-time candidate
+// ({confirmed: false, species: guess}) is a display hint: it must never
+// outrank the encounter's confirmed species, or a flag-only apply would
+// "replace" the encounter species with the guess. Mirrors the backend's
+// burst_species_list() and applyCurrent()'s alreadyConfirmedList.
+function overrideIsExplicit(ovr) {
+  if (!ovr) return false;
+  // A species_list array is authoritative whatever the confirmed flag:
+  // confirmed (uniform frames), unconfirmed (a mixed burst after an edit —
+  // its edited baseline, not the encounter's stale list, is what it holds)
+  // or empty (the sentinel a remove leaves). Only the legacy shape without
+  // the array is a detach-time candidate guess.
+  if (Array.isArray(ovr.species_list)) return true;
+  return ovr.confirmed === true && !!ovr.species;
+}
+
+function encounterConfirmedList(enc) {
+  if (!enc) return [];
+  if (Array.isArray(enc.confirmed_species_list)) return enc.confirmed_species_list.filter(Boolean);
+  return enc.confirmed_species ? [enc.confirmed_species] : [];
+}
+
+function burstSpeciesList(enc, burst) {
+  var ovr = burst && burst.species_override;
+  if (overrideIsExplicit(ovr)) return overrideSpeciesList(ovr);
+  var confirmed = encounterConfirmedList(enc);
+  if (confirmed.length) return confirmed;
+  // Nothing confirmed anywhere: an unconfirmed candidate override is still
+  // the best prefill hint, ahead of the encounter's predicted label.
+  var candidate = overrideSpeciesList(ovr);
+  if (candidate.length) return candidate;
+  if (enc && enc.species && enc.species.length && enc.species[0]) return [enc.species[0]];
+  return [];
+}
+
+function burstSpecies(enc, burst) {
+  return joinSpecies(burstSpeciesList(enc, burst));
 }
 
 function hasBurstSpeciesOverride(burst) {
-  return !!(burst && burst.species_override && burst.species_override.species);
+  return overrideIsExplicit(burst && burst.species_override);
+}
+
+// Find the burst that still holds every one of `ids` after the server
+// returned a (possibly restructured) encounter list. A replace can
+// auto-detach the burst into another encounter, shifting burst indices, so
+// each follow-up species request must target the burst's new position.
+function locateBurstByPhotoIds(encounters, ids) {
+  for (var e = 0; e < (encounters || []).length; e++) {
+    var enc = encounters[e];
+    var bursts = enc.bursts && enc.bursts.length ? enc.bursts : [{ photo_ids: enc.photo_ids || [] }];
+    for (var b = 0; b < bursts.length; b++) {
+      var members = new Set(burstIds(bursts[b]));
+      if (ids.length && ids.every(function(id) { return members.has(id); })) {
+        return { encIdx: e, burstIdx: b };
+      }
+    }
+  }
+  return null;
 }
 
 function buildSessions(results) {
@@ -832,6 +965,7 @@ function buildSessions(results) {
         burstIdx: burstIdx,
         ids: ids,
         species: burstSpecies(enc, burst),
+        speciesList: burstSpeciesList(enc, burst),
         hasBurstOverride: hasBurstSpeciesOverride(burst),
         title: 'Encounter ' + (encIdx + 1) + ', Burst ' + (burstIdx + 1),
         subtitle: ids.length + ' photos' + (burstSpecies(enc, burst) ? ' - ' + burstSpecies(enc, burst) : ''),
@@ -849,12 +983,18 @@ function photoFlag(p) {
   return (p && p.flag) || 'none';
 }
 
+function photoSpeciesList(p) {
+  if (!p) return [];
+  if (Array.isArray(p.confirmed_species_list)) return p.confirmed_species_list.filter(Boolean);
+  return p.confirmed_species ? [p.confirmed_species] : [];
+}
+
 function photoSpecies(p) {
-  return (p && p.confirmed_species) || '';
+  return joinSpecies(photoSpeciesList(p));
 }
 
 function photoHasSpecies(p) {
-  return !!photoSpecies(p);
+  return photoSpeciesList(p).length > 0;
 }
 
 function sessionPhotos(session) {
@@ -870,10 +1010,12 @@ function queueIncludedPhotos(session) {
 }
 
 function hasMixedSpecies(session) {
+  // Frames disagree when their confirmed species *sets* differ; a frame
+  // holding both a teal and a wigeon is not "mixed" with an identical frame.
   var seen = {};
   queueIncludedPhotos(session).forEach(function(p) {
-    var species = photoSpecies(p);
-    if (species) seen[species.toLowerCase()] = true;
+    var key = photoSpeciesList(p).map(speciesKey).sort().join('|');
+    if (key) seen[key] = true;
   });
   return Object.keys(seen).length > 1;
 }
@@ -1236,7 +1378,8 @@ async function openSession(index) {
   rapid.touched = new Set();
   rapid.initialFlags = {};
   rapid.initialSpeciesKeywords = {};
-  rapid.keywordStateSpecies = session.species || '';
+  var sessionSpeciesList = parseSpeciesList(session.species || '');
+  rapid.keywordStateSpecies = joinSpecies(sessionSpeciesList);
   rapid.initialSpecies = session.species || '';
   rapid.history = [];
   rapid.currentIndex = rapid.items.length ? 0 : -1;
@@ -1254,7 +1397,11 @@ async function openSession(index) {
     var data = await safeFetch('/api/pipeline/group/state', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ photo_ids: session.ids, species: session.species || '' }),
+      body: JSON.stringify({
+        photo_ids: session.ids,
+        species: sessionSpeciesList[0] || '',
+        species_list: sessionSpeciesList,
+      }),
     });
     // Drop the response if the user has switched bursts since this fetch
     // started — seeding burst A's DB state into burst B's queue would
@@ -1265,7 +1412,7 @@ async function openSession(index) {
       var st = photos[p.id] || {};
       var flag = st.flag || p.flag || 'none';
       rapid.initialFlags[p.id] = flag;
-      rapid.initialSpeciesKeywords[p.id] = !!st.has_species_keyword;
+      rapid.initialSpeciesKeywords[p.id] = rapidKeywordStateFor(st, sessionSpeciesList);
       if (flag === 'flagged') rapid.picks.add(p.id);
       else if (flag === 'rejected') rapid.rejects.add(p.id);
     });
@@ -1647,10 +1794,36 @@ function rapidOnSpeciesInput() {
   _rapidSpeciesRefetchTimer = setTimeout(rapidRefreshSpeciesKeywordState, 250);
 }
 
+// Per-frame keyword presence for each species in `speciesList`, keyed by
+// speciesKey. Prefers the per-name map from /group/state; falls back to the
+// legacy single has_species_keyword flag for every name.
+function rapidKeywordStateFor(st, speciesList) {
+  var map = {};
+  var perName = (st && st.has_species_keywords) || null;
+  speciesList.forEach(function(name) {
+    if (perName) {
+      // A name the server did not report on is simply not attached.
+      map[speciesKey(name)] = !!perName[name];
+    } else {
+      map[speciesKey(name)] = !!(st && st.has_species_keyword);
+    }
+  });
+  return map;
+}
+
+// True when the seeded keyword snapshot covers `targetList` and says frame
+// `pid` already carries `name`. A snapshot fetched for a different list is
+// treated as "missing" so the Apply label stays a conservative overestimate.
+function rapidFrameHasKeyword(pid, name, targetList) {
+  if (rapid.keywordStateSpecies !== joinSpecies(targetList)) return false;
+  var st = rapid.initialSpeciesKeywords[pid];
+  return !!(st && st[speciesKey(name)]);
+}
+
 function rapidRefreshSpeciesKeywordState() {
   if (!rapid.items || !rapid.items.length || rapid.sessionIndex < 0) return;
   var speciesEl = document.getElementById('speciesInput');
-  var species = speciesEl ? (speciesEl.value || '').trim() : '';
+  var speciesList = parseSpeciesList(speciesEl ? speciesEl.value : '');
   var token = ++_rapidSpeciesRefetchToken;
   var openToken = rapid.openToken;
   var sessionIndex = rapid.sessionIndex;
@@ -1659,16 +1832,20 @@ function rapidRefreshSpeciesKeywordState() {
   safeFetch('/api/pipeline/group/state', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ photo_ids: photoIds, species: species }),
+    body: JSON.stringify({
+      photo_ids: photoIds,
+      species: speciesList[0] || '',
+      species_list: speciesList,
+    }),
   }, { toast: false }).then(function(data) {
     if (token !== _rapidSpeciesRefetchToken) return;
     if (rapid.openToken !== openToken || rapid.sessionIndex !== sessionIndex) return;
     var fresh = (data && data.photos) || {};
     photoIds.forEach(function(pid) {
       var row = fresh[pid] || fresh[String(pid)] || {};
-      rapid.initialSpeciesKeywords[pid] = !!row.has_species_keyword;
+      rapid.initialSpeciesKeywords[pid] = rapidKeywordStateFor(row, speciesList);
     });
-    rapid.keywordStateSpecies = species;
+    rapid.keywordStateSpecies = joinSpecies(speciesList);
     renderApplyState();
   }).catch(function() {
     // Keep the previous keyword snapshot. If the typed species differs from
@@ -1680,16 +1857,41 @@ function rapidPlural(n, one, many) {
   return n === 1 ? one : (many || one + 's');
 }
 
+// Set difference between the burst's confirmed species and the typed list.
+// An empty field never removes anything: clearing the input is treated as
+// "no species work", not "strip every species", so an accidental clear can't
+// untag a burst.
+function rapidSpeciesSetDiff(targetList, currentList) {
+  var currentKeys = {};
+  currentList.forEach(function(name) { currentKeys[speciesKey(name)] = true; });
+  var targetKeys = {};
+  targetList.forEach(function(name) { targetKeys[speciesKey(name)] = true; });
+  if (!targetList.length) return { added: [], removed: [], kept: [] };
+  return {
+    added: targetList.filter(function(name) { return !currentKeys[speciesKey(name)]; }),
+    removed: currentList.filter(function(name) { return !targetKeys[speciesKey(name)]; }),
+    kept: targetList.filter(function(name) { return !!currentKeys[speciesKey(name)]; }),
+  };
+}
+
 function rapidComputeApplyDiff() {
   var speciesEl = document.getElementById('speciesInput');
-  var species = speciesEl ? (speciesEl.value || '').trim() : '';
+  var targetList = parseSpeciesList(speciesEl ? speciesEl.value : '');
+  var species = joinSpecies(targetList);
+  var initialList = parseSpeciesList(rapid.initialSpecies || '');
+  var setDiff = rapidSpeciesSetDiff(targetList, initialList);
   var diff = {
     flagNew: 0,
     rejectNew: 0,
     clearNew: 0,
     tagNew: 0,
-    speciesChanged: !!(species && species !== (rapid.initialSpecies || '')),
+    speciesChanged: targetList.length > 0 && !sameSpeciesSet(targetList, initialList),
     species: species,
+    speciesList: targetList,
+    // Dropped species with no new species to pair against: these are bare
+    // removals (a paired drop is a replace, already covered by the
+    // "set confirmed species" wording).
+    removedSpecies: setDiff.removed.slice(setDiff.added.length),
   };
   if (!rapid.items) return diff;
 
@@ -1701,13 +1903,13 @@ function rapidComputeApplyDiff() {
       else if (newFlag === 'rejected') diff.rejectNew++;
       else diff.clearNew++;
     }
-    var hasSpeciesKeyword = species &&
-      rapid.keywordStateSpecies === species &&
-      !!rapid.initialSpeciesKeywords[p.id];
-    // Apply tags EVERY frame in the burst with the species keyword (matching
+    // Apply tags EVERY frame in the burst with each species keyword (matching
     // the grid / the persisted pipeline decision), not just picks. Count all
-    // current-burst members that don't already carry it.
-    if (species && !hasSpeciesKeyword) diff.tagNew++;
+    // current-burst members missing at least one of the typed species.
+    var missing = targetList.some(function(name) {
+      return !rapidFrameHasKeyword(p.id, name, targetList);
+    });
+    if (targetList.length && missing) diff.tagNew++;
   });
   return diff;
 }
@@ -1728,8 +1930,13 @@ function rapidApplyTitle(diff, openNext) {
   if (diff.rejectNew > 0) actions.push('reject ' + diff.rejectNew + ' ' + rapidPlural(diff.rejectNew, 'photo'));
   if (diff.clearNew > 0) actions.push('clear flags on ' + diff.clearNew + ' ' + rapidPlural(diff.clearNew, 'photo'));
   if (diff.speciesChanged) actions.push('set confirmed species to "' + diff.species + '"');
+  if (diff.removedSpecies && diff.removedSpecies.length) {
+    var rmLabel = diff.removedSpecies.length > 1 ? 'species keywords' : 'species keyword';
+    actions.push('remove ' + rmLabel + ' "' + joinSpecies(diff.removedSpecies) + '" from every burst frame');
+  }
   if (diff.tagNew > 0) {
-    actions.push('add species keyword "' + diff.species + '" to ' + diff.tagNew + ' ' + rapidPlural(diff.tagNew, 'burst frame'));
+    var kwLabel = diff.speciesList && diff.speciesList.length > 1 ? 'species keywords' : 'species keyword';
+    actions.push('add ' + kwLabel + ' "' + diff.species + '" to ' + diff.tagNew + ' ' + rapidPlural(diff.tagNew, 'burst frame'));
   }
   var text = actions.length ? ('Apply will ' + actions.join(', ') + '.') : 'Apply will make no database changes for this burst.';
   if (openNext) text += ' Then open the next burst.';
@@ -1796,7 +2003,8 @@ async function applyCurrent(openNext) {
   if (!rapid.seeded || rapid.applying || rapid.sessionIndex < 0) return false;
   rapid.applying = true;
   renderApplyState();
-  var species = (document.getElementById('speciesInput').value || '').trim();
+  var targetList = parseSpeciesList(document.getElementById('speciesInput').value);
+  var species = joinSpecies(targetList);
   var picks = Array.from(rapid.picks);
   var rejects = Array.from(rapid.rejects);
   var candidates = candidateIdsForApply();
@@ -1820,15 +2028,27 @@ async function applyCurrent(openNext) {
   // INSERT-OR-IGNORE no-op, and undoing that no-op add would strip the
   // existing species keywords. Snapshot off rapid.results (not live rapid.*)
   // since openSession() can run during the awaits below.
-  var alreadyConfirmedSpecies = '';
+  var alreadyConfirmedList = [];
   var snapEnc = (rapid.results.encounters || [])[session.encIdx];
   if (snapEnc) {
     var snapBursts = (snapEnc.bursts && snapEnc.bursts.length) ? snapEnc.bursts : null;
     var snapBurst = snapBursts ? snapBursts[session.burstIdx] : null;
-    if (snapBurst && snapBurst.species_override && snapBurst.species_override.confirmed === true && snapBurst.species_override.species) {
-      alreadyConfirmedSpecies = snapBurst.species_override.species;
-    } else if (snapEnc.species_confirmed && snapEnc.confirmed_species) {
-      alreadyConfirmedSpecies = snapEnc.confirmed_species;
+    var snapOvr = snapBurst && snapBurst.species_override;
+    if (snapOvr && Array.isArray(snapOvr.species_list)) {
+      // Authoritative whatever the confirmed flag (see overrideIsExplicit):
+      // a confirmed list, a mixed burst's edited baseline, or the empty
+      // sentinel after its last species was removed.
+      alreadyConfirmedList = overrideSpeciesList(snapOvr);
+    } else if (snapOvr && snapOvr.confirmed === true && snapOvr.species) {
+      alreadyConfirmedList = [snapOvr.species];
+    } else {
+      // The encounter's list regardless of species_confirmed: a mixed
+      // encounter (one frame [A, B], another [A]) still records its
+      // dominant prior species as the list, and that is exactly what the
+      // server treats as the burst's current set (burst_species_list). An
+      // empty baseline here would make a flag-only apply re-post A and
+      // then overwrite every cached frame with [A], erasing B.
+      alreadyConfirmedList = encounterConfirmedList(snapEnc);
     }
   }
   // Gate the species POST on ACTUAL species/tag work, mirroring
@@ -1844,16 +2064,52 @@ async function applyCurrent(openNext) {
   // seeded client-side (rapid.initialSpeciesKeywords / keywordStateSpecies; see
   // openSession + the keyword-state refresh), so the tagNeeded signal is real,
   // not invented.
-  var speciesChanged = !!(species && species !== alreadyConfirmedSpecies);
-  var tagNeeded = false;
-  if (species) {
-    for (var ti = 0; ti < items.length; ti++) {
-      var hasKw = rapid.keywordStateSpecies === species &&
-        !!rapid.initialSpeciesKeywords[items[ti].id];
-      if (!hasKw) { tagNeeded = true; break; }
+  //
+  // The field edits the burst's species SET. Turn the set difference into
+  // /api/encounters/species requests:
+  //   * a dropped species paired with a new one → replace (previous_species
+  //     names which entry to swap, so a two-species burst keeps its other
+  //     subject);
+  //   * the first species on an unconfirmed burst → plain confirm, so the
+  //     server still replaces any dominant prior tag it finds in the cache;
+  //   * any further new species → add (never untags, never detaches);
+  //   * a dropped species with no replacement → remove;
+  //   * a kept species some frames still lack → add (re-tag only).
+  // Order matters for auto-detach, which only a replace can trigger and
+  // which the server judges against the burst's list at that moment:
+  // unpaired removes go first so the replace sees the shrunken set (turning
+  // [A, B] into [C] must detach: remove B, then replace A→C leaves nothing
+  // shared with the encounter), then replacements, then adds (which can
+  // only widen overlap and never detach).
+  var setDiff = rapidSpeciesSetDiff(targetList, alreadyConfirmedList);
+  var speciesRequests = [];
+  var pairCount = Math.min(setDiff.added.length, setDiff.removed.length);
+  for (var rmi = pairCount; rmi < setDiff.removed.length; rmi++) {
+    speciesRequests.push({ species: setDiff.removed[rmi], remove: true });
+  }
+  for (var pi = 0; pi < pairCount; pi++) {
+    speciesRequests.push({ species: setDiff.added[pi], previous_species: setDiff.removed[pi] });
+  }
+  for (var ai = pairCount; ai < setDiff.added.length; ai++) {
+    if (!alreadyConfirmedList.length && ai === 0) {
+      speciesRequests.push({ species: setDiff.added[ai] });
+    } else {
+      speciesRequests.push({ species: setDiff.added[ai], add: true });
     }
   }
-  var speciesPostNeeded = speciesChanged || tagNeeded;
+  setDiff.kept.forEach(function(name) {
+    var tagNeeded = items.some(function(p) { return !rapidFrameHasKeyword(p.id, name, targetList); });
+    if (!tagNeeded) return;
+    // A lone kept species on a single-species burst is the legacy re-tag
+    // path (plain confirm of the same species); with two species on the
+    // burst a plain confirm would be read as replacing the primary.
+    if (alreadyConfirmedList.length === 1 && targetList.length === 1) {
+      speciesRequests.push({ species: name });
+    } else {
+      speciesRequests.push({ species: name, add: true });
+    }
+  });
+  var speciesPostNeeded = speciesRequests.length > 0;
 
   try {
     var resp = await safeFetch('/api/pipeline/group/apply', {
@@ -1886,7 +2142,20 @@ async function applyCurrent(openNext) {
           // false here in production; confirmed species comes from the
           // adopted /api/encounters/species response below. Kept only because
           // some rapid-review tests still mock the old response shape.
-          if (species && resp.photos[pidStr].has_species_keyword) p.confirmed_species = species;
+          if (species && resp.photos[pidStr].has_species_keyword) {
+            // Merge, never overwrite: a mixed frame may carry a species the
+            // burst as a whole does not, and a flag-only apply never touched
+            // it. Only species this apply drops from the burst's set go.
+            var mirrorKeys = {};
+            targetList.forEach(function(name) { mirrorKeys[speciesKey(name)] = true; });
+            setDiff.removed.forEach(function(name) { mirrorKeys[speciesKey(name)] = true; });
+            var mirrorExtras = photoSpeciesList(p).filter(function(name) {
+              return !mirrorKeys[speciesKey(name)];
+            });
+            var mirrored = targetList.concat(mirrorExtras);
+            p.confirmed_species_list = mirrored.slice();
+            p.confirmed_species = mirrored[0] || null;
+          }
         }
       });
     }
@@ -1900,20 +2169,45 @@ async function applyCurrent(openNext) {
     // session.encIdx may point at a different (or out-of-bounds) encounter, and
     // a local write would corrupt it and then be persisted by save-cache below.
     if (speciesPostNeeded) {
-      var spResp = await safeFetch('/api/encounters/species', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          species: species,
-          photo_ids: items.map(function(p) { return p.id; }),
-          burst_index: session.burstIdx,
-        }),
-      });
+      var burstPhotoIds = items.map(function(p) { return p.id; });
+      var burstIndex = session.burstIdx;
+      // The server normalizes spellings (Say’s Phoebe → Say's Phoebe) and
+      // dedupes by keyword identity; each response carries the authoritative
+      // list, and the last one is what the burst actually holds.
+      var confirmedSpeciesList = null;
+      // Each request is its own server transaction (keywords + cache), so a
+      // failure part-way leaves the earlier changes applied. Rather than
+      // pretend atomicity, stop at the first failure, keep the server's
+      // truth for what did land, and say exactly which changes did not.
+      var speciesFailure = null;
+      var appliedRequests = [];
+      for (var ri = 0; ri < speciesRequests.length; ri++) {
+      var spResp;
+      try {
+        spResp = await safeFetch('/api/encounters/species', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(Object.assign({
+            photo_ids: burstPhotoIds,
+            burst_index: burstIndex,
+          }, speciesRequests[ri])),
+        });
+      } catch (err) {
+        speciesFailure = { index: ri, error: err };
+        break;
+      }
+      appliedRequests.push(speciesRequests[ri]);
       // Adopt the authoritative structure (the endpoint may auto-detach on a
       // species mismatch), so the save-cache below doesn't clobber its restructure.
+      if (spResp && Array.isArray(spResp.species_list)) {
+        confirmedSpeciesList = spResp.species_list.filter(Boolean);
+      }
       if (spResp && spResp.encounters) {
         rapid.results.encounters = spResp.encounters;
         if (spResp.summary) rapid.results.summary = spResp.summary;
+        // A detach moves the burst; the next request must follow it.
+        var located = locateBurstByPhotoIds(spResp.encounters, burstPhotoIds);
+        if (located) burstIndex = located.burstIdx;
         // Rebuild the sidebar sessions from the server's authoritative
         // encounters rather than trying to patch the old layout in place.
         // buildSessions() derives each session's encIdx/burstIdx, species
@@ -1930,7 +2224,8 @@ async function applyCurrent(openNext) {
         //     navigate server truth instead of stale indices.
         rapid.allSessions = buildSessions(rapid.results);
       }
-      // Only now that the species call has SUCCEEDED do we mirror the
+      }
+      // Only now that the species calls have SUCCEEDED do we mirror the
       // confirmation onto the local photos. The endpoint tags EVERY frame in
       // `items` (picks and non-picks alike), so mark them all — marking only
       // picks would leave non-pick frames in the "Needs species" queue / without
@@ -1938,7 +2233,45 @@ async function applyCurrent(openNext) {
       // (or in the label loop above) would leave the cache claiming confirmation
       // even when /api/encounters/species fails, hiding the burst from "Needs
       // species" locally until reload (the catch path doesn't roll it back).
-      items.forEach(function(p) { p.confirmed_species = species; });
+      // Persist the server-normalized list (not the raw field text) so the
+      // cache never claims a spelling or a duplicate the database lacks.
+      // Merge rather than overwrite: a frame may carry a species the burst as
+      // a whole does not (a mixed burst), and the server never touched it —
+      // only species this apply removed or replaced away are dropped.
+      var touchedKeys = {};
+      appliedRequests.forEach(function(req) {
+        if (req.remove) touchedKeys[speciesKey(req.species)] = true;
+        if (req.previous_species) touchedKeys[speciesKey(req.previous_species)] = true;
+      });
+      if (appliedRequests.length) {
+        var serverList = confirmedSpeciesList || (speciesFailure ? null : targetList);
+        items.forEach(function(p) {
+          if (!serverList) return;
+          var serverKeys = {};
+          serverList.forEach(function(name) { serverKeys[speciesKey(name)] = true; });
+          var extras = photoSpeciesList(p).filter(function(name) {
+            var key = speciesKey(name);
+            return !serverKeys[key] && !touchedKeys[key];
+          });
+          var merged = serverList.concat(extras);
+          p.confirmed_species_list = merged.slice();
+          p.confirmed_species = merged[0] || null;
+        });
+      }
+      if (speciesFailure) {
+        var failedReq = speciesRequests[speciesFailure.index];
+        var failedWhat = failedReq.remove
+          ? 'removing "' + failedReq.species + '"'
+          : failedReq.previous_species
+            ? 'replacing "' + failedReq.previous_species + '" with "' + failedReq.species + '"'
+            : 'adding "' + failedReq.species + '"';
+        var remaining = speciesRequests.length - speciesFailure.index;
+        var applied = appliedRequests.length;
+        var msg = 'Species change failed while ' + failedWhat + '. '
+          + (applied ? applied + ' earlier ' + rapidPlural(applied, 'change') + ' stayed applied; ' : '')
+          + remaining + ' ' + rapidPlural(remaining, 'change') + ' not applied. The field now shows what the server holds.';
+        if (typeof showToast === 'function') showToast(msg, 'error');
+      }
     }
     updateSummaryFromPhotos();
     await safeFetch('/api/pipeline/save-cache', {

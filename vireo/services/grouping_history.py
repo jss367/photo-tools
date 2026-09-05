@@ -26,7 +26,7 @@ class GroupingHistoryStale(GroupingHistoryConflict):
 # species edit that landed after a grouping edit has already been reverted
 # by the time we compare snapshots here — its leftover cache state is not
 # "newer work" that a grouping undo would silently overwrite.
-_CACHE_SPECIES_ENCOUNTER_FIELDS = ("confirmed_species", "species_confirmed")
+_CACHE_SPECIES_ENCOUNTER_FIELDS = ("confirmed_species", "confirmed_species_list", "species_confirmed")
 _CACHE_SPECIES_BURST_FIELDS = ("species_override",)
 
 
@@ -162,6 +162,7 @@ def save_grouping_edit(db, before, after, description, *, photo_edit=None, items
 
 def record_species_confirm_cache(
     db, *, species, target_enc, burst_index, submitted_photo_ids,
+    new_override=None, new_encounter_state=None, description=None,
 ):
     """Record an ``/api/encounters/species`` call that only wrote the cache.
 
@@ -190,27 +191,43 @@ def record_species_confirm_cache(
             return
         burst_photo_ids = list(bursts[burst_index].get("photo_ids") or [])
         prev_override = copy.deepcopy(bursts[burst_index].get("species_override"))
-        new_value = json.dumps({
+        payload = {
             "encounter_photo_ids": encounter_photo_ids,
             "burst_photo_ids": burst_photo_ids,
             "species": species,
             "previous_burst_override": prev_override,
-        })
-        description = f'Confirmed species "{species}" on 1 burst'
+        }
+        if new_override is not None:
+            # The exact override the endpoint is about to write (a species
+            # set may carry several names, an unconfirmed edited baseline,
+            # or the explicit-empty sentinel); restore compares against it.
+            payload["new_burst_override"] = copy.deepcopy(new_override)
+        new_value = json.dumps(payload)
+        if description is None:
+            description = f'Confirmed species "{species}" on 1 burst'
     else:
         prev_state = {
             "confirmed_species": target_enc.get("confirmed_species"),
             "species_confirmed": bool(target_enc.get("species_confirmed")),
         }
-        new_value = json.dumps({
+        payload = {
             "encounter_photo_ids": encounter_photo_ids,
             "submitted_photo_ids": list(submitted_photo_ids),
             "species": species,
             "previous_encounter_state": prev_state,
-        })
-        description = (
-            f'Confirmed species "{species}" on {len(submitted_photo_ids)} photos'
-        )
+        }
+        if new_encounter_state is not None:
+            prev_state["confirmed_species_list"] = list(
+                target_enc.get("confirmed_species_list")
+                or ([target_enc["confirmed_species"]]
+                    if target_enc.get("confirmed_species") else [])
+            )
+            payload["new_encounter_state"] = copy.deepcopy(new_encounter_state)
+        new_value = json.dumps(payload)
+        if description is None:
+            description = (
+                f'Confirmed species "{species}" on {len(submitted_photo_ids)} photos'
+            )
     db.record_edit(
         "species_confirm_cache", description, new_value, [],
         is_batch=False, _commit=False,
@@ -280,7 +297,11 @@ def restore_species_confirm_cache_edit(db, entry, *, undo):
                     "The burst has changed since this edit. "
                     "This confirmation cannot be restored."
                 )
-            confirmed = {"species": change["species"], "confirmed": True}
+            confirmed = change.get("new_burst_override")
+            if confirmed is None:
+                # Entries recorded before species sets: a single confirmed
+                # species.
+                confirmed = {"species": change["species"], "confirmed": True}
             previous = change.get("previous_burst_override")
             expected = confirmed if undo else previous
             if target_burst.get("species_override") != expected:
@@ -295,13 +316,22 @@ def restore_species_confirm_cache_edit(db, entry, *, undo):
                 target_burst["species_override"] = copy.deepcopy(replacement)
         else:
             previous = change.get("previous_encounter_state") or {}
-            confirmed = {
+            confirmed = change.get("new_encounter_state") or {
                 "confirmed_species": change["species"], "species_confirmed": True,
             }
+            # Entries recorded with species sets also carry the list; older
+            # ones compare the two legacy fields only.
+            with_list = "confirmed_species_list" in confirmed
             current_state = {
                 "confirmed_species": enc.get("confirmed_species"),
                 "species_confirmed": bool(enc.get("species_confirmed")),
             }
+            if with_list:
+                current_state["confirmed_species_list"] = list(
+                    enc.get("confirmed_species_list")
+                    or ([enc["confirmed_species"]]
+                        if enc.get("confirmed_species") else [])
+                )
             expected = confirmed if undo else previous
             if current_state != expected:
                 raise GroupingHistoryStale(
@@ -314,6 +344,10 @@ def restore_species_confirm_cache_edit(db, entry, *, undo):
             else:
                 enc["confirmed_species"] = replacement["confirmed_species"]
             enc["species_confirmed"] = bool(replacement.get("species_confirmed"))
+            if with_list:
+                enc["confirmed_species_list"] = list(
+                    replacement.get("confirmed_species_list") or []
+                )
         save_results_raw(restored, cache_dir, db._ws_id())
         try:
             yield

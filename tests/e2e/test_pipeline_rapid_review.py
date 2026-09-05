@@ -1344,3 +1344,457 @@ def test_rapid_review_adopts_detach_restructure_without_clobbering_cache(live_se
     # The sibling that kept the original species was NOT given the divergent one.
     sibling = next(e for e in saved["encounters"] if e["photo_ids"] == [2])
     assert sibling["species"] == ["Original bird"]
+
+
+# -- Multi-species bursts (issue #1298) --------------------------------------
+
+
+def _two_species_results():
+    return {
+        "photos": [
+            {"id": 1, "filename": "a.jpg", "label": "REVIEW", "quality_composite": 0.3, "subject_tenengrad": 10,
+             "confirmed_species": "American Wigeon",
+             "confirmed_species_list": ["American Wigeon", "Green-winged Teal"]},
+            {"id": 2, "filename": "b.jpg", "label": "REVIEW", "quality_composite": 0.6, "subject_tenengrad": 20,
+             "confirmed_species": "American Wigeon",
+             "confirmed_species_list": ["American Wigeon", "Green-winged Teal"]},
+            {"id": 3, "filename": "c.jpg", "label": "REVIEW", "quality_composite": 0.9, "subject_tenengrad": 30,
+             "confirmed_species": "American Wigeon",
+             "confirmed_species_list": ["American Wigeon", "Green-winged Teal"]},
+        ],
+        "encounters": [
+            {
+                "photo_ids": [1, 2, 3],
+                "photo_count": 3,
+                "burst_count": 1,
+                "species": ["American Wigeon"],
+                "species_confirmed": True,
+                "confirmed_species": "American Wigeon",
+                "confirmed_species_list": ["American Wigeon", "Green-winged Teal"],
+                "bursts": [{
+                    "photo_ids": [1, 2, 3],
+                    "species_override": {
+                        "species": "American Wigeon",
+                        "confirmed": True,
+                        "species_list": ["American Wigeon", "Green-winged Teal"],
+                    },
+                }],
+            }
+        ],
+        "summary": {"keep_count": 0, "review_count": 3, "reject_count": 0},
+    }
+
+
+def _two_species_state():
+    both = {"American Wigeon": True, "Green-winged Teal": True}
+    return {
+        "1": {"flag": "none", "has_species_keyword": True, "has_species_keywords": both},
+        "2": {"flag": "none", "has_species_keyword": True, "has_species_keywords": both},
+        "3": {"flag": "none", "has_species_keyword": True, "has_species_keywords": both},
+    }
+
+
+def test_rapid_review_two_species_burst_prefills_both_and_is_not_queued(live_server, page):
+    _mock_pipeline_rapid_review(
+        page, results=_two_species_results(), state_photos=_two_species_state(),
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+    # Fully confirmed on both subjects: nothing left to tag, no species change.
+    expect(page.locator("#applyBtn")).to_have_text("Apply: no DB changes")
+    expect(page.locator(".reason-chip", has_text="No species")).to_have_count(0)
+    expect(page.locator(".reason-chip", has_text="Mixed species")).to_have_count(0)
+
+
+def _fill_species_and_settle(page, value):
+    """Type a species list and wait for the debounced keyword-state refresh,
+    so Apply plans against the server's per-species keyword state rather than
+    the conservative "everything missing" placeholder."""
+    with page.expect_response("**/api/pipeline/group/state"):
+        page.locator("#speciesInput").fill(value)
+    # The response event fires before the page's .then() handler runs; wait
+    # for the snapshot to be adopted so a click can't plan against the
+    # pre-refresh placeholder state.
+    page.wait_for_function(
+        "(v) => window.rapid && rapid.keywordStateSpecies === v", arg=value,
+    )
+
+
+def test_rapid_review_swapping_one_species_replaces_only_that_species(live_server, page):
+    species_payloads = []
+    _mock_pipeline_rapid_review(
+        page, results=_two_species_results(), state_photos=_two_species_state(),
+        species_payloads=species_payloads,
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+
+    _fill_species_and_settle(page, "American Wigeon, Gadwall")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Set species · Tag 3")
+    expect(page.locator("#applyBtn")).to_have_attribute(
+        "title",
+        'Apply will set confirmed species to "American Wigeon, Gadwall", '
+        'add species keywords "American Wigeon, Gadwall" to 3 burst frames.',
+    )
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+
+    # One replace, scoped to the dropped species: the wigeon is untouched.
+    assert len(species_payloads) == 1, species_payloads
+    body = species_payloads[0]
+    assert body["species"] == "Gadwall"
+    assert body["previous_species"] == "Green-winged Teal"
+    assert body["burst_index"] == 0
+    assert sorted(body["photo_ids"]) == [1, 2, 3]
+    assert "add" not in body and "remove" not in body
+
+
+def test_rapid_review_adding_a_species_posts_add_mode(live_server, page):
+    species_payloads = []
+    _mock_pipeline_rapid_review(
+        page, results=_two_species_results(), state_photos=_two_species_state(),
+        species_payloads=species_payloads,
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+
+    _fill_species_and_settle(page, "American Wigeon, Green-winged Teal, Gadwall")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Set species · Tag 3")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+
+    assert len(species_payloads) == 1, species_payloads
+    assert species_payloads[0]["species"] == "Gadwall"
+    assert species_payloads[0]["add"] is True
+    assert "previous_species" not in species_payloads[0]
+
+
+def test_rapid_review_dropping_a_species_posts_remove_mode(live_server, page):
+    species_payloads = []
+    _mock_pipeline_rapid_review(
+        page, results=_two_species_results(), state_photos=_two_species_state(),
+        species_payloads=species_payloads,
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+
+    _fill_species_and_settle(page, "American Wigeon")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Set species")
+    expect(page.locator("#applyBtn")).to_have_attribute(
+        "title",
+        'Apply will set confirmed species to "American Wigeon", '
+        'remove species keyword "Green-winged Teal" from every burst frame.',
+    )
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+
+    assert len(species_payloads) == 1, species_payloads
+    assert species_payloads[0]["species"] == "Green-winged Teal"
+    assert species_payloads[0]["remove"] is True
+    assert species_payloads[0]["burst_index"] == 0
+
+
+def test_rapid_review_clearing_species_field_removes_nothing(live_server, page):
+    species_payloads = []
+    _mock_pipeline_rapid_review(
+        page, results=_two_species_results(), state_photos=_two_species_state(),
+        species_payloads=species_payloads,
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+
+    _fill_species_and_settle(page, "")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: no DB changes")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+    assert species_payloads == []
+
+
+def test_rapid_review_species_name_with_comma_round_trips(live_server, page):
+    """A stored keyword containing a delimiter is shown quoted and parsed back
+    as one name, so an unrelated flag change never rewrites it as two tags."""
+    species_payloads = []
+    results = _two_species_results()
+    name = "Mallard, domestic"
+    for p in results["photos"]:
+        p["confirmed_species"] = name
+        p["confirmed_species_list"] = [name]
+    enc = results["encounters"][0]
+    enc["confirmed_species"] = name
+    enc["confirmed_species_list"] = [name]
+    enc["bursts"][0]["species_override"] = {"species": name, "confirmed": True, "species_list": [name]}
+    state = {
+        str(pid): {"flag": "none", "has_species_keyword": True, "has_species_keywords": {name: True}}
+        for pid in (1, 2, 3)
+    }
+    _mock_pipeline_rapid_review(page, results=results, state_photos=state, species_payloads=species_payloads)
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value('"Mallard, domestic"')
+    expect(page.locator("#applyBtn")).to_have_text("Apply: no DB changes")
+
+    page.keyboard.press("p")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Flag 1")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+    assert species_payloads == []
+
+    # Typing a second, quoted name alongside pairs cleanly with the first.
+    _fill_species_and_settle(page, '"Mallard, domestic", Gadwall')
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Set species · Tag 3")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+    assert [p["species"] for p in species_payloads] == ["Gadwall"]
+    assert species_payloads[0]["add"] is True
+
+
+def test_rapid_review_shrinking_and_swapping_removes_before_replacing(live_server, page):
+    """[A, B] → [C] must send the bare remove first so the replace is judged
+    against a burst that shares nothing with its encounter and detaches."""
+    species_payloads = []
+    _mock_pipeline_rapid_review(
+        page, results=_two_species_results(), state_photos=_two_species_state(),
+        species_payloads=species_payloads,
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+
+    _fill_species_and_settle(page, "Gadwall")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Set species · Tag 3")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+
+    assert [(p["species"], p.get("remove"), p.get("previous_species")) for p in species_payloads] == [
+        ("Green-winged Teal", True, None),
+        ("Gadwall", None, "American Wigeon"),
+    ]
+
+
+def test_rapid_review_non_ascii_case_pair_is_treated_as_distinct(live_server, page):
+    """A burst holding two keywords that differ only by non-ASCII case
+    (``Éclair`` vs ``éclair``) must diff them as distinct species, matching
+    the backend's ASCII-only ``keyword_match_key``. JS ``toLowerCase()`` would
+    fold both to one key, so dropping the lowercase one from the field would
+    silently omit the ``remove`` from the plan and leave the DB tag attached."""
+    species_payloads = []
+    results = _two_species_results()
+    both = ["Éclair", "éclair"]
+    for p in results["photos"]:
+        p["confirmed_species"] = both[0]
+        p["confirmed_species_list"] = list(both)
+    enc = results["encounters"][0]
+    enc["confirmed_species"] = both[0]
+    enc["confirmed_species_list"] = list(both)
+    enc["bursts"][0]["species_override"] = {
+        "species": both[0], "confirmed": True, "species_list": list(both),
+    }
+    keyword_map = {both[0]: True, both[1]: True}
+    state = {
+        str(pid): {
+            "flag": "none", "has_species_keyword": True, "has_species_keywords": dict(keyword_map),
+        }
+        for pid in (1, 2, 3)
+    }
+    _mock_pipeline_rapid_review(page, results=results, state_photos=state, species_payloads=species_payloads)
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("Éclair, éclair")
+
+    # Drop the lowercase entry only. The ASCII-only key fold keeps the two
+    # names distinct, so the diff produces exactly one remove scoped to the
+    # lowercase name — not a silent no-op.
+    _fill_species_and_settle(page, "Éclair")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Set species")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+    assert len(species_payloads) == 1, species_payloads
+    body = species_payloads[0]
+    assert body["species"] == "éclair"
+    assert body.get("remove") is True
+    assert "add" not in body
+    assert "previous_species" not in body
+
+
+def test_rapid_review_mirrors_server_normalized_species_onto_cache(live_server, page):
+    """The photo cache takes the server's normalized species_list, not the raw
+    field text, so a typographic apostrophe never lands in the saved cache."""
+    save_payloads = []
+    species_payloads = []
+    results = _two_species_results()
+    _mock_pipeline_rapid_review(
+        page, results=results, state_photos=_two_species_state(),
+        species_payloads=species_payloads, save_payloads=save_payloads,
+        species_response={
+            "ok": True,
+            "species_list": ["American Wigeon", "Say's Phoebe"],
+            "encounters": results["encounters"],
+            "summary": results["summary"],
+        },
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+
+    _fill_species_and_settle(page, "American Wigeon, Say’s Phoebe")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+
+    assert species_payloads[-1]["species"] == "Say’s Phoebe"
+    saved = {p["id"]: p for p in save_payloads[-1]["photos"]}
+    for pid in (1, 2, 3):
+        assert saved[pid]["confirmed_species_list"] == ["American Wigeon", "Say's Phoebe"]
+        assert saved[pid]["confirmed_species"] == "American Wigeon"
+
+
+def test_rapid_review_prefill_ignores_candidate_override_under_confirmed_encounter(live_server, page):
+    """A detach-time candidate override (confirmed: false) on a burst whose
+    encounter is confirmed must not prefill the field: the burst's species
+    is the encounter's, so a flag-only apply sends no species request."""
+    species_payloads = []
+    results = _two_species_results()
+    for p in results["photos"]:
+        p["confirmed_species"] = "American Wigeon"
+        p["confirmed_species_list"] = ["American Wigeon"]
+    enc = results["encounters"][0]
+    enc["confirmed_species"] = "American Wigeon"
+    enc["confirmed_species_list"] = ["American Wigeon"]
+    enc["bursts"][0]["species_override"] = {"species": "Gadwall", "confirmed": False}
+    state = {
+        str(pid): {"flag": "none", "has_species_keyword": True,
+                   "has_species_keywords": {"American Wigeon": True}}
+        for pid in (1, 2, 3)
+    }
+    _mock_pipeline_rapid_review(page, results=results, state_photos=state, species_payloads=species_payloads)
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: no DB changes")
+
+    page.keyboard.press("p")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Flag 1")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+    assert species_payloads == []
+
+
+def test_rapid_review_flag_only_apply_keeps_mixed_frames_second_species(live_server, page):
+    """A mixed encounter (one frame [A, B], another [A]) is not uniformly
+    confirmed but still records [A] as its list. A flag-only apply must
+    treat [A] as the baseline: no species request, and the cached frame
+    that also carries B keeps it."""
+    species_payloads = []
+    save_payloads = []
+    results = _two_species_results()
+    results["photos"][0]["confirmed_species_list"] = ["American Wigeon", "Green-winged Teal"]
+    for p in results["photos"][1:]:
+        p["confirmed_species_list"] = ["American Wigeon"]
+    enc = results["encounters"][0]
+    enc["species_confirmed"] = False
+    enc["confirmed_species"] = "American Wigeon"
+    enc["confirmed_species_list"] = ["American Wigeon"]
+    enc["bursts"][0]["species_override"] = None
+    state = {
+        str(pid): {"flag": "none", "has_species_keyword": True,
+                   "has_species_keywords": {"American Wigeon": True}}
+        for pid in (1, 2, 3)
+    }
+    # /group/apply reports the keyword on every frame so the local mirror
+    # branch runs; it must merge, not overwrite, the mixed frame's list.
+    apply_photos = {
+        "1": {"flag": "flagged", "has_species_keyword": True},
+        "2": {"flag": "none", "has_species_keyword": True},
+        "3": {"flag": "none", "has_species_keyword": True},
+    }
+    _mock_pipeline_rapid_review(
+        page, results=results, state_photos=state, apply_photos=apply_photos,
+        species_payloads=species_payloads, save_payloads=save_payloads,
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon")
+    expect(page.locator(".reason-chip", has_text="Mixed species")).to_be_visible()
+
+    page.keyboard.press("p")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Flag 1")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+
+    assert species_payloads == []
+    saved = {p["id"]: p for p in save_payloads[-1]["photos"]}
+    assert saved[1]["confirmed_species_list"] == ["American Wigeon", "Green-winged Teal"]
+    assert saved[2]["confirmed_species_list"] == ["American Wigeon"]
+
+
+def test_rapid_review_partial_species_failure_keeps_applied_changes_and_reports(live_server, page):
+    """[A, B] → [C, D] is two replace requests. If the second fails, the first
+    stays applied (it was its own server transaction), the cache mirrors the
+    server's list from the successful response, and the user is told which
+    change did not land instead of the apply silently returning false."""
+    species_payloads = []
+    save_payloads = []
+    results = _two_species_results()
+    _mock_pipeline_rapid_review(
+        page, results=results, state_photos=_two_species_state(),
+        species_payloads=species_payloads, save_payloads=save_payloads,
+    )
+    calls = {"n": 0}
+
+    def flaky_species(route):
+        calls["n"] += 1
+        species_payloads.append(route.request.post_data_json)
+        if calls["n"] == 1:
+            route.fulfill(json={
+                "ok": True,
+                "species_list": ["Gadwall", "Green-winged Teal"],
+                "encounters": results["encounters"],
+                "summary": results["summary"],
+            })
+        else:
+            route.fulfill(status=500, json={"error": "boom"})
+
+    page.route("**/api/encounters/species", flaky_species)
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+
+    _fill_species_and_settle(page, "Gadwall, Mallard")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+
+    assert [(p["species"], p.get("previous_species")) for p in species_payloads] == [
+        ("Gadwall", "American Wigeon"),
+        ("Mallard", "Green-winged Teal"),
+    ]
+    expect(page.locator("#toastContainer [role=\"alert\"]").last).to_contain_text(
+        'replacing "Green-winged Teal" with "Mallard"'
+    )
+    saved = {p["id"]: p for p in save_payloads[-1]["photos"]}
+    for pid in (1, 2, 3):
+        assert saved[pid]["confirmed_species_list"] == ["Gadwall", "Green-winged Teal"]
+    # Apply is usable again and the field reflects server truth after reload.
+    expect(page.locator("#applyBtn")).to_be_enabled()
+
+
+def test_rapid_review_mixed_burst_edited_baseline_beats_encounter_list(live_server, page):
+    """A mixed burst that had B removed carries {confirmed: false,
+    species_list: [A]} under an encounter still listing [A, B]. The field
+    prefills A only, and a flag-only apply sends no species request."""
+    species_payloads = []
+    results = _two_species_results()
+    results["photos"][0]["confirmed_species_list"] = ["American Wigeon", "Gadwall"]
+    for p in results["photos"][1:]:
+        p["confirmed_species_list"] = ["American Wigeon"]
+    enc = results["encounters"][0]
+    enc["species_confirmed"] = False
+    enc["confirmed_species_list"] = ["American Wigeon", "Green-winged Teal"]
+    enc["bursts"][0]["species_override"] = {
+        "species": "American Wigeon", "confirmed": False, "species_list": ["American Wigeon"],
+    }
+    state = {
+        str(pid): {"flag": "none", "has_species_keyword": True,
+                   "has_species_keywords": {"American Wigeon": True}}
+        for pid in (1, 2, 3)
+    }
+    _mock_pipeline_rapid_review(page, results=results, state_photos=state, species_payloads=species_payloads)
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: no DB changes")
+
+    page.keyboard.press("p")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+    assert species_payloads == []

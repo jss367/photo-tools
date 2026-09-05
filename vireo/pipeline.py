@@ -500,6 +500,13 @@ def load_photo_features(db, collection_id=None, config=None,
         for pid, names in species_names_by_photo.items()
         if names
     }
+    # Every confirmed species per photo (a photo can carry two subjects);
+    # ``confirmed_species`` above stays the primary for legacy consumers.
+    confirmed_list_by_photo = {
+        pid: list(names)
+        for pid, names in species_names_by_photo.items()
+        if names
+    }
 
     # Classification is intentionally more permissive than grouping: it may
     # evaluate every bracketed weak run, but grouping promotes the run to an
@@ -636,6 +643,7 @@ def load_photo_features(db, collection_id=None, config=None,
             "species_top5": species_by_photo.get(pid, []),
             "subjects": subjects_by_photo.get(pid, []),
             "confirmed_species": confirmed_by_photo.get(pid),
+            "confirmed_species_list": confirmed_list_by_photo.get(pid, []),
             "subject_absent": subject_absent,
             "subject_present": subject_present,
             "subject_uncertain": subject_uncertain,
@@ -853,10 +861,87 @@ def _make_summary(encounters, all_photos):
     }
 
 
+def _photo_species_keysets(photos):
+    """Per-photo identity sets of confirmed species (empty set = unconfirmed)."""
+    from pipeline_results import photo_confirmed_species_list, species_key_set
+
+    return [
+        frozenset(species_key_set(photo_confirmed_species_list(p)))
+        for p in photos
+    ]
+
+
+def _shared_confirmed_species(photos):
+    """Species carried by every *tagged* photo, in the first tagged photo's
+    order (empty when the tagged photos share nothing or none is tagged)."""
+    from keyword_normalization import keyword_match_key
+    from pipeline_results import photo_confirmed_species_list
+
+    tagged = [
+        lst for lst in (photo_confirmed_species_list(p) for p in photos) if lst
+    ]
+    if not tagged:
+        return []
+    common = set.intersection(*(
+        {keyword_match_key(s) for s in lst} for lst in tagged
+    ))
+    return [s for s in tagged[0] if keyword_match_key(s) in common]
+
+
+def derive_burst_override(photos, preferred_order=None):
+    """Burst ``species_override`` implied by its frames' confirmed species.
+
+    The rule :func:`serialize_results` applies on regroup, shared with the
+    undo/redo refresh and the encounter-scoped confirm so a burst's cached
+    set never contradicts its frames: every frame tagged and sharing a
+    species → a confirmed override for the shared set; every frame tagged
+    but nothing shared, or every frame untagged → the explicit-empty
+    sentinel (so the burst does not inherit the encounter's baseline and
+    re-advertise a species its frames no longer carry); otherwise ``None``
+    (inherit the encounter).
+
+    ``preferred_order`` (a species list) puts those names first in the
+    shared list, so the entry the user just confirmed stays the primary.
+    """
+    from pipeline_results import (
+        build_species_override,
+        empty_species_override,
+        photo_confirmed_species_list,
+        species_key_set,
+    )
+
+    if not photos:
+        return None
+    if _photos_uniformly_confirmed(photos):
+        shared = _shared_confirmed_species(photos)
+        if preferred_order:
+            shared_keys = species_key_set(shared)
+            first = [s for s in preferred_order if s and species_key_set([s]) <= shared_keys]
+            first_keys = species_key_set(first)
+            shared = first + [s for s in shared if not species_key_set([s]) <= first_keys]
+        return build_species_override(shared)
+    if all(photo_confirmed_species_list(p) for p in photos):
+        return empty_species_override()
+    if all(not photo_confirmed_species_list(p) for p in photos):
+        return empty_species_override()
+    return None
+
+
 def _photos_uniformly_confirmed(photos):
-    species = [p.get("confirmed_species") for p in photos]
-    confirmed = {s for s in species if s}
-    return bool(photos) and len(confirmed) == 1 and all(species)
+    """True when every photo is tagged and they all share a species.
+
+    A burst is confirmed as the species every frame carries. A frame that
+    also carries an extra subject ([Wigeon, Teal] beside [Teal]) does not
+    make the burst unconfirmed — the user confirmed Teal on all of it, and
+    the extra shows up in that frame's own list and rapid review's
+    "Mixed species" chip. Requiring identical sets would flip such bursts
+    back to unconfirmed on the next regroup, right after an explicit
+    confirm, and would count every stray legacy tag as review work.
+    """
+    keysets = _photo_species_keysets(photos)
+    return bool(photos) and all(keysets) and bool(
+        _shared_confirmed_species(photos)
+    )
 
 
 def _count_raw_confirmation_units(encounters):
@@ -1010,7 +1095,7 @@ def _build_species_predictions(photos):
     return result
 
 
-def serialize_results(results):
+def serialize_results(results, prior_results=None):
     """Serialize pipeline results to a JSON-safe dict.
 
     Strips numpy arrays and non-serializable objects so results
@@ -1018,10 +1103,43 @@ def serialize_results(results):
 
     Args:
         results: dict from run_full_pipeline()
+        prior_results: previously-serialized cache, used to preserve the
+            explicit-empty burst sentinel across regroups. When a burst had
+            its last species removed, the endpoint records
+            ``empty_species_override()`` so the untagged photos do not
+            inherit the encounter's species. A regroup that rebuilds bursts
+            from DB photos alone cannot tell that "no tags" from an
+            explicit clear apart from "never touched" — pass the prior
+            cache so those photos keep the sentinel.
 
     Returns:
         JSON-serializable dict
     """
+    from pipeline_results import (
+        build_species_override,
+        empty_species_override,
+        photo_confirmed_species_list,
+    )
+
+    # Photo ids the prior cache recorded as belonging to an explicit-empty
+    # burst. A regrouped burst whose photos are all untagged in the DB AND
+    # every one of them was in an explicit-empty burst before keeps the
+    # sentinel; anything else is an ordinary unconfirmed burst.
+    prior_empty_photo_ids = set()
+    if isinstance(prior_results, dict):
+        for prior_enc in prior_results.get("encounters", []) or []:
+            for prior_burst in prior_enc.get("bursts") or []:
+                ovr = prior_burst.get("species_override")
+                if (
+                    isinstance(ovr, dict)
+                    and isinstance(ovr.get("species_list"), list)
+                    and not ovr["species_list"]
+                    and not ovr.get("confirmed")
+                ):
+                    prior_empty_photo_ids.update(
+                        prior_burst.get("photo_ids") or []
+                    )
+
     def _clean_photo(p):
         """Strip non-serializable fields from a photo dict."""
         cleaned = {}
@@ -1047,19 +1165,33 @@ def serialize_results(results):
         # the /api/encounters/species endpoint can find the keyword to untag
         # when the user re-confirms.
         photo_species = [p.get("confirmed_species") for p in photos_list]
-        confirmed_set = {s for s in photo_species if s}
-        if photos_list and len(confirmed_set) == 1 and all(s for s in photo_species):
-            enc_confirmed = next(iter(confirmed_set))
+        if _photos_uniformly_confirmed(photos_list):
+            # Every photo is tagged and they share at least one species:
+            # confirmed as the shared set (one or several), with the first
+            # entry as the legacy single-valued primary.
+            enc_confirmed_list = _shared_confirmed_species(photos_list)
+            enc_confirmed = enc_confirmed_list[0]
             species_confirmed_flag = True
         else:
-            # For mixed/partial encounters, pick the most frequent confirmed
-            # species, breaking ties by first appearance in photo order. Set
+            # Mixed/partial encounter. Prefer the species every tagged photo
+            # shares (a frame tagged [Wigeon, Teal] beside one tagged [Teal]
+            # is a Teal encounter with an extra subject on one frame, not a
+            # Wigeon one): that is the honest baseline for the confirm
+            # endpoint's previous_species and for rapid review's apply diff,
+            # and it keeps a flag-only apply from re-tagging the second
+            # frame with a species it never had. Only when the tagged photos
+            # share nothing does the most-frequent primary decide.
+            enc_confirmed = None
+            enc_confirmed_list = _shared_confirmed_species(photos_list)
+            if enc_confirmed_list:
+                enc_confirmed = enc_confirmed_list[0]
+            confirmed_set = {s for s in photo_species if s}
+            # Tie-break the fallback by first appearance in photo order. Set
             # iteration order is not stable across processes, so iterating
             # confirmed_set directly would feed /api/encounters/species an
             # arbitrary previous_species and untag an unpredictable keyword
             # on re-confirm.
-            enc_confirmed = None
-            if confirmed_set:
+            if enc_confirmed is None and confirmed_set:
                 counts = defaultdict(int)
                 first_index = {}
                 for idx, s in enumerate(photo_species):
@@ -1070,6 +1202,7 @@ def serialize_results(results):
                     counts,
                     key=lambda s: (counts[s], -first_index[s]),
                 )
+                enc_confirmed_list = [enc_confirmed]
             species_confirmed_flag = False
 
         species_votes = _build_species_predictions(photos_list)
@@ -1077,6 +1210,7 @@ def serialize_results(results):
         s_enc = {
             "species": enc.get("species"),
             "confirmed_species": enc_confirmed,
+            "confirmed_species_list": enc_confirmed_list,
             "species_predictions": species_votes,
             "species_confirmed": species_confirmed_flag,
             "photo_count": enc.get("photo_count"),
@@ -1103,13 +1237,31 @@ def serialize_results(results):
                 # burst-confirmed indicators survive a regroup. Previously this
                 # was always None, wiping per-burst confirmation state every
                 # time a slider moved even though the underlying tags persist.
-                burst_species = [p.get("confirmed_species") for p in burst]
-                burst_set = {s for s in burst_species if s}
-                if burst and len(burst_set) == 1 and all(s for s in burst_species):
-                    burst_override = {
-                        "species": next(iter(burst_set)),
-                        "confirmed": True,
-                    }
+                if _photos_uniformly_confirmed(burst):
+                    burst_override = build_species_override(
+                        _shared_confirmed_species(burst),
+                    )
+                elif burst and all(
+                    photo_confirmed_species_list(p) for p in burst
+                ):
+                    # Every frame tagged, nothing shared: the burst's own
+                    # set is empty. The sentinel keeps it from inheriting
+                    # the encounter's baseline (see the refresh helper).
+                    burst_override = empty_species_override()
+                elif (
+                    prior_empty_photo_ids
+                    and burst_ids
+                    and all(
+                        not photo_confirmed_species_list(p) for p in burst
+                    )
+                    and all(pid in prior_empty_photo_ids for pid in burst_ids)
+                ):
+                    # All photos are untagged AND every one of them was in
+                    # an explicit-empty burst before this regroup — keep the
+                    # sentinel so the burst does not inherit the encounter's
+                    # species and get its removed tag re-applied on the next
+                    # rapid/classic review apply.
+                    burst_override = empty_species_override()
                 else:
                     burst_override = None
                 s_enc["bursts"].append({
@@ -1153,8 +1305,12 @@ def save_results(results, cache_dir, workspace_id, preserve_miss_marker=True):
     Returns:
         path to the saved JSON file
     """
-    serialized = serialize_results(results)
     path = _results_cache_path(cache_dir, workspace_id)
+    # Load the prior cache once: serialize_results uses it to preserve the
+    # explicit-empty burst sentinel across regroups, and the miss-marker
+    # carry-forward below reads the same file.
+    existing = _load_results_json(path) if os.path.exists(path) else None
+    serialized = serialize_results(results, prior_results=existing)
     # Preserve miss_computed_at across reflow/regroup-live saves: it's
     # written by pipeline_job's miss_stage and gates the review UI's
     # "Review misses" shortcut on whether misses were recomputed in
@@ -1164,11 +1320,10 @@ def save_results(results, cache_dir, workspace_id, preserve_miss_marker=True):
     if (
         preserve_miss_marker
         and "miss_computed_at" not in serialized
-        and os.path.exists(path)
+        and existing
+        and existing.get("miss_computed_at")
     ):
-        existing = _load_results_json(path)
-        if existing and existing.get("miss_computed_at"):
-            serialized["miss_computed_at"] = existing["miss_computed_at"]
+        serialized["miss_computed_at"] = existing["miss_computed_at"]
     _atomic_json_dump(serialized, path)
     log.info("Pipeline results saved to %s", path)
     return path
@@ -1322,6 +1477,115 @@ def load_results_raw(cache_dir, workspace_id):
     """
     path = _results_cache_path(cache_dir, workspace_id)
     return _load_results_json(path)
+
+
+def refresh_cache_species_for_photos(
+    cache_dir, workspace_id, species_by_photo, photos_only=False,
+):
+    """Rewrite the on-disk pipeline cache so its per-photo, per-burst, and
+    per-encounter species fields match ``species_by_photo`` — a
+    ``{photo_id: [name, ...]}`` mapping as returned by
+    :meth:`Database.get_species_keywords_for_photos`.
+
+    Called after undo / redo of a species-affecting edit (``keyword_add``,
+    ``keyword_remove``, ``species_replace``, ``prediction_accept``): the DB
+    tags flip back to what they were, but the pipeline cache still reflects
+    the confirm/remove that the edit route wrote in-place. Without this,
+    reloading Process / Rapid Review shows a stale confirmed set even
+    though the keyword is once again attached (or gone).
+
+    An affected burst's ``species_override`` is rebuilt from its fresh
+    photo species, mirroring what :func:`serialize_results` would produce:
+    every photo confirmed as the same set → a confirmed override; every
+    photo empty → the explicit-empty sentinel (so the burst does not
+    silently re-inherit the encounter's confirmed species); non-uniform →
+    ``None`` (inherit encounter). Encounters recompute their
+    ``confirmed_species`` / ``confirmed_species_list`` /
+    ``species_confirmed`` the same way.
+
+    Returns True when the cache changed on disk, False otherwise (no
+    cache, no overlap with the affected ids, or already in sync).
+    """
+
+    if not species_by_photo:
+        return False
+    path = _results_cache_path(cache_dir, workspace_id)
+    data = _load_results_json(path)
+    if data is None:
+        return False
+
+    affected = set(species_by_photo)
+    cached_ids = {p.get("id") for p in data.get("photos", [])}
+    touched_ids = cached_ids & affected
+    if not touched_ids:
+        return False
+
+    for p in data.get("photos", []):
+        if p.get("id") not in touched_ids:
+            continue
+        names = [n for n in (species_by_photo.get(p["id"]) or []) if n]
+        p["confirmed_species"] = names[0] if names else None
+        p["confirmed_species_list"] = list(names)
+
+    photos_by_id = {p.get("id"): p for p in data.get("photos", [])}
+    for enc in data.get("encounters", []) if not photos_only else []:
+        enc_photo_ids = enc.get("photo_ids") or []
+        if not any(pid in touched_ids for pid in enc_photo_ids):
+            continue
+        enc_photos = [
+            photos_by_id[pid] for pid in enc_photo_ids if pid in photos_by_id
+        ]
+        for burst in enc.get("bursts") or []:
+            b_ids = burst.get("photo_ids") or []
+            if not any(pid in touched_ids for pid in b_ids):
+                continue
+            b_photos = [
+                photos_by_id[pid] for pid in b_ids if pid in photos_by_id
+            ]
+            if not b_photos:
+                continue
+            burst["species_override"] = derive_burst_override(b_photos)
+        if _photos_uniformly_confirmed(enc_photos):
+            enc_confirmed_list = _shared_confirmed_species(enc_photos)
+            enc["confirmed_species"] = enc_confirmed_list[0] if enc_confirmed_list else None
+            enc["confirmed_species_list"] = enc_confirmed_list
+            enc["species_confirmed"] = bool(enc_confirmed_list)
+        else:
+            enc_confirmed_list = _shared_confirmed_species(enc_photos)
+            if enc_confirmed_list:
+                enc["confirmed_species"] = enc_confirmed_list[0]
+                enc["confirmed_species_list"] = enc_confirmed_list
+            else:
+                # Fall back to the most-frequent primary, tie-broken by first
+                # appearance so the pick is deterministic (matches
+                # serialize_results).
+                photo_species = [p.get("confirmed_species") for p in enc_photos]
+                counts = defaultdict(int)
+                first_index = {}
+                for idx, s in enumerate(photo_species):
+                    if s:
+                        counts[s] += 1
+                        first_index.setdefault(s, idx)
+                if counts:
+                    top = max(
+                        counts,
+                        key=lambda s: (counts[s], -first_index[s]),
+                    )
+                    enc["confirmed_species"] = top
+                    enc["confirmed_species_list"] = [top]
+                else:
+                    enc["confirmed_species"] = None
+                    enc["confirmed_species_list"] = []
+            enc["species_confirmed"] = False
+
+    refresh_serialized_summary(data)
+    _atomic_json_dump(data, path)
+    log.info(
+        "Pipeline cache species refreshed at %s: %d photo(s)",
+        path,
+        len(touched_ids),
+    )
+    return True
 
 
 def _count_stage_targets(db):

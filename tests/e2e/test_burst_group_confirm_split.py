@@ -731,3 +731,87 @@ def test_species_field_clear_is_not_repopulated(live_server, page):
     expect(page.locator("#grmSpeciesKeywordSummary")).to_contain_text(
         "No species keyword"
     )
+
+
+def test_detached_burst_preserves_explicit_empty_override(live_server, page):
+    """A burst whose species were all removed carries the explicit-empty
+    override ({confirmed: false, species_list: []}). Detaching a frame from
+    it must copy that sentinel onto the new single-photo burst: a null
+    override would make the frame inherit the still-confirmed encounter
+    species even though its database row carries no species tag."""
+    encounter_species = "Northern Harrier"
+    photo_ids = live_server["data"]["photos"][0:3]
+    _write_single_burst_cache(live_server, photo_ids, confirmed_species=encounter_species)
+    empty = {"species": None, "confirmed": False, "species_list": []}
+    cache = _read_cache(live_server)
+    cache["encounters"][0]["bursts"][0]["species_override"] = dict(empty)
+    with open(_cache_path(live_server), "w") as f:
+        json.dump(cache, f)
+
+    _open_burst_modal(page, live_server)
+    # The sentinel is authoritative: the field must not pre-fill the
+    # encounter species, and "Confirm species" must default OFF, or a
+    # culling-only apply would re-tag the species that was just removed.
+    expect(page.locator("#grmSpecies")).to_have_value("")
+    expect(page.locator("#grmConfirmSpeciesChk")).not_to_be_checked()
+
+    second_pid = int(
+        page.locator("#grmOverlay .grm-card[data-photo-id]").nth(1).get_attribute("data-photo-id")
+    )
+    page.locator(f"#grmOverlay .grm-card[data-photo-id='{second_pid}']").click()
+    page.locator("#grmRemoveBtn").click()
+    expect(page.locator("#grmApplyFlagsChk")).to_be_checked()
+
+    with page.expect_response("**/api/pipeline/group/apply"):
+        page.locator("#grmApplyBtn").click()
+    expect(page.locator("#grmOverlay")).not_to_have_class(re.compile(r"\bopen\b"))
+
+    cache = _read_cache(live_server)
+    bursts = cache["encounters"][0]["bursts"]
+    assert len(bursts) == 2, [b["photo_ids"] for b in bursts]
+    detached = next(b for b in bursts if b["photo_ids"] == [second_pid])
+    source = next(b for b in bursts if second_pid not in b["photo_ids"])
+    assert detached["species_override"] == empty, detached["species_override"]
+    assert source["species_override"] == empty, source["species_override"]
+    assert _photos_with_species(live_server, photo_ids, encounter_species) == set()
+
+
+def test_detached_burst_preserves_mixed_authoritative_override(live_server, page):
+    """A mixed burst's unconfirmed-but-authoritative override
+    ({confirmed: false, species_list: [X]}) must be copied onto the
+    split-off single-photo burst by the client-side group detach, not
+    dropped to null (which would inherit the encounter's stale list)."""
+    override_species = "Cooper's Hawk"
+    encounter_species = "Northern Harrier"
+    photo_ids = live_server["data"]["photos"][0:3]
+    _write_single_burst_cache(live_server, photo_ids, confirmed_species=encounter_species)
+    mixed = {"species": override_species, "confirmed": False, "species_list": [override_species]}
+    cache = _read_cache(live_server)
+    cache["encounters"][0]["confirmed_species_list"] = [encounter_species, override_species]
+    cache["encounters"][0]["species_confirmed"] = False
+    cache["encounters"][0]["bursts"][0]["species_override"] = dict(mixed)
+    with open(_cache_path(live_server), "w") as f:
+        json.dump(cache, f)
+    _tag_all(live_server, photo_ids, override_species)
+
+    _open_burst_modal(page, live_server)
+    # The mixed override is the baseline: the untouched field is not a
+    # species change, so "Confirm species" defaults OFF.
+    expect(page.locator("#grmSpecies")).to_have_value(override_species)
+    expect(page.locator("#grmConfirmSpeciesChk")).not_to_be_checked()
+
+    second_pid = int(
+        page.locator("#grmOverlay .grm-card[data-photo-id]").nth(1).get_attribute("data-photo-id")
+    )
+    page.locator(f"#grmOverlay .grm-card[data-photo-id='{second_pid}']").click()
+    page.locator("#grmRemoveBtn").click()
+    expect(page.locator("#grmApplyFlagsChk")).to_be_checked()
+    with page.expect_response("**/api/pipeline/group/apply"):
+        page.locator("#grmApplyBtn").click()
+    expect(page.locator("#grmOverlay")).not_to_have_class(re.compile(r"\bopen\b"))
+
+    bursts = _read_cache(live_server)["encounters"][0]["bursts"]
+    assert len(bursts) == 2, [b["photo_ids"] for b in bursts]
+    detached = next(b for b in bursts if b["photo_ids"] == [second_pid])
+    assert detached["species_override"] == mixed, detached["species_override"]
+    assert _photos_with_species(live_server, photo_ids, encounter_species) == set()

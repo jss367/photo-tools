@@ -3337,3 +3337,279 @@ def test_prune_results_recomputes_missing_timestamp_count(tmp_path):
     enc = loaded["encounters"][0]
     assert enc["photo_count"] == 2
     assert enc["missing_timestamp_count"] == 1
+
+
+def test_serialize_results_two_species_burst_is_confirmed_with_list(tmp_path):
+    """Photos carrying two species each are uniformly confirmed: the burst
+    override and encounter surface the whole list, with the reducer's first
+    entry as the legacy primary."""
+    from pipeline import load_photo_features, run_full_pipeline, serialize_results
+
+    db, ids = _setup_db_with_photos(tmp_path)
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    wigeon = db.add_keyword("American Wigeon", is_species=True)
+    for pid in ids[0]:
+        db.tag_photo(pid, teal)
+        db.tag_photo(pid, wigeon)
+
+    photos = load_photo_features(db)
+    tagged = {p["id"]: p for p in photos if p["id"] in set(ids[0])}
+    for p in tagged.values():
+        assert p["confirmed_species_list"] == ["American Wigeon", "Green-winged Teal"]
+        assert p["confirmed_species"] == "American Wigeon"
+
+    serialized = serialize_results(run_full_pipeline(photos))
+    confirmed_ids = set(ids[0])
+    saw_burst = False
+    for enc in serialized["encounters"]:
+        assert "confirmed_species_list" in enc
+        if set(enc["photo_ids"]) <= confirmed_ids:
+            assert enc["species_confirmed"] is True
+            assert enc["confirmed_species_list"] == ["American Wigeon", "Green-winged Teal"]
+            assert enc["confirmed_species"] == "American Wigeon"
+        for burst in enc.get("bursts", []):
+            if set(burst["photo_ids"]) and set(burst["photo_ids"]) <= confirmed_ids:
+                assert burst["species_override"] == {
+                    "species": "American Wigeon",
+                    "confirmed": True,
+                    "species_list": ["American Wigeon", "Green-winged Teal"],
+                }
+                saw_burst = True
+    assert saw_burst
+
+
+def test_serialize_results_partial_second_species_confirmed_as_shared(tmp_path):
+    """One frame carrying an extra species does not unconfirm the burst: it
+    is confirmed as the species every frame carries (Teal), and the extra
+    stays on that frame's own list."""
+    from pipeline import load_photo_features, run_full_pipeline, serialize_results
+
+    db, ids = _setup_db_with_photos(tmp_path)
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    wigeon = db.add_keyword("American Wigeon", is_species=True)
+    for pid in ids[0]:
+        db.tag_photo(pid, teal)
+    db.tag_photo(ids[0][0], wigeon)
+
+    serialized = serialize_results(run_full_pipeline(load_photo_features(db)))
+    burst_ids = set(ids[0])
+    saw = False
+    for enc in serialized["encounters"]:
+        for burst in enc.get("bursts", []):
+            if set(burst["photo_ids"]) == burst_ids:
+                assert burst["species_override"] == {
+                    "species": "Green-winged Teal",
+                    "confirmed": True,
+                    "species_list": ["Green-winged Teal"],
+                }
+                saw = True
+    assert saw
+    extra = next(p for p in serialized["photos"] if p["id"] == ids[0][0])
+    assert extra["confirmed_species_list"] == ["American Wigeon", "Green-winged Teal"]
+
+
+def test_serialize_results_mixed_encounter_baseline_is_shared_species(tmp_path):
+    """One frame [Wigeon, Teal] beside frames [Teal]: the encounter is
+    confirmed as the shared Teal, not the alphabetically-first Wigeon of one
+    frame, and the extra Wigeon stays on that frame."""
+    from pipeline import load_photo_features, run_full_pipeline, serialize_results
+
+    db, ids = _setup_db_with_photos(tmp_path)
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    wigeon = db.add_keyword("American Wigeon", is_species=True)
+    for pid in ids[0]:
+        db.tag_photo(pid, teal)
+    db.tag_photo(ids[0][0], wigeon)
+
+    serialized = serialize_results(run_full_pipeline(load_photo_features(db)))
+    burst_ids = set(ids[0])
+    enc = next(e for e in serialized["encounters"] if burst_ids <= set(e["photo_ids"]))
+    if set(enc["photo_ids"]) == burst_ids:
+        assert enc["species_confirmed"] is True
+        assert enc["confirmed_species"] == "Green-winged Teal"
+        assert enc["confirmed_species_list"] == ["Green-winged Teal"]
+    for burst in enc.get("bursts", []):
+        if set(burst["photo_ids"]) == burst_ids:
+            assert burst["species_override"] == {
+                "species": "Green-winged Teal",
+                "confirmed": True,
+                "species_list": ["Green-winged Teal"],
+            }
+
+
+def test_serialize_results_preserves_explicit_empty_burst_after_regroup(tmp_path):
+    """A burst whose last species was removed carries an explicit-empty
+    override; when the next regroup rebuilds bursts from DB photos alone,
+    those same untagged photos must keep the sentinel so they do not
+    inherit their encounter's confirmed species again."""
+    from pipeline import load_photo_features, run_full_pipeline, serialize_results
+
+    db, ids = _setup_db_with_photos(tmp_path)
+    # Photos in encounter 0 are untagged (the "explicitly cleared" burst);
+    # encounter 1's photos are tagged as Teal so regrouping is unaffected.
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    for pid in ids[1]:
+        db.tag_photo(pid, teal)
+
+    # Prior cache marks encounter-0's photos as explicit-empty.
+    prior = {
+        "encounters": [
+            {
+                "photo_ids": list(ids[0]),
+                "bursts": [
+                    {
+                        "photo_ids": list(ids[0]),
+                        "species_override": {
+                            "species": None,
+                            "confirmed": False,
+                            "species_list": [],
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+    serialized = serialize_results(
+        run_full_pipeline(load_photo_features(db)),
+        prior_results=prior,
+    )
+    empty_ids = set(ids[0])
+    found = False
+    for enc in serialized["encounters"]:
+        for burst in enc.get("bursts", []):
+            if set(burst["photo_ids"]) == empty_ids:
+                assert burst["species_override"] == {
+                    "species": None,
+                    "confirmed": False,
+                    "species_list": [],
+                }
+                found = True
+    assert found, "explicit-empty burst should survive regroup"
+
+    # A regroup without the prior cache falls back to None (the previous
+    # behavior): the sentinel only survives when it can be traced back.
+    serialized_no_prior = serialize_results(
+        run_full_pipeline(load_photo_features(db)),
+    )
+    for enc in serialized_no_prior["encounters"]:
+        for burst in enc.get("bursts", []):
+            if set(burst["photo_ids"]) == empty_ids:
+                assert burst["species_override"] is None
+
+
+def test_serialize_results_disjoint_tagged_burst_gets_empty_override(tmp_path):
+    """Frames all tagged but sharing nothing ([Gadwall] / [Wigeon]) have an
+    empty shared set: the burst gets the explicit-empty sentinel instead of
+    inheriting whatever its encounter records."""
+    from pipeline import load_photo_features, run_full_pipeline, serialize_results
+
+    db, ids = _setup_db_with_photos(tmp_path)
+    gadwall = db.add_keyword("Gadwall", is_species=True)
+    wigeon = db.add_keyword("American Wigeon", is_species=True)
+    burst = ids[0]
+    assert len(burst) >= 2
+    db.tag_photo(burst[0], gadwall)
+    for pid in burst[1:]:
+        db.tag_photo(pid, wigeon)
+
+    serialized = serialize_results(run_full_pipeline(load_photo_features(db)))
+    burst_ids = set(burst)
+    saw = False
+    for enc in serialized["encounters"]:
+        for b in enc.get("bursts", []):
+            if set(b["photo_ids"]) == burst_ids:
+                assert b["species_override"] == {
+                    "species": None, "confirmed": False, "species_list": [],
+                }
+                saw = True
+    assert saw
+
+
+# -- derive_burst_override / auto_detach_burst_for_species (multi-species) --
+
+
+def _species_photo(pid, names):
+    return {"id": pid, "confirmed_species": names[0] if names else None,
+            "confirmed_species_list": list(names)}
+
+
+def test_derive_burst_override_confirms_shared_set_in_preferred_order():
+    from pipeline import derive_burst_override
+
+    photos = [_species_photo(1, ["Teal", "Wigeon"]), _species_photo(2, ["Wigeon", "Teal", "Gadwall"])]
+    assert derive_burst_override(photos) == {
+        "species": "Teal", "confirmed": True, "species_list": ["Teal", "Wigeon"],
+    }
+    assert derive_burst_override(photos, preferred_order=["Wigeon"]) == {
+        "species": "Wigeon", "confirmed": True, "species_list": ["Wigeon", "Teal"],
+    }
+
+
+def test_derive_burst_override_sentinels_and_inherit():
+    from pipeline import derive_burst_override
+    from pipeline_results import empty_species_override
+
+    # Every frame tagged, nothing shared → the burst's own set is empty.
+    assert derive_burst_override(
+        [_species_photo(1, ["Teal"]), _species_photo(2, ["Wigeon"])]
+    ) == empty_species_override()
+    # Every frame untagged → explicit empty, never inherit the encounter.
+    assert derive_burst_override(
+        [_species_photo(1, []), _species_photo(2, [])]
+    ) == empty_species_override()
+    # Some tagged, some not → inherit the encounter.
+    assert derive_burst_override(
+        [_species_photo(1, ["Teal"]), _species_photo(2, [])]
+    ) is None
+    assert derive_burst_override([]) is None
+
+
+def test_auto_detach_does_not_promote_candidate_override_to_confirmed_species():
+    """A detach-time candidate ({"species": guess, "confirmed": False}, no
+    list) is a classifier hint; detaching that burst for a new species must
+    not carry the guess into the new encounter's confirmed list."""
+    from pipeline_results import auto_detach_burst_for_species
+
+    results = {
+        "photos": [
+            {"id": i, "timestamp": f"2026-01-01T10:00:0{i}", "species_top5": []}
+            for i in range(1, 5)
+        ],
+        "encounters": [{
+            "species": ["Teal", 0.9],
+            "confirmed_species": "Teal",
+            "confirmed_species_list": ["Teal"],
+            "species_predictions": [],
+            "species_confirmed": True,
+            "photo_count": 4,
+            "burst_count": 2,
+            "time_range": ["2026-01-01T10:00:01", "2026-01-01T10:00:04"],
+            "photo_ids": [1, 2, 3, 4],
+            "bursts": [
+                {"photo_ids": [1, 2], "species_predictions": [],
+                 "species_override": {"species": "Gadwall", "confirmed": False}},
+                {"photo_ids": [3, 4], "species_predictions": [], "species_override": None},
+            ],
+        }],
+        "summary": {},
+    }
+    auto_detach_burst_for_species(results, 0, 0, "Wigeon")
+    new_enc = next(e for e in results["encounters"] if e["photo_ids"] == [1, 2])
+    assert new_enc["species_confirmed"] is True
+    assert new_enc["confirmed_species"] == "Wigeon"
+    assert new_enc["confirmed_species_list"] == ["Wigeon"]
+
+    # A genuinely confirmed second species on the burst does carry over.
+    results["encounters"] = [{
+        **results["encounters"][0],
+        "photo_ids": [1, 2, 3, 4], "photo_count": 4, "burst_count": 2,
+        "bursts": [
+            {"photo_ids": [1, 2], "species_predictions": [],
+             "species_override": {"species": "Teal", "confirmed": True,
+                                  "species_list": ["Teal", "Gadwall"]}},
+            {"photo_ids": [3, 4], "species_predictions": [], "species_override": None},
+        ],
+    }]
+    auto_detach_burst_for_species(results, 0, 0, "Wigeon")
+    new_enc = next(e for e in results["encounters"] if e["photo_ids"] == [1, 2])
+    assert new_enc["confirmed_species_list"] == ["Wigeon", "Teal", "Gadwall"]

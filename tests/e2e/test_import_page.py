@@ -2497,6 +2497,68 @@ def test_import_after_move_hint_blames_the_right_field(live_server, page):
     expect(row).to_be_visible()
 
 
+def test_import_after_move_recovers_when_archive_root_is_created(
+    live_server, page,
+):
+    """Archive-root presence is fetched with the target list; if the user
+    creates the folder mid-session (Finder, the Settings "Create folder"
+    button), the gate must re-check instead of insisting the root is
+    missing until a full reload."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+    state = {"present": False, "fetches": 0}
+
+    def remote_targets(route):
+        state["fetches"] += 1
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": [{
+                    "id": "nas1",
+                    "name": "Photo NAS",
+                    "user": "photo",
+                    "host": "nas.local",
+                    "remote_path": "/volume1/Photography",
+                    "mount_path": "/Volumes/Photography",
+                    "local_archive_root": "/Users/me/Pictures/Vireo Archive",
+                    "local_archive_root_present": state["present"],
+                }],
+            }),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    hint = page.locator("#afterMoveUnavailable")
+    row = page.locator("#afterMoveRow")
+    expect(hint).to_contain_text("does not exist on this machine")
+    expect(row).to_be_hidden()
+
+    # The folder now exists on disk. Expire the throttle (the test should
+    # not have to sleep through it) and touch the destination like the
+    # native picker does — an input event, not a reload.
+    state["present"] = True
+    page.evaluate("() => { _archiveRootPresenceCheckedAt = 0; }")
+    page.locator("#destInput").dispatch_event("input")
+
+    expect(row).to_be_visible()
+    expect(hint).to_be_hidden()
+    assert state["fetches"] >= 2
+
+
 def test_import_new_workspace_shows_target_default_in_after_import_display(
     live_server, page
 ):

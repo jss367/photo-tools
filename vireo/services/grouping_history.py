@@ -10,6 +10,31 @@ class GroupingHistoryConflict(ValueError):
     """A newer grouping cannot safely be replaced by an older history entry."""
 
 
+# Fields that ``/api/encounters/species`` mutates on the pipeline cache
+# without changing encounter structure. Undo is strict LIFO, so any
+# species edit that landed after a grouping edit has already been reverted
+# by the time we compare snapshots here — its leftover cache state is not
+# "newer work" that a grouping undo would silently overwrite.
+_CACHE_SPECIES_ENCOUNTER_FIELDS = ("confirmed_species", "species_confirmed")
+_CACHE_SPECIES_BURST_FIELDS = ("species_override",)
+
+
+def _grouping_signature(encounters):
+    """Return an encounters snapshot without cache-only species fields."""
+    signature = []
+    for enc in encounters or []:
+        stripped = {
+            k: v for k, v in enc.items()
+            if k not in _CACHE_SPECIES_ENCOUNTER_FIELDS and k != "bursts"
+        }
+        stripped["bursts"] = [
+            {k: v for k, v in b.items() if k not in _CACHE_SPECIES_BURST_FIELDS}
+            for b in enc.get("bursts", [])
+        ]
+        signature.append(stripped)
+    return signature
+
+
 def save_grouping_edit(db, before, after, description):
     """Save a detach and its history together, restoring the cache on failure.
 
@@ -44,8 +69,11 @@ def save_grouping_edit(db, before, after, description):
 def restore_grouping_edit(db, entry, *, undo):
     """Restore structure, retaining history if the write/commit fails.
 
-    Refuse a stale snapshot after recomputation or a later structural/species
-    edit instead of silently erasing that work.
+    Refuse a stale snapshot after recomputation or a later structural edit
+    instead of silently erasing that work. A leftover cache-only species
+    override or confirmation from an already-reverted species edit is not a
+    conflict — undo is strict LIFO, so any species entry newer than this
+    grouping entry has already been undone by the time we get here.
     """
     from pipeline import load_results_raw, save_results_raw
     from pipeline_locks import acquire_workspace_regroup
@@ -62,7 +90,7 @@ def restore_grouping_edit(db, entry, *, undo):
         change = json.loads(entry["new_value"])
         expected = change["after" if undo else "before"]
         target = change["before" if undo else "after"]
-        if current is None or current.get("encounters") != expected:
+        if current is None or _grouping_signature(current.get("encounters")) != _grouping_signature(expected):
             raise GroupingHistoryConflict(
                 "The photo groups have changed since this edit. "
                 "These groups cannot be restored without replacing newer work."

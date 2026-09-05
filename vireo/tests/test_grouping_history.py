@@ -80,10 +80,11 @@ def test_grouping_restore_preserves_new_photo_metadata(app_and_db):
 def test_stale_grouping_undo_retains_history_and_newer_work(app_and_db):
     app, db = app_and_db
     client = app.test_client()
-    _seed(db)
+    ids, _ = _seed(db)
     _detach(client)
     updated = _load(db)
-    updated['encounters'][0]['confirmed_species'] = 'New species'
+    # Structural change (a burst split) is real newer work — refuse.
+    updated['encounters'][0]['bursts'].append({'photo_ids': [ids[0]]})
     save_results_raw(updated, os.path.dirname(db._db_path), db._ws_id())
     response = client.post('/api/undo')
     assert response.status_code == 409
@@ -91,6 +92,32 @@ def test_stale_grouping_undo_retains_history_and_newer_work(app_and_db):
     assert _load(db) == updated
     assert client.get('/api/undo/status').json['count'] == 1
     assert client.get('/api/redo/status').json['available'] is False
+
+
+def test_grouping_undo_tolerates_reverted_species_cache_state(app_and_db):
+    """A species edit's leftover cache does not block a later grouping undo.
+
+    ``/api/encounters/species`` writes ``confirmed_species`` /
+    ``species_override`` into the cache but records its DB revert as an
+    ordinary undoable edit. After that species edit is undone, its cache
+    state remains — undo is strict LIFO, so a subsequent grouping undo is
+    not overwriting active newer work and must succeed.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    ids, original = _seed(db)
+    _detach(client)
+    detached = _load(db)
+    updated = copy.deepcopy(detached)
+    updated['encounters'][0]['confirmed_species'] = 'New species'
+    updated['encounters'][0]['species_confirmed'] = True
+    updated['encounters'][0]['bursts'][0]['species_override'] = {
+        'species': 'New species', 'confirmed': True,
+    }
+    save_results_raw(updated, os.path.dirname(db._db_path), db._ws_id())
+    response = client.post('/api/undo')
+    assert response.status_code == 200, response.get_json()
+    assert _load(db)['encounters'] == original['encounters']
 
 
 @pytest.mark.parametrize('operation', ['undo', 'redo'])

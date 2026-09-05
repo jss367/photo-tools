@@ -12295,7 +12295,7 @@ function formatDuration(seconds) {
   var _origSafeFetch = safeFetch;
   safeFetch = function(url, opts, options) {
     var mutation = opts && opts.method && /^(POST|PUT|PATCH|DELETE)$/i.test(opts.method);
-    var historyWrite = mutation && /\/(rating|flag|color_label|keywords|edit-recipe|batch\/|predictions\/|culling\/|species\/label-cluster|encounters\/species|sync\/discard|pipeline\/(detach-|group\/apply))/.test(url);
+    var historyWrite = mutation && /\/(rating|flag|color_label|keywords|edit-recipe|batch\/|predictions\/|culling\/|misses\/reject|highlights\/(confirm|relabel)|species\/label-cluster|encounters\/species|sync\/discard|pipeline\/(detach-|group\/apply)|photos\/\d+\/(wildlife_excluded|location))/.test(url);
     if (historyWrite && historyBusy) {
       var error = new Error('Undo or redo is still finishing — try again in a moment');
       if (!options || options.toast !== false) showToast(error.message, 'warning');

@@ -16028,7 +16028,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             comparison_prediction, stored_prediction = resolved_names(
                 d["species"]
             )
-            source_identity = species_resolver.prediction(d) if d.get("source_taxon_id") else None
+            native_identity = d.get("labels_fingerprint") == "tol" or model.startswith("iNat")
+            source_identity = species_resolver.prediction(d) if d.get("source_taxon_id") or native_identity else None
             comparison = compare_prediction_to_keywords(
                 source_identity.scientific_name if source_identity else comparison_prediction,
                 species_by_photo.get(pid, []),

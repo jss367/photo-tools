@@ -24175,3 +24175,30 @@ def test_pipeline_results_overlay_refreshes_confirmed_species_list(app_and_db):
     assert not any(
         "American Wigeon" in photos[pid]["confirmed_species_list"] for pid in photo_ids
     ), "the stale cached second species must not survive the overlay"
+
+
+def test_compare_keeps_native_scientific_identities_with_shared_common_name(app_and_db, tmp_path):
+    from unittest.mock import patch
+
+    from taxonomy import Taxonomy
+
+    app, db = app_and_db
+    photo_id = db.conn.execute("SELECT id FROM photos ORDER BY id LIMIT 1").fetchone()["id"]
+    det_id = db.save_detections(photo_id, [
+        {"box": {"x": .1, "y": .1, "w": .3, "h": .3}, "confidence": .9},
+    ], detector_model="MDV6")[0]
+    entries = []
+    for model, tid, sci in [("BioCLIP", 10, "First species"), ("iNat21", 20, "Second species")]:
+        db.add_prediction(det_id, "Shared name", .9, model, labels_fingerprint="tol",
+                          taxonomy={"scientific_name": sci})
+        entries.append({"taxon_id": tid, "scientific_name": sci, "common_name": "Shared name", "rank": "species"})
+    path = tmp_path / "taxonomy.json"
+    path.write_text(json.dumps({"taxa_by_common": {}, "ambiguous_common_names": ["shared name"],
+                                "taxa_by_scientific": {e["scientific_name"].lower(): e for e in entries}}))
+    cid = db.add_collection("Native identities", json.dumps([{"field": "photo_ids", "value": [photo_id]}]))
+    with patch("taxonomy.load_local_taxonomy", return_value=Taxonomy(path)):
+        response = app.test_client().get(f"/api/predictions/compare?collection_id={cid}")
+    assert response.status_code == 200
+    predictions = response.get_json()["photos"][0]["predictions"]
+    assert predictions["BioCLIP"][0]["canonical_species"] == "taxon:10"
+    assert predictions["iNat21"][0]["canonical_species"] == "taxon:20"

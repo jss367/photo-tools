@@ -26932,7 +26932,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     is_batch=len(newly_tagged) > 1,
                     _commit=False,
                 )
-            elif cached and target_enc is not None:
+            cache_only_write = (
+                not (is_replacement and had_old)
+                and not newly_tagged
+                and cached
+                and target_enc is not None
+            )
+            if cache_only_write:
                 # No keyword row was recorded (every photo already carries
                 # this species), but the cache mutation below will still
                 # write ``confirmed_species`` / ``species_confirmed`` (or a
@@ -26941,9 +26947,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # undoable row and its undo would silently discard this
                 # confirmation because grouping signatures ignore these
                 # species fields by design. Record the cache-only write so
-                # LIFO undo reverts it first. Skip when auto-detach will
-                # fire — that path is a structural change owned by
-                # ``save_grouping_edit`` callers, not this cache write.
+                # LIFO undo reverts it first. When auto-detach will fire
+                # the structural change is recorded via ``save_grouping_edit``
+                # further down instead.
                 if burst_index is not None:
                     burst_target = target_enc["bursts"][burst_index]
                     current_override = burst_target.get("species_override")
@@ -26981,44 +26987,86 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             burst_index=None,
                             submitted_photo_ids=photo_ids,
                         )
+
+            # Apply the pipeline-cache mutation and persist inside the same
+            # transaction so a failed ``save_results_raw`` rolls back the
+            # species/keyword edits that would otherwise leave undo pointing
+            # at a change that never landed on disk. ``burst_index`` was
+            # validated above, so the branch here is unambiguous: burst-
+            # scoped requests only touch the burst override, encounter-
+            # scoped requests only touch the encounter.
+            auto_detach_recorded = False
+            if cached and target_enc is not None:
+                if burst_index is not None:
+                    # Auto-detach if burst's confirmed species differs from
+                    # its encounter — splits it out and merges into an
+                    # adjacent encounter of the same confirmed species when
+                    # one exists. Compare with keyword_match_key so a cached
+                    # pre-normalization spelling (e.g. ‘Apapane) does not
+                    # trigger a needless split against the stored species
+                    # (Apapane); the DB write already normalized to the
+                    # canonical form.
+                    enc_species = target_enc.get("confirmed_species") or (
+                        target_enc["species"][0]
+                        if target_enc.get("species") else None
+                    )
+                    will_auto_detach = (
+                        enc_species is not None
+                        and keyword_match_key(enc_species)
+                            != keyword_match_key(species)
+                        and len(target_enc["bursts"]) > 1
+                    )
+                    target_enc["bursts"][burst_index]["species_override"] = {
+                        "species": species,
+                        "confirmed": True,
+                    }
+                    if will_auto_detach and cache_only_write:
+                        # Persist the cache-only auto-detach as a grouping
+                        # edit so ``restore_grouping_edit`` can reverse the
+                        # burst move on undo. Without this, the structural
+                        # change would silently bypass undo (no keyword
+                        # history row is recorded in this branch either)
+                        # and a later undo would pop an unrelated older
+                        # edit instead. ``save_grouping_edit`` records
+                        # history, saves the cache, and commits atomically
+                        # (rolling back both on failure), so we skip the
+                        # plain save below.
+                        from services.grouping_history import (
+                            save_grouping_edit,
+                        )
+                        # ``before_cached`` captures the pre-auto-detach
+                        # structure (with the just-applied override) so
+                        # save_grouping_edit's signature diff isolates the
+                        # burst move; the override itself is stripped by
+                        # ``_grouping_signature``.
+                        before_cached = copy.deepcopy(cached)
+                        auto_detach_burst_for_species(
+                            cached, target_enc_idx, burst_index, species
+                        )
+                        if before_cached["encounters"] != cached["encounters"]:
+                            save_grouping_edit(
+                                db, before_cached, cached,
+                                f'Confirmed species "{species}" on 1 burst',
+                            )
+                            auto_detach_recorded = True
+                    elif will_auto_detach:
+                        auto_detach_burst_for_species(
+                            cached, target_enc_idx, burst_index, species
+                        )
+                else:
+                    target_enc["species_confirmed"] = True
+                    target_enc["confirmed_species"] = species
+                if not auto_detach_recorded:
+                    save_results_raw(
+                        cached, cache_dir, db._active_workspace_id,
+                    )
+
             db.conn.commit()
         except Exception:
             db.conn.rollback()
             raise
         # Prune oldest edit-history rows now that the transaction has landed.
         db._prune_edit_history()
-
-        # Update pipeline cache. burst_index was validated above, so the
-        # branch here is unambiguous: burst-scoped requests only touch the
-        # burst override, encounter-scoped requests only touch the encounter.
-        if cached and target_enc is not None:
-            if burst_index is not None:
-                target_enc["bursts"][burst_index]["species_override"] = {
-                    "species": species,
-                    "confirmed": True,
-                }
-                # Auto-detach if burst's confirmed species differs from its
-                # encounter — splits it out and merges into an adjacent
-                # encounter of the same confirmed species when one exists.
-                # Compare with keyword_match_key so a cached pre-normalization
-                # spelling (e.g. ‘Apapane) does not trigger a needless split
-                # against the stored species (Apapane); the DB write already
-                # normalized to the canonical form.
-                enc_species = target_enc.get("confirmed_species") or (
-                    target_enc["species"][0] if target_enc.get("species") else None
-                )
-                if (
-                    enc_species is not None
-                    and keyword_match_key(enc_species) != keyword_match_key(species)
-                    and len(target_enc["bursts"]) > 1
-                ):
-                    auto_detach_burst_for_species(
-                        cached, target_enc_idx, burst_index, species
-                    )
-            else:
-                target_enc["species_confirmed"] = True
-                target_enc["confirmed_species"] = species
-            save_results_raw(cached, cache_dir, db._active_workspace_id)
 
         # Report `replaced` consistent with the actual replacement decision
         # (is_replacement, which uses keyword_match_key to match SQLite's

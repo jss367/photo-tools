@@ -269,11 +269,21 @@ def restore_species_confirm_cache_edit(db, entry, *, undo):
                     "This confirmation cannot be restored."
                 )
             if undo:
-                prev = change.get("previous_burst_override")
-                if prev is None:
-                    target_burst.pop("species_override", None)
-                else:
-                    target_burst["species_override"] = copy.deepcopy(prev)
+                # ``clearBurstOverride`` and other untracked writes can land
+                # after this confirmation with no history entry of their own.
+                # If the current override no longer matches the after-state
+                # this entry produced, restoring the recorded previous value
+                # would silently discard that newer user action. Preserve
+                # whatever the cache already holds in that case.
+                expected_after = {
+                    "species": change["species"], "confirmed": True,
+                }
+                if target_burst.get("species_override") == expected_after:
+                    prev = change.get("previous_burst_override")
+                    if prev is None:
+                        target_burst.pop("species_override", None)
+                    else:
+                        target_burst["species_override"] = copy.deepcopy(prev)
             else:
                 target_burst["species_override"] = {
                     "species": change["species"], "confirmed": True,
@@ -281,12 +291,22 @@ def restore_species_confirm_cache_edit(db, entry, *, undo):
         else:
             prev_state = change.get("previous_encounter_state") or {}
             if undo:
-                prev_species = prev_state.get("confirmed_species")
-                if prev_species is None:
-                    enc.pop("confirmed_species", None)
-                else:
-                    enc["confirmed_species"] = prev_species
-                enc["species_confirmed"] = bool(prev_state.get("species_confirmed"))
+                # Mirror the burst path: an untracked write that already
+                # displaced this confirmation's after-state must not be
+                # silently rewound to the recorded previous value.
+                current_matches_after = (
+                    enc.get("confirmed_species") == change["species"]
+                    and bool(enc.get("species_confirmed"))
+                )
+                if current_matches_after:
+                    prev_species = prev_state.get("confirmed_species")
+                    if prev_species is None:
+                        enc.pop("confirmed_species", None)
+                    else:
+                        enc["confirmed_species"] = prev_species
+                    enc["species_confirmed"] = bool(
+                        prev_state.get("species_confirmed")
+                    )
             else:
                 enc["confirmed_species"] = change["species"]
                 enc["species_confirmed"] = True

@@ -350,6 +350,143 @@ def test_cache_only_species_confirm_is_undone_before_older_grouping_edit(app_and
     assert replayed_match.get('species_confirmed') is True
 
 
+def test_cache_only_burst_confirm_that_auto_detaches_is_undoable(app_and_db):
+    """A cache-only burst confirmation that triggers auto-detach records history.
+
+    When every photo in a multi-burst encounter already carries a species
+    different from the encounter's confirmed species, ``/api/encounters/species``
+    would restructure the cache via ``auto_detach_burst_for_species`` without
+    recording any keyword change. Before this fix the structural change was
+    invisible to undo, so pressing Undo popped an unrelated older edit.
+    The route now persists the auto-detach as a grouping edit so undo
+    reverses the burst move and re-attaches it to its original encounter.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    ids, _ = _seed(db)
+    # Tag every photo with Cardinal so the first burst carries a species
+    # that differs from the encounter's confirmed one.
+    kid = db.conn.execute(
+        "SELECT id FROM keywords WHERE name = ? COLLATE NOCASE", ('Cardinal',),
+    ).fetchone()[0]
+    for pid in ids:
+        with contextlib.suppress(Exception):
+            db.tag_photo(pid, kid, source='manual')
+    db.conn.commit()
+    # Seed the cache so the encounter is confirmed as Sparrow — the confirm
+    # below asks for Cardinal on burst 0, which triggers auto-detach.
+    seeded = _load(db)
+    seeded['encounters'][0]['confirmed_species'] = 'Sparrow'
+    seeded['encounters'][0]['species_confirmed'] = True
+    save_results_raw(seeded, os.path.dirname(db._db_path), db._ws_id())
+
+    burst_photo_ids = ids[:2]
+    response = client.post('/api/encounters/species', json={
+        'species': 'Cardinal',
+        'photo_ids': burst_photo_ids,
+        'burst_index': 0,
+    })
+    assert response.status_code == 200, response.get_json()
+    after_confirm = _load(db)
+    # Auto-detach split the burst into its own encounter with Cardinal.
+    assert len(after_confirm['encounters']) == 2
+    assert client.get('/api/undo/status').json['count'] == 1
+
+    assert client.post('/api/undo').status_code == 200, \
+        'auto-detach must be reversible via undo'
+    restored = _load(db)
+    assert len(restored['encounters']) == 1
+    assert sorted(restored['encounters'][0]['photo_ids']) == sorted(ids)
+
+    assert client.post('/api/redo').status_code == 200
+    replayed = _load(db)
+    assert len(replayed['encounters']) == 2
+
+
+def test_cache_only_confirm_rolls_back_when_cache_write_fails(
+    app_and_db, monkeypatch,
+):
+    """A failed cache save rolls back the species_confirm_cache history row.
+
+    ``record_species_confirm_cache`` is committed with the rest of the
+    request. If ``save_results_raw`` fails afterward, the DB row must roll
+    back too — otherwise Undo would report a change that never landed on
+    disk, and Redo could re-apply a confirmation the user never saw.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    ids, _ = _seed(db)
+    kid = db.conn.execute(
+        "SELECT id FROM keywords WHERE name = ? COLLATE NOCASE", ('Cardinal',),
+    ).fetchone()[0]
+    for pid in ids:
+        with contextlib.suppress(Exception):
+            db.tag_photo(pid, kid, source='manual')
+    db.conn.commit()
+
+    before_count = client.get('/api/undo/status').json['count']
+    before_cache = _load(db)
+    with monkeypatch.context() as patch:
+        def fail(*args, **kwargs):
+            raise OSError('Disk full')
+        patch.setattr('pipeline.save_results_raw', fail)
+        response = client.post('/api/encounters/species', json={
+            'species': 'Cardinal',
+            'photo_ids': ids,
+        })
+        assert response.status_code == 500
+    # The failed request must not leave a species_confirm_cache entry
+    # sitting in undo history for a change that never happened.
+    assert client.get('/api/undo/status').json['count'] == before_count
+    assert _load(db) == before_cache
+
+
+def test_burst_confirm_undo_preserves_cleared_override(app_and_db):
+    """Undoing a cache-only burst confirmation preserves a later clear.
+
+    After a cache-only burst confirmation, ``clearBurstOverride`` can
+    write ``species_override = None`` through ``/api/pipeline/save-cache``
+    without a history entry. Undoing the still-latest confirmation must
+    not blindly restore the recorded previous override — that would
+    silently resurrect a state the user cleared.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    ids, _ = _seed(db)
+    kid = db.conn.execute(
+        "SELECT id FROM keywords WHERE name = ? COLLATE NOCASE", ('Cardinal',),
+    ).fetchone()[0]
+    for pid in ids:
+        with contextlib.suppress(Exception):
+            db.tag_photo(pid, kid, source='manual')
+    db.conn.commit()
+    # Seed a burst-level previous override so undo of the confirmation
+    # would (before the fix) restore it and overwrite the user's clear.
+    seeded = _load(db)
+    seeded['encounters'][0]['bursts'][0]['species_override'] = {
+        'species': 'Old', 'confirmed': True,
+    }
+    save_results_raw(seeded, os.path.dirname(db._db_path), db._ws_id())
+
+    burst_photo_ids = ids[:2]
+    response = client.post('/api/encounters/species', json={
+        'species': 'Cardinal',
+        'photo_ids': burst_photo_ids,
+        'burst_index': 0,
+    })
+    assert response.status_code == 200, response.get_json()
+    # Simulate ``clearBurstOverride``: user picks "Use encounter label",
+    # save-cache writes ``species_override = None`` with no history.
+    cleared = _load(db)
+    cleared['encounters'][0]['bursts'][0]['species_override'] = None
+    response = client.post('/api/pipeline/save-cache', json=cleared)
+    assert response.status_code == 200
+
+    assert client.post('/api/undo').status_code == 200
+    restored = _load(db)
+    assert restored['encounters'][0]['bursts'][0].get('species_override') is None
+
+
 def test_grouping_history_is_workspace_scoped(app_and_db):
     app, db = app_and_db
     client = app.test_client()

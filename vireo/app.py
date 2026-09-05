@@ -11920,7 +11920,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         ``docs/plans/2026-05-06-classification-inventory-design.md``.
         """
         import config as cfg
-        from labels import LABELS_DIR, get_saved_labels  # noqa: F401
+        from labels import get_saved_labels, load_merged_labels, read_label_file
         from labels_fingerprint import TOL_SENTINEL, compute_fingerprint
         from models import get_models
 
@@ -11950,8 +11950,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 continue
             seen_paths.add(path)
             try:
-                with open(path) as fh:
-                    species = [ln.strip() for ln in fh if ln.strip()]
+                species = read_label_file(path)
+                if species.identities:
+                    species = load_merged_labels([ls])
             except OSError:
                 continue
             label_sets.append({
@@ -12079,10 +12080,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if not all(os.path.exists(s) for s in sources):
                 continue
             try:
-                merged = []
-                for s in sources:
-                    with open(s) as fh:
-                        merged.extend(ln.strip() for ln in fh if ln.strip())
+                merged = load_merged_labels([{"labels_file": source} for source in sources])
             except OSError:
                 continue
             if compute_fingerprint(merged) == row["fingerprint"]:

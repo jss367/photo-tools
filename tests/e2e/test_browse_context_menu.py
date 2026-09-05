@@ -323,6 +323,10 @@ def test_browse_selection_review_marks_the_active_photos_eye(live_server, page):
         "() => document.querySelector('#grmOverlay.open')",
         timeout=5000,
     )
+    # The overlay opens before /group/state finishes seeding its selection.
+    # Wait before clearing it, or a late seed can reselect the first photo
+    # and turn the click below into a deselection (leaving the loupe empty).
+    page.wait_for_function("() => grmState.seeded")
     page.evaluate(
         "png => { window.grmPhotoUrl = () => 'data:image/png;base64,' + png; }",
         _PNG_1X1,

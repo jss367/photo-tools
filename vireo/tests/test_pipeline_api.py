@@ -2434,12 +2434,15 @@ def test_pipeline_accepts_skip_classify(setup):
 def test_pipeline_accepts_preview_max_size(setup):
     """Pipeline endpoint should accept preview_max_size parameter."""
     app, db_path = setup
-    with app.test_client() as c:
+    with patch("pipeline_job.run_pipeline_job", return_value={}) as run, app.test_client() as c:
         resp = c.post("/api/jobs/pipeline", json={
             "collection_id": 1,
             "preview_max_size": 2560,
         })
         assert resp.status_code == 200
+        job = wait_for_job_via_client(c, resp.get_json()["job_id"])
+        assert job["status"] == "completed"
+        assert run.call_args.args[4].preview_max_size == 2560
 
 
 def test_destination_preview_returns_folder_structure(setup, tmp_path):

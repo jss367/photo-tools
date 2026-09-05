@@ -1671,3 +1671,43 @@ def test_rapid_review_prefill_ignores_candidate_override_under_confirmed_encount
     with page.expect_response("**/api/pipeline/save-cache"):
         page.locator("#applyBtn").click()
     assert species_payloads == []
+
+
+def test_rapid_review_flag_only_apply_keeps_mixed_frames_second_species(live_server, page):
+    """A mixed encounter (one frame [A, B], another [A]) is not uniformly
+    confirmed but still records [A] as its list. A flag-only apply must
+    treat [A] as the baseline: no species request, and the cached frame
+    that also carries B keeps it."""
+    species_payloads = []
+    save_payloads = []
+    results = _two_species_results()
+    results["photos"][0]["confirmed_species_list"] = ["American Wigeon", "Green-winged Teal"]
+    for p in results["photos"][1:]:
+        p["confirmed_species_list"] = ["American Wigeon"]
+    enc = results["encounters"][0]
+    enc["species_confirmed"] = False
+    enc["confirmed_species"] = "American Wigeon"
+    enc["confirmed_species_list"] = ["American Wigeon"]
+    enc["bursts"][0]["species_override"] = None
+    state = {
+        str(pid): {"flag": "none", "has_species_keyword": True,
+                   "has_species_keywords": {"American Wigeon": True}}
+        for pid in (1, 2, 3)
+    }
+    _mock_pipeline_rapid_review(
+        page, results=results, state_photos=state,
+        species_payloads=species_payloads, save_payloads=save_payloads,
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon")
+    expect(page.locator(".reason-chip", has_text="Mixed species")).to_be_visible()
+
+    page.keyboard.press("p")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Flag 1")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+
+    assert species_payloads == []
+    saved = {p["id"]: p for p in save_payloads[-1]["photos"]}
+    assert saved[1]["confirmed_species_list"] == ["American Wigeon", "Green-winged Teal"]
+    assert saved[2]["confirmed_species_list"] == ["American Wigeon"]

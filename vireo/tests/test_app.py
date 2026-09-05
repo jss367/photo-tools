@@ -23261,3 +23261,25 @@ def test_encounter_species_remove_detaches_when_no_overlap_remains(app_and_db):
     assert encounters[detached_idx]["bursts"][0]["species_override"] == {
         "species": None, "confirmed": False, "species_list": [],
     }
+
+
+def test_encounter_species_remove_rejects_species_not_confirmed(app_and_db):
+    """``remove`` of a species the burst is not confirmed as is rejected and
+    touches no keywords, even when the photos happen to carry it."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    _seed_encounter_cache(app, db, photo_ids, confirmed_species="Green-winged Teal")
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    mallard = db.add_keyword("Mallard", is_species=True)
+    for pid in photo_ids:
+        db.tag_photo(pid, teal)
+        db.tag_photo(pid, mallard)
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "Mallard", "photo_ids": photo_ids, "remove": True,
+    })
+    assert resp.status_code == 400
+    assert "not a confirmed species" in resp.get_json()["error"]
+    for pid in photo_ids:
+        assert _species_names(db, pid) == ["Green-winged Teal", "Mallard"]

@@ -26574,7 +26574,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         ]
 
         if remove_mode:
-            previous_species = species
+            # Only a currently confirmed species can be removed; otherwise a
+            # stale client could strip an unrelated keyword from the photos
+            # while the cache list (which has nothing to drop) still reports
+            # success.
+            requested_key = keyword_match_key(species)
+            previous_species = next(
+                (
+                    s for s in current_species_list
+                    if keyword_match_key(s) == requested_key
+                ),
+                None,
+            )
+            if previous_species is None:
+                return json_error(
+                    f'"{species}" is not a confirmed species of the '
+                    "submitted photos",
+                )
+            species = previous_species
         elif add_mode:
             previous_species = None
         elif requested_previous is not None:

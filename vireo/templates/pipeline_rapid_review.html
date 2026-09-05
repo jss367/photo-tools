@@ -1972,7 +1972,13 @@ async function applyCurrent(openNext) {
       // The burst's last species was removed: it is confirmed as nothing,
       // even if its encounter still carries a species.
       alreadyConfirmedList = [];
-    } else if (snapEnc.species_confirmed && encounterConfirmedList(snapEnc).length) {
+    } else {
+      // The encounter's list regardless of species_confirmed: a mixed
+      // encounter (one frame [A, B], another [A]) still records its
+      // dominant prior species as the list, and that is exactly what the
+      // server treats as the burst's current set (burst_species_list). An
+      // empty baseline here would make a flag-only apply re-post A and
+      // then overwrite every cached frame with [A], erasing B.
       alreadyConfirmedList = encounterConfirmedList(snapEnc);
     }
   }

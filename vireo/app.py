@@ -27116,11 +27116,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 shared_keys = (
                     set.intersection(*actual_sets) if actual_sets else set()
                 )
-                frames_share = bool(actual_sets) and all(actual_sets) and bool(shared_keys)
+                recorded = species_key_set(new_species_list)
+                # Confirmed only when every frame is tagged and every entry
+                # of the edited list is on every frame. A legacy cache can
+                # list [A, B] while a frame lacks B; a replace of A then
+                # tags C everywhere but B is still missing from that frame,
+                # and if the follow-up re-tag of B fails the override must
+                # not claim [C, B] as confirmed.
+                frames_share = (
+                    bool(actual_sets)
+                    and all(actual_sets)
+                    and bool(shared_keys)
+                    and recorded <= shared_keys
+                )
                 if not new_species_list:
                     burst_override = empty_species_override()
                 elif frames_share:
-                    recorded = species_key_set(new_species_list)
                     extras = [
                         s for s in actual_by_photo.get(photo_ids[0], [])
                         if keyword_match_key(s) in shared_keys

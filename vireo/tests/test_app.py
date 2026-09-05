@@ -23641,3 +23641,45 @@ def test_encounter_species_remove_redo_with_disjoint_extras_keeps_empty_override
         assert "Green-winged Teal" not in _species_names(db, pid)
     with open(path) as f:
         assert _json.load(f)["encounters"][0]["bursts"][0]["species_override"] == empty
+
+
+def test_encounter_species_replace_does_not_confirm_list_entry_missing_from_a_frame(app_and_db):
+    """Cached list [A, B] but one frame lacks B (legacy state). Replacing A
+    with C leaves frames [B, C] / [C]: the override must stay unconfirmed
+    (authoritative [C, B]) because B is not on every frame."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    burst_ids = photo_ids[:2]
+    path = _seed_encounter_cache(
+        app, db, photo_ids, confirmed_species="Green-winged Teal",
+        bursts=[
+            {"photo_ids": burst_ids, "species_predictions": [],
+             "species_override": {"species": "Green-winged Teal", "confirmed": True,
+                                  "species_list": ["Green-winged Teal", "American Wigeon"]}},
+            {"photo_ids": photo_ids[2:], "species_predictions": [], "species_override": None},
+        ],
+    )
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    wigeon = db.add_keyword("American Wigeon", is_species=True)
+    for pid in photo_ids:
+        db.tag_photo(pid, teal)
+    db.tag_photo(burst_ids[0], wigeon)
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "Gadwall", "photo_ids": burst_ids, "burst_index": 0,
+        "previous_species": "Green-winged Teal",
+    })
+    assert resp.status_code == 200, resp.get_json()
+    assert resp.get_json()["species_list"] == ["Gadwall", "American Wigeon"]
+    with open(path) as f:
+        encounters = _json.load(f)["encounters"]
+    burst = next(
+        b for e in encounters for b in e["bursts"] if b["photo_ids"] == burst_ids
+    )
+    assert burst["species_override"] == {
+        "species": "Gadwall",
+        "confirmed": False,
+        "species_list": ["Gadwall", "American Wigeon"],
+    }

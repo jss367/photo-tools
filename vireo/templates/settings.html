@@ -1604,7 +1604,15 @@ function _saveStatusMark(path, phase, gen) {
     // superseded pending gen would linger forever.
     _saveStatus.pending[path] = gen;
   } else if (phase === 'inflight') {
-    if (_saveStatus.pending[path] === gen) delete _saveStatus.pending[path];
+    // Every POST sends the full current form snapshot, so a request at
+    // least as new as the queued write already carries its edits. This
+    // matters for direct _saveConfigNow() callers (the NAS wizard clears
+    // the debounce timer and flushes with a freshly minted gen): without
+    // the <= the superseded pending gen would never clear and the pill
+    // would read "Saving…" forever.
+    if (_saveStatus.pending[path] !== undefined && _saveStatus.pending[path] <= gen) {
+      delete _saveStatus.pending[path];
+    }
     if (!_saveStatus.inflight[path]) _saveStatus.inflight[path] = {};
     _saveStatus.inflight[path][gen] = true;
   } else if (phase === 'ok' || phase === 'error') {

@@ -3414,6 +3414,11 @@ def create_imports_blueprint(
                 active_ws, photo_ids, import_tags, location_from_gps, result,
                 job=job, runner=runner,
             )
+            # Pause before publishing the collection or handing off to a
+            # child job. Once the handoff starts, late parent requests must
+            # not claim they can stop the independently running child.
+            if not runner.begin_uncancellable(job["id"]):
+                result["cancelled"] = True
             _chain_after_import(job, result)
             return result
 
@@ -4349,19 +4354,10 @@ def create_imports_blueprint(
                     active_ws, result.get("photo_ids") or [], import_tags,
                     location_from_gps, result, job=job, runner=runner,
                 )
-                # Honor pauses before launching the after-import chain.
-                # ``_apply_import_tags`` returns without probing the runner
-                # when neither tags nor GPS locations are requested (the
-                # common case), so a Pause arriving after
-                # ``run_import_job``'s last checkpoint would otherwise let
-                # ``_chain_after_import`` create the import collection and
-                # enqueue the child Process job while this parent shows
-                # ``pausing`` — cancelling the paused parent would not
-                # cancel that child. ``runner.is_cancelled`` sleeps through
-                # a live pause request and reports cancellation on wake, so
-                # ``_chain_after_import`` sees the same
-                # ``result["cancelled"]`` gate it uses everywhere else.
-                if runner.is_cancelled(job["id"]):
+                # Atomically honor a pending pause/cancel before collection
+                # publication and child-job handoff. The shared runner gate
+                # rejects new requests once this final phase begins.
+                if not runner.begin_uncancellable(job["id"]):
                     result["cancelled"] = True
                 _chain_after_import(job, result)
                 return result

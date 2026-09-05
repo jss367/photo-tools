@@ -53,6 +53,9 @@ These jobs deliberately remain without Pause in the current implementation:
 Website publishing's final replacement step is also uninterrupted, even when
 Pause was available earlier in preparation. Once that commit step begins,
 new pause and cancellation requests are rejected.
+The final import handoff follows the same rule: pending requests are honored
+before creating the import collection and starting follow-up processing;
+after the handoff begins, control the follow-up job through its own controls.
 
 ## Adding a new job
 

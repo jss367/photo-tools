@@ -1108,3 +1108,58 @@ def test_import_photos_checkpoints_before_after_import_chain(
     finally:
         release.set()
         runner.cancel_job(job_id)
+
+
+@pytest.mark.parametrize("endpoint", ["import-photos", "import-in-place"])
+def test_import_handoff_rejects_late_parent_pause(request, monkeypatch, tmp_path, endpoint):
+    import import_job
+    from db import Database
+    from services.pipeline_launch import PipelineChain
+
+    children = []
+
+    def enqueue(*args, **kwargs):
+        children.append(kwargs["chained_from"])
+        return "test-child-process", None, None
+
+    # Patch before app construction captures the bound enqueue method.
+    monkeypatch.setattr(PipelineChain, "enqueue_process_job", enqueue)
+    app, db, photo_id = request.getfixturevalue("client_with_photo")
+    entered, release = threading.Event(), threading.Event()
+    original_add = Database.add_collection
+
+    def add_collection(database, *args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original_add(database, *args, **kwargs)
+
+    monkeypatch.setattr(Database, "add_collection", add_collection)
+    monkeypatch.setattr(import_job, "run_import_job", lambda *args, **kwargs: {
+        "ok": True, "photo_ids": [photo_id], "discovered": 1,
+        "copied": 1, "failed": 0, "total": 1,
+    })
+    process_id = next(p["id"] for p in db.get_saved_processes() if p["name"] == "Cull-ready")
+    source = tmp_path / "card-handoff"
+    source.mkdir()
+    Image.new("RGB", (8, 8), "blue").save(source / "new.jpg")
+    body = {"sources": [str(source)], "after_import": process_id}
+    if endpoint == "import-photos":
+        body["destination"] = str(tmp_path / "archive-handoff")
+    client = app.test_client()
+    runner = app._job_runner
+    response = client.post(f"/api/jobs/{endpoint}", json=body)
+    assert response.status_code == 200, response.get_json()
+    job_id = response.get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert not children
+        assert client.post(f"/api/jobs/{job_id}/pause").status_code == 409
+        assert client.post(f"/api/jobs/{job_id}/cancel").status_code == 404
+        release.set()
+        job = wait_for_job_via_client(client, job_id)
+        assert job["status"] == "completed", job
+        assert job["result"]["process_job_id"] == "test-child-process"
+        assert children == [job_id]
+    finally:
+        release.set()
+        runner.shutdown(timeout=5)

@@ -1529,8 +1529,6 @@ def create_pipeline_blueprint(
             if row is None:
                 continue
             flag = row["flag"] or "none"
-            if flag != (photo.get("flag") or "none") or flag != "none":
-                photo["label"] = {"flagged": "KEEP", "rejected": "REJECT"}.get(flag, "REVIEW")
             photo["flag"] = flag
             photo["rating"] = row["rating"] or 0
             names = species.get(photo["id"], [])
@@ -1996,7 +1994,6 @@ def create_pipeline_blueprint(
             if row is not None:
                 flag = row["flag"] or "none"
                 photo["flag"] = flag
-                photo["label"] = {"flagged": "KEEP", "rejected": "REJECT"}.get(flag, "REVIEW")
         refresh_serialized_summary(results)
 
     def review_decision_signature(encounters):

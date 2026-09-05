@@ -705,3 +705,24 @@ def test_pipeline_results_refresh_species_from_database_after_confirm_and_undo(a
     assert all(p['confirmed_species'] is None for p in client.get('/api/pipeline/results').json['photos'])
     assert client.post('/api/redo').status_code == 200
     assert all(p['confirmed_species'] == 'Cardinal' for p in client.get('/api/pipeline/results').json['photos'])
+
+
+def test_group_flags_leave_pipeline_suggestions_unchanged(app_and_db):
+    app, db = app_and_db
+    client = app.test_client()
+    ids, cached = _seed(db)
+    cached['photos'][0]['label'] = 'KEEP'
+    cached['photos'][1]['label'] = 'REJECT'
+    save_results_raw(cached, os.path.dirname(db._db_path), db._ws_id())
+    expected = {p['id']: p['label'] for p in cached['photos']}
+    assert client.post('/api/pipeline/group/apply', json={
+        'picks': [ids[1]], 'rejects': [ids[0]], 'candidates': [],
+    }).status_code == 200
+    for operation in (None, '/api/undo', '/api/redo'):
+        if operation:
+            assert client.post(operation).status_code == 200
+        assert {p['id']: p['label'] for p in _load(db)['photos']} == expected
+        for endpoint in ('/api/pipeline/results', '/api/pipeline/page-init'):
+            result = client.get(endpoint).json
+            photos = result['results']['photos'] if 'results' in result else result['photos']
+            assert {p['id']: p['label'] for p in photos} == expected

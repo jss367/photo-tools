@@ -1014,7 +1014,13 @@ function hasMixedSpecies(session) {
   // holding both a teal and a wigeon is not "mixed" with an identical frame.
   var seen = {};
   queueIncludedPhotos(session).forEach(function(p) {
-    var key = photoSpeciesList(p).map(speciesKey).sort().join('|');
+    var confirmed = {};
+    (p.confirmed_species_identities || []).forEach(function(entry) { confirmed[entry.name] = entry.key; });
+    var key = photoSpeciesList(p).map(function(name) {
+      if (confirmed[name]) return confirmed[name];
+      var identity = rapid.results && rapid.results.species_identities && rapid.results.species_identities[name];
+      return identity ? identity.key : speciesKey(name);
+    }).sort().join('|');
     if (key) seen[key] = true;
   });
   return Object.keys(seen).length > 1;

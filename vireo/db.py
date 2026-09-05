@@ -703,6 +703,10 @@ class Database:
         # have already advanced some live DBs past the next free version
         # number, which would silently skip a version-gated migration.
         self.normalize_keyword_data()
+        from species_identity_repair import repair_on_upgrade
+        repaired = repair_on_upgrade(self)
+        if repaired:
+            log.info("Corrected species identity for %d predictions; review decisions preserved", repaired)
         self._restore_active_workspace()
 
     def _restore_active_workspace(self):
@@ -1403,8 +1407,13 @@ class Database:
         """
         )
         cur = self.conn.cursor()
+        if "source_taxon_id" not in {r[1] for r in cur.execute("PRAGMA table_info(predictions)")}:
+            cur.execute("ALTER TABLE predictions ADD COLUMN source_taxon_id INTEGER")
         cur.execute("PRAGMA table_info(keywords)")
         kw_cols = {row[1] for row in cur.fetchall()}
+        if "source_taxon_id" not in kw_cols:
+            cur.execute("ALTER TABLE keywords ADD COLUMN source_taxon_id INTEGER")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_keywords_source_taxon_id ON keywords(source_taxon_id)")
         if "place_id" not in kw_cols:
             cur.execute("ALTER TABLE keywords ADD COLUMN place_id TEXT")
         cur.execute(
@@ -10997,6 +11006,14 @@ class Database:
         taxon), and ``is_keyword_species`` already filters those out via
         ``taxon_rank`` for species-specific readers.
         """
+        from species_identity import COMMON_NAME_CORRECTIONS
+        correction = COMMON_NAME_CORRECTIONS.get(keyword_match_key(name))
+        if correction:
+            target = self.conn.execute(
+                "SELECT id FROM taxa WHERE inat_id = ? AND name = ? AND rank = 'species'",
+                (correction["taxon_id"], correction["scientific_name"]),
+            ).fetchone()
+            return target["id"] if target else None
         for variant in _taxon_lookup_variants(name):
             if prefer_species or species_only:
                 direct = self.conn.execute(
@@ -11054,7 +11071,55 @@ class Database:
                     return taxon["id"]
         return None
 
-    def add_keyword(self, name, parent_id=None, is_species=False, kw_type=None, _commit=True):
+    def _add_source_species_keyword(self, name, source_taxon_id, parent_id=None, _commit=True):
+        """Bind accepted source evidence without reassigning same-name tags."""
+        if type(source_taxon_id) is not int or not 0 < source_taxon_id < (1 << 63):
+            raise ValueError("source_taxon_id must be a positive SQLite integer")
+        taxon = self.conn.execute("SELECT id FROM taxa WHERE inat_id = ?", (source_taxon_id,)).fetchone()
+        local_id = taxon["id"] if taxon else None
+        existing = self.conn.execute(
+            "SELECT id FROM keywords WHERE parent_id IS ? AND type IN ('taxonomy', 'general') "
+            "AND (source_taxon_id = ? OR (source_taxon_id IS NULL AND taxon_id = ?)) "
+            "ORDER BY (type = 'taxonomy') DESC, id LIMIT 1",
+            (parent_id, source_taxon_id, local_id),
+        ).fetchone()
+        if existing:
+            kid = existing["id"]
+            self.conn.execute(
+                "UPDATE keywords SET source_taxon_id = ?, taxon_id = ?, is_species = 1, type = 'taxonomy' WHERE id = ?",
+                (source_taxon_id, local_id, kid),
+            )
+        else:
+            from species_identity import SpeciesResolver
+            raw_name = name.removesuffix(f" (taxon {source_taxon_id})")
+            identity = SpeciesResolver(db=self).resolve(raw_name, source={"taxon_id": source_taxon_id})
+            display = self.resolve_species_display_name(identity.display_name)
+            candidate = display
+            suffix = 0
+            while self.conn.execute(
+                "SELECT 1 FROM keywords WHERE name = ? COLLATE NOCASE AND parent_id IS ? LIMIT 1",
+                (candidate, parent_id),
+            ).fetchone():
+                suffix += 1
+                candidate = f"{display} (taxon {source_taxon_id})" + (f" ({suffix})" if suffix > 1 else "")
+            kid = self.conn.execute(
+                "INSERT INTO keywords (name, parent_id, is_species, type, taxon_id, source_taxon_id) "
+                "VALUES (?, ?, 1, 'taxonomy', ?, ?)",
+                (candidate, parent_id, local_id, source_taxon_id),
+            ).lastrowid
+        if _commit:
+            self.conn.commit()
+        return kid
+
+    def relink_source_species_keywords(self):
+        """Refresh local foreign keys after importing source taxa; caller commits."""
+        self.conn.execute(
+            "UPDATE keywords SET taxon_id = (SELECT id FROM taxa WHERE inat_id = keywords.source_taxon_id) "
+            "WHERE source_taxon_id IS NOT NULL AND EXISTS "
+            "(SELECT 1 FROM taxa WHERE inat_id = keywords.source_taxon_id)"
+        )
+
+    def add_keyword(self, name, parent_id=None, is_species=False, kw_type=None, _commit=True, source_taxon_id=None):
         """Insert a keyword. Returns existing id if duplicate (case-insensitive).
 
         If a keyword with the same name but different casing exists, reuses
@@ -11070,6 +11135,8 @@ class Database:
                      a known taxon, otherwise ``general``).
             _commit: If False, skip the internal commit (caller is responsible
                      for committing the transaction).
+            source_taxon_id: Explicit iNaturalist ID for a species keyword;
+                     bypass common-name inference and reuse only that identity.
         """
         if kw_type is not None and kw_type not in KEYWORD_TYPES:
             raise ValueError(f"invalid keyword type: {kw_type!r}")
@@ -11105,6 +11172,10 @@ class Database:
         # the accepted species.
         if is_species and kw_type is None:
             kw_type = 'taxonomy'
+        if source_taxon_id is not None:
+            if not is_species:
+                raise ValueError("source_taxon_id requires a species keyword")
+            return self._add_source_species_keyword(name, source_taxon_id, parent_id, _commit)
         # Case-insensitive lookup with type-aware matching:
         #
         # When kw_type is supplied, only same-type or 'general' rows are
@@ -14788,10 +14859,12 @@ class Database:
                 result.setdefault(r["photo_id"], []).append(dict(r))
         return result
 
-    def get_species_keywords_for_photos(self, photo_ids):
+    def get_species_keywords_for_photos(self, photo_ids, include_identities=False):
         """Return deduplicated species-rank keyword names for photos.
 
         Returns a dict mapping photo_id -> list of species name strings.
+        With include_identities, each entry contains the stored name and a
+        source-aware identity key for comparisons that must preserve homonyms.
 
         A linked taxon must actually have rank ``species``; linked family,
         genus, and other ancestor keywords remain taxonomy keywords but are
@@ -14816,11 +14889,12 @@ class Database:
         # in a later chunk would double-append it under setdefault.
         photo_ids = list(dict.fromkeys(photo_ids))
         chosen = {}
+        source_keys = {}
         for chunk in _chunks(photo_ids):
             placeholders = ",".join("?" for _ in chunk)
             rows = self.conn.execute(
                 f"""SELECT pk.photo_id, k.id, k.name, k.parent_id,
-                           k.taxon_id, t.rank AS taxon_rank
+                           k.taxon_id, k.source_taxon_id, t.inat_id, t.name AS scientific_name, t.rank AS taxon_rank
                     FROM photo_keywords pk
                     JOIN keywords k ON k.id = pk.keyword_id
                     LEFT JOIN taxa t ON t.id = k.taxon_id
@@ -14852,6 +14926,12 @@ class Database:
                 chosen.setdefault(r["photo_id"], {}).setdefault(
                     identity, (r["name"], is_root)
                 )
+                source_id = r["source_taxon_id"] or r["inat_id"]
+                key = f"taxon:{source_id}" if source_id else (
+                    "scientific:" + r["scientific_name"].casefold() if r["scientific_name"]
+                    else "name:" + keyword_match_key(r["name"])
+                )
+                source_keys.setdefault((r["photo_id"], identity), key)
         taxon_ids = {
             identity[1]
             for by_identity in chosen.values()
@@ -14877,10 +14957,9 @@ class Database:
             names = []
             for identity, (name, is_root) in by_identity.items():
                 if identity[0] == "taxon" and not is_root:
-                    names.append(canonical_roots.get(identity[1], name))
-                else:
-                    names.append(name)
-            result[photo_id] = sorted(names, key=lambda n: keyword_match_key(n))
+                    name = canonical_roots.get(identity[1], name)
+                names.append({"name": name, "key": source_keys[(photo_id, identity)]} if include_identities else name)
+            result[photo_id] = sorted(names, key=lambda n: keyword_match_key(n["name"] if include_identities else n))
         return result
 
     def get_photos_with_equivalent_species(
@@ -16876,8 +16955,9 @@ class Database:
                 labels_fingerprint_full,
                 species, confidence, category,
                 taxonomy_kingdom, taxonomy_phylum, taxonomy_class,
-                taxonomy_order, taxonomy_family, taxonomy_genus, scientific_name)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                taxonomy_order, taxonomy_family, taxonomy_genus, scientific_name,
+                source_taxon_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 detection_id,
                 model,
@@ -16893,6 +16973,7 @@ class Database:
                 tax.get("family"),
                 tax.get("genus"),
                 tax.get("scientific_name"),
+                tax.get("taxon_id"),
             ),
         )
         # SQLite's ``cur.lastrowid`` stays at the previous successful insert
@@ -18408,6 +18489,13 @@ class Database:
         ).fetchone()
         if not pred:
             return None
+        source_taxon_id = pred["source_taxon_id"]
+        native_scientific = pred["scientific_name"] if (
+            pred["labels_fingerprint"] == "tol" or pred["model"].startswith("iNat")
+        ) else None
+        if source_taxon_id is None and native_scientific:
+            from species_identity import SpeciesResolver
+            source_taxon_id = SpeciesResolver(db=self).prediction(pred).taxon_id
 
         def _reject_siblings_of(this_pred_id):
             """Resolve the losing rows on one accepted row's detection.
@@ -18472,6 +18560,9 @@ class Database:
                     species = best
                 except Exception:
                     pass
+
+            if source_taxon_id is None and native_scientific:
+                species = native_scientific
 
             # Settle scope before the first write.
             #
@@ -18580,7 +18671,8 @@ class Database:
                     "photo_ids": [],
                 }
 
-            kid = self.add_keyword(species, is_species=True, _commit=False)
+            source_args = {"source_taxon_id": source_taxon_id} if source_taxon_id is not None else {}
+            kid = self.add_keyword(species, is_species=True, _commit=False, **source_args)
             # Re-read the stored keyword name so the queued sidecar changes,
             # curation renames, and returned history payload all reflect the
             # row actually tagged. add_keyword normalizes punctuation and

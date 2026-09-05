@@ -1345,7 +1345,7 @@ def create_pipeline_blueprint(
         )
         cache_dir = os.path.dirname(db_path)
         prune_missing_photos(cache_dir, db._active_workspace_id, db)
-        results = load_results(cache_dir, db._active_workspace_id)
+        results = load_results(cache_dir, db._active_workspace_id, db=db)
         if results and results.get("photos"):
             # Cached pipeline rows predate edit recipes, which live in their
             # own table. Enrich them before Process Review positions overlays
@@ -1540,6 +1540,9 @@ def create_pipeline_blueprint(
             # so a stale one would keep showing a removed second species
             # and mis-derive "Mixed species" after an edit, undo, or redo.
             photo["confirmed_species_list"] = list(names)
+        from pipeline import attach_species_identities
+        from species_identity import SpeciesResolver
+        attach_species_identities(results, SpeciesResolver(db=db))
 
     @blueprint.route("/api/pipeline/results")
     def api_pipeline_results():
@@ -1554,7 +1557,7 @@ def create_pipeline_blueprint(
         # against the DB at read time so the review page never renders
         # orphan cards that 404 on /thumbnails/<id>.jpg.
         prune_missing_photos(cache_dir, db._active_workspace_id, db)
-        results = load_results(cache_dir, db._active_workspace_id)
+        results = load_results(cache_dir, db._active_workspace_id, db=db)
         if results is None:
             return json_error("No pipeline results found. Run regroup first.", 404)
         attach_live_pipeline_decisions(db, results)

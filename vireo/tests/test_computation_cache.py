@@ -418,6 +418,7 @@ def test_database_export_bundle_import_and_duplicate_fanout(tmp_path):
         "European Robin",
         0.87,
         "bioclip-2.5",
+        taxonomy={"scientific_name": "Erithacus rubecula", "taxon_id": 123},
         labels_fingerprint=labels_short,
         labels_fingerprint_full=labels_full,
     )
@@ -491,7 +492,7 @@ def test_database_export_bundle_import_and_duplicate_fanout(tmp_path):
     assert applied["classifier_runs_applied"] == 2
     for photo_id in (first_photo, second_photo):
         prediction = destination.conn.execute(
-            """SELECT p.species, p.labels_fingerprint_full
+            """SELECT p.species, p.labels_fingerprint_full, p.source_taxon_id
                FROM predictions p
                JOIN detections d ON d.id = p.detection_id
                WHERE d.photo_id = ?""",
@@ -500,6 +501,7 @@ def test_database_export_bundle_import_and_duplicate_fanout(tmp_path):
         assert dict(prediction) == {
             "species": "European Robin",
             "labels_fingerprint_full": labels_full,
+            "source_taxon_id": 123,
         }
     assert destination.conn.execute(
         "SELECT COUNT(*) AS c FROM prediction_review",
@@ -1353,3 +1355,28 @@ def test_http_import_then_classify_job_uses_configured_cache_dir(
     # have looked, and reuse would have silently failed.
     default_store = ArtifactStore(computation_cache.DEFAULT_CACHE_DIR)
     assert list(default_store.iter_artifacts() or ()) == []
+
+
+@pytest.mark.parametrize("reviewed", [False, True])
+def test_materialize_handles_predictions_without_classifier_run(tmp_path, reviewed):
+    db, _, _ = _database_with_photo(tmp_path / "orphan.db", "photo.jpg")
+    materialize_artifacts(db, [detection_artifact()], known_runtimes={RUNTIME})
+    detection_id = db.conn.execute("SELECT id FROM detections").fetchone()[0]
+    db.add_prediction(detection_id, "Robin", .5, "bioclip-2.5",
+                      status="accepted" if reviewed else "pending", labels_fingerprint="3" * 12,
+                      taxonomy={"scientific_name": "Old species"})
+    assert db.conn.execute("SELECT count(*) FROM classifier_runs").fetchone()[0] == 0
+    artifact = classification_artifact(candidates=[{"species": "Robin", "confidence": .9,
+                                                  "taxonomy": {"scientific_name": "Erithacus rubecula", "taxon_id": 123}}])
+    result = materialize_artifacts(db, [artifact], known_runtimes={RUNTIME},
+                                   known_classifier_runtimes={CLASSIFIER_RUNTIME})
+    row = db.conn.execute("SELECT scientific_name, source_taxon_id, confidence FROM predictions").fetchone()
+    if reviewed:
+        assert tuple(row) == ("Old species", None, .5)
+        assert result["pinned_older_runtime"] == 1
+        assert db.conn.execute("SELECT count(*) FROM classifier_runs").fetchone()[0] == 0
+        assert db.conn.execute("SELECT status FROM prediction_review").fetchone()[0] == "accepted"
+    else:
+        assert tuple(row) == ("Erithacus rubecula", 123, .9)
+        assert result["classifier_runs_applied"] == 1
+    db.close()

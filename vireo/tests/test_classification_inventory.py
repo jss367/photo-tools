@@ -527,3 +527,37 @@ def test_endpoint_stale_count_uses_prediction_rows(app_and_db, tmp_path, monkeyp
     stale = [s for s in body["stale"] if s["fingerprint"] == "obsolete_fp"]
     assert len(stale) == 1
     assert stale[0]["stale_count"] == 3
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_inventory_matches_source_identity_fingerprints(app_and_db, tmp_path, monkeypatch, merged):
+    from labels import SpeciesLabels, load_merged_labels, save_labels
+    from labels_fingerprint import compute_fingerprint
+
+    app, db = app_and_db
+    monkeypatch.setattr("labels.LABELS_DIR", str(tmp_path / "labels"))
+    aliases = ["Red-crowned Amazon", "Red-crowned Parrot"]
+    identity = {"taxon_id": 18976, "scientific_name": "Amazona viridigenalis"}
+    paths = [save_labels("Parrots", 14, "California", ["birds"],
+                         SpeciesLabels(aliases, {name: identity for name in aliases}))]
+    if merged:
+        paths.append(save_labels("Other parrots", 14, "California", ["birds"], SpeciesLabels(
+            ["Lilac-crowned Parrot"], {"Lilac-crowned Parrot": {"taxon_id": 18993, "scientific_name": "Amazona finschi"}},
+        )))
+    labels = load_merged_labels([{"labels_file": path} for path in paths])
+    fingerprint = compute_fingerprint(labels)
+    photo_id = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()[0]
+    detection_id = _add_detection(db, photo_id)
+    _record_run(db, detection_id, "BioCLIP-2.5", fingerprint)
+    _add_prediction(db, detection_id, "BioCLIP-2.5", fingerprint, labels[0], .9)
+    db.upsert_labels_fingerprint(fingerprint, "Parrots", paths, len(labels))
+    response = app.test_client().get("/api/workspace/classification-inventory")
+    assert response.status_code == 200
+    inventory = response.get_json()
+    assert fingerprint not in {row["fingerprint"] for row in inventory["stale"]}
+    if not merged:
+        model = next(row for row in inventory["models"] if row["name"] == "BioCLIP-2.5")
+        pair = next(row for row in model["pairs"] if row["fingerprint"] == fingerprint)
+        assert pair["classified_dets"] == 1
+        assert pair["pending_dets"] == 0
+        assert pair["status"] == "complete"

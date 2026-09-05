@@ -16,7 +16,8 @@ def _ordered_labels_identity(labels):
         return "__tol__"
     canonical = canonicalize_labels(labels)
     body = json.dumps(
-        canonical, ensure_ascii=False, separators=(",", ":")
+        [canonical, getattr(labels, "identities", {})],
+        ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(body).hexdigest()
 

@@ -32,8 +32,8 @@ except ImportError:
     load_working_image = None
 
 from db import AUTO_MATCH_REVIEW_MARKER, Database, commit_with_retry
-from keyword_normalization import _ASCII_LOWER_TABLE, normalize_keyword_display
 from keyword_normalization import folded_species_key as _folded_species_key
+from keyword_normalization import normalize_keyword_display
 from keyword_normalization import species_match_key as _species_match_key
 from models import get_active_model, get_models
 from resource_ledger import ResourceWaitCancelled
@@ -125,6 +125,8 @@ def _load_labels(
         log.info("Using %d merged labels from %d sets", len(labels), len(active_sets))
     elif labels_file and os.path.exists(labels_file):
         labels = read_label_file(labels_file)
+        if getattr(labels, "identities", {}):
+            labels = load_merged_labels([{"labels_file": labels_file}])
         log.info("Using %d labels from file: %s", len(labels), labels_file)
     else:
         # Try workspace-scoped active labels first
@@ -261,8 +263,8 @@ def _run_classifier_on_detection(db, detection_id, classifier_model, labels,
                 (detection_id, classifier_model, labels_fingerprint, species,
                  confidence, category, scientific_name,
                  taxonomy_kingdom, taxonomy_phylum, taxonomy_class,
-                 taxonomy_order, taxonomy_family, taxonomy_genus)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 taxonomy_order, taxonomy_family, taxonomy_genus, source_taxon_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 detection_id,
                 classifier_model,
@@ -277,6 +279,7 @@ def _run_classifier_on_detection(db, detection_id, classifier_model, labels,
                 tax.get("order"),
                 tax.get("family"),
                 tax.get("genus"),
+                tax.get("taxon_id"),
             ),
         )
     commit_with_retry(db.conn)
@@ -1607,7 +1610,7 @@ def _classify_photos(
                                 "timestamp": timestamp,
                                 "filename": photo["filename"],
                                 "embedding": embedding,
-                                "taxonomy": None,
+                                "taxonomy": _cached_prediction_taxonomy(top),
                                 "alternatives": [],
                                 "_existing": True,
                             })
@@ -1739,7 +1742,7 @@ def _classify_photos(
                             "timestamp": timestamp,
                             "filename": photo["filename"],
                             "embedding": embedding,
-                            "taxonomy": None,
+                            "taxonomy": _cached_prediction_taxonomy(top),
                             "alternatives": [],
                             "_existing": True,
                         })
@@ -1919,6 +1922,29 @@ def _publish_classifier_runs_for_raw_results(
             )
 
 
+def _cached_prediction_taxonomy(row):
+    row = dict(row)
+    if not row.get("source_taxon_id") and row.get("labels_fingerprint") != "tol":
+        return None  # Legacy custom-label scientific names were inferred.
+    result = {rank: row.get("taxonomy_" + rank) for rank in (
+        "kingdom", "phylum", "class", "order", "family", "genus",
+    )}
+    result.update(scientific_name=row.get("scientific_name"), taxon_id=row.get("source_taxon_id"))
+    return {key: value for key, value in result.items() if value} or None
+
+
+def _prediction_taxonomy(tax, species, supplied=None):
+    """Enrich source-backed labels by binomial, preserving source provenance."""
+    supplied = supplied or {}
+    from species_identity import SpeciesResolver
+    identity = SpeciesResolver(taxonomy=tax).resolve(
+        species, supplied.get("scientific_name"), supplied if supplied.get("taxon_id") else None,
+    )
+    name = identity.scientific_name or (None if supplied.get("taxon_id") else species)
+    hierarchy = tax.get_hierarchy(name) if tax and name else {}
+    return {**hierarchy, **supplied}
+
+
 def _store_match_prediction(
     db, item, model_name, labels_fingerprint, tax=None,
     species=None, confidence=None, taxonomy=None,
@@ -1942,9 +1968,7 @@ def _store_match_prediction(
     """
     species = species or item["prediction"]
     confidence = item["confidence"] if confidence is None else confidence
-    tax_hierarchy = taxonomy or item.get("taxonomy") or (
-        tax.get_hierarchy(species) if tax else {}
-    )
+    tax_hierarchy = _prediction_taxonomy(tax, species, taxonomy or item.get("taxonomy"))
     db.add_prediction(
         detection_id=item["detection_id"],
         species=species,
@@ -1987,9 +2011,7 @@ def _store_match_prediction(
             if alt_key in seen_species:
                 continue
             seen_species.add(alt_key)
-            alt_tax = alt.get("taxonomy") or (
-                tax.get_hierarchy(alt["species"]) if tax else {}
-            )
+            alt_tax = _prediction_taxonomy(tax, alt["species"], alt.get("taxonomy"))
             db.add_prediction(
                 detection_id=item["detection_id"],
                 species=alt["species"],
@@ -2094,9 +2116,7 @@ def _store_pending_detection_prediction(
     total_votes=None,
     individual=None,
 ):
-    tax_hierarchy = item.get("taxonomy") or (
-        tax.get_hierarchy(item["prediction"]) if tax else {}
-    )
+    tax_hierarchy = _prediction_taxonomy(tax, item["prediction"], item.get("taxonomy"))
     if item.get("_existing"):
         existing_row = db.conn.execute(
             """SELECT id FROM predictions
@@ -2169,9 +2189,7 @@ def _store_pending_detection_prediction(
         if alt_key in seen_species:
             continue
         seen_species.add(alt_key)
-        alt_tax = alt.get("taxonomy") or (
-            tax.get_hierarchy(alt["species"]) if tax else {}
-        )
+        alt_tax = _prediction_taxonomy(tax, alt["species"], alt.get("taxonomy"))
         db.add_prediction(
             detection_id=item["detection_id"],
             species=alt["species"],
@@ -2204,7 +2222,19 @@ def _store_grouped_predictions(
         group_by_timestamp,
         refine_groups_by_similarity,
     )
+    from species_identity import SpeciesResolver
     from xmp import read_keywords
+
+    resolver = SpeciesResolver(taxonomy=tax)
+
+    def identity_for(item):
+        supplied = item.get("taxonomy") or {}
+        source = supplied if supplied.get("taxon_id") else None
+        return resolver.resolve(item["prediction"], supplied.get("scientific_name"), source)
+
+    def comparison_name(item):
+        identity = identity_for(item)
+        return identity.scientific_name or identity.display_name
 
     groups = group_by_timestamp(raw_results, window_seconds=grouping_window)
     groups = refine_groups_by_similarity(
@@ -2229,10 +2259,10 @@ def _store_grouped_predictions(
                 )
                 existing = read_keywords(xmp_path)
                 category = _categorize_detection_prediction(
-                    item["prediction"], existing, tax,
+                    comparison_name(item), existing, tax,
                 )
                 auto_accept = _can_auto_accept_detection_prediction(
-                    item["prediction"], category, existing, tax,
+                    comparison_name(item), category, existing, tax,
                 )
 
             if auto_accept:
@@ -2249,55 +2279,16 @@ def _store_grouped_predictions(
         else:
             group_count += 1
             gid = f"g{job_id[-6:]}-{group_count:04d}"
-            # Fold each frame's species onto the same key ``add_prediction``
-            # uses before computing consensus and the reviewability check.
-            # Without this, a burst whose frames spell the same bird as
-            # both `Say's Phoebe` and `Say’s Phoebe` (because the merged
-            # label set carries both variants) counts as two distinct
-            # species, ``group_reviewable`` becomes False, and the
-            # unanimous burst is stored without its group_id, vote counts,
-            # or individual JSON — so the survivor prediction drops out
-            # of its burst group even though every frame agreed.
-            #
-            # Apostrophe folding alone is not enough: when frames also
-            # differ in ASCII capitalization (`Say's Phoebe` vs
-            # `Say's phoebe` — same word, different label-file entries),
-            # `_folded_species_key` still returns two distinct case
-            # variants. `consensus_prediction` keys on the raw string, so
-            # a semantically unanimous burst gets split votes such as
-            # `1/2`, while `group_species` below already ASCII-folds and
-            # would declare it reviewable — a mismatch that stores split
-            # `individual` entries and a wrong vote count. Canonicalize
-            # to the first-seen casing for each ASCII-lowercase key so
-            # the count sums correctly while `individual_predictions`
-            # still shows a real display-cased species name.
-            #
-            # ASCII-only case fold (``_ASCII_LOWER_TABLE``) rather than
-            # ``.lower()``: SQLite ``COLLATE NOCASE`` and
-            # ``keyword_match_key`` treat non-ASCII case pairs such as
-            # ``Éclair``/``éclair`` as distinct, so ``.lower()`` here
-            # would canonicalize them into one species and inflate a
-            # burst into a spuriously unanimous vote.
-            _canonical_case = {}
+            # Vote on identity, retaining the first display spelling for
+            # each key. Synonymous prompts must not split a unanimous vote.
+            display_by_key = {}
             for item in group:
-                key = _folded_species_key(item.get("prediction"))
-                if key is None:
-                    continue
-                _canonical_case.setdefault(
-                    key.strip().translate(_ASCII_LOWER_TABLE), key,
-                )
-
-            def _cons_key(species, _canon=_canonical_case):
-                folded = _folded_species_key(species)
-                if folded is None:
-                    return folded
-                return _canon.get(
-                    folded.strip().translate(_ASCII_LOWER_TABLE), folded,
-                )
+                identity = identity_for(item)
+                display_by_key.setdefault(identity.key, _folded_species_key(identity.display_name))
 
             cons_input = [
                 {
-                    "prediction": _cons_key(item["prediction"]),
+                    "prediction": identity_for(item).key,
                     "confidence": item["confidence"],
                 }
                 for item in group
@@ -2307,13 +2298,14 @@ def _store_grouped_predictions(
                 continue
 
             group_species = {
-                _species_match_key(item.get("prediction"))
+                identity_for(item).key
                 for item in group
                 if item.get("prediction")
             }
             group_reviewable = len(group_species) == 1
+            cons["prediction"] = display_by_key[cons["prediction"]]
             individual_json = (
-                json.dumps(cons["individual_predictions"])
+                json.dumps({display_by_key[key]: count for key, count in cons["individual_predictions"].items()})
                 if group_reviewable
                 else None
             )
@@ -2329,10 +2321,10 @@ def _store_grouped_predictions(
                     )
                     existing = read_keywords(xmp_path)
                     category = _categorize_detection_prediction(
-                        item["prediction"], existing, tax,
+                        comparison_name(item), existing, tax,
                     )
                     auto_accept = _can_auto_accept_detection_prediction(
-                        item["prediction"], category, existing, tax,
+                        comparison_name(item), category, existing, tax,
                     )
 
                 if auto_accept:
@@ -2504,7 +2496,7 @@ def _finalize_cached_only(
                 "timestamp": timestamp,
                 "filename": photo["filename"],
                 "embedding": None,
-                "taxonomy": None,
+                "taxonomy": _cached_prediction_taxonomy(top),
                 "alternatives": [],
                 "_existing": True,
             })

@@ -11920,7 +11920,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         ``docs/plans/2026-05-06-classification-inventory-design.md``.
         """
         import config as cfg
-        from labels import LABELS_DIR, get_saved_labels  # noqa: F401
+        from labels import get_saved_labels, load_merged_labels, read_label_file
         from labels_fingerprint import TOL_SENTINEL, compute_fingerprint
         from models import get_models
 
@@ -11950,8 +11950,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 continue
             seen_paths.add(path)
             try:
-                with open(path) as fh:
-                    species = [ln.strip() for ln in fh if ln.strip()]
+                species = read_label_file(path)
+                if species.identities:
+                    species = load_merged_labels([ls])
             except OSError:
                 continue
             label_sets.append({
@@ -12079,10 +12080,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if not all(os.path.exists(s) for s in sources):
                 continue
             try:
-                merged = []
-                for s in sources:
-                    with open(s) as fh:
-                        merged.extend(ln.strip() for ln in fh if ln.strip())
+                merged = load_merged_labels([{"labels_file": source} for source in sources])
             except OSError:
                 continue
             if compute_fingerprint(merged) == row["fingerprint"]:
@@ -15826,6 +15824,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         taxonomy = load_local_taxonomy()
 
         resolved_name_cache = {}
+        from species_identity import SpeciesResolver
+        species_resolver = SpeciesResolver(taxonomy=taxonomy, db=db)
 
         def resolved_names(raw_species):
             """``(comparison_name, stored_name)`` for one raw model label.
@@ -15877,9 +15877,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             """
             for candidate in (raw_species, db_species):
                 if candidate and taxonomy is not None:
-                    taxon = taxonomy.lookup(candidate)
-                    if taxon and taxon.get("taxon_id") is not None:
-                        return f"taxon:{taxon['taxon_id']}"
+                    identity = species_resolver.resolve(candidate)
+                    if identity.taxon_id is not None:
+                        return identity.key
             for candidate in (db_species, raw_species):
                 if candidate:
                     return str(candidate).strip().lower()
@@ -15920,13 +15920,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             """
             for candidate in (raw_species, db_species):
                 if candidate and taxonomy is not None:
-                    taxon = taxonomy.lookup(candidate)
-                    if taxon and taxon.get("taxon_id") is not None:
-                        return (
-                            taxon.get("common_name")
-                            or taxon.get("scientific_name")
-                            or str(candidate).strip()
-                        )
+                    identity = species_resolver.resolve(candidate)
+                    if identity.taxon_id is not None:
+                        return identity.display_name
             for candidate in (db_species, raw_species):
                 if candidate:
                     return str(candidate).strip()
@@ -16030,19 +16026,31 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             comparison_prediction, stored_prediction = resolved_names(
                 d["species"]
             )
+            native_identity = d.get("labels_fingerprint") == "tol" or model.startswith("iNat")
+            source_identity = species_resolver.prediction(d) if d.get("source_taxon_id") or native_identity else None
+            existing_species = species_by_photo.get(pid, [])
+            comparison_name = comparison_prediction
+            scientific_name = source_identity.scientific_name if source_identity else None
+            if scientific_name and taxonomy is not None and taxonomy.lookup(scientific_name):
+                # Use native identity when taxonomy can compare it, retaining
+                # the exact-text fallback for an unindexed confirmed label.
+                exact_unindexed = any(
+                    kw.lower() == comparison_prediction.lower() and taxonomy.lookup(kw) is None
+                    for kw in existing_species
+                )
+                if not exact_unindexed:
+                    comparison_name = scientific_name
             comparison = compare_prediction_to_keywords(
-                comparison_prediction,
-                species_by_photo.get(pid, []),
-                taxonomy,
+                comparison_name, existing_species, taxonomy,
             )
             prediction = {
                 "id": d["id"],
                 "detection_id": d["detection_id"],
                 "species": d["species"],
-                "canonical_species": canonical_species_key(
+                "canonical_species": source_identity.key if source_identity else canonical_species_key(
                     d["species"], comparison_prediction,
                 ),
-                "canonical_display": canonical_display_name(
+                "canonical_display": source_identity.display_name if source_identity else canonical_display_name(
                     d["species"], stored_prediction,
                 ),
                 "confidence": d["confidence"],

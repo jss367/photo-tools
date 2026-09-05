@@ -29,6 +29,8 @@ MAX_BUNDLE_BYTES = 512 * 1024 * 1024
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
 
+_SQLITE_INT64_MAX = (1 << 63) - 1
+
 _HEX64 = frozenset("0123456789abcdef")
 _ARTIFACT_TYPES = frozenset({"detection", "classification"})
 _FILE_DIGEST_CACHE = {}
@@ -410,6 +412,7 @@ def classifier_runtime_fingerprint(
     model_identity, labels_fingerprint_full, detector_runtime,
     taxonomy_identity="no-tax",
 ):
+    from species_identity import resolution_identity
     if (
         not isinstance(model_identity, dict)
         or not _is_sha256(labels_fingerprint_full)
@@ -433,6 +436,7 @@ def classifier_runtime_fingerprint(
         # one made after it, so the cache would skip the reclassify that
         # replaces raw binomials with current names (Codex #1560 P2).
         "output_enrichment": {
+            "species_resolution": resolution_identity(),
             "taxonomy_identity": taxonomy_identity,
             "scientific_synonyms_identity": local_synonyms_identity(),
         },
@@ -555,7 +559,7 @@ def promote_and_publish_classifier_run(
         row["file_hash"], row["runtime_fingerprint"], [subject],
     )
     predictions = db.conn.execute(
-        """SELECT species, confidence, scientific_name,
+        """SELECT species, confidence, scientific_name, source_taxon_id,
                   taxonomy_kingdom, taxonomy_phylum, taxonomy_class,
                   taxonomy_order, taxonomy_family, taxonomy_genus
            FROM predictions
@@ -573,6 +577,7 @@ def promote_and_publish_classifier_run(
             "confidence": prediction["confidence"],
         }
         taxonomy = {
+            "taxon_id": prediction["source_taxon_id"],
             "scientific_name": prediction["scientific_name"],
             "kingdom": prediction["taxonomy_kingdom"],
             "phylum": prediction["taxonomy_phylum"],
@@ -732,6 +737,9 @@ def _validate_candidate_taxonomy(taxonomy):
         return
     if not isinstance(taxonomy, dict):
         raise CacheFormatError("candidate taxonomy must be an object")
+    tid = taxonomy.get("taxon_id")
+    if tid is not None and (type(tid) is not int or not 0 < tid <= _SQLITE_INT64_MAX):
+        raise CacheFormatError("candidate taxonomy taxon_id must be a positive integer")
     for field in _TAXONOMY_SCALAR_FIELDS:
         if field not in taxonomy:
             continue
@@ -890,7 +898,6 @@ def validate_artifact(artifact):
         # materialize_artifacts binds the value.  By that point the bundle
         # object has already been published, leaving an unmaterialized
         # entry behind.  Reject out-of-range values up-front instead.
-        _SQLITE_INT64_MAX = (1 << 63) - 1
         if label_count is not None and (
             isinstance(label_count, bool)
             or not isinstance(label_count, int)
@@ -1503,7 +1510,7 @@ def exportable_artifacts(db, artifact_types=None):
                     }
                     subject["category"] = detection["category"] or "animal"
                 predictions = db.conn.execute(
-                    """SELECT species, confidence, scientific_name,
+                    """SELECT species, confidence, scientific_name, source_taxon_id,
                               taxonomy_kingdom, taxonomy_phylum,
                               taxonomy_class, taxonomy_order,
                               taxonomy_family, taxonomy_genus
@@ -1521,6 +1528,7 @@ def exportable_artifacts(db, artifact_types=None):
                         "confidence": prediction["confidence"],
                     }
                     taxonomy = {
+                        "taxon_id": prediction["source_taxon_id"],
                         "scientific_name": prediction["scientific_name"],
                         "kingdom": prediction["taxonomy_kingdom"],
                         "phylum": prediction["taxonomy_phylum"],
@@ -2064,22 +2072,23 @@ def materialize_artifacts(
                     ):
                         result["already_materialized"] += 1
                         continue
-                    if prior is not None and _manual_review_exists(
+                    if _manual_review_exists(
                         db.conn, detection_id, artifact["classifier_model"],
                         labels["short_fingerprint"],
                     ):
                         result["pinned_older_runtime"] += 1
                         continue
-                    if prior is not None:
-                        db.conn.execute(
-                            """DELETE FROM predictions
-                               WHERE detection_id = ? AND classifier_model = ?
-                                 AND labels_fingerprint = ?""",
-                            (
-                                detection_id, artifact["classifier_model"],
-                                labels["short_fingerprint"],
-                            ),
-                        )
+                    # Predictions can predate classifier_runs. Replace all
+                    # unreviewed candidates before certifying this artifact.
+                    db.conn.execute(
+                        """DELETE FROM predictions
+                           WHERE detection_id = ? AND classifier_model = ?
+                             AND labels_fingerprint = ?""",
+                        (
+                            detection_id, artifact["classifier_model"],
+                            labels["short_fingerprint"],
+                        ),
+                    )
                     for candidate in subject["candidates"]:
                         taxonomy = candidate.get("taxonomy") or {}
                         species = normalize_keyword_display(candidate["species"])
@@ -2090,8 +2099,8 @@ def materialize_artifacts(
                                   species, confidence, category, scientific_name,
                                   taxonomy_kingdom, taxonomy_phylum,
                                   taxonomy_class, taxonomy_order,
-                                  taxonomy_family, taxonomy_genus)
-                               VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?)""",
+                                  taxonomy_family, taxonomy_genus, source_taxon_id)
+                               VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (
                                 detection_id, artifact["classifier_model"],
                                 labels["short_fingerprint"], labels["fingerprint"],
@@ -2100,6 +2109,7 @@ def materialize_artifacts(
                                 taxonomy.get("kingdom"), taxonomy.get("phylum"),
                                 taxonomy.get("class"), taxonomy.get("order"),
                                 taxonomy.get("family"), taxonomy.get("genus"),
+                                taxonomy.get("taxon_id"),
                             ),
                         )
                     db.conn.execute(

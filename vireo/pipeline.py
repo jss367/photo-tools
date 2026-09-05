@@ -361,9 +361,8 @@ def load_photo_features(db, collection_id=None, config=None,
     # backing detection passes the workspace threshold — lowering the
     # threshold in workspace config should surface more predictions without
     # rewriting any rows.
-    # NOTE: pr.classifier_model aliased to "model" for back-compat with
-    # species_top5 tuple shape consumed downstream. Prediction review
-    # fields (status/group_id/individual) are Task 25 scope.
+    # Keep name/confidence/model in the first three tuple positions and
+    # append the identity key for grouping and serialized review evidence.
     #
     # Fingerprint filter: a detection + classifier_model can have predictions
     # from multiple label sets (fingerprints) when the user rotates labels.
@@ -373,7 +372,7 @@ def load_photo_features(db, collection_id=None, config=None,
     if labels_fingerprint is not None:
         pred_rows = db.conn.execute(
             f"""SELECT d.photo_id, d.id AS detection_id,
-                      pr.species, pr.confidence,
+                      pr.species, pr.confidence, pr.scientific_name, pr.labels_fingerprint, pr.source_taxon_id,
                       pr.classifier_model AS model,
                       d.detector_confidence, d.detector_model
                FROM predictions pr
@@ -393,7 +392,7 @@ def load_photo_features(db, collection_id=None, config=None,
     else:
         pred_rows = db.conn.execute(
             f"""SELECT d.photo_id, d.id AS detection_id,
-                      pr.species, pr.confidence,
+                      pr.species, pr.confidence, pr.scientific_name, pr.labels_fingerprint, pr.source_taxon_id,
                       pr.classifier_model AS model,
                       d.detector_confidence, d.detector_model
                FROM predictions pr
@@ -416,6 +415,8 @@ def load_photo_features(db, collection_id=None, config=None,
 
     # Group predictions by photo_id, keep top K
     top_k = (config or {}).get("top_k_predictions", 5)
+    from species_identity import SpeciesResolver
+    species_resolver = SpeciesResolver(db=db)
     species_by_photo = defaultdict(list)
     for pr in pred_rows:
         pid = pr["photo_id"]
@@ -426,12 +427,14 @@ def load_photo_features(db, collection_id=None, config=None,
         )
         if pr["detector_confidence"] < min_conf and not is_contextual_weak:
             continue
+        identity = species_resolver.prediction(pr)
+        species = identity.display_name
         if len(species_by_photo[pid]) < top_k:
-            species_by_photo[pid].append((pr["species"], pr["confidence"], pr["model"]))
+            species_by_photo[pid].append((species, pr["confidence"], pr["model"], identity.key))
         subject = subjects_by_detection.get(pr["detection_id"])
         if subject is not None and len(subject["predictions"]) < top_k:
             subject["predictions"].append(
-                (pr["species"], pr["confidence"], pr["model"])
+                (species, pr["confidence"], pr["model"], identity.key)
             )
 
     # Load primary detection per photo (highest confidence) via the global
@@ -492,9 +495,8 @@ def load_photo_features(db, collection_id=None, config=None,
     # encounter confirmation flag all key off the same string. For
     # photos with multiple species tags we keep the alphabetically-first
     # entry so the choice stays deterministic across runs.
-    species_names_by_photo = db.get_species_keywords_for_photos(
-        photo_ids_for_dets,
-    )
+    confirmed_identities = db.get_species_keywords_for_photos(photo_ids_for_dets, include_identities=True)
+    species_names_by_photo = {pid: [entry["name"] for entry in entries] for pid, entries in confirmed_identities.items()}
     confirmed_by_photo = {
         pid: names[0]
         for pid, names in species_names_by_photo.items()
@@ -641,6 +643,7 @@ def load_photo_features(db, collection_id=None, config=None,
             "dino_subject_embedding": subj_emb,
             "dino_global_embedding": global_emb,
             "species_top5": species_by_photo.get(pid, []),
+            "confirmed_species_identities": confirmed_identities.get(pid, []),
             "subjects": subjects_by_photo.get(pid, []),
             "confirmed_species": confirmed_by_photo.get(pid),
             "confirmed_species_list": confirmed_list_by_photo.get(pid, []),
@@ -861,31 +864,27 @@ def _make_summary(encounters, all_photos):
     }
 
 
-def _photo_species_keysets(photos):
-    """Per-photo identity sets of confirmed species (empty set = unconfirmed)."""
-    from pipeline_results import photo_confirmed_species_list, species_key_set
-
-    return [
-        frozenset(species_key_set(photo_confirmed_species_list(p)))
-        for p in photos
-    ]
-
-
-def _shared_confirmed_species(photos):
-    """Species carried by every *tagged* photo, in the first tagged photo's
-    order (empty when the tagged photos share nothing or none is tagged)."""
+def _confirmed_species_entries(photo):
     from keyword_normalization import keyword_match_key
     from pipeline_results import photo_confirmed_species_list
 
-    tagged = [
-        lst for lst in (photo_confirmed_species_list(p) for p in photos) if lst
-    ]
+    identities = {entry["name"]: entry["key"] for entry in photo.get("confirmed_species_identities") or []}
+    return [(name, identities.get(name, "name:" + keyword_match_key(name)))
+            for name in photo_confirmed_species_list(photo)]
+
+
+def _photo_species_keysets(photos):
+    """Per-photo identity sets of confirmed species (empty set = unconfirmed)."""
+    return [frozenset(key for _, key in _confirmed_species_entries(photo)) for photo in photos]
+
+
+def _shared_confirmed_species(photos):
+    """Shared confirmed identities, retaining the first tagged photo's names."""
+    tagged = [entries for photo in photos if (entries := _confirmed_species_entries(photo))]
     if not tagged:
         return []
-    common = set.intersection(*(
-        {keyword_match_key(s) for s in lst} for lst in tagged
-    ))
-    return [s for s in tagged[0] if keyword_match_key(s) in common]
+    common = set.intersection(*({key for _, key in entries} for entries in tagged))
+    return [name for name, key in tagged[0] if key in common]
 
 
 def derive_burst_override(photos, preferred_order=None):
@@ -1059,10 +1058,16 @@ def _build_species_predictions(photos):
     Returns a list of dicts sorted by total count descending, each with:
         species, count, avg_confidence, models: [{model, confidence, photo_count}]
     """
+    from species_identity import species_entry_key
     model_data = defaultdict(lambda: defaultdict(lambda: {"confs": [], "count": 0}))
+    display_names = {}
+    identity_keys = set()
     for p in photos:
         for entry in (p.get("species_top5") or []):
-            sp_name = entry[0]
+            sp_name = species_entry_key(entry)
+            display_names[sp_name] = entry[0]
+            if len(entry) > 3:
+                identity_keys.add(sp_name)
             sp_conf = entry[1]
             sp_model = entry[2] if len(entry) > 2 else "unknown"
             model_data[sp_name][sp_model]["confs"].append(sp_conf)
@@ -1087,7 +1092,8 @@ def _build_species_predictions(photos):
             total_conf_sum += sum(data["confs"])
             total_conf_count += len(data["confs"])
         result.append({
-            "species": sp_name,
+            "species": display_names[sp_name],
+            **({"species_key": sp_name} if sp_name in identity_keys else {}),
             "count": total_count,
             "avg_confidence": round(total_conf_sum / total_conf_count, 4) if total_conf_count else 0,
             "models": models,
@@ -1329,7 +1335,103 @@ def save_results(results, cache_dir, workspace_id, preserve_miss_marker=True):
     return path
 
 
-def load_results(cache_dir, workspace_id):
+def attach_species_identities(data, resolver):
+    """Give review comparisons a stable key while retaining editable keyword text."""
+    names = set()
+    source_keys = defaultdict(set)
+    if resolver.db is not None:
+        by_photo = resolver.db.get_species_keywords_for_photos(
+            [p["id"] for p in data.get("photos", [])], include_identities=True,
+        )
+        for photo in data.get("photos", []):
+            photo["confirmed_species_identities"] = by_photo.get(photo["id"], [])
+
+    def collect(container):
+        for field in ("confirmed_species",):
+            if container.get(field):
+                names.add(container[field])
+        names.update(container.get("confirmed_species_list") or [])
+        for entry in container.get("species_top5") or []:
+            if entry:
+                names.add(entry[0])
+                if len(entry) > 3:
+                    source_keys[entry[0]].add(entry[3])
+        for entry in container.get("species_predictions") or []:
+            if entry.get("species"):
+                names.add(entry["species"])
+
+    for photo in data.get("photos", []):
+        collect(photo)
+    for enc in data.get("encounters", []):
+        collect(enc)
+        if enc.get("species"):
+            names.add(enc["species"][0])
+        for burst in enc.get("bursts", []):
+            collect(burst)
+            override = burst.get("species_override") or {}
+            if override.get("species"):
+                names.add(override["species"])
+            names.update(override.get("species_list") or [])
+    source_identities = {
+        name: {"key": next(iter(keys)), "display_name": name}
+        for name, keys in source_keys.items() if len(keys) == 1
+    }
+    data["species_identities"] = {
+        name: source_identities.get(name) or {"key": resolver.resolve(name).key, "display_name": resolver.resolve(name).display_name}
+        for name in names if name
+    }
+
+
+def normalize_cached_species(data, resolver):
+    """Refresh derived names on read, without rewriting confirmed keywords."""
+    from encounters import encounter_species_label
+
+    photo_map = {p["id"]: p for p in data.get("photos", [])}
+    changed = False
+    for photo in photo_map.values():
+        containers = [photo, *photo.get("subjects", [])]
+        for container in containers:
+            field = "species_top5" if container is photo else "predictions"
+            entries = container.get(field) or []
+            normalized = []
+            for entry in entries:
+                # A serialized key is primary evidence; never re-infer its
+                # taxon from the display label during a cache read.
+                key = entry[3] if len(entry) > 3 else ""
+                if key.startswith("taxon:"):
+                    tid = int(key.split(":", 1)[1])
+                    raw_name = entry[0].removesuffix(f" (taxon {tid})")
+                    identity = resolver.resolve(raw_name, source={"taxon_id": tid})
+                    name = identity.display_name if identity.scientific_name else entry[0]
+                elif key.startswith("scientific:"):
+                    identity = resolver.resolve(entry[0], scientific_name=key.split(":", 1)[1])
+                    # Comparison keys are case-folded, not display spellings.
+                    name = identity.display_name if identity.taxon_id is not None else entry[0]
+                else:
+                    name = resolver.resolve(entry[0]).display_name
+                changed |= name != entry[0]
+                normalized.append([name, *entry[1:]])
+            if entries:
+                container[field] = normalized
+    if not changed:
+        return
+    for enc in data.get("encounters", []):
+        photos = [photo_map[pid] for pid in enc.get("photo_ids", []) if pid in photo_map]
+        if photos:
+            enc["species"] = list(encounter_species_label(photos))
+            enc["species_predictions"] = _build_species_predictions(photos)
+        for burst in enc.get("bursts", []):
+            burst_photos = [photo_map[pid] for pid in burst.get("photo_ids", []) if pid in photo_map]
+            if burst_photos:
+                burst["species_predictions"] = _build_species_predictions(burst_photos)
+            override = burst.get("species_override")
+            if (override and not override.get("confirmed") and override.get("species")
+                    and "species_list" not in override):
+                override["species"] = resolver.resolve(override["species"]).display_name
+    data["species_names_refreshed"] = True
+
+
+def load_results(cache_dir, workspace_id, db=None):
     """Load pipeline results from a JSON cache file.
 
     Args:
@@ -1343,6 +1445,11 @@ def load_results(cache_dir, workspace_id):
     data = _load_results_json(path)
     if data is None:
         return None
+    if db is not None:
+        from species_identity import SpeciesResolver
+        resolver = SpeciesResolver(db=db)
+        normalize_cached_species(data, resolver)
+        attach_species_identities(data, resolver)
     refresh_serialized_summary(data)
     return data
 
@@ -1939,6 +2046,8 @@ def compute_group_fingerprint(config):
         "encounters": _effective(encounters.DEFAULTS),
         "bursts": _effective(bursts.DEFAULTS),
     }
+    from species_identity import resolution_identity
+    payload["species_resolution"] = resolution_identity()
     blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha1(blob).hexdigest()[:16]
 

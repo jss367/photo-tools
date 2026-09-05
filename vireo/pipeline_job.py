@@ -5026,6 +5026,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 import config as cfg
                 from classify_job import (
                     _BATCH_SIZE,
+                    _cached_prediction_taxonomy,
                     _flush_batch,
                     _prepare_image,
                     _publish_classifier_runs_for_raw_results,
@@ -6152,7 +6153,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                                 "timestamp": timestamp,
                                                 "filename": photo["filename"],
                                                 "embedding": embedding,
-                                                "taxonomy": None,
+                                                "taxonomy": _cached_prediction_taxonomy(top),
                                                 "_existing": True,
                                             })
                                             continue

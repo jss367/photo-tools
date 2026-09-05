@@ -2367,6 +2367,92 @@ def test_import_new_workspace_forwards_explicit_after_import(live_server, page):
     assert body["after_import"] == identify_id
 
 
+def test_import_after_move_hint_blames_the_right_field(live_server, page):
+    """Issue #1377: with a typo'd archive root (Vireo_Archive vs the real
+    "Vireo Archive"), the old hint said the *destination* was outside every
+    archive root, so the user re-typed a destination that was never the
+    problem. The hint must name the configured root and say which of the
+    three situations applies."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+
+    def remote_targets(route):
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": [{
+                    "id": "nas1",
+                    "name": "Photo NAS",
+                    "user": "photo",
+                    "host": "nas.local",
+                    "remote_path": "/volume1/Photography",
+                    "mount_path": "/Volumes/Photography",
+                    "local_archive_root": "/Users/me/Pictures/Vireo_Archive",
+                    "local_archive_root_present": False,
+                }],
+            }),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    hint = page.locator("#afterMoveUnavailable")
+    expect(hint).to_be_visible()
+    expect(hint).to_contain_text("does not exist on this machine")
+    expect(hint).to_contain_text("Photo NAS (/Users/me/Pictures/Vireo_Archive)")
+    expect(hint).not_to_contain_text("destination is not inside")
+    expect(page.locator("#afterMoveRow")).to_be_hidden()
+
+    # Root exists but the destination genuinely is outside it.
+    page.evaluate(
+        """
+        () => {
+          importRemoteTargets[0].local_archive_root_present = true;
+          updateAfterMoveUI();
+        }
+        """
+    )
+    expect(hint).to_contain_text("the destination is outside the local archive root of")
+    expect(hint).to_contain_text("Photo NAS (/Users/me/Pictures/Vireo_Archive)")
+
+    # No target has a root at all.
+    page.evaluate(
+        """
+        () => {
+          importRemoteTargets[0].local_archive_root = "";
+          updateAfterMoveUI();
+        }
+        """
+    )
+    expect(hint).to_contain_text("no remote target has a local archive root configured")
+
+    # Fixing the typo in the destination makes the row appear.
+    page.evaluate(
+        """
+        () => {
+          importRemoteTargets[0].local_archive_root = "/Users/me/Pictures/Vireo Archive";
+          importRemoteTargets[0].local_archive_root_present = true;
+          updateAfterMoveUI();
+        }
+        """
+    )
+    expect(hint).to_be_hidden()
+    expect(page.locator("#afterMoveRow")).to_be_visible()
+
+
 def test_import_new_workspace_shows_target_default_in_after_import_display(
     live_server, page
 ):

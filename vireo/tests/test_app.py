@@ -17421,6 +17421,158 @@ def test_import_page_surfaces_remote_target_load_failure(app_and_db):
     assert "/api/jobs/import-photos" in html
 
 
+def _remote_target_body(**over):
+    body = {"host": "nas", "user": "julius", "remote_path": "/volume1/Photos",
+            "mount_path": "/Volumes/Photos", "name": "Photo NAS"}
+    body.update(over)
+    return body
+
+
+def _fake_remote_probe(monkeypatch):
+    """Stub every subprocess-touching helper the remote-target test
+    endpoint calls so the archive-root check can be exercised alone."""
+    import move
+    monkeypatch.setattr(move, "resolve_rsync_bin", lambda _: "/usr/bin/rsync")
+    monkeypatch.setattr(move, "is_gnu_rsync", lambda _: True)
+    monkeypatch.setattr(move, "resolve_ssh_bin", lambda _: "/usr/bin/ssh")
+    monkeypatch.setattr(move, "test_remote_connection", lambda *_: {
+        "ok": True, "ssh": True, "remote_path_writable": True,
+        "rsync_ok": True, "remote_rsync_ok": True,
+        "message": "Connection OK \u2014 SSH, remote path, and rsync all good.",
+    })
+
+
+def test_remote_target_test_flags_missing_local_archive_root(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """Issue #1377: a typo'd/missing local_archive_root used to get a bare
+    green "Connection OK" from Test connection, and the misconfiguration
+    only surfaced on the Import page as a hint blaming the destination.
+    The connection genuinely is OK (ok stays true) but the message must
+    name the archive root and the result must carry a machine-readable
+    archive_root_present so the UI can downgrade it to a warning."""
+    app, _ = app_and_db
+    _fake_remote_probe(monkeypatch)
+    missing = str(tmp_path / "Vireo_Archive")
+    resp = app.test_client().post(
+        "/api/remote-targets/test",
+        json=_remote_target_body(local_archive_root=missing))
+    assert resp.status_code == 200
+    res = resp.get_json()
+    assert res["ok"] is True
+    assert res["archive_root"] == missing
+    assert res["archive_root_present"] is False
+    assert res["message"].startswith("Connection OK, but")
+    assert missing in res["message"]
+    assert "does not exist" in res["message"]
+
+
+def test_remote_target_test_keeps_plain_ok_when_archive_root_exists(
+    app_and_db, monkeypatch, tmp_path,
+):
+    app, _ = app_and_db
+    _fake_remote_probe(monkeypatch)
+    root = tmp_path / "Vireo Archive"
+    root.mkdir()
+    resp = app.test_client().post(
+        "/api/remote-targets/test",
+        json=_remote_target_body(local_archive_root=str(root)))
+    res = resp.get_json()
+    assert res["ok"] is True
+    assert res["archive_root_present"] is True
+    assert res["message"] == (
+        "Connection OK \u2014 SSH, remote path, and rsync all good.")
+
+
+def test_remote_target_test_archive_root_present_is_none_when_unset(
+    app_and_db, monkeypatch,
+):
+    """"Not configured" must stay distinguishable from "configured but
+    missing" \u2014 a target with no archive root simply never offers the
+    chained move and should not be warned about."""
+    app, _ = app_and_db
+    _fake_remote_probe(monkeypatch)
+    resp = app.test_client().post(
+        "/api/remote-targets/test", json=_remote_target_body())
+    res = resp.get_json()
+    assert res["ok"] is True
+    assert res["archive_root"] is None
+    assert res["archive_root_present"] is None
+    assert res["message"].startswith("Connection OK \u2014")
+
+
+def test_remote_target_test_missing_archive_root_does_not_mask_ssh_failure(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """When the connection itself failed, that failure is the message; the
+    archive-root note must not overwrite it."""
+    import move
+    app, _ = app_and_db
+    _fake_remote_probe(monkeypatch)
+    monkeypatch.setattr(move, "test_remote_connection", lambda *_: {
+        "ok": False, "ssh": False, "remote_path_writable": False,
+        "rsync_ok": True, "remote_rsync_ok": False,
+        "message": "SSH connection failed",
+    })
+    resp = app.test_client().post(
+        "/api/remote-targets/test",
+        json=_remote_target_body(local_archive_root=str(tmp_path / "nope")))
+    res = resp.get_json()
+    assert res["ok"] is False
+    assert res["message"] == "SSH connection failed"
+    assert res["archive_root_present"] is False
+
+
+def test_remote_targets_list_reports_archive_root_presence(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """GET /api/remote-targets tells the Import page whether each
+    configured archive root exists, so its "Move to NAS unavailable" hint
+    can say "the root does not exist" instead of blaming the destination."""
+    import config as cfg
+    import move
+    app, _ = app_and_db
+    monkeypatch.setattr(move, "resolve_rsync_bin", lambda _: "/usr/bin/rsync")
+    monkeypatch.setattr(move, "is_gnu_rsync", lambda _: True)
+    monkeypatch.setattr(move, "resolve_ssh_bin", lambda _: "/usr/bin/ssh")
+    present = tmp_path / "present"
+    present.mkdir()
+    cfg.save({"remote_targets": [
+        _remote_target_body(id="a", local_archive_root=str(present)),
+        _remote_target_body(id="b", local_archive_root=str(tmp_path / "gone")),
+        _remote_target_body(id="c"),
+    ]})
+    resp = app.test_client().get("/api/remote-targets")
+    assert resp.status_code == 200
+    by_id = {t["id"]: t for t in resp.get_json()["targets"]}
+    assert by_id["a"]["local_archive_root_present"] is True
+    assert by_id["b"]["local_archive_root_present"] is False
+    assert by_id["c"]["local_archive_root_present"] is None
+
+
+def test_import_page_after_move_hint_names_the_archive_root(app_and_db):
+    """The Import hint distinguishes no-root / root-missing / outside-root
+    and shows the configured path, so a typo is visible at a glance."""
+    app, _ = app_and_db
+    html = app.test_client().get("/import").data.decode()
+    assert "function afterMoveUnavailableReason()" in html
+    assert "no remote target has a local archive root configured" in html
+    assert "does not exist on this machine" in html
+    assert "the destination is outside the local archive root of" in html
+    assert "local_archive_root_present === false" in html
+    # The old destination-blaming wording is gone.
+    assert "the destination is not inside any remote" not in html
+
+
+def test_settings_page_test_connection_warns_on_missing_archive_root(
+    app_and_db,
+):
+    app, _ = app_and_db
+    html = app.test_client().get("/settings").data.decode()
+    assert "archive_root_present === false" in html
+    assert "Create folder" in html
+
+
 def test_import_page_surfaces_destination_errors_and_recovery_actions(
     app_and_db,
 ):

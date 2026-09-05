@@ -1754,10 +1754,39 @@ async function testRemoteTarget(i, btn, statusEl) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(t),
     }, { toast: false });
-    statusEl.textContent = (res.ok ? '✓ ' : '⚠ ') + (res.message || '')
+    // A missing local archive root is not a connection failure, but a bare
+    // green "Connection OK" would hide the one misconfiguration the Import
+    // page can't name later (issue #1377): render it as a warning and offer
+    // the one-line fix inline, since the folder is the user's own staging
+    // area and creating it is always safe.
+    var archiveRootMissing = !!(res.ok && res.archive_root && res.archive_root_present === false);
+    statusEl.textContent = (res.ok && !archiveRootMissing ? '✓ ' : '⚠ ') + (res.message || '')
       + (res.mount_path && !res.mount_present
           ? ' (mount path not currently present — fine if the NAS just isn’t mounted right now.)' : '');
-    statusEl.style.color = res.ok ? 'var(--success, #4caf50)' : 'var(--warning)';
+    statusEl.style.color = res.ok && !archiveRootMissing ? 'var(--success, #4caf50)' : 'var(--warning)';
+    if (archiveRootMissing) {
+      statusEl.appendChild(document.createTextNode(' '));
+      var mk = document.createElement('button');
+      mk.type = 'button';
+      mk.textContent = 'Create folder';
+      mk.style.cssText = 'background:var(--bg-tertiary);color:var(--text-secondary);border:1px solid var(--border-secondary);border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer;';
+      mk.onclick = async function() {
+        mk.disabled = true;
+        try {
+          await safeFetch('/api/browse/mkdir', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ path: res.archive_root }),
+          }, { toast: false });
+          // Re-run the test so the status reflects the folder now existing.
+          await testRemoteTarget(i, btn, statusEl);
+        } catch (e) {
+          statusEl.textContent = '⚠ Could not create ' + res.archive_root + ': '
+            + (e && e.message ? e.message : 'unknown error');
+          statusEl.style.color = 'var(--warning)';
+        }
+      };
+      statusEl.appendChild(mk);
+    }
   } catch (e) {
     statusEl.textContent = '⚠ ' + (e && e.message ? e.message : 'Test failed.');
     statusEl.style.color = 'var(--warning)';

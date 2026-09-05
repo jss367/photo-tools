@@ -24682,6 +24682,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             result["preview"] = preview_merge(folder["path"], resolved)
         return jsonify(result)
 
+    def _archive_root_present(target):
+        """None when the target has no ``local_archive_root`` configured,
+        else whether that directory currently exists on this machine."""
+        root = (target.get("local_archive_root") or "").strip()
+        if not root:
+            return None
+        return os.path.isdir(root)
+
     @app.route("/api/remote-targets")
     def api_remote_targets_list():
         """List configured remote (SSH) move targets for the move-form picker,
@@ -24695,8 +24703,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         usable = bool(rsync_bin and move_mod.is_gnu_rsync(rsync_bin))
         ssh_bin = move_mod.resolve_ssh_bin(
             effective_cfg.get("ssh_bin", "") or "")
+        targets = cfg.get_remote_targets()
+        for t in targets:
+            t["local_archive_root_present"] = _archive_root_present(t)
         return jsonify({
-            "targets": cfg.get_remote_targets(),
+            "targets": targets,
             "rsync_available": usable,
             "rsync_bin": rsync_bin if usable else None,
             "ssh_available": bool(ssh_bin),
@@ -24707,8 +24718,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/remote-targets/test", methods=["POST"])
     def api_remote_target_test():
         """Test connectivity for a remote target (saved or in-progress edit):
-        SSH reachability, remote-path writability, GNU rsync availability, and
-        whether the local mount path is currently present."""
+        SSH reachability, remote-path writability, GNU rsync availability,
+        whether the local mount path is currently present, and whether the
+        local archive root exists.
+
+        The archive-root check is the one that catches a typo'd
+        ``local_archive_root`` (issue #1377): the connection itself is fine,
+        so ``ok`` stays true, but a bare "Connection OK" would let the user
+        walk away from Settings believing the chained move is configured
+        and only find out on the Import page, where the hint can't name
+        the field that is wrong. ``archive_root_present`` is None when no
+        root is configured (nothing to check), so the UI can tell "not
+        set" from "set but missing"."""
         import config as cfg
         import move as move_mod
 
@@ -24730,8 +24751,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         mount = target.get("mount_path")
         res["mount_path"] = mount
         res["mount_present"] = bool(mount and os.path.isdir(mount))
+        archive_root = target.get("local_archive_root") or ""
+        res["archive_root"] = archive_root or None
+        res["archive_root_present"] = _archive_root_present(target)
         res["rsync_bin"] = rsync_bin or None
         res["ssh_bin"] = ssh_bin
+        if res.get("ok") and res["archive_root_present"] is False:
+            res["message"] = (
+                f"Connection OK, but the local archive root '{archive_root}' "
+                f"does not exist on this machine \u2014 the Import page won't "
+                f"offer \"Then move to NAS\" for this target until it does. "
+                f"Check the path for a typo, or create the folder.")
         if not ssh_bin:
             res["ok"] = False
             res["message"] = (

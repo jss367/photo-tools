@@ -16030,10 +16030,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
             native_identity = d.get("labels_fingerprint") == "tol" or model.startswith("iNat")
             source_identity = species_resolver.prediction(d) if d.get("source_taxon_id") or native_identity else None
+            existing_species = species_by_photo.get(pid, [])
+            comparison_name = comparison_prediction
+            scientific_name = source_identity.scientific_name if source_identity else None
+            if scientific_name and taxonomy is not None and taxonomy.lookup(scientific_name):
+                # Use native identity when taxonomy can compare it, retaining
+                # the exact-text fallback for an unindexed confirmed label.
+                exact_unindexed = any(
+                    kw.lower() == comparison_prediction.lower() and taxonomy.lookup(kw) is None
+                    for kw in existing_species
+                )
+                if not exact_unindexed:
+                    comparison_name = scientific_name
             comparison = compare_prediction_to_keywords(
-                source_identity.scientific_name if source_identity else comparison_prediction,
-                species_by_photo.get(pid, []),
-                taxonomy,
+                comparison_name, existing_species, taxonomy,
             )
             prediction = {
                 "id": d["id"],

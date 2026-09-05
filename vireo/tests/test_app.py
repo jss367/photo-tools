@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 
+import pytest
 from wait import wait_for_job_via_client
 
 
@@ -24202,3 +24203,41 @@ def test_compare_keeps_native_scientific_identities_with_shared_common_name(app_
     predictions = response.get_json()["photos"][0]["predictions"]
     assert predictions["BioCLIP"][0]["canonical_species"] == "taxon:10"
     assert predictions["iNat21"][0]["canonical_species"] == "taxon:20"
+
+
+@pytest.mark.parametrize("taxonomy_state", ["absent", "empty", "scientific_only"])
+@pytest.mark.parametrize("source_backed", [True, False])
+def test_compare_preserves_exact_keyword_match_with_incomplete_taxonomy(
+    app_and_db, tmp_path, taxonomy_state, source_backed,
+):
+    from unittest.mock import patch
+
+    from taxonomy import Taxonomy
+
+    app, db = app_and_db
+    photo_id = db.conn.execute("SELECT id FROM photos ORDER BY id LIMIT 1").fetchone()[0]
+    keyword = db.add_keyword("Test Parrot", is_species=True)
+    db.tag_photo(photo_id, keyword)
+    det_id = db.save_detections(photo_id, [
+        {"box": {"x": .1, "y": .1, "w": .3, "h": .3}, "confidence": .9},
+    ], detector_model="MDV6")[0]
+    evidence = {"scientific_name": "Test species"}
+    if source_backed:
+        evidence["taxon_id"] = 123
+    db.add_prediction(det_id, "Test Parrot", .9, "BioCLIP", taxonomy=evidence,
+                      labels_fingerprint="custom" if source_backed else "tol")
+    tax = None
+    if taxonomy_state != "absent":
+        path = tmp_path / "taxonomy.json"
+        entries = {"test species": {"taxon_id": 123, "scientific_name": "Test species", "rank": "species"}}
+        path.write_text(json.dumps({"taxa_by_common": {}, "taxa_by_scientific":
+                                    entries if taxonomy_state == "scientific_only" else {}}))
+        tax = Taxonomy(path)
+    cid = db.add_collection("Exact keyword", json.dumps([{"field": "photo_ids", "value": [photo_id]}]))
+    with patch("taxonomy.load_local_taxonomy", return_value=tax):
+        response = app.test_client().get(f"/api/predictions/compare?collection_id={cid}")
+    assert response.status_code == 200
+    prediction = response.get_json()["photos"][0]["predictions"]["BioCLIP"][0]
+    assert prediction["category"] == "match"
+    assert prediction["canonical_species"] == ("taxon:123" if source_backed or tax and taxonomy_state == "scientific_only"
+                                                else "scientific:test species")

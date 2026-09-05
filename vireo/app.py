@@ -23657,6 +23657,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     },
                 )
 
+            # Park a pause requested during the final iteration before the
+            # eviction pass, which can unlink many previews and rewrite their
+            # database rows. Without this checkpoint the accepted request
+            # would remain ``pausing`` while eviction ran, and a cancel from
+            # that state could leave the cache mid-eviction.
+            if ctx.runner.is_cancelled(job["id"]):
+                return {"generated": generated, "skipped": skipped, "total": total}
+
             # Run a single eviction pass at the end so the batch doesn't
             # fsync after every photo.
             evict_preview_cache_if_over_quota(thread_db, vireo_dir)

@@ -580,6 +580,12 @@ def test_jobs_page_returns_200(app_and_db):
     assert b'Jobs' in resp.data
     assert b'data-pause-job' in resp.data
     assert b'data-resume-job' in resp.data
+    # A pending pause can be withdrawn while the worker is still on its way
+    # to a checkpoint. The button must reuse the resume endpoint (which
+    # accepts "pausing") and must not hide the pausing status pill.
+    assert b'data-cancel-pause' in resp.data
+    assert b'>Cancel pause</button>' in resp.data
+    assert b'disabled>Pausing\xe2\x80\xa6</button>' not in resp.data
     assert b'data-retry-import-job' in resp.data
     assert b'importRetryBody' in resp.data
     # Import-in-place's overall counter pauses during discovery/metadata.

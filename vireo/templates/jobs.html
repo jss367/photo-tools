@@ -584,7 +584,13 @@
       if (job.pausable && job.status === 'running') {
         html += '<button class="btn-pause" data-pause-job="' + escapeAttr(job.id) + '">Pause</button>';
       } else if (job.pausable && job.status === 'pausing') {
-        html += '<button class="btn-pause" disabled>Pausing…</button>';
+        // The pause has been requested but not yet honored: the worker
+        // stops at its next safe checkpoint, which can be minutes away
+        // (e.g. label embeddings inside the model lock). The status pill
+        // still reads "pausing" so the user can see it is underway; this
+        // button withdraws the request via the resume endpoint, which
+        // accepts pausing as well as paused.
+        html += '<button class="btn-pause" data-resume-job="' + escapeAttr(job.id) + '" data-cancel-pause="1" title="Pause is still pending; the job stops at its next safe checkpoint. Click to keep it running instead.">Cancel pause</button>';
       } else if (job.pausable && job.status === 'paused') {
         html += '<button class="btn-pause" data-resume-job="' + escapeAttr(job.id) + '">Resume</button>';
       }
@@ -1254,11 +1260,13 @@
     if (pauseBtn || resumeBtn) {
       var controlBtn = pauseBtn || resumeBtn;
       var action = pauseBtn ? 'pause' : 'resume';
+      var cancellingPause = !!(resumeBtn && resumeBtn.hasAttribute('data-cancel-pause'));
       var jobId = controlBtn.getAttribute(
         pauseBtn ? 'data-pause-job' : 'data-resume-job'
       );
       controlBtn.disabled = true;
-      controlBtn.textContent = pauseBtn ? 'Pausing…' : 'Resuming…';
+      controlBtn.textContent = pauseBtn ? 'Pausing…' :
+        (cancellingPause ? 'Cancelling pause…' : 'Resuming…');
       fetch('/api/jobs/' + encodeURIComponent(jobId) + '/' + action, {
         method: 'POST'
       }).then(function(r) {
@@ -1272,7 +1280,11 @@
         var job = activeJobs.find(function(j) { return j.id === jobId; });
         if (job && data.status) job.status = data.status;
         if (typeof showToast === 'function') {
-          showToast(action === 'pause' ? 'Pausing after the current batch…' : 'Job resumed', 'info');
+          showToast(
+            action === 'pause' ? 'Pausing after the current batch…' :
+              (cancellingPause ? 'Pause cancelled; the job keeps running' : 'Job resumed'),
+            'info'
+          );
         }
         fetchJobs();
       }).catch(function(err) {

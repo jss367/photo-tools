@@ -23283,3 +23283,64 @@ def test_encounter_species_remove_rejects_species_not_confirmed(app_and_db):
     assert "not a confirmed species" in resp.get_json()["error"]
     for pid in photo_ids:
         assert _species_names(db, pid) == ["Green-winged Teal", "Mallard"]
+
+
+def test_encounter_species_add_on_mixed_burst_stays_unconfirmed(app_and_db):
+    """A burst whose frames carry different species sets is not confirmed
+    after an add: the override follows the database (None, as regroup would
+    derive), so the still-mixed burst is not hidden as confirmed. A uniform
+    burst is confirmed with the cache's list plus any shared extra."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    mixed_ids, uniform_ids = photo_ids[:2], photo_ids[2:]
+    path = _seed_encounter_cache(
+        app, db, photo_ids, confirmed_species=None,
+        bursts=[
+            {"photo_ids": mixed_ids, "species_predictions": [], "species_override": None},
+            {"photo_ids": uniform_ids, "species_predictions": [],
+             "species_override": {"species": "Green-winged Teal", "confirmed": True,
+                                  "species_list": ["Green-winged Teal"]}},
+        ],
+    )
+    import json as _json2
+    with open(path) as f:
+        cache = _json2.load(f)
+    cache["encounters"][0]["confirmed_species"] = "Green-winged Teal"
+    cache["encounters"][0]["confirmed_species_list"] = ["Green-winged Teal"]
+    cache["encounters"][0]["species_confirmed"] = False
+    with open(path, "w") as f:
+        _json2.dump(cache, f)
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    gadwall = db.add_keyword("Gadwall", is_species=True)
+    for pid in photo_ids:
+        db.tag_photo(pid, teal)
+    db.tag_photo(mixed_ids[0], gadwall)
+    for pid in uniform_ids:
+        db.tag_photo(pid, gadwall)
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "American Wigeon", "photo_ids": mixed_ids,
+        "burst_index": 0, "add": True,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    assert resp.get_json()["species_list"] == ["Green-winged Teal", "American Wigeon"]
+    with open(path) as f:
+        bursts = _json.load(f)["encounters"][0]["bursts"]
+    assert bursts[0]["species_override"] is None
+    assert _species_names(db, mixed_ids[0]) == ["American Wigeon", "Gadwall", "Green-winged Teal"]
+    assert _species_names(db, mixed_ids[1]) == ["American Wigeon", "Green-winged Teal"]
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "American Wigeon", "photo_ids": uniform_ids,
+        "burst_index": 1, "add": True,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    with open(path) as f:
+        bursts = _json.load(f)["encounters"][0]["bursts"]
+    assert bursts[1]["species_override"] == {
+        "species": "Green-winged Teal",
+        "confirmed": True,
+        "species_list": ["Green-winged Teal", "American Wigeon", "Gadwall"],
+    }

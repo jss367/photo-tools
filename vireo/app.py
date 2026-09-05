@@ -27052,12 +27052,43 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # burst override, encounter-scoped requests only touch the encounter.
         if cached and target_enc is not None:
             if burst_index is not None:
-                # An emptied burst keeps an explicit empty override rather
-                # than None: None would make it inherit the encounter's
-                # species, which the remove just untagged.
+                # The override's confirmed state comes from the database, the
+                # same rule serialize_results applies on regroup: confirmed
+                # only when every submitted frame now carries the same
+                # species set. A mixed burst ([A, C] on one frame, [A] on
+                # another) that just gained B is still mixed, so it stays
+                # unconfirmed (None → the encounter's list, as regroup would
+                # write) rather than being hidden as confirmed. When uniform,
+                # the list is the cache's ordering plus any extra the frames
+                # already shared that the cache had not recorded. An emptied
+                # burst keeps an explicit empty override rather than None:
+                # None would make it inherit the encounter's species, which
+                # the remove just untagged.
+                actual_by_photo = db.get_species_keywords_for_photos(photo_ids)
+                actual_sets = [
+                    frozenset(species_key_set(actual_by_photo.get(pid, [])))
+                    for pid in photo_ids
+                ]
+                frames_uniform = (
+                    bool(actual_sets)
+                    and all(actual_sets)
+                    and len(set(actual_sets)) == 1
+                )
+                if not new_species_list:
+                    burst_override = empty_species_override()
+                elif frames_uniform:
+                    recorded = species_key_set(new_species_list)
+                    extras = [
+                        s for s in actual_by_photo.get(photo_ids[0], [])
+                        if keyword_match_key(s) not in recorded
+                    ]
+                    burst_override = build_species_override(
+                        new_species_list + extras,
+                    )
+                else:
+                    burst_override = None
                 target_enc["bursts"][burst_index]["species_override"] = (
-                    build_species_override(new_species_list)
-                    or empty_species_override()
+                    burst_override
                 )
                 # Auto-detach if the burst's confirmed species no longer
                 # overlap its encounter's — splits it out and merges into an

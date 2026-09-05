@@ -1,7 +1,17 @@
 """Every browser transport participates in persistent edit history."""
 
+import time
+
 import pytest
 from playwright.sync_api import expect
+
+
+def _held_route(page, held):
+    deadline = time.monotonic() + 5
+    while not held and time.monotonic() < deadline:
+        page.wait_for_timeout(50)
+    assert len(held) == 1, 'expected exactly one held history request'
+    return held.pop()
 
 
 @pytest.mark.parametrize('transport', ['fetch', 'request', 'json'])
@@ -27,8 +37,7 @@ def test_pending_browser_writes_guard_history_and_refresh_after_save(live_server
     }''', {'photoId': photo_id, 'transport': transport})
     expect(page.locator('#historyUndoBtn')).to_be_disabled()
     page.evaluate('doUndo()')
-    assert len(held) == 1
-    held.pop().continue_()
+    _held_route(page, held).continue_()
     page.evaluate('window.historyTestWrite')
     expect(page.locator('#historyUndoBtn')).to_be_enabled()
     assert live_server['db'].get_photo(photo_id)['flag'] == 'rejected'
@@ -99,6 +108,6 @@ def test_pending_cache_save_blocks_undo(live_server, page):
     expect(page.locator('#historyUndoBtn')).to_be_disabled()
     page.evaluate('doUndo()')
     assert live_server['db'].get_photo(photo_id)['flag'] == 'rejected'
-    held.pop().abort()
+    _held_route(page, held).abort()
     page.evaluate('window.pendingCacheSave')
     expect(page.locator('#historyUndoBtn')).to_be_enabled()

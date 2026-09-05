@@ -20923,63 +20923,102 @@ class Database:
 
         Non-undoable entries (prediction_reject, discard) are skipped.
         The entry is marked as undone (not deleted) so it can be redone.
+
+        A ``pipeline_grouping`` entry whose ``after`` snapshot no longer
+        matches the cached encounter structure (regroup-live, reflow, or a
+        later pipeline run wrote fresh results on top of it) is retired here
+        and the search resumes with the next candidate — otherwise the stale
+        row would remain the newest undoable edit forever and block every
+        older undoable edit behind it. Transient lock conflicts still bubble
+        up so the caller can retry.
         """
         placeholders = ",".join("?" for _ in self._NON_UNDOABLE)
-        entry = self.conn.execute(
-            f"SELECT * FROM edit_history WHERE workspace_id = ? AND undone = 0 AND action_type NOT IN ({placeholders}) "
-            "ORDER BY created_at DESC, id DESC LIMIT 1",
-            (self._ws_id(), *self._NON_UNDOABLE),
-        ).fetchone()
-        if not entry:
-            return None
-        entry = dict(entry)
-        items = self.conn.execute(
-            "SELECT * FROM edit_history_items WHERE edit_id = ?",
-            (entry['id'],),
-        ).fetchall()
+        while True:
+            entry = self.conn.execute(
+                f"SELECT * FROM edit_history WHERE workspace_id = ? AND undone = 0 AND action_type NOT IN ({placeholders}) "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (self._ws_id(), *self._NON_UNDOABLE),
+            ).fetchone()
+            if not entry:
+                return None
+            entry = dict(entry)
+            items = self.conn.execute(
+                "SELECT * FROM edit_history_items WHERE edit_id = ?",
+                (entry['id'],),
+            ).fetchall()
 
-        if entry['action_type'] == 'pipeline_grouping':
-            from services.grouping_history import restore_grouping_edit
+            if entry['action_type'] == 'pipeline_grouping':
+                from services.grouping_history import (
+                    GroupingHistoryStale,
+                    restore_grouping_edit,
+                )
 
-            with restore_grouping_edit(self, entry, undo=True):
+                try:
+                    with restore_grouping_edit(self, entry, undo=True):
+                        self.conn.execute("UPDATE edit_history SET undone = 1 WHERE id = ?", (entry['id'],))
+                        self.conn.commit()
+                except GroupingHistoryStale:
+                    self._retire_stale_grouping_entry(entry['id'])
+                    continue
+            else:
+                self._apply_undo(entry, items)
                 self.conn.execute("UPDATE edit_history SET undone = 1 WHERE id = ?", (entry['id'],))
                 self.conn.commit()
-        else:
-            self._apply_undo(entry, items)
-            self.conn.execute("UPDATE edit_history SET undone = 1 WHERE id = ?", (entry['id'],))
-            self.conn.commit()
-        return entry
+            return entry
 
     def redo_last_undo(self):
         """Redo the most recently undone edit. Returns the entry dict, or None.
 
-        Replays in chronological order (ASC) so sequential undos are redone correctly.
+        Replays in chronological order (ASC) so sequential undos are redone
+        correctly. Stale ``pipeline_grouping`` entries are retired for the
+        same reason as ``undo_last_edit``.
         """
         placeholders = ",".join("?" for _ in self._NON_UNDOABLE)
-        entry = self.conn.execute(
-            f"SELECT * FROM edit_history WHERE workspace_id = ? AND undone = 1 AND action_type NOT IN ({placeholders}) "
-            "ORDER BY created_at ASC, id ASC LIMIT 1",
-            (self._ws_id(), *self._NON_UNDOABLE),
-        ).fetchone()
-        if not entry:
-            return None
-        entry = dict(entry)
-        items = self.conn.execute(
-            "SELECT * FROM edit_history_items WHERE edit_id = ?",
-            (entry['id'],),
-        ).fetchall()
+        while True:
+            entry = self.conn.execute(
+                f"SELECT * FROM edit_history WHERE workspace_id = ? AND undone = 1 AND action_type NOT IN ({placeholders}) "
+                "ORDER BY created_at ASC, id ASC LIMIT 1",
+                (self._ws_id(), *self._NON_UNDOABLE),
+            ).fetchone()
+            if not entry:
+                return None
+            entry = dict(entry)
+            items = self.conn.execute(
+                "SELECT * FROM edit_history_items WHERE edit_id = ?",
+                (entry['id'],),
+            ).fetchall()
 
-        if entry['action_type'] == 'pipeline_grouping':
-            from services.grouping_history import restore_grouping_edit
+            if entry['action_type'] == 'pipeline_grouping':
+                from services.grouping_history import (
+                    GroupingHistoryStale,
+                    restore_grouping_edit,
+                )
 
-            with restore_grouping_edit(self, entry, undo=False):
+                try:
+                    with restore_grouping_edit(self, entry, undo=False):
+                        self.conn.execute("UPDATE edit_history SET undone = 0 WHERE id = ?", (entry['id'],))
+                        self.conn.commit()
+                except GroupingHistoryStale:
+                    self._retire_stale_grouping_entry(entry['id'])
+                    continue
+            else:
+                self._apply_redo(entry, items)
                 self.conn.execute("UPDATE edit_history SET undone = 0 WHERE id = ?", (entry['id'],))
                 self.conn.commit()
-        else:
-            self._apply_redo(entry, items)
-            self.conn.execute("UPDATE edit_history SET undone = 0 WHERE id = ?", (entry['id'],))
-            self.conn.commit()
-        return entry
+            return entry
+
+    def _retire_stale_grouping_entry(self, entry_id):
+        """Delete a ``pipeline_grouping`` row whose snapshot no longer matches.
+
+        Called only after ``restore_grouping_edit`` refused the row because
+        the cached encounter structure diverged from its recorded ``before`` /
+        ``after``. Leaving the row in history would keep it as the newest
+        undoable (or oldest redoable) grouping entry forever and block every
+        older undoable edit behind it. The row's ``edit_history_items``
+        cascade with the parent.
+        """
+        self.conn.execute("DELETE FROM edit_history WHERE id = ?", (entry_id,))
+        self.conn.commit()
 
     # ------------------------------------------------------------------
     # Undo / redo

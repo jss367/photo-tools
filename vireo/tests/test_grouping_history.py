@@ -77,21 +77,41 @@ def test_grouping_restore_preserves_new_photo_metadata(app_and_db):
     assert restored['miss_computed_at'] == 'new marker'
 
 
-def test_stale_grouping_undo_retains_history_and_newer_work(app_and_db):
+def test_stale_grouping_entry_is_retired_and_preserves_newer_work(app_and_db):
+    """A stale grouping entry never blocks older undoable edits.
+
+    When reflow, regroup-live, or a later pipeline run replaces the cached
+    encounters after a detach, the entry's ``after`` snapshot no longer
+    matches the cache and can never be restored without erasing that newer
+    work. Undo must retire the stale row (deleting only the row, not the
+    cache) so the search resumes with the next candidate — otherwise the
+    row would remain the newest undoable grouping entry forever and every
+    older undoable edit would sit permanently unreachable behind it.
+    """
     app, db = app_and_db
     client = app.test_client()
     ids, _ = _seed(db)
+    # Older undoable edit that must remain reachable through undo.
+    client.post('/api/batch/flag', json={'photo_ids': ids, 'flag': 'flagged'})
     _detach(client)
     updated = _load(db)
-    # Structural change (a burst split) is real newer work — refuse.
+    # Structural change (a burst split) mirrors what reflow/regroup-live
+    # would land: the cache no longer matches the detach entry's snapshot.
     updated['encounters'][0]['bursts'].append({'photo_ids': [ids[0]]})
     save_results_raw(updated, os.path.dirname(db._db_path), db._ws_id())
+
+    # Undo retires the stale detach and then undoes the older flag edit.
     response = client.post('/api/undo')
-    assert response.status_code == 409
-    assert 'newer work' in response.json['error']
-    assert _load(db) == updated
-    assert client.get('/api/undo/status').json['count'] == 1
+    assert response.status_code == 200, response.get_json()
+    assert 'flag' in response.get_json()['undone'].lower()
+    assert _load(db)['encounters'] == updated['encounters']
+    assert all(db.get_photo(pid)['flag'] == 'none' for pid in ids)
+    assert client.get('/api/undo/status').json['count'] == 0
+    # Redo replays the flag edit; the retired detach never resurfaces.
+    assert client.post('/api/redo').status_code == 200
+    assert all(db.get_photo(pid)['flag'] == 'flagged' for pid in ids)
     assert client.get('/api/redo/status').json['available'] is False
+    assert _load(db)['encounters'] == updated['encounters']
 
 
 def test_grouping_undo_tolerates_reverted_species_cache_state(app_and_db):

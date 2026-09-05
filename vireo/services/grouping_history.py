@@ -7,7 +7,18 @@ from contextlib import contextmanager
 
 
 class GroupingHistoryConflict(ValueError):
-    """A newer grouping cannot safely be replaced by an older history entry."""
+    """A newer grouping cannot safely be replaced by an older history entry.
+
+    Bare ``GroupingHistoryConflict`` is transient — another writer holds the
+    workspace regroup lock and undo is worth retrying. ``GroupingHistoryStale``
+    means the cached encounter structure has diverged so far from this entry's
+    snapshot that no future retry could succeed; callers must retire the
+    history row instead of leaving it to block older undoable edits forever.
+    """
+
+
+class GroupingHistoryStale(GroupingHistoryConflict):
+    """The cache no longer matches this entry — retire, don't retry."""
 
 
 # Fields that ``/api/encounters/species`` mutates on the pipeline cache
@@ -91,7 +102,7 @@ def restore_grouping_edit(db, entry, *, undo):
         expected = change["after" if undo else "before"]
         target = change["before" if undo else "after"]
         if current is None or _grouping_signature(current.get("encounters")) != _grouping_signature(expected):
-            raise GroupingHistoryConflict(
+            raise GroupingHistoryStale(
                 "The photo groups have changed since this edit. "
                 "These groups cannot be restored without replacing newer work."
             )

@@ -23088,3 +23088,47 @@ def test_encounter_species_remove_last_burst_species_leaves_explicit_empty_overr
     assert resp.status_code == 200, resp.get_json()
     assert resp.get_json()["previous_species"] is None
     assert resp.get_json()["species_list"] == ["Gadwall"]
+
+
+def test_encounter_species_ignores_candidate_override_when_resolving_previous(app_and_db):
+    """A detach-time candidate override (confirmed False) is a guess, not a
+    confirmation: the burst's current set is the encounter's confirmed
+    species, so a replace naming that species succeeds and an add never
+    promotes the guess."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    burst_ids, other_ids = photo_ids[:2], photo_ids[2:]
+    path = _seed_encounter_cache(
+        app, db, photo_ids, confirmed_species="Green-winged Teal",
+        bursts=[
+            {"photo_ids": burst_ids, "species_predictions": [],
+             "species_override": {"species": "Gadwall", "confirmed": False}},
+            {"photo_ids": other_ids, "species_predictions": [], "species_override": None},
+        ],
+    )
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    for pid in photo_ids:
+        db.tag_photo(pid, teal)
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "American Wigeon", "photo_ids": burst_ids,
+        "burst_index": 0, "add": True,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    assert resp.get_json()["species_list"] == ["Green-winged Teal", "American Wigeon"]
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "Mallard", "photo_ids": burst_ids, "burst_index": 0,
+        "previous_species": "Green-winged Teal",
+    })
+    assert resp.status_code == 200, resp.get_json()
+    assert resp.get_json()["previous_species"] == "Green-winged Teal"
+    assert resp.get_json()["species_list"] == ["Mallard", "American Wigeon"]
+    for pid in burst_ids:
+        assert _species_names(db, pid) == ["American Wigeon", "Mallard"]
+    with open(path) as f:
+        encounters = _json.load(f)["encounters"]
+    # Nothing shared with the encounter's teal any more → detached.
+    assert len(encounters) == 2

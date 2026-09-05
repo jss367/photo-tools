@@ -606,6 +606,38 @@ def test_save_load_results_roundtrip(tmp_path):
     assert len(loaded["encounters"]) == 2
 
 
+def test_load_results_handles_legacy_raw_bursts(tmp_path):
+    """Caches written before bursts became objects are still readable.
+
+    A legacy cache stores each burst as a raw array of photo IDs. Species
+    identity attachment must skip those instead of treating them as dicts,
+    or the review page 500s on every pre-upgrade cache.
+    """
+    from pipeline import load_results, save_results
+
+    db, ids = _setup_db_with_photos(tmp_path, n_encounters=1, photos_per_encounter=2)
+    cache_dir = str(tmp_path)
+
+    from pipeline import load_photo_features, run_full_pipeline
+
+    results = run_full_pipeline(load_photo_features(db))
+    save_results(results, cache_dir, workspace_id=1)
+
+    path = os.path.join(cache_dir, "pipeline_results_ws1.json")
+    with open(path) as f:
+        cached = json.load(f)
+    for enc in cached["encounters"]:
+        enc["bursts"] = [b["photo_ids"] for b in enc["bursts"]]
+    with open(path, "w") as f:
+        json.dump(cached, f)
+
+    loaded = load_results(cache_dir, workspace_id=1, db=db)
+
+    assert loaded is not None
+    assert loaded["encounters"][0]["bursts"] == cached["encounters"][0]["bursts"]
+    assert "species_identities" in loaded
+
+
 def test_load_results_missing(tmp_path):
     """load_results returns None when no cache exists."""
     from pipeline import load_results

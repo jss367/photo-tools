@@ -1367,6 +1367,11 @@ def attach_species_identities(data, resolver):
         if enc.get("species"):
             names.add(enc["species"][0])
         for burst in enc.get("bursts", []):
+            # Legacy caches store a burst as a raw photo-id array with no
+            # species fields of its own; its photos are already collected
+            # above, so there is nothing more to read from it.
+            if not isinstance(burst, dict):
+                continue
             collect(burst)
             override = burst.get("species_override") or {}
             if override.get("species"):
@@ -1421,6 +1426,10 @@ def normalize_cached_species(data, resolver):
             enc["species"] = list(encounter_species_label(photos))
             enc["species_predictions"] = _build_species_predictions(photos)
         for burst in enc.get("bursts", []):
+            # Legacy raw photo-id arrays carry no per-burst predictions or
+            # override to refresh.
+            if not isinstance(burst, dict):
+                continue
             burst_photos = [photo_map[pid] for pid in burst.get("photo_ids", []) if pid in photo_map]
             if burst_photos:
                 burst["species_predictions"] = _build_species_predictions(burst_photos)

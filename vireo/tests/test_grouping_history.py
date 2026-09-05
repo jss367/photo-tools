@@ -442,7 +442,9 @@ def test_cache_only_confirm_rolls_back_when_cache_write_fails(
     assert _load(db) == before_cache
 
 
-def test_burst_confirm_undo_preserves_cleared_override(app_and_db):
+@pytest.mark.parametrize("undo_before_clear", [False, True])
+@pytest.mark.parametrize("burst", [False, True])
+def test_confirm_history_preserves_cleared_override(app_and_db, undo_before_clear, burst):
     """Undoing a cache-only burst confirmation preserves a later clear.
 
     After a cache-only burst confirmation, ``clearBurstOverride`` can
@@ -464,28 +466,36 @@ def test_burst_confirm_undo_preserves_cleared_override(app_and_db):
     # Seed a burst-level previous override so undo of the confirmation
     # would (before the fix) restore it and overwrite the user's clear.
     seeded = _load(db)
-    seeded['encounters'][0]['bursts'][0]['species_override'] = {
-        'species': 'Old', 'confirmed': True,
-    }
+    if burst:
+        seeded['encounters'][0]['bursts'][0]['species_override'] = {
+            'species': 'Old', 'confirmed': True,
+        }
+    else:
+        seeded['encounters'][0].update(confirmed_species='Old', species_confirmed=True)
     save_results_raw(seeded, os.path.dirname(db._db_path), db._ws_id())
-
-    burst_photo_ids = ids[:2]
-    response = client.post('/api/encounters/species', json={
-        'species': 'Cardinal',
-        'photo_ids': burst_photo_ids,
-        'burst_index': 0,
-    })
+    payload = {'species': 'Cardinal', 'photo_ids': ids[:2] if burst else ids}
+    if burst:
+        payload['burst_index'] = 0
+    response = client.post('/api/encounters/species', json=payload)
     assert response.status_code == 200, response.get_json()
-    # Simulate ``clearBurstOverride``: user picks "Use encounter label",
-    # save-cache writes ``species_override = None`` with no history.
-    cleared = _load(db)
-    cleared['encounters'][0]['bursts'][0]['species_override'] = None
-    response = client.post('/api/pipeline/save-cache', json=cleared)
-    assert response.status_code == 200
+    if undo_before_clear:
+        assert client.post('/api/undo').status_code == 200
 
-    assert client.post('/api/undo').status_code == 200
-    restored = _load(db)
-    assert restored['encounters'][0]['bursts'][0].get('species_override') is None
+    cleared = _load(db)
+    if burst:
+        cleared['encounters'][0]['bursts'][0]['species_override'] = None
+    else:
+        cleared['encounters'][0].update(confirmed_species=None, species_confirmed=False)
+    assert client.post('/api/pipeline/save-cache', json=cleared).status_code == 200
+    cleared = _load(db)
+
+    # A superseded confirmation is retired, never made redoable by a no-op undo.
+    direction = 'redo' if undo_before_clear else 'undo'
+    assert client.post('/api/' + direction).status_code == 400
+    assert _load(db) == cleared
+    assert client.get('/api/undo/status').json['available'] is False
+    assert client.post('/api/redo').status_code == 400
+    assert _load(db) == cleared
 
 
 def test_grouping_history_is_workspace_scoped(app_and_db):

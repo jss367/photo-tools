@@ -1,6 +1,7 @@
 import json
 import re
 
+import pytest
 from playwright.sync_api import expect
 
 
@@ -16,6 +17,89 @@ def test_pipeline_start_button_disabled_without_folders(live_server, page):
     page.goto(f"{url}/pipeline")
     btn = page.locator("[data-testid='start-pipeline-btn']")
     expect(btn).to_be_disabled()
+
+
+@pytest.mark.parametrize("source", ["folders", "collection"])
+def test_pipeline_plan_requires_source_and_clears_counts(live_server, page, source):
+    """Empty selections must never display or request a workspace-wide plan."""
+    collection_id = live_server["db"].add_collection(
+        "All test photos", json.dumps({"mode": "all", "rules": []}),
+    )
+    requests = []
+    page.on("request", lambda request: requests.append(request.post_data_json)
+            if request.url.endswith("/api/pipeline/plan") else None)
+    page.goto(f'{live_server["url"]}/pipeline')
+    page.wait_for_function("!window._pageInitPending")
+    expect(page.locator("#collectionPicker option", has_text="All test photos")).to_have_count(1)
+    if source == "collection":
+        page.click("[data-testid='source-collection']")
+
+    summary = page.locator("#pipelinePlanSummary")
+    expect(summary).to_have_text("Select a source to see the pipeline plan.")
+    expect(page.locator("#pillPreviews")).to_have_text("Select a source")
+    expect(page.locator("#pipelineActionStatus")).to_contain_text("Select workspace folders")
+    # Let initial model/label loading and the debounce finish before checking
+    # that the empty page never requested the API's whole-workspace fallback.
+    page.wait_for_timeout(400)
+    assert requests == []
+
+    folder = page.locator("#folderScopeList input[type=checkbox]").first
+    if source == "folders":
+        folder.check()
+    else:
+        page.select_option("#collectionPicker", str(collection_id))
+    expect(page.locator("#summaryPreviews")).to_contain_text("preview")
+    expect(page.locator("#btnStartPipeline")).to_be_enabled()
+    assert requests
+    assert all("folder_ids" in body if source == "folders"
+               else body.get("collection_id") == collection_id for body in requests)
+    request_count = len(requests)
+
+    if source == "folders":
+        folder.uncheck()
+    else:
+        page.select_option("#collectionPicker", "")
+    expect(summary).to_have_text("Select a source to see the pipeline plan.")
+    for suffix in ("Scan", "Previews", "Classify", "Extract", "EyeKeypoints", "Group"):
+        expect(page.locator(f"#pill{suffix}")).to_have_text("Select a source")
+    for selector in ("#summaryPreviews", "#txtDetections", "#txtMasks",
+                     "#txtEyeKeypoints", "#txtResults"):
+        expect(page.locator(selector)).to_be_empty()
+    expect(page.locator(".stage-progress-bar:not(.hidden)")).to_have_count(0)
+    expect(page.locator("#btnStartPipeline")).to_be_disabled()
+    page.wait_for_timeout(250)
+    assert len(requests) == request_count
+
+
+def test_pipeline_late_plan_cannot_restore_counts_after_source_cleared(live_server, page):
+    page.goto(f'{live_server["url"]}/pipeline')
+    page.wait_for_function("!window._pageInitPending")
+    folder = page.locator("#folderScopeList input[type=checkbox]").first
+    folder.check()
+    expect(page.locator("#summaryPreviews")).to_contain_text("preview")
+    page.wait_for_function("!_planRefreshPending")
+    # Hold the next plan response while the user switches to an empty source.
+    page.evaluate("""() => {
+        const fetch = safeFetch;
+        const oldPlan = _pipelinePlan;
+        safeFetch = function(url, ...args) {
+            if (url === '/api/pipeline/plan') {
+                return new Promise(resolve => {
+                    window.releasePlan = () => resolve(oldPlan);
+                });
+            }
+            return fetch(url, ...args);
+        };
+        window.heldPlan = refreshPipelinePlan();
+    }""")
+    page.click("[data-testid='source-collection']")
+    page.evaluate("async () => { releasePlan(); await heldPlan; }")
+    expect(page.locator("#pipelinePlanSummary")).to_have_text(
+        "Select a source to see the pipeline plan."
+    )
+    expect(page.locator("#summaryPreviews")).to_be_empty()
+    expect(page.locator("#btnStartPipeline")).to_be_disabled()
+    assert page.evaluate("_pipelinePlan === null && !_planRefreshPending")
 
 
 def test_pipeline_has_no_destination_card(live_server, page):
@@ -174,6 +258,7 @@ def test_pipeline_section_headers_visible(live_server, page):
 def test_pipeline_status_pills_visible_for_processing_stages(live_server, page):
     url = live_server["url"]
     page.goto(f"{url}/pipeline")
+    page.locator("#folderScopeList input[type=checkbox]").first.check()
     # Stages 3-8 each have a pill that's populated on load.
     for suffix in ["Scan", "Previews", "Classify", "Extract", "EyeKeypoints", "Group"]:
         pill = page.locator(f"#pill{suffix}")
@@ -189,6 +274,7 @@ def test_pipeline_status_pills_visible_for_processing_stages(live_server, page):
 def test_pipeline_reclassify_flips_classify_pill_to_will_run(live_server, page):
     url = live_server["url"]
     page.goto(f"{url}/pipeline")
+    page.locator("#folderScopeList input[type=checkbox]").first.check()
     expect(page.locator("#pillClassify")).to_contain_text("Already done")
     page.click("#card-classify .stage-header")
     page.check("#chkReclassify")
@@ -331,6 +417,7 @@ def test_pipeline_process_dialog_validates_name_and_closes_with_escape(
 def test_pipeline_toggling_classify_off_keeps_group_available(live_server, page):
     url = live_server["url"]
     page.goto(f"{url}/pipeline")
+    page.locator("#folderScopeList input[type=checkbox]").first.check()
     page.click("#card-classify .stage-header")
     page.uncheck("#enableClassify")
     for suffix in ["Classify", "Extract"]:
@@ -347,6 +434,7 @@ def test_pipeline_toggling_classify_off_keeps_group_available(live_server, page)
 def test_pipeline_plan_summary_lists_stages(live_server, page):
     url = live_server["url"]
     page.goto(f"{url}/pipeline")
+    page.locator("#folderScopeList input[type=checkbox]").first.check()
     summary = page.locator("[data-testid='pipeline-plan-summary']")
     expect(summary).to_be_visible()
     # Extract & Group will run; Classify is done-prior (seed has classifier_runs).
@@ -364,6 +452,7 @@ def test_pipeline_plan_summary_lists_stages(live_server, page):
 def test_pipeline_plan_summary_updates_on_toggle(live_server, page):
     url = live_server["url"]
     page.goto(f"{url}/pipeline")
+    page.locator("#folderScopeList input[type=checkbox]").first.check()
     page.click("#card-classify .stage-header")
     page.uncheck("#enableClassify")
     summary = page.locator("[data-testid='pipeline-plan-summary']")
@@ -406,6 +495,7 @@ def test_pipeline_skipped_user_disabled_stage_keeps_will_skip_pill(live_server, 
     the pill must stay "Will skip" — not flip to "Already done"."""
     url = live_server["url"]
     page.goto(f"{url}/pipeline")
+    page.locator("#folderScopeList input[type=checkbox]").first.check()
     page.click("#card-classify .stage-header")
     page.uncheck("#enableExtract")
     expect(page.locator("#pillExtract")).to_contain_text("Will skip")
@@ -424,6 +514,7 @@ def test_pipeline_skipped_auto_stage_shows_already_done(live_server, page):
     "Already done" — distinguishing it from an explicit user skip."""
     url = live_server["url"]
     page.goto(f"{url}/pipeline")
+    page.locator("#folderScopeList input[type=checkbox]").first.check()
     # Extract is enabled by default.
     expect(page.locator("#pillExtract")).to_contain_text("Will run")
     page.evaluate("""
@@ -466,6 +557,7 @@ def test_pipeline_eye_keypoints_pill_will_skip_by_default(live_server, page):
     """
     url = live_server["url"]
     page.goto(f"{url}/pipeline")
+    page.locator("#folderScopeList input[type=checkbox]").first.check()
     # Wait for /api/pipeline/page-init to settle so the checkbox reflects
     # cfg.eye_detect_enabled (not the HTML default), then wait for the
     # initial /api/pipeline/plan. Without the page-init wait the checkbox
@@ -491,6 +583,7 @@ def test_pipeline_eye_keypoints_toggle_off_marks_will_skip(live_server, page):
     """
     url = live_server["url"]
     page.goto(f"{url}/pipeline")
+    page.locator("#folderScopeList input[type=checkbox]").first.check()
     # Wait for /api/pipeline/page-init to settle first. Its success handler
     # assigns enableEyeKeypoints.checked from cfg.eye_detect_enabled; if it
     # ran after page.check() below, it would silently overwrite the opt-in
@@ -526,6 +619,7 @@ def test_pipeline_disabling_extract_keeps_group_available(live_server, page):
     disable Eye Keypoints while leaving cached-feature grouping available."""
     url = live_server["url"]
     page.goto(f"{url}/pipeline")
+    page.locator("#folderScopeList input[type=checkbox]").first.check()
     page.click("#card-extract .stage-header")
     page.uncheck("#enableExtract")
     ek = page.locator("#enableEyeKeypoints")
@@ -541,16 +635,14 @@ def test_pipeline_disabling_extract_keeps_group_available(live_server, page):
 def test_pipeline_previews_pill_shows_pending_count(live_server, page):
     """Previews card must surface honest counts ("Will generate N previews")
     instead of an opaque "Will run", per CORE_PHILOSOPHY's no-black-boxes
-    rule. The seeded fixture has 5 photos and no preview_cache rows, so
-    the pill should reflect 5 photos pending and the summary should name
-    the substages that have work.
+    rule. The selected folder has 3 photos and no preview_cache rows, so
+    the pill should reflect that scope and name the substages with work.
     """
     url = live_server["url"]
     page.goto(f"{url}/pipeline")
+    page.locator("#folderScopeList input[type=checkbox]").first.check()
     expect(page.locator("#pillPreviews")).to_contain_text("Will run")
-    # Wait for the plan to actually populate — the pill above has a
-    # default-when-no-plan fallback, so its presence isn't proof the
-    # plan response has been merged into _pipelinePlan yet.
+    # Verify the counts are scoped to the selected folder.
     page.wait_for_function(
         "() => window._pipelinePlan && window._pipelinePlan.stages "
         "&& window._pipelinePlan.stages.Previews"
@@ -559,7 +651,7 @@ def test_pipeline_previews_pill_shows_pending_count(live_server, page):
         "() => window._pipelinePlan ? window._pipelinePlan.stages.Previews : null"
     )
     assert plan is not None, "Previews plan entry missing from response"
-    assert plan["detail"]["eligible"] > 0, f"Expected eligible>0, got: {plan!r}"
+    assert plan["detail"]["eligible"] == 3, f"Expected selected folder's 3 photos, got: {plan!r}"
     # Detail count appears in parentheses — the pill formatter shape is
     # "Will run (N)" / "Resume (N left)".
     pill_text = page.locator("#pillPreviews").inner_text()

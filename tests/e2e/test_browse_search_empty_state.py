@@ -2153,3 +2153,50 @@ def test_flag_quick_filters_show_picks_and_rejects(live_server, page):
 
     reject_btn.click()
     expect(page.locator(".grid-card")).to_have_count(5)
+
+
+def test_toolbar_history_requeries_flag_filter_and_keeps_collection(live_server, page):
+    db = live_server['db']
+    ids = live_server['data']['photos'][:2]
+    db.update_photo_flag(ids[1], 'rejected')
+    collection_id = db.add_collection('Rejected history test', json.dumps([
+        {'field': 'flag', 'op': 'is', 'value': 'rejected'},
+    ]))
+    page.goto(live_server['url'] + '/browse')
+    page.locator('.grid-card').first.wait_for(state='visible')
+    page.evaluate("id => setFlagFor(id, 'rejected')", ids[0])
+    page.locator(f'.tree-item[data-collection-id="{collection_id}"]').click()
+    expect(page.locator('.grid-card')).to_have_count(2)
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    page.locator('#historyUndoBtn').click()
+    expect(page.locator('.grid-card')).to_have_count(1)
+    expect(page.locator('.grid-card')).to_have_attribute('data-id', str(ids[1]))
+    expect(page.locator('#historyRedoBtn')).to_be_enabled()
+    assert page.evaluate('openedCollectionId') == collection_id
+    page.locator('#historyRedoBtn').click()
+    expect(page.locator('.grid-card')).to_have_count(2)
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    # Keyboard and toolbar share the query refresh, including collection scope.
+    page.evaluate('(id) => { activeCollectionId = id; }', collection_id)
+    page.evaluate('undoLast()')
+    expect(page.locator('.grid-card')).to_have_count(1)
+    assert page.evaluate('openedCollectionId') == collection_id
+    assert page.evaluate('activeCollectionId') == collection_id
+
+
+def test_toolbar_history_requeries_rating_sort(live_server, page):
+    db = live_server['db']
+    ids = live_server['data']['photos'][:2]
+    db.update_photo_rating(ids[0], 2)
+    db.update_photo_rating(ids[1], 1)
+    page.goto(live_server['url'] + '/browse')
+    page.locator('#sortSelect').select_option('rating')
+    expect(page.locator('.grid-card').first).to_have_attribute('data-id', str(ids[0]))
+    page.evaluate('id => setRatingFor(id, 5)', ids[1])
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    page.locator('#historyUndoBtn').click()
+    expect(page.locator('#historyRedoBtn')).to_be_enabled()
+    expect(page.locator('.grid-card').first).to_have_attribute('data-id', str(ids[0]))
+    page.locator('#historyRedoBtn').click()
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    expect(page.locator('.grid-card').first).to_have_attribute('data-id', str(ids[1]))

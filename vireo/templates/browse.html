@@ -8850,9 +8850,8 @@ function openPredictionInReview(photoId) {
 // mutation already passes through:
 //   * `_refreshBrowseKeywordState` — every keyword write in Browse calls it,
 //     because card badges have to be refetched anyway;
-//   * `refreshBrowseSidebarPanels`, off the `vireo:edit-history-changed`
-//     document event — undo and redo, which revert keywords and prediction
-//     rows together and so repaint the whole sidebar;
+//   * `refreshBrowseSidebarPanels` — the shared history refresh hook repaints
+//     the whole sidebar after undo/redo reverses keywords and predictions;
 //   * `_afterPredictionMutation` / `rejectDetailPredictions` — status writes.
 // A future keyword mutation path therefore gets panel freshness for free.
 //
@@ -8884,7 +8883,7 @@ function refreshPredictionPanels(opts) {
 // falsehood in the other direction.
 //
 // Undo/redo is the one mutation source Browse cannot route through its own
-// call sites: the navbar writes and then announces. So this repaints the
+// call sites: the navbar writes and then calls the refresh hook. So this repaints the
 // sidebar wholesale rather than naming the panel that happens to be wrong
 // today, and a panel added to that sidebar later is refreshed by default
 // instead of silently going stale until someone notices.
@@ -8908,25 +8907,37 @@ function refreshBrowseSidebarPanels() {
   }
 }
 
-document.addEventListener('vireo:edit-history-changed', function() {
-  // Card badges move with the same edits, so refresh the loaded grid rows too.
-  // `skipPanels` because the sidebar refresh below is the broader one: without
-  // it the prediction panels would be fetched twice per undo.
-  //
-  // Undo/redo also reverses rating and flag edits, and those two fields are
-  // inputs to browseStackCoverCompare — reversing one can hand a collapsed
-  // stack back to a different cover. Unlike every in-page rating/flag path
-  // there is no mutation site here to apply the reversal locally, so the
-  // refresh below copies both fields from the server and reconciles the
-  // covers of whichever stacks actually moved. `reportFailure` because a
-  // failed refresh here means the server reversed an edit the grid is still
-  // showing: silence would make Undo look like a no-op.
-  var loadedIds = loadedBrowsePhotoIds();
-  if (loadedIds.length) {
-    _refreshBrowseKeywordState(loadedIds, {skipPanels: true, reportFailure: true});
+window.afterHistoryChange = async function() {
+  // History can change membership and ordering, including photos outside the
+  // loaded page. Re-run the current query for both toolbar and keyboard actions.
+  var previousSelection = new Set(selectedPhotos);
+  var cachedMemberIds = new Set();
+  Object.values(browseStackMembers).forEach(function(members) {
+    members.forEach(function(photo) { cachedMemberIds.add(photo.id); });
+  });
+  var loaded = await resetAndLoad({preserveAnchor: true, preserveCollection: true});
+  if (loaded === false) throw new Error('Could not reload Browse');
+  if (loaded !== true) return;
+  var windowIsCurrent = observeBrowseWindow();
+  for (var cover of photos.slice()) {
+    var memberIds = cover.browse_stack && cover.browse_stack.photo_ids;
+    if (memberIds && memberIds.some(function(id) { return cachedMemberIds.has(id); })) {
+      var status = await hydrateBrowseStackCoverMembers(cover, windowIsCurrent);
+      if (!windowIsCurrent()) return;
+      if (status === 'unresolved') throw new Error('Could not reload stack members');
+    }
   }
+  // Restore only selections that still belong to the refreshed query.
+  previousSelection.forEach(function(id) {
+    var photo = findBrowsePhoto(id);
+    if (photo && browsePhotoIsAvailable(photo)) selectedPhotos.add(id);
+  });
+  refreshCardSelectionVisuals();
+  updateBatchBar();
   refreshBrowseSidebarPanels();
-});
+  scheduleCollectionCountsRefresh();
+  refreshPendingSyncBanner();
+};
 
 // Accepting writes a keyword, so every surface that counts keywords has to be
 // told — the same fan-out applySelectionKeyword performs. refreshPendingSyncBanner
@@ -10252,18 +10263,10 @@ function clearSelection() {
 
 /* ---------- Undo / Redo ---------- */
 async function undoLast() {
-  if (await window.doUndo()) {
-    resetAndLoad();
-    scheduleCollectionCountsRefresh();
-    refreshPendingSyncBanner();
-  }
+  return window.doUndo();
 }
 async function redoLast() {
-  if (await window.doRedo()) {
-    resetAndLoad();
-    scheduleCollectionCountsRefresh();
-    refreshPendingSyncBanner();
-  }
+  return window.doRedo();
 }
 
 async function showUndoToast() {

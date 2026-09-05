@@ -27167,7 +27167,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         new_species_list[0],
                     )
             else:
+                # Same database-derived rule as the burst branch: confirmed
+                # when every submitted frame carries the edited set (always
+                # true after an add/replace, which tagged them all); an edit
+                # that leaves frames sharing nothing records the list
+                # unconfirmed. Per-frame extras do not unconfirm.
+                actual_by_photo = db.get_species_keywords_for_photos(photo_ids)
+                actual_sets = [
+                    species_key_set(actual_by_photo.get(pid, []))
+                    for pid in photo_ids
+                ]
+                shared_keys = (
+                    set.intersection(*actual_sets) if actual_sets else set()
+                )
+                frames_share = (
+                    bool(actual_sets) and all(actual_sets) and bool(shared_keys)
+                )
                 set_encounter_confirmed_species(target_enc, new_species_list)
+                if new_species_list and not frames_share:
+                    target_enc["species_confirmed"] = False
             save_results_raw(cached, cache_dir, db._active_workspace_id)
 
         # Report `replaced` consistent with the actual replacement decision

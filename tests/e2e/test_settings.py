@@ -606,3 +606,68 @@ def test_settings_override_edit_during_resync_survives(live_server, page):
     expect(other_value).to_have_value("77")
     overrides = page.request.get(f"{url}/api/workspaces/active/config").json()
     assert "similarity_threshold" in overrides
+
+
+def test_settings_import_reloads_page_when_config_refetch_fails(live_server, page):
+    """If /api/config GET fails after a committed import, the page reloads.
+
+    loadConfig() swallows fetch errors and falls back to placeholders so the
+    page can still paint on first load. The import path used to trust that a
+    successful await meant the form was fresh, so a failed post-import GET
+    left autosave suspended cleared and the next curated edit POSTed the
+    stale pre-import snapshot over the just-imported config. The current
+    safeguard: loadConfig() returns false on failure, the import treats that
+    as "form not reloaded" and the finally block reloads the page from the
+    imported config on disk.
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/settings", timeout=5000)
+    _wait_for_settings_idle(page)
+    dialogs = []
+    page.on("dialog", lambda d: (dialogs.append(d.message), d.accept()))
+
+    # Set the pre-import form to a value that must not be persisted after
+    # the import (proves autosave stays off / the page truly reloads from
+    # disk instead of the stale form).
+    with page.expect_response(
+        lambda r: r.url.endswith("/api/config") and r.request.method == "POST"
+    ):
+        page.select_option("#cfgKeywordCase", "lower")
+
+    # Fail the /api/config GET that loadConfig() issues after the import
+    # commits, but let the POST for /api/settings/import (the actual import)
+    # and any config POSTs through.
+    def _fail_config_get_only(route, request):
+        if request.method == "GET":
+            route.fulfill(status=500, content_type="application/json",
+                          body='{"error": "reload failed"}')
+        else:
+            route.continue_()
+
+    page.route("**/api/config", _fail_config_get_only)
+
+    payload = page.request.get(f"{url}/api/settings/export").json()
+    payload["keyword_case"] = "title"
+    with page.expect_event("framenavigated", timeout=10_000):
+        page.set_input_files(
+            "#settingsImportInput",
+            {
+                "name": "backup.json",
+                "mimeType": "application/json",
+                "buffer": json.dumps(payload).encode(),
+            },
+        )
+
+    # The refresh-failure dialog fired before the page reload.
+    assert any("could not refresh" in m for m in dialogs), (
+        "expected the refresh-failure alert before location.reload(); "
+        f"saw {dialogs!r}"
+    )
+
+    # After the reload, the form is rebuilt from disk (the import
+    # committed), not from any stale in-memory snapshot.
+    page.unroute("**/api/config", _fail_config_get_only)
+    _wait_for_settings_idle(page)
+    expect(page.locator("#cfgKeywordCase")).to_have_value("title")
+    cfg = page.request.get(f"{url}/api/config").json()
+    assert cfg["keyword_case"] == "title"

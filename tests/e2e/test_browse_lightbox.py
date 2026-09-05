@@ -2285,6 +2285,118 @@ def test_browse_lightbox_resumes_warmups_after_source_failure(
     assert page.evaluate("_lbCurrentSrcKey") == expected_source
 
 
+def test_browse_lightbox_original_waits_for_slow_neighbor_queue(live_server, page):
+    """The original dwell cannot spend retries competing with slow Fit generation."""
+    current_id = live_server["data"]["photos"][0]
+    live_server["db"].conn.execute(
+        "UPDATE photos SET width=4000, height=2000 WHERE id=?", (current_id,),
+    )
+    live_server["db"].conn.commit()
+    full_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="960">'
+        '<rect width="1920" height="960" fill="#274"/></svg>'
+    )
+    held_fit = []
+    original_requests = []
+
+    def serve_full(route):
+        """Hold the first adjacent render longer than both original dwell attempts."""
+        if "prefetch=1" in route.request.url and not held_fit:
+            held_fit.append(route)
+            return
+        route.fulfill(body=full_svg, content_type="image/svg+xml")
+
+    def serve_original(route):
+        """Record whether the original competes with a neighboring render."""
+        original_requests.append(route.request.url)
+        route.fulfill(body=full_svg, content_type="image/svg+xml")
+
+    page.route("**/photos/*/full*", serve_full)
+    page.route("**/photos/*/original*", serve_original)
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+    page.wait_for_function("_lbOriginalPreloadWaiting !== null")
+    page.wait_for_timeout(1600)
+    assert len(held_fit) == 1
+    assert original_requests == []
+    held_fit[0].fulfill(body=full_svg, content_type="image/svg+xml")
+    page.wait_for_function("_lbOriginalPreload && _lbOriginalPreload.status === 'decoded'")
+    assert len(original_requests) == 1
+    assert "prefetch=1" in original_requests[0]
+
+
+@pytest.mark.parametrize("retired_source", ["full", "original"])
+@pytest.mark.parametrize("action", ["navigate", "zoom", "reopen"])
+def test_browse_lightbox_keeps_pruned_request_in_flight_until_response(
+    live_server, page, retired_source, action,
+):
+    """Changing the navigation window cannot reuse an occupied server slot."""
+    current_id = live_server["data"]["photos"][0]
+    live_server["db"].conn.execute(
+        "UPDATE photos SET width=4000, height=2000 WHERE id=?", (current_id,),
+    )
+    live_server["db"].conn.commit()
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="960">'
+        '<rect width="1920" height="960" fill="#274"/></svg>'
+    )
+    held = []
+    speculative_requests = []
+
+    def serve_photo(route):
+        """Keep one server response pending even after the viewer retires it."""
+        if "prefetch=1" in route.request.url:
+            speculative_requests.append(route.request.url)
+            if f"/{retired_source}" in route.request.url and not held:
+                held.append(route)
+                return
+        route.fulfill(body=svg, content_type="image/svg+xml")
+
+    page.route("**/photos/*/full*", serve_photo)
+    page.route("**/photos/*/original*", serve_photo)
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+    page.wait_for_function(
+        "source => _lbSpeculativeInFlight && _lbSpeculativeInFlight.sourceKey === source",
+        arg=retired_source,
+    )
+    page.wait_for_timeout(100)
+    assert len(held) == 1
+    # Routed images may be transferred again when a decoded warmup becomes
+    # visible; only a new URL represents extra background work here.
+    before = set(speculative_requests)
+    if action == "zoom":
+        page.evaluate("_lbSetZoom(100)")
+        page.wait_for_function("_lbCurrentSrcKey === 'original'")
+    else:
+        if action == "reopen":
+            page.keyboard.press("Escape")
+        target_id = page.evaluate(
+            """() => {
+                var target = _lightboxPhotoList[3];
+                openLightbox(target.id, target.filename, _lightboxPhotoList);
+                return target.id;
+            }"""
+        )
+        page.wait_for_function("id => _lightboxCommittedId === id", arg=target_id)
+    page.wait_for_timeout(1600)
+    assert set(speculative_requests) == before
+    assert page.evaluate("_lbSpeculativeInFlight !== null")
+    held[0].fulfill(body=svg, content_type="image/svg+xml")
+    page.wait_for_function(
+        """action => Object.values(_lbAdjacentPreloads).some(
+            entry => entry.photoId === _lightboxPhotoList[action === 'zoom' ? 1 : 4].id &&
+                entry.sourceKey === (action === 'zoom' ? 'original' : 'full') && entry.status === 'decoded'
+        ) && _lbSpeculativeInFlight === null""",
+        arg=action,
+    )
+    assert len(set(speculative_requests)) > len(before)
+    if action != "zoom":
+        assert page.evaluate(
+            "Object.values(_lbAdjacentPreloads).every(entry => entry.photoId !== _lightboxPhotoList[1].id)"
+        )
+
+
 def test_browse_lightbox_close_discards_pending_warmup_queue(live_server, page):
     """A late image completion after close cannot start the remaining warmups."""
     held = []

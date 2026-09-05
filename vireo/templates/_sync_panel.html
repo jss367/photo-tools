@@ -168,9 +168,15 @@ async function checkPendingSync() {
     var data = await safeFetch('/api/sync/status', {}, { toast: false });
     var banner = document.getElementById('syncBanner');
     if (data.pending_count > 0) {
+      var status = document.getElementById('syncStatus');
+      if (status.textContent === 'Synced!') {
+        status.textContent = '';
+        status.style.color = 'var(--text-dim)';
+      }
       document.getElementById('syncBannerText').textContent =
-        data.pending_count + ' change' + (data.pending_count !== 1 ? 's' : '') +
-        ' pending \u2014 metadata changes have been saved in Vireo but not written to XMP sidecar files yet.';
+        data.pending_count.toLocaleString() + ' change' + (data.pending_count !== 1 ? 's' : '') +
+        ' across ' + data.pending_photo_count.toLocaleString() + ' photo' + (data.pending_photo_count !== 1 ? 's' : '') +
+        ' \u2014 metadata changes have been saved in Vireo but not written to XMP sidecar files yet.';
       banner.style.display = 'flex';
     } else {
       banner.style.display = 'none';
@@ -198,7 +204,7 @@ async function runSync(changeIds) {
     safeEventSource('/api/jobs/' + data.job_id + '/stream', {
       onProgress: function(p) {
         if (p.total > 0) {
-          status.textContent = 'Writing XMP: ' + p.current + '/' + p.total;
+          status.textContent = 'Syncing photos: ' + p.current.toLocaleString() + '/' + p.total.toLocaleString();
         } else if (p.current_file || p.phase) {
           status.textContent = p.current_file || p.phase;
         }

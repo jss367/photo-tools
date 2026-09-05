@@ -6528,6 +6528,10 @@ function _lbTryApplyPendingViewportState() {
 
 function _lbApplyPendingOneToOneZoom() {
   if (!_lbPending1To1 || !_lbNativeZoom) return;
+  // After /original fails, native zoom describes the current preview's pixels.
+  // A late metadata callback must keep waiting for the sharper fallback already
+  // requested by the error path; snapping now would retarget that swap to /full.
+  if (_lbOriginalUnavailable && _lbSrcRank(_lbDesiredSrcKey) > _lbSrcRank(_lbCurrentSrcKey)) return;
   // Don't snap to true 1:1 until the displayed source is at least the tier
   // that 1:1 needs. Otherwise the /api/photos/<id> metadata fetch resolving
   // before the held /original load would learn _lbNativeZoom, clear the
@@ -10818,6 +10822,13 @@ function _lbScheduleSourceSwap(targetZoom) {
         // The failed request is no longer pending. Keep the usable bitmap
         // and resume its neighbors without automatically retrying this tier.
         _lbDesiredSrcKey = _lbCurrentSrcKey;
+        if (_lbPending1To1) {
+          _lbPending1To1 = false;
+          _lbPending1To1Anchor = null;
+          _lbPendingViewportState = null;
+          _lbUpdateZoomControl();
+          _lbSaveViewportState(photoId);
+        }
         _lbScheduleAdjacentPhoto(_lbCurrentSrcKey);
       }
       // Keep current source on failure

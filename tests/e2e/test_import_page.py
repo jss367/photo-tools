@@ -2564,14 +2564,19 @@ def test_import_after_move_recovers_when_archive_root_is_corrected(
     live_server, page,
 ):
     """The hint sends the user to Settings to fix a typo'd root. Doing so
-    in another tab must be picked up by the still-open Import page: the
-    refreshed target entry is merged whole, not just its presence flag."""
+    in another tab must be picked up by the still-open Import page when
+    the user comes back to it — even for a legacy target whose id changes
+    when Settings re-saves it, and without touching the form again."""
     url = live_server["url"]
     db = live_server["db"]
     identify_id = next(
         p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
     )
-    state = {"root": "/Users/me/Pictures/Vireo_Archive", "present": False}
+    state = {
+        "id": "photo@nas.local:/volume1/Photography",
+        "root": "/Users/me/Pictures/Vireo_Archive",
+        "present": False,
+    }
 
     def remote_targets(route):
         route.fulfill(
@@ -2581,7 +2586,7 @@ def test_import_after_move_recovers_when_archive_root_is_corrected(
                 "rsync_available": True,
                 "ssh_available": True,
                 "targets": [{
-                    "id": "nas1",
+                    "id": state["id"],
                     "name": "Photo NAS",
                     "user": "photo",
                     "host": "nas.local",
@@ -2608,14 +2613,23 @@ def test_import_after_move_recovers_when_archive_root_is_corrected(
     expect(hint).to_contain_text("Vireo_Archive — does not exist on this machine")
     expect(row).to_be_hidden()
 
-    # The user fixes the underscore in Settings (another tab) and comes back
-    # to the destination field.
+    # Let the refresh that the hint triggered settle on the unchanged list,
+    # so what follows is not riding on that first fetch.
+    page.wait_for_function("() => _afterMoveTargetsCheckedAt > 0")
+
+    # The user fixes the underscore in Settings (another tab). Settings
+    # re-saves the legacy entry under a generated id. They come back to
+    # this tab without touching the form.
+    state["id"] = "rt-9f3a"
     state["root"] = "/Users/me/Pictures/Vireo Archive"
     state["present"] = True
-    page.locator("#destInput").dispatch_event("input")
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
 
     expect(row).to_be_visible(timeout=10000)
     expect(hint).to_be_hidden()
+    # The dropdown was rebuilt with the new id and the selection kept.
+    expect(page.locator("#destMode option")).to_have_count(2)
+    assert page.locator("#destMode").input_value() == "local"
 
 
 def test_import_new_workspace_shows_target_default_in_after_import_display(

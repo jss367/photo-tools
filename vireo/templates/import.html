@@ -1128,12 +1128,17 @@ async function loadImportRemoteTargets() {
       errEl.appendChild(retry);
     }
   }
+  renderImportDestModes();
+}
+
+// Rebuild the Archive Destination dropdown from importRemoteTargets.
+// Rebuilding removes the selected option, which silently flips the form
+// back to "Local" — put the selection back if its target survived (matters
+// for the Retry link and for the after-move refresh: a filled-in remote
+// form must not reset itself when the list is re-fetched).
+function renderImportDestModes() {
   const sel = document.getElementById('destMode');
   if (!sel) return;
-  // Rebuilding removes the selected option, which silently flips the form
-  // back to "Local" — put the selection back if its target survived the
-  // reload (matters for the Retry link: a filled-in remote form must not
-  // reset itself when the retry succeeds).
   const prevValue = sel.value;
   while (sel.options.length > 1) sel.remove(1);
   importRemoteTargets.forEach((t) => {
@@ -1737,9 +1742,9 @@ function afterMoveUnavailableReason(destination) {
 // Settings to fix the root, or to Finder / the picker to create the folder;
 // both happen while this page stays open, so the gate must not keep
 // judging against stale data until a full reload. Whenever the unavailable
-// hint is rendered, re-fetch the targets — throttled so typing in the
-// destination field doesn't hammer the server — merge each refreshed entry
-// over the one we hold, and re-render if anything the gate reads changed.
+// hint is rendered (and whenever the tab becomes active again), re-fetch
+// the targets — throttled so typing in the destination field doesn't
+// hammer the server — and re-render if anything the gate reads changed.
 let _afterMoveTargetsRefresh = null;
 let _afterMoveTargetsCheckedAt = 0;
 let _afterMoveTargetsTimer = null;
@@ -1774,18 +1779,18 @@ function refreshAfterMoveTargets() {
     .then((data) => {
       _afterMoveTargetsCheckedAt = Date.now();
       if (!data || !Array.isArray(data.targets)) return;
-      const fresh = new Map(data.targets.map((t) => [t.id, t]));
-      let changed = false;
-      importRemoteTargets.forEach((t) => {
-        const f = fresh.get(t.id);
-        if (!f) return;
-        const before = afterMoveTargetKey(t);
-        // Merge the whole entry: a corrected local_archive_root (the fix
-        // the hint advertises) matters as much as the folder appearing.
-        Object.assign(t, f);
-        if (afterMoveTargetKey(t) !== before) changed = true;
-      });
-      if (changed) updateAfterMoveUI();
+      // Replace the list rather than merging by id: a legacy entry saved
+      // without an id gets a synthesized id here but a generated one once
+      // Settings re-saves it (e.g. when the user corrects its archive root,
+      // the very fix the hint advertises), so an id-keyed merge would skip
+      // exactly the entry that changed. renderImportDestModes() keeps the
+      // current dropdown selection when its target survived.
+      const before = importRemoteTargets.map(afterMoveTargetKey).join('\n');
+      const after = data.targets.map(afterMoveTargetKey).join('\n');
+      if (after !== before) {
+        importRemoteTargets = data.targets;
+        renderImportDestModes();
+      }
     })
     .catch(() => {})
     .finally(() => {
@@ -1980,6 +1985,14 @@ function updateAdvancedImportOptions() {
 // updateAdvancedImportOptions then updateAfterMoveUI separately) so the
 // move row always re-evaluates against the already-updated After Import
 // selection, without depending on listener registration order.
+// The hint sends the user to Settings or Finder and back. Coming back is
+// itself the signal to re-check: nothing else on the form changes, so
+// without this the last (unchanged) refresh would be the final word until
+// a reload. updateAfterMoveUI() only re-fetches while the hint is showing.
+const _afterMoveOnReturn = () => { if (!document.hidden) updateAfterMoveUI(); };
+window.addEventListener('focus', _afterMoveOnReturn);
+window.addEventListener('pageshow', _afterMoveOnReturn);
+document.addEventListener('visibilitychange', _afterMoveOnReturn);
 window.addEventListener('advancedmodechange', () => { updateAdvancedImportOptions(); updateAfterMoveUI(); });
 window.addEventListener('devmodechange', () => { updateAdvancedImportOptions(); updateAfterMoveUI(); });
 

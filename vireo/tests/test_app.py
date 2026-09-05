@@ -17614,7 +17614,14 @@ def test_import_page_after_move_eligibility_requires_existing_root(
     # root in Settings mid-session does not require a reload.
     assert "function refreshAfterMoveTargets()" in html
     assert "refreshAfterMoveTargets();" in html
-    assert "Object.assign(t, f);" in html
+    # The refreshed list replaces the held one (legacy entries change id
+    # when Settings re-saves them, so an id-keyed merge would miss them)
+    # and the dropdown is rebuilt with the selection preserved.
+    assert "importRemoteTargets = data.targets;" in html
+    assert "function renderImportDestModes()" in html
+    # Returning to the tab re-evaluates the gate.
+    assert "document.addEventListener('visibilitychange', _afterMoveOnReturn);" in html
+    assert "window.addEventListener('focus', _afterMoveOnReturn);" in html
 
 
 def test_import_page_surfaces_destination_errors_and_recovery_actions(

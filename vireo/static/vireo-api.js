@@ -36,7 +36,12 @@
   }
 
   function browserFetch(input, init) {
-    return nativeFetch(input, withBrowserHeader(input, init));
+    var next = withBrowserHeader(input, init);
+    var send = function() { return nativeFetch(input, next); };
+    if (isSameOrigin(input) && typeof Vireo.api.trackHistoryRequest === 'function') {
+      return Vireo.api.trackHistoryRequest(input, next, send);
+    }
+    return send();
   }
 
   async function json(input, init, options) {
@@ -44,6 +49,7 @@
     try {
       response = await browserFetch(input, init);
     } catch (cause) {
+      if (cause && cause.code === 'history_busy') throw cause;
       var networkMessage = (
         'Couldn’t reach Vireo. Check that the app is still running, then try again.'
       );

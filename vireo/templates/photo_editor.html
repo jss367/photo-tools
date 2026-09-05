@@ -1126,6 +1126,31 @@ function setEditorLoading(loading) {
   updateAspectButtons();
 }
 
+window.beforeHistoryChange = function() {
+  if (editorState.loading || Object.keys(editorState.savingPhotoIds).length || isEditorDirty()) {
+    showToast('Save or discard your editor changes before undoing saved edits.', 'info');
+    return false;
+  }
+  return true;
+};
+
+var editorHistoryLoadSeq = null;
+document.addEventListener('vireo:edit-history-busy', function(event) {
+  if (event.detail.busy) {
+    editorHistoryLoadSeq = editorState.loadSeq;
+    setEditorLoading(true);
+  } else {
+    // A reload (including its failure state) owns the controls once it starts.
+    // Only release our freeze if the history request failed before that reload.
+    if (editorHistoryLoadSeq === editorState.loadSeq) setEditorLoading(false);
+    editorHistoryLoadSeq = null;
+  }
+});
+
+window.afterHistoryChange = async function() {
+  if (editorState.photoId) await loadPhoto(editorState.photoId, {skipUrl: true});
+};
+
 function isEditorDirty() {
   return recipeKey(editorState.recipe) !== recipeKey(editorState.savedRecipe);
 }
@@ -3158,7 +3183,7 @@ function resetAllEdits() {
 }
 
 async function saveRecipe(description) {
-  if (!editorState.photoId) return false;
+  if (!editorState.photoId || editorState.loading) return false;
   if (editorState.savingPhotoIds[String(editorState.photoId)]) return false;
   // Capture the photo being saved so a Prev/Next during the PUT can't make us
   // write the previous photo's returned recipe back into the editor state for

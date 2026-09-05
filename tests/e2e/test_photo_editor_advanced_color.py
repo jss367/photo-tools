@@ -222,3 +222,47 @@ def test_reset_adjustments_preserves_advanced_color(live_server, page):
     assert adjustments.get("color_grading") == {
         "shadows": {"hue": 220.0, "saturation": 18.0},
     }
+
+
+def test_toolbar_history_refreshes_editor_recipe_and_next_save(live_server, page):
+    photo_id = live_server['data']['photos'][0]
+    page.goto(f"{live_server['url']}/edit/{photo_id}")
+    expect(page.locator('#editorFilename')).to_have_text('hawk1.jpg')
+    _set_range(page, '#exposureRange', 1)
+    page.evaluate('saveRecipe()')
+    _set_range(page, '#exposureRange', 2)
+    page.evaluate('saveRecipe()')
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    page.locator('#historyUndoBtn').click()
+    expect(page.locator('#historyRedoBtn')).to_be_enabled()
+    expect(page.locator('#exposureRange')).to_have_value('1')
+    assert page.evaluate('isEditorDirty()') is False
+    page.locator('#historyRedoBtn').click()
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    expect(page.locator('#exposureRange')).to_have_value('2')
+    page.evaluate('doUndo()')
+    _set_range(page, '#contrastRange', 15)
+    # Unsaved work must not be replaced by a toolbar history refresh.
+    assert page.evaluate('doUndo()') is False
+    expect(page.locator('#contrastRange')).to_have_value('15')
+    assert page.evaluate('saveRecipe()') is True
+    recipe = live_server['db'].get_photo_edit_recipe(photo_id)
+    assert recipe['adjustments']['exposure'] == 1
+    assert recipe['adjustments']['contrast'] == 15
+
+
+def test_editor_history_failure_releases_request_freeze_but_keeps_failed_load_frozen(live_server, page):
+    photo_id = live_server['data']['photos'][0]
+    page.goto(f"{live_server['url']}/edit/{photo_id}")
+    expect(page.locator('#editorFilename')).to_have_text('hawk1.jpg')
+    _set_range(page, '#exposureRange', 1)
+    page.evaluate('saveRecipe()')
+    page.route('**/api/undo', lambda route: route.abort())
+    assert page.evaluate('doUndo()') is False
+    assert page.evaluate('editorState.loading') is False
+    page.unroute('**/api/undo')
+    page.route(f'**/api/photos/{photo_id}', lambda route: route.abort())
+    assert page.evaluate('doUndo()') is True
+    expect(page.locator('#editorFilename')).to_have_text('Photo unavailable')
+    assert page.evaluate('editorState.loading') is True
+    assert page.evaluate('saveRecipe()') is False

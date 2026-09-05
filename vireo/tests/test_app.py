@@ -2397,7 +2397,7 @@ def test_encounter_species_replacement_is_atomic_in_history(app_and_db):
 
     history = db.get_edit_history()
     assert len(history) == 1
-    assert history[0]['action_type'] == 'species_replace'
+    assert history[0]['action_type'] == 'pipeline_grouping'
     assert 'Sparrow' in history[0]['description']
     assert 'Blue Jay' in history[0]['description']
 
@@ -2417,7 +2417,7 @@ def test_encounter_species_replacement_undo_restores_previous(app_and_db):
     # One undo should swap the photos back to Sparrow.
     undone = db.undo_last_edit()
     assert undone is not None
-    assert undone['action_type'] == 'species_replace'
+    assert undone['action_type'] == 'pipeline_grouping'
 
     for pid in photo_ids:
         names = {k["name"] for k in db.get_photo_keywords(pid)}
@@ -2453,7 +2453,7 @@ def test_encounter_species_replacement_undo_after_sync_queues_swap(app_and_db):
 
     undone = db.undo_last_edit()
     assert undone is not None
-    assert undone['action_type'] == 'species_replace'
+    assert undone['action_type'] == 'pipeline_grouping'
 
     for pid in photo_ids:
         names = {k["name"] for k in db.get_photo_keywords(pid)}
@@ -2480,7 +2480,7 @@ def test_encounter_species_replacement_redo_reapplies(app_and_db):
     db.undo_last_edit()
     redone = db.redo_last_undo()
     assert redone is not None
-    assert redone['action_type'] == 'species_replace'
+    assert redone['action_type'] == 'pipeline_grouping'
 
     for pid in photo_ids:
         names = {k["name"] for k in db.get_photo_keywords(pid)}
@@ -2907,7 +2907,7 @@ def test_encounter_species_records_only_newly_tagged(app_and_db):
 
     history = db.get_edit_history()
     assert len(history) == 1
-    assert history[0]["action_type"] == "keyword_add"
+    assert history[0]["action_type"] == "pipeline_grouping"
     # Only the (len - 1) newly-tagged photos are in the edit items.
     assert history[0]["item_count"] == len(photo_ids) - 1
 
@@ -2949,7 +2949,7 @@ def test_encounter_species_replacement_only_for_changed_photos(app_and_db):
 
     history = db.get_edit_history()
     assert len(history) == 1
-    assert history[0]["action_type"] == "species_replace"
+    assert history[0]["action_type"] == "pipeline_grouping"
     # All photos gained Blue Jay (none had it), so all are recorded.
     assert history[0]["item_count"] == len(photo_ids)
     for pid in photo_ids:
@@ -3050,7 +3050,7 @@ def test_encounter_species_replacement_removes_hierarchical_previous(app_and_db)
     assert nested not in tagged_ids
     assert alternate_nested not in tagged_ids
     history = db.get_edit_history()
-    assert history[0]["action_type"] == "species_replace"
+    assert history[0]["action_type"] == "pipeline_grouping"
 
     db.undo_last_edit()
     names = {row["name"] for row in db.get_photo_keywords(photo_id)}
@@ -3130,7 +3130,7 @@ def test_encounter_species_replacement_retags_same_taxon_alias(app_and_db):
         f"expected only the new scientific-name row, got {remaining!r}"
     )
     history = db.get_edit_history()
-    assert history[0]["action_type"] == "species_replace"
+    assert history[0]["action_type"] == "pipeline_grouping"
 
     db.undo_last_edit()
     restored = _species_names_on(photo_id)
@@ -21231,26 +21231,16 @@ def test_browse_sidebar_panels_refresh_on_undo_and_redo(app_and_db):
     # listener's own comments explain why each refresh is there, and a
     # character budget silently turns into "the comment got longer" failures.
     handler = _browse_js_function_body(
-        html, "document.addEventListener('vireo:edit-history-changed'"
+        html, "window.afterHistoryChange = async function("
     )
     assert "refreshBrowseSidebarPanels(" in handler, (
         "undo/redo must repaint the whole sidebar, not one panel"
     )
-    # Undo/redo also reverses ratings and flags, which are inputs to the stack
-    # cover comparison. Nothing else applies that reversal to the loaded rows,
-    # so the refresh this handler runs has to carry both fields and reconcile
-    # the covers they rank — otherwise the grid keeps showing a representative
-    # the database no longer picks and Undo reads as a no-op.
-    assert "_refreshBrowseKeywordState(" in handler
-    refresh = _browse_js_function_body(
-        html, "async function _refreshBrowseKeywordState(",
-    )
-    assert "local.rating = " in refresh and "local.flag = " in refresh, (
-        "undo/redo has no other path to apply a reverted rating or flag"
-    )
-    assert "reconcileBrowseStackCovers(" in refresh, (
-        "a reverted rating or flag can hand the stack back to another cover"
-    )
+    # The history hook reloads the query so membership, ordering, and covers
+    # reflect the database, including photos absent from the previous grid.
+    assert "await resetAndLoad(" in handler
+    assert "preserveCollection: true" in handler
+    assert "hydrateBrowseStackCoverMembers(" in handler
     body = _browse_js_function_body(
         html, "function refreshBrowseSidebarPanels(",
     )

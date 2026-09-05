@@ -20897,7 +20897,11 @@ class Database:
                LIMIT ? OFFSET ?""",
             (self._ws_id(), limit, offset),
         ).fetchall()
-        return [dict(r) for r in rows]
+        entries = [dict(r) for r in rows]
+        for entry in entries:
+            if entry['action_type'] == 'pipeline_grouping':
+                entry['new_value'] = None
+        return entries
 
     # Action types that appear in history but cannot be reversed
     _NON_UNDOABLE = (
@@ -20919,6 +20923,11 @@ class Database:
 
         Non-undoable entries (prediction_reject, discard) are skipped.
         The entry is marked as undone (not deleted) so it can be redone.
+
+        Stale cache-linked actions are retired and reported without applying
+        another entry. The caller must refresh the controls so the next click
+        names the edit it will actually reverse. Retirement commits on its own;
+        valid combined photo/group edits retain the writer lock until complete.
         """
         placeholders = ",".join("?" for _ in self._NON_UNDOABLE)
         entry = self.conn.execute(
@@ -20934,16 +20943,54 @@ class Database:
             (entry['id'],),
         ).fetchall()
 
-        self._apply_undo(entry, items)
+        if entry['action_type'] == 'pipeline_grouping':
+            from services.grouping_history import (
+                GroupingHistoryStale,
+                apply_grouping_photo_edit,
+                restore_grouping_edit,
+            )
 
-        self.conn.execute("UPDATE edit_history SET undone = 1 WHERE id = ?", (entry['id'],))
-        self.conn.commit()
+            try:
+                with restore_grouping_edit(self, entry, undo=True):
+                    apply_grouping_photo_edit(self, entry, items, undo=True)
+                    self.conn.execute("UPDATE edit_history SET undone = 1 WHERE id = ?", (entry['id'],))
+                    self.conn.commit()
+            except GroupingHistoryStale:
+                self._retire_stale_grouping_entry(entry['id'])
+                self.conn.commit()
+                raise GroupingHistoryStale(
+                    'That grouping or species action was superseded by newer analysis. '
+                    'History has been refreshed; review the next action before trying again.'
+                ) from None
+        elif entry['action_type'] == 'species_confirm_cache':
+            from services.grouping_history import (
+                GroupingHistoryStale,
+                restore_species_confirm_cache_edit,
+            )
+
+            try:
+                with restore_species_confirm_cache_edit(self, entry, undo=True):
+                    self.conn.execute("UPDATE edit_history SET undone = 1 WHERE id = ?", (entry['id'],))
+                    self.conn.commit()
+            except GroupingHistoryStale:
+                self._retire_stale_grouping_entry(entry['id'])
+                self.conn.commit()
+                raise GroupingHistoryStale(
+                    'That grouping or species action was superseded by newer analysis. '
+                    'History has been refreshed; review the next action before trying again.'
+                ) from None
+        else:
+            self._apply_undo(entry, items)
+            self.conn.execute("UPDATE edit_history SET undone = 1 WHERE id = ?", (entry['id'],))
+            self.conn.commit()
         return entry
 
     def redo_last_undo(self):
         """Redo the most recently undone edit. Returns the entry dict, or None.
 
-        Replays in chronological order (ASC) so sequential undos are redone correctly.
+        Replays in chronological order (ASC) so sequential undos are redone
+        correctly. Stale cache-linked actions are retired and reported without
+        replaying another entry, just as in ``undo_last_edit``.
         """
         placeholders = ",".join("?" for _ in self._NON_UNDOABLE)
         entry = self.conn.execute(
@@ -20959,11 +21006,68 @@ class Database:
             (entry['id'],),
         ).fetchall()
 
-        self._apply_redo(entry, items)
+        if entry['action_type'] == 'pipeline_grouping':
+            from services.grouping_history import (
+                GroupingHistoryStale,
+                apply_grouping_photo_edit,
+                restore_grouping_edit,
+            )
 
-        self.conn.execute("UPDATE edit_history SET undone = 0 WHERE id = ?", (entry['id'],))
-        self.conn.commit()
+            try:
+                with restore_grouping_edit(self, entry, undo=False):
+                    apply_grouping_photo_edit(self, entry, items, undo=False)
+                    self.conn.execute("UPDATE edit_history SET undone = 0 WHERE id = ?", (entry['id'],))
+                    self.conn.commit()
+            except GroupingHistoryStale:
+                self._retire_stale_grouping_entry(entry['id'])
+                self.conn.commit()
+                raise GroupingHistoryStale(
+                    'That grouping or species action was superseded by newer analysis. '
+                    'History has been refreshed; review the next action before trying again.'
+                ) from None
+        elif entry['action_type'] == 'species_confirm_cache':
+            from services.grouping_history import (
+                GroupingHistoryStale,
+                restore_species_confirm_cache_edit,
+            )
+
+            try:
+                with restore_species_confirm_cache_edit(self, entry, undo=False):
+                    self.conn.execute("UPDATE edit_history SET undone = 0 WHERE id = ?", (entry['id'],))
+                    self.conn.commit()
+            except GroupingHistoryStale:
+                self._retire_stale_grouping_entry(entry['id'])
+                self.conn.commit()
+                raise GroupingHistoryStale(
+                    'That grouping or species action was superseded by newer analysis. '
+                    'History has been refreshed; review the next action before trying again.'
+                ) from None
+        else:
+            self._apply_redo(entry, items)
+            self.conn.execute("UPDATE edit_history SET undone = 0 WHERE id = ?", (entry['id'],))
+            self.conn.commit()
         return entry
+
+    def _retire_stale_grouping_entry(self, entry_id):
+        """Retire stale cache state while retaining any reversible photo edit.
+
+        The caller commits this retirement and reports it to the user before
+        another action can run. This helper never applies a photo change.
+        """
+        row = self.conn.execute(
+            "SELECT action_type, new_value, description FROM edit_history WHERE id = ?", (entry_id,),
+        ).fetchone()
+        if row and row['action_type'] == 'pipeline_grouping':
+            photo_edit = json.loads(row['new_value']).get('photo_edit')
+            if photo_edit:
+                # A recompute invalidates structure, not the recorded photo edit.
+                self.conn.execute(
+                    "UPDATE edit_history SET new_value = ?, description = ? WHERE id = ?",
+                    (json.dumps({'photo_edit': photo_edit, 'photo_only': True}),
+                     "Photo changes from: " + row["description"], entry_id),
+                )
+                return
+        self.conn.execute("DELETE FROM edit_history WHERE id = ?", (entry_id,))
 
     # ------------------------------------------------------------------
     # Undo / redo

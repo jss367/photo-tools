@@ -291,6 +291,11 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
 }
 .bottom-toggle .job-summary.idle { color: var(--text-invisible); }
+.history-controls { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.history-controls .history-description { color: var(--text-secondary); max-width: 32vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-controls button { background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border-primary); border-radius: 4px; padding: 2px 8px; cursor: pointer; white-space: nowrap; }
+.history-controls button:disabled { opacity: .45; cursor: default; }
+@media (max-width: 700px) { .history-controls .history-description { display: none; } }
 
 .bottom-panel {
   position: fixed;
@@ -11112,6 +11117,11 @@ function closeSimilar() {
 <div class="bottom-toggle" id="bottomToggle">
   <span class="toggle-arrow" id="bpArrow" onclick="toggleBottomPanel()">&#9650;</span>
   <span class="job-summary idle" id="jobSummary">No active jobs</span>
+  <div class="history-controls" id="undoToast" role="group" aria-label="Edit history">
+    <span class="history-description" id="undoMsg" role="status" aria-live="polite"></span>
+    <button type="button" class="undo-toast-btn" id="historyUndoBtn" onclick="doUndo()" disabled>Undo</button>
+    <button type="button" id="historyRedoBtn" onclick="doRedo()" disabled>Redo</button>
+  </div>
 </div>
 
 <script>
@@ -12111,6 +12121,8 @@ function formatDuration(seconds) {
         });
     }
 
+    refreshHistoryControls();
+
     // Always poll once for navbar badge
     pollJobs();
 
@@ -12151,7 +12163,8 @@ function formatDuration(seconds) {
     var offset = append ? list.querySelectorAll('.bp-history-row').length : 0;
     var historyPromise = safeFetch('/api/edit-history?limit=50&offset=' + offset, {}, {toast: false});
     var redoPromise = !append ? safeFetch('/api/redo/status', {}, {toast: false}).catch(function() { return null; }) : Promise.resolve(null);
-    Promise.all([historyPromise, redoPromise])
+    var undoPromise = safeFetch('/api/undo/status', {}, {toast: false});
+    Promise.all([historyPromise, redoPromise, undoPromise])
       .then(function(results) {
         var data = results[0];
         var redoStatus = results[1];
@@ -12171,12 +12184,7 @@ function formatDuration(seconds) {
           if (!append && !list.querySelector('.bp-history-redo')) list.innerHTML = '<div class="bp-history-empty" style="color:var(--text-muted);padding:12px;font-size:12px;">No edits yet</div>';
           return;
         }
-        var mostRecentId = null;
-        if (!append) {
-          var existing = list.querySelector('.bp-history-row');
-          if (!existing) mostRecentId = data[0].id;
-        }
-        data.forEach(function(entry, i) {
+        data.forEach(function(entry) {
           var row = document.createElement('div');
           row.className = 'bp-history-row';
           row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 8px;font-size:12px;border-bottom:1px solid var(--border-subtle);';
@@ -12185,7 +12193,7 @@ function formatDuration(seconds) {
                      entry.action_type === 'flag' ? '\u2691' : '\uD83C\uDFF7';
 
           var ago = _timeAgo(entry.created_at);
-          var isFirst = (offset === 0 && i === 0);
+          var isFirst = results[2] && entry.id === results[2].id;
 
           row.innerHTML = '<span style="opacity:0.5;min-width:70px;">' + ago + '</span>'
             + '<span style="min-width:16px;text-align:center;">' + icon + '</span>'
@@ -12205,41 +12213,120 @@ function formatDuration(seconds) {
     return d.innerHTML;
   }
 
-  window.doUndo = function(btn) {
-    if (btn) btn.disabled = true;
-    safeFetch('/api/undo', {method: 'POST'})
-      .then(function(data) {
-        if (data && data.ok) {
-          _lbRefreshEditRecipeCache(data.edit_recipes);
-          showToast('Undone: ' + data.undone + ' — press Ctrl+Shift+Z to redo', 'success');
-          _historySessionCount = Math.max(0, _historySessionCount - 1);
-          document.getElementById('historyBadge').textContent = _historySessionCount || '';
-          loadEditHistory();
-          document.dispatchEvent(new CustomEvent('vireo:edit-history-changed', {
-            detail: { operation: 'undo', result: data }
-          }));
-        }
-      })
-      .catch(function() { if (btn) btn.disabled = false; });
-  };
+  var historyBusy = false;
+  var historyPendingWrites = 0;
+  var historyStatusSeq = 0;
+  var historyStatus = {undo: {available: false}, redo: {available: false}};
 
-  window.doRedo = function(btn) {
+  function renderHistoryControls() {
+    var blocked = historyBusy || historyPendingWrites > 0;
+    ['undo', 'redo'].forEach(function(operation) {
+      var button = document.getElementById(operation === 'undo' ? 'historyUndoBtn' : 'historyRedoBtn');
+      var status = historyStatus[operation];
+      button.disabled = blocked || !status.available;
+      var label = operation === 'undo' ? 'Undo' : 'Redo';
+      button.title = status.available ? label + ': ' + status.description : 'Nothing to ' + operation;
+      var modifier = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl+';
+      button.title += ' (' + modifier + (operation === 'undo' ? 'Z' : 'Shift+Z') + ')';
+      button.setAttribute('aria-label', button.title);
+      button.setAttribute('aria-keyshortcuts', operation === 'undo' ? 'Control+z Meta+z' : 'Control+Shift+z Meta+Shift+z');
+    });
+    var status = historyStatus.undo;
+    document.getElementById('undoMsg').textContent = historyBusy ? 'Updating…' : (status.description || '');
+    document.getElementById('undoToast').setAttribute('aria-busy', String(blocked));
+  }
+
+  function refreshHistoryControls() {
+    var seq = ++historyStatusSeq;
+    return Promise.all([
+      safeFetch('/api/undo/status', {}, {toast: false}),
+      safeFetch('/api/redo/status', {}, {toast: false})
+    ]).then(function(results) {
+      if (seq !== historyStatusSeq) return;
+      historyStatus = {undo: results[0], redo: results[1]};
+      renderHistoryControls();
+    }).catch(function() {
+      // Keep the last known action retryable after a transient status failure.
+      if (seq === historyStatusSeq) renderHistoryControls();
+    });
+  }
+  window.refreshHistoryControls = refreshHistoryControls;
+  window.addEventListener('focus', refreshHistoryControls);
+  window.vireoHistoryBusy = function() { return historyBusy; };
+
+  async function changeHistory(operation, btn) {
+    if (historyBusy || historyPendingWrites) return false;
+    if (typeof window.beforeHistoryChange === 'function' && window.beforeHistoryChange() === false) return false;
+    historyBusy = true;
+    document.dispatchEvent(new CustomEvent('vireo:edit-history-busy', {detail: {busy: true}}));
     if (btn) btn.disabled = true;
-    safeFetch('/api/redo', {method: 'POST'})
-      .then(function(data) {
-        if (data && data.ok) {
-          _lbRefreshEditRecipeCache(data.edit_recipes);
-          showToast('Redone: ' + data.redone, 'success');
-          _historySessionCount++;
-          document.getElementById('historyBadge').textContent = _historySessionCount || '';
-          loadEditHistory();
-          document.dispatchEvent(new CustomEvent('vireo:edit-history-changed', {
-            detail: { operation: 'redo', result: data }
-          }));
-        }
-      })
-      .catch(function() { if (btn) btn.disabled = false; });
-  };
+    renderHistoryControls();
+    try {
+      var data = await safeFetch('/api/' + operation, {method: 'POST'});
+      if (!data || !data.ok) return false;
+      _lbRefreshEditRecipeCache(data.edit_recipes);
+      // Invalidate older in-flight lightbox flag reads before refreshing it.
+      _lbFlagEditSeq++;
+      var description = data[operation === 'undo' ? 'undone' : 'redone'];
+      showToast((operation === 'undo' ? 'Undone: ' : 'Redone: ') + description, 'success');
+      _historySessionCount = Math.max(0, _historySessionCount + (operation === 'undo' ? -1 : 1));
+      document.getElementById('historyBadge').textContent = _historySessionCount || '';
+      loadEditHistory();
+      document.dispatchEvent(new CustomEvent('vireo:edit-history-changed', {
+        detail: { operation: operation, result: data }
+      }));
+      if (typeof window.afterHistoryChange === 'function') {
+        try { await window.afterHistoryChange(data); }
+        catch (e) { showToast('The edit was saved, but the view could not refresh. Reload to see the current state.', 'error'); }
+      }
+      await refreshHistoryLightbox();
+      return true;
+    } catch (e) {
+      // safeFetch reports the error. The server retains the history entry.
+      return false;
+    } finally {
+      await refreshHistoryControls();
+      historyBusy = false;
+      document.dispatchEvent(new CustomEvent('vireo:edit-history-busy', {detail: {busy: false}}));
+      if (btn) btn.disabled = false;
+      renderHistoryControls();
+    }
+  }
+
+  async function refreshHistoryLightbox() {
+    var photoId = _lightboxCurrentId;
+    var openSeq = _lbOpenSeq;
+    if (photoId == null || !document.getElementById('lightboxOverlay').classList.contains('active')) return;
+    try {
+      var photo = await safeFetch('/api/photos/' + photoId, {}, {toast: false});
+      if (_lightboxCurrentId !== photoId || _lbOpenSeq !== openSeq) return;
+      _lbPhotoDataByPhoto[String(photoId)] = photo;
+      _lbRecordFlag(photoId, photo.flag);
+      _lbRenderKeywords(photo.keywords);
+      _lbRenderLifeListPanel(photoId);
+    } catch (e) {
+      showToast('The edit was saved, but the photo details could not refresh. Reopen the photo to see its current state.', 'error');
+    }
+  }
+
+  window.doUndo = function(btn) { return changeHistory('undo', btn); };
+  window.doRedo = function(btn) { return changeHistory('redo', btn); };
+
+  // Browse keeps its configurable shortcut bindings; fields retain native
+  // text undo, and staged modal edits must not undo the catalog behind them.
+  Keymap.register('global', {name: 'undo_history', key: 'ctrl+z', action: function(e) {
+    return historyShortcut(e, 'undo');
+  }});
+  Keymap.register('global', {name: 'redo_history', key: 'ctrl+shift+z', action: function(e) {
+    return historyShortcut(e, 'redo');
+  }});
+  function historyShortcut(e, operation) {
+    if (location.pathname === '/browse' || location.pathname.indexOf('/edit') === 0) return false;
+    if (document.querySelector('.modal-overlay.open, .grm-overlay.open, .inspect-overlay.open, .help-overlay.active, .folder-browser-overlay.open, .shortcuts-overlay.open')) return false;
+    e.stopImmediatePropagation();
+    changeHistory(operation);
+    return true;
+  }
 
   function _refreshEditRecipeHistoryChanges(data) {
     if (!data || data.action_type !== 'edit_recipe' || !Array.isArray(data.edit_recipes)) return;
@@ -12272,15 +12359,29 @@ function formatDuration(seconds) {
     if (currentBpTab === 'history') loadEditHistory();
   }
 
-  var _origSafeFetch = safeFetch;
-  safeFetch = function(url, opts, options) {
-    return _origSafeFetch(url, opts, options).then(function(data) {
-      if (data && data.ok && opts && opts.method && /^(POST|PUT|DELETE)$/i.test(opts.method)) {
-        if (/\/(rating|flag|keywords|edit-recipe|batch\/|predictions\/|culling\/|species\/label-cluster|encounters\/species|sync\/discard)/.test(url)) {
-          _bumpHistoryBadge();
-        }
+  // Track at the shared transport so fetch, Request objects, and safeFetch
+  // all participate in the same pending-write guard exactly once.
+  Vireo.api.trackHistoryRequest = function(input, opts, send) {
+    var url = input instanceof Request ? input.url : String(input);
+    var method = (opts && opts.method) || (input instanceof Request ? input.method : 'GET');
+    var mutation = /^(POST|PUT|PATCH|DELETE)$/i.test(method);
+    var historyWrite = mutation && /\/(rating|flag|color_label|keywords|edit-recipe|batch\/|predictions\/|culling\/|misses\/reject|highlights\/(confirm|relabel)|species\/label-cluster|encounters\/species|sync\/discard|pipeline\/(detach-|group\/apply|save-cache)|photos\/\d+\/(wildlife_excluded|location))/.test(url);
+    if (historyWrite && historyBusy) {
+      var error = new Error('Undo or redo is still finishing — try again in a moment');
+      error.code = 'history_busy';
+      showToast(error.message, 'warning');
+      return Promise.reject(error);
+    }
+    if (historyWrite) { historyPendingWrites++; renderHistoryControls(); }
+    return Promise.resolve().then(send).then(function(response) {
+      if (historyWrite && response.ok) _bumpHistoryBadge();
+      return response;
+    }).finally(function() {
+      if (historyWrite) {
+        historyPendingWrites--;
+        refreshHistoryControls();
+        renderHistoryControls();
       }
-      return data;
     });
   };
 
@@ -12371,6 +12472,7 @@ function formatDuration(seconds) {
   /* ---------- Jobs polling ---------- */
   // Pages signal job completion via this event so activeJobs stays current
   window.addEventListener('vireo-job-done', function(e) {
+    refreshHistoryControls();
     var jobId = e.detail && e.detail.job_id;
     if (jobId) {
       activeJobs = activeJobs.filter(function(j) { return j.id !== jobId; });
@@ -12386,6 +12488,9 @@ function formatDuration(seconds) {
     fetch('/api/jobs')
       .then(function(r) { return r.json(); })
       .then(function(data) {
+        // Import tags and other worker edits commit after their start request
+        // returns. Reconcile even if a short job finished between two polls.
+        refreshHistoryControls();
         activeJobs = data.active || [];
         _activeWsId = data.active_workspace_id || null;
         renderJobs();

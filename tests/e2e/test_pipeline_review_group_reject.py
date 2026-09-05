@@ -2914,3 +2914,27 @@ def test_group_review_removal_is_undoable_without_a_flag_change(live_server, pag
     expect(page.get_by_test_id('reject-burst')).to_have_count(2)
     page.locator('#historyRedoBtn').click()
     expect(page.get_by_test_id('reject-burst')).to_have_count(3)
+
+
+def test_rapid_review_refreshes_saved_decisions_after_history(live_server, page):
+    ids = live_server['data']['photos'][:4]
+    _write_grouped_pipeline_cache(live_server, ids)
+    page.goto(live_server['url'] + '/pipeline/rapid-review')
+    page.wait_for_function('rapid.seeded')
+    page.evaluate("changeQueue({filter: 'all'})")
+    page.wait_for_function('rapid.seeded')
+    page.evaluate("decideCurrent('reject')")
+    page.evaluate('applyCurrent(false)')
+    page.wait_for_function('rapid.seeded && !rapid.applying')
+    rejected = page.evaluate("Object.values(rapid.photoMap).find(p => p.flag === 'rejected').id")
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    page.locator('#historyUndoBtn').click()
+    page.wait_for_function('(id) => rapid.photoMap[id].flag === "none" && rapid.seeded', arg=rejected)
+    assert page.evaluate('(id) => rapid.rejects.has(id)', rejected) is False
+    page.locator('#historyRedoBtn').click()
+    page.wait_for_function('(id) => rapid.photoMap[id].flag === "rejected" && rapid.seeded', arg=rejected)
+    assert page.evaluate('(id) => rapid.rejects.has(id)', rejected) is True
+    # Staged local choices must not undo saved database edits behind the page.
+    page.evaluate("decideCurrent('pick')")
+    page.evaluate('doUndo()')
+    assert live_server['db'].get_photo(rejected)['flag'] == 'rejected'

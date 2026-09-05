@@ -2,6 +2,7 @@
 
 import logging
 import os
+import sqlite3
 from pathlib import Path
 
 from catalog import read_catalog
@@ -96,7 +97,8 @@ def preview_import(catalog_paths, db):
 
 
 def execute_import(
-    catalog_paths, db, write_xmp=False, strategy="merge_all", progress_callback=None
+    catalog_paths, db, write_xmp=False, strategy="merge_all", progress_callback=None,
+    pause_callback=None,
 ):
     """Import keywords from catalogs into the Vireo database.
 
@@ -115,6 +117,8 @@ def execute_import(
     all_photos = db.get_photos(per_page=999999)
     folders = {f["id"]: f["path"] for f in db.get_folder_tree()}
     for p in all_photos:
+        if pause_callback:
+            pause_callback()
         folder_path = folders.get(p["folder_id"], "")
         full_path = os.path.join(folder_path, p["filename"])
         photos_by_path[full_path] = p
@@ -122,13 +126,17 @@ def execute_import(
     # Merge catalog data
     merged = {}  # file_path -> {flat_keywords, hierarchical_keywords}
     for idx, cat_path in enumerate(catalog_paths):
+        if pause_callback:
+            pause_callback()
         try:
-            data = read_catalog(cat_path)
-        except Exception:
+            data = read_catalog(cat_path, pause_callback=pause_callback)
+        except (OSError, sqlite3.Error):
             log.exception("Failed to read catalog: %s", cat_path)
             continue
 
         for file_path, kw_data in data.items():
+            if pause_callback:
+                pause_callback()
             if file_path not in merged:
                 merged[file_path] = {
                     "flat_keywords": set(),
@@ -152,6 +160,9 @@ def execute_import(
     total = len(merged)
 
     for i, (file_path, kw_data) in enumerate(merged.items()):
+        if pause_callback:
+            db.conn.commit()
+            pause_callback()
         # Find matching photo in DB
         photo = photos_by_path.get(file_path)
         if not photo:

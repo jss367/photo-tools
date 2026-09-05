@@ -306,6 +306,14 @@ function appendHighlightFilterParams(params) {
   }
 }
 
+window.afterHistoryChange = async function() {
+  rejectedFromGrid.clear();
+  rejectedAtLoadSeq = {};
+  hideHighlightUndo();
+  await loadHighlights();
+  updateHighlightsLightboxControls(activeLightboxPhotoId);
+};
+
 async function loadHighlights() {
   var params = requestScopeParams();
   var folderSelect = document.getElementById('folderSelect');
@@ -318,6 +326,7 @@ async function loadHighlights() {
   // includes and we must not strip.
   var loadSeq = ++highlightsLoadSeq;
   var data = await safeFetch('/api/highlights?' + params);
+  if (loadSeq !== highlightsLoadSeq) return;
   currentData = data;
 
   // Guard against a reload issued against backend state from before a rejection

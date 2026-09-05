@@ -312,6 +312,7 @@ def create_export_blueprint(
                 },
                 progress_cb=progress_cb,
                 cancel_check=lambda: ctx.runner.is_cancelled(job["id"]),
+                cancel_only_check=lambda: ctx.runner.cancellation_requested(job["id"]),
             )
             exported_files = result.pop("files", [])
             result["revealed"] = bool(
@@ -323,7 +324,7 @@ def create_export_blueprint(
             return result
 
         return ctx.start(
-            "export", work,
+            "export", work, pausable=True,
             config={
                 "photo_ids": photo_ids,
                 "destination": destination,
@@ -577,6 +578,7 @@ def create_export_blueprint(
         return ctx.start(
             "publish-site",
             work,
+            pausable=True,
             config={
                 "destination": destination,
                 "include_life_list": options["include_life_list"],

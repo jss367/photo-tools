@@ -102,6 +102,33 @@
     background: var(--accent);
     color: var(--accent-text);
   }
+
+  /* Autosave status pill. Every curated field on this page writes through
+   * on change (no Save button), so the page has to say so out loud:
+   * "Saving…" while a write is queued or in flight, then "Saved ✓ HH:MM:SS"
+   * that stays put so the confirmation is still there after the 500 ms
+   * debounce window. A failed write stays red until a later write lands. */
+  .settings-save-status {
+    position: fixed;
+    top: 58px;
+    right: 18px;
+    z-index: 150;
+    display: none;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    color: var(--text-dim);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+    transition: color 0.3s, border-color 0.3s;
+  }
+  .settings-save-status[data-state] { display: flex; }
+  .settings-save-status[data-state="saving"] { color: var(--text-secondary); }
+  .settings-save-status[data-state="saved"].flash { color: var(--success); border-color: var(--success); }
+  .settings-save-status[data-state="error"] { color: var(--danger); border-color: var(--danger); }
 </style>
 </head>
 <body>
@@ -115,6 +142,8 @@
   <button type="button" onclick="moveSettingsFind(1)" title="Next match" aria-label="Next match">v</button>
   <button type="button" onclick="closeSettingsFind()" title="Close find" aria-label="Close find">x</button>
 </div>
+
+<div class="settings-save-status" id="settingsSaveStatus" role="status" aria-live="polite"></div>
 
 <div class="content">
 
@@ -1408,6 +1437,22 @@ function toggleSection(header) {
   body.classList.toggle('open');
 }
 
+/* ---------- Initial load readiness ----------
+ * The curated forms are populated asynchronously from /api/config and
+ * /api/workspaces/active/config. Tests (and any code that interacts with
+ * form fields on load) need a way to know both have finished, otherwise
+ * they can edit a field before loadConfig() overwrites it, or trigger
+ * saveWsConfig() before _wsOverridesLoaded flips on and get a silent
+ * no-op. The body's data-settings-ready attribute flips to "true" after
+ * both initial loads have settled (success OR handled failure). */
+var _settingsInitialLoads = { config: false, ws: false };
+function _markSettingsInitialLoad(kind) {
+  _settingsInitialLoads[kind] = true;
+  if (_settingsInitialLoads.config && _settingsInitialLoads.ws) {
+    document.body.setAttribute('data-settings-ready', 'true');
+  }
+}
+
 /* ---------- Workspace Config Overrides ---------- */
 var _wsOverridesLoaded = false;
 async function loadWsOverrides() {
@@ -1418,29 +1463,39 @@ async function loadWsOverrides() {
     }
     var overrides = await safeFetch('/api/workspaces/active/config', {}, { toast: false });
     ['classification_threshold', 'grouping_window_seconds', 'similarity_threshold', 'detector_confidence'].forEach(function(key) {
-      var checkbox = document.getElementById('wsOverride_' + key);
-      var input = document.getElementById('wsVal_' + key);
-      var ctrl = document.getElementById('wsOverrideCtrl_' + key);
-      if (!checkbox || !input || !ctrl) return;
-      if (overrides[key] !== undefined) {
-        checkbox.checked = true;
-        ctrl.style.display = 'flex';
-        if (key === 'classification_threshold' || key === 'similarity_threshold' || key === 'detector_confidence') {
-          input.value = Math.round(overrides[key] * 100);
-        } else {
-          input.value = overrides[key];
-        }
-        updateWsLabel(key);
-      } else {
-        // Sync removal too — when re-called after a schema-row reset, an
-        // override may have been deleted server-side. Leaving the checkbox
-        // checked would cause the next saveWsConfig to re-add it.
-        checkbox.checked = false;
-        ctrl.style.display = 'none';
-      }
+      _applyWsOverrideField(key, overrides);
     });
     _wsOverridesLoaded = true;
-  } catch(e) {}
+  } catch(e) {
+    _markSettingsInitialLoad('ws');
+    return false;
+  }
+  _markSettingsInitialLoad('ws');
+  return true;
+}
+
+// Show one override row exactly as the server has it.
+function _applyWsOverrideField(key, overrides) {
+  var checkbox = document.getElementById('wsOverride_' + key);
+  var input = document.getElementById('wsVal_' + key);
+  var ctrl = document.getElementById('wsOverrideCtrl_' + key);
+  if (!checkbox || !input || !ctrl) return;
+  if (overrides[key] !== undefined) {
+    checkbox.checked = true;
+    ctrl.style.display = 'flex';
+    if (key === 'classification_threshold' || key === 'similarity_threshold' || key === 'detector_confidence') {
+      input.value = Math.round(overrides[key] * 100);
+    } else {
+      input.value = overrides[key];
+    }
+    updateWsLabel(key);
+  } else {
+    // Sync removal too — when re-called after a schema-row reset, an
+    // override may have been deleted server-side. Leaving the checkbox
+    // checked would cause the next saveWsConfig to re-add it.
+    checkbox.checked = false;
+    ctrl.style.display = 'none';
+  }
 }
 
 function updateWsLabel(key) {
@@ -1478,9 +1533,19 @@ function saveWsConfig() {
   // wipe persisted state we never displayed. Bail out instead.
   if (!_wsOverridesLoaded) return;
   clearTimeout(_wsSaveTimer);
-  _wsSaveTimer = setTimeout(async function() {
+  var gen = _nextSaveGen();
+  _saveStatusMark('workspace', 'pending', gen);
+  _wsSaveTimer = setTimeout(function() {
+    _serializedSave('workspace', function() { return _postWsOverrides(gen); });
+  }, 500);
+}
+
+async function _postWsOverrides(gen) {
+    // Runs only once any earlier override POST has settled; reads the form
+    // now so the snapshot reflects every edit made while waiting.
     var overrides = {};
     var needsResync = false;
+    var invalidKeys = [];
     ['classification_threshold', 'grouping_window_seconds', 'similarity_threshold', 'detector_confidence'].forEach(function(key) {
       var checkbox = document.getElementById('wsOverride_' + key);
       var input = document.getElementById('wsVal_' + key);
@@ -1495,6 +1560,7 @@ function saveWsConfig() {
           // preserves omitted keys) and resync the input from the server
           // afterwards so it shows the value that is actually in effect.
           needsResync = true;
+          invalidKeys.push(key);
           return;
         }
         if (key === 'classification_threshold' || key === 'similarity_threshold' || key === 'detector_confidence') {
@@ -1508,17 +1574,184 @@ function saveWsConfig() {
         overrides[key] = null;
       }
     });
+    _saveStatusMark('workspace', 'inflight', gen);
     try {
       await safeFetch('/api/workspaces/active/config', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(overrides)
       });
-    } catch(e) {}
-    // Restore any field left empty/invalid to the server's persisted value
-    // (or uncheck it if no override actually exists server-side).
-    if (needsResync) loadWsOverrides();
-  }, 500);
+    } catch(e) {
+      _saveStatusMark('workspace', 'error', gen);
+      return;
+    }
+    if (needsResync) {
+      // An omitted (blank/invalid) field was NOT saved. Don't claim
+      // "Saved" until the form shows what is actually in effect: restore
+      // the field from the server first, and tell the user their entry
+      // was dropped. If the resync itself fails, the form still shows an
+      // unsaved value, so report that as a failed save rather than a
+      // false confirmation.
+      var current;
+      try {
+        current = await safeFetch('/api/workspaces/active/config', {}, { toast: false });
+      } catch (e) {
+        _saveStatusMark('workspace', 'error', gen);
+        return;
+      }
+      // Only the omitted fields are restored, and only if no newer
+      // override edit was queued while the GET was in flight: that edit's
+      // save reads the form when its turn comes, so overwriting fields
+      // here would post the server's old value over the user's newer one.
+      if (_saveStatus.pending.workspace === undefined) {
+        invalidKeys.forEach(function(key) { _applyWsOverrideField(key, current); });
+        if (typeof showToast === 'function') {
+          showToast(
+            'Blank or invalid override for ' + invalidKeys.join(', ') +
+            ' was not saved; showing the value currently in effect.',
+            'warning'
+          );
+        }
+      }
+    }
+    _saveStatusMark('workspace', 'ok', gen);
+}
+
+// ---------- Autosave status ----------
+// The curated forms on this page (global config and workspace overrides)
+// autosave on every change. Each save path reports its lifecycle here so
+// the pill at the top-right answers "did my edit persist?" honestly:
+//   pending  — a debounced write is queued but not yet sent
+//   inflight — the POST is on the wire
+//   ok       — the server accepted it
+//   error    — the server rejected it or the network failed
+// Paths are tracked separately so a failed config save is not masked by a
+// later successful workspace-override save (they persist to different
+// places; only a retry of the SAME path clears its failure).
+//
+// Every save carries a monotonically increasing generation token so that
+// the completion of an OLDER request cannot clear pending/inflight state
+// belonging to a NEWER edit. Without this, editing a second field while a
+// POST for the first is in flight would show "Saved" as soon as the first
+// completes — during the second edit's debounce window or even while its
+// request was already running.
+var _saveStatus = { pending: {}, inflight: {}, lastResult: {}, lastSavedAt: null };
+var _saveStatusFlashTimer = null;
+var _saveGenCounter = 0;
+
+function _nextSaveGen() { return ++_saveGenCounter; }
+
+// Saves for the same path are serialized: the next POST starts only after
+// the previous one has settled. Generation tokens order the UI
+// bookkeeping, but they cannot order what the server sees — two
+// overlapping requests can reach the backend out of order, and the older
+// full-form snapshot could land last and silently revert the newer edit
+// while the pill says "Saved". With one request in flight per path, the
+// server applies snapshots in the order they were sent, and each snapshot
+// is read from the form at send time so a queued save always carries the
+// latest values.
+var _saveChains = {};
+var _saveChainEpochs = {};
+var _autosaveSuspended = false;
+var _editedWhileSuspended = false;
+function _serializedSave(path, doSave) {
+  var epoch = _saveChainEpochs[path] || 0;
+  var prev = _saveChains[path] || Promise.resolve();
+  var run = prev.catch(function() {}).then(function() {
+    // A save queued behind an in-flight POST reads the form only when its
+    // turn comes. If the chain was cancelled meanwhile (settings import
+    // replaced the config), that stale snapshot must not be posted.
+    if ((_saveChainEpochs[path] || 0) !== epoch) {
+      throw new Error('autosave cancelled');
+    }
+    return doSave();
+  });
+  _saveChains[path] = run;
+  return run;
+}
+// Drop every save queued for a path that has not started yet, and wait
+// for the one in flight (if any) to settle. Used before replacing the
+// whole config so no pre-import snapshot can land after the import.
+function _cancelQueuedSaves(path) {
+  _saveChainEpochs[path] = (_saveChainEpochs[path] || 0) + 1;
+  var chain = _saveChains[path] || Promise.resolve();
+  _saveStatusMark(path, 'cancel');
+  return chain.catch(function() {});
+}
+
+function _saveStatusMark(path, phase, gen) {
+  if (phase === 'pending') {
+    // Debounced writes are singleton per path (clearTimeout drops any
+    // older timer), so overwrite rather than accumulate — otherwise a
+    // superseded pending gen would linger forever.
+    _saveStatus.pending[path] = gen;
+  } else if (phase === 'inflight') {
+    // Every POST sends the full current form snapshot, so a request at
+    // least as new as the queued write already carries its edits. This
+    // matters for direct _saveConfigNow() callers (the NAS wizard clears
+    // the debounce timer and flushes with a freshly minted gen): without
+    // the <= the superseded pending gen would never clear and the pill
+    // would read "Saving…" forever.
+    if (_saveStatus.pending[path] !== undefined && _saveStatus.pending[path] <= gen) {
+      delete _saveStatus.pending[path];
+    }
+    if (!_saveStatus.inflight[path]) _saveStatus.inflight[path] = {};
+    _saveStatus.inflight[path][gen] = true;
+  } else if (phase === 'ok' || phase === 'error') {
+    if (_saveStatus.inflight[path]) {
+      delete _saveStatus.inflight[path][gen];
+      if (Object.keys(_saveStatus.inflight[path]).length === 0) {
+        delete _saveStatus.inflight[path];
+      }
+    }
+    // Only let the LATEST completion define the visible outcome. An older
+    // 'ok' arriving after a newer 'error' must not overwrite the failure,
+    // and vice versa. Ties (same gen) update in call order.
+    var prev = _saveStatus.lastResult[path];
+    if (!prev || gen >= prev.gen) {
+      _saveStatus.lastResult[path] = { gen: gen, phase: phase };
+    }
+    if (phase === 'ok') _saveStatus.lastSavedAt = new Date();
+  } else if (phase === 'cancel') {
+    // A queued write was dropped on purpose (settings import replaces the
+    // whole config). Nothing was persisted, so don't claim a save happened.
+    delete _saveStatus.pending[path];
+  }
+  _renderSaveStatus();
+}
+
+function _renderSaveStatus() {
+  var el = document.getElementById('settingsSaveStatus');
+  if (!el) return;
+  var busy = Object.keys(_saveStatus.pending).length > 0 ||
+             Object.keys(_saveStatus.inflight).length > 0;
+  var failed = Object.keys(_saveStatus.lastResult).some(function(p) {
+    return _saveStatus.lastResult[p].phase === 'error';
+  });
+  clearTimeout(_saveStatusFlashTimer);
+  el.classList.remove('flash');
+  if (busy) {
+    el.setAttribute('data-state', 'saving');
+    el.textContent = 'Saving\u2026';
+    el.title = 'Your change is being written to disk.';
+  } else if (failed) {
+    el.setAttribute('data-state', 'error');
+    el.textContent = 'Save failed \u2014 changes not saved';
+    el.title = 'The last save was rejected. Edit the field again to retry.';
+  } else if (_saveStatus.lastSavedAt) {
+    var t = _saveStatus.lastSavedAt.toLocaleTimeString([], {
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+    el.setAttribute('data-state', 'saved');
+    el.textContent = 'Saved \u2713 ' + t;
+    el.title = 'All changes on this page are saved automatically. Last saved at ' + t + '.';
+    el.classList.add('flash');
+    _saveStatusFlashTimer = setTimeout(function() { el.classList.remove('flash'); }, 2000);
+  } else {
+    el.removeAttribute('data-state');
+    el.textContent = '';
+    el.title = '';
+  }
 }
 
 var _saveTimer = null;
@@ -2523,7 +2756,11 @@ async function loadConfig() {
       .grouping.burst_embedding_distance;
     document.getElementById('cfgBurstEmb').value = fallbackDistance;
     document.getElementById('cfgBurstEmbVal').textContent = fallbackDistance + '%';
+    _markSettingsInitialLoad('config');
+    return false;
   }
+  _markSettingsInitialLoad('config');
+  return true;
 }
 
 var CARD_FIELD_OPTIONS = [
@@ -2563,7 +2800,23 @@ function getSelectedCardFields() {
   return fields;
 }
 
-async function _saveConfigNow() {
+function _saveConfigNow(gen) {
+    // Direct callers (NAS wizard, etc.) don't hand us a generation, so mint
+    // one here. Threading a fresh gen through inflight/ok/error keeps the
+    // autosave pill honest when this call overlaps a debounced write.
+    if (gen === undefined) gen = _nextSaveGen();
+    // Settings import is replacing the whole config; a direct flush would
+    // post the pre-import form over it. Refuse so the caller reports a
+    // failed save instead of the import being silently overwritten.
+    if (_autosaveSuspended) {
+      return Promise.reject(new Error('Settings import in progress; try again in a moment.'));
+    }
+    return _serializedSave('config', function() { return _postConfigSnapshot(gen); });
+}
+
+async function _postConfigSnapshot(gen) {
+    // Runs only once any earlier config POST has settled; reads the form
+    // now so the snapshot reflects every edit made while waiting.
     var threshold = parseInt(document.getElementById('cfgThreshold').value, 10) / 100;
     var grouping = parseInt(document.getElementById('cfgGroupingWindow').value, 10);
     if (isNaN(grouping)) grouping = 10;
@@ -2572,7 +2825,9 @@ async function _saveConfigNow() {
     var keywordCase = document.getElementById('cfgKeywordCase').value;
     var maxEditHistory = parseInt(document.getElementById('cfgMaxEditHistory').value, 10);
     if (isNaN(maxEditHistory)) maxEditHistory = 1000;
-    await safeFetch('/api/config', {
+    _saveStatusMark('config', 'inflight', gen);
+    try {
+      await safeFetch('/api/config', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -2674,6 +2929,11 @@ async function _saveConfigNow() {
           },
         }),
       });
+    } catch (e) {
+      _saveStatusMark('config', 'error', gen);
+      throw e;
+    }
+    _saveStatusMark('config', 'ok', gen);
     if (typeof loadPreviewCacheStatus === 'function') loadPreviewCacheStatus();
     // Drop the cached editor list so the next "Open in Editor" action
     // sees changes to the editors list without a page reload.
@@ -2683,14 +2943,22 @@ async function _saveConfigNow() {
 }
 
 function saveConfig() {
-  // Debounced fire-and-forget for the settings-page inline handlers. Errors
-  // are silent — the network layer already toasts on failure and the next
-  // change re-tries. Callers that need to KNOW the write landed (e.g. the
-  // NAS wizard, before it tears down its modal) must call _saveConfigNow()
-  // directly and await it.
+  // Debounced fire-and-forget for the settings-page inline handlers. The
+  // outcome is reported through the autosave pill (_saveStatusMark) and the
+  // network layer toasts on failure; the next change re-tries. Callers that
+  // need to KNOW the write landed (e.g. the NAS wizard, before it tears down
+  // its modal) must call _saveConfigNow() directly and await it.
+  if (_autosaveSuspended) {
+    // Settings import is replacing the config. Remember that an edit was
+    // made so it can be saved if the import does not go through.
+    _editedWhileSuspended = true;
+    return;
+  }
   clearTimeout(_saveTimer);
+  var gen = _nextSaveGen();
+  _saveStatusMark('config', 'pending', gen);
   _saveTimer = setTimeout(function() {
-    _saveConfigNow().catch(function() {});
+    _saveConfigNow(gen).catch(function() {});
   }, 500);
 }
 
@@ -4826,14 +5094,27 @@ async function importSettingsFile(file) {
       ALL_SETTINGS_DEBOUNCE[token] = null;
     }
   });
+  // Only the global config chain is cancelled: the import replaces global
+  // config and leaves workspace overrides alone, so an override save may
+  // keep going and must not be dropped (the override form is not reloaded
+  // afterwards, and a dropped edit would stay on screen unsaved).
+  //
+  // A curated config save whose debounce already fired may be queued
+  // behind an in-flight POST; it would read the pre-import form when its
+  // turn came and post that snapshot over the imported config. Drop queued
+  // saves, wait for the in-flight one to settle, and keep autosave off
+  // until the form has been reloaded from the imported config. Remember
+  // whether an edit was dropped so it can be re-queued if the import does
+  // not go through (the form would otherwise show an unsaved value).
+  var hadPendingConfigSave = _saveStatus.pending.config !== undefined;
   if (typeof _saveTimer !== 'undefined' && _saveTimer) {
     clearTimeout(_saveTimer);
     _saveTimer = null;
   }
-  if (typeof _wsSaveTimer !== 'undefined' && _wsSaveTimer) {
-    clearTimeout(_wsSaveTimer);
-    _wsSaveTimer = null;
-  }
+  _autosaveSuspended = true;
+  await _cancelQueuedSaves('config');
+  var imported = false;
+  var formReloaded = false;
   var confirmedEviction = false;
   try {
     while (true) {
@@ -4866,15 +5147,42 @@ async function importSettingsFile(file) {
       }
       break;
     }
+    // The server has committed the import at this point; everything below
+    // is UI refresh. Flag it now so a refresh failure can't be mistaken
+    // for an aborted import (which would re-post the stale form over it).
+    imported = true;
+    // The import is a successful write of the whole global config, so a
+    // failure left over from an earlier autosave no longer describes what
+    // is on disk.
+    _saveStatusMark('config', 'ok', _nextSaveGen());
     await refreshAllSettingsValues();
     renderAllSettings(document.getElementById('allSettingsCategories'));
     filterAllSettings();
     // Curated form posts its own snapshot — repull so a later edit doesn't
     // overwrite imported global values with stale form state.
-    await loadConfig();
+    // loadConfig() swallows fetch failures (it has to on first paint), so
+    // check its result rather than assume the form now matches disk.
+    formReloaded = await loadConfig();
+    if (!formReloaded) return;
     alert('Settings imported. Workspace overrides preserved.');
   } catch (err) {
     alert('Network error: ' + (err && err.message || err));
+  } finally {
+    if (imported && !formReloaded) {
+      // The config on disk is the imported one but the form could not be
+      // refreshed from it. Re-enabling autosave here would let the next
+      // ordinary edit post the stale form over the import, so keep it off
+      // and reload the page, which rebuilds the form from disk.
+      alert('Settings imported, but the page could not refresh. Reloading.');
+      location.reload();
+    } else {
+      _autosaveSuspended = false;
+      // The import did not replace the config, so the edit we dropped (or
+      // one made while the import was running) is still the user's intent
+      // and still on screen: save it after all.
+      if (!imported && (hadPendingConfigSave || _editedWhileSuspended)) saveConfig();
+    }
+    _editedWhileSuspended = false;
   }
 }
 

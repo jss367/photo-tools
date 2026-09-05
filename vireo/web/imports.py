@@ -1371,6 +1371,7 @@ def create_imports_blueprint(
                     skip_duplicates=skip_duplicates,
                     verify_by_hash=verify_by_hash,
                     progress_callback=ingest_cb,
+                    pause_callback=lambda: ctx.checkpoint(job),
                     skip_paths=exclude_paths or None,
                 )
                 copied_paths = ingest_result.get("copied_paths", [])
@@ -1412,6 +1413,7 @@ def create_imports_blueprint(
                                    summary=f"{ingest_result.get('copied', 0)} copied")
 
             # Phase 2: Scan to index into DB
+            ctx.checkpoint(job)
             ctx.runner.update_step(job["id"], "scan", status="running")
 
             def scan_cb(current, total):
@@ -1497,6 +1499,7 @@ def create_imports_blueprint(
                                summary=scan_summary)
 
             # Phase 3: Generate thumbnails
+            ctx.checkpoint(job)
             ctx.runner.update_step(job["id"], "thumbnails", status="running")
             ctx.runner.push_event(job["id"], "progress", {
                 "current": 0, "total": 0,
@@ -1516,6 +1519,7 @@ def create_imports_blueprint(
             thumb_result = generate_all(
                 thread_db, config["THUMB_CACHE_DIR"],
                 progress_callback=thumb_cb,
+                cancel_check=lambda: ctx.runner.is_cancelled(job["id"]),
                 vireo_dir=vireo_dir,
             )
             from thumbnails import format_summary as thumb_summary
@@ -1523,6 +1527,7 @@ def create_imports_blueprint(
                                summary=thumb_summary(thumb_result))
 
             # Phase 4: Create collection
+            ctx.checkpoint(job)
             ctx.runner.update_step(job["id"], "collection", status="running")
             photo_ids = []
             if copy:
@@ -1582,7 +1587,7 @@ def create_imports_blueprint(
             return result
 
         return ctx.start(
-            "import-full", work,
+            "import-full", work, pausable=True,
             config={"source": source, "destination": destination, "copy": copy, "file_types": file_types},
         )
 
@@ -1619,10 +1624,11 @@ def create_imports_blueprint(
                 write_xmp=write_xmp,
                 strategy=strategy,
                 progress_callback=progress_cb,
+                pause_callback=lambda: ctx.checkpoint(job),
             )
 
         return ctx.start(
-            "import", work, config={"catalogs": catalogs, "strategy": strategy},
+            "import", work, pausable=True, config={"catalogs": catalogs, "strategy": strategy},
         )
 
     @blueprint.route("/api/import/orphaned-staging", methods=["GET"])
@@ -1648,11 +1654,14 @@ def create_imports_blueprint(
 
         def work(job):
             thread_db = ctx.thread_db()
-            return verify_orphaned_staging(thread_db, vireo_dir, path)
+            return verify_orphaned_staging(
+                thread_db, vireo_dir, path, pause_callback=lambda: ctx.checkpoint(job),
+            )
 
         return ctx.start(
             "staging-verify",
             work,
+            pausable=True,
             config={"path": path},
         )
 
@@ -3405,6 +3414,11 @@ def create_imports_blueprint(
                 active_ws, photo_ids, import_tags, location_from_gps, result,
                 job=job, runner=runner,
             )
+            # Pause before publishing the collection or handing off to a
+            # child job. Once the handoff starts, late parent requests must
+            # not claim they can stop the independently running child.
+            if not runner.begin_uncancellable(job["id"]):
+                result["cancelled"] = True
             _chain_after_import(job, result)
             return result
 
@@ -3429,9 +3443,17 @@ def create_imports_blueprint(
             "workspace_id": active_ws,
             "created_workspace": created_workspace,
         }
+        # Snapshot-backed imports serialize on ``snapshot_import_lock`` for
+        # the entire worker call. Pausing inside that critical section would
+        # sleep while holding the shared lock, so a queued second import for
+        # the same snapshot would block on the bare lock acquisition and
+        # could not reach any runner checkpoint — cancelling it would have
+        # no effect until the first import resumed. Keep this mode
+        # non-pausable while the lock is in play; other in-place imports
+        # remain pausable.
         job_id = runner.start(
             "import-in-place", work, config=job_config, workspace_id=active_ws,
-            pausable=True,
+            pausable=snapshot_import_lock is None,
         )
         response = {"job_id": job_id}
         if created_workspace is not None:
@@ -4332,6 +4354,11 @@ def create_imports_blueprint(
                     active_ws, result.get("photo_ids") or [], import_tags,
                     location_from_gps, result, job=job, runner=runner,
                 )
+                # Atomically honor a pending pause/cancel before collection
+                # publication and child-job handoff. The shared runner gate
+                # rejects new requests once this final phase begins.
+                if not runner.begin_uncancellable(job["id"]):
+                    result["cancelled"] = True
                 _chain_after_import(job, result)
                 return result
             finally:

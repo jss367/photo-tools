@@ -11643,7 +11643,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         would see now.
         """
         action = entry.get("action_type") if entry else None
-        if action != "species_replace":
+        if action == "pipeline_grouping":
+            # A species edit whose cache write changed the encounter
+            # structure is recorded as a grouping edit wrapping the photo
+            # edit; the grouping restore already put bursts and encounters
+            # back from its snapshot, so only the per-photo lists remain.
+            try:
+                payload = json.loads(entry.get("new_value") or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            if payload.get("photo_only"):
+                # Retired after its cache snapshot went stale: the newer
+                # cache belongs to a later analysis and must stay untouched;
+                # only the photo edit was reversed.
+                return
+            action = (payload.get("photo_edit") or {}).get("action_type")
+        if action not in ("species_replace", "keyword_add", "prediction_accept"):
             return
         photo_id_rows = db.conn.execute(
             "SELECT DISTINCT photo_id FROM edit_history_items WHERE edit_id = ?",
@@ -11661,14 +11676,29 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 species_by_photo.setdefault(pid, [])
             from pipeline import refresh_cache_species_for_photos
             cache_dir = os.path.dirname(db_path)
+            # Photos only: burst overrides and encounter fields are owned by
+            # the grouping/species-confirm history entries (restored from
+            # their recorded snapshots), and a plain keyword edit never
+            # changed them.
             refresh_cache_species_for_photos(
                 cache_dir, db._active_workspace_id, species_by_photo,
+                photos_only=True,
             )
         except Exception:
             log.exception(
                 "Failed to refresh pipeline cache species after undo/redo of %s",
                 action,
             )
+    def _history_flags_changed(db, entry):
+        action = entry["action_type"]
+        if action == "pipeline_grouping":
+            action = (json.loads(entry["new_value"]).get("photo_edit") or {}).get("action_type")
+        if action != "flag":
+            return False
+        return db.conn.execute(
+            "SELECT 1 FROM edit_history_items WHERE edit_id = ? AND old_value != new_value LIMIT 1",
+            (entry["id"],),
+        ).fetchone() is not None
 
     @app.route("/api/undo", methods=["POST"])
     def api_undo():
@@ -11692,7 +11722,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             undone.append(entry)
             return None
 
-        early = _under_prediction_decision_lock(db, _apply)
+        from services.grouping_history import GroupingHistoryConflict
+
+        try:
+            early = _under_prediction_decision_lock(db, _apply)
+        except GroupingHistoryConflict as exc:
+            return json_error(str(exc), 409)
         if early is not None:
             return early
         result = undone[0]
@@ -11703,7 +11738,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # state, so it has nothing to serialize against.
             edit_recipe_updates = _edit_recipe_history_updates(db, result["id"])
         _refresh_pipeline_cache_species_from_edit(db, result)
-        response = {"ok": True, "undone": result["description"]}
+        response = {"ok": True, "undone": result["description"], "flags_changed": _history_flags_changed(db, result)}
         if edit_recipe_updates is not None:
             response["action_type"] = "edit_recipe"
             response["edit_recipes"] = edit_recipe_updates
@@ -11729,6 +11764,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify({
             "available": True,
             "description": latest["description"],
+            "id": latest["id"],
             "count": total,
         })
 
@@ -11748,7 +11784,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             redone.append(entry)
             return None
 
-        early = _under_prediction_decision_lock(db, _apply)
+        from services.grouping_history import GroupingHistoryConflict
+
+        try:
+            early = _under_prediction_decision_lock(db, _apply)
+        except GroupingHistoryConflict as exc:
+            return json_error(str(exc), 409)
         if early is not None:
             return early
         result = redone[0]
@@ -11757,7 +11798,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # Outside the locked section, for the reason ``api_undo`` gives.
             edit_recipe_updates = _edit_recipe_history_updates(db, result["id"])
         _refresh_pipeline_cache_species_from_edit(db, result)
-        response = {"ok": True, "redone": result["description"]}
+        response = {"ok": True, "redone": result["description"], "flags_changed": _history_flags_changed(db, result)}
         if edit_recipe_updates is not None:
             response["action_type"] = "edit_recipe"
             response["edit_recipes"] = edit_recipe_updates
@@ -19991,6 +20032,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Comprehensive storage info for the storage management panel."""
         from classifier import CACHE_DIR as EMB_CACHE_DIR
         from models import DEFAULT_MODELS_DIR
+        from storage_breakdown import group_auxiliary_storage
 
         def _dir_stats(path):
             count = 0
@@ -20075,18 +20117,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             (masks["path"], masks_size),
             (hf_cache, hf_size),
         ]
-        named_inside_root = sum(
-            size for path, size in named_storage
-            if _is_within(path, storage_root)
-        )
-
         catalog_root = os.path.dirname(os.path.abspath(db_path))
         if os.path.abspath(storage_root) == catalog_root:
             # In the conventional layout this is Vireo's dedicated data
             # directory. Include taxonomy, logs, SQLite sidecars/backups, and
             # other managed files that do not have their own category.
-            storage_root_size = _dir_size_recursive(storage_root)
-            other_size = max(0, storage_root_size - named_inside_root)
+            try:
+                with os.scandir(storage_root) as entries:
+                    auxiliary_paths = [entry.path for entry in entries]
+            except OSError:
+                auxiliary_paths = []
         else:
             # ``--thumb-dir`` may be any directory (for example
             # /data/thumbs). Its parent is not necessarily owned by Vireo, so
@@ -20139,15 +20179,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     )
             except OSError:
                 pass
-            other_size = 0
-            for path in auxiliary_paths:
-                try:
-                    if os.path.isfile(path):
-                        other_size += os.path.getsize(path)
-                    elif os.path.isdir(path):
-                        other_size += _dir_size_recursive(path)
-                except OSError:
-                    continue
+        other_entries = []
+        measured_paths = []
+        # Measure each top-level auxiliary path once, then remove the bytes
+        # already represented by a named category. This also exposes files
+        # nested in cache folders that their flat/DB-backed counters omit.
+        for path in sorted(set(map(os.path.abspath, auxiliary_paths)), key=len):
+            if any(_is_within(path, parent) for parent in measured_paths):
+                continue
+            # As with os.walk(storage_root), do not follow directory links
+            # into unrelated data or back into an already-counted cache.
+            if os.path.islink(path) and os.path.isdir(path):
+                continue
+            measured_paths.append(path)
+            try:
+                size = (
+                    os.path.getsize(path) if os.path.isfile(path)
+                    else _dir_size_recursive(path)
+                )
+            except OSError:
+                continue
+            accounted = sum(
+                named_size for named_path, named_size in named_storage
+                if _is_within(named_path, path)
+            )
+            remaining = max(0, size - accounted)
+            if remaining:
+                other_entries.append({"path": path, "size": remaining})
+        other_categories = group_auxiliary_storage(other_entries, os.path.abspath(db_path))
+        other_size = sum(category["size"] for category in other_categories)
         total = sum(size for _path, size in named_storage) + other_size
         reclaimable = thumb["size"] + preview["size"] + emb["size"]
 
@@ -20233,7 +20293,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "thumbnails": thumb,
                 "previews": preview,
                 "working_copies": working,
-                "other": {"size": other_size, "path": storage_root},
+                "other": {
+                    "size": other_size, "path": storage_root,
+                    "categories": other_categories,
+                },
                 "embeddings": emb,
                 "models": {"size": models_size, "path": DEFAULT_MODELS_DIR},
                 "hf_cache": {"size": hf_size, "path": hf_cache, "models": hf_models},
@@ -20695,9 +20758,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         if not os.path.isdir(CACHE_DIR):
             return jsonify({"entries": [], "total_size": 0})
+        from embedding_cache import CHECKPOINT_SUFFIX
+
         entries = []
         total_size = 0
         for f in sorted(os.listdir(CACHE_DIR)):
+            if f.endswith(CHECKPOINT_SUFFIX):
+                # Partial progress from a paused or interrupted
+                # computation, not a usable embedding set.
+                continue
             if f.endswith(".npy") or f.endswith(".pt"):
                 fp = os.path.join(CACHE_DIR, f)
                 size = os.path.getsize(fp)
@@ -20811,15 +20880,41 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     },
                 )
 
+            from classifier import ClassifierLoadPaused
+
+            def _pause_requested():
+                return ctx.runner.pause_requested(job["id"])
+
+            def _cancelled():
+                # Pure cancel probe: the pause is handled by the retry
+                # loop below, outside the embedding single-flight, so the
+                # producer never parks while equal-key waiters are joined.
+                return ctx.runner.cancellation_requested(job["id"])
+
             # The shared service loads only the text side and joins an
             # equal-key pipeline/precompute already doing this work.
-            precompute_label_embeddings(
-                labels=labels,
-                model_str=model["model_str"],
-                pretrained_str=model["weights_path"],
-                progress_callback=_progress,
-                cancel_check=lambda: ctx.runner.is_cancelled(job["id"]),
-            )
+            while True:
+                try:
+                    precompute_label_embeddings(
+                        labels=labels,
+                        model_str=model["model_str"],
+                        pretrained_str=model["weights_path"],
+                        progress_callback=_progress,
+                        cancel_check=_cancelled,
+                        pause_check=_pause_requested,
+                    )
+                    break
+                except ClassifierLoadPaused:
+                    # Progress is checkpointed. Park here with no shared
+                    # lock held; the next attempt resumes from the
+                    # checkpoint. A Cancel during the pause surfaces on
+                    # the retry through the cancel probe.
+                    log.info(
+                        "Pre-computing embeddings paused; parking until "
+                        "Resume",
+                    )
+                    ctx.runner.is_cancelled(job["id"])
+                    continue
 
             return {"labels": len(labels), "model": model["name"]}
 
@@ -20830,6 +20925,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "model_id": model_id,
                 "labels_file": labels_file,
             },
+            pausable=True,
             runtime_warning=build_cpu_runtime_warning(
                 "precompute-embeddings",
                 work_units=runtime_warning_work_units(
@@ -21290,6 +21386,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             from labels import fetch_species_list, read_label_file, save_labels
 
             def progress_cb(msg, current=None, total=None):
+                ctx.checkpoint(job)
                 job["progress"]["current_file"] = msg
                 if current is not None:
                     job["progress"]["current"] = current
@@ -21366,6 +21463,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "fetch-labels",
             work,
+            pausable=True,
             config={
                 "place_id": place_id,
                 "place_name": place_name,
@@ -21665,7 +21763,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         })
 
                 revealed = False
-                if exported and reveal and not ctx.runner.is_cancelled(job["id"]):
+                cancelled = ctx.runner.is_cancelled(job["id"])
+                if exported and reveal and not cancelled:
                     revealed = reveal_inat_exports(
                         [item["path"] for item in exported], destination,
                     )
@@ -21682,6 +21781,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "inat-export",
             work,
+            pausable=True,
             config={
                 "photo_ids": [item["photo_id"] for item in submissions],
                 "destination": destination,
@@ -23568,6 +23668,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             job["_start_time"] = time.time()
 
             for i, photo in enumerate(photos):
+                if ctx.runner.is_cancelled(job["id"]):
+                    break
                 detail_photo = thread_db.get_photo(photo["id"]) or photo
                 cache_path = os.path.join(preview_dir, f'{photo["id"]}_{max_size}.jpg')
                 recipe = thread_db.get_photo_edit_recipe(photo["id"])
@@ -23639,6 +23741,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     },
                 )
 
+            # Park a pause requested during the final iteration before the
+            # eviction pass, which can unlink many previews and rewrite their
+            # database rows. Without this checkpoint the accepted request
+            # would remain ``pausing`` while eviction ran, and a cancel from
+            # that state could leave the cache mid-eviction.
+            if ctx.runner.is_cancelled(job["id"]):
+                return {"generated": generated, "skipped": skipped, "total": total}
+
             # Run a single eviction pass at the end so the batch doesn't
             # fsync after every photo.
             evict_preview_cache_if_over_quota(thread_db, vireo_dir)
@@ -23648,6 +23758,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "previews",
             work,
+            pausable=True,
             config={
                 "collection_id": collection_id,
                 "photo_ids": requested_photo_ids,
@@ -23716,12 +23827,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 skip_duplicates=skip_duplicates,
                 verify_by_hash=verify_by_hash,
                 progress_callback=progress_cb,
+                pause_callback=lambda: ctx.checkpoint(job),
             )
             return result
 
         return ctx.start(
             "ingest",
             work,
+            pausable=True,
             config={
                 "source": source,
                 "destination": destination,
@@ -23780,6 +23893,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 destination=destination,
                 progress_cb=progress_cb,
                 developed_dir=developed_dir,
+                cancel_check=lambda: ctx.runner.cancellation_requested(job["id"]),
+                pause_requested=lambda: ctx.runner.pause_requested(job["id"]),
+                pause_callback=lambda: ctx.runner.is_cancelled(job["id"]),
             )
             if int(result.get("moved") or 0) > 0:
                 try:
@@ -23796,7 +23912,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return result
 
         return ctx.start(
-            "move-photos", work,
+            "move-photos", work, pausable=True,
             config={"photo_ids": photo_ids, "destination": destination},
         )
 
@@ -23876,6 +23992,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             job["progress"]["total"] = total
 
             for i, pid in enumerate(photo_ids):
+                if ctx.runner.is_cancelled(job["id"]):
+                    break
                 photo = photos_map.get(pid)
                 filename = photo["filename"] if photo else ""
                 if not photo:
@@ -23897,6 +24015,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                 f'{photo["filename"]}: {result["status"]}'
                             )
                     except Exception as exc:
+                        thread_db.conn.rollback()
                         failed += 1
                         job["errors"].append(f'{photo["filename"]}: {exc}')
                         log.warning("Offline cache failed for %s: %s", filename, exc)
@@ -23934,6 +24053,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "offline-cache",
             work,
+            pausable=True,
             config={"photo_ids": photo_ids},
         )
 
@@ -24051,6 +24171,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                     finally:
                                         response.close()
                         except Exception as exc:
+                            thread_db.conn.rollback()
                             error = str(exc) or exc.__class__.__name__
                             log.warning(
                                 "Full-resolution preparation failed for %s: %s",
@@ -24093,6 +24214,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "prepare-full-resolution",
             work,
+            pausable=True,
             config={"photo_ids": photo_ids},
             extra={"total": len(photo_ids)},
         )
@@ -25168,6 +25290,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "classify",
             work,
+            pausable=True,
             config={
                 "collection_id": collection_id,
                 "model_name": params.model_name,
@@ -25887,6 +26010,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             job["_start_time"] = time.time()
 
             for i, photo in enumerate(photos):
+                if ctx.runner.is_cancelled(job["id"]):
+                    break
                 folder_path = folders.get(photo["folder_id"], "")
                 input_path = os.path.join(folder_path, photo["filename"])
 
@@ -25966,6 +26091,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "develop",
             work,
+            pausable=True,
             config={
                 "photo_ids": photo_ids,
                 "style": style,
@@ -26139,6 +26265,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             job["_start_time"] = time.time()
 
             for i, photo in enumerate(photos):
+                if ctx.runner.is_cancelled(job["id"]):
+                    break
                 photo_id = photo["id"]
                 folder_path = folders.get(photo["folder_id"], "")
                 image_path = os.path.join(folder_path, photo["filename"])
@@ -26148,7 +26276,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # filename, so serializing its full cache-check/write sequence
                 # lets Process safely reclaim that predecessor after commit.
                 photo_mask_lock = acquire_photo_mask(photo_id)
-                photo_mask_lock.acquire()
+                while not ctx.runner.is_cancelled(job["id"]):
+                    if not photo_mask_lock.acquire(timeout=0.1):
+                        continue
+                    # A pause can arrive during acquisition. Release before
+                    # parking so another Process job can use this photo.
+                    if (ctx.runner.pause_requested(job["id"])
+                            or ctx.runner.cancellation_requested(job["id"])):
+                        photo_mask_lock.release()
+                        continue
+                    break
+                else:
+                    break
                 mask_file_stage = None
                 try:
                     # Cache hit: photo_masks already has a row for
@@ -26369,6 +26508,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "extract-masks",
             work,
+            pausable=True,
             config={
                 "collection_id": collection_id,
                 "sam2_variant": sam2_variant,
@@ -26488,7 +26628,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         * ``remove``: ``species`` is untagged from the submitted photos and
           dropped from the list; no keyword is added.
         """
+        from pipeline_locks import acquire_workspace_regroup
+
         db = _get_db()
+        with acquire_workspace_regroup(db._ws_id()):
+            return _under_prediction_decision_lock(
+                db, lambda: _confirm_encounter_species(db),
+            )
+
+    def _confirm_encounter_species(db):
+        """Confirm species while holding the grouping and database writer locks."""
         body = request.get_json(silent=True) or {}
         species = body.get("species", "").strip()
         photo_ids = body.get("photo_ids", [])
@@ -26560,6 +26709,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         cache_dir = os.path.dirname(db_path)
         cached = load_results_raw(cache_dir, db._active_workspace_id)
+        before_cached = copy.deepcopy(cached)
+        cache_saved = False
         previous_species = None
         current_species_list = []
         target_enc = None
@@ -27024,6 +27175,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     pid, species, workspace_id=ws_id, _commit=False,
                 )
 
+            photo_edit_id = None
             if is_replacement and had_old:
                 # Photos that actually changed: had the old keyword (so the
                 # remove side fired) and/or newly gained the new one. Use the
@@ -27056,7 +27208,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         f'Replaced species "{previous_species}" with '
                         f'"{species}" on {len(changed)} photos'
                     )
-                db.record_edit(
+                photo_edit_id = db.record_edit(
                     "species_replace",
                     description,
                     str(kid) if kid is not None else "",
@@ -27069,7 +27221,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     {"photo_id": pid, "old_value": "", "new_value": str(kid)}
                     for pid in newly_tagged
                 ]
-                db.record_edit(
+                photo_edit_id = db.record_edit(
                     "keyword_add",
                     f'Confirmed species "{species}" on {len(newly_tagged)} photos',
                     str(kid),
@@ -27077,36 +27229,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     is_batch=len(newly_tagged) > 1,
                     _commit=False,
                 )
-            db.conn.commit()
-        except Exception:
-            db.conn.rollback()
-            raise
-        # Prune oldest edit-history rows now that the transaction has landed.
-        db._prune_edit_history()
-
-        # The confirmed set after this edit, for the cache and the response.
-        new_species_list = updated_species_list(
-            current_species_list, species, previous_species,
-            add=add_mode, remove=remove_mode,
-        )
-
-        # Update pipeline cache. burst_index was validated above, so the
-        # branch here is unambiguous: burst-scoped requests only touch the
-        # burst override, encounter-scoped requests only touch the encounter.
-        if cached and target_enc is not None:
-            if burst_index is not None:
-                # The override's confirmed state comes from the database, the
-                # same rule serialize_results applies on regroup: a burst is
-                # confirmed as the species every frame carries. Per-frame
-                # extras ([A, C] on one frame beside [A]) do not unconfirm
-                # it — the user just confirmed the set on all of it — and the
-                # list is the cache's ordering plus any extra the frames all
-                # share that the cache had not recorded. Only when some frame
-                # ended up with nothing shared (a remove that left disjoint
-                # extras) is the edited list written unconfirmed; it still
-                # stays authoritative (burst_species_list), because None
-                # would make the burst inherit the encounter's stale list
-                # and resurrect a species this edit removed. An emptied
+            # The confirmed set after this edit, for the cache, the history
+            # entry and the response.
+            new_species_list = updated_species_list(
+                current_species_list, species, previous_species,
+                add=add_mode, remove=remove_mode,
+            )
+            if remove_mode:
+                cache_description = f'Removed species "{species}" from '
+            elif add_mode:
+                cache_description = f'Added species "{species}" on '
+            else:
+                cache_description = f'Confirmed species "{species}" on '
+            new_burst_override = None
+            will_auto_detach = False
+            new_encounter_state = None
+            if cached and target_enc is not None:
+                # The override's confirmed state comes from the database (read
+                # inside this transaction, so it sees the tags just written),
+                # the same rule serialize_results applies on regroup: a burst
+                # is confirmed as the species every frame carries, and only
+                # when every entry of the edited list is on every frame. Per-
+                # frame extras ([A, C] beside [A]) do not unconfirm it — the
+                # user just confirmed the set on all of it — and the list is
+                # the cache's ordering plus any extra the frames all share
+                # that the cache had not recorded. An edit that leaves some
+                # frame without the full set records the list unconfirmed;
+                # it still stays authoritative (burst_species_list), because
+                # None would make the burst inherit the encounter's stale
+                # list and resurrect a species this edit removed. An emptied
                 # burst keeps an explicit empty override for the same reason.
                 actual_by_photo = db.get_species_keywords_for_photos(photo_ids)
                 actual_sets = [
@@ -27117,87 +27268,175 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     set.intersection(*actual_sets) if actual_sets else set()
                 )
                 recorded = species_key_set(new_species_list)
-                # Confirmed only when every frame is tagged and every entry
-                # of the edited list is on every frame. A legacy cache can
-                # list [A, B] while a frame lacks B; a replace of A then
-                # tags C everywhere but B is still missing from that frame,
-                # and if the follow-up re-tag of B fails the override must
-                # not claim [C, B] as confirmed.
                 frames_share = (
                     bool(actual_sets)
                     and all(actual_sets)
                     and bool(shared_keys)
                     and recorded <= shared_keys
                 )
-                if not new_species_list:
-                    burst_override = empty_species_override()
-                elif frames_share:
-                    extras = [
-                        s for s in actual_by_photo.get(photo_ids[0], [])
-                        if keyword_match_key(s) in shared_keys
-                        and keyword_match_key(s) not in recorded
-                    ]
-                    burst_override = build_species_override(
-                        new_species_list + extras,
+                if burst_index is not None:
+                    if not new_species_list:
+                        new_burst_override = empty_species_override()
+                    elif frames_share:
+                        extras = [
+                            s for s in actual_by_photo.get(photo_ids[0], [])
+                            if keyword_match_key(s) in shared_keys
+                            and keyword_match_key(s) not in recorded
+                        ]
+                        new_burst_override = build_species_override(
+                            new_species_list + extras,
+                        )
+                    else:
+                        new_burst_override = build_species_override(
+                            new_species_list, confirmed=False,
+                        )
+                    # Auto-detach if the burst's species no longer overlap
+                    # its encounter's — splits it out and merges into an
+                    # adjacent encounter of the same confirmed species when
+                    # one exists. Compare with keyword_match_key so a cached
+                    # pre-normalization spelling (e.g. ‘Apapane) does not
+                    # trigger a needless split against the stored species
+                    # (Apapane); the DB write already normalized to the
+                    # canonical form. Adding a second species never
+                    # detaches (it can only widen overlap); a remove
+                    # detaches only when it leaves a non-empty set that
+                    # shares nothing with the encounter. An emptied burst
+                    # stays put: there is nothing to file it under.
+                    enc_species_list = encounter_confirmed_species_list(target_enc)
+                    if not enc_species_list and target_enc.get("species"):
+                        enc_species_list = [target_enc["species"][0]]
+                    will_auto_detach = (
+                        not add_mode
+                        and bool(new_species_list)
+                        and bool(enc_species_list)
+                        and not (
+                            species_key_set(new_species_list)
+                            & species_key_set(enc_species_list)
+                        )
+                        and len(target_enc["bursts"]) > 1
                     )
                 else:
-                    burst_override = build_species_override(
-                        new_species_list, confirmed=False,
-                    )
-                target_enc["bursts"][burst_index]["species_override"] = (
-                    burst_override
+                    new_encounter_state = {
+                        "confirmed_species": (
+                            new_species_list[0] if new_species_list else None
+                        ),
+                        "confirmed_species_list": list(new_species_list),
+                        "species_confirmed": bool(new_species_list) and frames_share,
+                    }
+
+            cache_only_write = (
+                not (is_replacement and had_old)
+                and not newly_tagged
+                and cached
+                and target_enc is not None
+            )
+            if cache_only_write:
+                # No keyword row was recorded (every photo already carries
+                # this species), but the cache mutation below will still
+                # write ``confirmed_species`` / ``species_confirmed`` (or a
+                # burst ``species_override``). Without a matching history
+                # entry, a preceding grouping edit would remain the newest
+                # undoable row and its undo would silently discard this
+                # confirmation because grouping signatures ignore these
+                # species fields by design. Record the cache-only write so
+                # LIFO undo reverts it first. When auto-detach will fire
+                # the structural change and confirmation share one grouping
+                # history entry further down instead.
+                from services.grouping_history import (
+                    record_species_confirm_cache,
                 )
-                # Auto-detach if the burst's confirmed species no longer
-                # overlap its encounter's — splits it out and merges into an
-                # adjacent encounter of the same confirmed species when one
-                # exists. Compare with keyword_match_key so a cached
-                # pre-normalization spelling (e.g. ‘Apapane) does not trigger
-                # a needless split against the stored species (Apapane); the
-                # DB write already normalized to the canonical form. Adding a
-                # second species never detaches (it can only widen overlap);
-                # a remove detaches only when it leaves a non-empty set that
-                # shares nothing with the encounter ([A, B] under an
-                # A-encounter, minus A, is a B burst that belongs elsewhere).
-                # An emptied burst stays put: there is nothing to file it
-                # under.
-                enc_species_list = encounter_confirmed_species_list(target_enc)
-                if not enc_species_list and target_enc.get("species"):
-                    enc_species_list = [target_enc["species"][0]]
-                if (
-                    not add_mode
-                    and new_species_list
-                    and enc_species_list
-                    and not (
-                        species_key_set(new_species_list)
-                        & species_key_set(enc_species_list)
+                if burst_index is not None:
+                    burst_target = target_enc["bursts"][burst_index]
+                    current_override = burst_target.get("species_override")
+                    if current_override != new_burst_override and not will_auto_detach:
+                        record_species_confirm_cache(
+                            db, species=species, target_enc=target_enc,
+                            burst_index=burst_index,
+                            submitted_photo_ids=photo_ids,
+                            new_override=new_burst_override,
+                            description=cache_description + "1 burst",
+                        )
+                else:
+                    current_state = {
+                        "confirmed_species": target_enc.get("confirmed_species"),
+                        "confirmed_species_list": list(
+                            encounter_confirmed_species_list(target_enc)
+                        ),
+                        "species_confirmed": bool(target_enc.get("species_confirmed")),
+                    }
+                    if current_state != new_encounter_state:
+                        record_species_confirm_cache(
+                            db, species=species, target_enc=target_enc,
+                            burst_index=None,
+                            submitted_photo_ids=photo_ids,
+                            new_encounter_state=new_encounter_state,
+                            description=(
+                                cache_description + f"{len(photo_ids)} photos"
+                            ),
+                        )
+
+            # Apply the pipeline-cache mutation and persist inside the same
+            # transaction so a failed ``save_results_raw`` rolls back the
+            # species/keyword edits that would otherwise leave undo pointing
+            # at a change that never landed on disk. ``burst_index`` was
+            # validated above, so the branch here is unambiguous: burst-
+            # scoped requests only touch the burst override, encounter-
+            # scoped requests only touch the encounter.
+            if cached and target_enc is not None:
+                if burst_index is not None:
+                    target_enc["bursts"][burst_index]["species_override"] = (
+                        new_burst_override
                     )
-                    and len(target_enc["bursts"]) > 1
-                ):
-                    auto_detach_burst_for_species(
-                        cached, target_enc_idx, burst_index,
-                        new_species_list[0],
+                    if will_auto_detach:
+                        auto_detach_burst_for_species(
+                            cached, target_enc_idx, burst_index,
+                            new_species_list[0],
+                        )
+                        change = {
+                            "before": before_cached["encounters"],
+                            "after": cached["encounters"],
+                        }
+                        if photo_edit_id is None:
+                            db.record_edit(
+                                "pipeline_grouping",
+                                cache_description + "1 burst",
+                                json.dumps(change), [], _commit=False,
+                            )
+                else:
+                    set_encounter_confirmed_species(target_enc, new_species_list)
+                    target_enc["species_confirmed"] = bool(
+                        new_encounter_state["species_confirmed"]
                     )
-            else:
-                # Same database-derived rule as the burst branch: confirmed
-                # when every submitted frame carries the edited set (always
-                # true after an add/replace, which tagged them all); an edit
-                # that leaves frames sharing nothing records the list
-                # unconfirmed. Per-frame extras do not unconfirm.
-                actual_by_photo = db.get_species_keywords_for_photos(photo_ids)
-                actual_sets = [
-                    species_key_set(actual_by_photo.get(pid, []))
-                    for pid in photo_ids
-                ]
-                shared_keys = (
-                    set.intersection(*actual_sets) if actual_sets else set()
-                )
-                frames_share = (
-                    bool(actual_sets) and all(actual_sets) and bool(shared_keys)
-                )
-                set_encounter_confirmed_species(target_enc, new_species_list)
-                if new_species_list and not frames_share:
-                    target_enc["species_confirmed"] = False
-            save_results_raw(cached, cache_dir, db._active_workspace_id)
+                if photo_edit_id is not None and before_cached["encounters"] != cached["encounters"]:
+                    # Labels and confirmation counts are part of the same user
+                    # action even when no burst moves to another encounter.
+                    photo_edit = db.conn.execute(
+                        "SELECT action_type, new_value FROM edit_history WHERE id = ?",
+                        (photo_edit_id,),
+                    ).fetchone()
+                    change = {
+                        "before": before_cached["encounters"],
+                        "after": cached["encounters"],
+                        "photo_edit": dict(photo_edit),
+                    }
+                    db.conn.execute(
+                        "UPDATE edit_history SET action_type = 'pipeline_grouping', new_value = ? WHERE id = ?",
+                        (json.dumps(change), photo_edit_id),
+                    )
+                save_results_raw(cached, cache_dir, db._active_workspace_id)
+                cache_saved = True
+
+            db.conn.commit()
+        except Exception:
+            db.conn.rollback()
+            if cache_saved:
+                try:
+                    save_results_raw(before_cached, cache_dir, db._active_workspace_id)
+                except Exception:
+                    log.exception("Failed to restore pipeline cache after species confirmation failed")
+            raise
+        # Prune oldest edit-history rows now that the transaction has landed.
+        db._prune_edit_history()
 
         # Report `replaced` consistent with the actual replacement decision
         # (is_replacement, which uses keyword_match_key to match SQLite's

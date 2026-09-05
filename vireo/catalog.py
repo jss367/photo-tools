@@ -1,16 +1,38 @@
 """Read Lightroom .lrcat catalogs and extract keyword data per image file."""
 
 import sqlite3
+from contextlib import closing
 
 
-def _build_keyword_map(conn):
+def _catalog_rows(conn, query, row_id, pause_callback):
+    """Read bounded pages and release SQLite's read lock before pausing."""
+    last_id = None
+    while True:
+        if pause_callback:
+            pause_callback()
+        where = f" WHERE {row_id} > ?" if last_id is not None else ""
+        params = (last_id,) if last_id is not None else ()
+        with closing(conn.execute(
+            query + where + f" ORDER BY {row_id} LIMIT 256", params,
+        )) as cursor:
+            rows = cursor.fetchall()
+        if not rows:
+            return
+        for row in rows:
+            if pause_callback:
+                pause_callback()
+            yield row
+        last_id = rows[-1][0]
+
+
+def _build_keyword_map(conn, pause_callback=None):
     """Build a dict of keyword_id -> {name, parent, includeOnExport, includeParents}."""
-    cursor = conn.execute(
+    rows = _catalog_rows(conn,
         "SELECT id_local, name, parent, includeOnExport, includeParents "
-        "FROM AgLibraryKeyword"
+        "FROM AgLibraryKeyword", "id_local", pause_callback,
     )
     keywords = {}
-    for row in cursor:
+    for row in rows:
         keywords[row[0]] = {
             "name": row[1] or "",
             "parent": row[2],
@@ -51,7 +73,7 @@ def _build_hierarchy_path(keyword_id, keyword_map):
     return flat_keyword, hierarchical_path
 
 
-def read_catalog(catalog_path):
+def read_catalog(catalog_path, pause_callback=None):
     """Read a .lrcat catalog and return a dict mapping file paths to keyword data.
 
     Returns:
@@ -59,11 +81,12 @@ def read_catalog(catalog_path):
     """
     conn = sqlite3.connect(f"file:{catalog_path}?mode=ro", uri=True)
     try:
-        keyword_map = _build_keyword_map(conn)
+        keyword_map = _build_keyword_map(conn, pause_callback)
 
         # Query: join images -> files -> folders -> root folders, with keywords
         query = """
             SELECT
+                ki.id_local,
                 rf.absolutePath,
                 f.pathFromRoot,
                 fi.baseName,
@@ -77,8 +100,8 @@ def read_catalog(catalog_path):
         """
 
         result = {}
-        for row in conn.execute(query):
-            abs_path, path_from_root, base_name, extension, keyword_id = row
+        for row in _catalog_rows(conn, query, "ki.id_local", pause_callback):
+            _row_id, abs_path, path_from_root, base_name, extension, keyword_id = row
             file_path = f"{abs_path}{path_from_root}{base_name}.{extension}"
 
             flat_kw, hier_kw = _build_hierarchy_path(keyword_id, keyword_map)

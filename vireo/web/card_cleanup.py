@@ -43,7 +43,7 @@ def create_card_cleanup_blueprint(get_db, json_error, get_runner, db_path, confi
             scan_job = dict(row) if row is not None else None
         if scan_job is None or scan_job.get("type") != "card-cleanup-scan":
             return None, json_error("unknown scan job", status=404)
-        if scan_job.get("status") in ("queued", "running"):
+        if scan_job.get("status") in ("queued", "running", "pausing", "paused"):
             # Mid-flight, not a dead end: telling the user to re-scan
             # here would throw away a scan that is about to succeed.
             return None, json_error(
@@ -63,7 +63,7 @@ def create_card_cleanup_blueprint(get_db, json_error, get_runner, db_path, confi
         for j in runner.list_jobs():
             if (j.get("type") in
                     ("card-cleanup-verify", "card-cleanup-delete")
-                    and j.get("status") in ("queued", "running")
+                    and j.get("status") in ("queued", "running", "pausing", "paused")
                     and (j.get("config") or {}).get("scan_job_id")
                     == scan_job_id):
                 return json_error(
@@ -167,7 +167,7 @@ def create_card_cleanup_blueprint(get_db, json_error, get_runner, db_path, confi
                 thread_db.close()
 
         return ctx.start(
-            "card-cleanup-scan", work,
+            "card-cleanup-scan", work, pausable=True,
             config={"source": source, "recursive": recursive})
 
     @blueprint.route("/api/card-cleanup/<scan_job_id>/manifest")
@@ -253,7 +253,7 @@ def create_card_cleanup_blueprint(get_db, json_error, get_runner, db_path, confi
                     thread_db.close()
 
             job_id = ctx.start_job(
-                "card-cleanup-verify", work,
+                "card-cleanup-verify", work, pausable=True,
                 config={"scan_job_id": scan_job_id})
         return jsonify({"job_id": job_id})
 
@@ -357,7 +357,7 @@ def create_card_cleanup_blueprint(get_db, json_error, get_runner, db_path, confi
             if conflict is not None:
                 return conflict
             job_id = ctx.start_job(
-                "card-cleanup-delete", work,
+                "card-cleanup-delete", work, pausable=True,
                 config={"scan_job_id": scan_job_id})
         return jsonify({"job_id": job_id})
 

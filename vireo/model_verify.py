@@ -451,7 +451,7 @@ def clear_verified_cache(model_id: str) -> None:
         _verify_error_cache.pop(model_id, None)
 
 
-def verify_all_models(progress_callback=None) -> dict[str, VerifyResult]:
+def verify_all_models(progress_callback=None, pause_callback=None) -> dict[str, VerifyResult]:
     """Verify every installed known-model that's in the 'ok' state.
 
     Used by the "Verify all models" button in Settings. Skips:
@@ -475,6 +475,8 @@ def verify_all_models(progress_callback=None) -> dict[str, VerifyResult]:
 
     results: dict[str, VerifyResult] = {}
     for m in _models.get_models():
+        if pause_callback:
+            pause_callback()
         if m.get("source") == "custom":
             continue
         if not m.get("hf_subdir"):

@@ -675,6 +675,7 @@ var rapid = {
   seeded: false,
   applying: false,
   loadError: false,
+  historyRefreshFailed: false,
   zoomed: false,
   zoomPhotoId: null,
   zoomAnchor: null,
@@ -1226,6 +1227,69 @@ function requestOpenSession(index) {
   openSession(index);
 }
 
+window.beforeHistoryChange = function() {
+  if (rapid.loadError) {
+    showToast('Rapid Review could not load. Use Retry before undoing or redoing saved edits.', 'error');
+    return false;
+  }
+  if (rapid.applying || (rapid.sessionIndex >= 0 && !rapid.seeded)) {
+    showToast('Wait for Rapid Review to finish loading or saving.', 'info');
+    return false;
+  }
+  if (hasStagedChanges() || isQueuePromptOpen()) {
+    showToast('Apply or discard your staged decisions before undoing saved edits.', 'info');
+    return false;
+  }
+  return true;
+};
+
+window.afterHistoryChange = async function() {
+  rapid.loadError = false;
+  rapid.historyRefreshFailed = false;
+  var previous = rapid.sessions[rapid.sessionIndex];
+  var previousIds = previous ? previous.ids.slice() : [];
+  rapid.openToken++;
+  rapid.applying = true;
+  rapid.seeded = false;
+  renderApplyState();
+  try {
+    var results = await safeFetch('/api/pipeline/results', {}, {toast: false});
+    rapid.results = results;
+    rapid.photoMap = {};
+    (results.photos || []).forEach(function(photo) { rapid.photoMap[photo.id] = photo; });
+    rapid.allSessions = buildSessions(results);
+    rebuildFilteredSessions();
+    renderQueueControls();
+    renderBurstList();
+    var index = rapid.sessions.findIndex(function(session) {
+      return session.ids.some(function(id) { return previousIds.includes(id); });
+    });
+    if (index < 0 && rapid.sessions.length) index = 0;
+    if (index >= 0) await openSession(index);
+    else showEmptyQueue();
+  } catch (error) {
+    rapid.loadError = true;
+    rapid.historyRefreshFailed = true;
+    rapid.seeded = false;
+    rapid.openToken++;
+    renderAll();
+    throw error;
+  } finally {
+    rapid.applying = false;
+    renderApplyState();
+  }
+};
+
+async function retryRapidReview() {
+  if (rapid.applying) return;
+  try {
+    if (rapid.historyRefreshFailed) await window.afterHistoryChange();
+    else await openSession(rapid.sessionIndex);
+  } catch (error) {
+    showToast('Rapid Review could not refresh. Use Retry to try again.', 'error');
+  }
+}
+
 async function initRapidReview() {
   try {
     rapid.results = await safeFetch('/api/pipeline/results', {}, { toast: false });
@@ -1303,6 +1367,7 @@ function showEmptyQueue() {
 }
 
 async function openSession(index) {
+  if (rapid.historyRefreshFailed) return retryRapidReview();
   if (index < 0 || index >= rapid.sessions.length) return;
   rapid.sessionIndex = index;
   var session = rapid.sessions[index];
@@ -1617,7 +1682,7 @@ function renderCurrent() {
   document.getElementById('burstTitle').textContent = session ? session.title : 'Rapid Review';
   var subtitle = document.getElementById('burstSubtitle');
   if (rapid.loadError) {
-    subtitle.innerHTML = 'Failed to load burst state. <button type="button" class="rapid-inline-btn" onclick="openSession(rapid.sessionIndex)">Retry</button>';
+    subtitle.innerHTML = 'Failed to load burst state. <button type="button" class="rapid-inline-btn" onclick="retryRapidReview()">Retry</button>';
   } else {
     var queue = QUEUE_FILTERS[rapid.queue.filter] || QUEUE_FILTERS.all;
     var position = session ? ((rapid.sessionIndex + 1) + ' of ' + rapid.sessions.length + ' in ' + queue.label) : '';

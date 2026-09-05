@@ -1,4 +1,27 @@
+from pathlib import Path
+
 from playwright.sync_api import expect
+
+
+def test_storage_shows_named_categories_and_escaped_file_paths(live_server, page):
+    db_path = live_server["db"]._db_path
+    # Literal angle brackets are invalid in Windows filenames. Encoded markup
+    # still catches missing HTML escaping: its displayed path must stay exact.
+    backup = Path(f"{db_path}.bak-&lt;img src=x onerror=alert(1)&gt;")
+    backup.write_bytes(b"backup" * 1024)
+    originals = Path(live_server["app"].config["THUMB_CACHE_DIR"]).parent / "originals"
+    originals.mkdir(exist_ok=True)
+    (originals / "1.display.jpg").write_bytes(b"render" * 1024)
+
+    page.goto(f"{live_server['url']}/storage")
+    expect(page.locator("#storageGrid")).to_contain_text("Catalog backups")
+    expect(page.locator("#storageGrid")).to_contain_text("Full-resolution renders")
+    expect(page.locator("#storageGrid")).not_to_contain_text("Other Vireo Data")
+    details = page.locator("#storageBreakdown details").filter(has_text="Catalog backups")
+    details.locator("summary").click()
+    expect(details.locator("code").filter(has_text=backup.name)).to_be_visible()
+    expect(details.locator(".storage-breakdown-row").filter(has_text=backup.name)).to_contain_text("6 KB")
+    expect(details.locator("img")).to_have_count(0)
 
 
 def test_quota_apply_aborts_when_pending_storage_autosave_fails(

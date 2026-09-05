@@ -401,6 +401,11 @@ body { padding-bottom: 36px; }
 
 <script>
 var cullData = null;
+var cullBusy = false;
+var cullAnalysisPending = 0;
+var cullAnalysisSeq = 0;
+var cullDirty = false;
+var cullUseSavedFlags = false;
 var pipelineResults = null;
 var selectedCollectionId = null;
 var expandedSpecies = {};
@@ -591,6 +596,7 @@ function onScoringChange(slider) {
   var indicator = document.getElementById('reflowIndicator');
   if (indicator) { indicator.style.display = 'block'; indicator.textContent = 'Recomputing...'; }
   _reflowTimer = setTimeout(doReflow, 250);
+  updateCullApplyButton();
 }
 
 function onGroupingChange(slider) {
@@ -599,10 +605,13 @@ function onGroupingChange(slider) {
   var indicator = document.getElementById('reflowIndicator');
   if (indicator) { indicator.style.display = 'block'; indicator.textContent = 'Regrouping...'; }
   _regroupTimer = setTimeout(doRegroupLive, 500);
+  updateCullApplyButton();
 }
 
-function setPipelineResults(data, statusText) {
+function setPipelineResults(data, statusText, useSavedFlags) {
   pipelineResults = data;
+  cullUseSavedFlags = !!useSavedFlags;
+  cullDirty = false;
   rebuildCullDataFromPipeline();
   var status = document.getElementById('cullStatus');
   if (statusText && status) {
@@ -617,41 +626,58 @@ function pipelineBody(config) {
   return body;
 }
 
+function cullOperationPending() {
+  return cullBusy || cullAnalysisPending > 0 || _reflowTimer != null || _regroupTimer != null
+    || (window.vireoHistoryBusy && window.vireoHistoryBusy());
+}
+
+function updateCullApplyButton() {
+  document.getElementById('applyBtn').disabled = !!cullOperationPending();
+}
+
+async function recomputeCulling(endpoint, statusText) {
+  if (cullBusy || (window.vireoHistoryBusy && window.vireoHistoryBusy())) {
+    showToast('Wait for the current edit to finish before recomputing culling.', 'info');
+    return;
+  }
+  var seq = ++cullAnalysisSeq;
+  cullAnalysisPending++;
+  updateCullApplyButton();
+  try {
+    var config = Object.assign({}, getGroupingConfig(), getScoringConfig());
+    var data = await safeFetch(endpoint, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(pipelineBody(config)),
+    }, {toast: false});
+    if (seq === cullAnalysisSeq) setPipelineResults(data, statusText);
+  } catch (error) {
+    if (seq === cullAnalysisSeq) {
+      var status = document.getElementById('cullStatus');
+      status.textContent = 'Error: ' + error.message;
+      status.style.color = 'var(--danger)';
+    }
+  } finally {
+    cullAnalysisPending--;
+    updateCullApplyButton();
+    if (!cullAnalysisPending) {
+      var indicator = document.getElementById('reflowIndicator');
+      if (indicator) indicator.style.display = 'none';
+    }
+  }
+}
+
 function doReflow() {
+  clearTimeout(_reflowTimer);
+  _reflowTimer = null;
   if (!pipelineResults) return runCulling();
-  // Send grouping config too: the server's /api/pipeline/reflow re-runs
-  // run_grouping internally, so without the current UI grouping values
-  // it falls back to persisted defaults and the visible grouping
-  // sliders would lie about the active analysis state.
-  var config = Object.assign({}, getGroupingConfig(), getScoringConfig());
-  safeFetch('/api/pipeline/reflow', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(pipelineBody(config)),
-  }, { toast: false })
-  .then(function(data) {
-    if (data && !data.error) setPipelineResults(data);
-  })
-  .finally(function() {
-    var indicator = document.getElementById('reflowIndicator');
-    if (indicator) indicator.style.display = 'none';
-  });
+  // Reflow also groups photos, so send both sets of current slider values.
+  return recomputeCulling('/api/pipeline/reflow');
 }
 
 function doRegroupLive() {
-  var config = Object.assign({}, getGroupingConfig(), getScoringConfig());
-  safeFetch('/api/pipeline/regroup-live', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(pipelineBody(config)),
-  }, { toast: false })
-  .then(function(data) {
-    if (data && !data.error) setPipelineResults(data);
-  })
-  .finally(function() {
-    var indicator = document.getElementById('reflowIndicator');
-    if (indicator) indicator.style.display = 'none';
-  });
+  clearTimeout(_regroupTimer);
+  _regroupTimer = null;
+  return recomputeCulling('/api/pipeline/regroup-live');
 }
 
 function toggleCullSettings() {
@@ -663,19 +689,53 @@ async function runCulling() {
   var status = document.getElementById('cullStatus');
   status.textContent = 'Analyzing pipeline...';
   status.style.color = 'var(--text-dim)';
-  try {
-    var config = Object.assign({}, getGroupingConfig(), getScoringConfig());
-    var data = await safeFetch('/api/pipeline/regroup-live', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(pipelineBody(config)),
-    }, { toast: false });
-    setPipelineResults(data, 'Analysis complete!');
-  } catch(e) {
-    status.textContent = 'Error: ' + e.message;
-    status.style.color = 'var(--danger)';
-  }
+  return recomputeCulling('/api/pipeline/regroup-live', 'Analysis complete!');
 }
+
+window.beforeHistoryChange = function() {
+  if (cullOperationPending()) {
+    showToast('Wait for culling to finish updating before undoing saved edits.', 'info');
+    return false;
+  }
+  if (cullDirty) {
+    showToast('Apply your staged culling decisions or reload before undoing saved edits.', 'info');
+    return false;
+  }
+  return true;
+};
+
+window.afterHistoryChange = async function(result) {
+  cullBusy = true;
+  document.getElementById('applyBtn').disabled = true;
+  try {
+    var results;
+    if (selectedCollectionId != null && pipelineResults) {
+      // Collection grouping and scores were computed for this exact scope.
+      // Keep that analysis and refresh only its persisted photo flags.
+      results = JSON.parse(JSON.stringify(pipelineResults));
+      var state = await safeFetch('/api/pipeline/group/state', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({photo_ids: results.photos.map(function(photo) { return photo.id; })}),
+      }, {toast: false});
+      results.photos.forEach(function(photo) {
+        if (state.photos[photo.id]) photo.flag = state.photos[photo.id].flag;
+      });
+    } else {
+      var data = await safeFetch('/api/pipeline/page-init', {}, {toast: false});
+      results = data && data.results;
+    }
+    setPipelineResults(results,
+      result.undone ? 'Undone: ' + result.undone : 'Redone: ' + result.redone,
+      cullUseSavedFlags || result.flags_changed === true);
+  } catch (error) {
+    cullData = null;
+    renderCulling();
+    throw error;
+  } finally {
+    cullBusy = false;
+    document.getElementById('applyBtn').disabled = false;
+  }
+};
 
 async function loadCullingResults() {
   try {
@@ -776,7 +836,9 @@ function pipelineToCullData(results) {
 
     burstOrder.forEach(function(pid) {
       var p = photoMap[pid];
-      var action = actionForLabel(p.label);
+      var action = cullUseSavedFlags
+        ? (p.flag === 'flagged' ? 'keep' : p.flag === 'rejected' ? 'reject' : 'review')
+        : actionForLabel(p.label);
       groupPhotos.push({
         photo_id: pid,
         quality: p.quality_composite || 0,
@@ -1009,6 +1071,7 @@ function toggleSpecies(idx) {
 }
 
 function toggleCullAction(speciesIdx, poseIdx, photoId) {
+  if (cullOperationPending()) return;
   var sg = cullData.species_groups[speciesIdx];
   var groups = sg.scene_groups || sg.pose_groups || [];
   var pg = groups[poseIdx];
@@ -1028,13 +1091,13 @@ function toggleCullAction(speciesIdx, poseIdx, photoId) {
   var next = photo.action === 'keep' ? 'review' : (photo.action === 'review' ? 'reject' : 'keep');
   dec(photo.action);
   photo.action = next;
-  photo.pipeline_label = next.toUpperCase();
+  cullDirty = true;
   inc(next);
   renderCulling();
 }
 
 async function applyCulling() {
-  if (!cullData) return;
+  if (!cullData || cullOperationPending()) return;
 
   var keepers = [];
   var rejects = [];
@@ -1048,18 +1111,34 @@ async function applyCulling() {
     });
   });
 
-  if (!confirm('Apply culling decisions?\n\n' + keepers.length + ' photos flagged as keepers\n' + rejects.length + ' photos flagged as rejected\n\nThis sets the flag on each photo. You can undo in the Browse view.')) return;
+  if (!confirm('Apply culling decisions?\n\n' + keepers.length + ' photos flagged as keepers\n' + rejects.length + ' photos flagged as rejected\n\nThis sets the flag on each photo. Use Undo below to restore the previous flags.')) return;
 
+  cullBusy = true;
+  document.getElementById('applyBtn').disabled = true;
   try {
     await safeFetch('/api/culling/apply', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({keepers: keepers, rejects: rejects}),
     }, { toast: false });
+    // Apply establishes the saved baseline. Review photos were not sent to
+    // the server, so retain their existing flags instead of clearing them.
+    var keeperIds = new Set(keepers);
+    var rejectIds = new Set(rejects);
+    pipelineResults.photos.forEach(function(photo) {
+      if (keeperIds.has(photo.id)) photo.flag = 'flagged';
+      else if (rejectIds.has(photo.id)) photo.flag = 'rejected';
+    });
+    cullUseSavedFlags = true;
+    cullDirty = false;
+    rebuildCullDataFromPipeline();
     document.getElementById('cullStatus').textContent = 'Applied! ' + keepers.length + ' keepers, ' + rejects.length + ' rejected';
     document.getElementById('cullStatus').style.color = 'var(--accent)';
   } catch(e) {
     document.getElementById('cullStatus').textContent = 'Error: ' + e.message;
+  } finally {
+    cullBusy = false;
+    document.getElementById('applyBtn').disabled = false;
   }
 }
 

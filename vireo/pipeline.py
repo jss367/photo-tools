@@ -1440,7 +1440,9 @@ def load_results_raw(cache_dir, workspace_id):
     return _load_results_json(path)
 
 
-def refresh_cache_species_for_photos(cache_dir, workspace_id, species_by_photo):
+def refresh_cache_species_for_photos(
+    cache_dir, workspace_id, species_by_photo, photos_only=False,
+):
     """Rewrite the on-disk pipeline cache so its per-photo, per-burst, and
     per-encounter species fields match ``species_by_photo`` — a
     ``{photo_id: [name, ...]}`` mapping as returned by
@@ -1492,7 +1494,7 @@ def refresh_cache_species_for_photos(cache_dir, workspace_id, species_by_photo):
         p["confirmed_species_list"] = list(names)
 
     photos_by_id = {p.get("id"): p for p in data.get("photos", [])}
-    for enc in data.get("encounters", []):
+    for enc in data.get("encounters", []) if not photos_only else []:
         enc_photo_ids = enc.get("photo_ids") or []
         if not any(pid in touched_ids for pid in enc_photo_ids):
             continue

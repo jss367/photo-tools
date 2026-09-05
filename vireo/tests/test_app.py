@@ -827,10 +827,11 @@ def test_storage_page_has_health_cleanup_and_location_controls(app_and_db):
         b'Download again', b'cannot currently be reclaimed separately',
         b'loadMasksCard(s && s.masks)', b'cfgWorkingCopyCacheMaxGb',
         b"{name: 'Working Copies'", b'Oldest files are removed first',
-        b"{name: 'Other Vireo Data'",
+        b'storageBreakdown', b'View files and folders',
     ):
         assert marker in page.data
     assert page.data.count(b"{name: 'Database'") == 1
+    assert b'Other Vireo Data' not in page.data
 
 
 def test_storage_page_confirms_destructive_working_copy_quota_reduction(
@@ -954,6 +955,54 @@ def test_api_storage_counts_unclassified_vireo_root_files_as_other(
     assert after["other"]["path"] == str(tmp_path)
     assert after["other"]["size"] - before["other"]["size"] == len(payload)
     assert after["total"] - before["total"] == len(payload)
+    entries = [entry for category in after["other"]["categories"] for entry in category["entries"]]
+    assert any(
+        entry["path"] == str(tmp_path / "unclassified-vireo-data.bin")
+        and entry["size"] == len(payload) for entry in entries
+    )
+
+
+def test_api_storage_breaks_down_backups_renders_and_nested_cache_files(
+    app_and_db, tmp_path,
+):
+    app, db = app_and_db
+    before = app.test_client().get('/api/storage').get_json()
+    baseline_backups = next(
+        (category["size"] for category in before["other"]["categories"]
+         if category["name"] == "Catalog backups"), 0,
+    )
+    # Different backup conventions should share a category, retaining their
+    # individual paths and sizes so a large snapshot can be identified.
+    Path(f"{db._db_path}.pre-v999.bak").write_bytes(b"a" * 100)
+    Path(f"{db._db_path}.bak-pre-repair").write_bytes(b"b" * 200)
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    (backups / "catalog.db").write_bytes(b"c" * 300)
+    originals = tmp_path / "originals"
+    originals.mkdir()
+    (originals / "1.display.jpg").write_bytes(b"d" * 700)
+    nested = tmp_path / "thumbs" / "nested"
+    nested.mkdir()
+    (nested / "untracked.jpg").write_bytes(b"e" * 50)
+    if os.name != "nt":  # Windows may require privileges to create links.
+        (tmp_path / "linked-originals").symlink_to(originals, target_is_directory=True)
+
+    data = app.test_client().get('/api/storage').get_json()
+    categories = data["other"]["categories"]
+    by_name = {category["name"]: category for category in categories}
+    assert by_name["Catalog backups"]["size"] == baseline_backups + 600
+    backup_sizes = [entry["size"] for entry in by_name["Catalog backups"]["entries"]]
+    assert backup_sizes == sorted(backup_sizes, reverse=True)
+    assert {100, 200, 300}.issubset(backup_sizes)
+    assert by_name["Full-resolution renders"]["size"] == 700
+    entries = {entry["path"]: entry for category in categories for entry in category["entries"]}
+    assert entries[str(tmp_path / "thumbs")]["size"] == 50
+    assert str(db._db_path) not in entries
+    assert str(tmp_path / "linked-originals") not in entries
+    assert data["other"]["size"] == sum(category["size"] for category in categories)
+    assert [category["size"] for category in categories] == sorted(
+        [category["size"] for category in categories], reverse=True,
+    )
 
 
 def test_api_storage_custom_thumb_dir_ignores_unrelated_siblings(
@@ -1024,6 +1073,16 @@ def test_api_storage_custom_thumb_dir_ignores_unrelated_siblings(
         == len(backup_payload)
     )
     assert after_backup["total"] - after_staging["total"] == len(backup_payload)
+    categories = {category["name"]: category for category in after_backup["other"]["categories"]}
+    prior_backup_size = sum(
+        category["size"] for category in after_staging["other"]["categories"]
+        if category["name"] == "Catalog backups"
+    )
+    assert categories["Catalog backups"]["size"] == prior_backup_size + len(backup_payload)
+    assert categories["Import recovery files"]["size"] == len(staged)
+    assert categories["Species reference data"]["size"] == 2 * len(taxonomy_payload)
+    entries = [entry for category in categories.values() for entry in category["entries"]]
+    assert all("unrelated" not in entry["path"] and "pre-vbad" not in entry["path"] for entry in entries)
 
 
 def test_startup_sweeps_abandoned_transient_originals(app_and_db, tmp_path):
@@ -2338,7 +2397,7 @@ def test_encounter_species_replacement_is_atomic_in_history(app_and_db):
 
     history = db.get_edit_history()
     assert len(history) == 1
-    assert history[0]['action_type'] == 'species_replace'
+    assert history[0]['action_type'] == 'pipeline_grouping'
     assert 'Sparrow' in history[0]['description']
     assert 'Blue Jay' in history[0]['description']
 
@@ -2358,7 +2417,7 @@ def test_encounter_species_replacement_undo_restores_previous(app_and_db):
     # One undo should swap the photos back to Sparrow.
     undone = db.undo_last_edit()
     assert undone is not None
-    assert undone['action_type'] == 'species_replace'
+    assert undone['action_type'] == 'pipeline_grouping'
 
     for pid in photo_ids:
         names = {k["name"] for k in db.get_photo_keywords(pid)}
@@ -2394,7 +2453,7 @@ def test_encounter_species_replacement_undo_after_sync_queues_swap(app_and_db):
 
     undone = db.undo_last_edit()
     assert undone is not None
-    assert undone['action_type'] == 'species_replace'
+    assert undone['action_type'] == 'pipeline_grouping'
 
     for pid in photo_ids:
         names = {k["name"] for k in db.get_photo_keywords(pid)}
@@ -2421,7 +2480,7 @@ def test_encounter_species_replacement_redo_reapplies(app_and_db):
     db.undo_last_edit()
     redone = db.redo_last_undo()
     assert redone is not None
-    assert redone['action_type'] == 'species_replace'
+    assert redone['action_type'] == 'pipeline_grouping'
 
     for pid in photo_ids:
         names = {k["name"] for k in db.get_photo_keywords(pid)}
@@ -2848,7 +2907,7 @@ def test_encounter_species_records_only_newly_tagged(app_and_db):
 
     history = db.get_edit_history()
     assert len(history) == 1
-    assert history[0]["action_type"] == "keyword_add"
+    assert history[0]["action_type"] == "pipeline_grouping"
     # Only the (len - 1) newly-tagged photos are in the edit items.
     assert history[0]["item_count"] == len(photo_ids) - 1
 
@@ -2890,7 +2949,7 @@ def test_encounter_species_replacement_only_for_changed_photos(app_and_db):
 
     history = db.get_edit_history()
     assert len(history) == 1
-    assert history[0]["action_type"] == "species_replace"
+    assert history[0]["action_type"] == "pipeline_grouping"
     # All photos gained Blue Jay (none had it), so all are recorded.
     assert history[0]["item_count"] == len(photo_ids)
     for pid in photo_ids:
@@ -2991,7 +3050,7 @@ def test_encounter_species_replacement_removes_hierarchical_previous(app_and_db)
     assert nested not in tagged_ids
     assert alternate_nested not in tagged_ids
     history = db.get_edit_history()
-    assert history[0]["action_type"] == "species_replace"
+    assert history[0]["action_type"] == "pipeline_grouping"
 
     db.undo_last_edit()
     names = {row["name"] for row in db.get_photo_keywords(photo_id)}
@@ -3071,7 +3130,7 @@ def test_encounter_species_replacement_retags_same_taxon_alias(app_and_db):
         f"expected only the new scientific-name row, got {remaining!r}"
     )
     history = db.get_edit_history()
-    assert history[0]["action_type"] == "species_replace"
+    assert history[0]["action_type"] == "pipeline_grouping"
 
     db.undo_last_edit()
     restored = _species_names_on(photo_id)
@@ -21176,26 +21235,16 @@ def test_browse_sidebar_panels_refresh_on_undo_and_redo(app_and_db):
     # listener's own comments explain why each refresh is there, and a
     # character budget silently turns into "the comment got longer" failures.
     handler = _browse_js_function_body(
-        html, "document.addEventListener('vireo:edit-history-changed'"
+        html, "window.afterHistoryChange = async function("
     )
     assert "refreshBrowseSidebarPanels(" in handler, (
         "undo/redo must repaint the whole sidebar, not one panel"
     )
-    # Undo/redo also reverses ratings and flags, which are inputs to the stack
-    # cover comparison. Nothing else applies that reversal to the loaded rows,
-    # so the refresh this handler runs has to carry both fields and reconcile
-    # the covers they rank — otherwise the grid keeps showing a representative
-    # the database no longer picks and Undo reads as a no-op.
-    assert "_refreshBrowseKeywordState(" in handler
-    refresh = _browse_js_function_body(
-        html, "async function _refreshBrowseKeywordState(",
-    )
-    assert "local.rating = " in refresh and "local.flag = " in refresh, (
-        "undo/redo has no other path to apply a reverted rating or flag"
-    )
-    assert "reconcileBrowseStackCovers(" in refresh, (
-        "a reverted rating or flag can hand the stack back to another cover"
-    )
+    # The history hook reloads the query so membership, ordering, and covers
+    # reflect the database, including photos absent from the previous grid.
+    assert "await resetAndLoad(" in handler
+    assert "preserveCollection: true" in handler
+    assert "hydrateBrowseStackCoverMembers(" in handler
     body = _browse_js_function_body(
         html, "function refreshBrowseSidebarPanels(",
     )
@@ -22831,8 +22880,14 @@ def test_encounter_species_add_mode_keeps_existing_species(app_and_db):
         "confirmed": True,
         "species_list": ["Green-winged Teal", "American Wigeon"],
     }
+    # The keyword add changed the burst override, so it is recorded as a
+    # grouping edit wrapping the photo edit (main's persistent-history rule).
     history = db.get_edit_history()
-    assert history[0]["action_type"] == "keyword_add"
+    assert history[0]["action_type"] == "pipeline_grouping"
+    wrapped = db.conn.execute(
+        "SELECT new_value FROM edit_history WHERE id = ?", (history[0]["id"],)
+    ).fetchone()["new_value"]
+    assert _json.loads(wrapped)["photo_edit"]["action_type"] == "keyword_add"
 
 
 def test_encounter_species_replace_named_previous_on_two_species_burst(app_and_db):
@@ -22975,7 +23030,11 @@ def test_encounter_species_remove_mode_untags_one_species(app_and_db):
     }
 
     history = db.get_edit_history()
-    assert history[0]["action_type"] == "species_replace"
+    assert history[0]["action_type"] == "pipeline_grouping"
+    wrapped = db.conn.execute(
+        "SELECT new_value FROM edit_history WHERE id = ?", (history[0]["id"],)
+    ).fetchone()["new_value"]
+    assert _json.loads(wrapped)["photo_edit"]["action_type"] == "species_replace"
     assert history[0]["description"].startswith('Removed species "American Wigeon"')
     assert client.post("/api/undo").status_code == 200
     for pid in photo_ids:

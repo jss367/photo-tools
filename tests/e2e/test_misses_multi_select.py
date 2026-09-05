@@ -1123,3 +1123,21 @@ def test_misses_context_menu_opens_card_in_browse(live_server, page):
         f"location.pathname === '/browse' && new URLSearchParams(location.search).get('photo_id') === '{pid}'",
         timeout=5000,
     )
+
+
+def test_toolbar_history_restores_rejected_miss_membership(live_server, page):
+    ids = live_server['data']['photos'][:2]
+    _seed_misses(live_server['db'], ids)
+    page.goto(live_server['url'] + '/misses')
+    cards = page.locator("[data-testid^='miss-card-no_subject-']")
+    expect(cards).to_have_count(2)
+    page.on('dialog', lambda dialog: dialog.accept())
+    page.evaluate("bulkReject('no_subject')")
+    expect(cards).to_have_count(0)
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    page.locator('#historyUndoBtn').click()
+    expect(page.locator('#historyRedoBtn')).to_be_enabled()
+    expect(cards).to_have_count(2)
+    page.locator('#historyRedoBtn').click()
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    expect(cards).to_have_count(0)

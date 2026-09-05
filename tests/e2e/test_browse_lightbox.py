@@ -4,6 +4,7 @@ import json
 import re
 import time
 
+import pytest
 from PIL import Image
 from playwright.sync_api import expect
 
@@ -2049,6 +2050,392 @@ def test_browse_lightbox_predecodes_adjacent_photo_for_current_source_tier(
         "nextId => window._lbSrcUrl(nextId, 'original')", arg=next_id,
     )
     assert page.evaluate("window._lightboxCurrentId") != next_id
+
+
+def test_browse_lightbox_warms_fit_window_and_reuses_it_on_reversal(live_server, page):
+    """Fast steps and a reversal reuse decoded neighbors in a bounded window."""
+    page.route(
+        "**/photos/*/full*",
+        lambda route: route.fulfill(
+            body=base64.b64decode(_PNG_1X1), content_type="image/png"
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").nth(1).dblclick()
+    ids = page.evaluate("window._lightboxPhotoList.map(photo => photo.id)")
+    page.wait_for_function(
+        """ids => ids.every(id => Object.values(_lbAdjacentPreloads).some(
+            entry => entry.photoId === id && entry.status === 'decoded'
+        ))""",
+        arg=[ids[0], *ids[2:5]],
+    )
+    assert page.evaluate("Object.keys(_lbAdjacentPreloads).length") == 4
+
+    # Two immediate steps use the head start built while viewing photo 2.
+    for photo_id in ids[2:4]:
+        page.keyboard.press("ArrowRight")
+        page.wait_for_function(
+            "id => _lightboxCommittedId === id && !_lbVisualTransitionPending",
+            arg=photo_id,
+        )
+        assert "prefetch=1" in page.locator("#lightboxImg").get_attribute("src")
+    page.wait_for_function(
+        """oldId => !Object.values(_lbAdjacentPreloads).some(
+            entry => entry.photoId === oldId
+        )""",
+        arg=ids[0],
+    )
+    assert page.evaluate("Object.keys(_lbAdjacentPreloads).length") <= 5
+
+    page.keyboard.press("ArrowLeft")
+    page.wait_for_function("id => _lightboxCommittedId === id", arg=ids[2])
+    assert "prefetch=1" in page.locator("#lightboxImg").get_attribute("src")
+    page.keyboard.press("Escape")
+    assert page.evaluate("Object.keys(_lbAdjacentPreloads).length") == 0
+
+
+def test_browse_lightbox_queues_warmups_and_continues_past_failures(live_server, page):
+    """A slow warmup stays serial; a rejected one cannot starve the other neighbors."""
+    held = []
+    requests = []
+    failing_id = None
+
+    def serve_full(route):
+        photo_id = int(re.search(r"/photos/(\d+)/", route.request.url)[1])
+        if "prefetch=1" in route.request.url:
+            requests.append(photo_id)
+            if len(requests) == 1:
+                held.append(route)
+                return
+            if photo_id == failing_id:
+                route.fulfill(status=503, body="Busy")
+                return
+        route.fulfill(body=base64.b64decode(_PNG_1X1), content_type="image/png")
+
+    page.route("**/photos/*/full*", serve_full)
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").nth(1).dblclick()
+    ids = page.evaluate("window._lightboxPhotoList.map(photo => photo.id)")
+    failing_id = ids[2]
+    page.wait_for_function(
+        "Object.values(_lbAdjacentPreloads).some(entry => entry.status === 'loading')"
+    )
+    page.wait_for_timeout(200)
+    assert requests == [failing_id]
+    assert len(held) == 1
+    held.pop().fulfill(status=503, body="Busy")
+    page.wait_for_function(
+        """ids => ids.every(id => Object.values(_lbAdjacentPreloads).some(
+            entry => entry.photoId === id && entry.status === 'decoded'
+        ))""",
+        arg=[ids[0], ids[3], ids[4]],
+    )
+    page.wait_for_function(
+        "Object.values(_lbAdjacentPreloadRetry).some(retry => retry.count === 2)"
+    )
+    page.wait_for_timeout(800)
+    assert requests.count(failing_id) == 2
+    assert requests[:4] == [failing_id, ids[0], ids[3], ids[4]]
+
+
+def test_browse_lightbox_pauses_fit_warmups_during_source_upgrade(live_server, page):
+    """Finishing a Fit warmup cannot queue more work ahead of a pending zoom image."""
+    held_fit = []
+    held_original = []
+    fit_requests = []
+    original_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="4000" height="2000">'
+        '<rect width="4000" height="2000" fill="#274"/></svg>'
+    )
+
+    def serve_full(route):
+        """Hold the first neighboring preview until the zoom upgrade is pending."""
+        if "prefetch=1" in route.request.url:
+            fit_requests.append(route.request.url)
+            if len(fit_requests) == 1:
+                held_fit.append(route)
+                return
+        route.fulfill(body=base64.b64decode(_PNG_1X1), content_type="image/png")
+
+    def serve_original(route):
+        """Stall the visible upgrade while allowing later original warmups."""
+        if "prefetch=1" not in route.request.url and not held_original:
+            held_original.append(route)
+            return
+        route.fulfill(body=original_svg, content_type="image/svg+xml")
+
+    page.route("**/photos/*/full*", serve_full)
+    page.route("**/photos/*/original*", serve_original)
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").nth(1).dblclick()
+    page.wait_for_function(
+        """_lbFullUsesOriginal === false && Object.values(_lbAdjacentPreloads).some(
+            entry => entry.status === 'loading'
+        )"""
+    )
+    page.evaluate("_lbSetZoom(2)")
+    page.wait_for_timeout(200)
+    assert len(held_original) == 1
+    assert page.evaluate("_lbCurrentSrcKey") == "full"
+    assert page.evaluate("_lbDesiredSrcKey") == "original"
+    assert len(held_fit) == 1
+    held_fit.pop().fulfill(body=base64.b64decode(_PNG_1X1), content_type="image/png")
+    page.wait_for_function(
+        "Object.values(_lbAdjacentPreloads).some(entry => entry.status === 'decoded')"
+    )
+    page.wait_for_timeout(200)
+    assert len(fit_requests) == 1
+
+    held_original[0].fulfill(body=original_svg, content_type="image/svg+xml")
+    page.wait_for_function(
+        """_lbCurrentSrcKey === 'original' && Object.values(_lbAdjacentPreloads).some(
+            entry => entry.sourceKey === 'original' && entry.status === 'decoded'
+        )"""
+    )
+
+
+@pytest.mark.parametrize("failed_tier,needed_pixels", [("full", 100), ("2560", 2300), ("3840", 3200)])
+@pytest.mark.parametrize("superseded", [False, True])
+def test_browse_lightbox_resumes_warmups_after_source_failure(
+    live_server, page, failed_tier, needed_pixels, superseded,
+):
+    """A failed tier releases the queue while retaining the usable original."""
+    held_neighbor = []
+    held_tier = []
+    failure_enabled = False
+    neighbor_requests = []
+    original_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="4000" height="2000">'
+        '<rect width="4000" height="2000" fill="#274"/></svg>'
+    )
+
+    def serve_photo(route):
+        """Keep one neighbor and the selected failing tier pending independently."""
+        url = route.request.url
+        speculative = "prefetch=1" in url
+        if (failure_enabled and "/original" not in url and not speculative
+                and not any(held.request.url == url for held in held_tier)):
+            held_tier.append(route)
+            return
+        if "/original" in url:
+            if speculative:
+                neighbor_requests.append(url)
+                if len(neighbor_requests) == 1:
+                    held_neighbor.append(route)
+                    return
+            route.fulfill(body=original_svg, content_type="image/svg+xml")
+        else:
+            route.fulfill(
+                body=original_svg.replace('width="4000"', 'width="1920"').replace('height="2000"', 'height="960"'),
+                content_type="image/svg+xml",
+            )
+
+    page.route("**/photos/*/full*", serve_photo)
+    page.route("**/photos/*/original*", serve_photo)
+    page.route("**/photos/*/preview?*", serve_photo)
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").nth(1).dblclick()
+    page.wait_for_function("_lbFullUsesOriginal === false && _lbFullLongEdge !== null")
+    page.evaluate("_lbSetZoom(100)")
+    page.wait_for_function(
+        """_lbCurrentSrcKey === 'original' && Object.values(_lbAdjacentPreloads).some(
+            entry => entry.sourceKey === 'original' && entry.status === 'loading'
+        )"""
+    )
+    failure_enabled = True
+    target = "/full" if failed_tier == "full" else f"size={failed_tier}"
+    with page.expect_request(lambda request: target in request.url and "prefetch=1" not in request.url):
+        page.evaluate(
+            "pixels => _lbScheduleSourceSwap(pixels / (_lbPhotoW * _lbFitScale * devicePixelRatio))",
+            needed_pixels,
+        )
+    assert page.evaluate("_lbDesiredSrcKey") == failed_tier
+    assert len(held_neighbor) == 1
+    held_neighbor[0].fulfill(body=original_svg, content_type="image/svg+xml")
+    page.wait_for_function(
+        "Object.values(_lbAdjacentPreloads).some(entry => entry.status === 'decoded')"
+    )
+    page.wait_for_timeout(200)
+    assert len(neighbor_requests) == 1
+    assert len(held_tier) == 1
+    expected_source = "original"
+    if superseded:
+        expected_source, next_pixels = ("2560", 2300) if failed_tier == "3840" else ("3840", 3200)
+        with page.expect_request(
+            lambda request: f"size={expected_source}" in request.url and "prefetch=1" not in request.url
+        ):
+            page.evaluate(
+                "pixels => _lbScheduleSourceSwap(pixels / (_lbPhotoW * _lbFitScale * devicePixelRatio))",
+                next_pixels,
+            )
+    held_tier[0].fulfill(status=503, body="Transient tier failure")
+    if superseded:
+        page.wait_for_timeout(200)
+        assert page.evaluate("_lbDesiredSrcKey") == expected_source
+        assert len(neighbor_requests) == 1
+        assert len(held_tier) == 2
+        held_tier[1].fulfill(body=original_svg, content_type="image/svg+xml")
+    page.wait_for_function("_lbDesiredSrcKey === _lbCurrentSrcKey", timeout=5000)
+    page.wait_for_function(
+        """source => Object.values(_lbAdjacentPreloads).filter(
+            entry => entry.sourceKey === source && entry.status === 'decoded'
+        ).length === 2""",
+        arg=expected_source,
+    )
+    assert page.evaluate("_lbCurrentSrcKey") == expected_source
+
+
+@pytest.mark.parametrize("neighbor_fails", [False, True])
+def test_browse_lightbox_original_waits_for_slow_neighbor_queue(live_server, page, neighbor_fails):
+    """The original dwell cannot spend retries competing with slow Fit generation."""
+    current_id = live_server["data"]["photos"][0]
+    live_server["db"].conn.execute(
+        "UPDATE photos SET width=4000, height=2000 WHERE id=?", (current_id,),
+    )
+    live_server["db"].conn.commit()
+    full_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="960">'
+        '<rect width="1920" height="960" fill="#274"/></svg>'
+    )
+    held_fit = []
+    original_requests = []
+
+    def serve_full(route):
+        """Hold the first adjacent render longer than both original dwell attempts."""
+        if "prefetch=1" in route.request.url and (
+            not held_fit or (neighbor_fails and len(held_fit) == 1 and route.request.url == held_fit[0].request.url)
+        ):
+            held_fit.append(route)
+            return
+        route.fulfill(body=full_svg, content_type="image/svg+xml")
+
+    def serve_original(route):
+        """Record whether the original competes with a neighboring render."""
+        original_requests.append(route.request.url)
+        route.fulfill(body=full_svg, content_type="image/svg+xml")
+
+    page.route("**/photos/*/full*", serve_full)
+    page.route("**/photos/*/original*", serve_original)
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+    page.wait_for_function("_lbOriginalPreloadWaiting !== null")
+    page.wait_for_timeout(1600)
+    assert len(held_fit) == 1
+    assert original_requests == []
+    if neighbor_fails:
+        with page.expect_request(lambda request: request.url == held_fit[0].request.url):
+            held_fit[0].fulfill(status=503, body="Temporary neighbor failure")
+        # The request event can arrive before Playwright invokes its route
+        # handler. Wait for the parked retry before inspecting or releasing it.
+        deadline = time.monotonic() + 5
+        while len(held_fit) < 2 and time.monotonic() < deadline:
+            page.wait_for_timeout(10)
+        assert original_requests == []
+        assert len(held_fit) == 2
+        held_fit[1].fulfill(body=full_svg, content_type="image/svg+xml")
+    else:
+        held_fit[0].fulfill(body=full_svg, content_type="image/svg+xml")
+    page.wait_for_function("_lbOriginalPreload && _lbOriginalPreload.status === 'decoded'")
+    assert len(original_requests) == 1
+    assert "prefetch=1" in original_requests[0]
+
+
+@pytest.mark.parametrize("retired_source", ["full", "original"])
+@pytest.mark.parametrize("action", ["navigate", "zoom", "reopen"])
+def test_browse_lightbox_keeps_pruned_request_in_flight_until_response(
+    live_server, page, retired_source, action,
+):
+    """Changing the navigation window cannot reuse an occupied server slot."""
+    current_id = live_server["data"]["photos"][0]
+    live_server["db"].conn.execute(
+        "UPDATE photos SET width=4000, height=2000 WHERE id=?", (current_id,),
+    )
+    live_server["db"].conn.commit()
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="960">'
+        '<rect width="1920" height="960" fill="#274"/></svg>'
+    )
+    held = []
+    speculative_requests = []
+
+    def serve_photo(route):
+        """Keep one server response pending even after the viewer retires it."""
+        if "prefetch=1" in route.request.url:
+            speculative_requests.append(route.request.url)
+            if f"/{retired_source}" in route.request.url and not held:
+                held.append(route)
+                return
+        route.fulfill(body=svg, content_type="image/svg+xml")
+
+    page.route("**/photos/*/full*", serve_photo)
+    page.route("**/photos/*/original*", serve_photo)
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+    page.wait_for_function(
+        "source => _lbSpeculativeInFlight && _lbSpeculativeInFlight.sourceKey === source",
+        arg=retired_source,
+    )
+    page.wait_for_timeout(100)
+    assert len(held) == 1
+    # Routed images may be transferred again when a decoded warmup becomes
+    # visible; only a new URL represents extra background work here.
+    before = set(speculative_requests)
+    if action == "zoom":
+        page.evaluate("_lbSetZoom(100)")
+        page.wait_for_function("_lbCurrentSrcKey === 'original'")
+    else:
+        if action == "reopen":
+            page.keyboard.press("Escape")
+        target_id = page.evaluate(
+            """() => {
+                var target = _lightboxPhotoList[3];
+                openLightbox(target.id, target.filename, _lightboxPhotoList);
+                return target.id;
+            }"""
+        )
+        page.wait_for_function("id => _lightboxCommittedId === id", arg=target_id)
+    page.wait_for_timeout(1600)
+    assert set(speculative_requests) == before
+    assert page.evaluate("_lbSpeculativeInFlight !== null")
+    held[0].fulfill(body=svg, content_type="image/svg+xml")
+    page.wait_for_function(
+        """action => Object.values(_lbAdjacentPreloads).some(
+            entry => entry.photoId === _lightboxPhotoList[action === 'zoom' ? 1 : 4].id &&
+                entry.sourceKey === (action === 'zoom' ? 'original' : 'full') && entry.status === 'decoded'
+        ) && _lbSpeculativeInFlight === null""",
+        arg=action,
+    )
+    assert len(set(speculative_requests)) > len(before)
+    if action != "zoom":
+        assert page.evaluate(
+            "Object.values(_lbAdjacentPreloads).every(entry => entry.photoId !== _lightboxPhotoList[1].id)"
+        )
+
+
+def test_browse_lightbox_close_discards_pending_warmup_queue(live_server, page):
+    """A late image completion after close cannot start the remaining warmups."""
+    held = []
+
+    def serve_full(route):
+        if "prefetch=1" in route.request.url:
+            held.append(route)
+            return
+        route.fulfill(body=base64.b64decode(_PNG_1X1), content_type="image/png")
+
+    page.route("**/photos/*/full*", serve_full)
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").nth(1).dblclick()
+    page.wait_for_function(
+        "Object.values(_lbAdjacentPreloads).some(entry => entry.status === 'loading')"
+    )
+    page.wait_for_timeout(100)
+    assert len(held) == 1
+    page.keyboard.press("Escape")
+    held[0].fulfill(body=base64.b64decode(_PNG_1X1), content_type="image/png")
+    page.wait_for_timeout(200)
+    assert len(held) == 1
+    assert page.evaluate("Object.keys(_lbAdjacentPreloads).length") == 0
+    assert page.evaluate("_lbAdjacentPreloadTimer") is None
 
 
 def test_browse_lightbox_preloads_current_original_after_preview_settles(

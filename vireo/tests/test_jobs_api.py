@@ -580,6 +580,19 @@ def test_jobs_page_returns_200(app_and_db):
     assert b'Jobs' in resp.data
     assert b'data-pause-job' in resp.data
     assert b'data-resume-job' in resp.data
+    # A pending pause can be withdrawn while the worker is still on its way
+    # to a checkpoint. The button must reuse the resume endpoint (which
+    # accepts "pausing") and must not hide the pausing status pill.
+    assert b'data-cancel-pause' in resp.data
+    assert b'>Cancel pause</button>' in resp.data
+    # But cancelling the pause is only offered when the user requested it.
+    # Automatic safety pauses (pipeline_job.py's ``_handle_source_offline``
+    # publishes ``pause_reason`` before flipping to ``pausing``) must still
+    # render a disabled Pausing… button — cancelling one of those would
+    # burn a bounded ``_MAX_SOURCE_OFFLINE_PAUSES`` attempt on a dead
+    # source and can convert a recoverable outage into a failed run.
+    assert b'automaticPauseReason' in resp.data
+    assert b'job.progress && job.progress.pause_reason' in resp.data
     assert b'data-retry-import-job' in resp.data
     assert b'importRetryBody' in resp.data
     # Import-in-place's overall counter pauses during discovery/metadata.
@@ -2438,8 +2451,9 @@ def test_extract_masks_route_writes_photo_masks_row(
     lock_events = []
 
     class TrackingLock:
-        def acquire(self):
+        def acquire(self, timeout=-1):
             lock_events.append(("acquire", pid))
+            return True
 
         def release(self):
             lock_events.append(("release", pid))
@@ -2515,6 +2529,69 @@ def test_extract_masks_route_writes_photo_masks_row(
     assert replacement["path"] != previous_path
     assert os.path.isfile(replacement["path"])
     assert not os.path.exists(previous_path)
+
+
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+@pytest.mark.parametrize("pause_during", ["contention", "acquisition"])
+def test_extract_masks_pauses_without_holding_photo_lock(
+    app_and_db, tmp_path, monkeypatch, action, pause_during,
+):
+    import pipeline_locks
+
+    app, db = app_and_db
+    pid = _seed_photo_with_detection(
+        db, tmp_path, "bird.jpg", (10, 20, 100, 200), "MegaDetector",
+    )
+    calls = []
+    _patch_extract_masks_deps(monkeypatch, calls)
+    lock = threading.Lock()
+    entered, release = threading.Event(), threading.Event()
+    held_by_test = pause_during == "contention"
+    if held_by_test:
+        lock.acquire()
+
+    class ContendedLock:
+        def acquire(self, timeout=-1):
+            if pause_during == "contention":
+                entered.set()
+            acquired = lock.acquire(timeout=timeout)
+            if acquired and pause_during == "acquisition":
+                entered.set()
+                assert release.wait(5)
+            return acquired
+
+        def release(self):
+            lock.release()
+
+    monkeypatch.setattr(pipeline_locks, "acquire_photo_mask", lambda _: ContendedLock())
+    runner = app._job_runner
+    client = app.test_client()
+    job_id = client.post("/api/jobs/extract-masks", json={}).get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        release.set()
+        _wait_for_runner_status(runner, job_id, "paused")
+        assert calls == []
+        if pause_during == "contention":
+            lock.release()
+            held_by_test = False
+        assert lock.acquire(timeout=1), "Paused worker must not own the photo lock"
+        lock.release()
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM photo_masks WHERE photo_id=?", (pid,),
+        ).fetchone()[0] == 0
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        job = wait_for_job_via_client(client, job_id)
+        assert job["status"] == ("completed" if action == "resume" else "cancelled")
+        assert len(calls) == (1 if action == "resume" else 0)
+        assert lock.acquire(timeout=1), "Finished worker must release the photo lock"
+        lock.release()
+    finally:
+        release.set()
+        runner.cancel_job(job_id)
+        if held_by_test:
+            lock.release()
 
 
 def test_extract_masks_route_skips_sam_when_cached(
@@ -9101,8 +9178,12 @@ def test_import_photos_retry_rejects_second_retry_while_first_is_pausing(
         assert second_retry.status_code == 409, second_retry.get_json()
         assert "already in flight" in second_retry.get_json()["error"]
 
+        # The runner honors pending pauses even when the worker returns.
+        # Withdraw this test's pause before allowing its fake worker to finish.
+        assert client.post(f"/api/jobs/{first_retry_id}/resume").status_code == 200
         release_first_retry.set()
-        wait_for_job_via_client(client, first_retry_id)
+        finished = wait_for_job_via_client(client, first_retry_id)
+        assert finished["status"] == "completed"
 
 
 def test_import_photos_remote_and_destination_mutually_exclusive(

@@ -4031,6 +4031,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         active_model["id"], verify_err,
                     )
 
+            try:
+                from classifier import ClassifierLoadPaused
+            except ImportError:
+                class ClassifierLoadPaused(RuntimeError):
+                    pass
+
             def _construct_classifier():
                 try:
                     from classifier import ClassificationCancelled
@@ -4058,6 +4064,21 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         or _cancellation_requested()
                     )
 
+                # Non-parking pause probe. A pause request makes the
+                # classifier checkpoint the label embeddings finished so
+                # far and raise ``ClassifierLoadPaused`` instead of
+                # parking under ``load_lock``; the acquire loop below
+                # parks this participant at its normal checkpoint with
+                # every lock released and constructs again on Resume.
+                # Threads without a registered pause participant cannot
+                # park, so they never abort for pause and instead honor
+                # it at the owning worker's next boundary.
+                def pause_check():
+                    if getattr(pause_context, "participant", None) is None:
+                        return False
+                    probe = getattr(runner, "pause_requested", None)
+                    return bool(probe is not None and probe(job["id"]))
+
                 if model_type == "timm":
                     if cancel_check():
                         raise ClassificationCancelled("classification cancelled")
@@ -4071,6 +4092,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     model_str=model_str,
                     pretrained_str=weights_path,
                     cancel_check=cancel_check,
+                    pause_check=pause_check,
                 )
 
             # The shared cache key includes an ordered, canonical label identity
@@ -4105,26 +4127,61 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             # helper rekeys the entry to the post-load file fingerprint.
             cache_handle = None
             try:
-                cache_handle = acquire_cached_classifier(
-                    model_type=model_type,
-                    model_str=model_str,
-                    weights_path=weights_path,
-                    labels=None if use_tol else labels,
-                    factory=_construct_classifier,
-                    files=files,
-                    # Fold in optional-artifact presence: without this a
-                    # Repair that downloads timm's label_descriptions.json
-                    # (or bioclip-2.5's ToL files) would not invalidate the
-                    # entry already loaded from the pre-repair install, and
-                    # subsequent pipeline runs would keep using a stale
-                    # classifier constructed without those artifacts.
-                    optional_files=active_model.get("optional_files"),
-                    taxonomy_fingerprint=tax_fp,
-                    cancel_check=lambda: (
-                        _should_abort(abort) or _cancellation_requested()
-                    ),
-                )
-                clf = cache_handle.__enter__()
+                while True:
+                    try:
+                        cache_handle = acquire_cached_classifier(
+                            model_type=model_type,
+                            model_str=model_str,
+                            weights_path=weights_path,
+                            labels=None if use_tol else labels,
+                            factory=_construct_classifier,
+                            files=files,
+                            # Fold in optional-artifact presence: without
+                            # this a Repair that downloads timm's
+                            # label_descriptions.json (or bioclip-2.5's ToL
+                            # files) would not invalidate the entry already
+                            # loaded from the pre-repair install, and
+                            # subsequent pipeline runs would keep using a
+                            # stale classifier constructed without those
+                            # artifacts.
+                            optional_files=active_model.get("optional_files"),
+                            taxonomy_fingerprint=tax_fp,
+                            cancel_check=lambda: (
+                                _should_abort(abort)
+                                or _cancellation_requested()
+                            ),
+                        )
+                        clf = cache_handle.__enter__()
+                        break
+                    except ClassifierLoadPaused:
+                        # The factory stepped out of the shared load lock
+                        # with its label embeddings checkpointed. Park this
+                        # participant at the pipeline's pause gate (no lock
+                        # held), then construct again so the computation
+                        # resumes from the checkpoint. A Cancel during the
+                        # pause surfaces on the retry through the factory's
+                        # own cancel probe.
+                        log.info(
+                            "Classifier load for %s paused; parking until "
+                            "Resume", model_name,
+                        )
+                        _pause_checkpoint()
+                        # ``pause_check`` only fires on a thread with a
+                        # registered participant, so the gate parks us
+                        # above. Should it ever return with the pause
+                        # still pending (and no cancel), wait on the
+                        # runner directly rather than spin through
+                        # construction until Resume.
+                        pause_probe = getattr(runner, "pause_requested", None)
+                        direct_wait = getattr(runner, "wait_if_paused", None)
+                        if (
+                            pause_probe is not None
+                            and direct_wait is not None
+                            and pause_probe(job["id"])
+                            and not _cancellation_requested()
+                        ):
+                            direct_wait(job["id"], publish_paused=False)
+                        continue
             except Exception as load_err:
                 # ONNXRuntime signals missing external-data with a
                 # "model_path must not be empty" / "Initializer" error. Treat

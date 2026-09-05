@@ -218,7 +218,12 @@ def test_move_photos_job_invalidates_missing_originals_cache(
 
     def fake_move_photos(
         db, photo_ids, destination, progress_cb=None, developed_dir="",
+        cancel_check=None, pause_requested=None, pause_callback=None,
     ):
+        assert cancel_check is not None
+        assert cancel_check() is False
+        assert pause_requested() is False
+        pause_callback()
         assert photo_ids == [pid]
         assert destination == str(dst)
         assert developed_dir == ""
@@ -258,7 +263,12 @@ def test_move_photos_job_passes_configured_developed_dir(
 
     def fake_move_photos(
         db, photo_ids, destination, progress_cb=None, developed_dir="",
+        cancel_check=None, pause_requested=None, pause_callback=None,
     ):
+        assert cancel_check is not None
+        assert cancel_check() is False
+        assert pause_requested() is False
+        pause_callback()
         assert photo_ids == [pid]
         assert destination == str(tmp_path / "move-destination")
         assert developed_dir == str(tmp_path / "configured-developed")

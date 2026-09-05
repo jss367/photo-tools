@@ -1069,36 +1069,6 @@ input[type="range"]::-moz-range-thumb {
 .burst-strip:hover .detach-btn { opacity: 1; }
 .photo-card:hover .detach-btn { opacity: 1; }
 
-/* Undo toast */
-.undo-toast {
-  position: fixed;
-  bottom: 60px;
-  left: 50%;
-  transform: translateX(-50%);
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-secondary);
-  border-radius: 8px;
-  padding: 12px 20px;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  font-size: 13px;
-  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-  z-index: 200;
-  transition: opacity 0.3s;
-}
-.undo-toast.hidden { opacity: 0; pointer-events: none; }
-.undo-toast-btn {
-  background: var(--accent);
-  color: var(--accent-text);
-  border: none;
-  border-radius: 4px;
-  padding: 4px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
 /* ---------- Group Review Modal ---------- */
 .grm-overlay {
   display: none;
@@ -1908,10 +1878,7 @@ input[type="range"]::-moz-range-thumb {
   <div class="inspect-panel" id="inspectPanel"></div>
 </div>
 
-<div class="undo-toast hidden" id="undoToast">
-  <span id="undoMsg"></span>
-  <button class="undo-toast-btn" onclick="undoLastAction()">Undo</button>
-</div>
+
 
 <!-- Photo organization dialogs opened from the Process Review context menu. -->
 <div class="modal-overlay" id="pipelineKeywordModal"
@@ -3869,13 +3836,10 @@ function findEncounterForPhoto(photoId) {
 var inspectPhotoId = null;
 var pipelineReviewGroupFlagInFlight = {};
 // Photo IDs that any in-flight bulk reject/clear is currently mutating. We
-// check for overlap in setPipelineReviewGroupFlag so an encounter-level
-// action and one of its burst-level actions can't run concurrently: each
-// snapshots previousFlags from its own /api/pipeline/group/state read, so
-// two overlapping writes would let the later Undo restore shared photos to
-// the pre-first-action state, silently rolling back part of the earlier
-// action. Non-overlapping bulk actions (different bursts, different
-// encounters) still proceed in parallel.
+// check for overlap so an encounter action and one of its burst actions
+// cannot make competing decisions from the same live-state read. The server
+// records each completed write in history. Disjoint groups can still proceed
+// in parallel.
 var pipelineReviewGroupFlagInFlightPhotoIds = new Set();
 // Direct per-photo flag writes can already be in flight when Group Review
 // opens. Track them by photo so Apply can wait before persisting a newer
@@ -3990,48 +3954,6 @@ function groupFlagTarget(encIdx, burstIdx) {
   };
 }
 
-function restorePipelineReviewFlags(previousFlags, noun) {
-  var byFlag = {none: [], flagged: [], rejected: []};
-  Object.keys(previousFlags).forEach(function(pid) {
-    var flag = normalizedPipelineReviewFlag(previousFlags[pid]);
-    byFlag[flag].push(parseInt(pid, 10));
-  });
-  var ids = Object.keys(previousFlags).map(function(pid) { return parseInt(pid, 10); });
-  // Undo is another bulk flag write and must hold the same photo-ID lock as
-  // the forward action. Otherwise a pick/reject started while these restore
-  // requests are running can be overwritten by the older snapshot.
-  var overlaps = ids.some(function(pid) {
-    return pipelineReviewGroupFlagInFlightPhotoIds.has(pid);
-  });
-  if (overlaps) {
-    showToast('Another flag change is still finishing — try Undo again in a moment', 'error');
-    return Promise.resolve();
-  }
-  ids.forEach(function(pid) { pipelineReviewGroupFlagInFlightPhotoIds.add(pid); });
-  var sequence = Promise.resolve();
-  ['none', 'flagged', 'rejected'].forEach(function(flag) {
-    if (!byFlag[flag].length) return;
-    sequence = sequence.then(function() {
-      return safeFetch('/api/batch/flag', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({photo_ids: byFlag[flag], flag: flag}),
-      }).then(function() {
-        byFlag[flag].forEach(function(pid) {
-          updatePipelineReviewPhotoFlag(findPhotoInResults(pid), flag);
-        });
-      });
-    });
-  });
-  return sequence.then(function() {
-    renderResults();
-    showToast('Restored previous flags for ' + noun, 'success');
-    refreshLatestScopeSnapshotIfCurrent();
-  }).finally(function() {
-    ids.forEach(function(pid) { pipelineReviewGroupFlagInFlightPhotoIds.delete(pid); });
-  });
-}
-
 function setPipelineReviewGroupFlag(target, flag) {
   if (!target || pipelineReviewGroupFlagInFlight[target.key]) return Promise.resolve();
   if (isScopedReviewView()) {
@@ -4045,9 +3967,8 @@ function setPipelineReviewGroupFlag(target, flag) {
 
   // Block bulk actions whose photos overlap an in-flight bulk action — e.g.,
   // clicking Reject burst while the parent encounter's Reject is still
-  // running. Both requests would snapshot previousFlags from the pre-first
-  // DB read, and the later Undo could restore the shared photos to 'none',
-  // silently reverting part of the earlier action.
+  // running. Both requests would otherwise make their decisions from the
+  // state before the first write completed.
   var overlaps = ids.some(function(pid) {
     return pipelineReviewGroupFlagInFlightPhotoIds.has(pid);
   });
@@ -4097,10 +4018,6 @@ function setPipelineReviewGroupFlag(target, flag) {
       renderResults();
       return;
     }
-    var previousFlags = {};
-    changedIds.forEach(function(pid) {
-      previousFlags[pid] = liveFlagFor(pid);
-    });
     return safeFetch('/api/batch/flag', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -4115,9 +4032,7 @@ function setPipelineReviewGroupFlag(target, flag) {
       var message = flag === 'rejected'
         ? 'Rejected ' + count + ' photo' + (count === 1 ? '' : 's') + ' in ' + target.noun
         : 'Cleared rejects from ' + count + ' photo' + (count === 1 ? '' : 's') + ' in ' + target.noun;
-      showUndo(message, function() {
-        restorePipelineReviewFlags(previousFlags, target.noun);
-      });
+      showToast(message, 'success');
     });
   }).finally(function() {
     delete pipelineReviewGroupFlagInFlight[target.key];
@@ -4187,6 +4102,10 @@ function batchSetFlag(flag) {
 }
 
 function setPipelineReviewFlag(photoId, flag) {
+  if (window.vireoHistoryBusy && window.vireoHistoryBusy()) {
+    showToast('Undo or redo is still finishing — try again in a moment', 'warning');
+    return Promise.resolve(false);
+  }
   if (flag !== 'flagged' && flag !== 'rejected' && flag !== 'none') return Promise.resolve();
   photoId = parseInt(photoId, 10);
   if (!photoId) return Promise.resolve();
@@ -5224,57 +5143,55 @@ async function clearBurstOverride(event, encIdx, burstIdx) {
   }
   var enc = pipelineResults.encounters[encIdx];
   if (!enc || !enc.bursts || !enc.bursts[burstIdx]) return;
-  enc.bursts[burstIdx].species_override = null;
-  // Persist to cache
-  safeFetch('/api/pipeline/save-cache', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(pipelineResults),
-  });
+  var burst = enc.bursts[burstIdx];
+  try {
+    var response = await safeFetch('/api/pipeline/save-cache', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({clear_override: {
+        encounter_photo_ids: enc.photo_ids,
+        burst_photo_ids: burst.photo_ids,
+        expected_override: burst.species_override || null,
+      }}),
+    });
+    if (response.encounters) pipelineResults.encounters = response.encounters;
+    if (response.summary) pipelineResults.summary = response.summary;
+  } catch (_) { return; }
+
   renderResults();
   updateSummaryBar(refreshLocalSummaryCounts());
   refreshLatestScopeSnapshotIfCurrent();
 }
 
-// -- Detach & Undo --
-
-var undoStack = [];
-var _undoTimer = null;
-
-function showUndo(msg, undoFn) {
-  // Clear previous
-  clearTimeout(_undoTimer);
-  undoStack = [undoFn];
-
-  var toast = document.getElementById('undoToast');
-  var msgEl = document.getElementById('undoMsg');
-  if (!toast || !msgEl) return;
-  msgEl.textContent = msg;
-  toast.classList.remove('hidden');
-
-  _undoTimer = setTimeout(function() {
-    toast.classList.add('hidden');
-    undoStack = [];
-  }, 5000);
-}
-
-function undoLastAction() {
-  clearTimeout(_undoTimer);
-  var toast = document.getElementById('undoToast');
-  if (toast) toast.classList.add('hidden');
-  if (undoStack.length > 0) {
-    var fn = undoStack.pop();
-    fn();
+// Grouping, flags and other photo edits share the durable workspace history.
+window.beforeHistoryChange = function() {
+  if (Object.keys(pipelineReviewGroupFlagInFlight).length) {
+    showToast('A photo edit is still finishing — try again in a moment', 'info');
+    return false;
   }
-}
+  if (document.querySelector('.grm-overlay.open, .inspect-overlay.open')) {
+    showToast('Finish or close Group Review before undoing saved edits', 'info');
+    return false;
+  }
+  return true;
+};
+
+window.afterHistoryChange = async function() {
+  var seq = ++reviewScopeRequestSeq;
+  var data = await safeFetch('/api/pipeline/page-init', {}, {toast: false});
+  if (seq !== reviewScopeRequestSeq || !data || !data.results) return;
+  var results = data.results;
+  cachedPipelineResults = cloneReviewData(results);
+  cachedResultsCacheInfo = cloneReviewData(data.results_cache_info);
+  if (reviewScopeMode === 'cache') applyReviewResults(results, data.results_cache_info);
+  else loadReviewScopeResults();
+};
 
 async function detachBurst(encIdx, burstIdx) {
   if (isScopedReviewView()) {
     notifyReadOnlyScopedView();
     return;
   }
-  // Save state for undo
-  var snapshot = JSON.parse(JSON.stringify(pipelineResults));
 
   var resp = await safeFetch('/api/pipeline/detach-burst', {
     method: 'POST',
@@ -5289,19 +5206,7 @@ async function detachBurst(encIdx, burstIdx) {
   updateSummaryBar(pipelineResults.summary);
   refreshLatestScopeSnapshotIfCurrent();
 
-  showUndo('Burst detached from encounter', function() {
-    // Restore from snapshot
-    pipelineResults = snapshot;
-    // Re-save to cache
-    safeFetch('/api/pipeline/save-cache', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(pipelineResults),
-    });
-    renderResults();
-    updateSummaryBar(pipelineResults.summary);
-    refreshLatestScopeSnapshotIfCurrent();
-  });
+  showToast('Burst detached from encounter', 'success');
 }
 
 async function detachPhoto(encIdx, burstIdx, photoId) {
@@ -5309,7 +5214,6 @@ async function detachPhoto(encIdx, burstIdx, photoId) {
     notifyReadOnlyScopedView();
     return;
   }
-  var snapshot = JSON.parse(JSON.stringify(pipelineResults));
 
   var resp = await safeFetch('/api/pipeline/detach-photo', {
     method: 'POST',
@@ -5324,17 +5228,7 @@ async function detachPhoto(encIdx, burstIdx, photoId) {
   updateSummaryBar(pipelineResults.summary);
   refreshLatestScopeSnapshotIfCurrent();
 
-  showUndo('Photo detached from burst', function() {
-    pipelineResults = snapshot;
-    safeFetch('/api/pipeline/save-cache', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(pipelineResults),
-    });
-    renderResults();
-    updateSummaryBar(pipelineResults.summary);
-    refreshLatestScopeSnapshotIfCurrent();
-  });
+  showToast('Photo detached from burst', 'success');
 }
 
 /* ==================== Group Review Modal ==================== */
@@ -8424,6 +8318,7 @@ async function grmApply() {
       // pipeline cache and the DB can't drift apart — the prior fire-and-forget
       // save-cache + no-DB-write was the bug behind this whole change.
       var applyResp;
+      var sourceBurst = ((pipelineResults.encounters[grmState.encIdx] || {}).bursts || [])[grmState.burstIdx];
       try {
         applyResp = await safeFetch('/api/pipeline/group/apply', {
           method: 'POST',
@@ -8432,6 +8327,14 @@ async function grmApply() {
             picks: picksArr,
             rejects: rejectsArr,
             candidates: candidatesArr,
+            removed: grmState.source === 'browse-selection' ? [] : Array.from(grmState.removed).filter(function(pid) {
+              return grmState.appliedRemovalSessionId !== applySessionId ||
+                !(grmState.appliedRemovalIds || []).includes(pid);
+            }),
+            encounter_index: grmState.encIdx,
+            burst_index: grmState.burstIdx,
+            expected_burst_photo_ids: grmState.source === 'browse-selection' ? [] :
+              (Array.isArray(sourceBurst) ? sourceBurst : sourceBurst?.photo_ids || []),
           }),
         });
       } catch (e) {
@@ -8520,101 +8423,16 @@ async function grmApply() {
       // its purpose, so drop it. A later reload degrades to normal review;
       // the in-memory group stays reopenable via the Reopen button.
       clearBrowseBurstHandoff();
-    } else if (grmState.removed.size > 0) {
-      // Detach removed photos from the burst into new single-photo bursts.
-      var enc = pipelineResults.encounters[grmState.encIdx];
-      var burst = enc.bursts[grmState.burstIdx];
-      var burstIds = burst.photo_ids || burst;
-      // Whether the source burst is the modern object shape (carries its own
-      // predictions) vs a legacy raw photo-id array (no predictions field).
-      var srcHasPreds = burst && Array.isArray(burst.species_predictions);
-      grmState.removed.forEach(function(pid) {
-        var idx = burstIds.indexOf(pid);
-        if (idx >= 0) burstIds.splice(idx, 1);
-        // New single-photo burst: rebuild its consensus from just this photo so it
-        // doesn't inherit the source burst's predictions for photos it no longer
-        // contains (the loupe and the saved cache both trust burst.species_predictions).
-        var photo = findPhotoInResults(pid);
-        // Preserve a burst-specific confirmed species: if the source burst had
-        // a species_override differing from the encounter default, the detached
-        // single-photo burst must keep it (shallow clone so it doesn't alias the
-        // source), or a flags-only apply would silently revert this photo to the
-        // encounter species and drop the burst-specific confirmation.
-        var detachedPhotos = photo ? [photo] : [];
-        var detachedConsensus = buildBurstConsensus(detachedPhotos);
-        var sourceOverride = burst && burst.species_override;
-        // Match the server detach-photo elif (vireo/app.py): fall through to
-        // a null override whenever the encounter tracks any confirmed_species,
-        // including the mixed/partial state (species_confirmed=false but
-        // confirmed_species set) where a classifier-guess override would
-        // mask the real prior tag for a later burst-confirm.
-        // Copy an array-valued species_list as authoritative regardless of
-        // its confirmed flag: the explicit-empty sentinel
-        // ({confirmed:false, species_list:[]}) a remove leaves on a burst,
-        // AND the mixed-but-edited shape ({confirmed:false,
-        // species_list:[A]}) a set edit leaves on a still-mixed burst.
-        // Under a stale encounter baseline a null override would make the
-        // split-off photo inherit a species this edit already dropped.
-        var sourceHasAuthoritativeList = !!sourceOverride
-          && Array.isArray(sourceOverride.species_list);
-        var copiedOverride = null;
-        if (sourceOverride && (sourceHasAuthoritativeList || sourceOverride.confirmed === true)) {
-          copiedOverride = Object.assign({}, sourceOverride);
-          if (Array.isArray(sourceOverride.species_list)) {
-            copiedOverride.species_list = sourceOverride.species_list.slice();
-          }
-        }
-        enc.bursts.push({
-          photo_ids: [pid],
-          species_predictions: detachedConsensus,
-          species_override: copiedOverride
-            ? copiedOverride
-            : (enc.confirmed_species
-              ? null
-              : candidateSpeciesOverrideFromPhotos(detachedPhotos)),
-        });
-      });
-      // Recompute the shortened source burst's consensus from its remaining
-      // photos, so it no longer reflects the detached ones. Skip legacy array
-      // bursts (no predictions field to maintain).
-      if (srcHasPreds) {
-        burst.species_predictions = buildBurstConsensus(
-          burstIds.map(function(id) { return findPhotoInResults(id); }).filter(Boolean)
-        );
-      }
-      // Clean up empty burst
-      if (burstIds.length === 0) {
-        enc.bursts.splice(grmState.burstIdx, 1);
-      }
-      enc.burst_count = enc.bursts.length;
+    } else {
+      if (applyResp.encounters) pipelineResults.encounters = applyResp.encounters;
+      if (applyResp.summary) pipelineResults.summary = applyResp.summary;
+      grmState.appliedRemovalSessionId = applySessionId;
+      grmState.appliedRemovalIds = Array.from(grmState.removed);
     }
   }
 
-  // Save the updated pipeline cache (label + flag changes + detached bursts)
-  // BEFORE confirming species: /api/encounters/species reloads the cache from
-  // disk and validates photo_ids ⊆ bursts[burst_index], so the structure the
-  // user sees must be persisted first.
-  //
-  // Skip for browse-selection: pipelineResults there is a *temporary* ad-hoc
-  // selection set, not the real pipeline run, and save_results_raw would
-  // clobber the actual per-workspace cache. Its species path uses
-  // /api/batch/keyword (no cache read), so there is no ordering dependency.
-  //
-  // Also skip when flags weren't committed: the only local mutations to
-  // pipelineResults (label/flag sync + removed→detach) live under the
-  // checks.flags block above, so with flags unchecked there is nothing new to
-  // persist. The species-only path relies on the SERVER to save the cache —
-  // /api/encounters/species loads the on-disk cache and re-saves it itself
-  // (we adopt resp.encounters after) — so a local save-cache here would be a
-  // no-op write on the wire.
-    if (grmState.source !== 'browse-selection' && checks.flags) {
-      await safeFetch('/api/pipeline/save-cache', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(pipelineResults),
-      });
-      if (!sessionIsActive()) return false;
-    }
+  // Group Apply has already saved flags and removals from its canonical cache.
+  // Species confirmation below reads that committed structure.
 
   // --- Species side ---
   // Server-owned now: tag all remaining (non-removed) burst frames + mark the
@@ -8637,7 +8455,7 @@ async function grmApply() {
         // already committed idempotently above, so a retry re-runs only the
         // species side. No try/catch — propagating the throw is the desired
         // "keep modal open" behavior.
-        await grmConfirmSpeciesCall(species, memberIds);
+        if (memberIds.length) await grmConfirmSpeciesCall(species, memberIds);
         if (!sessionIsActive()) return false;
       }
     }

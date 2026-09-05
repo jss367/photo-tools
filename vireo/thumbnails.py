@@ -332,7 +332,8 @@ def get_thumb_path(photo_id, cache_dir):
     return None
 
 
-def generate_all(db, cache_dir, progress_callback=None, config=None, vireo_dir=None):
+def generate_all(db, cache_dir, progress_callback=None, config=None, vireo_dir=None,
+                 cancel_check=None):
     """Generate thumbnails for photos that don't have one yet.
 
     Only processes photos missing thumbnails, so re-running is fast.
@@ -358,6 +359,8 @@ def generate_all(db, cache_dir, progress_callback=None, config=None, vireo_dir=N
     # Filter to only photos needing thumbnails
     needed = []
     for photo in photos:
+        if cancel_check and cancel_check():
+            return {"generated": 0, "skipped": 0, "failed": 0}
         thumb_path = os.path.join(cache_dir, f"{photo['id']}.jpg")
         if not os.path.exists(thumb_path):
             needed.append(photo)
@@ -376,6 +379,8 @@ def generate_all(db, cache_dir, progress_callback=None, config=None, vireo_dir=N
     generated = 0
     failed = 0
     for i, photo in enumerate(needed):
+        if cancel_check and cancel_check():
+            break
         # Resolve source via the single canonical-path helper when we
         # have a vireo_dir; fall back to a raw folder+filename join for
         # callers that don't pass it.

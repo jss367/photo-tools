@@ -26,6 +26,10 @@ import functools
 from flask import jsonify
 
 
+class JobCancelled(Exception):
+    """Exit a worker at a safe checkpoint after cancellation."""
+
+
 class JobLaunch:
     """Per-request context for launching one background job.
 
@@ -53,6 +57,15 @@ class JobLaunch:
         if self.workspace_id is not None:
             db.set_active_workspace(self.workspace_id)
         return db
+
+    def checkpoint(self, job):
+        """Pause or exit between completed units of work.
+
+        Call only after releasing transactions, shared locks, and active
+        subprocesses. The runner records the cancellation when this unwinds.
+        """
+        if self.runner.is_cancelled(job["id"]):
+            raise JobCancelled("Job cancelled")
 
     def start_job(self, job_type, work, config=None, **kwargs):
         """Register ``work`` with the runner and return the new job id.

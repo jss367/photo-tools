@@ -122,7 +122,8 @@ def score_burst_group(photo_paths):
     return results
 
 
-def score_collection_photos(db, collection_id, progress_callback=None, vireo_dir=None):
+def score_collection_photos(db, collection_id, progress_callback=None, vireo_dir=None,
+                            pause_callback=None):
     """Score all photos in a collection, grouping bursts and ranking within each.
 
     Args:
@@ -182,6 +183,8 @@ def score_collection_photos(db, collection_id, progress_callback=None, vireo_dir
     group_count = 0
 
     for gi, group in enumerate(groups):
+        if pause_callback:
+            pause_callback()
         if progress_callback:
             progress_callback(scored, total, f"Scoring group {gi + 1}/{len(groups)}...")
 

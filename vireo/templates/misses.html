@@ -1091,6 +1091,10 @@ function applyMissesPayload(data) {
 }
 
 /* ---------- Fetch + render ---------- */
+window.afterHistoryChange = async function() {
+  await loadMisses();
+};
+
 async function loadMisses() {
   var requestId = ++missLoadRequestId;
   var since = getSinceParam();

@@ -8540,15 +8540,17 @@ async function grmApply() {
         // including the mixed/partial state (species_confirmed=false but
         // confirmed_species set) where a classifier-guess override would
         // mask the real prior tag for a later burst-confirm.
-        // Also copy the explicit-empty sentinel ({confirmed:false,
-        // species_list:[]}) a remove leaves on a burst: under a still-
-        // confirmed encounter a null override would make the split-off
-        // photo inherit a species its database row no longer carries.
-        var sourceExplicitEmpty = !!sourceOverride
-          && Array.isArray(sourceOverride.species_list)
-          && sourceOverride.species_list.length === 0;
+        // Copy an array-valued species_list as authoritative regardless of
+        // its confirmed flag: the explicit-empty sentinel
+        // ({confirmed:false, species_list:[]}) a remove leaves on a burst,
+        // AND the mixed-but-edited shape ({confirmed:false,
+        // species_list:[A]}) a set edit leaves on a still-mixed burst.
+        // Under a stale encounter baseline a null override would make the
+        // split-off photo inherit a species this edit already dropped.
+        var sourceHasAuthoritativeList = !!sourceOverride
+          && Array.isArray(sourceOverride.species_list);
         var copiedOverride = null;
-        if (sourceOverride && (sourceOverride.confirmed === true || sourceExplicitEmpty)) {
+        if (sourceOverride && (sourceHasAuthoritativeList || sourceOverride.confirmed === true)) {
           copiedOverride = Object.assign({}, sourceOverride);
           if (Array.isArray(sourceOverride.species_list)) {
             copiedOverride.species_list = sourceOverride.species_list.slice();

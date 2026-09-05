@@ -1867,20 +1867,33 @@ def create_pipeline_blueprint(
         # Create new single-photo burst in the same encounter
         new_burst_predictions = rebuild_species_predictions(results, [photo_id])
         new_burst_species = rebuild_encounter_species_label(results, [photo_id])
-        source_explicit_empty = (
-            isinstance(source_override.get("species_list"), list)
-            and not source_override["species_list"]
+        source_list = (
+            source_override.get("species_list")
+            if isinstance(source_override, dict) else None
         )
-        if source_explicit_empty or (
+        source_has_authoritative_list = isinstance(source_list, list)
+        source_legacy_confirmed = bool(
             source_override.get("confirmed") and source_override.get("species")
-        ):
-            # Copy the source burst's confirmed set — including the
-            # explicit-empty sentinel a remove leaves behind, which must not
-            # decay into "inherit the encounter" on the split-off photo.
-            new_burst_override = (
-                build_species_override(burst_species_list({}, burst))
-                or empty_species_override()
-            )
+        )
+        if source_has_authoritative_list or source_legacy_confirmed:
+            # Copy the source burst's authoritative set — including the
+            # explicit-empty sentinel a remove leaves behind AND the
+            # mixed-but-edited shape ({confirmed: False, species_list: [A]})
+            # a set edit leaves on a still-mixed burst. Every array-valued
+            # species_list is authoritative (burst_species_list), so a null
+            # override on the split-off photo would let it inherit the
+            # encounter's stale baseline and resurrect a species this edit
+            # already dropped.
+            copied_list = burst_species_list({}, burst)
+            if copied_list:
+                # Preserve the source's confirmed flag: True for a genuinely
+                # confirmed burst, False for a mixed-but-edited baseline.
+                new_burst_override = build_species_override(
+                    copied_list,
+                    confirmed=bool(source_override.get("confirmed")),
+                )
+            else:
+                new_burst_override = empty_species_override()
         elif enc.get("confirmed_species"):
             # Inherit the encounter's prior confirmed species by leaving the
             # override empty. Also covers the mixed/partial state where

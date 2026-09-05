@@ -2756,8 +2756,11 @@ async function loadConfig() {
       .grouping.burst_embedding_distance;
     document.getElementById('cfgBurstEmb').value = fallbackDistance;
     document.getElementById('cfgBurstEmbVal').textContent = fallbackDistance + '%';
+    _markSettingsInitialLoad('config');
+    return false;
   }
   _markSettingsInitialLoad('config');
+  return true;
 }
 
 var CARD_FIELD_OPTIONS = [
@@ -5151,8 +5154,10 @@ async function importSettingsFile(file) {
     filterAllSettings();
     // Curated form posts its own snapshot — repull so a later edit doesn't
     // overwrite imported global values with stale form state.
-    await loadConfig();
-    formReloaded = true;
+    // loadConfig() swallows fetch failures (it has to on first paint), so
+    // check its result rather than assume the form now matches disk.
+    formReloaded = await loadConfig();
+    if (!formReloaded) return;
     alert('Settings imported. Workspace overrides preserved.');
   } catch (err) {
     alert('Network error: ' + (err && err.message || err));

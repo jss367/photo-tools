@@ -397,10 +397,11 @@ def test_cache_only_burst_confirm_that_auto_detaches_is_undoable(app_and_db):
     restored = _load(db)
     assert len(restored['encounters']) == 1
     assert sorted(restored['encounters'][0]['photo_ids']) == sorted(ids)
+    assert restored['encounters'] == seeded['encounters']
 
     assert client.post('/api/redo').status_code == 200
     replayed = _load(db)
-    assert len(replayed['encounters']) == 2
+    assert replayed['encounters'] == after_confirm['encounters']
 
 
 def test_cache_only_confirm_rolls_back_when_cache_write_fails(
@@ -500,3 +501,56 @@ def test_grouping_history_is_workspace_scoped(app_and_db):
     assert client.post(f'/api/workspaces/{original_workspace}/activate', json={}).status_code == 200
     assert client.get('/api/undo/status').json['available'] is True
     assert client.post('/api/undo').status_code == 200
+
+
+@pytest.mark.parametrize('cache_only', [False, True])
+@pytest.mark.parametrize('auto_detach', [False, True])
+def test_species_confirmation_restores_cache_on_commit_failure(
+    app_and_db, monkeypatch, cache_only, auto_detach,
+):
+    """A failed DB commit restores the complete pre-confirmation cache."""
+    from db import Database
+
+    app, db = app_and_db
+    client = app.test_client()
+    ids, _ = _seed(db)
+    if cache_only:
+        kid = db.add_keyword('Cardinal', is_species=True)
+        for pid in ids:
+            db.tag_photo(pid, kid)
+    before = _load(db)
+    if auto_detach:
+        before['encounters'][0]['confirmed_species'] = 'Sparrow'
+        before['encounters'][0]['species_confirmed'] = True
+    save_results_raw(before, os.path.dirname(db._db_path), db._ws_id())
+    keywords_before = {pid: db.get_photo_keywords(pid) for pid in ids}
+    history_before = db.get_edit_history()
+    pending_before = [dict(row) for row in db.conn.execute('SELECT * FROM pending_changes')]
+    original_init = Database.__init__
+
+    class FailCommit:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __getattr__(self, name):
+            return getattr(self.conn, name)
+
+        def commit(self):
+            raise OSError('Commit failed')
+
+    with monkeypatch.context() as patch:
+        def fail_commit_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            self.conn = FailCommit(self.conn)
+
+        patch.setattr(Database, '__init__', fail_commit_init)
+        payload = {'species': 'Cardinal', 'photo_ids': ids[:2] if auto_detach else ids}
+        if auto_detach:
+            payload['burst_index'] = 0
+        response = client.post('/api/encounters/species', json=payload)
+        assert response.status_code == 500
+    assert _load(db) == before
+    assert db.get_edit_history() == history_before
+    assert {pid: db.get_photo_keywords(pid) for pid in ids} == keywords_before
+    assert [dict(row) for row in db.conn.execute('SELECT * FROM pending_changes')] == pending_before
+    assert client.post('/api/encounters/species', json=payload).status_code == 200

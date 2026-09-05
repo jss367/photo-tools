@@ -26443,7 +26443,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         cancels the still-pending add if it hadn't synced yet — so the XMP
         doesn't accumulate stale species keywords.
         """
+        from pipeline_locks import acquire_workspace_regroup
+
         db = _get_db()
+        with acquire_workspace_regroup(db._ws_id()):
+            return _under_prediction_decision_lock(
+                db, lambda: _confirm_encounter_species(db),
+            )
+
+    def _confirm_encounter_species(db):
+        """Confirm species while holding the grouping and database writer locks."""
         body = request.get_json(silent=True) or {}
         species = body.get("species", "").strip()
         photo_ids = body.get("photo_ids", [])
@@ -26499,6 +26508,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         cache_dir = os.path.dirname(db_path)
         cached = load_results_raw(cache_dir, db._active_workspace_id)
+        before_cached = copy.deepcopy(cached)
+        cache_saved = False
         previous_species = None
         target_enc = None
         target_enc_idx = None
@@ -26948,8 +26959,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # confirmation because grouping signatures ignore these
                 # species fields by design. Record the cache-only write so
                 # LIFO undo reverts it first. When auto-detach will fire
-                # the structural change is recorded via ``save_grouping_edit``
-                # further down instead.
+                # the structural change and confirmation share one grouping
+                # history entry further down instead.
                 if burst_index is not None:
                     burst_target = target_enc["bursts"][burst_index]
                     current_override = burst_target.get("species_override")
@@ -26995,7 +27006,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # validated above, so the branch here is unambiguous: burst-
             # scoped requests only touch the burst override, encounter-
             # scoped requests only touch the encounter.
-            auto_detach_recorded = False
             if cached and target_enc is not None:
                 if burst_index is not None:
                     # Auto-detach if burst's confirmed species differs from
@@ -27020,50 +27030,34 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         "species": species,
                         "confirmed": True,
                     }
-                    if will_auto_detach and cache_only_write:
-                        # Persist the cache-only auto-detach as a grouping
-                        # edit so ``restore_grouping_edit`` can reverse the
-                        # burst move on undo. Without this, the structural
-                        # change would silently bypass undo (no keyword
-                        # history row is recorded in this branch either)
-                        # and a later undo would pop an unrelated older
-                        # edit instead. ``save_grouping_edit`` records
-                        # history, saves the cache, and commits atomically
-                        # (rolling back both on failure), so we skip the
-                        # plain save below.
-                        from services.grouping_history import (
-                            save_grouping_edit,
-                        )
-                        # ``before_cached`` captures the pre-auto-detach
-                        # structure (with the just-applied override) so
-                        # save_grouping_edit's signature diff isolates the
-                        # burst move; the override itself is stripped by
-                        # ``_grouping_signature``.
-                        before_cached = copy.deepcopy(cached)
+                    if will_auto_detach:
                         auto_detach_burst_for_species(
                             cached, target_enc_idx, burst_index, species
                         )
-                        if before_cached["encounters"] != cached["encounters"]:
-                            save_grouping_edit(
-                                db, before_cached, cached,
+                        if cache_only_write:
+                            # One user action includes both confirmation and
+                            # splitting. Snapshot before either mutation and
+                            # commit its history with the common cache save.
+                            db.record_edit(
+                                "pipeline_grouping",
                                 f'Confirmed species "{species}" on 1 burst',
+                                json.dumps({
+                                    "before": before_cached["encounters"],
+                                    "after": cached["encounters"],
+                                }),
+                                [], _commit=False,
                             )
-                            auto_detach_recorded = True
-                    elif will_auto_detach:
-                        auto_detach_burst_for_species(
-                            cached, target_enc_idx, burst_index, species
-                        )
                 else:
                     target_enc["species_confirmed"] = True
                     target_enc["confirmed_species"] = species
-                if not auto_detach_recorded:
-                    save_results_raw(
-                        cached, cache_dir, db._active_workspace_id,
-                    )
+                save_results_raw(cached, cache_dir, db._active_workspace_id)
+                cache_saved = True
 
             db.conn.commit()
         except Exception:
             db.conn.rollback()
+            if cache_saved:
+                save_results_raw(before_cached, cache_dir, db._active_workspace_id)
             raise
         # Prune oldest edit-history rows now that the transaction has landed.
         db._prune_edit_history()

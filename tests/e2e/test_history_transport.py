@@ -1,5 +1,6 @@
 """Every browser transport participates in persistent edit history."""
 
+import re
 import time
 
 import pytest
@@ -111,3 +112,30 @@ def test_pending_cache_save_blocks_undo(live_server, page):
     _held_route(page, held).abort()
     page.evaluate('window.pendingCacheSave')
     expect(page.locator('#historyUndoBtn')).to_be_enabled()
+
+
+@pytest.mark.parametrize('notification', ['poll', 'event'])
+def test_background_import_tag_refreshes_history_controls(live_server, page, notification):
+    page.clock.install()
+    page.goto(live_server['url'] + '/browse')
+    expect(page.locator('.grid-card').first).to_be_visible()
+    expect(page.locator('#historyUndoBtn')).to_be_disabled()
+    # The import worker commits after its start request, outside the browser's
+    # request tracker. No focus change or foreground edit should be necessary.
+    db = live_server['db']
+    photo_id = live_server['data']['photos'][0]
+    keyword_id = db.add_keyword('Imported trip')
+    db.tag_photo(photo_id, keyword_id)
+    description = 'Added Imported trip during import'
+    db.record_edit('keyword_add', description, str(keyword_id), [
+        {'photo_id': photo_id, 'old_value': '', 'new_value': str(keyword_id)},
+    ])
+    if notification == 'poll':
+        with page.expect_response('**/api/jobs'):
+            page.clock.fast_forward(15000)
+    else:
+        page.evaluate("window.dispatchEvent(new CustomEvent('vireo-job-done', {detail: {job_id: 'finished-import'}}))")
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    expect(page.locator('#historyUndoBtn')).to_have_attribute('title', re.compile(description))
+    page.locator('#historyUndoBtn').click()
+    expect(page.locator('#historyRedoBtn')).to_be_enabled()

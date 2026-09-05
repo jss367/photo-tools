@@ -12405,6 +12405,7 @@ function formatDuration(seconds) {
   /* ---------- Jobs polling ---------- */
   // Pages signal job completion via this event so activeJobs stays current
   window.addEventListener('vireo-job-done', function(e) {
+    refreshHistoryControls();
     var jobId = e.detail && e.detail.job_id;
     if (jobId) {
       activeJobs = activeJobs.filter(function(j) { return j.id !== jobId; });
@@ -12420,6 +12421,9 @@ function formatDuration(seconds) {
     fetch('/api/jobs')
       .then(function(r) { return r.json(); })
       .then(function(data) {
+        // Import tags and other worker edits commit after their start request
+        // returns. Reconcile even if a short job finished between two polls.
+        refreshHistoryControls();
         activeJobs = data.active || [];
         _activeWsId = data.active_workspace_id || null;
         renderJobs();

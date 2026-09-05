@@ -12193,6 +12193,7 @@ function formatDuration(seconds) {
     if (historyBusy || historyPendingWrites) return false;
     if (typeof window.beforeHistoryChange === 'function' && window.beforeHistoryChange() === false) return false;
     historyBusy = true;
+    document.dispatchEvent(new CustomEvent('vireo:edit-history-busy', {detail: {busy: true}}));
     if (btn) btn.disabled = true;
     renderHistoryControls();
     try {
@@ -12221,6 +12222,7 @@ function formatDuration(seconds) {
     } finally {
       await refreshHistoryControls();
       historyBusy = false;
+      document.dispatchEvent(new CustomEvent('vireo:edit-history-busy', {detail: {busy: false}}));
       if (btn) btn.disabled = false;
       renderHistoryControls();
     }

@@ -402,6 +402,8 @@ body { padding-bottom: 36px; }
 <script>
 var cullData = null;
 var cullBusy = false;
+var cullAnalysisPending = 0;
+var cullAnalysisSeq = 0;
 var cullDirty = false;
 var cullUseSavedFlags = false;
 var pipelineResults = null;
@@ -594,6 +596,7 @@ function onScoringChange(slider) {
   var indicator = document.getElementById('reflowIndicator');
   if (indicator) { indicator.style.display = 'block'; indicator.textContent = 'Recomputing...'; }
   _reflowTimer = setTimeout(doReflow, 250);
+  updateCullApplyButton();
 }
 
 function onGroupingChange(slider) {
@@ -602,6 +605,7 @@ function onGroupingChange(slider) {
   var indicator = document.getElementById('reflowIndicator');
   if (indicator) { indicator.style.display = 'block'; indicator.textContent = 'Regrouping...'; }
   _regroupTimer = setTimeout(doRegroupLive, 500);
+  updateCullApplyButton();
 }
 
 function setPipelineResults(data, statusText, useSavedFlags) {
@@ -622,41 +626,58 @@ function pipelineBody(config) {
   return body;
 }
 
+function cullOperationPending() {
+  return cullBusy || cullAnalysisPending > 0 || _reflowTimer != null || _regroupTimer != null
+    || (window.vireoHistoryBusy && window.vireoHistoryBusy());
+}
+
+function updateCullApplyButton() {
+  document.getElementById('applyBtn').disabled = !!cullOperationPending();
+}
+
+async function recomputeCulling(endpoint, statusText) {
+  if (cullBusy || (window.vireoHistoryBusy && window.vireoHistoryBusy())) {
+    showToast('Wait for the current edit to finish before recomputing culling.', 'info');
+    return;
+  }
+  var seq = ++cullAnalysisSeq;
+  cullAnalysisPending++;
+  updateCullApplyButton();
+  try {
+    var config = Object.assign({}, getGroupingConfig(), getScoringConfig());
+    var data = await safeFetch(endpoint, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(pipelineBody(config)),
+    }, {toast: false});
+    if (seq === cullAnalysisSeq) setPipelineResults(data, statusText);
+  } catch (error) {
+    if (seq === cullAnalysisSeq) {
+      var status = document.getElementById('cullStatus');
+      status.textContent = 'Error: ' + error.message;
+      status.style.color = 'var(--danger)';
+    }
+  } finally {
+    cullAnalysisPending--;
+    updateCullApplyButton();
+    if (!cullAnalysisPending) {
+      var indicator = document.getElementById('reflowIndicator');
+      if (indicator) indicator.style.display = 'none';
+    }
+  }
+}
+
 function doReflow() {
+  clearTimeout(_reflowTimer);
+  _reflowTimer = null;
   if (!pipelineResults) return runCulling();
-  // Send grouping config too: the server's /api/pipeline/reflow re-runs
-  // run_grouping internally, so without the current UI grouping values
-  // it falls back to persisted defaults and the visible grouping
-  // sliders would lie about the active analysis state.
-  var config = Object.assign({}, getGroupingConfig(), getScoringConfig());
-  safeFetch('/api/pipeline/reflow', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(pipelineBody(config)),
-  }, { toast: false })
-  .then(function(data) {
-    if (data && !data.error) setPipelineResults(data);
-  })
-  .finally(function() {
-    var indicator = document.getElementById('reflowIndicator');
-    if (indicator) indicator.style.display = 'none';
-  });
+  // Reflow also groups photos, so send both sets of current slider values.
+  return recomputeCulling('/api/pipeline/reflow');
 }
 
 function doRegroupLive() {
-  var config = Object.assign({}, getGroupingConfig(), getScoringConfig());
-  safeFetch('/api/pipeline/regroup-live', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(pipelineBody(config)),
-  }, { toast: false })
-  .then(function(data) {
-    if (data && !data.error) setPipelineResults(data);
-  })
-  .finally(function() {
-    var indicator = document.getElementById('reflowIndicator');
-    if (indicator) indicator.style.display = 'none';
-  });
+  clearTimeout(_regroupTimer);
+  _regroupTimer = null;
+  return recomputeCulling('/api/pipeline/regroup-live');
 }
 
 function toggleCullSettings() {
@@ -668,22 +689,15 @@ async function runCulling() {
   var status = document.getElementById('cullStatus');
   status.textContent = 'Analyzing pipeline...';
   status.style.color = 'var(--text-dim)';
-  try {
-    var config = Object.assign({}, getGroupingConfig(), getScoringConfig());
-    var data = await safeFetch('/api/pipeline/regroup-live', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(pipelineBody(config)),
-    }, { toast: false });
-    setPipelineResults(data, 'Analysis complete!');
-  } catch(e) {
-    status.textContent = 'Error: ' + e.message;
-    status.style.color = 'var(--danger)';
-  }
+  return recomputeCulling('/api/pipeline/regroup-live', 'Analysis complete!');
 }
 
 window.beforeHistoryChange = function() {
-  if (cullBusy || cullDirty) {
+  if (cullOperationPending()) {
+    showToast('Wait for culling to finish updating before undoing saved edits.', 'info');
+    return false;
+  }
+  if (cullDirty) {
     showToast('Apply your staged culling decisions or reload before undoing saved edits.', 'info');
     return false;
   }
@@ -1057,7 +1071,7 @@ function toggleSpecies(idx) {
 }
 
 function toggleCullAction(speciesIdx, poseIdx, photoId) {
-  if (cullBusy) return;
+  if (cullOperationPending()) return;
   var sg = cullData.species_groups[speciesIdx];
   var groups = sg.scene_groups || sg.pose_groups || [];
   var pg = groups[poseIdx];
@@ -1083,7 +1097,7 @@ function toggleCullAction(speciesIdx, poseIdx, photoId) {
 }
 
 async function applyCulling() {
-  if (!cullData || cullBusy) return;
+  if (!cullData || cullOperationPending()) return;
 
   var keepers = [];
   var rejects = [];

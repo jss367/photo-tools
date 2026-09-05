@@ -3045,3 +3045,43 @@ def test_cull_apply_keeps_saved_decisions_after_rating_undo(live_server, page, s
     expect(page.locator(f'.cull-card[data-photo-id="{ids[0]}"]')).to_have_class(re.compile(r'\bkeep\b'))
     for pid in ids[1:]:
         expect(page.locator(f'.cull-card[data-photo-id="{pid}"]')).to_have_class(re.compile(r'\breview\b'))
+
+
+@pytest.mark.parametrize('analysis', ['doReflow', 'doRegroupLive', 'runCulling', 'onScoringChange', 'onGroupingChange'])
+@pytest.mark.parametrize('succeeds', [True, False])
+def test_cull_pending_analysis_blocks_history_until_response(live_server, page, analysis, succeeds):
+    ids = live_server['data']['photos'][:4]
+    _write_grouped_pipeline_cache(live_server, ids)
+    page.goto(live_server['url'] + '/cull')
+    expect(page.locator('.cull-card')).to_have_count(4)
+    page.evaluate('''id => safeFetch('/api/photos/' + id + '/flag', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({flag: 'flagged'})
+    })''', ids[0])
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    snapshot = page.evaluate('pipelineResults')
+    held = []
+    endpoint = 'reflow' if analysis in ('doReflow', 'onScoringChange') else 'regroup-live'
+    page.route('**/api/pipeline/' + endpoint, lambda route: held.append(route))
+    page.evaluate('''analysis => {
+      selectedCollectionId = 123;
+      const slider = document.getElementById(analysis === 'onScoringChange' ? 'slRejectFocus' : 'slWTime');
+      window.pendingAnalysis = window[analysis](slider);
+    }''', analysis)
+    expect(page.locator('#applyBtn')).to_be_disabled()
+    assert page.evaluate('doUndo()') is False
+    assert live_server['db'].get_photo(ids[0])['flag'] == 'flagged'
+    for _ in range(100):
+        if held:
+            break
+        page.wait_for_timeout(50)
+    assert len(held) == 1
+    if succeeds:
+        held[0].fulfill(json=snapshot)
+    else:
+        held[0].abort()
+    page.evaluate('window.pendingAnalysis')
+    page.wait_for_function('cullAnalysisPending === 0 && _reflowTimer == null && _regroupTimer == null')
+    expect(page.locator('#applyBtn')).to_be_enabled()
+    assert page.evaluate('doUndo()') is True
+    assert live_server['db'].get_photo(ids[0])['flag'] == 'none'
+    expect(page.locator(f'.cull-card[data-photo-id="{ids[0]}"]')).to_have_class(re.compile(r'\breview\b'))

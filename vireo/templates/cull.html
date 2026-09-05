@@ -1107,7 +1107,17 @@ async function applyCulling() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({keepers: keepers, rejects: rejects}),
     }, { toast: false });
+    // Apply establishes the saved baseline. Review photos were not sent to
+    // the server, so retain their existing flags instead of clearing them.
+    var keeperIds = new Set(keepers);
+    var rejectIds = new Set(rejects);
+    pipelineResults.photos.forEach(function(photo) {
+      if (keeperIds.has(photo.id)) photo.flag = 'flagged';
+      else if (rejectIds.has(photo.id)) photo.flag = 'rejected';
+    });
+    cullUseSavedFlags = true;
     cullDirty = false;
+    rebuildCullDataFromPipeline();
     document.getElementById('cullStatus').textContent = 'Applied! ' + keepers.length + ' keepers, ' + rejects.length + ' rejected';
     document.getElementById('cullStatus').style.color = 'var(--accent)';
   } catch(e) {

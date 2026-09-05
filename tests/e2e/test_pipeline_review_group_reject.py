@@ -3013,3 +3013,35 @@ def test_rapid_review_can_retry_a_failed_history_refresh(live_server, page):
     assert page.evaluate('(id) => rapid.photoMap[id].flag', rejected) == 'none'
     page.locator('#historyRedoBtn').click()
     page.wait_for_function('(id) => rapid.photoMap[id].flag === "rejected" && rapid.seeded', arg=rejected)
+
+
+@pytest.mark.parametrize('scoped', [False, True])
+def test_cull_apply_keeps_saved_decisions_after_rating_undo(live_server, page, scoped):
+    ids = live_server['data']['photos'][:4]
+    _write_grouped_pipeline_cache(live_server, ids)
+    page.goto(live_server['url'] + '/cull')
+    expect(page.locator('.cull-card')).to_have_count(4)
+    page.evaluate('''({ids, scoped}) => {
+      pipelineResults.photos.forEach(photo => { photo.label = 'REJECT'; });
+      if (scoped) selectedCollectionId = 123;
+      rebuildCullDataFromPipeline();
+      cullData.species_groups.forEach(sg => (sg.scene_groups || sg.pose_groups).forEach(pg => {
+        pg.photos.forEach(photo => { photo.action = photo.photo_id === ids[0] ? 'keep' : 'review'; });
+      }));
+      cullDirty = true;
+      renderCulling();
+    }''', {'ids': ids, 'scoped': scoped})
+    page.on('dialog', lambda dialog: dialog.accept())
+    page.locator('#applyBtn').click()
+    expect(page.locator('#cullStatus')).to_contain_text('Applied!')
+    assert page.evaluate('cullUseSavedFlags') is True
+    assert page.evaluate('id => pipelineResults.photos.find(p => p.id === id).flag', ids[0]) == 'flagged'
+    page.evaluate('''id => safeFetch('/api/photos/' + id + '/rating', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({rating: 1})
+    })''', ids[0])
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    page.locator('#historyUndoBtn').click()
+    expect(page.locator('#historyRedoBtn')).to_be_enabled()
+    expect(page.locator(f'.cull-card[data-photo-id="{ids[0]}"]')).to_have_class(re.compile(r'\bkeep\b'))
+    for pid in ids[1:]:
+        expect(page.locator(f'.cull-card[data-photo-id="{pid}"]')).to_have_class(re.compile(r'\breview\b'))

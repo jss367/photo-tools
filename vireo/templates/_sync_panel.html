@@ -168,6 +168,11 @@ async function checkPendingSync() {
     var data = await safeFetch('/api/sync/status', {}, { toast: false });
     var banner = document.getElementById('syncBanner');
     if (data.pending_count > 0) {
+      var status = document.getElementById('syncStatus');
+      if (status.textContent === 'Synced!') {
+        status.textContent = '';
+        status.style.color = 'var(--text-dim)';
+      }
       document.getElementById('syncBannerText').textContent =
         data.pending_count.toLocaleString() + ' change' + (data.pending_count !== 1 ? 's' : '') +
         ' across ' + data.pending_photo_count.toLocaleString() + ' photo' + (data.pending_photo_count !== 1 ? 's' : '') +

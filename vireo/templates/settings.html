@@ -1526,7 +1526,7 @@ function saveWsConfig() {
   // If the initial load failed, every checkbox shows unchecked even though the
   // server may have overrides. Saving now would send null for every key and
   // wipe persisted state we never displayed. Bail out instead.
-  if (!_wsOverridesLoaded) return;
+  if (!_wsOverridesLoaded || _autosaveSuspended) return;
   clearTimeout(_wsSaveTimer);
   var gen = _nextSaveGen();
   _saveStatusMark('workspace', 'pending', gen);
@@ -1637,11 +1637,31 @@ function _nextSaveGen() { return ++_saveGenCounter; }
 // is read from the form at send time so a queued save always carries the
 // latest values.
 var _saveChains = {};
+var _saveChainEpochs = {};
+var _autosaveSuspended = false;
 function _serializedSave(path, doSave) {
+  var epoch = _saveChainEpochs[path] || 0;
   var prev = _saveChains[path] || Promise.resolve();
-  var run = prev.catch(function() {}).then(doSave);
+  var run = prev.catch(function() {}).then(function() {
+    // A save queued behind an in-flight POST reads the form only when its
+    // turn comes. If the chain was cancelled meanwhile (settings import
+    // replaced the config), that stale snapshot must not be posted.
+    if ((_saveChainEpochs[path] || 0) !== epoch) {
+      throw new Error('autosave cancelled');
+    }
+    return doSave();
+  });
   _saveChains[path] = run;
   return run;
+}
+// Drop every save queued for a path that has not started yet, and wait
+// for the one in flight (if any) to settle. Used before replacing the
+// whole config so no pre-import snapshot can land after the import.
+function _cancelQueuedSaves(path) {
+  _saveChainEpochs[path] = (_saveChainEpochs[path] || 0) + 1;
+  var chain = _saveChains[path] || Promise.resolve();
+  _saveStatusMark(path, 'cancel');
+  return chain.catch(function() {});
 }
 
 function _saveStatusMark(path, phase, gen) {
@@ -2904,6 +2924,7 @@ function saveConfig() {
   // network layer toasts on failure; the next change re-tries. Callers that
   // need to KNOW the write landed (e.g. the NAS wizard, before it tears down
   // its modal) must call _saveConfigNow() directly and await it.
+  if (_autosaveSuspended) return;
   clearTimeout(_saveTimer);
   var gen = _nextSaveGen();
   _saveStatusMark('config', 'pending', gen);
@@ -5047,13 +5068,19 @@ async function importSettingsFile(file) {
   if (typeof _saveTimer !== 'undefined' && _saveTimer) {
     clearTimeout(_saveTimer);
     _saveTimer = null;
-    _saveStatusMark('config', 'cancel');
   }
   if (typeof _wsSaveTimer !== 'undefined' && _wsSaveTimer) {
     clearTimeout(_wsSaveTimer);
     _wsSaveTimer = null;
-    _saveStatusMark('workspace', 'cancel');
   }
+  // A curated save whose debounce already fired may be queued behind an
+  // in-flight POST; it would read the pre-import form when its turn came
+  // and post that snapshot over the imported config. Drop queued saves,
+  // wait for the in-flight one to settle, and keep autosave off until the
+  // form has been reloaded from the imported config.
+  _autosaveSuspended = true;
+  await _cancelQueuedSaves('config');
+  await _cancelQueuedSaves('workspace');
   var confirmedEviction = false;
   try {
     while (true) {
@@ -5095,6 +5122,8 @@ async function importSettingsFile(file) {
     alert('Settings imported. Workspace overrides preserved.');
   } catch (err) {
     alert('Network error: ' + (err && err.message || err));
+  } finally {
+    _autosaveSuspended = false;
   }
 }
 

@@ -1,3 +1,4 @@
+import json
 import re
 
 from playwright.sync_api import expect
@@ -244,3 +245,66 @@ def test_settings_saves_for_same_path_are_serialized(live_server, page):
     expect(status).to_have_attribute("data-state", "saved", timeout=10_000)
     cfg = page.request.get(f"{url}/api/config").json()
     assert cfg["keyword_case"] == "lower"
+
+
+def test_settings_import_drops_queued_autosave(live_server, page):
+    """A save queued behind an in-flight POST must not overwrite an import."""
+    url = live_server["url"]
+    page.goto(f"{url}/settings", timeout=5000)
+    status = _wait_for_settings_idle(page)
+    page.on("dialog", lambda d: d.accept())
+
+    held = []
+    config_posts = []
+
+    def _hold_first_post(route, request):
+        if request.method == "POST":
+            config_posts.append(request)
+            if len(config_posts) == 1:
+                held.append(route)
+                return
+        route.continue_()
+
+    page.route("**/api/config", _hold_first_post)
+    page.select_option("#cfgKeywordCase", "title")
+    for _ in range(60):
+        if held:
+            break
+        page.wait_for_timeout(50)
+    assert held, "first POST was never requested"
+
+    # Second edit queues behind the stalled POST.
+    page.select_option("#cfgKeywordCase", "lower")
+    page.wait_for_timeout(700)
+    assert len(config_posts) == 1
+
+    import_posts = []
+    page.on(
+        "request",
+        lambda r: import_posts.append(r)
+        if r.url.endswith("/api/settings/import")
+        else None,
+    )
+    payload = page.request.get(f"{url}/api/settings/export").json()
+    payload["keyword_case"] = "auto"
+    page.set_input_files(
+        "#settingsImportInput",
+        {
+            "name": "backup.json",
+            "mimeType": "application/json",
+            "buffer": json.dumps(payload).encode(),
+        },
+    )
+    # Import waits for the in-flight save to settle before replacing config.
+    page.wait_for_timeout(500)
+    assert not import_posts, "import POSTed while a save was still in flight"
+
+    with page.expect_response("**/api/settings/import"):
+        held[0].continue_()
+    expect(page.locator("#cfgKeywordCase")).to_have_value("auto", timeout=10_000)
+    page.wait_for_timeout(700)
+    # The queued 'lower' snapshot was dropped: only the first POST ever went out.
+    assert len(config_posts) == 1
+    expect(status).not_to_have_attribute("data-state", "saving")
+    cfg = page.request.get(f"{url}/api/config").json()
+    assert cfg["keyword_case"] == "auto"

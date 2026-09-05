@@ -17579,7 +17579,7 @@ def test_import_page_after_move_hint_names_the_archive_root(app_and_db):
     and shows the configured path, so a typo is visible at a glance."""
     app, _ = app_and_db
     html = app.test_client().get("/import").data.decode()
-    assert "function afterMoveUnavailableReason()" in html
+    assert "function afterMoveUnavailableReason(destination)" in html
     assert "no remote target has a local archive root configured" in html
     assert "does not exist on this machine" in html
     assert "the destination is outside the local archive root of" in html

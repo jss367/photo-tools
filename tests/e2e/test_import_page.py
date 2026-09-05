@@ -2410,13 +2410,20 @@ def test_import_after_move_hint_blames_the_right_field(live_server, page):
     page.locator("#afterImportSelect").select_option(str(identify_id))
 
     hint = page.locator("#afterMoveUnavailable")
-    expect(hint).to_be_visible()
-    expect(hint).to_contain_text("does not exist on this machine")
-    expect(hint).to_contain_text("Photo NAS (/Users/me/Pictures/Vireo_Archive)")
-    expect(hint).not_to_contain_text("destination is not inside")
-    expect(page.locator("#afterMoveRow")).to_be_hidden()
+    row = page.locator("#afterMoveRow")
 
-    # Root exists but the destination genuinely is outside it.
+    # Typo'd root: the destination is lexically outside it, so this is the
+    # "outside" case, but the missing root is annotated inline so the
+    # underscore-vs-space mismatch is visible in one line.
+    expect(hint).to_be_visible()
+    expect(hint).to_contain_text("the destination is outside the local archive root of")
+    expect(hint).to_contain_text(
+        "Photo NAS (/Users/me/Pictures/Vireo_Archive — does not exist on this machine)"
+    )
+    expect(hint).not_to_contain_text("destination is not inside")
+    expect(row).to_be_hidden()
+
+    # Root exists but the destination genuinely is outside it: no annotation.
     page.evaluate(
         """
         () => {
@@ -2427,6 +2434,26 @@ def test_import_after_move_hint_blames_the_right_field(live_server, page):
     )
     expect(hint).to_contain_text("the destination is outside the local archive root of")
     expect(hint).to_contain_text("Photo NAS (/Users/me/Pictures/Vireo_Archive)")
+    expect(hint).not_to_contain_text("does not exist")
+
+    # A second target with a missing root that does not contain the
+    # destination is listed, but the user is not told to create it.
+    page.evaluate(
+        """
+        () => {
+          importRemoteTargets.push({
+            id: "nas2", name: "Backup NAS", user: "photo", host: "backup.local",
+            remote_path: "/volume1/Backup", mount_path: "/Volumes/Backup",
+            local_archive_root: "/archive-b", local_archive_root_present: false,
+          });
+          updateAfterMoveUI();
+        }
+        """
+    )
+    expect(hint).to_contain_text("the destination is outside the local archive root of")
+    expect(hint).to_contain_text("Backup NAS (/archive-b — does not exist on this machine)")
+    expect(hint).not_to_contain_text("Create it")
+    page.evaluate("() => { importRemoteTargets.pop(); }")
 
     # No target has a root at all.
     page.evaluate(
@@ -2439,9 +2466,8 @@ def test_import_after_move_hint_blames_the_right_field(live_server, page):
     )
     expect(hint).to_contain_text("no remote target has a local archive root configured")
 
-    # A destination lexically inside a root that does not exist still gets
-    # the missing-root hint rather than the move row: the prefix match alone
-    # must not bless a typo'd root.
+    # Destination inside a root that does not exist yet: creating the root
+    # is the fix, and the prefix match alone must not show the move row.
     page.evaluate(
         """
         () => {
@@ -2452,8 +2478,11 @@ def test_import_after_move_hint_blames_the_right_field(live_server, page):
         """
     )
     expect(hint).to_be_visible()
-    expect(hint).to_contain_text("does not exist on this machine")
-    expect(page.locator("#afterMoveRow")).to_be_hidden()
+    expect(hint).to_contain_text(
+        "the local archive root for Photo NAS (/Users/me/Pictures/Vireo Archive "
+        "— does not exist on this machine). Create it"
+    )
+    expect(row).to_be_hidden()
 
     # Once the root exists, the same destination makes the row appear.
     page.evaluate(
@@ -2465,7 +2494,7 @@ def test_import_after_move_hint_blames_the_right_field(live_server, page):
         """
     )
     expect(hint).to_be_hidden()
-    expect(page.locator("#afterMoveRow")).to_be_visible()
+    expect(row).to_be_visible()
 
 
 def test_import_new_workspace_shows_target_default_in_after_import_display(

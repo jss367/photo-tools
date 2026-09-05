@@ -1704,18 +1704,26 @@ function afterMoveEligibleTargets() {
 // fix by retyping the destination. Three cases, each naming the actual
 // configured root so a mismatch is visible at a glance:
 //   1. no target has an archive root configured at all;
-//   2. a configured root does not exist on this machine (typo or moved);
-//   3. every root exists — the destination really is outside them.
-function afterMoveUnavailableReason() {
+//   2. the destination is inside a configured root that does not exist on
+//      this machine — creating it is the fix;
+//   3. otherwise the destination is outside every root. Roots that do not
+//      exist are annotated inline (a typo'd root is the usual reason the
+//      destination "doesn't match"), but the user is not told to create a
+//      folder that would not make any target eligible.
+function afterMoveUnavailableReason(destination) {
   const configured = importRemoteTargets.filter((t) => t.local_archive_root);
   if (!configured.length) {
     return 'no remote target has a local archive root configured. ';
   }
-  const describe = (t) => t.name + ' (' + t.local_archive_root + ')';
-  const missing = configured.filter((t) => t.local_archive_root_present === false);
-  if (missing.length) {
-    return 'the local archive root for ' + missing.map(describe).join(', ')
-      + ' does not exist on this machine. Check the path for a typo under '
+  const describe = (t) => t.name + ' (' + t.local_archive_root
+    + (t.local_archive_root_present === false ? ' — does not exist on this machine' : '')
+    + ')';
+  const missingHere = configured.filter(
+    (t) => t.local_archive_root_present === false
+      && afterMovePathInsideRoot(destination, t.local_archive_root));
+  if (missingHere.length) {
+    return 'the local archive root for ' + missingHere.map(describe).join(', ')
+      + '. Create it, or check the path for a typo under '
       + 'Settings › Remote targets. ';
   }
   return 'the destination is outside the local archive root of '
@@ -1750,7 +1758,7 @@ function updateAfterMoveUI() {
     // judge — an empty or relative destination isn't decidable yet.
     const destination = (document.getElementById('destInput').value || '').trim();
     if (importIsAbsolutePath(destination)) {
-      unavailable.textContent = 'Move to NAS unavailable: ' + afterMoveUnavailableReason();
+      unavailable.textContent = 'Move to NAS unavailable: ' + afterMoveUnavailableReason(destination);
       const setup = document.createElement('a');
       setup.href = '/settings#nas-setup';
       setup.textContent = 'Set up remote target…';

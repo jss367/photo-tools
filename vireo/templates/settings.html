@@ -5105,6 +5105,7 @@ async function importSettingsFile(file) {
   _autosaveSuspended = true;
   await _cancelQueuedSaves('config');
   var imported = false;
+  var formReloaded = false;
   var confirmedEviction = false;
   try {
     while (true) {
@@ -5151,15 +5152,25 @@ async function importSettingsFile(file) {
     // Curated form posts its own snapshot — repull so a later edit doesn't
     // overwrite imported global values with stale form state.
     await loadConfig();
+    formReloaded = true;
     alert('Settings imported. Workspace overrides preserved.');
   } catch (err) {
     alert('Network error: ' + (err && err.message || err));
   } finally {
-    _autosaveSuspended = false;
-    // The import did not replace the config, so the edit we dropped (or
-    // one made while the import was running) is still the user's intent
-    // and still on screen: save it after all.
-    if (!imported && (hadPendingConfigSave || _editedWhileSuspended)) saveConfig();
+    if (imported && !formReloaded) {
+      // The config on disk is the imported one but the form could not be
+      // refreshed from it. Re-enabling autosave here would let the next
+      // ordinary edit post the stale form over the import, so keep it off
+      // and reload the page, which rebuilds the form from disk.
+      alert('Settings imported, but the page could not refresh. Reloading.');
+      location.reload();
+    } else {
+      _autosaveSuspended = false;
+      // The import did not replace the config, so the edit we dropped (or
+      // one made while the import was running) is still the user's intent
+      // and still on screen: save it after all.
+      if (!imported && (hadPendingConfigSave || _editedWhileSuspended)) saveConfig();
+    }
     _editedWhileSuspended = false;
   }
 }

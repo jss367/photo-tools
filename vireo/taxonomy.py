@@ -1047,6 +1047,8 @@ class Taxonomy:
         """
         # Skip names we've already tried and failed to resolve
         norm_name = self._normalize(name)
+        if norm_name in self._ambiguous_normalized:
+            return None
         if norm_name in self._api_misses:
             return None
 
@@ -1550,6 +1552,10 @@ def fetch_common_names(db, locale='en'):
 
     inat_ids = [(r['id'], r['inat_id']) for r in rows]
     updated = 0
+    remaining = {iid for _, iid in inat_ids}
+    # A partial refresh cannot certify an old, lossy name index.
+    if locale == 'en':
+        db.set_meta("common_name_identity_version", "", _commit=False)
 
     for i in range(0, len(inat_ids), INAT_BATCH_SIZE):
         batch = inat_ids[i:i + INAT_BATCH_SIZE]
@@ -1572,12 +1578,14 @@ def fetch_common_names(db, locale='en'):
                 if not local_id:
                     continue
 
+                remaining.discard(inat_id)
+                # Replace each returned taxon's names so a removed alias does
+                # not survive a complete refresh as false identity evidence.
+                db.conn.execute("DELETE FROM taxa_common_names WHERE taxon_id = ? AND locale = ?",
+                                (local_id, locale))
                 preferred = taxon.get('preferred_common_name')
+                db.conn.execute("UPDATE taxa SET common_name = ? WHERE id = ?", (preferred, local_id))
                 if preferred:
-                    db.conn.execute(
-                        "UPDATE taxa SET common_name = ? WHERE id = ?",
-                        (preferred, local_id),
-                    )
                     updated += 1
 
                 for name_entry in taxon.get('names', []):
@@ -1591,6 +1599,9 @@ def fetch_common_names(db, locale='en'):
             log.warning("iNat API request failed: %s", e)
             continue
 
+    if locale == 'en' and inat_ids and not remaining:
+        db.set_meta("common_name_identity_version", str(COMMON_NAME_IDENTITY_VERSION), _commit=False)
+        db.set_meta("ambiguous_common_names", "[]", _commit=False)
     db.conn.commit()
     log.info("Common names: %d taxa updated", updated)
     return {"updated": updated}

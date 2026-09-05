@@ -1355,3 +1355,28 @@ def test_http_import_then_classify_job_uses_configured_cache_dir(
     # have looked, and reuse would have silently failed.
     default_store = ArtifactStore(computation_cache.DEFAULT_CACHE_DIR)
     assert list(default_store.iter_artifacts() or ()) == []
+
+
+@pytest.mark.parametrize("reviewed", [False, True])
+def test_materialize_handles_predictions_without_classifier_run(tmp_path, reviewed):
+    db, _, _ = _database_with_photo(tmp_path / "orphan.db", "photo.jpg")
+    materialize_artifacts(db, [detection_artifact()], known_runtimes={RUNTIME})
+    detection_id = db.conn.execute("SELECT id FROM detections").fetchone()[0]
+    db.add_prediction(detection_id, "Robin", .5, "bioclip-2.5",
+                      status="accepted" if reviewed else "pending", labels_fingerprint="3" * 12,
+                      taxonomy={"scientific_name": "Old species"})
+    assert db.conn.execute("SELECT count(*) FROM classifier_runs").fetchone()[0] == 0
+    artifact = classification_artifact(candidates=[{"species": "Robin", "confidence": .9,
+                                                  "taxonomy": {"scientific_name": "Erithacus rubecula", "taxon_id": 123}}])
+    result = materialize_artifacts(db, [artifact], known_runtimes={RUNTIME},
+                                   known_classifier_runtimes={CLASSIFIER_RUNTIME})
+    row = db.conn.execute("SELECT scientific_name, source_taxon_id, confidence FROM predictions").fetchone()
+    if reviewed:
+        assert tuple(row) == ("Old species", None, .5)
+        assert result["pinned_older_runtime"] == 1
+        assert db.conn.execute("SELECT count(*) FROM classifier_runs").fetchone()[0] == 0
+        assert db.conn.execute("SELECT status FROM prediction_review").fetchone()[0] == "accepted"
+    else:
+        assert tuple(row) == ("Erithacus rubecula", 123, .9)
+        assert result["classifier_runs_applied"] == 1
+    db.close()

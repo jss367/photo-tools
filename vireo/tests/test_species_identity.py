@@ -279,7 +279,7 @@ def test_resolution_policy_is_part_of_portable_runtime(monkeypatch):
     assert classifier_runtime_fingerprint(*args) != before
 
 
-@pytest.mark.parametrize("value", [True, -1, "18976", [], {}])
+@pytest.mark.parametrize("value", [True, -1, "18976", [], {}, 1 << 63])
 def test_portable_source_id_validation(value):
     with pytest.raises(CacheFormatError):
         _validate_candidate_taxonomy({"taxon_id": value})
@@ -333,3 +333,78 @@ def test_import_preserves_ambiguity_even_when_only_one_preferred_name_matches(db
     populate_taxa_db_from_json(db, path)
     assert SpeciesResolver(db=db).resolve("Lilac-crowned Parrot").taxon_id is None
     assert SpeciesResolver(db=db).resolve(LILAC["scientific_name"]).taxon_id == LILAC["taxon_id"]
+
+
+@pytest.mark.parametrize("species_list", [["Red-crowned Amazon"], []])
+def test_cached_refresh_preserves_authoritative_unconfirmed_override(taxonomy, species_list):
+    override = {"species": "Red-crowned Amazon", "species_list": species_list, "confirmed": False}
+    data = {"photos": [{"id": 1, "species_top5": [["Red-crowned Amazon", .9, "BioCLIP"]]}],
+            "encounters": [{"photo_ids": [1], "bursts": [{"photo_ids": [1], "species_override": override}]}]}
+    before = dict(override)
+    normalize_cached_species(data, SpeciesResolver(taxonomy=taxonomy))
+    assert override == before
+    assert data["photos"][0]["species_top5"][0][0] == "Red-crowned Parrot"
+
+
+@pytest.mark.parametrize("field", ["species", "classifier_model", "labels_fingerprint", "detection_id"])
+def test_repair_rejects_changed_eligibility_and_run_key(db, tmp_path, field):
+    _, det = _photo(db, tmp_path)
+    _, other_det = _photo(db, tmp_path, "other.jpg")
+    db.add_prediction(det, "Red-crowned Amazon", .9, "BioCLIP-2.5", labels_fingerprint="custom",
+                      taxonomy={"scientific_name": BROWED["scientific_name"]})
+    plan = plan_repairs(db.conn)
+    value = other_det if field == "detection_id" else "changed"
+    db.conn.execute(f"UPDATE predictions SET {field} = ?", (value,))
+    db.conn.commit()
+    with pytest.raises(ValueError, match="changed after"), db.conn:
+        apply_repairs(db.conn, plan)
+    assert db.conn.execute("SELECT scientific_name FROM predictions").fetchone()[0] == BROWED["scientific_name"]
+    assert db.conn.execute("SELECT count(*) FROM species_identity_repairs").fetchone()[0] == 0
+
+
+def test_id_only_taxonomy_controls_matching_and_enrichment(db, tmp_path, taxonomy):
+    from classify_job import _store_grouped_predictions
+
+    pid, det = _photo(db, tmp_path)
+    raw = [{"photo": {"id": pid, "filename": "photo.jpg"}, "folder_path": str(tmp_path),
+            "detection_id": det, "prediction": "Red-crowned Amazon", "confidence": .9,
+            "alternatives": [], "taxonomy": {"taxon_id": 18997}, "timestamp": None}]
+    with patch("classify_job._categorize_detection_prediction", return_value="new") as category, \
+         patch("classify_job._can_auto_accept_detection_prediction", return_value=False) as accept:
+        _store_grouped_predictions(raw, "test-job", "BioCLIP", 10, .99, taxonomy, db, "custom")
+    assert category.call_args.args[0] == BROWED["scientific_name"]
+    assert accept.call_args.args[0] == BROWED["scientific_name"]
+    stored = db.conn.execute("SELECT scientific_name, source_taxon_id FROM predictions").fetchone()
+    assert tuple(stored) == (BROWED["scientific_name"], 18997)
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_api_common_names_verify_only_complete_refresh(db, complete):
+    from taxonomy import fetch_common_names
+
+    db.set_meta("common_name_identity_version", "")
+    db.conn.execute("INSERT INTO taxa_common_names (taxon_id, name, locale) "
+                    "SELECT id, 'Stale alias', 'en' FROM taxa WHERE inat_id = ?", (RED["taxon_id"],))
+    entries = [RED, BROWED, LILAC] if complete else [RED]
+    results = [{"id": e["taxon_id"], "preferred_common_name": e["common_name"],
+                "names": [{"name": "Shared alias", "locale": "en"}]} for e in entries]
+    with patch("taxonomy.requests.get") as request:
+        request.return_value.status_code = 200
+        request.return_value.json.return_value = {"results": results}
+        fetch_common_names(db)
+    assert db.get_meta("common_name_identity_version") == ("1" if complete else "")
+    assert SpeciesResolver(db=db).resolve("Shared alias").taxon_id is None
+    assert not db.conn.execute("SELECT 1 FROM taxa_common_names WHERE name = 'Stale alias'").fetchone()
+    if complete:
+        assert SpeciesResolver(db=db).resolve("Lilac-crowned Parrot").taxon_id == LILAC["taxon_id"]
+
+
+def test_api_lookup_cannot_reintroduce_ambiguous_names(tmp_path):
+    path = tmp_path / "taxonomy.json"
+    path.write_text(json.dumps({"taxa_by_common": {}, "ambiguous_common_names": ["parrot"],
+                                "taxa_by_scientific": {RED["scientific_name"].lower(): RED}}))
+    tax = Taxonomy(path)
+    with patch("urllib.request.urlopen") as request:
+        assert tax.api_lookup("Parrot") is None
+    request.assert_not_called()
+    assert tax.lookup("Parrot") is None

@@ -29,6 +29,8 @@ MAX_BUNDLE_BYTES = 512 * 1024 * 1024
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
 
+_SQLITE_INT64_MAX = (1 << 63) - 1
+
 _HEX64 = frozenset("0123456789abcdef")
 _ARTIFACT_TYPES = frozenset({"detection", "classification"})
 _FILE_DIGEST_CACHE = {}
@@ -736,7 +738,7 @@ def _validate_candidate_taxonomy(taxonomy):
     if not isinstance(taxonomy, dict):
         raise CacheFormatError("candidate taxonomy must be an object")
     tid = taxonomy.get("taxon_id")
-    if tid is not None and (type(tid) is not int or tid <= 0):
+    if tid is not None and (type(tid) is not int or not 0 < tid <= _SQLITE_INT64_MAX):
         raise CacheFormatError("candidate taxonomy taxon_id must be a positive integer")
     for field in _TAXONOMY_SCALAR_FIELDS:
         if field not in taxonomy:
@@ -896,7 +898,6 @@ def validate_artifact(artifact):
         # materialize_artifacts binds the value.  By that point the bundle
         # object has already been published, leaving an unmaterialized
         # entry behind.  Reject out-of-range values up-front instead.
-        _SQLITE_INT64_MAX = (1 << 63) - 1
         if label_count is not None and (
             isinstance(label_count, bool)
             or not isinstance(label_count, int)
@@ -2071,22 +2072,23 @@ def materialize_artifacts(
                     ):
                         result["already_materialized"] += 1
                         continue
-                    if prior is not None and _manual_review_exists(
+                    if _manual_review_exists(
                         db.conn, detection_id, artifact["classifier_model"],
                         labels["short_fingerprint"],
                     ):
                         result["pinned_older_runtime"] += 1
                         continue
-                    if prior is not None:
-                        db.conn.execute(
-                            """DELETE FROM predictions
-                               WHERE detection_id = ? AND classifier_model = ?
-                                 AND labels_fingerprint = ?""",
-                            (
-                                detection_id, artifact["classifier_model"],
-                                labels["short_fingerprint"],
-                            ),
-                        )
+                    # Predictions can predate classifier_runs. Replace all
+                    # unreviewed candidates before certifying this artifact.
+                    db.conn.execute(
+                        """DELETE FROM predictions
+                           WHERE detection_id = ? AND classifier_model = ?
+                             AND labels_fingerprint = ?""",
+                        (
+                            detection_id, artifact["classifier_model"],
+                            labels["short_fingerprint"],
+                        ),
+                    )
                     for candidate in subject["candidates"]:
                         taxonomy = candidate.get("taxonomy") or {}
                         species = normalize_keyword_display(candidate["species"])

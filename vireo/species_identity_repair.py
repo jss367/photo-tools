@@ -15,7 +15,7 @@ def plan_repairs(conn):
     changes = []
     for name, evidence in COMMON_NAME_CORRECTIONS.items():
         rows = conn.execute(
-            "SELECT id, detection_id, classifier_model, labels_fingerprint, scientific_name, "
+            "SELECT id, species, detection_id, classifier_model, labels_fingerprint, scientific_name, "
             "source_taxon_id FROM predictions WHERE species = ? COLLATE NOCASE "
             "AND classifier_model LIKE 'BioCLIP%' AND labels_fingerprint NOT IN ('tol', 'legacy') "
             "AND source_taxon_id IS NULL AND scientific_name IS NOT ?",
@@ -50,8 +50,10 @@ def apply_repairs(conn, changes):
         }
         updated = conn.execute(
             "UPDATE predictions SET scientific_name = ?, source_taxon_id = ? "
-            "WHERE id = ? AND scientific_name IS ? AND source_taxon_id IS ?",
-            (*after.values(), change["id"], change["scientific_name"], change["source_taxon_id"]),
+            "WHERE id = ? AND scientific_name IS ? AND source_taxon_id IS ? "
+            "AND species IS ? AND classifier_model IS ? AND labels_fingerprint IS ? AND detection_id IS ?",
+            (*after.values(), change["id"], change["scientific_name"], change["source_taxon_id"],
+             change["species"], change["classifier_model"], change["labels_fingerprint"], change["detection_id"]),
         )
         if updated.rowcount != 1:
             raise ValueError(f"Prediction {change['id']} changed after the repair was planned")

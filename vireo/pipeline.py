@@ -1396,7 +1396,8 @@ def normalize_cached_species(data, resolver):
             if burst_photos:
                 burst["species_predictions"] = _build_species_predictions(burst_photos)
             override = burst.get("species_override")
-            if override and not override.get("confirmed") and override.get("species"):
+            if (override and not override.get("confirmed") and override.get("species")
+                    and "species_list" not in override):
                 override["species"] = resolver.resolve(override["species"]).display_name
     data["species_names_refreshed"] = True
 

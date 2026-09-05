@@ -1936,7 +1936,11 @@ def _cached_prediction_taxonomy(row):
 def _prediction_taxonomy(tax, species, supplied=None):
     """Enrich source-backed labels by binomial, preserving source provenance."""
     supplied = supplied or {}
-    name = supplied.get("scientific_name") or species
+    from species_identity import SpeciesResolver
+    identity = SpeciesResolver(taxonomy=tax).resolve(
+        species, supplied.get("scientific_name"), supplied if supplied.get("taxon_id") else None,
+    )
+    name = identity.scientific_name or species
     hierarchy = tax.get_hierarchy(name) if tax else {}
     return {**hierarchy, **supplied}
 
@@ -2229,7 +2233,8 @@ def _store_grouped_predictions(
         return resolver.resolve(item["prediction"], supplied.get("scientific_name"), source)
 
     def comparison_name(item):
-        return (item.get("taxonomy") or {}).get("scientific_name") or item["prediction"]
+        identity = identity_for(item)
+        return identity.scientific_name or identity.display_name
 
     groups = group_by_timestamp(raw_results, window_seconds=grouping_window)
     groups = refine_groups_by_similarity(

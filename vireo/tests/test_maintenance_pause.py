@@ -471,6 +471,74 @@ def test_final_file_write_pauses_after_completion(
 
 
 @pytest.mark.parametrize("action", ["resume", "cancel"])
+def test_previews_pause_after_final_photo_defers_eviction(
+    client_with_photo, monkeypatch, action,
+):
+    """A pause requested during the final preview waits until eviction.
+
+    The precompute loop must park after the last photo and before
+    ``evict_preview_cache_if_over_quota`` runs, so a pause accepted during
+    the final iteration is not silently overtaken by completion after
+    eviction has already unlinked files and rewritten catalog rows.
+    """
+    import app as app_module
+    from preview_materializer import materialize_preview as real_materialize
+
+    app, db, first = client_with_photo
+    second = _second_photo(db, first)
+    runner = app._job_runner
+    client = app.test_client()
+    entered = threading.Event()
+    release = threading.Event()
+    materialized_ids = []
+    eviction_started = threading.Event()
+
+    def materialize(*args, **kwargs):
+        photo = args[1] if len(args) > 1 else kwargs.get("photo")
+        materialized_ids.append(photo["id"])
+        if len(materialized_ids) == 2:
+            entered.set()
+            assert release.wait(5)
+        return real_materialize(*args, **kwargs)
+
+    def evict(*_args, **_kwargs):
+        eviction_started.set()
+
+    monkeypatch.setattr(app_module, "materialize_preview", materialize)
+    monkeypatch.setattr(
+        app_module, "evict_preview_cache_if_over_quota", evict,
+    )
+
+    response = client.post("/api/jobs/previews", json={})
+    assert response.status_code == 200, response.get_json()
+    job_id = response.get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        assert runner.get(job_id)["status"] == "pausing"
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        # The pause was requested during the last preview; the post-loop
+        # checkpoint must park before eviction runs.
+        assert not eviction_started.is_set()
+        # Pausing releases the writer, so unrelated catalog work can run.
+        db.conn.execute("UPDATE photos SET rating=4 WHERE id=?", (first,))
+        db.conn.commit()
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        finished = wait_for_job_via_client(client, job_id)
+        if action == "resume":
+            assert finished["status"] == "completed", finished
+            assert eviction_started.is_set()
+        else:
+            assert finished["status"] == "cancelled", finished
+            assert not eviction_started.is_set()
+        assert sorted(materialized_ids) == sorted([first, second])
+    finally:
+        release.set()
+        runner.cancel_job(job_id)
+
+
+@pytest.mark.parametrize("action", ["resume", "cancel"])
 def test_callback_checkpoint_retains_state_and_unwinds_on_cancel(app_and_db, action):
     from web.background_jobs import JobLaunch
 

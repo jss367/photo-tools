@@ -1202,6 +1202,13 @@ def serialize_results(results, prior_results=None):
                     burst_override = build_species_override(
                         _shared_confirmed_species(burst),
                     )
+                elif burst and all(
+                    photo_confirmed_species_list(p) for p in burst
+                ):
+                    # Every frame tagged, nothing shared: the burst's own
+                    # set is empty. The sentinel keeps it from inheriting
+                    # the encounter's baseline (see the refresh helper).
+                    burst_override = empty_species_override()
                 elif (
                     prior_empty_photo_ids
                     and burst_ids
@@ -1461,6 +1468,7 @@ def refresh_cache_species_for_photos(cache_dir, workspace_id, species_by_photo):
     from pipeline_results import (
         build_species_override,
         empty_species_override,
+        photo_confirmed_species_list,
     )
 
     if not species_by_photo:
@@ -1504,6 +1512,13 @@ def refresh_cache_species_for_photos(cache_dir, workspace_id, species_by_photo):
                 burst["species_override"] = build_species_override(
                     _shared_confirmed_species(b_photos)
                 )
+            elif all(photo_confirmed_species_list(p) for p in b_photos):
+                # Every photo is tagged but they share nothing (a remove
+                # took the only common species, leaving disjoint extras):
+                # the burst's own set is empty, so it gets the explicit-
+                # empty sentinel rather than inheriting the encounter's
+                # baseline and re-advertising the removed species.
+                burst["species_override"] = empty_species_override()
             elif all(
                 not (p.get("confirmed_species_list") or p.get("confirmed_species"))
                 for p in b_photos

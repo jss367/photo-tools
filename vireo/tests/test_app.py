@@ -23596,3 +23596,48 @@ def test_encounter_species_remove_redo_refreshes_pipeline_cache(app_and_db):
         "species": None, "confirmed": False, "species_list": [],
     }
 
+
+
+def test_encounter_species_remove_redo_with_disjoint_extras_keeps_empty_override(app_and_db):
+    """Frames [A, X] and [A, Y]: removing A leaves the explicit-empty
+    sentinel (nothing shared). Undo restores A; redo must restore the
+    sentinel again rather than None (which would inherit the encounter)."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    burst_ids, other_ids = photo_ids[:2], photo_ids[2:]
+    path = _seed_encounter_cache(
+        app, db, photo_ids, confirmed_species="Green-winged Teal",
+        bursts=[
+            {"photo_ids": burst_ids, "species_predictions": [],
+             "species_override": {"species": "Green-winged Teal", "confirmed": True,
+                                  "species_list": ["Green-winged Teal"]}},
+            {"photo_ids": other_ids, "species_predictions": [], "species_override": None},
+        ],
+    )
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    gadwall = db.add_keyword("Gadwall", is_species=True)
+    wigeon = db.add_keyword("American Wigeon", is_species=True)
+    for pid in photo_ids:
+        db.tag_photo(pid, teal)
+    db.tag_photo(burst_ids[0], gadwall)
+    db.tag_photo(burst_ids[1], wigeon)
+
+    empty = {"species": None, "confirmed": False, "species_list": []}
+    resp = client.post("/api/encounters/species", json={
+        "species": "Green-winged Teal", "photo_ids": burst_ids,
+        "burst_index": 0, "remove": True,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    with open(path) as f:
+        assert _json.load(f)["encounters"][0]["bursts"][0]["species_override"] == empty
+
+    assert client.post("/api/undo").status_code == 200
+    for pid in burst_ids:
+        assert "Green-winged Teal" in _species_names(db, pid)
+    assert client.post("/api/redo").status_code == 200
+    for pid in burst_ids:
+        assert "Green-winged Teal" not in _species_names(db, pid)
+    with open(path) as f:
+        assert _json.load(f)["encounters"][0]["bursts"][0]["species_override"] == empty

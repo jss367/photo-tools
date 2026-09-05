@@ -3495,3 +3495,31 @@ def test_serialize_results_preserves_explicit_empty_burst_after_regroup(tmp_path
         for burst in enc.get("bursts", []):
             if set(burst["photo_ids"]) == empty_ids:
                 assert burst["species_override"] is None
+
+
+def test_serialize_results_disjoint_tagged_burst_gets_empty_override(tmp_path):
+    """Frames all tagged but sharing nothing ([Gadwall] / [Wigeon]) have an
+    empty shared set: the burst gets the explicit-empty sentinel instead of
+    inheriting whatever its encounter records."""
+    from pipeline import load_photo_features, run_full_pipeline, serialize_results
+
+    db, ids = _setup_db_with_photos(tmp_path)
+    gadwall = db.add_keyword("Gadwall", is_species=True)
+    wigeon = db.add_keyword("American Wigeon", is_species=True)
+    burst = ids[0]
+    assert len(burst) >= 2
+    db.tag_photo(burst[0], gadwall)
+    for pid in burst[1:]:
+        db.tag_photo(pid, wigeon)
+
+    serialized = serialize_results(run_full_pipeline(load_photo_features(db)))
+    burst_ids = set(burst)
+    saw = False
+    for enc in serialized["encounters"]:
+        for b in enc.get("bursts", []):
+            if set(b["photo_ids"]) == burst_ids:
+                assert b["species_override"] == {
+                    "species": None, "confirmed": False, "species_list": [],
+                }
+                saw = True
+    assert saw

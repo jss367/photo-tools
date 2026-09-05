@@ -795,8 +795,10 @@ def test_detached_burst_preserves_mixed_authoritative_override(live_server, page
     _tag_all(live_server, photo_ids, override_species)
 
     _open_burst_modal(page, live_server)
+    # The mixed override is the baseline: the untouched field is not a
+    # species change, so "Confirm species" defaults OFF.
     expect(page.locator("#grmSpecies")).to_have_value(override_species)
-    page.locator("#grmConfirmSpeciesChk").set_checked(False)
+    expect(page.locator("#grmConfirmSpeciesChk")).not_to_be_checked()
 
     second_pid = int(
         page.locator("#grmOverlay .grm-card[data-photo-id]").nth(1).get_attribute("data-photo-id")

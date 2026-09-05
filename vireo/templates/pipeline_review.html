@@ -5600,10 +5600,13 @@ function openGroupReview(encIdx, burstIdx, selectPhotoId) {
   // nothing, so the field must not pre-fill the encounter species — with
   // initialConfirmedSpecies '' that pre-fill would default "Confirm species"
   // ON and a culling-only apply would re-tag the species just removed.
-  var burstExplicitEmpty = !!burstOvr
-    && Array.isArray(burstOvr.species_list)
-    && burstOvr.species_list.length === 0;
-  var initialSpecies = burstExplicitEmpty ? '' : (
+  // More generally, any array-valued species_list is the burst's own set
+  // whatever its confirmed flag (confirmed, mixed-but-edited, or empty), so
+  // it supplies BOTH the pre-fill and the apply baseline below; this page
+  // edits one species at a time, so the primary (first entry) stands in.
+  var burstHasList = !!burstOvr && Array.isArray(burstOvr.species_list);
+  var burstListPrimary = burstHasList ? (burstOvr.species_list[0] || '') : '';
+  var initialSpecies = burstHasList ? burstListPrimary : (
     (burstOvr && burstOvr.species)
     || enc.confirmed_species
     || (enc.species ? enc.species[0] : '')
@@ -5616,7 +5619,12 @@ function openGroupReview(encIdx, burstIdx, selectPhotoId) {
   // differs from what's already confirmed, confirming is a meaningful action
   // (including confirming a so-far-unconfirmed prediction). '' = unconfirmed.
   var initialConfirmedSpecies = '';
-  if (burstOvr && burstOvr.confirmed === true && burstOvr.species) {
+  if (burstHasList) {
+    // Authoritative list: its primary is the baseline ('' when empty), so an
+    // untouched field is never read as a species change and a flag-only
+    // apply never posts the encounter species onto this burst.
+    initialConfirmedSpecies = burstListPrimary;
+  } else if (burstOvr && burstOvr.confirmed === true && burstOvr.species) {
     initialConfirmedSpecies = burstOvr.species;
   } else if (enc.species_confirmed && enc.confirmed_species) {
     initialConfirmedSpecies = enc.confirmed_species;

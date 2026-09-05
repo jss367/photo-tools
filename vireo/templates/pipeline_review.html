@@ -4972,8 +4972,11 @@ function toggleSpeciesDropdown(event, encIdx, burstIdx, pos) {
 }
 
 function closeAllDropdowns() {
+  clearTimeout(_searchTimer);
+  _searchTimer = null;
   document.querySelectorAll('.species-dropdown.open').forEach(function(d) {
     d.classList.remove('open');
+    d.replaceChildren();
   });
   activeDropdown = null;
 }
@@ -5058,6 +5061,7 @@ function searchSpecies(event, encIdx, burstIdx, pos) {
     var params = new URLSearchParams({q: q});
     VireoTextSearch.appendParams(params, speciesDropdownSearchOptions);
     var results = await safeFetch('/api/species/search?' + params.toString(), {}, { toast: false });
+    if (!container.isConnected) return;
     if (!results || !Array.isArray(results)) results = [];
     renderInto(container, q, results);
   }, 250);

@@ -146,3 +146,24 @@ def test_review_grid_reload_resets_collapsed_encounters(live_server, page):
     assert page.evaluate("collapsedEncounters.size") == 0
     page.evaluate("renderResults()")
     expect(page.locator("#encBody0")).to_be_visible()
+
+
+def test_review_grid_releases_closed_species_menus(live_server, page):
+    _open_grid(page, live_server, encounter_count=3)
+    for index in range(3):
+        card = page.locator(f'.encounter-card[data-encounter-index="{index}"]')
+        card.scroll_into_view_if_needed()
+        card.locator(".species-name").first.click()
+        expect(page.locator(".species-dropdown input")).to_have_count(1)
+        expect(page.locator(".species-dropdown-item")).to_have_count(5)
+    page.locator(".encounter-header").last.click()
+    expect(page.locator(".species-dropdown input")).to_have_count(0)
+    expect(page.locator(".species-dropdown-item")).to_have_count(0)
+
+    # Reused cards must not retain closed controls after a full render, and
+    # opening the same menu again must restore its predictions.
+    page.evaluate("renderResults()")
+    expect(page.locator(".species-dropdown input")).to_have_count(0)
+    card.locator(".species-name").first.click()
+    expect(page.locator(".species-dropdown.open input")).to_be_visible()
+    expect(page.locator(".species-dropdown-item")).to_have_count(5)

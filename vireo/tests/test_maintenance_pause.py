@@ -1,4 +1,5 @@
 """Pause integration at real per-photo and database transaction boundaries."""
+import json
 import os
 import threading
 import time
@@ -30,6 +31,162 @@ def _second_photo(db, photo_id):
         file_size=os.path.getsize(path), file_mtime=os.path.getmtime(path),
         width=80, height=60,
     )
+
+
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+def test_card_scan_pauses_during_discovery(app_and_db, monkeypatch, tmp_path, action):
+    import card_cleanup
+
+    app, _db = app_and_db
+    source = tmp_path / "card"
+    source.mkdir()
+    (source / "bird.jpg").write_bytes(b"photo")
+    entered = threading.Event()
+    release = threading.Event()
+    continued = threading.Event()
+
+    def walk(path, *, cancel_check=None, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        assert cancel_check is not None
+        if cancel_check():
+            raise card_cleanup.ScanCancelled("cancelled")
+        continued.set()
+        yield str(source), [], ["bird.jpg"]
+
+    monkeypatch.setattr(card_cleanup, "safe_scan_walk", walk)
+    client = app.test_client()
+    runner = app._job_runner
+    job_id = client.post("/api/card-cleanup/scan", json={
+        "source": str(source), "recursive": True,
+    }).get_json()["job_id"]
+    manifest = card_cleanup.manifest_path(app.config["CARD_CLEANUP_DIR"], job_id)
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        assert not continued.is_set()
+        assert not os.path.exists(manifest)
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        finished = wait_for_job_via_client(client, job_id)
+        assert finished["status"] == ("completed" if action == "resume" else "cancelled")
+        assert os.path.exists(manifest) == (action == "resume")
+    finally:
+        release.set()
+        runner.cancel_job(job_id)
+
+
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+@pytest.mark.parametrize("phase", ["source_root", "file_discovery"])
+def test_staging_verification_pauses_during_enumeration(
+    client_with_photo, monkeypatch, action, phase,
+):
+    from contextlib import contextmanager
+
+    import staging_recovery
+
+    app, _db, _photo_id = client_with_photo
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    root = os.path.join(vireo_dir, "staging", "pipeline-pause")
+    source = os.path.join(root, "photos")
+    os.makedirs(source)
+    for name in ("bird.jpg", ".hidden.txt"):
+        with open(os.path.join(source, name), "w") as f:
+            f.write("staged data")
+    entered = threading.Event()
+    release = threading.Event()
+    enumerated = []
+    original = staging_recovery.os.scandir
+    target = root if phase == "source_root" else source
+
+    @contextmanager
+    def scandir(path):
+        with original(path) as entries:
+            if str(path) != target:
+                yield entries
+                return
+
+            def delayed_entries():
+                for entry in entries:
+                    enumerated.append(entry.name)
+                    if len(enumerated) == 1:
+                        entered.set()
+                        assert release.wait(5)
+                    yield entry
+
+            yield delayed_entries()
+
+    monkeypatch.setattr(staging_recovery.os, "scandir", scandir)
+    client = app.test_client()
+    runner = app._job_runner
+    job_id = client.post("/api/import/orphaned-staging/verify", json={
+        "path": root,
+    }).get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        assert len(enumerated) == 1
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        finished = wait_for_job_via_client(client, job_id)
+        assert finished["status"] == ("completed" if action == "resume" else "cancelled")
+        if action == "resume":
+            assert finished["result"]["file_count"] == 2
+            assert finished["result"]["unaccounted"] == 2
+        else:
+            assert len(enumerated) == 1
+        assert os.path.exists(os.path.join(source, "bird.jpg"))
+        assert os.path.exists(os.path.join(source, ".hidden.txt"))
+    finally:
+        release.set()
+        runner.cancel_job(job_id)
+
+
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+def test_culling_pauses_before_publishing_final_result(client_with_photo, monkeypatch, action):
+    import culling
+
+    app, db, _photo_id = client_with_photo
+    entered = threading.Event()
+    release = threading.Event()
+    result = {
+        "total_photos": 1, "suggested_keepers": 1, "suggested_rejects": 0,
+        "species_groups": [],
+    }
+
+    def analyze(*args, pause_callback, **kwargs):
+        pause_callback()
+        entered.set()
+        assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(culling, "analyze_for_culling", analyze)
+    cache = os.path.join(
+        os.path.dirname(app.config["THUMB_CACHE_DIR"]),
+        f"culling_results_ws{db._ws_id()}.json",
+    )
+    with open(cache, "w") as f:
+        json.dump({"previous": True}, f)
+    client = app.test_client()
+    runner = app._job_runner
+    job_id = client.post("/api/jobs/cull", json={}).get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        with open(cache) as f:
+            assert json.load(f) == {"previous": True}
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        finished = wait_for_job_via_client(client, job_id)
+        assert finished["status"] == ("completed" if action == "resume" else "cancelled")
+        with open(cache) as f:
+            assert json.load(f) == (result if action == "resume" else {"previous": True})
+    finally:
+        release.set()
+        runner.cancel_job(job_id)
 
 
 @pytest.mark.parametrize("action", ["resume", "cancel"])

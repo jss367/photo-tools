@@ -766,6 +766,7 @@ def create_jobs_blueprint(
             )
 
             # Store culling results in a temporary cache for the UI
+            ctx.checkpoint(job)
             cache_path = os.path.join(
                 os.path.dirname(db_path), f"culling_results_ws{ctx.workspace_id}.json"
             )

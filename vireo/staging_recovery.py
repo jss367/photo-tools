@@ -48,17 +48,19 @@ def staging_base(vireo_dir: str) -> str:
     return os.path.join(vireo_dir, "staging")
 
 
-def _entry_for_pipeline_dir(path: str) -> StagingEntry:
+def _entry_for_pipeline_dir(path: str, pause_callback=None) -> StagingEntry:
     """Return cleanup root and likely import source root for one pipeline dir."""
     children = []
     direct_files = []
     try:
-        for name in os.listdir(path):
-            full = os.path.join(path, name)
-            if os.path.isdir(full):
-                children.append(full)
-            elif os.path.isfile(full):
-                direct_files.append(full)
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if pause_callback:
+                    pause_callback()
+                if entry.is_dir():
+                    children.append(entry.path)
+                elif entry.is_file():
+                    direct_files.append(entry.path)
     except OSError:
         pass
     # local_processing.staging_root created pipeline-*/<final-destination-name>.
@@ -105,7 +107,7 @@ def discover_orphaned_staging(vireo_dir: str) -> list[dict]:
     return entries
 
 
-def _resolve_entry(vireo_dir: str, cleanup_root: str) -> StagingEntry:
+def _resolve_entry(vireo_dir: str, cleanup_root: str, pause_callback=None) -> StagingEntry:
     base = staging_base(vireo_dir)
     root = os.path.realpath(cleanup_root)
     if not _is_relative_to(root, base):
@@ -114,7 +116,7 @@ def _resolve_entry(vireo_dir: str, cleanup_root: str) -> StagingEntry:
         raise ValueError("staging path is not a pipeline staging directory")
     if not os.path.isdir(root):
         raise ValueError("staging path was not found")
-    return _entry_for_pipeline_dir(root)
+    return _entry_for_pipeline_dir(root, pause_callback=pause_callback)
 
 
 def _catalog_candidates(db, filename: str, size: int, staging_root: str) -> list[dict]:
@@ -211,21 +213,53 @@ def _infer_destination(source_root: str, staged_file: str, folder_path: str) -> 
     return folder_path
 
 
+def _walk_staging_files(source_root: str, pause_callback=None):
+    """Enumerate all staging files, checking before each filesystem operation.
+
+    Unlike photo discovery, recovery must include hidden and non-photo files.
+    Stream scandir so a large single directory can pause before it is buffered.
+    Directory symlinks are not traversed, matching os.walk's default.
+    """
+    pending = [source_root]
+    while pending:
+        if pause_callback:
+            pause_callback()
+        root = pending.pop()
+        files = []
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if pause_callback:
+                        pause_callback()
+                    try:
+                        is_dir = entry.is_dir()
+                    except OSError:
+                        is_dir = False
+                    if is_dir:
+                        if not entry.is_symlink():
+                            pending.append(entry.path)
+                    else:
+                        files.append(entry.path)
+        except OSError:
+            continue
+        yield from sorted(files)
+
+
 def verify_orphaned_staging(db, vireo_dir: str, cleanup_root: str, pause_callback=None) -> dict:
     """Reconcile a staging folder against the catalog and archive filesystem."""
-    entry = _resolve_entry(vireo_dir, cleanup_root)
+    entry = _resolve_entry(vireo_dir, cleanup_root, pause_callback=pause_callback)
     files: list[tuple[str, str, int]] = []
-    for root, _dirs, filenames in os.walk(entry.source_root):
-        for filename in sorted(filenames):
-            path = os.path.join(root, filename)
-            try:
-                st = os.stat(path)
-            except OSError:
-                continue
-            if not os.path.isfile(path):
-                continue
-            rel = os.path.relpath(path, entry.source_root)
-            files.append((path, rel, st.st_size))
+    for path in _walk_staging_files(entry.source_root, pause_callback):
+        if pause_callback:
+            pause_callback()
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if not os.path.isfile(path):
+            continue
+        rel = os.path.relpath(path, entry.source_root)
+        files.append((path, rel, st.st_size))
 
     result = {
         "path": entry.cleanup_root,

@@ -24,6 +24,7 @@ from pathlib import Path
 import path_guard
 from image_loader import (
     SUPPORTED_EXTENSIONS,
+    ScanCancelled,
     is_excluded_scan_path,
     safe_iter_dir,
     safe_scan_walk,
@@ -112,7 +113,7 @@ def prune_manifests(manifest_dir, max_age_days=MANIFEST_MAX_AGE_DAYS):
                 os.unlink(full)
 
 
-def classify_source_files(source, recursive=True, onerror=None):
+def classify_source_files(source, recursive=True, onerror=None, should_cancel=None):
     """One walk over the card; returns (candidates, ignored), both sorted.
 
     Mirrors discover_source_files' file_types="both" filter — parity is
@@ -140,7 +141,7 @@ def classify_source_files(source, recursive=True, onerror=None):
     if recursive:
         def _walk():
             for dirpath, _dirnames, filenames in safe_scan_walk(
-                    str(source_path), onerror=onerror):
+                    str(source_path), onerror=onerror, cancel_check=should_cancel):
                 for name in filenames:
                     yield Path(dirpath) / name
         entries = _walk()
@@ -148,6 +149,8 @@ def classify_source_files(source, recursive=True, onerror=None):
         entries = safe_iter_dir(str(source_path), onerror=onerror)
     candidates, ignored = [], []
     for f in entries:
+        if should_cancel is not None and should_cancel():
+            raise ScanCancelled("card discovery cancelled")
         # Symlinks resolve to bytes stored elsewhere. If we followed one
         # (Path.is_file does), the size/hash recorded here would be the
         # target's, but os.remove(path) unlinks only the link — no card
@@ -161,6 +164,8 @@ def classify_source_files(source, recursive=True, onerror=None):
             candidates.append(f)
         else:
             ignored.append(f)
+    if should_cancel is not None and should_cancel():
+        raise ScanCancelled("card discovery cancelled")
     return sorted(candidates), sorted(ignored)
 
 
@@ -945,9 +950,14 @@ def scan_card(db, source, recursive, manifest_dir, scan_job_id,
     source_root_real = os.path.realpath(source)
     contains_check = path_guard.make_case_folded_check(source_root_real)
     walk_errors = []
-    candidates, ignored = classify_source_files(
-        source, recursive=recursive,
-        onerror=lambda e: walk_errors.append(str(e)))
+    try:
+        candidates, ignored = classify_source_files(
+            source, recursive=recursive, should_cancel=should_cancel,
+            onerror=lambda e: walk_errors.append(str(e)))
+    except ScanCancelled:
+        return {"cancelled": True}
+    if should_cancel is not None and should_cancel():
+        return {"cancelled": True}
     by_hash = _load_catalog_by_hash(db)
     entries = []
     totals = {
@@ -1002,6 +1012,8 @@ def scan_card(db, source, recursive, manifest_dir, scan_job_id,
             totals["kept"]["bytes"] += st.st_size
         entries.append(entry)
     for f in ignored:
+        if should_cancel is not None and should_cancel():
+            return {"cancelled": True}
         entries.append({"path": str(f), "bucket": "ignored"})
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
@@ -1014,6 +1026,8 @@ def scan_card(db, source, recursive, manifest_dir, scan_job_id,
         "totals": totals,
         "revision": INITIAL_MANIFEST_REVISION,
     }
+    if should_cancel is not None and should_cancel():
+        return {"cancelled": True}
     write_manifest(manifest_dir, manifest)
     # Job-result flag only — deliberately NOT part of the persisted
     # manifest (added after write_manifest). A completed scan's manifest

@@ -17,14 +17,14 @@ not a checkpoint that survives restarting the application.
 | Adjust capture time | Between photos, after the metadata write and catalog update |
 | Scan for duplicates | Between duplicate groups |
 | Score sharpness | Between burst groups, saved scores, and automatic flags |
-| Analyze photos for culling | Between scene-hash calculations and species groups |
+| Analyze photos for culling | Between scene-hash calculations and species groups, and before saving the final result |
 | Regroup encounters and bursts | Between loading, grouping, and saving stages |
 | Verify installed models | Between models |
 | Fetch regional species labels | Between request progress updates |
 | Import and organize photos | During discovery, between metadata batches of at most 100 files, and between copies; combined imports also use the scanner's pause coordination |
 | Import Lightroom catalog keywords | Between photos, after committing completed keyword writes |
-| Verify abandoned import staging folders | Between files |
-| Scan memory cards, verify archive copies, delete verified card files | Between files or archive hash groups |
+| Verify abandoned import staging folders | During directory enumeration and between files |
+| Scan memory cards, verify archive copies, delete verified card files | During card discovery, between files or archive hash groups |
 | Classify photos | Between photos and stages; shared model construction finishes before pausing |
 | Publish a website | During preparation, before the final replacement of published files |
 | Scan folders, repair metadata, import in place, import photos, process pipelines | Existing coordinated checkpoints |

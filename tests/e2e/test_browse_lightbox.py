@@ -2051,6 +2051,118 @@ def test_browse_lightbox_predecodes_adjacent_photo_for_current_source_tier(
     assert page.evaluate("window._lightboxCurrentId") != next_id
 
 
+def test_browse_lightbox_warms_fit_window_and_reuses_it_on_reversal(live_server, page):
+    """Fast steps and a reversal reuse decoded neighbors in a bounded window."""
+    page.route(
+        "**/photos/*/full*",
+        lambda route: route.fulfill(
+            body=base64.b64decode(_PNG_1X1), content_type="image/png"
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").nth(1).dblclick()
+    ids = page.evaluate("window._lightboxPhotoList.map(photo => photo.id)")
+    page.wait_for_function(
+        """ids => ids.every(id => Object.values(_lbAdjacentPreloads).some(
+            entry => entry.photoId === id && entry.status === 'decoded'
+        ))""",
+        arg=[ids[0], *ids[2:5]],
+    )
+    assert page.evaluate("Object.keys(_lbAdjacentPreloads).length") == 4
+
+    # Two immediate steps use the head start built while viewing photo 2.
+    for photo_id in ids[2:4]:
+        page.keyboard.press("ArrowRight")
+        page.wait_for_function(
+            "id => _lightboxCommittedId === id && !_lbVisualTransitionPending",
+            arg=photo_id,
+        )
+        assert "prefetch=1" in page.locator("#lightboxImg").get_attribute("src")
+    page.wait_for_function(
+        """oldId => !Object.values(_lbAdjacentPreloads).some(
+            entry => entry.photoId === oldId
+        )""",
+        arg=ids[0],
+    )
+    assert page.evaluate("Object.keys(_lbAdjacentPreloads).length") <= 5
+
+    page.keyboard.press("ArrowLeft")
+    page.wait_for_function("id => _lightboxCommittedId === id", arg=ids[2])
+    assert "prefetch=1" in page.locator("#lightboxImg").get_attribute("src")
+    page.keyboard.press("Escape")
+    assert page.evaluate("Object.keys(_lbAdjacentPreloads).length") == 0
+
+
+def test_browse_lightbox_queues_warmups_and_continues_past_failures(live_server, page):
+    """A slow warmup stays serial; a rejected one cannot starve the other neighbors."""
+    held = []
+    requests = []
+    failing_id = None
+
+    def serve_full(route):
+        photo_id = int(re.search(r"/photos/(\d+)/", route.request.url)[1])
+        if "prefetch=1" in route.request.url:
+            requests.append(photo_id)
+            if len(requests) == 1:
+                held.append(route)
+                return
+            if photo_id == failing_id:
+                route.fulfill(status=503, body="Busy")
+                return
+        route.fulfill(body=base64.b64decode(_PNG_1X1), content_type="image/png")
+
+    page.route("**/photos/*/full*", serve_full)
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").nth(1).dblclick()
+    ids = page.evaluate("window._lightboxPhotoList.map(photo => photo.id)")
+    failing_id = ids[2]
+    page.wait_for_function(
+        "Object.values(_lbAdjacentPreloads).some(entry => entry.status === 'loading')"
+    )
+    page.wait_for_timeout(200)
+    assert requests == [failing_id]
+    assert len(held) == 1
+    held.pop().fulfill(status=503, body="Busy")
+    page.wait_for_function(
+        """ids => ids.every(id => Object.values(_lbAdjacentPreloads).some(
+            entry => entry.photoId === id && entry.status === 'decoded'
+        ))""",
+        arg=[ids[0], ids[3], ids[4]],
+    )
+    page.wait_for_function(
+        "Object.values(_lbAdjacentPreloadRetry).some(retry => retry.count === 2)"
+    )
+    page.wait_for_timeout(800)
+    assert requests.count(failing_id) == 2
+    assert requests[:4] == [failing_id, ids[0], ids[3], ids[4]]
+
+
+def test_browse_lightbox_close_discards_pending_warmup_queue(live_server, page):
+    """A late image completion after close cannot start the remaining warmups."""
+    held = []
+
+    def serve_full(route):
+        if "prefetch=1" in route.request.url:
+            held.append(route)
+            return
+        route.fulfill(body=base64.b64decode(_PNG_1X1), content_type="image/png")
+
+    page.route("**/photos/*/full*", serve_full)
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").nth(1).dblclick()
+    page.wait_for_function(
+        "Object.values(_lbAdjacentPreloads).some(entry => entry.status === 'loading')"
+    )
+    page.wait_for_timeout(100)
+    assert len(held) == 1
+    page.keyboard.press("Escape")
+    held[0].fulfill(body=base64.b64decode(_PNG_1X1), content_type="image/png")
+    page.wait_for_timeout(200)
+    assert len(held) == 1
+    assert page.evaluate("Object.keys(_lbAdjacentPreloads).length") == 0
+    assert page.evaluate("_lbAdjacentPreloadTimer") is None
+
+
 def test_browse_lightbox_preloads_current_original_after_preview_settles(
     live_server, page
 ):

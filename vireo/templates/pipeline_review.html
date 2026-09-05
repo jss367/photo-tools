@@ -5595,10 +5595,20 @@ function openGroupReview(encIdx, burstIdx, selectPhotoId) {
   // the encounter species and silently replace the burst's existing override
   // (untag X, tag Y). Matches renderSpeciesWidget's burst-override precedence.
   var burstOvr = burst && burst.species_override;
-  var initialSpecies = (burstOvr && burstOvr.species)
+  // The explicit-empty sentinel ({confirmed:false, species_list:[]}) a
+  // remove leaves behind is authoritative: this burst is confirmed as
+  // nothing, so the field must not pre-fill the encounter species — with
+  // initialConfirmedSpecies '' that pre-fill would default "Confirm species"
+  // ON and a culling-only apply would re-tag the species just removed.
+  var burstExplicitEmpty = !!burstOvr
+    && Array.isArray(burstOvr.species_list)
+    && burstOvr.species_list.length === 0;
+  var initialSpecies = burstExplicitEmpty ? '' : (
+    (burstOvr && burstOvr.species)
     || enc.confirmed_species
     || (enc.species ? enc.species[0] : '')
-    || '';
+    || ''
+  );
 
   // The species this burst is ACTUALLY confirmed as (vs initialSpecies, which
   // falls back to the unconfirmed top prediction so the input pre-fills). The
@@ -6110,7 +6120,18 @@ function renderGroupModal() {
   // an unwanted species without the user noticing.
   if (!document.getElementById('grmSpecies').value && items.length > 0 && !grmState.speciesFieldTouched) {
     var enc = pipelineResults.encounters[grmState.encIdx];
-    document.getElementById('grmSpecies').value = enc.confirmed_species || (enc.species ? enc.species[0] : '') || '';
+    // A burst carrying the explicit-empty override ({confirmed:false,
+    // species_list:[]}) is confirmed as nothing; an empty field is its
+    // honest state, not a gap to fill from the encounter (see
+    // openGroupReview's initialSpecies).
+    var renderBurst = enc && enc.bursts && enc.bursts[grmState.burstIdx];
+    var renderOvr = renderBurst && renderBurst.species_override;
+    var renderExplicitEmpty = !!renderOvr
+      && Array.isArray(renderOvr.species_list)
+      && renderOvr.species_list.length === 0;
+    if (!renderExplicitEmpty) {
+      document.getElementById('grmSpecies').value = enc.confirmed_species || (enc.species ? enc.species[0] : '') || '';
+    }
   }
 
   document.getElementById('grmCount').textContent = pickItems.length + ' picks, ' + rejectItems.length + ' rejects, ' + candidateItems.length + ' unsorted';

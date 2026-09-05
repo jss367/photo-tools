@@ -749,8 +749,10 @@ def test_detached_burst_preserves_explicit_empty_override(live_server, page):
         json.dump(cache, f)
 
     _open_burst_modal(page, live_server)
-    # Isolate the detach path: no species work on this apply.
-    page.locator("#grmConfirmSpeciesChk").set_checked(False)
+    # The sentinel is authoritative: the field must not pre-fill the
+    # encounter species, and "Confirm species" must default OFF, or a
+    # culling-only apply would re-tag the species that was just removed.
+    expect(page.locator("#grmSpecies")).to_have_value("")
     expect(page.locator("#grmConfirmSpeciesChk")).not_to_be_checked()
 
     second_pid = int(

@@ -585,7 +585,14 @@ def test_jobs_page_returns_200(app_and_db):
     # accepts "pausing") and must not hide the pausing status pill.
     assert b'data-cancel-pause' in resp.data
     assert b'>Cancel pause</button>' in resp.data
-    assert b'disabled>Pausing\xe2\x80\xa6</button>' not in resp.data
+    # But cancelling the pause is only offered when the user requested it.
+    # Automatic safety pauses (pipeline_job.py's ``_handle_source_offline``
+    # publishes ``pause_reason`` before flipping to ``pausing``) must still
+    # render a disabled Pausing… button — cancelling one of those would
+    # burn a bounded ``_MAX_SOURCE_OFFLINE_PAUSES`` attempt on a dead
+    # source and can convert a recoverable outage into a failed run.
+    assert b'automaticPauseReason' in resp.data
+    assert b'job.progress && job.progress.pause_reason' in resp.data
     assert b'data-retry-import-job' in resp.data
     assert b'importRetryBody' in resp.data
     # Import-in-place's overall counter pauses during discovery/metadata.

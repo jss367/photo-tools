@@ -10651,8 +10651,14 @@ function _lbPrimeAdjacentPhotos(sourceKey) {
     return true;
   });
   if (!candidate) {
-    _lbStartPendingOriginalPreload();
-    if (retryAt != null) _lbScheduleAdjacentPhoto(key, retryAt - now);
+    // A pending neighbor retry has higher priority than the current-photo
+    // original: a slow RAW extraction here would occupy the shared slot for
+    // seconds and force the retry to burn its backoff on our own request.
+    if (retryAt != null) {
+      _lbScheduleAdjacentPhoto(key, retryAt - now);
+    } else {
+      _lbStartPendingOriginalPreload();
+    }
     return;
   }
 

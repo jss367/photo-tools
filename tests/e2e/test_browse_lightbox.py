@@ -2325,6 +2325,71 @@ def test_browse_lightbox_original_waits_for_slow_neighbor_queue(live_server, pag
     assert "prefetch=1" in original_requests[0]
 
 
+def test_browse_lightbox_original_defers_until_neighbor_retry_finishes(live_server, page):
+    """A pending neighbor retry keeps the shared slot free of the original decode."""
+    current_id = live_server["data"]["photos"][0]
+    live_server["db"].conn.execute(
+        "UPDATE photos SET width=4000, height=2000 WHERE id=?", (current_id,),
+    )
+    live_server["db"].conn.commit()
+    full_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="960">'
+        '<rect width="1920" height="960" fill="#274"/></svg>'
+    )
+    held = []
+    failing_url = [None]
+    original_requests = []
+
+    def serve_full(route):
+        """Hold the first neighbor past the dwell, then fail it and its retry."""
+        url = route.request.url
+        if "prefetch=1" in url:
+            if failing_url[0] is None:
+                failing_url[0] = url
+                held.append(route)
+                return
+            if url == failing_url[0]:
+                route.fulfill(status=503, body="Busy")
+                return
+        route.fulfill(body=full_svg, content_type="image/svg+xml")
+
+    def serve_original(route):
+        """Record whether the original competes with a queued retry."""
+        original_requests.append(route.request.url)
+        route.fulfill(body=full_svg, content_type="image/svg+xml")
+
+    page.route("**/photos/*/full*", serve_full)
+    page.route("**/photos/*/original*", serve_original)
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+    # The held first neighbor keeps _lbSpeculativeInFlight busy past the 1.4s
+    # original dwell, so _lbOriginalPreloadWaiting becomes populated but the
+    # original itself has not been requested yet.
+    page.wait_for_function("_lbOriginalPreloadWaiting !== null")
+    assert len(held) == 1
+    # Fail the held neighbor. Its 750ms retry backoff begins while other
+    # neighbors decode quickly. The original must not start while the retry
+    # is still pending, otherwise the retry would waste its backoff on our
+    # own occupied slot.
+    held.pop().fulfill(status=503, body="Busy")
+    page.wait_for_function(
+        "Object.values(_lbAdjacentPreloadRetry).some(retry => retry.count === 1)"
+    )
+    page.wait_for_timeout(400)
+    assert original_requests == [], (
+        "Original decode competed with a pending neighbor retry"
+    )
+    # After the retry attempt itself fires and fails (count === 2), the
+    # failing neighbor is dead and the queue drains; only then may the
+    # original warm the current photo.
+    page.wait_for_function(
+        "Object.values(_lbAdjacentPreloadRetry).some(retry => retry.count === 2)"
+    )
+    page.wait_for_function("_lbOriginalPreload && _lbOriginalPreload.status === 'decoded'")
+    assert len(original_requests) == 1
+    assert "prefetch=1" in original_requests[0]
+
+
 @pytest.mark.parametrize("retired_source", ["full", "original"])
 @pytest.mark.parametrize("action", ["navigate", "zoom", "reopen"])
 def test_browse_lightbox_keeps_pruned_request_in_flight_until_response(

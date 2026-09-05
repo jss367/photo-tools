@@ -450,3 +450,159 @@ def test_settings_import_preserves_queued_workspace_override_save(live_server, p
     assert len(ws_posts) == 2, (
         f"expected 2 workspace POSTs (initial + queued), got {len(ws_posts)}"
     )
+
+
+def test_settings_edit_during_import_suspension_is_saved_on_failure(live_server, page):
+    """An edit made while autosave is suspended for the import must not be lost."""
+    url = live_server["url"]
+    page.goto(f"{url}/settings", timeout=5000)
+    status = _wait_for_settings_idle(page)
+    page.on("dialog", lambda d: d.accept())
+
+    import_routes = []
+    config_posts = []
+
+    def _hold_import(route, request):
+        if request.method == "POST":
+            import_routes.append(route)
+        else:
+            route.continue_()
+
+    page.on(
+        "request",
+        lambda r: config_posts.append(r)
+        if r.url.endswith("/api/config") and r.method == "POST"
+        else None,
+    )
+    page.route("**/api/settings/import", _hold_import)
+
+    page.set_input_files(
+        "#settingsImportInput",
+        {
+            "name": "bad.json",
+            "mimeType": "application/json",
+            "buffer": json.dumps({"classification_threshold": "not a number"}).encode(),
+        },
+    )
+    for _ in range(60):
+        if import_routes:
+            break
+        page.wait_for_timeout(50)
+    assert import_routes, "import POST was never sent"
+
+    # Edit a curated field while the import is stalled: saveConfig() bails
+    # out because _autosaveSuspended is true, but the edit must be
+    # remembered so it is written after the import fails.
+    page.select_option("#cfgKeywordCase", "title")
+    page.wait_for_timeout(700)
+    assert not config_posts, "config POST fired while autosave was suspended"
+
+    import_routes[0].fulfill(
+        status=400,
+        content_type="application/json",
+        body='{"error": "bad"}',
+    )
+
+    expect(status).to_have_attribute("data-state", "saved", timeout=10_000)
+    assert config_posts, "suspended edit was never saved after the import failed"
+    cfg = page.request.get(f"{url}/api/config").json()
+    assert cfg["keyword_case"] == "title"
+
+
+def test_settings_successful_import_clears_prior_save_error(live_server, page):
+    """A prior autosave error must not linger on the pill after a successful import."""
+    url = live_server["url"]
+    page.goto(f"{url}/settings", timeout=5000)
+    status = _wait_for_settings_idle(page)
+    page.on("dialog", lambda d: d.accept())
+
+    def _fail_post(route, request):
+        if request.method == "POST":
+            route.fulfill(
+                status=500,
+                content_type="application/json",
+                body='{"error": "disk full"}',
+            )
+        else:
+            route.continue_()
+
+    page.route("**/api/config", _fail_post)
+    page.select_option("#cfgKeywordCase", "lower")
+    expect(status).to_have_attribute("data-state", "error", timeout=10_000)
+    page.unroute("**/api/config", _fail_post)
+
+    # Import a valid backup: the pill must move out of the error state
+    # (the import replaced the whole config on the server, so the earlier
+    # unsaved autosave no longer describes what is on disk).
+    payload = page.request.get(f"{url}/api/settings/export").json()
+    payload["keyword_case"] = "auto"
+    with page.expect_response("**/api/settings/import"):
+        page.set_input_files(
+            "#settingsImportInput",
+            {
+                "name": "backup.json",
+                "mimeType": "application/json",
+                "buffer": json.dumps(payload).encode(),
+            },
+        )
+    expect(page.locator("#cfgKeywordCase")).to_have_value("auto", timeout=10_000)
+    expect(status).not_to_have_attribute("data-state", "error", timeout=10_000)
+
+
+def test_settings_override_edit_during_resync_survives(live_server, page):
+    """An override edit made while the post-invalid resync GET is in flight is not overwritten."""
+    url = live_server["url"]
+    page.goto(f"{url}/settings", timeout=5000)
+    status = _wait_for_settings_idle(page)
+
+    # Enable the grouping override so blanking it triggers the resync branch.
+    checkbox = page.locator("#wsOverride_grouping_window_seconds")
+    checkbox.check()
+    expect(status).to_have_attribute("data-state", "saved", timeout=10_000)
+    value = page.locator("#wsVal_grouping_window_seconds")
+    expect(value).to_have_value("10")
+
+    # Hold the resync GET so we can edit a DIFFERENT field while the reload
+    # is in flight. A prior implementation used a full loadWsOverrides()
+    # here, which iterated every override and reset the newly checked one
+    # from the server response (still empty), silently losing the edit.
+    held = []
+
+    def _hold_get(route, request):
+        if request.method == "GET":
+            held.append(route)
+        else:
+            route.continue_()
+
+    page.route("**/api/workspaces/active/config", _hold_get)
+    with page.expect_response(
+        lambda r: r.url.endswith("/api/workspaces/active/config")
+        and r.request.method == "POST"
+    ):
+        value.fill("")
+        value.dispatch_event("change")
+        expect(status).to_have_attribute("data-state", "saving")
+
+    for _ in range(40):
+        if held:
+            break
+        page.wait_for_timeout(50)
+    assert held, "resync GET was never requested"
+
+    other_checkbox = page.locator("#wsOverride_similarity_threshold")
+    other_checkbox.check()
+    other_value = page.locator("#wsVal_similarity_threshold")
+    other_value.fill("77")
+    other_value.dispatch_event("change")
+
+    for route in held:
+        route.continue_()
+    page.unroute("**/api/workspaces/active/config", _hold_get)
+
+    # The queued save for the new edit fires after the resync settles;
+    # wait for it so any resync-induced reset would have had time to hit.
+    expect(status).to_have_attribute("data-state", "saved", timeout=10_000)
+    expect(other_checkbox).to_be_checked()
+    expect(other_value).to_have_value("77")
+    overrides = page.request.get(f"{url}/api/workspaces/active/config").json()
+    assert "similarity_threshold" in overrides

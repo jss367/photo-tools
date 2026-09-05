@@ -8010,3 +8010,127 @@ def test_classifier_identity_uses_the_mapping_the_instance_consumed(tmp_path):
         pass
 
     assert with_consumed_label_descriptions(probed, _NoSnapshot()) == probed
+
+
+def test_classify_factory_pause_parks_outside_load_lock_then_retries(
+    tmp_path, monkeypatch,
+):
+    """A pause during classifier construction must unwind the factory (so
+    ``ModelCache._Entry.load_lock`` is released), park the job at its own
+    boundary, and construct again after Resume. Before this, a pause during
+    label-embedding setup was only honored once every embedding had been
+    computed — for a 1255-label set on a loaded machine that meant the
+    "pausing" state lasted hours.
+    """
+    import config as cfg
+    from classifier import ClassifierLoadPaused
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.save_detections(pid, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="megadetector-v6")
+    coll_id = db.add_collection(
+        "c", '[{"field":"photo_ids","value":[' + str(pid) + ']}]',
+    )
+
+    events = []
+
+    class PausingRunner(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.paused = False
+
+        def cancellation_requested(self, job_id):
+            return False
+
+        def pause_requested(self, job_id):
+            return self.paused
+
+        def is_cancelled(self, job_id):
+            # The job's own pause boundary: simulate the user resuming.
+            if self.paused:
+                events.append("park")
+                self.paused = False
+            return False
+
+    runner = PausingRunner()
+
+    fake_weights = tmp_path / "weights"
+    fake_weights.mkdir()
+    (fake_weights / "tol_embeddings.npy").write_bytes(b"stub")
+    (fake_weights / "tol_classes.json").write_bytes(b"[]")
+    import classify_job as cj
+    monkeypatch.setattr(cj, "get_active_model", lambda: {
+        "id": "BioCLIP",
+        "name": "BioCLIP",
+        "model_str": "hf-hub:imageomics/bioclip",
+        "weights_path": str(fake_weights),
+        "model_type": "bioclip",
+        "downloaded": True,
+    })
+
+    class _StopAfterRetry(RuntimeError):
+        pass
+
+    class _StubClassifier:
+        """Behaves like the real constructor's embedding loop: steps down
+        with ClassifierLoadPaused while a pause is pending, otherwise
+        aborts the test run with a distinctive error."""
+
+        def __init__(self, *args, pause_check=None, **kwargs):
+            events.append("construct")
+            if events.count("construct") == 1:
+                # The user clicks Pause while embeddings are computing.
+                runner.paused = True
+            if pause_check is not None and pause_check():
+                raise ClassifierLoadPaused("classifier load paused")
+            raise _StopAfterRetry("stop after the post-resume construction")
+
+    monkeypatch.setattr(cj, "Classifier", _StubClassifier)
+
+    import classifier_cache
+
+    def _tracking_acquire(*, factory, **kwargs):
+        events.append("acquire")
+        return factory()
+
+    monkeypatch.setattr(
+        classifier_cache, "acquire_cached_classifier", _tracking_acquire,
+    )
+
+    job = _make_job()
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None,
+        labels_file=None,
+        model_id=None,
+        model_name="BioCLIP",
+        grouping_window=0,
+        similarity_threshold=0.99,
+        reclassify=False,
+    )
+
+    with pytest.raises(_StopAfterRetry):
+        run_classify_job(job, runner, db_path, ws, params)
+
+    assert events == [
+        "acquire", "construct", "park", "acquire", "construct",
+    ], (
+        "expected: factory steps down for the pause, the job parks with the "
+        "load lock released, then constructs again after Resume; "
+        f"got {events}"
+    )
+    assert runner.paused is False

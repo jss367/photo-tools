@@ -3125,6 +3125,15 @@ def run_classify_job(
                 return probe(job["id"])
             return runner.is_cancelled(job["id"])
 
+        # Non-parking pause probe for the same factory. When it reports a
+        # pause, the classifier checkpoints the label embeddings finished
+        # so far and raises ``ClassifierLoadPaused`` instead of parking
+        # under ``load_lock``; the retry loop below parks at this job's
+        # own boundary and re-enters construction on Resume.
+        def _factory_pause_check():
+            probe = getattr(runner, "pause_requested", None)
+            return bool(probe is not None and probe(job["id"]))
+
         if model_type == "timm":
             if runner.is_cancelled(job["id"]):
                 runner.update_step(
@@ -3167,39 +3176,61 @@ def run_classify_job(
                 )
 
             def _construct_classifier():
+                if _factory_cancel_check():
+                    raise ClassificationCancelled("classification cancelled")
                 return Classifier(
                     labels=None if use_tol else labels,
                     model_str=model_str,
                     pretrained_str=weights_path,
                     embedding_progress_callback=_emb_progress,
                     cancel_check=_factory_cancel_check,
+                    pause_check=_factory_pause_check,
                 )
 
         try:
+            from classifier import ClassifierLoadPaused
             from classifier_cache import acquire_cached_classifier
             from computation_cache import taxonomy_identity
             from resource_ledger import ResourceWaitCancelled
 
-            classifier_cache_handle = acquire_cached_classifier(
-                model_type=model_type,
-                model_str=model_str,
-                weights_path=weights_path,
-                labels=None if use_tol else labels,
-                factory=_construct_classifier,
-                files=active_model.get("files"),
-                # Optional-artifact presence must flip the fingerprint too.
-                # timm declares label_descriptions.json as optional and
-                # TimmClassifier reads it to translate to common names, so
-                # after a Repair downloads it we must not reuse the
-                # pre-repair classifier still emitting scientific names.
-                # bioclip-2.5's ToL artifacts are declared the same way.
-                optional_files=active_model.get("optional_files"),
-                taxonomy_fingerprint=(
-                    taxonomy_identity(tax) if model_type == "timm" else None
-                ),
-                cancel_check=_factory_cancel_check,
-            )
-            clf = classifier_cache_handle.__enter__()
+            while True:
+                try:
+                    classifier_cache_handle = acquire_cached_classifier(
+                        model_type=model_type,
+                        model_str=model_str,
+                        weights_path=weights_path,
+                        labels=None if use_tol else labels,
+                        factory=_construct_classifier,
+                        files=active_model.get("files"),
+                        # Optional-artifact presence must flip the
+                        # fingerprint too. timm declares
+                        # label_descriptions.json as optional and
+                        # TimmClassifier reads it to translate to common
+                        # names, so after a Repair downloads it we must
+                        # not reuse the pre-repair classifier still
+                        # emitting scientific names. bioclip-2.5's ToL
+                        # artifacts are declared the same way.
+                        optional_files=active_model.get("optional_files"),
+                        taxonomy_fingerprint=(
+                            taxonomy_identity(tax)
+                            if model_type == "timm" else None
+                        ),
+                        cancel_check=_factory_cancel_check,
+                    )
+                    clf = classifier_cache_handle.__enter__()
+                    break
+                except ClassifierLoadPaused:
+                    # The factory stepped out of the shared load lock with
+                    # its label embeddings checkpointed. Park here, where
+                    # no lock is held, then construct again: the resumed
+                    # computation continues from the checkpoint. A Cancel
+                    # during the pause surfaces on the retry through the
+                    # factory's own cancel probe.
+                    log.info(
+                        "Classifier load paused; parking until Resume",
+                    )
+                    runner.is_cancelled(job["id"])
+                    continue
         except (ClassificationCancelled, ResourceWaitCancelled):
             # Two cancellation shapes reach here: ``ClassificationCancelled``
             # from ``ModelCache``'s waiter-local cancel probe, and

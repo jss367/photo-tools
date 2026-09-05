@@ -25,7 +25,8 @@ not a checkpoint that survives restarting the application.
 | Import Lightroom catalog keywords | Between photos, after committing completed keyword writes |
 | Verify abandoned import staging folders | During directory enumeration and between files |
 | Scan memory cards, verify archive copies, delete verified card files | During card discovery, between files or archive hash groups |
-| Classify photos | Between photos and stages; shared model construction finishes before pausing |
+| Classify photos | Between photos and stages; label embedding computation checkpoints and releases shared cache locks before pausing |
+| Precompute label embeddings | Between label batches, after saving resumable progress and releasing shared cache locks |
 | Publish a website | During preparation, before the final replacement of published files |
 | Scan folders, repair metadata, import in place, import photos, process pipelines | Existing coordinated checkpoints |
 
@@ -42,7 +43,6 @@ These jobs deliberately remain without Pause in the current implementation:
 | Work | Reason |
 | --- | --- |
 | Download models, taxonomy, or Darktable | Downloads and setup delegate to external downloaders, active network streams, or installation steps. Their progress notifications do not establish a point where all work has stopped. Taxonomy installation also performs large database transactions. Supporting pause requires separate download and installation coordination. |
-| Precompute label embeddings | The computation is shared with other jobs through the embedding cache. Pausing its producer can strand other jobs waiting for the same embeddings. Independent producer ownership or detachment is needed first. |
 | Synchronize metadata to XMP sidecars | A job holds the shared synchronization lock while collecting and writing changes. Parking inside that operation would block other synchronization jobs. The lock and change snapshots need a resumable batch protocol. |
 | Move entire folders | Moves may hold a batch serialization lock and use external transfer tools, followed by catalog rebasing and source cleanup. Pausing requires coordinated transfer and catalog boundaries. Moving selected photos supports pause separately. |
 | Work Locally: stage, synchronize, or discard, for either folders or workspaces | These transitions reserve shared folder or workspace state while switching between remote and local files. An indefinite pause can block other operations or leave a transition pending. |

@@ -827,10 +827,11 @@ def test_storage_page_has_health_cleanup_and_location_controls(app_and_db):
         b'Download again', b'cannot currently be reclaimed separately',
         b'loadMasksCard(s && s.masks)', b'cfgWorkingCopyCacheMaxGb',
         b"{name: 'Working Copies'", b'Oldest files are removed first',
-        b"{name: 'Other Vireo Data'",
+        b'storageBreakdown', b'View files and folders',
     ):
         assert marker in page.data
     assert page.data.count(b"{name: 'Database'") == 1
+    assert b'Other Vireo Data' not in page.data
 
 
 def test_storage_page_confirms_destructive_working_copy_quota_reduction(
@@ -954,6 +955,54 @@ def test_api_storage_counts_unclassified_vireo_root_files_as_other(
     assert after["other"]["path"] == str(tmp_path)
     assert after["other"]["size"] - before["other"]["size"] == len(payload)
     assert after["total"] - before["total"] == len(payload)
+    entries = [entry for category in after["other"]["categories"] for entry in category["entries"]]
+    assert any(
+        entry["path"] == str(tmp_path / "unclassified-vireo-data.bin")
+        and entry["size"] == len(payload) for entry in entries
+    )
+
+
+def test_api_storage_breaks_down_backups_renders_and_nested_cache_files(
+    app_and_db, tmp_path,
+):
+    app, db = app_and_db
+    before = app.test_client().get('/api/storage').get_json()
+    baseline_backups = next(
+        (category["size"] for category in before["other"]["categories"]
+         if category["name"] == "Catalog backups"), 0,
+    )
+    # Different backup conventions should share a category, retaining their
+    # individual paths and sizes so a large snapshot can be identified.
+    Path(f"{db._db_path}.pre-v999.bak").write_bytes(b"a" * 100)
+    Path(f"{db._db_path}.bak-pre-repair").write_bytes(b"b" * 200)
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    (backups / "catalog.db").write_bytes(b"c" * 300)
+    originals = tmp_path / "originals"
+    originals.mkdir()
+    (originals / "1.display.jpg").write_bytes(b"d" * 700)
+    nested = tmp_path / "thumbs" / "nested"
+    nested.mkdir()
+    (nested / "untracked.jpg").write_bytes(b"e" * 50)
+    if os.name != "nt":  # Windows may require privileges to create links.
+        (tmp_path / "linked-originals").symlink_to(originals, target_is_directory=True)
+
+    data = app.test_client().get('/api/storage').get_json()
+    categories = data["other"]["categories"]
+    by_name = {category["name"]: category for category in categories}
+    assert by_name["Catalog backups"]["size"] == baseline_backups + 600
+    backup_sizes = [entry["size"] for entry in by_name["Catalog backups"]["entries"]]
+    assert backup_sizes == sorted(backup_sizes, reverse=True)
+    assert {100, 200, 300}.issubset(backup_sizes)
+    assert by_name["Full-resolution renders"]["size"] == 700
+    entries = {entry["path"]: entry for category in categories for entry in category["entries"]}
+    assert entries[str(tmp_path / "thumbs")]["size"] == 50
+    assert str(db._db_path) not in entries
+    assert str(tmp_path / "linked-originals") not in entries
+    assert data["other"]["size"] == sum(category["size"] for category in categories)
+    assert [category["size"] for category in categories] == sorted(
+        [category["size"] for category in categories], reverse=True,
+    )
 
 
 def test_api_storage_custom_thumb_dir_ignores_unrelated_siblings(
@@ -1024,6 +1073,16 @@ def test_api_storage_custom_thumb_dir_ignores_unrelated_siblings(
         == len(backup_payload)
     )
     assert after_backup["total"] - after_staging["total"] == len(backup_payload)
+    categories = {category["name"]: category for category in after_backup["other"]["categories"]}
+    prior_backup_size = sum(
+        category["size"] for category in after_staging["other"]["categories"]
+        if category["name"] == "Catalog backups"
+    )
+    assert categories["Catalog backups"]["size"] == prior_backup_size + len(backup_payload)
+    assert categories["Import recovery files"]["size"] == len(staged)
+    assert categories["Species reference data"]["size"] == 2 * len(taxonomy_payload)
+    entries = [entry for category in categories.values() for entry in category["entries"]]
+    assert all("unrelated" not in entry["path"] and "pre-vbad" not in entry["path"] for entry in entries)
 
 
 def test_startup_sweeps_abandoned_transient_originals(app_and_db, tmp_path):

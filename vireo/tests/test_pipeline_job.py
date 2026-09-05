@@ -3093,6 +3093,93 @@ def test_pipeline_loops_over_multiple_models(tmp_path, monkeypatch):
     )
 
 
+def test_pipeline_pause_during_classifier_load_parks_and_resumes(
+    tmp_path, monkeypatch,
+):
+    """Pause arriving while the model loader is computing label embeddings
+    must take effect promptly: the factory steps down (checkpointing its
+    progress and releasing the shared load lock), the model_loader
+    participant parks at the pipeline pause gate, and construction runs
+    again after Resume. The run then completes normally.
+    """
+    import classifier as classifier_mod
+    import config as cfg
+    from classifier import ClassifierLoadPaused
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    col_id = db.add_collection("Test", "[]")
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    events = []
+
+    class PausingRunner(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.paused = False
+
+        def cancellation_requested(self, job_id):
+            return False
+
+        def pause_requested(self, job_id):
+            return self.paused
+
+        def mark_paused(self, job_id):
+            return True
+
+        def wait_if_paused(self, job_id, *, publish_paused=False):
+            if self.paused:
+                events.append("park")
+                self.paused = False
+            return False
+
+    class FakeClassifier:
+        def __init__(self, *args, pause_check=None, **kwargs):
+            events.append("construct")
+            if events.count("construct") == 1:
+                # The user clicks Pause while embeddings are computing.
+                runner.paused = True
+            if pause_check is not None and pause_check():
+                # Mirrors the real embedding loop stepping down mid-way.
+                raise ClassifierLoadPaused("classifier load paused")
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_extract_masks=True,
+        skip_regroup=True,
+    )
+    runner = PausingRunner()
+    job = _make_job()
+
+    run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    assert events == ["construct", "park", "construct"], (
+        "the factory must step down for the pause, the loader must park "
+        "outside the load lock, and construction must run again after "
+        f"Resume; got {events}"
+    )
+    assert runner.paused is False
+    assert not job["errors"], job["errors"]
+    model_loader_status = [
+        kwargs.get("status")
+        for (_, step_id, kwargs) in runner.step_updates
+        if step_id == "model_loader"
+    ]
+    assert "completed" in model_loader_status, model_loader_status
+
+
 def test_pipeline_model_ids_back_compat_with_model_id(tmp_path, monkeypatch):
     """A job with only the legacy `model_id` field (no `model_ids`) must still
     load exactly that one model — preserving back-compat with older callers."""

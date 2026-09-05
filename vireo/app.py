@@ -19948,6 +19948,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Comprehensive storage info for the storage management panel."""
         from classifier import CACHE_DIR as EMB_CACHE_DIR
         from models import DEFAULT_MODELS_DIR
+        from storage_breakdown import group_auxiliary_storage
 
         def _dir_stats(path):
             count = 0
@@ -20032,18 +20033,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             (masks["path"], masks_size),
             (hf_cache, hf_size),
         ]
-        named_inside_root = sum(
-            size for path, size in named_storage
-            if _is_within(path, storage_root)
-        )
-
         catalog_root = os.path.dirname(os.path.abspath(db_path))
         if os.path.abspath(storage_root) == catalog_root:
             # In the conventional layout this is Vireo's dedicated data
             # directory. Include taxonomy, logs, SQLite sidecars/backups, and
             # other managed files that do not have their own category.
-            storage_root_size = _dir_size_recursive(storage_root)
-            other_size = max(0, storage_root_size - named_inside_root)
+            try:
+                with os.scandir(storage_root) as entries:
+                    auxiliary_paths = [entry.path for entry in entries]
+            except OSError:
+                auxiliary_paths = []
         else:
             # ``--thumb-dir`` may be any directory (for example
             # /data/thumbs). Its parent is not necessarily owned by Vireo, so
@@ -20096,15 +20095,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     )
             except OSError:
                 pass
-            other_size = 0
-            for path in auxiliary_paths:
-                try:
-                    if os.path.isfile(path):
-                        other_size += os.path.getsize(path)
-                    elif os.path.isdir(path):
-                        other_size += _dir_size_recursive(path)
-                except OSError:
-                    continue
+        other_entries = []
+        measured_paths = []
+        # Measure each top-level auxiliary path once, then remove the bytes
+        # already represented by a named category. This also exposes files
+        # nested in cache folders that their flat/DB-backed counters omit.
+        for path in sorted(set(map(os.path.abspath, auxiliary_paths)), key=len):
+            if any(_is_within(path, parent) for parent in measured_paths):
+                continue
+            # As with os.walk(storage_root), do not follow directory links
+            # into unrelated data or back into an already-counted cache.
+            if os.path.islink(path) and os.path.isdir(path):
+                continue
+            measured_paths.append(path)
+            try:
+                size = (
+                    os.path.getsize(path) if os.path.isfile(path)
+                    else _dir_size_recursive(path)
+                )
+            except OSError:
+                continue
+            accounted = sum(
+                named_size for named_path, named_size in named_storage
+                if _is_within(named_path, path)
+            )
+            remaining = max(0, size - accounted)
+            if remaining:
+                other_entries.append({"path": path, "size": remaining})
+        other_categories = group_auxiliary_storage(other_entries, os.path.abspath(db_path))
+        other_size = sum(category["size"] for category in other_categories)
         total = sum(size for _path, size in named_storage) + other_size
         reclaimable = thumb["size"] + preview["size"] + emb["size"]
 
@@ -20190,7 +20209,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "thumbnails": thumb,
                 "previews": preview,
                 "working_copies": working,
-                "other": {"size": other_size, "path": storage_root},
+                "other": {
+                    "size": other_size, "path": storage_root,
+                    "categories": other_categories,
+                },
                 "embeddings": emb,
                 "models": {"size": models_size, "path": DEFAULT_MODELS_DIR},
                 "hf_cache": {"size": hf_size, "path": hf_cache, "models": hf_models},
@@ -20652,9 +20674,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         if not os.path.isdir(CACHE_DIR):
             return jsonify({"entries": [], "total_size": 0})
+        from embedding_cache import CHECKPOINT_SUFFIX
+
         entries = []
         total_size = 0
         for f in sorted(os.listdir(CACHE_DIR)):
+            if f.endswith(CHECKPOINT_SUFFIX):
+                # Partial progress from a paused or interrupted
+                # computation, not a usable embedding set.
+                continue
             if f.endswith(".npy") or f.endswith(".pt"):
                 fp = os.path.join(CACHE_DIR, f)
                 size = os.path.getsize(fp)
@@ -20768,15 +20796,41 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     },
                 )
 
+            from classifier import ClassifierLoadPaused
+
+            def _pause_requested():
+                return ctx.runner.pause_requested(job["id"])
+
+            def _cancelled():
+                # Pure cancel probe: the pause is handled by the retry
+                # loop below, outside the embedding single-flight, so the
+                # producer never parks while equal-key waiters are joined.
+                return ctx.runner.cancellation_requested(job["id"])
+
             # The shared service loads only the text side and joins an
             # equal-key pipeline/precompute already doing this work.
-            precompute_label_embeddings(
-                labels=labels,
-                model_str=model["model_str"],
-                pretrained_str=model["weights_path"],
-                progress_callback=_progress,
-                cancel_check=lambda: ctx.runner.is_cancelled(job["id"]),
-            )
+            while True:
+                try:
+                    precompute_label_embeddings(
+                        labels=labels,
+                        model_str=model["model_str"],
+                        pretrained_str=model["weights_path"],
+                        progress_callback=_progress,
+                        cancel_check=_cancelled,
+                        pause_check=_pause_requested,
+                    )
+                    break
+                except ClassifierLoadPaused:
+                    # Progress is checkpointed. Park here with no shared
+                    # lock held; the next attempt resumes from the
+                    # checkpoint. A Cancel during the pause surfaces on
+                    # the retry through the cancel probe.
+                    log.info(
+                        "Pre-computing embeddings paused; parking until "
+                        "Resume",
+                    )
+                    ctx.runner.is_cancelled(job["id"])
+                    continue
 
             return {"labels": len(labels), "model": model["name"]}
 
@@ -20787,6 +20841,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "model_id": model_id,
                 "labels_file": labels_file,
             },
+            pausable=True,
             runtime_warning=build_cpu_runtime_warning(
                 "precompute-embeddings",
                 work_units=runtime_warning_work_units(

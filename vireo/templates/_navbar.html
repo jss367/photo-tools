@@ -4769,6 +4769,17 @@ window.vireoUpdatePairSourceControls = function(photoId) {
   });
 };
 
+// Queued grid images display blob URLs; retain the canonical URL for edits
+// and RAW/JPEG switches, and send replacements through the same bounded queue.
+function _vireoRenderedImageSource(img) {
+  return img.getAttribute('data-thumbnail-src') || img.getAttribute('src') || '';
+}
+
+function _vireoSetRenderedImageSource(img, url) {
+  if (img.hasAttribute('data-thumbnail-src')) img.setAttribute('data-thumbnail-src', url);
+  else img.src = url;
+}
+
 function _vireoPairAnchorImage(photoId) {
   var key = String(photoId);
   if (String(_lightboxCurrentId) === key) {
@@ -4785,6 +4796,16 @@ function _vireoPairAnchorStillCurrent(anchor, photoId) {
   var key = String(photoId);
   if (anchor.id === 'lightboxImg') return String(_lightboxCurrentId) === key;
   if (anchor.id === 'detailImg') return String(window._detailPhotoId) === key;
+  if (anchor.hasAttribute('data-thumbnail-src')) {
+    // A source probe can finish after the user scrolls away. The queue will
+    // not load that offscreen anchor, so do not wait for its load event while
+    // leaving the source control permanently pending.
+    var root = document.getElementById('gridContainer');
+    var rect = anchor.getBoundingClientRect();
+    var bounds = root && root.getBoundingClientRect();
+    if (!bounds || !rect.width || !rect.height ||
+        rect.bottom <= bounds.top || rect.top >= bounds.bottom) return false;
+  }
   var card = anchor.closest ? anchor.closest('.grid-card') : null;
   return !card || String(card.getAttribute('data-id')) === key;
 }
@@ -4805,7 +4826,7 @@ function _vireoPairSourceLoadFailed(photoId, requested, anchor, oldSrc) {
   );
   delete _vireoPairPendingSourceByPhoto[key];
   window.vireoUpdatePairSourceControls(photoId);
-  if (anchorStillCurrent && oldSrc) anchor.src = oldSrc;
+  if (anchorStillCurrent && oldSrc) _vireoSetRenderedImageSource(anchor, oldSrc);
   if (anchorStillCurrent && typeof showToast === 'function') {
     showToast('Could not load the ' + requested.toUpperCase() + ' source', 'error');
   }
@@ -4853,7 +4874,7 @@ window.vireoTogglePairSource = function(photoId) {
     ? 'jpeg'
     : 'raw';
   var anchor = _vireoPairAnchorImage(photoId);
-  var oldSrc = anchor ? (anchor.getAttribute('src') || anchor.src || '') : '';
+  var oldSrc = anchor ? _vireoRenderedImageSource(anchor) : '';
   var base = oldSrc ? _vireoBaseRenderedUrl(oldSrc) : '/thumbnails/' + key + '.jpg';
   _vireoBumpRenderVersion(photoId);
   var targetUrl = window.vireoRenderedUrl(base, photoId, requested);
@@ -4876,6 +4897,7 @@ window.vireoTogglePairSource = function(photoId) {
     function cleanup() {
       anchor.removeEventListener('load', loaded);
       anchor.removeEventListener('error', failed);
+      anchor.removeEventListener('vireo:thumbnail-cancelled', cancelled);
     }
     function loaded() {
       cleanup();
@@ -4885,14 +4907,20 @@ window.vireoTogglePairSource = function(photoId) {
       }
       _vireoCommitPairSource(photoId, requested, anchor);
     }
+    function cancelled() {
+      cleanup();
+      _vireoCancelPairSourceChange(photoId, requested);
+      _vireoSetRenderedImageSource(anchor, oldSrc);
+    }
     function failed() {
       cleanup();
       _vireoPairSourceLoadFailed(photoId, requested, anchor, oldSrc);
     }
     anchor.addEventListener('load', loaded);
     anchor.addEventListener('error', failed);
+    anchor.addEventListener('vireo:thumbnail-cancelled', cancelled);
     if (_vireoPairAnchorStillCurrent(anchor, photoId)) {
-      anchor.src = targetUrl;
+      _vireoSetRenderedImageSource(anchor, targetUrl);
     } else {
       cleanup();
       _vireoCancelPairSourceChange(photoId, requested);
@@ -4912,9 +4940,9 @@ window.vireoRefreshPhotoRenders = function(photoIds) {
     idSet[String(id)] = true;
   });
   if (!Object.keys(idSet).length) return;
-  var imgs = document.querySelectorAll('img[src]');
+  var imgs = document.querySelectorAll('img[src], img[data-thumbnail-src]');
   imgs.forEach(function(img) {
-    var attr = img.getAttribute('src') || '';
+    var attr = _vireoRenderedImageSource(img);
     var base = _vireoBaseRenderedUrl(attr);
     Object.keys(idSet).forEach(function(id) {
       if (
@@ -4923,9 +4951,9 @@ window.vireoRefreshPhotoRenders = function(photoIds) {
         base.indexOf('/photos/' + id + '/original') === 0 ||
         base.indexOf('/photos/' + id + '/preview?') === 0
       ) {
-        img.src = window.vireoRenderedUrl
+        _vireoSetRenderedImageSource(img, window.vireoRenderedUrl
           ? window.vireoRenderedUrl(base, id)
-          : _vireoUrlWithRenderVersion(base, id);
+          : _vireoUrlWithRenderVersion(base, id));
       }
     });
   });
@@ -6012,7 +6040,11 @@ function _lbRefreshVisiblePhotoImages(photoId) {
   function refreshImg(img, url) {
     if (!img || refreshed.indexOf(img) !== -1) return;
     refreshed.push(img);
-    img.src = url || thumbUrl;
+    // Route through _vireoSetRenderedImageSource so grid cards update
+    // data-thumbnail-src; the queue then cancels any in-flight fetch and
+    // fetches the new URL under the concurrency limit, preventing a stale
+    // response from overwriting the edited pixels.
+    _vireoSetRenderedImageSource(img, url || thumbUrl);
   }
 
   refreshImg(document.querySelector('.grid-card[data-id="' + photoId + '"] img'));
@@ -7728,7 +7760,7 @@ function _lbRefreshThumbnailCache(photoId, version) {
   var id = String(photoId);
   var refreshedUrl = _lbThumbnailUrl(id, version);
   document.querySelectorAll('img').forEach(function(img) {
-    var rawSrc = img.getAttribute('src') || '';
+    var rawSrc = _vireoRenderedImageSource(img);
     if (!rawSrc) return;
     var url;
     try {
@@ -7737,7 +7769,7 @@ function _lbRefreshThumbnailCache(photoId, version) {
       return;
     }
     if (url.pathname !== '/thumbnails/' + id + '.jpg') return;
-    img.src = refreshedUrl;
+    _vireoSetRenderedImageSource(img, refreshedUrl);
   });
   try {
     document.dispatchEvent(new CustomEvent('vireo:thumbnail-invalidated', {

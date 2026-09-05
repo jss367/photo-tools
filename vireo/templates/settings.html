@@ -1463,26 +1463,7 @@ async function loadWsOverrides() {
     }
     var overrides = await safeFetch('/api/workspaces/active/config', {}, { toast: false });
     ['classification_threshold', 'grouping_window_seconds', 'similarity_threshold', 'detector_confidence'].forEach(function(key) {
-      var checkbox = document.getElementById('wsOverride_' + key);
-      var input = document.getElementById('wsVal_' + key);
-      var ctrl = document.getElementById('wsOverrideCtrl_' + key);
-      if (!checkbox || !input || !ctrl) return;
-      if (overrides[key] !== undefined) {
-        checkbox.checked = true;
-        ctrl.style.display = 'flex';
-        if (key === 'classification_threshold' || key === 'similarity_threshold' || key === 'detector_confidence') {
-          input.value = Math.round(overrides[key] * 100);
-        } else {
-          input.value = overrides[key];
-        }
-        updateWsLabel(key);
-      } else {
-        // Sync removal too — when re-called after a schema-row reset, an
-        // override may have been deleted server-side. Leaving the checkbox
-        // checked would cause the next saveWsConfig to re-add it.
-        checkbox.checked = false;
-        ctrl.style.display = 'none';
-      }
+      _applyWsOverrideField(key, overrides);
     });
     _wsOverridesLoaded = true;
   } catch(e) {
@@ -1491,6 +1472,30 @@ async function loadWsOverrides() {
   }
   _markSettingsInitialLoad('ws');
   return true;
+}
+
+// Show one override row exactly as the server has it.
+function _applyWsOverrideField(key, overrides) {
+  var checkbox = document.getElementById('wsOverride_' + key);
+  var input = document.getElementById('wsVal_' + key);
+  var ctrl = document.getElementById('wsOverrideCtrl_' + key);
+  if (!checkbox || !input || !ctrl) return;
+  if (overrides[key] !== undefined) {
+    checkbox.checked = true;
+    ctrl.style.display = 'flex';
+    if (key === 'classification_threshold' || key === 'similarity_threshold' || key === 'detector_confidence') {
+      input.value = Math.round(overrides[key] * 100);
+    } else {
+      input.value = overrides[key];
+    }
+    updateWsLabel(key);
+  } else {
+    // Sync removal too — when re-called after a schema-row reset, an
+    // override may have been deleted server-side. Leaving the checkbox
+    // checked would cause the next saveWsConfig to re-add it.
+    checkbox.checked = false;
+    ctrl.style.display = 'none';
+  }
 }
 
 function updateWsLabel(key) {
@@ -1587,17 +1592,26 @@ async function _postWsOverrides(gen) {
       // was dropped. If the resync itself fails, the form still shows an
       // unsaved value, so report that as a failed save rather than a
       // false confirmation.
-      var resynced = await loadWsOverrides();
-      if (!resynced) {
+      var current;
+      try {
+        current = await safeFetch('/api/workspaces/active/config', {}, { toast: false });
+      } catch (e) {
         _saveStatusMark('workspace', 'error', gen);
         return;
       }
-      if (typeof showToast === 'function') {
-        showToast(
-          'Blank or invalid override for ' + invalidKeys.join(', ') +
-          ' was not saved; showing the value currently in effect.',
-          'warning'
-        );
+      // Only the omitted fields are restored, and only if no newer
+      // override edit was queued while the GET was in flight: that edit's
+      // save reads the form when its turn comes, so overwriting fields
+      // here would post the server's old value over the user's newer one.
+      if (_saveStatus.pending.workspace === undefined) {
+        invalidKeys.forEach(function(key) { _applyWsOverrideField(key, current); });
+        if (typeof showToast === 'function') {
+          showToast(
+            'Blank or invalid override for ' + invalidKeys.join(', ') +
+            ' was not saved; showing the value currently in effect.',
+            'warning'
+          );
+        }
       }
     }
     _saveStatusMark('workspace', 'ok', gen);
@@ -1639,6 +1653,7 @@ function _nextSaveGen() { return ++_saveGenCounter; }
 var _saveChains = {};
 var _saveChainEpochs = {};
 var _autosaveSuspended = false;
+var _editedWhileSuspended = false;
 function _serializedSave(path, doSave) {
   var epoch = _saveChainEpochs[path] || 0;
   var prev = _saveChains[path] || Promise.resolve();
@@ -2924,7 +2939,12 @@ function saveConfig() {
   // network layer toasts on failure; the next change re-tries. Callers that
   // need to KNOW the write landed (e.g. the NAS wizard, before it tears down
   // its modal) must call _saveConfigNow() directly and await it.
-  if (_autosaveSuspended) return;
+  if (_autosaveSuspended) {
+    // Settings import is replacing the config. Remember that an edit was
+    // made so it can be saved if the import does not go through.
+    _editedWhileSuspended = true;
+    return;
+  }
   clearTimeout(_saveTimer);
   var gen = _nextSaveGen();
   _saveStatusMark('config', 'pending', gen);
@@ -5117,21 +5137,30 @@ async function importSettingsFile(file) {
       }
       break;
     }
+    // The server has committed the import at this point; everything below
+    // is UI refresh. Flag it now so a refresh failure can't be mistaken
+    // for an aborted import (which would re-post the stale form over it).
+    imported = true;
+    // The import is a successful write of the whole global config, so a
+    // failure left over from an earlier autosave no longer describes what
+    // is on disk.
+    _saveStatusMark('config', 'ok', _nextSaveGen());
     await refreshAllSettingsValues();
     renderAllSettings(document.getElementById('allSettingsCategories'));
     filterAllSettings();
     // Curated form posts its own snapshot — repull so a later edit doesn't
     // overwrite imported global values with stale form state.
     await loadConfig();
-    imported = true;
     alert('Settings imported. Workspace overrides preserved.');
   } catch (err) {
     alert('Network error: ' + (err && err.message || err));
   } finally {
     _autosaveSuspended = false;
-    // The import did not replace the config, so the edit we dropped is
-    // still the user's intent and still on screen: save it after all.
-    if (!imported && hadPendingConfigSave) saveConfig();
+    // The import did not replace the config, so the edit we dropped (or
+    // one made while the import was running) is still the user's intent
+    // and still on screen: save it after all.
+    if (!imported && (hadPendingConfigSave || _editedWhileSuspended)) saveConfig();
+    _editedWhileSuspended = false;
   }
 }
 

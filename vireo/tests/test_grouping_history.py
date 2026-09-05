@@ -1,5 +1,6 @@
 """Grouping edits share persistent history with ordinary photo edits."""
 
+import contextlib
 import copy
 import os
 
@@ -288,10 +289,9 @@ def test_cache_only_species_confirm_is_undone_before_older_grouping_edit(app_and
     # Pre-tag every seeded photo with Cardinal so a subsequent confirmation
     # produces no ``newly_tagged`` and no ``keyword_add`` history row.
     for pid in ids:
-        try:
+        # Already-tagged rows raise; ignore.
+        with contextlib.suppress(Exception):
             db.tag_photo(pid, kid, source='manual')
-        except Exception:  # already-tagged rows raise; ignore
-            pass
     db.conn.commit()
 
     _detach(client)

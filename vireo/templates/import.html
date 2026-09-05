@@ -1683,11 +1683,17 @@ function afterMovePathInsideRoot(destination, root) {
 // destination sits inside its local_archive_root. This client-side prefix
 // check mirrors the server's realpath/commonpath validation closely enough
 // for UI gating; the server remains the authority.
+// A root that does not exist on this machine is never eligible, even when
+// the destination is lexically inside it: offering the move there would
+// silently bless a typo'd root (and contradict the Settings "Test
+// connection" warning that says the move won't be offered until the folder
+// exists). The hint names the missing root instead.
 function afterMoveEligibleTargets() {
   const destination = (document.getElementById('destInput').value || '').trim();
   if (!importIsAbsolutePath(destination)) return [];
   return importRemoteTargets.filter(
     (t) => t.local_archive_root
+      && t.local_archive_root_present !== false
       && afterMovePathInsideRoot(destination, t.local_archive_root));
 }
 

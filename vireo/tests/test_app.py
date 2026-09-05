@@ -17497,6 +17497,7 @@ def test_remote_target_test_archive_root_present_is_none_when_unset(
     res = resp.get_json()
     assert res["ok"] is True
     assert res["archive_root"] is None
+    assert res["archive_root_invalid"] is False
     assert res["archive_root_present"] is None
     assert res["message"].startswith("Connection OK \u2014")
 
@@ -17521,6 +17522,29 @@ def test_remote_target_test_missing_archive_root_does_not_mask_ssh_failure(
     assert res["ok"] is False
     assert res["message"] == "SSH connection failed"
     assert res["archive_root_present"] is False
+
+
+def test_remote_target_test_reports_rejected_archive_root(
+    app_and_db, monkeypatch,
+):
+    """A submitted archive root that _coerce_remote_target blanks (relative,
+    or inside mount_path) must not read as "not configured" and get a green
+    result: the save would silently clear it and the chained move would
+    never be offered. Report it as invalid, naming the submitted value."""
+    app, _ = app_and_db
+    _fake_remote_probe(monkeypatch)
+    client = app.test_client()
+    for bad in ("Pictures/Vireo Archive", "/Volumes/Photos/archive"):
+        res = client.post(
+            "/api/remote-targets/test",
+            json=_remote_target_body(local_archive_root=bad)).get_json()
+        assert res["ok"] is True, bad
+        assert res["archive_root_invalid"] is True, bad
+        assert res["archive_root"] == bad
+        assert res["archive_root_present"] is False, bad
+        assert res["message"].startswith("Connection OK, but"), bad
+        assert bad in res["message"]
+        assert "not valid" in res["message"]
 
 
 def test_remote_targets_list_reports_archive_root_presence(
@@ -17570,7 +17594,21 @@ def test_settings_page_test_connection_warns_on_missing_archive_root(
     app, _ = app_and_db
     html = app.test_client().get("/settings").data.decode()
     assert "archive_root_present === false" in html
+    assert "res.archive_root_invalid" in html
     assert "Create folder" in html
+
+
+def test_import_page_after_move_eligibility_requires_existing_root(
+    app_and_db,
+):
+    """A destination lexically inside a root that does not exist must not
+    make the target eligible \u2014 that would offer the chained move through
+    a typo'd root and contradict the Settings warning."""
+    app, _ = app_and_db
+    html = app.test_client().get("/import").data.decode()
+    start = html.index("function afterMoveEligibleTargets()")
+    body = html[start:html.index("}", start)]
+    assert "t.local_archive_root_present !== false" in body
 
 
 def test_import_page_surfaces_destination_errors_and_recovery_actions(

@@ -2439,11 +2439,26 @@ def test_import_after_move_hint_blames_the_right_field(live_server, page):
     )
     expect(hint).to_contain_text("no remote target has a local archive root configured")
 
-    # Fixing the typo in the destination makes the row appear.
+    # A destination lexically inside a root that does not exist still gets
+    # the missing-root hint rather than the move row: the prefix match alone
+    # must not bless a typo'd root.
     page.evaluate(
         """
         () => {
           importRemoteTargets[0].local_archive_root = "/Users/me/Pictures/Vireo Archive";
+          importRemoteTargets[0].local_archive_root_present = false;
+          updateAfterMoveUI();
+        }
+        """
+    )
+    expect(hint).to_be_visible()
+    expect(hint).to_contain_text("does not exist on this machine")
+    expect(page.locator("#afterMoveRow")).to_be_hidden()
+
+    # Once the root exists, the same destination makes the row appear.
+    page.evaluate(
+        """
+        () => {
           importRemoteTargets[0].local_archive_root_present = true;
           updateAfterMoveUI();
         }

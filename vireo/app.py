@@ -24751,12 +24751,28 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         mount = target.get("mount_path")
         res["mount_path"] = mount
         res["mount_present"] = bool(mount and os.path.isdir(mount))
+        # _coerce_remote_target blanks an invalid archive root (relative,
+        # or inside mount_path) rather than rejecting the target, and the
+        # save path does the same. Compare against what was actually
+        # submitted so a rejected root is reported as such instead of
+        # reading as "not configured" and getting a green result.
+        submitted_root = (body.get("local_archive_root") or "").strip()
         archive_root = target.get("local_archive_root") or ""
-        res["archive_root"] = archive_root or None
-        res["archive_root_present"] = _archive_root_present(target)
+        archive_root_invalid = bool(submitted_root and not archive_root)
+        res["archive_root"] = (archive_root or submitted_root) or None
+        res["archive_root_invalid"] = archive_root_invalid
+        res["archive_root_present"] = (
+            False if archive_root_invalid else _archive_root_present(target))
         res["rsync_bin"] = rsync_bin or None
         res["ssh_bin"] = ssh_bin
-        if res.get("ok") and res["archive_root_present"] is False:
+        if res.get("ok") and archive_root_invalid:
+            res["message"] = (
+                f"Connection OK, but the local archive root "
+                f"'{submitted_root}' is not valid: it must be an absolute "
+                f"path on this machine and must not be inside the mount "
+                f"path. Saving will clear it, and the Import page won't "
+                f"offer \"Then move to NAS\" for this target.")
+        elif res.get("ok") and res["archive_root_present"] is False:
             res["message"] = (
                 f"Connection OK, but the local archive root '{archive_root}' "
                 f"does not exist on this machine \u2014 the Import page won't "

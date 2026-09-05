@@ -1759,11 +1759,16 @@ async function testRemoteTarget(i, btn, statusEl) {
     // page can't name later (issue #1377): render it as a warning and offer
     // the one-line fix inline, since the folder is the user's own staging
     // area and creating it is always safe.
-    var archiveRootMissing = !!(res.ok && res.archive_root && res.archive_root_present === false);
-    statusEl.textContent = (res.ok && !archiveRootMissing ? '✓ ' : '⚠ ') + (res.message || '')
+    var archiveRootInvalid = !!(res.ok && res.archive_root_invalid);
+    var archiveRootMissing = !!(res.ok && !archiveRootInvalid && res.archive_root
+      && res.archive_root_present === false);
+    var archiveRootProblem = archiveRootInvalid || archiveRootMissing;
+    statusEl.textContent = (res.ok && !archiveRootProblem ? '✓ ' : '⚠ ') + (res.message || '')
       + (res.mount_path && !res.mount_present
           ? ' (mount path not currently present — fine if the NAS just isn’t mounted right now.)' : '');
-    statusEl.style.color = res.ok && !archiveRootMissing ? 'var(--success, #4caf50)' : 'var(--warning)';
+    statusEl.style.color = res.ok && !archiveRootProblem ? 'var(--success, #4caf50)' : 'var(--warning)';
+    // Only a missing-but-valid root can be fixed by creating it; an invalid
+    // one needs the path changed.
     if (archiveRootMissing) {
       statusEl.appendChild(document.createTextNode(' '));
       var mk = document.createElement('button');

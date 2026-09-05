@@ -1303,3 +1303,26 @@ def test_highlights_api_limits_initial_bucket_and_loads_more(live_server):
     assert chunk["loaded_count"] == 15
     assert chunk["has_more"] is True
     assert len(chunk["photos"]) == 10
+
+
+def test_toolbar_history_refreshes_highlight_species_buckets(live_server, page):
+    _seed_quality_scores_and_species(live_server['db'], live_server['data'])
+    _goto_highlights(page, live_server['url'])
+    expect(page.locator('.bucket-title')).to_have_count(2)
+    ids = live_server['data']['photos'][:3]
+    page.evaluate('''async ids => {
+      await safeFetch('/api/highlights/relabel', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({photo_ids: ids, species: 'Northern Cardinal'})
+      });
+      await loadHighlights();
+    }''', ids)
+    expect(page.locator('.bucket-title').filter(has_text='Northern Cardinal')).to_have_count(1)
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    page.locator('#historyUndoBtn').click()
+    expect(page.locator('#historyRedoBtn')).to_be_enabled()
+    expect(page.locator('.bucket-title').filter(has_text='Northern Cardinal')).to_have_count(0)
+    expect(page.locator('.bucket-title').filter(has_text='Red-tailed Hawk')).to_have_count(1)
+    page.locator('#historyRedoBtn').click()
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    expect(page.locator('.bucket-title').filter(has_text='Northern Cardinal')).to_have_count(1)

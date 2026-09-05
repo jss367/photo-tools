@@ -21079,8 +21079,8 @@ class Database:
             if photo_edit:
                 # A recompute invalidates structure, not the recorded photo edit.
                 self.conn.execute(
-                    "UPDATE edit_history SET action_type = ?, new_value = ? WHERE id = ?",
-                    (photo_edit['action_type'], photo_edit['new_value'], entry_id),
+                    "UPDATE edit_history SET new_value = ? WHERE id = ?",
+                    (json.dumps({'photo_edit': photo_edit, 'photo_only': True}), entry_id),
                 )
                 return
         self.conn.execute("DELETE FROM edit_history WHERE id = ?", (entry_id,))

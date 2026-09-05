@@ -726,3 +726,44 @@ def test_group_flags_leave_pipeline_suggestions_unchanged(app_and_db):
             result = client.get(endpoint).json
             photos = result['results']['photos'] if 'results' in result else result['photos']
             assert {p['id']: p['label'] for p in photos} == expected
+
+
+@pytest.mark.parametrize('undo', [False, True])
+def test_stale_combined_photo_history_retains_writer_lock(app_and_db, monkeypatch, undo):
+    import sqlite3
+
+    from services import grouping_history
+
+    app, db = app_and_db
+    client = app.test_client()
+    ids, before = _seed(db)
+    before['encounters'][0].update(confirmed_species='Sparrow', species_confirmed=True)
+    save_results_raw(before, os.path.dirname(db._db_path), db._ws_id())
+    assert client.post('/api/encounters/species', json={
+        'species': 'Cardinal', 'photo_ids': ids[:2], 'burst_index': 0,
+    }).status_code == 200
+    newer = _load(db)
+    newer['encounters'][0]['bursts'].append({'photo_ids': []})
+    save_results_raw(newer, os.path.dirname(db._db_path), db._ws_id())
+    if not undo:
+        assert client.post('/api/undo').status_code == 200
+    apply = grouping_history.apply_grouping_photo_edit
+    checked = []
+
+    def check_after_photo_write(request_db, entry, items, **kwargs):
+        apply(request_db, entry, items, **kwargs)
+        assert request_db.conn.in_transaction
+        competitor = sqlite3.connect(db._db_path, timeout=0)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match='locked'):
+                competitor.execute('BEGIN IMMEDIATE')
+        finally:
+            competitor.rollback()
+            competitor.close()
+        checked.append(True)
+
+    monkeypatch.setattr(grouping_history, 'apply_grouping_photo_edit', check_after_photo_write)
+    response = client.post('/api/undo' if undo else '/api/redo')
+    assert response.status_code == 200
+    assert checked == [True]
+    assert _load(db) == newer

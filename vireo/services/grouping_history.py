@@ -339,6 +339,13 @@ def restore_grouping_edit(db, entry, *, undo):
     from pipeline import load_results_raw, save_results_raw
     from pipeline_locks import acquire_workspace_regroup
 
+    change = json.loads(entry["new_value"])
+    if change.get("photo_only"):
+        # A stale grouping snapshot was retired; its photo half still uses
+        # the non-committing replay below and the caller's writer transaction.
+        yield
+        return
+
     # Undo already holds the database writer lock. Never wait here: processing
     # takes the regroup lock first and may need the database before releasing
     # it. Ordinary photo undo does not need this lock at all.
@@ -348,7 +355,6 @@ def restore_grouping_edit(db, entry, *, undo):
     try:
         cache_dir = os.path.dirname(db._db_path)
         current = load_results_raw(cache_dir, db._ws_id())
-        change = json.loads(entry["new_value"])
         expected = change["after" if undo else "before"]
         target = change["before" if undo else "after"]
         signature = (lambda value: value) if change.get("label_edit") else _grouping_signature

@@ -33,6 +33,64 @@ def _second_photo(db, photo_id):
     )
 
 
+@pytest.mark.parametrize("phase", ["scan", "thumbnails"])
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+def test_full_import_pauses_between_phases(client_with_photo, monkeypatch, phase, action):
+    import scanner
+    import thumbnails
+
+    app, db, photo_id = client_with_photo
+    photo = db.get_photo(photo_id)
+    source = db.conn.execute(
+        "SELECT path FROM folders WHERE id=?", (photo["folder_id"],),
+    ).fetchone()["path"]
+    previous_count = db.conn.execute("SELECT COUNT(*) FROM collections").fetchone()[0]
+    entered = threading.Event()
+    release = threading.Event()
+    thumbs_started = threading.Event()
+
+    def finish_phase():
+        entered.set()
+        assert release.wait(5)
+
+    def scan(*args, **kwargs):
+        if phase == "scan":
+            finish_phase()
+
+    def generate(*args, **kwargs):
+        thumbs_started.set()
+        if phase == "thumbnails":
+            finish_phase()
+        return {"generated": 1, "skipped": 0, "failed": 0}
+
+    monkeypatch.setattr(scanner, "scan", scan)
+    monkeypatch.setattr(thumbnails, "generate_all", generate)
+    client = app.test_client()
+    runner = app._job_runner
+    response = client.post("/api/jobs/import-full", json={"source": source, "copy": False})
+    assert response.status_code == 200, response.get_json()
+    job_id = response.get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        assert thumbs_started.is_set() == (phase == "thumbnails")
+        assert db.conn.execute("SELECT COUNT(*) FROM collections").fetchone()[0] == previous_count
+        db.conn.execute("UPDATE photos SET rating=3 WHERE id=?", (photo_id,))
+        db.conn.commit()
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        job = wait_for_job_via_client(client, job_id)
+        assert job["status"] == ("completed" if action == "resume" else "cancelled")
+        expected_count = previous_count + (1 if action == "resume" else 0)
+        assert db.conn.execute("SELECT COUNT(*) FROM collections").fetchone()[0] == expected_count
+        if action == "resume":
+            assert job["result"]["collection_id"] is not None
+    finally:
+        release.set()
+        runner.cancel_job(job_id)
+
+
 @pytest.mark.parametrize("action", ["resume", "cancel"])
 def test_card_scan_pauses_during_discovery(app_and_db, monkeypatch, tmp_path, action):
     import card_cleanup

@@ -1413,6 +1413,7 @@ def create_imports_blueprint(
                                    summary=f"{ingest_result.get('copied', 0)} copied")
 
             # Phase 2: Scan to index into DB
+            ctx.checkpoint(job)
             ctx.runner.update_step(job["id"], "scan", status="running")
 
             def scan_cb(current, total):
@@ -1498,6 +1499,7 @@ def create_imports_blueprint(
                                summary=scan_summary)
 
             # Phase 3: Generate thumbnails
+            ctx.checkpoint(job)
             ctx.runner.update_step(job["id"], "thumbnails", status="running")
             ctx.runner.push_event(job["id"], "progress", {
                 "current": 0, "total": 0,
@@ -1525,6 +1527,7 @@ def create_imports_blueprint(
                                summary=thumb_summary(thumb_result))
 
             # Phase 4: Create collection
+            ctx.checkpoint(job)
             ctx.runner.update_step(job["id"], "collection", status="running")
             photo_ids = []
             if copy:

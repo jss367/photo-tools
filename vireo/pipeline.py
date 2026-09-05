@@ -871,6 +871,23 @@ def _photo_species_keysets(photos):
     ]
 
 
+def _shared_confirmed_species(photos):
+    """Species carried by every *tagged* photo, in the first tagged photo's
+    order (empty when the tagged photos share nothing or none is tagged)."""
+    from keyword_normalization import keyword_match_key
+    from pipeline_results import photo_confirmed_species_list
+
+    tagged = [
+        lst for lst in (photo_confirmed_species_list(p) for p in photos) if lst
+    ]
+    if not tagged:
+        return []
+    common = set.intersection(*(
+        {keyword_match_key(s) for s in lst} for lst in tagged
+    ))
+    return [s for s in tagged[0] if keyword_match_key(s) in common]
+
+
 def _photos_uniformly_confirmed(photos):
     """True when every photo is confirmed as the same species *set*."""
     keysets = _photo_species_keysets(photos)
@@ -1080,15 +1097,25 @@ def serialize_results(results):
             enc_confirmed = enc_confirmed_list[0]
             species_confirmed_flag = True
         else:
+            # Mixed/partial encounter. Prefer the species every tagged photo
+            # shares (a frame tagged [Wigeon, Teal] beside one tagged [Teal]
+            # is a Teal encounter with an extra subject on one frame, not a
+            # Wigeon one): that is the honest baseline for the confirm
+            # endpoint's previous_species and for rapid review's apply diff,
+            # and it keeps a flag-only apply from re-tagging the second
+            # frame with a species it never had. Only when the tagged photos
+            # share nothing does the most-frequent primary decide.
+            enc_confirmed = None
+            enc_confirmed_list = _shared_confirmed_species(photos_list)
+            if enc_confirmed_list:
+                enc_confirmed = enc_confirmed_list[0]
             confirmed_set = {s for s in photo_species if s}
-            # For mixed/partial encounters, pick the most frequent confirmed
-            # species, breaking ties by first appearance in photo order. Set
+            # Tie-break the fallback by first appearance in photo order. Set
             # iteration order is not stable across processes, so iterating
             # confirmed_set directly would feed /api/encounters/species an
             # arbitrary previous_species and untag an unpredictable keyword
             # on re-confirm.
-            enc_confirmed = None
-            if confirmed_set:
+            if enc_confirmed is None and confirmed_set:
                 counts = defaultdict(int)
                 first_index = {}
                 for idx, s in enumerate(photo_species):
@@ -1099,7 +1126,7 @@ def serialize_results(results):
                     counts,
                     key=lambda s: (counts[s], -first_index[s]),
                 )
-            enc_confirmed_list = [enc_confirmed] if enc_confirmed else []
+                enc_confirmed_list = [enc_confirmed]
             species_confirmed_flag = False
 
         species_votes = _build_species_predictions(photos_list)

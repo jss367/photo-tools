@@ -3395,3 +3395,28 @@ def test_serialize_results_partial_second_species_not_confirmed(tmp_path):
         for burst in enc.get("bursts", []):
             if set(burst["photo_ids"]) == burst_ids:
                 assert burst["species_override"] is None
+
+
+def test_serialize_results_mixed_encounter_baseline_is_shared_species(tmp_path):
+    """One frame [Wigeon, Teal] beside frames [Teal]: the encounter is not
+    uniformly confirmed, but its recorded list is the shared Teal, not the
+    alphabetically-first Wigeon of one frame."""
+    from pipeline import load_photo_features, run_full_pipeline, serialize_results
+
+    db, ids = _setup_db_with_photos(tmp_path)
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    wigeon = db.add_keyword("American Wigeon", is_species=True)
+    for pid in ids[0]:
+        db.tag_photo(pid, teal)
+    db.tag_photo(ids[0][0], wigeon)
+
+    serialized = serialize_results(run_full_pipeline(load_photo_features(db)))
+    burst_ids = set(ids[0])
+    enc = next(e for e in serialized["encounters"] if burst_ids <= set(e["photo_ids"]))
+    if set(enc["photo_ids"]) == burst_ids:
+        assert enc["species_confirmed"] is False
+        assert enc["confirmed_species"] == "Green-winged Teal"
+        assert enc["confirmed_species_list"] == ["Green-winged Teal"]
+    for burst in enc.get("bursts", []):
+        if set(burst["photo_ids"]) == burst_ids:
+            assert burst["species_override"] is None

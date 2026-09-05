@@ -1711,3 +1711,52 @@ def test_rapid_review_flag_only_apply_keeps_mixed_frames_second_species(live_ser
     saved = {p["id"]: p for p in save_payloads[-1]["photos"]}
     assert saved[1]["confirmed_species_list"] == ["American Wigeon", "Green-winged Teal"]
     assert saved[2]["confirmed_species_list"] == ["American Wigeon"]
+
+
+def test_rapid_review_partial_species_failure_keeps_applied_changes_and_reports(live_server, page):
+    """[A, B] → [C, D] is two replace requests. If the second fails, the first
+    stays applied (it was its own server transaction), the cache mirrors the
+    server's list from the successful response, and the user is told which
+    change did not land instead of the apply silently returning false."""
+    species_payloads = []
+    save_payloads = []
+    results = _two_species_results()
+    _mock_pipeline_rapid_review(
+        page, results=results, state_photos=_two_species_state(),
+        species_payloads=species_payloads, save_payloads=save_payloads,
+    )
+    calls = {"n": 0}
+
+    def flaky_species(route):
+        calls["n"] += 1
+        species_payloads.append(route.request.post_data_json)
+        if calls["n"] == 1:
+            route.fulfill(json={
+                "ok": True,
+                "species_list": ["Gadwall", "Green-winged Teal"],
+                "encounters": results["encounters"],
+                "summary": results["summary"],
+            })
+        else:
+            route.fulfill(status=500, json={"error": "boom"})
+
+    page.route("**/api/encounters/species", flaky_species)
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+
+    _fill_species_and_settle(page, "Gadwall, Mallard")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+
+    assert [(p["species"], p.get("previous_species")) for p in species_payloads] == [
+        ("Gadwall", "American Wigeon"),
+        ("Mallard", "Green-winged Teal"),
+    ]
+    expect(page.locator("#toastContainer [role=\"alert\"]").last).to_contain_text(
+        'replacing "Green-winged Teal" with "Mallard"'
+    )
+    saved = {p["id"]: p for p in save_payloads[-1]["photos"]}
+    for pid in (1, 2, 3):
+        assert saved[pid]["confirmed_species_list"] == ["Gadwall", "Green-winged Teal"]
+    # Apply is usable again and the field reflects server truth after reload.
+    expect(page.locator("#applyBtn")).to_be_enabled()

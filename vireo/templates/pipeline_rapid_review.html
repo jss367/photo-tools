@@ -2096,15 +2096,28 @@ async function applyCurrent(openNext) {
       // dedupes by keyword identity; each response carries the authoritative
       // list, and the last one is what the burst actually holds.
       var confirmedSpeciesList = null;
+      // Each request is its own server transaction (keywords + cache), so a
+      // failure part-way leaves the earlier changes applied. Rather than
+      // pretend atomicity, stop at the first failure, keep the server's
+      // truth for what did land, and say exactly which changes did not.
+      var speciesFailure = null;
+      var appliedRequests = [];
       for (var ri = 0; ri < speciesRequests.length; ri++) {
-      var spResp = await safeFetch('/api/encounters/species', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(Object.assign({
-          photo_ids: burstPhotoIds,
-          burst_index: burstIndex,
-        }, speciesRequests[ri])),
-      });
+      var spResp;
+      try {
+        spResp = await safeFetch('/api/encounters/species', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(Object.assign({
+            photo_ids: burstPhotoIds,
+            burst_index: burstIndex,
+          }, speciesRequests[ri])),
+        });
+      } catch (err) {
+        speciesFailure = { index: ri, error: err };
+        break;
+      }
+      appliedRequests.push(speciesRequests[ri]);
       // Adopt the authoritative structure (the endpoint may auto-detach on a
       // species mismatch), so the save-cache below doesn't clobber its restructure.
       if (spResp && Array.isArray(spResp.species_list)) {
@@ -2143,11 +2156,43 @@ async function applyCurrent(openNext) {
       // species" locally until reload (the catch path doesn't roll it back).
       // Persist the server-normalized list (not the raw field text) so the
       // cache never claims a spelling or a duplicate the database lacks.
-      var mirrored = confirmedSpeciesList || targetList;
-      items.forEach(function(p) {
-        p.confirmed_species_list = mirrored.slice();
-        p.confirmed_species = mirrored[0] || null;
+      // Merge rather than overwrite: a frame may carry a species the burst as
+      // a whole does not (a mixed burst), and the server never touched it —
+      // only species this apply removed or replaced away are dropped.
+      var touchedKeys = {};
+      appliedRequests.forEach(function(req) {
+        if (req.remove) touchedKeys[speciesKey(req.species)] = true;
+        if (req.previous_species) touchedKeys[speciesKey(req.previous_species)] = true;
       });
+      if (appliedRequests.length) {
+        var serverList = confirmedSpeciesList || (speciesFailure ? null : targetList);
+        items.forEach(function(p) {
+          if (!serverList) return;
+          var serverKeys = {};
+          serverList.forEach(function(name) { serverKeys[speciesKey(name)] = true; });
+          var extras = photoSpeciesList(p).filter(function(name) {
+            var key = speciesKey(name);
+            return !serverKeys[key] && !touchedKeys[key];
+          });
+          var merged = serverList.concat(extras);
+          p.confirmed_species_list = merged.slice();
+          p.confirmed_species = merged[0] || null;
+        });
+      }
+      if (speciesFailure) {
+        var failedReq = speciesRequests[speciesFailure.index];
+        var failedWhat = failedReq.remove
+          ? 'removing "' + failedReq.species + '"'
+          : failedReq.previous_species
+            ? 'replacing "' + failedReq.previous_species + '" with "' + failedReq.species + '"'
+            : 'adding "' + failedReq.species + '"';
+        var remaining = speciesRequests.length - speciesFailure.index;
+        var applied = appliedRequests.length;
+        var msg = 'Species change failed while ' + failedWhat + '. '
+          + (applied ? applied + ' earlier ' + rapidPlural(applied, 'change') + ' stayed applied; ' : '')
+          + remaining + ' ' + rapidPlural(remaining, 'change') + ' not applied. The field now shows what the server holds.';
+        if (typeof showToast === 'function') showToast(msg, 'error');
+      }
     }
     updateSummaryFromPhotos();
     await safeFetch('/api/pipeline/save-cache', {

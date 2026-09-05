@@ -2983,6 +2983,68 @@ def test_import_remote_selection_does_not_migrate_to_preexisting_twin(
     expect(banner).to_contain_text('"NAS a" is no longer configured')
 
 
+def test_import_slow_initial_target_load_does_not_overwrite_newer_refresh(
+    live_server, page,
+):
+    """The initial /api/remote-targets request and a background refresh
+    can be in flight together. If the target changed in between and the
+    older (initial) response lands last, it must be discarded rather than
+    overwrite the newer snapshot the page already applied."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+    state = {"calls": 0, "held": None}
+
+    def body(root):
+        return json.dumps({
+            "rsync_available": True,
+            "ssh_available": True,
+            "targets": [{
+                "id": "nas1", "name": "Photo NAS", "user": "photo",
+                "host": "nas.local", "remote_path": "/volume1/Photography",
+                "mount_path": "/Volumes/Photography",
+                "local_archive_root": root, "local_archive_root_present": True,
+            }],
+        })
+
+    def remote_targets(route):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            # Hold the initial load; it will be answered (stale) later.
+            state["held"] = route
+            return
+        route.fulfill(status=200, content_type="application/json",
+                      body=body("/Users/me/Pictures/Vireo Archive"))
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    # The hint (no targets known yet) triggers the refresh, which completes
+    # first with the current configuration.
+    expect(page.locator("#afterMoveRow")).to_be_visible(timeout=10000)
+    assert state["held"] is not None
+
+    # Now the delayed initial response arrives with the OLD root.
+    state["held"].fulfill(status=200, content_type="application/json",
+                          body=body("/Users/me/Pictures/Vireo_Archive"))
+    page.wait_for_timeout(700)
+
+    assert page.evaluate("importRemoteTargets[0].local_archive_root") == (
+        "/Users/me/Pictures/Vireo Archive"
+    )
+    expect(page.locator("#afterMoveRow")).to_be_visible()
+    expect(page.locator("#afterMoveUnavailable")).to_be_hidden()
+
+
 def test_import_new_workspace_shows_target_default_in_after_import_display(
     live_server, page
 ):

@@ -1087,7 +1087,15 @@ function onImportDestModeChange() {
 // SMB mount) must settle either way: an unbounded background fetch would
 // leave its in-flight flag set forever and every later trigger would be
 // swallowed until a reload.
+// Requests are numbered so a response can never overwrite state applied
+// from a newer request: the initial load and a background refresh can be
+// in flight together (a slow first load while the user fills in enough of
+// the form to show the after-move hint), and if Settings changes a target
+// in between, the older snapshot must lose regardless of arrival order.
+let _remoteTargetsRequestSeq = 0;
+let _remoteTargetsAppliedSeq = 0;
 async function fetchImportRemoteTargets() {
+  const seq = ++_remoteTargetsRequestSeq;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 10000);
   let resp;
@@ -1097,7 +1105,11 @@ async function fetchImportRemoteTargets() {
     clearTimeout(timer);
   }
   if (!resp.ok) throw new Error('remote targets unavailable');
-  return await resp.json();
+  return { seq, data: await resp.json() };
+}
+
+function remoteTargetsResponseIsStale(res) {
+  return !res || res.seq < _remoteTargetsAppliedSeq;
 }
 
 // Apply a successful response: the target list AND the tool availability
@@ -1106,7 +1118,9 @@ async function fetchImportRemoteTargets() {
 // while repopulating the dropdown would block the very SSH destinations it
 // just restored.
 let _previousRemoteTargets = [];
-function applyImportRemoteTargets(data) {
+function applyImportRemoteTargets(res) {
+  const data = res.data;
+  _remoteTargetsAppliedSeq = Math.max(_remoteTargetsAppliedSeq, res.seq);
   _previousRemoteTargets = importRemoteTargets;
   importRemoteTargets = (data && data.targets) || [];
   importRsyncAvailable = !!(data && data.rsync_available);
@@ -1150,7 +1164,11 @@ async function loadImportRemoteTargets() {
   // over a transient failure.
   let failed = false;
   try {
-    applyImportRemoteTargets(await fetchImportRemoteTargets());
+    const res = await fetchImportRemoteTargets();
+    // A newer refresh already applied a later snapshot: this one is
+    // history, and applying it would show a configuration Start won't use.
+    if (remoteTargetsResponseIsStale(res)) return;
+    applyImportRemoteTargets(res);
   } catch (e) {
     failed = true;
   }
@@ -1868,8 +1886,10 @@ function refreshAfterMoveTargets() {
     return;
   }
   _afterMoveTargetsRefresh = fetchImportRemoteTargets()
-    .then((data) => {
+    .then((res) => {
       _afterMoveTargetsCheckedAt = Date.now();
+      if (remoteTargetsResponseIsStale(res)) return;
+      const data = res.data;
       if (!data || !Array.isArray(data.targets)) return;
       // Replace the list rather than merging by id: a legacy entry saved
       // without an id gets a synthesized id here but a generated one once
@@ -1884,7 +1904,7 @@ function refreshAfterMoveTargets() {
       // A success after a failed initial load is a recovery: apply it in
       // full (tools, banner) exactly as the Retry link would.
       if (listChanged || capsChanged || remoteTargetsLoadFailed()) {
-        applyImportRemoteTargets(data);
+        applyImportRemoteTargets(res);
         renderRemoteTargetsError(false);
         renderImportDestModes();
       }

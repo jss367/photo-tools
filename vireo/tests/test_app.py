@@ -17758,6 +17758,10 @@ def test_import_page_after_move_eligibility_requires_existing_root(
     assert "function fetchImportRemoteTargets()" in html
     assert "_afterMoveTargetsRefresh = fetchImportRemoteTargets()" in html
     assert html.count("applyImportRemoteTargets(") >= 3
+    # Responses carry a sequence number; an older one never overwrites
+    # state applied from a newer request, whichever arrives first.
+    assert "function remoteTargetsResponseIsStale(res)" in html
+    assert html.count("remoteTargetsResponseIsStale(res)") >= 3
     assert "renderRemoteTargetsError(false);" in html
     # Returning to the tab re-evaluates the gate.
     assert "document.addEventListener('visibilitychange', _afterMoveOnReturn);" in html

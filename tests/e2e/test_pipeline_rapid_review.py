@@ -1567,3 +1567,47 @@ def test_rapid_review_shrinking_and_swapping_removes_before_replacing(live_serve
         ("Green-winged Teal", True, None),
         ("Gadwall", None, "American Wigeon"),
     ]
+
+
+def test_rapid_review_non_ascii_case_pair_is_treated_as_distinct(live_server, page):
+    """A burst holding two keywords that differ only by non-ASCII case
+    (``Éclair`` vs ``éclair``) must diff them as distinct species, matching
+    the backend's ASCII-only ``keyword_match_key``. JS ``toLowerCase()`` would
+    fold both to one key, so dropping the lowercase one from the field would
+    silently omit the ``remove`` from the plan and leave the DB tag attached."""
+    species_payloads = []
+    results = _two_species_results()
+    both = ["Éclair", "éclair"]
+    for p in results["photos"]:
+        p["confirmed_species"] = both[0]
+        p["confirmed_species_list"] = list(both)
+    enc = results["encounters"][0]
+    enc["confirmed_species"] = both[0]
+    enc["confirmed_species_list"] = list(both)
+    enc["bursts"][0]["species_override"] = {
+        "species": both[0], "confirmed": True, "species_list": list(both),
+    }
+    keyword_map = {both[0]: True, both[1]: True}
+    state = {
+        str(pid): {
+            "flag": "none", "has_species_keyword": True, "has_species_keywords": dict(keyword_map),
+        }
+        for pid in (1, 2, 3)
+    }
+    _mock_pipeline_rapid_review(page, results=results, state_photos=state, species_payloads=species_payloads)
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("Éclair, éclair")
+
+    # Drop the lowercase entry only. The ASCII-only key fold keeps the two
+    # names distinct, so the diff produces exactly one remove scoped to the
+    # lowercase name — not a silent no-op.
+    _fill_species_and_settle(page, "Éclair")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Set species")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+    assert len(species_payloads) == 1, species_payloads
+    body = species_payloads[0]
+    assert body["species"] == "éclair"
+    assert body.get("remove") is True
+    assert "add" not in body
+    assert "previous_species" not in body

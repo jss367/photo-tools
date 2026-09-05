@@ -1103,7 +1103,7 @@ async function loadImportRemoteTargets() {
     if (!resp.ok) throw new Error('remote targets unavailable');
     const data = await resp.json();
     importRemoteTargets = (data && data.targets) || [];
-    _archiveRootPresenceCheckedAt = Date.now();
+    _afterMoveTargetsCheckedAt = Date.now();
     importRsyncAvailable = !!(data && data.rsync_available);
     importSshAvailable = !!(data && data.ssh_available);
   } catch (e) {
@@ -1732,61 +1732,67 @@ function afterMoveUnavailableReason(destination) {
     + 'it, or change the root under Settings › Remote targets. ';
 }
 
-// local_archive_root_present is a snapshot taken when the target list was
-// loaded. If the user creates the folder mid-session (Finder, the native
-// destination picker, or the Settings "Create folder" button in another
-// tab), the gate must not keep claiming it is missing until a full reload.
-// Whenever the gate is about to blame a missing root, re-fetch presence —
-// throttled so typing in the destination field doesn't hammer the server —
-// and re-render if anything changed.
-let _archiveRootPresenceRefresh = null;
-let _archiveRootPresenceCheckedAt = 0;
-let _archiveRootPresenceTimer = null;
-let _archiveRootPresenceRerun = false;
-const ARCHIVE_ROOT_PRESENCE_TTL_MS = 5000;
-function refreshArchiveRootPresence() {
-  if (_archiveRootPresenceRefresh) {
+// The target list (and with it local_archive_root / _present) is a
+// snapshot taken when the page loaded. The hint below sends the user to
+// Settings to fix the root, or to Finder / the picker to create the folder;
+// both happen while this page stays open, so the gate must not keep
+// judging against stale data until a full reload. Whenever the unavailable
+// hint is rendered, re-fetch the targets — throttled so typing in the
+// destination field doesn't hammer the server — merge each refreshed entry
+// over the one we hold, and re-render if anything the gate reads changed.
+let _afterMoveTargetsRefresh = null;
+let _afterMoveTargetsCheckedAt = 0;
+let _afterMoveTargetsTimer = null;
+let _afterMoveTargetsRerun = false;
+const AFTER_MOVE_TARGETS_TTL_MS = 5000;
+function afterMoveTargetKey(t) {
+  return JSON.stringify([t.id, t.name, t.local_archive_root, t.local_archive_root_present]);
+}
+function refreshAfterMoveTargets() {
+  if (_afterMoveTargetsRefresh) {
     // A trigger arrived mid-fetch; the in-flight result predates it, so
     // run once more when it lands (the throttle will space it out).
-    _archiveRootPresenceRerun = true;
+    _afterMoveTargetsRerun = true;
     return;
   }
-  const wait = ARCHIVE_ROOT_PRESENCE_TTL_MS - (Date.now() - _archiveRootPresenceCheckedAt);
+  const wait = AFTER_MOVE_TARGETS_TTL_MS - (Date.now() - _afterMoveTargetsCheckedAt);
   if (wait > 0) {
     // Throttled — but never drop the trigger. The native picker fires a
     // single input event; if the user created and picked the folder within
     // the TTL of the last check, that one event is the only signal we get,
     // so schedule a trailing refresh for when the window expires.
-    if (!_archiveRootPresenceTimer) {
-      _archiveRootPresenceTimer = setTimeout(() => {
-        _archiveRootPresenceTimer = null;
-        refreshArchiveRootPresence();
+    if (!_afterMoveTargetsTimer) {
+      _afterMoveTargetsTimer = setTimeout(() => {
+        _afterMoveTargetsTimer = null;
+        refreshAfterMoveTargets();
       }, wait);
     }
     return;
   }
-  _archiveRootPresenceRefresh = fetch('/api/remote-targets')
+  _afterMoveTargetsRefresh = fetch('/api/remote-targets')
     .then((r) => (r.ok ? r.json() : null))
     .then((data) => {
-      _archiveRootPresenceCheckedAt = Date.now();
+      _afterMoveTargetsCheckedAt = Date.now();
       if (!data || !Array.isArray(data.targets)) return;
       const fresh = new Map(data.targets.map((t) => [t.id, t]));
       let changed = false;
       importRemoteTargets.forEach((t) => {
         const f = fresh.get(t.id);
-        if (f && f.local_archive_root_present !== t.local_archive_root_present) {
-          t.local_archive_root_present = f.local_archive_root_present;
-          changed = true;
-        }
+        if (!f) return;
+        const before = afterMoveTargetKey(t);
+        // Merge the whole entry: a corrected local_archive_root (the fix
+        // the hint advertises) matters as much as the folder appearing.
+        Object.assign(t, f);
+        if (afterMoveTargetKey(t) !== before) changed = true;
       });
       if (changed) updateAfterMoveUI();
     })
     .catch(() => {})
     .finally(() => {
-      _archiveRootPresenceRefresh = null;
-      if (_archiveRootPresenceRerun) {
-        _archiveRootPresenceRerun = false;
-        refreshArchiveRootPresence();
+      _afterMoveTargetsRefresh = null;
+      if (_afterMoveTargetsRerun) {
+        _afterMoveTargetsRerun = false;
+        refreshAfterMoveTargets();
       }
     });
 }
@@ -1818,9 +1824,7 @@ function updateAfterMoveUI() {
     // judge — an empty or relative destination isn't decidable yet.
     const destination = (document.getElementById('destInput').value || '').trim();
     if (importIsAbsolutePath(destination)) {
-      if (importRemoteTargets.some((t) => t.local_archive_root_present === false)) {
-        refreshArchiveRootPresence();
-      }
+      refreshAfterMoveTargets();
       unavailable.textContent = 'Move to NAS unavailable: ' + afterMoveUnavailableReason(destination);
       const setup = document.createElement('a');
       setup.href = '/settings#nas-setup';

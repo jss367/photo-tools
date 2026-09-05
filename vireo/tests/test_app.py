@@ -17609,10 +17609,12 @@ def test_import_page_after_move_eligibility_requires_existing_root(
     start = html.index("function afterMoveEligibleTargets()")
     body = html[start:html.index("}", start)]
     assert "t.local_archive_root_present !== false" in body
-    # Presence is re-checked (throttled) whenever the gate blames a missing
-    # root, so creating the folder mid-session does not require a reload.
-    assert "function refreshArchiveRootPresence()" in html
-    assert "refreshArchiveRootPresence();" in html
+    # Targets are re-fetched (throttled) whenever the unavailable hint
+    # renders and merged whole, so creating the folder or correcting the
+    # root in Settings mid-session does not require a reload.
+    assert "function refreshAfterMoveTargets()" in html
+    assert "refreshAfterMoveTargets();" in html
+    assert "Object.assign(t, f);" in html
 
 
 def test_import_page_surfaces_destination_errors_and_recovery_actions(

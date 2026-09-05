@@ -2549,7 +2549,7 @@ def test_import_after_move_recovers_when_archive_root_is_created(
 
     # The folder now exists on disk. Touch the destination once, like the
     # native picker does — a single input event, no reload. This lands
-    # inside the presence throttle window that started at page load, which
+    # inside the refresh throttle window that started at page load, which
     # is exactly the case where the one trigger must not be dropped: the
     # refresh is deferred to the end of the window, not skipped.
     state["present"] = True
@@ -2558,6 +2558,64 @@ def test_import_after_move_recovers_when_archive_root_is_created(
     expect(row).to_be_visible(timeout=10000)
     expect(hint).to_be_hidden()
     assert state["fetches"] >= 2
+
+
+def test_import_after_move_recovers_when_archive_root_is_corrected(
+    live_server, page,
+):
+    """The hint sends the user to Settings to fix a typo'd root. Doing so
+    in another tab must be picked up by the still-open Import page: the
+    refreshed target entry is merged whole, not just its presence flag."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+    state = {"root": "/Users/me/Pictures/Vireo_Archive", "present": False}
+
+    def remote_targets(route):
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": [{
+                    "id": "nas1",
+                    "name": "Photo NAS",
+                    "user": "photo",
+                    "host": "nas.local",
+                    "remote_path": "/volume1/Photography",
+                    "mount_path": "/Volumes/Photography",
+                    "local_archive_root": state["root"],
+                    "local_archive_root_present": state["present"],
+                }],
+            }),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    hint = page.locator("#afterMoveUnavailable")
+    row = page.locator("#afterMoveRow")
+    expect(hint).to_contain_text("Vireo_Archive — does not exist on this machine")
+    expect(row).to_be_hidden()
+
+    # The user fixes the underscore in Settings (another tab) and comes back
+    # to the destination field.
+    state["root"] = "/Users/me/Pictures/Vireo Archive"
+    state["present"] = True
+    page.locator("#destInput").dispatch_event("input")
+
+    expect(row).to_be_visible(timeout=10000)
+    expect(hint).to_be_hidden()
 
 
 def test_import_new_workspace_shows_target_default_in_after_import_display(

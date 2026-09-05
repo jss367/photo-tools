@@ -813,8 +813,15 @@ function burstIds(burst) {
 // (confirmed_species_list, species_override.species_list). The species field
 // edits the whole set: comma-separated names, compared case-insensitively.
 
+// Identity key for comparing species names. Mirrors the backend's
+// keyword_match_key: whitespace-collapsed and ASCII-only case folded, the
+// same equivalence SQLite's NOCASE gives add_keyword(). A Unicode-aware
+// toLowerCase() would merge names the database keeps distinct (Éclair vs
+// éclair) and make a replace/remove skip the tag it should drop.
 function speciesKey(name) {
-  return (name || '').trim().toLowerCase();
+  return (name || '').trim().replace(/\s+/g, ' ').replace(/[A-Z]/g, function(ch) {
+    return ch.toLowerCase();
+  });
 }
 
 // Split the field into names. Names are separated by commas or semicolons;

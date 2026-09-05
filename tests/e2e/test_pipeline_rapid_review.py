@@ -1641,3 +1641,33 @@ def test_rapid_review_mirrors_server_normalized_species_onto_cache(live_server, 
     for pid in (1, 2, 3):
         assert saved[pid]["confirmed_species_list"] == ["American Wigeon", "Say's Phoebe"]
         assert saved[pid]["confirmed_species"] == "American Wigeon"
+
+
+def test_rapid_review_prefill_ignores_candidate_override_under_confirmed_encounter(live_server, page):
+    """A detach-time candidate override (confirmed: false) on a burst whose
+    encounter is confirmed must not prefill the field: the burst's species
+    is the encounter's, so a flag-only apply sends no species request."""
+    species_payloads = []
+    results = _two_species_results()
+    for p in results["photos"]:
+        p["confirmed_species"] = "American Wigeon"
+        p["confirmed_species_list"] = ["American Wigeon"]
+    enc = results["encounters"][0]
+    enc["confirmed_species"] = "American Wigeon"
+    enc["confirmed_species_list"] = ["American Wigeon"]
+    enc["bursts"][0]["species_override"] = {"species": "Gadwall", "confirmed": False}
+    state = {
+        str(pid): {"flag": "none", "has_species_keyword": True,
+                   "has_species_keywords": {"American Wigeon": True}}
+        for pid in (1, 2, 3)
+    }
+    _mock_pipeline_rapid_review(page, results=results, state_photos=state, species_payloads=species_payloads)
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: no DB changes")
+
+    page.keyboard.press("p")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Flag 1")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+    assert species_payloads == []

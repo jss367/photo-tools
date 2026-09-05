@@ -888,11 +888,19 @@ function overrideSpeciesList(ovr) {
   return ovr.species ? [ovr.species] : [];
 }
 
-// An override with an explicit species_list (even an empty one, after the
-// burst's last species was removed) is authoritative; a null override or a
-// legacy override without a species inherits the encounter.
+// An override speaks for the burst's confirmed set only when it is
+// confirmed, or when it is the explicit-empty sentinel a remove leaves
+// behind ({confirmed: false, species_list: []}). A detach-time candidate
+// ({confirmed: false, species: guess}) is a display hint: it must never
+// outrank the encounter's confirmed species, or a flag-only apply would
+// "replace" the encounter species with the guess. Mirrors the backend's
+// burst_species_list() and applyCurrent()'s alreadyConfirmedList.
 function overrideIsExplicit(ovr) {
-  return !!ovr && (Array.isArray(ovr.species_list) || !!ovr.species);
+  if (!ovr) return false;
+  if (Array.isArray(ovr.species_list)) {
+    return ovr.confirmed === true || ovr.species_list.length === 0;
+  }
+  return ovr.confirmed === true && !!ovr.species;
 }
 
 function encounterConfirmedList(enc) {
@@ -906,6 +914,10 @@ function burstSpeciesList(enc, burst) {
   if (overrideIsExplicit(ovr)) return overrideSpeciesList(ovr);
   var confirmed = encounterConfirmedList(enc);
   if (confirmed.length) return confirmed;
+  // Nothing confirmed anywhere: an unconfirmed candidate override is still
+  // the best prefill hint, ahead of the encounter's predicted label.
+  var candidate = overrideSpeciesList(ovr);
+  if (candidate.length) return candidate;
   if (enc && enc.species && enc.species.length && enc.species[0]) return [enc.species[0]];
   return [];
 }

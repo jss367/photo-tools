@@ -22902,6 +22902,21 @@ def test_encounter_species_replace_rejects_unknown_previous(app_and_db):
     })
     assert resp.status_code == 400
 
+    # Nothing confirmed at all (encounter unconfirmed): a named previous
+    # species is still rejected rather than trusted, so a stale client
+    # cannot have an arbitrary keyword untagged.
+    _seed_encounter_cache(app, db, photo_ids, confirmed_species=None)
+    mallard = db.add_keyword("Mallard", is_species=True)
+    for pid in photo_ids:
+        db.tag_photo(pid, mallard)
+    resp = client.post("/api/encounters/species", json={
+        "species": "Gadwall", "photo_ids": photo_ids,
+        "previous_species": "Mallard",
+    })
+    assert resp.status_code == 400
+    for pid in photo_ids:
+        assert _species_names(db, pid) == ["Mallard"]
+
 
 def test_encounter_species_remove_mode_untags_one_species(app_and_db):
     """``remove`` drops one species from a two-species burst: the keyword is

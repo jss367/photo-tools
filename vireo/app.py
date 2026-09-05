@@ -26583,22 +26583,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
             if not requested_previous:
                 return json_error("previous_species must not be empty")
-            if current_species_list:
-                requested_key = keyword_match_key(requested_previous)
-                previous_species = next(
-                    (
-                        s for s in current_species_list
-                        if keyword_match_key(s) == requested_key
-                    ),
-                    None,
+            # The named species must be one the burst is currently confirmed
+            # as — including when nothing is confirmed (or there is no
+            # cache), otherwise a stale client could have an arbitrary
+            # keyword untagged from the submitted photos.
+            requested_key = keyword_match_key(requested_previous)
+            previous_species = next(
+                (
+                    s for s in current_species_list
+                    if keyword_match_key(s) == requested_key
+                ),
+                None,
+            )
+            if previous_species is None:
+                return json_error(
+                    f'"{requested_previous}" is not a confirmed species '
+                    "of the submitted photos",
                 )
-                if previous_species is None:
-                    return json_error(
-                        f'"{requested_previous}" is not a confirmed species '
-                        "of the submitted photos",
-                    )
-            else:
-                previous_species = requested_previous
         else:
             previous_species = (
                 current_species_list[0] if current_species_list else None

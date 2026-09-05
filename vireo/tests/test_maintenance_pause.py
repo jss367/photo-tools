@@ -33,6 +33,46 @@ def _second_photo(db, photo_id):
     )
 
 
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+def test_previews_pause_before_eviction(client_with_photo, monkeypatch, action):
+    import app as app_module
+
+    app, db, photo_id = client_with_photo
+    entered = threading.Event()
+    release = threading.Event()
+    evictions = []
+    original = app_module.materialize_preview
+
+    def materialize(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "materialize_preview", materialize)
+    monkeypatch.setattr(
+        app_module, "evict_preview_cache_if_over_quota",
+        lambda *args: evictions.append(True),
+    )
+    client = app.test_client()
+    runner = app._job_runner
+    job_id = client.post("/api/jobs/previews", json={"photo_ids": [photo_id]}).get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        assert not evictions
+        db.conn.execute("UPDATE photos SET rating=3 WHERE id=?", (photo_id,))
+        db.conn.commit()
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        job = wait_for_job_via_client(client, job_id)
+        assert job["status"] == ("completed" if action == "resume" else "cancelled")
+        assert bool(evictions) == (action == "resume")
+    finally:
+        release.set()
+        runner.cancel_job(job_id)
+
+
 @pytest.mark.parametrize("phase", ["scan", "thumbnails"])
 @pytest.mark.parametrize("action", ["resume", "cancel"])
 def test_full_import_pauses_between_phases(client_with_photo, monkeypatch, phase, action):

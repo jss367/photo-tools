@@ -23659,6 +23659,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             # Run a single eviction pass at the end so the batch doesn't
             # fsync after every photo.
+            ctx.checkpoint(job)
             evict_preview_cache_if_over_quota(thread_db, vireo_dir)
 
             return {"generated": generated, "skipped": skipped, "total": total}

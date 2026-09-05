@@ -703,6 +703,10 @@ class Database:
         # have already advanced some live DBs past the next free version
         # number, which would silently skip a version-gated migration.
         self.normalize_keyword_data()
+        from species_identity_repair import repair_on_upgrade
+        repaired = repair_on_upgrade(self)
+        if repaired:
+            log.info("Corrected species identity for %d predictions; review decisions preserved", repaired)
         self._restore_active_workspace()
 
     def _restore_active_workspace(self):
@@ -1403,6 +1407,8 @@ class Database:
         """
         )
         cur = self.conn.cursor()
+        if "source_taxon_id" not in {r[1] for r in cur.execute("PRAGMA table_info(predictions)")}:
+            cur.execute("ALTER TABLE predictions ADD COLUMN source_taxon_id INTEGER")
         cur.execute("PRAGMA table_info(keywords)")
         kw_cols = {row[1] for row in cur.fetchall()}
         if "place_id" not in kw_cols:
@@ -10997,6 +11003,14 @@ class Database:
         taxon), and ``is_keyword_species`` already filters those out via
         ``taxon_rank`` for species-specific readers.
         """
+        from species_identity import COMMON_NAME_CORRECTIONS
+        correction = COMMON_NAME_CORRECTIONS.get(keyword_match_key(name))
+        if correction:
+            target = self.conn.execute(
+                "SELECT id FROM taxa WHERE inat_id = ? AND name = ? AND rank = 'species'",
+                (correction["taxon_id"], correction["scientific_name"]),
+            ).fetchone()
+            return target["id"] if target else None
         for variant in _taxon_lookup_variants(name):
             if prefer_species or species_only:
                 direct = self.conn.execute(
@@ -16876,8 +16890,9 @@ class Database:
                 labels_fingerprint_full,
                 species, confidence, category,
                 taxonomy_kingdom, taxonomy_phylum, taxonomy_class,
-                taxonomy_order, taxonomy_family, taxonomy_genus, scientific_name)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                taxonomy_order, taxonomy_family, taxonomy_genus, scientific_name,
+                source_taxon_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 detection_id,
                 model,
@@ -16893,6 +16908,7 @@ class Database:
                 tax.get("family"),
                 tax.get("genus"),
                 tax.get("scientific_name"),
+                tax.get("taxon_id"),
             ),
         )
         # SQLite's ``cur.lastrowid`` stays at the previous successful insert

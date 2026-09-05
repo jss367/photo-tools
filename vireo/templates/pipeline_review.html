@@ -2879,6 +2879,8 @@ var SPECIES_CONFLICT_THRESHOLDS = {
 };
 
 function normalizedSpeciesName(name) {
+  var identity = typeof pipelineResults !== 'undefined' && pipelineResults && pipelineResults.species_identities && pipelineResults.species_identities[name];
+  if (identity) return identity.key;
   return String(name || '').trim().toLocaleLowerCase().replace(/\s+/g, ' ');
 }
 
@@ -4827,6 +4829,8 @@ function renderSpeciesWidget(enc, encIdx, level, burstIdx, pos) {
   }
 
   var hasCandidate = !!candidateSpecies;
+  var identity = pipelineResults && pipelineResults.species_identities && pipelineResults.species_identities[candidateSpecies];
+  if (identity) displayName = identity.display_name;
   var isPending = speciesConfirmPendingFor(enc, burstIdx);
   var cls = isConfirmed ? 'confirmed' : (hasCandidate ? 'unconfirmed' : 'missing');
   var badge = isConfirmed ? '&#10003;' : (hasCandidate ? '?' : '+');

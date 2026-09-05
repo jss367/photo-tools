@@ -1,6 +1,7 @@
 """Fetch regional species labels from iNaturalist for classification."""
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -20,6 +21,26 @@ _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 INAT_API = "https://api.inaturalist.org/v1"
 
 LABELS_DIR = os.path.expanduser("~/.vireo/labels")
+
+
+class SpeciesLabels(list):
+    """Prompt strings plus optional source identities; text remains unchanged."""
+
+    def __init__(self, names=(), identities=None):
+        super().__init__(names)
+        self.identities = identities or {}
+
+
+def _text_identity(names):
+    return hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()
+
+
+def _merge_identity(identities, name, entry):
+    previous = identities.get(name)
+    if previous is not None and previous != entry:
+        identities[name] = {"ambiguous": True}
+    else:
+        identities[name] = entry
 
 # Major taxonomic groups with their iNaturalist taxon IDs
 TAXON_GROUPS = {
@@ -107,6 +128,7 @@ def fetch_species_list(
     )["params"]
 
     all_species = []
+    identities = {}
 
     for gi, group_key in enumerate(taxon_groups):
         group = TAXON_GROUPS.get(group_key)
@@ -182,6 +204,13 @@ def fetch_species_list(
                 name = common_name or scientific_name
                 if name:
                     group_species.append(name)
+                    if scientific_name and isinstance(taxon.get("id"), int):
+                        _merge_identity(identities, name, {
+                            "taxon_id": taxon["id"],
+                            "scientific_name": scientific_name,
+                            "common_name": common_name,
+                            "rank": taxon.get("rank"),
+                        })
 
             fetched = (page - 1) * per_page + len(results)
 
@@ -211,7 +240,7 @@ def fetch_species_list(
             len(all_species),
         )
 
-    return all_species
+    return SpeciesLabels(all_species, identities)
 
 
 def save_labels(name, place_id, place_name, taxon_groups, species,
@@ -253,6 +282,10 @@ def save_labels(name, place_id, place_name, taxon_groups, species,
         "species_count": len(set(species)),
         "labels_file": labels_path,
     }
+    identities = getattr(species, "identities", {})
+    if identities:
+        meta["label_identities"] = identities
+        meta["labels_text_sha256"] = _text_identity(sorted(set(species)))
     _atomic_write_text(meta_path, json.dumps(meta, indent=2))
 
     return labels_path
@@ -281,7 +314,26 @@ def read_label_file(path):
         )
         with open(path, encoding="cp1252") as f:
             lines = f.readlines()
-    return [line.strip() for line in lines if line.strip()]
+    names = [line.strip() for line in lines if line.strip()]
+    identities = {}
+    try:
+        with open(os.path.splitext(path)[0] + ".json", encoding="utf-8") as f:
+            meta = json.load(f)
+        # Do not attach an old source identity after a user edits the prompts,
+        # or during the small window between the two atomic file replacements.
+        if meta.get("labels_text_sha256") == _text_identity(names):
+            for name, entry in meta.get("label_identities", {}).items():
+                if name not in names or not isinstance(entry, dict):
+                    continue
+                if entry.get("ambiguous"):
+                    identities[name] = {"ambiguous": True}
+                elif (type(entry.get("taxon_id")) is int and entry["taxon_id"] > 0
+                      and isinstance(entry.get("scientific_name"), str)
+                      and entry["scientific_name"].strip()):
+                    identities[name] = entry
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass  # Legacy and hand-authored text files remain supported.
+    return SpeciesLabels(names, identities)
 
 
 def _atomic_write_text(path, text):
@@ -453,12 +505,16 @@ def load_merged_labels(label_sets):
     )
 
     all_species = set()
+    identities = {}
     for ls in label_sets:
         path = ls.get("labels_file", "")
         if not path or not os.path.exists(path):
             log.warning("Label file missing, skipping: %s", path)
             continue
-        for name in read_label_file(path):
+        labels = read_label_file(path)
+        for name, entry in labels.identities.items():
+            _merge_identity(identities, keyword_match_key(name), entry)
+        for name in labels:
             all_species.add(name)
     # Group by the ASCII-NOCASE key so case-only variants collapse the
     # same way SQLite's ``COLLATE NOCASE`` does, then collapse only the
@@ -484,4 +540,21 @@ def load_merged_labels(label_sets):
                 (v for v in ordered if normalize_keyword_display(v) == v),
                 ordered[0],
             ))
-    return sorted(merged)
+    merged_identities = {
+        name: identities[keyword_match_key(name)] for name in merged
+        if keyword_match_key(name) in identities
+    }
+    # Two regional lists can use different names for the same taxon. A
+    # duplicate softmax class would split its probability before thresholding.
+    # Only source-backed identities justify dropping a prompt; legacy text
+    # keeps the historical spelling/fingerprint behavior above.
+    seen_taxa = set()
+    unique = []
+    for name in sorted(merged):
+        tid = merged_identities.get(name, {}).get("taxon_id")
+        if tid is not None and tid in seen_taxa:
+            continue
+        if tid is not None:
+            seen_taxa.add(tid)
+        unique.append(name)
+    return SpeciesLabels(unique, {name: merged_identities[name] for name in unique if name in merged_identities})

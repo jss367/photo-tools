@@ -617,6 +617,13 @@ class Classifier:
         cancel_check=None,
         pause_check=None,
     ):
+        self._label_identities = getattr(labels, "identities", {}).copy()
+        ambiguous = [name for name, entry in self._label_identities.items() if entry.get("ambiguous")]
+        if ambiguous:
+            raise ValueError(
+                "These labels refer to multiple taxa; use distinct scientific names: "
+                + ", ".join(sorted(ambiguous))
+            )
         # Resolve model directory.
         # pretrained_str may be a configured weights_path (e.g. from a custom
         # model registration).  Use it directly when it points to an existing
@@ -861,6 +868,17 @@ class Classifier:
                     "confidence_tag": f"auto:confidence:{score:.2f}",
                 }
             )
+            source = getattr(self, "_label_identities", {}).get(species)
+            if source:
+                # Keep the prompt as the raw model label. Enrichment and UI
+                # resolution use the source identity, never a reverse lookup
+                # of this potentially ambiguous common name.
+                results[-1]["taxonomy"] = (
+                    {"identity_ambiguous": True} if source.get("ambiguous") else {
+                        "scientific_name": source["scientific_name"],
+                        "taxon_id": source["taxon_id"],
+                    }
+                )
         return results
 
     def _build_tol_results(self, probs, threshold):

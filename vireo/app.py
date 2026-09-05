@@ -15826,6 +15826,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         taxonomy = load_local_taxonomy()
 
         resolved_name_cache = {}
+        from species_identity import SpeciesResolver
+        species_resolver = SpeciesResolver(taxonomy=taxonomy, db=db)
 
         def resolved_names(raw_species):
             """``(comparison_name, stored_name)`` for one raw model label.
@@ -15877,9 +15879,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             """
             for candidate in (raw_species, db_species):
                 if candidate and taxonomy is not None:
-                    taxon = taxonomy.lookup(candidate)
-                    if taxon and taxon.get("taxon_id") is not None:
-                        return f"taxon:{taxon['taxon_id']}"
+                    identity = species_resolver.resolve(candidate)
+                    if identity.taxon_id is not None:
+                        return identity.key
             for candidate in (db_species, raw_species):
                 if candidate:
                     return str(candidate).strip().lower()
@@ -15920,13 +15922,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             """
             for candidate in (raw_species, db_species):
                 if candidate and taxonomy is not None:
-                    taxon = taxonomy.lookup(candidate)
-                    if taxon and taxon.get("taxon_id") is not None:
-                        return (
-                            taxon.get("common_name")
-                            or taxon.get("scientific_name")
-                            or str(candidate).strip()
-                        )
+                    identity = species_resolver.resolve(candidate)
+                    if identity.taxon_id is not None:
+                        return identity.display_name
             for candidate in (db_species, raw_species):
                 if candidate:
                     return str(candidate).strip()
@@ -16030,8 +16028,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             comparison_prediction, stored_prediction = resolved_names(
                 d["species"]
             )
+            source_identity = species_resolver.prediction(d) if d.get("source_taxon_id") else None
             comparison = compare_prediction_to_keywords(
-                comparison_prediction,
+                source_identity.scientific_name if source_identity else comparison_prediction,
                 species_by_photo.get(pid, []),
                 taxonomy,
             )
@@ -16039,10 +16038,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "id": d["id"],
                 "detection_id": d["detection_id"],
                 "species": d["species"],
-                "canonical_species": canonical_species_key(
+                "canonical_species": source_identity.key if source_identity else canonical_species_key(
                     d["species"], comparison_prediction,
                 ),
-                "canonical_display": canonical_display_name(
+                "canonical_display": source_identity.display_name if source_identity else canonical_display_name(
                     d["species"], stored_prediction,
                 ),
                 "confidence": d["confidence"],

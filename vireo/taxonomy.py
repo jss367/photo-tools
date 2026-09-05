@@ -911,13 +911,22 @@ class Taxonomy:
             data = json.load(f)
         self._by_common = data.get("taxa_by_common", {})
         self._by_scientific = data.get("taxa_by_scientific", {})
+        from species_identity import COMMON_NAME_CORRECTIONS, correct_common_name_index
+        self._ambiguous_common = set(data.get("ambiguous_common_names", [])) - set(COMMON_NAME_CORRECTIONS)
+        for name in self._ambiguous_common:
+            self._by_common.pop(name, None)
+        correct_common_name_index(self._by_common, self._by_scientific)
         self._api_misses = set(data.get("api_misses", []))
         self.last_updated = data.get("last_updated")
         self.taxa_count = len(self._by_common) + len(self._by_scientific)
         # Build normalized index for fuzzy lookups (handles hyphens, etc.)
         self._by_common_normalized = {}
+        self._ambiguous_normalized = {self._normalize(n) for n in self._ambiguous_common}
         for key, val in self._by_common.items():
             nk = self._normalize(key)
+            previous = self._by_common_normalized.get(nk)
+            if previous and previous.get("scientific_name") != val.get("scientific_name"):
+                self._ambiguous_normalized.add(nk)
             if nk not in self._by_common_normalized:
                 self._by_common_normalized[nk] = val
         # Track whether new data was added (for save)
@@ -966,6 +975,8 @@ class Taxonomy:
             lineage_names, lineage_ranks — or None if not found
         """
         key = name.lower().strip()
+        if key in getattr(self, "_ambiguous_common", set()):
+            return self._by_scientific.get(key)
         result = self._by_common.get(key)
         if result:
             return result
@@ -982,11 +993,20 @@ class Taxonomy:
                 return result
 
         # Fuzzy: try normalized lookup (handles hyphens, e.g. "scrub jay" vs "scrub-jay")
+        if self._normalize(name) in getattr(self, "_ambiguous_normalized", set()):
+            return None
         return self._by_common_normalized.get(self._normalize(name))
 
     def is_taxon(self, name):
         """Check if a name is a recognized taxon."""
         return self.lookup(name) is not None
+
+    def lookup_id(self, taxon_id):
+        """Resolve a source ID even after its scientific/common names change."""
+        if not hasattr(self, "_by_taxon_id"):
+            self._by_taxon_id = {entry["taxon_id"]: entry for entry in self._by_scientific.values()
+                                 if entry.get("taxon_id") is not None}
+        return self._by_taxon_id.get(taxon_id)
 
     def api_lookup(self, name):
         """Look up a name via the iNaturalist API (handles alternate/regional names).
@@ -1302,6 +1322,9 @@ def populate_taxa_db_from_json(db, taxonomy_json_path, progress_callback=None):
 
     taxa_by_sci = data.get("taxa_by_scientific", {})
     taxa_by_common = data.get("taxa_by_common", {})
+
+    from species_identity import correct_common_name_index
+    correct_common_name_index(taxa_by_common, taxa_by_sci)
 
     # Dedupe by inat_id (same entry appears in both indices and multiple
     # common-name keys can point to the same entry).
@@ -1763,16 +1786,25 @@ def download_taxonomy(output_path, progress_callback=None):
                 taxa_by_common[cn_key] = entry
 
         # Then index alternate names only for still-unmapped keys
+        common_candidates = {}
         for taxon_id, names in alt_names.items():
             entry = entries_by_taxon.get(taxon_id)
             if not entry:
                 continue
             for cn in names:
                 cn_key = cn.lower()
+                common_candidates.setdefault(cn_key, set()).add(taxon_id)
                 if cn_key not in taxa_by_common:
                     taxa_by_common[cn_key] = entry
 
+        ambiguous_common_names = sorted(
+            name for name, ids in common_candidates.items() if len(ids) > 1
+        )
+        for name in ambiguous_common_names:
+            taxa_by_common.pop(name, None)
+
         result = {
+            "ambiguous_common_names": ambiguous_common_names,
             "last_updated": str(date.today()),
             "source": "iNaturalist DWCA",
             "taxa_by_common": taxa_by_common,

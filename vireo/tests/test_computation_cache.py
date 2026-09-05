@@ -418,6 +418,7 @@ def test_database_export_bundle_import_and_duplicate_fanout(tmp_path):
         "European Robin",
         0.87,
         "bioclip-2.5",
+        taxonomy={"scientific_name": "Erithacus rubecula", "taxon_id": 123},
         labels_fingerprint=labels_short,
         labels_fingerprint_full=labels_full,
     )
@@ -491,7 +492,7 @@ def test_database_export_bundle_import_and_duplicate_fanout(tmp_path):
     assert applied["classifier_runs_applied"] == 2
     for photo_id in (first_photo, second_photo):
         prediction = destination.conn.execute(
-            """SELECT p.species, p.labels_fingerprint_full
+            """SELECT p.species, p.labels_fingerprint_full, p.source_taxon_id
                FROM predictions p
                JOIN detections d ON d.id = p.detection_id
                WHERE d.photo_id = ?""",
@@ -500,6 +501,7 @@ def test_database_export_bundle_import_and_duplicate_fanout(tmp_path):
         assert dict(prediction) == {
             "species": "European Robin",
             "labels_fingerprint_full": labels_full,
+            "source_taxon_id": 123,
         }
     assert destination.conn.execute(
         "SELECT COUNT(*) AS c FROM prediction_review",

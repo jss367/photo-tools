@@ -7,13 +7,18 @@ conflicting or silently clobbering each other.
 """
 
 import hashlib
+import json
 
 TOL_SENTINEL = "tol"
 LEGACY_SENTINEL = "legacy"
 
 
 def _canonical_labels(labels):
-    return "\n".join(sorted(set(labels))).encode("utf-8")
+    text = "\n".join(sorted(set(labels)))
+    identities = getattr(labels, "identities", {})
+    if identities:
+        text += "\nsource-identities-v1:" + json.dumps(identities, sort_keys=True)
+    return text.encode("utf-8")
 
 
 def compute_fingerprint(labels):

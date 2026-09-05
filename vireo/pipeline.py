@@ -373,7 +373,7 @@ def load_photo_features(db, collection_id=None, config=None,
     if labels_fingerprint is not None:
         pred_rows = db.conn.execute(
             f"""SELECT d.photo_id, d.id AS detection_id,
-                      pr.species, pr.confidence,
+                      pr.species, pr.confidence, pr.scientific_name, pr.labels_fingerprint, pr.source_taxon_id,
                       pr.classifier_model AS model,
                       d.detector_confidence, d.detector_model
                FROM predictions pr
@@ -393,7 +393,7 @@ def load_photo_features(db, collection_id=None, config=None,
     else:
         pred_rows = db.conn.execute(
             f"""SELECT d.photo_id, d.id AS detection_id,
-                      pr.species, pr.confidence,
+                      pr.species, pr.confidence, pr.scientific_name, pr.labels_fingerprint, pr.source_taxon_id,
                       pr.classifier_model AS model,
                       d.detector_confidence, d.detector_model
                FROM predictions pr
@@ -416,6 +416,8 @@ def load_photo_features(db, collection_id=None, config=None,
 
     # Group predictions by photo_id, keep top K
     top_k = (config or {}).get("top_k_predictions", 5)
+    from species_identity import SpeciesResolver
+    species_resolver = SpeciesResolver(db=db)
     species_by_photo = defaultdict(list)
     for pr in pred_rows:
         pid = pr["photo_id"]
@@ -426,12 +428,13 @@ def load_photo_features(db, collection_id=None, config=None,
         )
         if pr["detector_confidence"] < min_conf and not is_contextual_weak:
             continue
+        species = species_resolver.prediction(pr).display_name
         if len(species_by_photo[pid]) < top_k:
-            species_by_photo[pid].append((pr["species"], pr["confidence"], pr["model"]))
+            species_by_photo[pid].append((species, pr["confidence"], pr["model"]))
         subject = subjects_by_detection.get(pr["detection_id"])
         if subject is not None and len(subject["predictions"]) < top_k:
             subject["predictions"].append(
-                (pr["species"], pr["confidence"], pr["model"])
+                (species, pr["confidence"], pr["model"])
             )
 
     # Load primary detection per photo (highest confidence) via the global
@@ -1329,7 +1332,76 @@ def save_results(results, cache_dir, workspace_id, preserve_miss_marker=True):
     return path
 
 
-def load_results(cache_dir, workspace_id):
+def attach_species_identities(data, resolver):
+    """Give review comparisons a stable key while retaining editable keyword text."""
+    names = set()
+
+    def collect(container):
+        for field in ("confirmed_species",):
+            if container.get(field):
+                names.add(container[field])
+        names.update(container.get("confirmed_species_list") or [])
+        for entry in container.get("species_top5") or []:
+            if entry:
+                names.add(entry[0])
+        for entry in container.get("species_predictions") or []:
+            if entry.get("species"):
+                names.add(entry["species"])
+
+    for photo in data.get("photos", []):
+        collect(photo)
+    for enc in data.get("encounters", []):
+        collect(enc)
+        if enc.get("species"):
+            names.add(enc["species"][0])
+        for burst in enc.get("bursts", []):
+            collect(burst)
+            override = burst.get("species_override") or {}
+            if override.get("species"):
+                names.add(override["species"])
+            names.update(override.get("species_list") or [])
+    data["species_identities"] = {
+        name: {"key": resolver.resolve(name).key, "display_name": resolver.resolve(name).display_name}
+        for name in names if name
+    }
+
+
+def normalize_cached_species(data, resolver):
+    """Refresh derived names on read, without rewriting confirmed keywords."""
+    from encounters import encounter_species_label
+
+    photo_map = {p["id"]: p for p in data.get("photos", [])}
+    changed = False
+    for photo in photo_map.values():
+        containers = [photo, *photo.get("subjects", [])]
+        for container in containers:
+            field = "species_top5" if container is photo else "predictions"
+            entries = container.get(field) or []
+            normalized = []
+            for entry in entries:
+                name = resolver.resolve(entry[0]).display_name
+                changed |= name != entry[0]
+                normalized.append([name, *entry[1:]])
+            if entries:
+                container[field] = normalized
+    if not changed:
+        return
+    for enc in data.get("encounters", []):
+        photos = [photo_map[pid] for pid in enc.get("photo_ids", []) if pid in photo_map]
+        if photos:
+            enc["species"] = list(encounter_species_label(photos))
+            enc["species_predictions"] = _build_species_predictions(photos)
+        for burst in enc.get("bursts", []):
+            burst_photos = [photo_map[pid] for pid in burst.get("photo_ids", []) if pid in photo_map]
+            if burst_photos:
+                burst["species_predictions"] = _build_species_predictions(burst_photos)
+            override = burst.get("species_override")
+            if override and not override.get("confirmed") and override.get("species"):
+                override["species"] = resolver.resolve(override["species"]).display_name
+    data["species_names_refreshed"] = True
+
+
+def load_results(cache_dir, workspace_id, db=None):
     """Load pipeline results from a JSON cache file.
 
     Args:
@@ -1343,6 +1415,11 @@ def load_results(cache_dir, workspace_id):
     data = _load_results_json(path)
     if data is None:
         return None
+    if db is not None:
+        from species_identity import SpeciesResolver
+        resolver = SpeciesResolver(db=db)
+        normalize_cached_species(data, resolver)
+        attach_species_identities(data, resolver)
     refresh_serialized_summary(data)
     return data
 
@@ -1939,6 +2016,8 @@ def compute_group_fingerprint(config):
         "encounters": _effective(encounters.DEFAULTS),
         "bursts": _effective(bursts.DEFAULTS),
     }
+    from species_identity import resolution_identity
+    payload["species_resolution"] = resolution_identity()
     blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha1(blob).hexdigest()[:16]
 

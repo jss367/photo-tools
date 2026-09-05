@@ -193,7 +193,7 @@ def _merge_null_species_predictions(conn):
                p.confidence, p.category, p.scientific_name,
                p.taxonomy_kingdom, p.taxonomy_phylum, p.taxonomy_class,
                p.taxonomy_order, p.taxonomy_family, p.taxonomy_genus,
-               p.created_at
+               p.created_at, p.source_taxon_id
         FROM predictions p
         JOIN legacy_detection_merge m ON m.old_id = p.detection_id
         WHERE p.species IS NULL
@@ -217,7 +217,7 @@ def _merge_null_species_predictions(conn):
     for row in null_losers:
         (survivor_id, classifier_model, labels_fingerprint, loser_confidence,
          loser_category, loser_sci, loser_king, loser_phyl, loser_cls,
-         loser_ord, loser_fam, loser_gen, loser_created) = row
+         loser_ord, loser_fam, loser_gen, loser_created, loser_source_taxon_id) = row
 
         existing = conn.execute(
             """
@@ -238,13 +238,13 @@ def _merge_null_species_predictions(conn):
                   detection_id, classifier_model, labels_fingerprint, species,
                   confidence, category, scientific_name, taxonomy_kingdom,
                   taxonomy_phylum, taxonomy_class, taxonomy_order,
-                  taxonomy_family, taxonomy_genus, created_at
-                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  taxonomy_family, taxonomy_genus, created_at, source_taxon_id
+                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (survivor_id, classifier_model, labels_fingerprint,
                  loser_confidence, loser_category, loser_sci,
                  loser_king, loser_phyl, loser_cls, loser_ord, loser_fam,
-                 loser_gen, loser_created),
+                 loser_gen, loser_created, loser_source_taxon_id),
             )
             continue
 
@@ -253,6 +253,8 @@ def _merge_null_species_predictions(conn):
             """
             UPDATE predictions
             SET confidence = ?,
+                source_taxon_id = CASE WHEN scientific_name IS NULL OR scientific_name IS ?
+                    THEN COALESCE(source_taxon_id, ?) ELSE source_taxon_id END,
                 category = COALESCE(category, ?),
                 scientific_name = COALESCE(scientific_name, ?),
                 taxonomy_kingdom = COALESCE(taxonomy_kingdom, ?),
@@ -266,6 +268,7 @@ def _merge_null_species_predictions(conn):
             """,
             (
                 _pick_higher_confidence(existing_confidence, loser_confidence),
+                loser_sci, loser_source_taxon_id,
                 loser_category, loser_sci,
                 loser_king, loser_phyl, loser_cls,
                 loser_ord, loser_fam, loser_gen,
@@ -617,13 +620,13 @@ def _merge_legacy_detector_alias(conn):
           detection_id, classifier_model, labels_fingerprint, species,
           confidence, category, scientific_name, taxonomy_kingdom,
           taxonomy_phylum, taxonomy_class, taxonomy_order, taxonomy_family,
-          taxonomy_genus, created_at
+          taxonomy_genus, created_at, source_taxon_id
         )
         SELECT m.survivor_id, p.classifier_model, p.labels_fingerprint,
                p.species, p.confidence, p.category, p.scientific_name,
                p.taxonomy_kingdom, p.taxonomy_phylum, p.taxonomy_class,
                p.taxonomy_order, p.taxonomy_family, p.taxonomy_genus,
-               p.created_at
+               p.created_at, p.source_taxon_id
         FROM predictions p
         JOIN legacy_detection_merge m ON m.old_id = p.detection_id
         WHERE p.species IS NOT NULL
@@ -636,6 +639,10 @@ def _merge_legacy_detector_alias(conn):
             ELSE predictions.confidence
           END,
           category = COALESCE(predictions.category, excluded.category),
+          source_taxon_id = CASE
+            WHEN predictions.scientific_name IS NULL OR predictions.scientific_name IS excluded.scientific_name
+            THEN COALESCE(predictions.source_taxon_id, excluded.source_taxon_id)
+            ELSE predictions.source_taxon_id END,
           scientific_name = COALESCE(predictions.scientific_name, excluded.scientific_name),
           taxonomy_kingdom = COALESCE(predictions.taxonomy_kingdom, excluded.taxonomy_kingdom),
           taxonomy_phylum = COALESCE(predictions.taxonomy_phylum, excluded.taxonomy_phylum),

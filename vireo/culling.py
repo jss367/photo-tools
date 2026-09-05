@@ -110,11 +110,14 @@ def analyze_for_culling(
     # model spaces is meaningless, so the photo's embedding must come from
     # the same model that named its species.
     predictions = {}
+    from species_identity import SpeciesResolver
+    species_resolver = SpeciesResolver(db=db)
     for pid in photo_ids:
         if pause_callback:
             pause_callback()
         pred = db.conn.execute(
-            """SELECT pr.species, pr.confidence, pr.classifier_model
+            """SELECT pr.species, pr.confidence, pr.classifier_model,
+                      pr.scientific_name, pr.labels_fingerprint, pr.source_taxon_id
                FROM predictions pr
                JOIN detections d ON d.id = pr.detection_id
                WHERE d.photo_id = ?
@@ -123,7 +126,7 @@ def analyze_for_culling(
         ).fetchone()
         if pred:
             predictions[pid] = {
-                "species": pred["species"],
+                "species": species_resolver.prediction(pred).display_name,
                 "confidence": pred["confidence"],
                 "classifier_model": pred["classifier_model"],
             }

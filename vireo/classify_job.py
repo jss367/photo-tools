@@ -125,6 +125,8 @@ def _load_labels(
         log.info("Using %d merged labels from %d sets", len(labels), len(active_sets))
     elif labels_file and os.path.exists(labels_file):
         labels = read_label_file(labels_file)
+        if getattr(labels, "identities", {}):
+            labels = load_merged_labels([{"labels_file": labels_file}])
         log.info("Using %d labels from file: %s", len(labels), labels_file)
     else:
         # Try workspace-scoped active labels first
@@ -261,8 +263,8 @@ def _run_classifier_on_detection(db, detection_id, classifier_model, labels,
                 (detection_id, classifier_model, labels_fingerprint, species,
                  confidence, category, scientific_name,
                  taxonomy_kingdom, taxonomy_phylum, taxonomy_class,
-                 taxonomy_order, taxonomy_family, taxonomy_genus)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 taxonomy_order, taxonomy_family, taxonomy_genus, source_taxon_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 detection_id,
                 classifier_model,
@@ -277,6 +279,7 @@ def _run_classifier_on_detection(db, detection_id, classifier_model, labels,
                 tax.get("order"),
                 tax.get("family"),
                 tax.get("genus"),
+                tax.get("taxon_id"),
             ),
         )
     commit_with_retry(db.conn)
@@ -1607,7 +1610,7 @@ def _classify_photos(
                                 "timestamp": timestamp,
                                 "filename": photo["filename"],
                                 "embedding": embedding,
-                                "taxonomy": None,
+                                "taxonomy": _cached_prediction_taxonomy(top),
                                 "alternatives": [],
                                 "_existing": True,
                             })
@@ -1739,7 +1742,7 @@ def _classify_photos(
                             "timestamp": timestamp,
                             "filename": photo["filename"],
                             "embedding": embedding,
-                            "taxonomy": None,
+                            "taxonomy": _cached_prediction_taxonomy(top),
                             "alternatives": [],
                             "_existing": True,
                         })
@@ -1919,6 +1922,25 @@ def _publish_classifier_runs_for_raw_results(
             )
 
 
+def _cached_prediction_taxonomy(row):
+    row = dict(row)
+    if not row.get("source_taxon_id") and row.get("labels_fingerprint") != "tol":
+        return None  # Legacy custom-label scientific names were inferred.
+    result = {rank: row.get("taxonomy_" + rank) for rank in (
+        "kingdom", "phylum", "class", "order", "family", "genus",
+    )}
+    result.update(scientific_name=row.get("scientific_name"), taxon_id=row.get("source_taxon_id"))
+    return {key: value for key, value in result.items() if value} or None
+
+
+def _prediction_taxonomy(tax, species, supplied=None):
+    """Enrich source-backed labels by binomial, preserving source provenance."""
+    supplied = supplied or {}
+    name = supplied.get("scientific_name") or species
+    hierarchy = tax.get_hierarchy(name) if tax else {}
+    return {**hierarchy, **supplied}
+
+
 def _store_match_prediction(
     db, item, model_name, labels_fingerprint, tax=None,
     species=None, confidence=None, taxonomy=None,
@@ -1942,9 +1964,7 @@ def _store_match_prediction(
     """
     species = species or item["prediction"]
     confidence = item["confidence"] if confidence is None else confidence
-    tax_hierarchy = taxonomy or item.get("taxonomy") or (
-        tax.get_hierarchy(species) if tax else {}
-    )
+    tax_hierarchy = _prediction_taxonomy(tax, species, taxonomy or item.get("taxonomy"))
     db.add_prediction(
         detection_id=item["detection_id"],
         species=species,
@@ -1987,9 +2007,7 @@ def _store_match_prediction(
             if alt_key in seen_species:
                 continue
             seen_species.add(alt_key)
-            alt_tax = alt.get("taxonomy") or (
-                tax.get_hierarchy(alt["species"]) if tax else {}
-            )
+            alt_tax = _prediction_taxonomy(tax, alt["species"], alt.get("taxonomy"))
             db.add_prediction(
                 detection_id=item["detection_id"],
                 species=alt["species"],
@@ -2094,9 +2112,7 @@ def _store_pending_detection_prediction(
     total_votes=None,
     individual=None,
 ):
-    tax_hierarchy = item.get("taxonomy") or (
-        tax.get_hierarchy(item["prediction"]) if tax else {}
-    )
+    tax_hierarchy = _prediction_taxonomy(tax, item["prediction"], item.get("taxonomy"))
     if item.get("_existing"):
         existing_row = db.conn.execute(
             """SELECT id FROM predictions
@@ -2169,9 +2185,7 @@ def _store_pending_detection_prediction(
         if alt_key in seen_species:
             continue
         seen_species.add(alt_key)
-        alt_tax = alt.get("taxonomy") or (
-            tax.get_hierarchy(alt["species"]) if tax else {}
-        )
+        alt_tax = _prediction_taxonomy(tax, alt["species"], alt.get("taxonomy"))
         db.add_prediction(
             detection_id=item["detection_id"],
             species=alt["species"],
@@ -2204,7 +2218,18 @@ def _store_grouped_predictions(
         group_by_timestamp,
         refine_groups_by_similarity,
     )
+    from species_identity import SpeciesResolver
     from xmp import read_keywords
+
+    resolver = SpeciesResolver(taxonomy=tax)
+
+    def identity_for(item):
+        supplied = item.get("taxonomy") or {}
+        source = supplied if supplied.get("taxon_id") else None
+        return resolver.resolve(item["prediction"], supplied.get("scientific_name"), source)
+
+    def comparison_name(item):
+        return (item.get("taxonomy") or {}).get("scientific_name") or item["prediction"]
 
     groups = group_by_timestamp(raw_results, window_seconds=grouping_window)
     groups = refine_groups_by_similarity(
@@ -2229,10 +2254,10 @@ def _store_grouped_predictions(
                 )
                 existing = read_keywords(xmp_path)
                 category = _categorize_detection_prediction(
-                    item["prediction"], existing, tax,
+                    comparison_name(item), existing, tax,
                 )
                 auto_accept = _can_auto_accept_detection_prediction(
-                    item["prediction"], category, existing, tax,
+                    comparison_name(item), category, existing, tax,
                 )
 
             if auto_accept:
@@ -2297,7 +2322,7 @@ def _store_grouped_predictions(
 
             cons_input = [
                 {
-                    "prediction": _cons_key(item["prediction"]),
+                    "prediction": _cons_key(identity_for(item).display_name),
                     "confidence": item["confidence"],
                 }
                 for item in group
@@ -2307,7 +2332,7 @@ def _store_grouped_predictions(
                 continue
 
             group_species = {
-                _species_match_key(item.get("prediction"))
+                identity_for(item).key
                 for item in group
                 if item.get("prediction")
             }
@@ -2329,10 +2354,10 @@ def _store_grouped_predictions(
                     )
                     existing = read_keywords(xmp_path)
                     category = _categorize_detection_prediction(
-                        item["prediction"], existing, tax,
+                        comparison_name(item), existing, tax,
                     )
                     auto_accept = _can_auto_accept_detection_prediction(
-                        item["prediction"], category, existing, tax,
+                        comparison_name(item), category, existing, tax,
                     )
 
                 if auto_accept:
@@ -2504,7 +2529,7 @@ def _finalize_cached_only(
                 "timestamp": timestamp,
                 "filename": photo["filename"],
                 "embedding": None,
-                "taxonomy": None,
+                "taxonomy": _cached_prediction_taxonomy(top),
                 "alternatives": [],
                 "_existing": True,
             })

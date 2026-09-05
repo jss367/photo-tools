@@ -10822,6 +10822,25 @@ function _lbScheduleSourceSwap(targetZoom) {
         // The failed request is no longer pending. Keep the usable bitmap
         // and resume its neighbors without automatically retrying this tier.
         _lbDesiredSrcKey = _lbCurrentSrcKey;
+        // A pending 1:1 that was routed here after /original also failed has now
+        // exhausted the sharper fallback we asked for. Settle the intent on the
+        // usable current source so the badge does not stick at "Loading 1:1";
+        // otherwise _lbApplyPendingOneToOneZoom would keep re-picking the same
+        // failed tier and the fit view would freeze indefinitely.
+        if (_lbPending1To1) {
+          var pendingAnchor = _lbPending1To1Anchor;
+          _lbPending1To1 = false;
+          _lbPending1To1Anchor = null;
+          if (_lbNativeZoom) {
+            _lbSetZoom(
+              _lbNativeZoom,
+              pendingAnchor ? pendingAnchor.x : null,
+              pendingAnchor ? pendingAnchor.y : null
+            );
+          } else {
+            _lbApplyTransform();
+          }
+        }
         _lbScheduleAdjacentPhoto(_lbCurrentSrcKey);
       }
       // Keep current source on failure

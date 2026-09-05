@@ -4568,6 +4568,80 @@ def test_browse_lightbox_waits_for_fallback_tier_after_original_fails(live_serve
     )
 
 
+def test_browse_lightbox_settles_pending_one_to_one_when_fallback_tier_also_fails(
+    live_server, page
+):
+    """Both /original and the sharper preview fallback failing must unstick the badge.
+
+    Regression: after /original failed, _lbPending1To1 stayed armed while the
+    fallback tier request was in flight. If that request also errored, the
+    non-original preloader.onerror branch only reset _lbDesiredSrcKey and never
+    cleared _lbPending1To1, so the badge stayed at "Loading 1:1" and the lightbox
+    remained at Fit indefinitely.
+    """
+    full_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="960" '
+        'viewBox="0 0 1920 960"><rect width="1920" height="960" fill="#246"/></svg>'
+    )
+    page.route(
+        "**/photos/*/full",
+        lambda route: route.fulfill(body=full_svg, content_type="image/svg+xml"),
+    )
+    page.route("**/photos/*/original*", lambda route: route.abort())
+    page.route("**/photos/*/preview*", lambda route: route.abort())
+
+    url = live_server["url"]
+    page.set_viewport_size({"width": 1000, "height": 800})
+    page.goto(f"{url}/browse")
+
+    first_card = page.locator(".grid-card").first
+    first_card.wait_for(state="visible")
+    first_card.dblclick()
+
+    expect(page.locator("#lightboxOverlay")).to_have_class("lightbox-overlay active")
+    page.wait_for_function(
+        """() => {
+            const img = document.getElementById('lightboxImg');
+            return img && img.complete && img.naturalWidth === 1920;
+        }"""
+    )
+
+    page.evaluate(
+        """() => {
+            window._lbPhotoW = null;
+            window._lbPhotoH = null;
+            window._lbOriginalUnavailable = false;
+            window._lbCurrentSrcKey = 'full';
+            window._lbNativeZoom = null;
+            window._lbZoom = 1;
+            window.toggleLightboxZoom();
+        }"""
+    )
+
+    # After /original aborts, the deferral routes the pending 1:1 to a sharper
+    # preview tier; that request will also abort. The fix must clear the pending
+    # intent instead of leaving the badge stuck.
+    page.wait_for_function(
+        """() => window._lbOriginalUnavailable === true
+                && window._lbPending1To1 === false
+                && window._lbDesiredSrcKey === window._lbCurrentSrcKey""",
+        timeout=5000,
+    )
+
+    state = page.evaluate(
+        """() => ({
+            badge: document.getElementById('lightboxZoomBadge')
+                ? document.getElementById('lightboxZoomBadge').textContent
+                : null,
+            pending: window._lbPending1To1,
+            pendingAnchor: window._lbPending1To1Anchor,
+        })"""
+    )
+    assert state["pending"] is False
+    assert state["pendingAnchor"] is None
+    assert state["badge"] != "Loading 1:1"
+
+
 def test_browse_lightbox_ignores_stale_original_failure_after_nav(live_server, page):
     """A late /original error from the previous photo must not poison the next photo."""
     full_svg = (

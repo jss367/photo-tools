@@ -1485,8 +1485,12 @@ async function loadWsOverrides() {
       }
     });
     _wsOverridesLoaded = true;
-  } catch(e) {}
+  } catch(e) {
+    _markSettingsInitialLoad('ws');
+    return false;
+  }
   _markSettingsInitialLoad('ws');
+  return true;
 }
 
 function updateWsLabel(key) {
@@ -1529,6 +1533,7 @@ function saveWsConfig() {
   _wsSaveTimer = setTimeout(async function() {
     var overrides = {};
     var needsResync = false;
+    var invalidKeys = [];
     ['classification_threshold', 'grouping_window_seconds', 'similarity_threshold', 'detector_confidence'].forEach(function(key) {
       var checkbox = document.getElementById('wsOverride_' + key);
       var input = document.getElementById('wsVal_' + key);
@@ -1543,6 +1548,7 @@ function saveWsConfig() {
           // preserves omitted keys) and resync the input from the server
           // afterwards so it shows the value that is actually in effect.
           needsResync = true;
+          invalidKeys.push(key);
           return;
         }
         if (key === 'classification_threshold' || key === 'similarity_threshold' || key === 'detector_confidence') {
@@ -1563,13 +1569,31 @@ function saveWsConfig() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(overrides)
       });
-      _saveStatusMark('workspace', 'ok', gen);
     } catch(e) {
       _saveStatusMark('workspace', 'error', gen);
+      return;
     }
-    // Restore any field left empty/invalid to the server's persisted value
-    // (or uncheck it if no override actually exists server-side).
-    if (needsResync) loadWsOverrides();
+    if (needsResync) {
+      // An omitted (blank/invalid) field was NOT saved. Don't claim
+      // "Saved" until the form shows what is actually in effect: restore
+      // the field from the server first, and tell the user their entry
+      // was dropped. If the resync itself fails, the form still shows an
+      // unsaved value, so report that as a failed save rather than a
+      // false confirmation.
+      var resynced = await loadWsOverrides();
+      if (!resynced) {
+        _saveStatusMark('workspace', 'error', gen);
+        return;
+      }
+      if (typeof showToast === 'function') {
+        showToast(
+          'Blank or invalid override for ' + invalidKeys.join(', ') +
+          ' was not saved; showing the value currently in effect.',
+          'warning'
+        );
+      }
+    }
+    _saveStatusMark('workspace', 'ok', gen);
   }, 500);
 }
 

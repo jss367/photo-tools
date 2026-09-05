@@ -152,3 +152,50 @@ def test_settings_workspace_override_autosave_shows_saved(live_server, page):
     expect(status).to_contain_text("Saved ✓")
     overrides = page.request.get(f"{url}/api/workspaces/active/config").json()
     assert "classification_threshold" in overrides
+
+
+def test_settings_cleared_override_is_not_reported_as_saved(live_server, page):
+    """A blank override is dropped from the save; the pill must not claim it saved."""
+    url = live_server["url"]
+    page.goto(f"{url}/settings", timeout=5000)
+    status = _wait_for_settings_idle(page)
+
+    checkbox = page.locator("#wsOverride_grouping_window_seconds")
+    checkbox.check()
+    expect(status).to_have_attribute("data-state", "saved", timeout=10_000)
+    value = page.locator("#wsVal_grouping_window_seconds")
+    expect(value).to_have_value("10")
+
+    # Hold the resync GET so we can observe that "Saved" waits for it.
+    held = []
+
+    def _hold_get(route, request):
+        if request.method == "GET":
+            held.append(route)
+        else:
+            route.continue_()
+
+    page.route("**/api/workspaces/active/config", _hold_get)
+    with page.expect_response(
+        lambda r: r.url.endswith("/api/workspaces/active/config")
+        and r.request.method == "POST"
+    ):
+        value.fill("")
+        value.dispatch_event("change")
+        expect(status).to_have_attribute("data-state", "saving")
+    # The POST has completed but the resync GET is held: still not "Saved".
+    for _ in range(40):
+        if held:
+            break
+        page.wait_for_timeout(50)
+    assert held, "resync GET was never requested"
+    expect(status).to_have_attribute("data-state", "saving")
+
+    for route in held:
+        route.continue_()
+    page.unroute("**/api/workspaces/active/config", _hold_get)
+    expect(status).to_have_attribute("data-state", "saved", timeout=10_000)
+    # The field shows the value actually in effect, not the blank entry.
+    expect(value).to_have_value("10")
+    overrides = page.request.get(f"{url}/api/workspaces/active/config").json()
+    assert overrides["grouping_window_seconds"] == 10

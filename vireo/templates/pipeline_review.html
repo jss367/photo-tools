@@ -3461,6 +3461,10 @@ function updatePipelineReviewSidebarVisibility() {
 function toggleEncounter(idx) {
   var body = document.getElementById('encBody' + idx);
   if (!body) return;
+  // Collapsing changes the retained node directly. A later results reload
+  // resets collapse state, so it must not reuse the pre-toggle markup.
+  var rendered = pipelineReviewRenderedCards.get(idx);
+  if (rendered) rendered.html = null;
   var collapsed = body.style.display !== 'none';
   body.style.display = collapsed ? 'none' : '';
   var chev = document.getElementById('encChev' + idx);

@@ -134,3 +134,15 @@ def test_review_grid_conflict_evidence_refreshes_after_in_place_edits(live_serve
         renderResults();
     }""")
     expect(conflict).to_have_count(0)
+
+
+def test_review_grid_reload_resets_collapsed_encounters(live_server, page):
+    _open_grid(page, live_server, encounter_count=2)
+    page.locator("#encChev0").click()
+    expect(page.locator("#encBody0")).to_be_hidden()
+    page.evaluate("applyReviewResults(cloneReviewData(pipelineResults), resultsCacheInfo)")
+    expect(page.locator("#encBody0")).to_be_visible()
+    expect(page.locator("#encChev0")).not_to_have_class("encounter-chevron collapsed")
+    assert page.evaluate("collapsedEncounters.size") == 0
+    page.evaluate("renderResults()")
+    expect(page.locator("#encBody0")).to_be_visible()

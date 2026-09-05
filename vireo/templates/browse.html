@@ -2401,6 +2401,7 @@ body.sidebar-resizing {
 <script src="/static/vireo-work-locally.js"></script>
 <script src="/static/vireo-folder-browser.js"></script>
 <script src="/static/vireo-export-presets.js"></script>
+<script src="/static/vireo-thumbnail-queue.js"></script>
 <script>
 /* Google Maps API key — populated from /api/config below (window._cfgPromise).
    Empty string when no key is configured; the Location section then
@@ -3311,7 +3312,7 @@ function renderPhotoCard(p, idx) {
   var thumbUrl = window.vireoThumbnailUrl ? window.vireoThumbnailUrl(p) : '/thumbnails/' + p.id + '.jpg';
   return '<div class="grid-card' + stackClass + selectedClass + '" data-id="' + p.id + '" data-idx="' + idx + '" data-filename="' + escapeAttr(p.filename) + '" onclick="selectPhoto(event,' + p.id + ',' + idx + ')">' +
     '<div class="grid-card-img-wrap">' +
-      '<img src="' + escapeAttr(thumbUrl) + '" loading="lazy" decoding="async" alt="' + escapeAttr(p.filename) + '">' +
+      '<img data-thumbnail-src="' + escapeAttr(thumbUrl) + '" decoding="async" alt="' + escapeAttr(p.filename) + '">' +
       renderBrowseStackBadge(p) +
       clipBadge +
       boxHtml +
@@ -3348,7 +3349,7 @@ function renderBrowseStackMember(p, coverId) {
     + 'onclick="selectBrowseStackMember(event,' + p.id + ',' + coverId + ')" '
     + 'ondblclick="openBrowseStackMember(event,' + p.id + ',' + coverId + ')">'
     + '<div class="grid-card-img-wrap">'
-    + '<img src="' + escapeAttr(thumbUrl) + '" loading="lazy" decoding="async" alt="' + escapeAttr(p.filename) + '">'
+    + '<img data-thumbnail-src="' + escapeAttr(thumbUrl) + '" decoding="async" alt="' + escapeAttr(p.filename) + '">'
     + renderDetectionBoxes(p)
     + (inatSubmitted[String(p.id)] ? '<span class="inat-badge">iNat</span>' : '')
     + (p.wildlife_excluded ? '<span class="no-wildlife-badge">No Wildlife</span>' : '')

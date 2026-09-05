@@ -693,27 +693,26 @@ window.beforeHistoryChange = function() {
 window.afterHistoryChange = async function(result) {
   cullBusy = true;
   document.getElementById('applyBtn').disabled = true;
-  var scopedIds = selectedCollectionId == null ? null : new Set(
-    (pipelineResults && pipelineResults.photos || []).map(function(photo) { return photo.id; })
-  );
   try {
-    var data = await safeFetch('/api/pipeline/page-init', {}, {toast: false});
-    var results = data && data.results;
-    if (results && scopedIds) {
-      results.photos = results.photos.filter(function(photo) { return scopedIds.has(photo.id); });
-      results.encounters = results.encounters.filter(function(enc) {
-        enc.photo_ids = enc.photo_ids.filter(function(id) { return scopedIds.has(id); });
-        enc.bursts = (enc.bursts || []).map(function(burst) {
-          var ids = (burst.photo_ids || burst).filter(function(id) { return scopedIds.has(id); });
-          return Array.isArray(burst) ? ids : Object.assign({}, burst, {photo_ids: ids});
-        }).filter(function(burst) { return (burst.photo_ids || burst).length; });
-        enc.photo_count = enc.photo_ids.length;
-        enc.burst_count = enc.bursts.length;
-        return enc.photo_count > 0;
+    var results;
+    if (selectedCollectionId != null && pipelineResults) {
+      // Collection grouping and scores were computed for this exact scope.
+      // Keep that analysis and refresh only its persisted photo flags.
+      results = JSON.parse(JSON.stringify(pipelineResults));
+      var state = await safeFetch('/api/pipeline/group/state', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({photo_ids: results.photos.map(function(photo) { return photo.id; })}),
+      }, {toast: false});
+      results.photos.forEach(function(photo) {
+        if (state.photos[photo.id]) photo.flag = state.photos[photo.id].flag;
       });
+    } else {
+      var data = await safeFetch('/api/pipeline/page-init', {}, {toast: false});
+      results = data && data.results;
     }
     setPipelineResults(results,
-      result.undone ? 'Undone: ' + result.undone : 'Redone: ' + result.redone, true);
+      result.undone ? 'Undone: ' + result.undone : 'Redone: ' + result.redone,
+      cullUseSavedFlags || result.flags_changed === true);
   } catch (error) {
     cullData = null;
     renderCulling();

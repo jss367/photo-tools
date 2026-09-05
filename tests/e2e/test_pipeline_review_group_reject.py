@@ -5,6 +5,7 @@ import os
 import re
 import time
 
+import pytest
 from playwright.sync_api import expect
 
 
@@ -2947,3 +2948,42 @@ def test_rapid_review_refreshes_saved_decisions_after_history(live_server, page)
     page.evaluate("decideCurrent('pick')")
     page.evaluate('doUndo()')
     assert live_server['db'].get_photo(rejected)['flag'] == 'rejected'
+
+
+@pytest.mark.parametrize('scoped', [False, True])
+@pytest.mark.parametrize('history_action', ['rating', 'flag'])
+def test_cull_history_preserves_analysis_scope_and_unrelated_suggestions(live_server, page, scoped, history_action):
+    ids = live_server['data']['photos'][:4]
+    _write_grouped_pipeline_cache(live_server, ids)
+    page.goto(live_server['url'] + '/cull')
+    expect(page.locator('.cull-card')).to_have_count(4)
+    page.evaluate('''({ids, scoped}) => {
+      const results = JSON.parse(JSON.stringify(pipelineResults));
+      results.photos[0].label = 'KEEP';
+      results.photos[1].label = 'REJECT';
+      if (scoped) {
+        selectedCollectionId = 123;
+        results.photos = results.photos.filter(photo => ids.slice(0, 2).includes(photo.id));
+        results.encounters = ids.slice(0, 2).map(id => ({
+          photo_ids: [id], bursts: [{photo_ids: [id]}],
+          photo_count: 1, burst_count: 1, species: ['Scoped bird']
+        }));
+      }
+      setPipelineResults(results);
+      window.cullAnalysisBefore = JSON.stringify(pipelineResults.encounters);
+    }''', {'ids': ids, 'scoped': scoped})
+    if not scoped:
+        # The unscoped read returns the same analysis, with live fields attached.
+        snapshot = page.evaluate('pipelineResults')
+        page.route('**/api/pipeline/page-init', lambda route: route.fulfill(json={'results': snapshot}))
+    page.evaluate('''({id, action}) => safeFetch('/api/photos/' + id + '/' + action, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({[action]: action === 'rating' ? 1 : 'rejected'})
+    })''', {'id': ids[0], 'action': history_action})
+    expect(page.locator('#historyUndoBtn')).to_be_enabled()
+    page.locator('#historyUndoBtn').click()
+    expect(page.locator('#historyRedoBtn')).to_be_enabled()
+    actions = ['keep', 'reject'] if history_action == 'rating' else ['review', 'review']
+    for pid, action in zip(ids[:2], actions, strict=True):
+        expect(page.locator(f'.cull-card[data-photo-id="{pid}"]')).to_have_class(re.compile(r'\b' + action + r'\b'))
+    assert page.evaluate('JSON.stringify(pipelineResults.encounters) === window.cullAnalysisBefore')

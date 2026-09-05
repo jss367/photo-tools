@@ -11629,6 +11629,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
         return updates
 
+    def _history_flags_changed(db, entry):
+        action = entry["action_type"]
+        if action == "pipeline_grouping":
+            action = (json.loads(entry["new_value"]).get("photo_edit") or {}).get("action_type")
+        if action != "flag":
+            return False
+        return db.conn.execute(
+            "SELECT 1 FROM edit_history_items WHERE edit_id = ? AND old_value != new_value LIMIT 1",
+            (entry["id"],),
+        ).fetchone() is not None
+
     @app.route("/api/undo", methods=["POST"])
     def api_undo():
         """Undo the most recent undoable edit.
@@ -11666,7 +11677,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # rows and commits them itself, and it touches no prediction
             # state, so it has nothing to serialize against.
             edit_recipe_updates = _edit_recipe_history_updates(db, result["id"])
-        response = {"ok": True, "undone": result["description"]}
+        response = {"ok": True, "undone": result["description"], "flags_changed": _history_flags_changed(db, result)}
         if edit_recipe_updates is not None:
             response["action_type"] = "edit_recipe"
             response["edit_recipes"] = edit_recipe_updates
@@ -11725,7 +11736,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if result.get("action_type") == "edit_recipe":
             # Outside the locked section, for the reason ``api_undo`` gives.
             edit_recipe_updates = _edit_recipe_history_updates(db, result["id"])
-        response = {"ok": True, "redone": result["description"]}
+        response = {"ok": True, "redone": result["description"], "flags_changed": _history_flags_changed(db, result)}
         if edit_recipe_updates is not None:
             response["action_type"] = "edit_recipe"
             response["edit_recipes"] = edit_recipe_updates

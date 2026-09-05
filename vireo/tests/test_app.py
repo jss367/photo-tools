@@ -23132,3 +23132,56 @@ def test_encounter_species_ignores_candidate_override_when_resolving_previous(ap
         encounters = _json.load(f)["encounters"]
     # Nothing shared with the encounter's teal any more → detached.
     assert len(encounters) == 2
+
+
+def test_pipeline_detach_photo_copies_explicit_empty_override(app_and_db):
+    """A photo split off a burst whose species were all removed keeps the
+    explicit-empty override; a None override would make the new burst
+    present the still-confirmed encounter species as its own."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+
+    cache_dir = os.path.dirname(app.config["DB_PATH"])
+    ws_id = db._active_workspace_id
+    empty = {"species": None, "confirmed": False, "species_list": []}
+    results = {
+        "encounters": [
+            {
+                "species": ["Robin", 0.9],
+                "confirmed_species": "Robin",
+                "confirmed_species_list": ["Robin"],
+                "species_predictions": [],
+                "species_confirmed": True,
+                "photo_count": 3,
+                "burst_count": 2,
+                "time_range": [None, None],
+                "photo_ids": [1, 2, 3],
+                "bursts": [
+                    {"photo_ids": [1, 2], "species_predictions": [],
+                     "species_override": dict(empty)},
+                    {"photo_ids": [3], "species_predictions": [],
+                     "species_override": None},
+                ],
+            }
+        ],
+        "photos": [
+            {"id": 1, "label": "KEEP", "filename": "a.jpg", "species_top5": [["Robin", 0.9, "m1"]]},
+            {"id": 2, "label": "KEEP", "filename": "b.jpg", "species_top5": [["Robin", 0.85, "m1"]]},
+            {"id": 3, "label": "KEEP", "filename": "c.jpg", "species_top5": [["Robin", 0.8, "m1"]]},
+        ],
+        "summary": {"total_photos": 3, "encounter_count": 1, "burst_count": 2,
+                     "keep_count": 3, "review_count": 0, "reject_count": 0,
+                     "rarity_protected": 0},
+    }
+    path = os.path.join(cache_dir, f"pipeline_results_ws{ws_id}.json")
+    with open(path, "w") as f:
+        _json.dump(results, f)
+
+    resp = client.post("/api/pipeline/detach-photo",
+                       json={"encounter_index": 0, "burst_index": 0, "photo_id": 2})
+    assert resp.status_code == 200
+    enc = resp.get_json()["encounters"][0]
+    assert enc["bursts"][0]["species_override"] == empty
+    assert enc["bursts"][-1]["photo_ids"] == [2]
+    assert enc["bursts"][-1]["species_override"] == empty

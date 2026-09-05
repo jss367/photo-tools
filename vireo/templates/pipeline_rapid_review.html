@@ -1988,10 +1988,18 @@ async function applyCurrent(openNext) {
   //   * any further new species → add (never untags, never detaches);
   //   * a dropped species with no replacement → remove;
   //   * a kept species some frames still lack → add (re-tag only).
-  // Replacements go first because they may auto-detach the burst.
+  // Order matters for auto-detach, which only a replace can trigger and
+  // which the server judges against the burst's list at that moment:
+  // unpaired removes go first so the replace sees the shrunken set (turning
+  // [A, B] into [C] must detach: remove B, then replace A→C leaves nothing
+  // shared with the encounter), then replacements, then adds (which can
+  // only widen overlap and never detach).
   var setDiff = rapidSpeciesSetDiff(targetList, alreadyConfirmedList);
   var speciesRequests = [];
   var pairCount = Math.min(setDiff.added.length, setDiff.removed.length);
+  for (var rmi = pairCount; rmi < setDiff.removed.length; rmi++) {
+    speciesRequests.push({ species: setDiff.removed[rmi], remove: true });
+  }
   for (var pi = 0; pi < pairCount; pi++) {
     speciesRequests.push({ species: setDiff.added[pi], previous_species: setDiff.removed[pi] });
   }
@@ -2001,9 +2009,6 @@ async function applyCurrent(openNext) {
     } else {
       speciesRequests.push({ species: setDiff.added[ai], add: true });
     }
-  }
-  for (var rmi = pairCount; rmi < setDiff.removed.length; rmi++) {
-    speciesRequests.push({ species: setDiff.removed[rmi], remove: true });
   }
   setDiff.kept.forEach(function(name) {
     var tagNeeded = items.some(function(p) { return !rapidFrameHasKeyword(p.id, name, targetList); });

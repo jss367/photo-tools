@@ -1545,3 +1545,25 @@ def test_rapid_review_species_name_with_comma_round_trips(live_server, page):
         page.locator("#applyBtn").click()
     assert [p["species"] for p in species_payloads] == ["Gadwall"]
     assert species_payloads[0]["add"] is True
+
+
+def test_rapid_review_shrinking_and_swapping_removes_before_replacing(live_server, page):
+    """[A, B] → [C] must send the bare remove first so the replace is judged
+    against a burst that shares nothing with its encounter and detaches."""
+    species_payloads = []
+    _mock_pipeline_rapid_review(
+        page, results=_two_species_results(), state_photos=_two_species_state(),
+        species_payloads=species_payloads,
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+
+    _fill_species_and_settle(page, "Gadwall")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Set species · Tag 3")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+
+    assert [(p["species"], p.get("remove"), p.get("previous_species")) for p in species_payloads] == [
+        ("Green-winged Teal", True, None),
+        ("Gadwall", None, "American Wigeon"),
+    ]

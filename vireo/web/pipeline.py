@@ -26,6 +26,7 @@ from pipeline_results import (
     burst_species_list,
     candidate_species_override,
     compute_time_range,
+    empty_species_override,
     rebuild_encounter_species_label,
 )
 from runtime_warnings import build_cpu_runtime_warning, runtime_warning_work_units
@@ -1866,9 +1867,19 @@ def create_pipeline_blueprint(
         # Create new single-photo burst in the same encounter
         new_burst_predictions = rebuild_species_predictions(results, [photo_id])
         new_burst_species = rebuild_encounter_species_label(results, [photo_id])
-        if source_override.get("confirmed") and source_override.get("species"):
-            new_burst_override = build_species_override(
-                burst_species_list({}, burst),
+        source_explicit_empty = (
+            isinstance(source_override.get("species_list"), list)
+            and not source_override["species_list"]
+        )
+        if source_explicit_empty or (
+            source_override.get("confirmed") and source_override.get("species")
+        ):
+            # Copy the source burst's confirmed set — including the
+            # explicit-empty sentinel a remove leaves behind, which must not
+            # decay into "inherit the encounter" on the split-off photo.
+            new_burst_override = (
+                build_species_override(burst_species_list({}, burst))
+                or empty_species_override()
             )
         elif enc.get("confirmed_species"):
             # Inherit the encounter's prior confirmed species by leaving the

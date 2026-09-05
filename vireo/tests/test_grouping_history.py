@@ -263,6 +263,93 @@ def test_processing_lock_does_not_stall_undo_or_consume_history(app_and_db):
     assert client.post('/api/undo').status_code == 200
 
 
+def test_cache_only_species_confirm_is_undone_before_older_grouping_edit(app_and_db):
+    """A cache-only encounter confirmation is undoable in LIFO with a detach.
+
+    ``/api/encounters/species`` writes ``confirmed_species`` /
+    ``species_confirmed`` into the cache regardless of whether any photo's
+    keyword tags change. When every submitted photo already carries the
+    requested species keyword (``newly_tagged`` is empty), no
+    ``keyword_add`` history row would be recorded. Without a dedicated
+    entry, a preceding grouping edit stays newest and its undo silently
+    discards the still-active confirmation because grouping signatures
+    strip these species fields by design.
+
+    A ``species_confirm_cache`` entry restores LIFO order: the first undo
+    reverts the cache confirmation, the second undo reverts the detach
+    with pristine species state.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    ids, original = _seed(db)
+    kid = db.conn.execute(
+        "SELECT id FROM keywords WHERE name = ? COLLATE NOCASE", ('Cardinal',),
+    ).fetchone()[0]
+    # Pre-tag every seeded photo with Cardinal so a subsequent confirmation
+    # produces no ``newly_tagged`` and no ``keyword_add`` history row.
+    for pid in ids:
+        try:
+            db.tag_photo(pid, kid, source='manual')
+        except Exception:  # already-tagged rows raise; ignore
+            pass
+    db.conn.commit()
+
+    _detach(client)
+    detached = _load(db)
+    # Locate the pre-detach parent encounter that survived (still holds the
+    # remaining burst) and confirm species on it. All its photos already
+    # carry Cardinal, so this write is cache-only.
+    parent_enc = next(
+        enc for enc in detached['encounters']
+        if len(enc.get('bursts') or []) > 0
+        and set(enc.get('photo_ids') or []) != set(ids[:2])
+    )
+    response = client.post('/api/encounters/species', json={
+        'species': 'Cardinal',
+        'photo_ids': parent_enc['photo_ids'],
+    })
+    assert response.status_code == 200, response.get_json()
+
+    confirmed = _load(db)
+    matched = next(
+        enc for enc in confirmed['encounters']
+        if enc.get('photo_ids') == parent_enc['photo_ids']
+    )
+    assert matched.get('confirmed_species') == 'Cardinal'
+    assert matched.get('species_confirmed') is True
+    # Both edits are undoable: the detach and the cache-only confirmation.
+    assert client.get('/api/undo/status').json['count'] == 2
+
+    # First undo reverts the cache confirmation, not the detach.
+    response = client.post('/api/undo')
+    assert response.status_code == 200, response.get_json()
+    after_first_undo = _load(db)
+    reverted = next(
+        enc for enc in after_first_undo['encounters']
+        if enc.get('photo_ids') == parent_enc['photo_ids']
+    )
+    assert reverted.get('confirmed_species') is None
+    assert not reverted.get('species_confirmed')
+    # Structure still shows the detach — its history entry is next in line.
+    assert len(after_first_undo['encounters']) == len(detached['encounters'])
+
+    # Second undo reverts the detach itself.
+    response = client.post('/api/undo')
+    assert response.status_code == 200, response.get_json()
+    assert _load(db)['encounters'] == original['encounters']
+
+    # Both redos replay in order.
+    assert client.post('/api/redo').status_code == 200
+    assert client.post('/api/redo').status_code == 200
+    replayed = _load(db)
+    replayed_match = next(
+        enc for enc in replayed['encounters']
+        if enc.get('photo_ids') == parent_enc['photo_ids']
+    )
+    assert replayed_match.get('confirmed_species') == 'Cardinal'
+    assert replayed_match.get('species_confirmed') is True
+
+
 def test_grouping_history_is_workspace_scoped(app_and_db):
     app, db = app_and_db
     client = app.test_client()

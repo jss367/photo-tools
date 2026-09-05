@@ -26932,6 +26932,55 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     is_batch=len(newly_tagged) > 1,
                     _commit=False,
                 )
+            elif cached and target_enc is not None:
+                # No keyword row was recorded (every photo already carries
+                # this species), but the cache mutation below will still
+                # write ``confirmed_species`` / ``species_confirmed`` (or a
+                # burst ``species_override``). Without a matching history
+                # entry, a preceding grouping edit would remain the newest
+                # undoable row and its undo would silently discard this
+                # confirmation because grouping signatures ignore these
+                # species fields by design. Record the cache-only write so
+                # LIFO undo reverts it first. Skip when auto-detach will
+                # fire — that path is a structural change owned by
+                # ``save_grouping_edit`` callers, not this cache write.
+                if burst_index is not None:
+                    burst_target = target_enc["bursts"][burst_index]
+                    current_override = burst_target.get("species_override")
+                    new_override = {"species": species, "confirmed": True}
+                    enc_species = target_enc.get("confirmed_species") or (
+                        target_enc["species"][0]
+                        if target_enc.get("species") else None
+                    )
+                    auto_detach_will_fire = (
+                        enc_species is not None
+                        and keyword_match_key(enc_species)
+                            != keyword_match_key(species)
+                        and len(target_enc["bursts"]) > 1
+                    )
+                    if current_override != new_override and not auto_detach_will_fire:
+                        from services.grouping_history import (
+                            record_species_confirm_cache,
+                        )
+                        record_species_confirm_cache(
+                            db, species=species, target_enc=target_enc,
+                            burst_index=burst_index,
+                            submitted_photo_ids=photo_ids,
+                        )
+                else:
+                    will_change = (
+                        target_enc.get("confirmed_species") != species
+                        or not target_enc.get("species_confirmed")
+                    )
+                    if will_change:
+                        from services.grouping_history import (
+                            record_species_confirm_cache,
+                        )
+                        record_species_confirm_cache(
+                            db, species=species, target_enc=target_enc,
+                            burst_index=None,
+                            submitted_photo_ids=photo_ids,
+                        )
             db.conn.commit()
         except Exception:
             db.conn.rollback()

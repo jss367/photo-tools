@@ -20931,8 +20931,14 @@ class Database:
         row would remain the newest undoable edit forever and block every
         older undoable edit behind it. Transient lock conflicts still bubble
         up so the caller can retry.
+
+        Retirements piggy-back on the outer ``BEGIN IMMEDIATE`` transaction so
+        the writer lock ``/api/undo`` acquired is retained across the retry:
+        the eventual successful undo commits everything together, and an
+        exhausted search commits the DELETEs before returning ``None``.
         """
         placeholders = ",".join("?" for _ in self._NON_UNDOABLE)
+        retired_stale = False
         while True:
             entry = self.conn.execute(
                 f"SELECT * FROM edit_history WHERE workspace_id = ? AND undone = 0 AND action_type NOT IN ({placeholders}) "
@@ -20940,6 +20946,8 @@ class Database:
                 (self._ws_id(), *self._NON_UNDOABLE),
             ).fetchone()
             if not entry:
+                if retired_stale:
+                    self.conn.commit()
                 return None
             entry = dict(entry)
             items = self.conn.execute(
@@ -20959,6 +20967,21 @@ class Database:
                         self.conn.commit()
                 except GroupingHistoryStale:
                     self._retire_stale_grouping_entry(entry['id'])
+                    retired_stale = True
+                    continue
+            elif entry['action_type'] == 'species_confirm_cache':
+                from services.grouping_history import (
+                    GroupingHistoryStale,
+                    restore_species_confirm_cache_edit,
+                )
+
+                try:
+                    with restore_species_confirm_cache_edit(self, entry, undo=True):
+                        self.conn.execute("UPDATE edit_history SET undone = 1 WHERE id = ?", (entry['id'],))
+                        self.conn.commit()
+                except GroupingHistoryStale:
+                    self._retire_stale_grouping_entry(entry['id'])
+                    retired_stale = True
                     continue
             else:
                 self._apply_undo(entry, items)
@@ -20971,9 +20994,11 @@ class Database:
 
         Replays in chronological order (ASC) so sequential undos are redone
         correctly. Stale ``pipeline_grouping`` entries are retired for the
-        same reason as ``undo_last_edit``.
+        same reason as ``undo_last_edit`` and share its transaction handling
+        so the writer lock spans the loop's retries.
         """
         placeholders = ",".join("?" for _ in self._NON_UNDOABLE)
+        retired_stale = False
         while True:
             entry = self.conn.execute(
                 f"SELECT * FROM edit_history WHERE workspace_id = ? AND undone = 1 AND action_type NOT IN ({placeholders}) "
@@ -20981,6 +21006,8 @@ class Database:
                 (self._ws_id(), *self._NON_UNDOABLE),
             ).fetchone()
             if not entry:
+                if retired_stale:
+                    self.conn.commit()
                 return None
             entry = dict(entry)
             items = self.conn.execute(
@@ -21000,6 +21027,21 @@ class Database:
                         self.conn.commit()
                 except GroupingHistoryStale:
                     self._retire_stale_grouping_entry(entry['id'])
+                    retired_stale = True
+                    continue
+            elif entry['action_type'] == 'species_confirm_cache':
+                from services.grouping_history import (
+                    GroupingHistoryStale,
+                    restore_species_confirm_cache_edit,
+                )
+
+                try:
+                    with restore_species_confirm_cache_edit(self, entry, undo=False):
+                        self.conn.execute("UPDATE edit_history SET undone = 0 WHERE id = ?", (entry['id'],))
+                        self.conn.commit()
+                except GroupingHistoryStale:
+                    self._retire_stale_grouping_entry(entry['id'])
+                    retired_stale = True
                     continue
             else:
                 self._apply_redo(entry, items)
@@ -21008,17 +21050,24 @@ class Database:
             return entry
 
     def _retire_stale_grouping_entry(self, entry_id):
-        """Delete a ``pipeline_grouping`` row whose snapshot no longer matches.
+        """Delete a cache-linked history row whose snapshot no longer matches.
 
-        Called only after ``restore_grouping_edit`` refused the row because
-        the cached encounter structure diverged from its recorded ``before`` /
-        ``after``. Leaving the row in history would keep it as the newest
-        undoable (or oldest redoable) grouping entry forever and block every
-        older undoable edit behind it. The row's ``edit_history_items``
-        cascade with the parent.
+        Called after ``restore_grouping_edit`` or
+        ``restore_species_confirm_cache_edit`` refused the row because the
+        cached encounter structure diverged from what the entry recorded.
+        Leaving the row would keep it as the newest undoable (or oldest
+        redoable) cache-linked entry forever and block every older undoable
+        edit behind it. The row's ``edit_history_items`` cascade with the
+        parent.
+
+        Intentionally does not commit: the caller runs inside the writer
+        lock's ``BEGIN IMMEDIATE`` transaction and needs to keep that lock
+        across the retry — committing here would release it and let a
+        concurrent mutation slip in before the next candidate is applied,
+        which would violate LIFO ordering. The caller commits together with
+        the eventual undo/redo, or once no candidate remains.
         """
         self.conn.execute("DELETE FROM edit_history WHERE id = ?", (entry_id,))
-        self.conn.commit()
 
     # ------------------------------------------------------------------
     # Undo / redo

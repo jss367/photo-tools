@@ -148,6 +148,160 @@ def save_grouping_edit(db, before, after, description):
     db._prune_edit_history()
 
 
+def record_species_confirm_cache(
+    db, *, species, target_enc, burst_index, submitted_photo_ids,
+):
+    """Record an ``/api/encounters/species`` call that only wrote the cache.
+
+    When every submitted photo already carries the requested species keyword,
+    the endpoint mutates ``confirmed_species`` / ``species_confirmed`` (or
+    ``species_override`` for a burst) without any per-photo keyword change,
+    so nothing is otherwise added to ``edit_history``. Without an entry,
+    a preceding grouping edit would remain the newest undoable row, and
+    its undo would silently discard this cache-only confirmation (grouping
+    signatures ignore these fields by design because they belong to species
+    LIFO, not to structure).
+
+    Recording a lightweight ``species_confirm_cache`` entry restores LIFO
+    ordering: undo reverts this cache write first, then the earlier grouping
+    edit runs against pristine species state.
+
+    Called from ``api_encounter_species`` *before* the cache mutation, inside
+    the same transaction as the DB writes, with ``_commit=False``.
+    """
+    if not target_enc:
+        return
+    encounter_photo_ids = list(target_enc.get("photo_ids") or [])
+    if burst_index is not None:
+        bursts = target_enc.get("bursts") or []
+        if not (0 <= burst_index < len(bursts)):
+            return
+        burst_photo_ids = list(bursts[burst_index].get("photo_ids") or [])
+        prev_override = copy.deepcopy(bursts[burst_index].get("species_override"))
+        new_value = json.dumps({
+            "encounter_photo_ids": encounter_photo_ids,
+            "burst_photo_ids": burst_photo_ids,
+            "species": species,
+            "previous_burst_override": prev_override,
+        })
+        description = f'Confirmed species "{species}" on 1 burst'
+    else:
+        prev_state = {
+            "confirmed_species": target_enc.get("confirmed_species"),
+            "species_confirmed": bool(target_enc.get("species_confirmed")),
+        }
+        new_value = json.dumps({
+            "encounter_photo_ids": encounter_photo_ids,
+            "submitted_photo_ids": list(submitted_photo_ids),
+            "species": species,
+            "previous_encounter_state": prev_state,
+        })
+        description = (
+            f'Confirmed species "{species}" on {len(submitted_photo_ids)} photos'
+        )
+    db.record_edit(
+        "species_confirm_cache", description, new_value, [],
+        is_batch=False, _commit=False,
+    )
+
+
+def _find_encounter_by_photo_ids(encounters, photo_ids):
+    """Return the encounter dict whose photo_ids match, else None."""
+    target_key = tuple(photo_ids or ())
+    for enc in encounters or []:
+        if isinstance(enc, dict) and tuple(enc.get("photo_ids") or ()) == target_key:
+            return enc
+    return None
+
+
+@contextmanager
+def restore_species_confirm_cache_edit(db, entry, *, undo):
+    """Undo (or redo) a cache-only ``/api/encounters/species`` confirmation.
+
+    Locates the recorded encounter / burst by its photo_ids and swaps the
+    ``confirmed_species`` / ``species_confirmed`` (or ``species_override``)
+    fields between the previous state and the ``species`` value that was
+    written. Raises :class:`GroupingHistoryStale` when the encounter's
+    composition has changed — a later grouping edit or pipeline recompute
+    replaced the row — so the caller retires the entry rather than
+    resurrecting a stale confirmation on the wrong photos.
+
+    Uses ``restore_grouping_edit``'s ``current`` → mutate → save pattern so
+    ``yield`` runs inside the workspace regroup lock and any DB failure
+    inside the caller's transaction rolls back before the cache is put back.
+    """
+    from pipeline import load_results_raw, save_results_raw
+    from pipeline_locks import acquire_workspace_regroup
+
+    lock = acquire_workspace_regroup(db._ws_id())
+    if not lock.acquire(blocking=False):
+        raise GroupingHistoryConflict(
+            'Photo groups are being updated. Try again when processing finishes.'
+        )
+    try:
+        cache_dir = os.path.dirname(db._db_path)
+        current = load_results_raw(cache_dir, db._ws_id())
+        change = json.loads(entry["new_value"])
+        if current is None:
+            raise GroupingHistoryStale(
+                "The photo groups have changed since this edit. "
+                "This confirmation cannot be restored."
+            )
+        restored = copy.deepcopy(current)
+        enc = _find_encounter_by_photo_ids(
+            restored.get("encounters"), change.get("encounter_photo_ids"),
+        )
+        if enc is None:
+            raise GroupingHistoryStale(
+                "The photo groups have changed since this edit. "
+                "This confirmation cannot be restored."
+            )
+        burst_photo_ids = change.get("burst_photo_ids")
+        if burst_photo_ids is not None:
+            target_burst = None
+            for b in enc.get("bursts") or []:
+                if isinstance(b, dict) and list(b.get("photo_ids") or []) == burst_photo_ids:
+                    target_burst = b
+                    break
+            if target_burst is None:
+                raise GroupingHistoryStale(
+                    "The burst has changed since this edit. "
+                    "This confirmation cannot be restored."
+                )
+            if undo:
+                prev = change.get("previous_burst_override")
+                if prev is None:
+                    target_burst.pop("species_override", None)
+                else:
+                    target_burst["species_override"] = copy.deepcopy(prev)
+            else:
+                target_burst["species_override"] = {
+                    "species": change["species"], "confirmed": True,
+                }
+        else:
+            prev_state = change.get("previous_encounter_state") or {}
+            if undo:
+                prev_species = prev_state.get("confirmed_species")
+                if prev_species is None:
+                    enc.pop("confirmed_species", None)
+                else:
+                    enc["confirmed_species"] = prev_species
+                enc["species_confirmed"] = bool(prev_state.get("species_confirmed"))
+            else:
+                enc["confirmed_species"] = change["species"]
+                enc["species_confirmed"] = True
+        save_results_raw(restored, cache_dir, db._ws_id())
+        try:
+            yield
+        except Exception:
+            if db.conn.in_transaction:
+                db.conn.rollback()
+            save_results_raw(current, cache_dir, db._ws_id())
+            raise
+    finally:
+        lock.release()
+
+
 @contextmanager
 def restore_grouping_edit(db, entry, *, undo):
     """Restore structure, retaining history if the write/commit fails.
@@ -190,6 +344,13 @@ def restore_grouping_edit(db, entry, *, undo):
         try:
             yield
         except Exception:
+            # Roll back any pending DB writes (typically the caller's
+            # ``UPDATE edit_history SET undone = ...`` or its commit) before
+            # putting the cache back — otherwise a later commit on this
+            # connection could flush the undone flag without the matching
+            # grouping state on disk and leave history desynchronized.
+            if db.conn.in_transaction:
+                db.conn.rollback()
             save_results_raw(current, cache_dir, db._ws_id())
             raise
     finally:

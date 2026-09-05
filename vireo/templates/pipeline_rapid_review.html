@@ -2074,6 +2074,10 @@ async function applyCurrent(openNext) {
     if (speciesPostNeeded) {
       var burstPhotoIds = items.map(function(p) { return p.id; });
       var burstIndex = session.burstIdx;
+      // The server normalizes spellings (Say’s Phoebe → Say's Phoebe) and
+      // dedupes by keyword identity; each response carries the authoritative
+      // list, and the last one is what the burst actually holds.
+      var confirmedSpeciesList = null;
       for (var ri = 0; ri < speciesRequests.length; ri++) {
       var spResp = await safeFetch('/api/encounters/species', {
         method: 'POST',
@@ -2085,6 +2089,9 @@ async function applyCurrent(openNext) {
       });
       // Adopt the authoritative structure (the endpoint may auto-detach on a
       // species mismatch), so the save-cache below doesn't clobber its restructure.
+      if (spResp && Array.isArray(spResp.species_list)) {
+        confirmedSpeciesList = spResp.species_list.filter(Boolean);
+      }
       if (spResp && spResp.encounters) {
         rapid.results.encounters = spResp.encounters;
         if (spResp.summary) rapid.results.summary = spResp.summary;
@@ -2116,9 +2123,12 @@ async function applyCurrent(openNext) {
       // (or in the label loop above) would leave the cache claiming confirmation
       // even when /api/encounters/species fails, hiding the burst from "Needs
       // species" locally until reload (the catch path doesn't roll it back).
+      // Persist the server-normalized list (not the raw field text) so the
+      // cache never claims a spelling or a duplicate the database lacks.
+      var mirrored = confirmedSpeciesList || targetList;
       items.forEach(function(p) {
-        p.confirmed_species_list = targetList.slice();
-        p.confirmed_species = targetList[0] || null;
+        p.confirmed_species_list = mirrored.slice();
+        p.confirmed_species = mirrored[0] || null;
       });
     }
     updateSummaryFromPhotos();

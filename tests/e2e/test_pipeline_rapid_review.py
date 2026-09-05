@@ -1611,3 +1611,33 @@ def test_rapid_review_non_ascii_case_pair_is_treated_as_distinct(live_server, pa
     assert body.get("remove") is True
     assert "add" not in body
     assert "previous_species" not in body
+
+
+def test_rapid_review_mirrors_server_normalized_species_onto_cache(live_server, page):
+    """The photo cache takes the server's normalized species_list, not the raw
+    field text, so a typographic apostrophe never lands in the saved cache."""
+    save_payloads = []
+    species_payloads = []
+    results = _two_species_results()
+    _mock_pipeline_rapid_review(
+        page, results=results, state_photos=_two_species_state(),
+        species_payloads=species_payloads, save_payloads=save_payloads,
+        species_response={
+            "ok": True,
+            "species_list": ["American Wigeon", "Say's Phoebe"],
+            "encounters": results["encounters"],
+            "summary": results["summary"],
+        },
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+
+    _fill_species_and_settle(page, "American Wigeon, Say’s Phoebe")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+
+    assert species_payloads[-1]["species"] == "Say’s Phoebe"
+    saved = {p["id"]: p for p in save_payloads[-1]["photos"]}
+    for pid in (1, 2, 3):
+        assert saved[pid]["confirmed_species_list"] == ["American Wigeon", "Say's Phoebe"]
+        assert saved[pid]["confirmed_species"] == "American Wigeon"

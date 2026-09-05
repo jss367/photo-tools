@@ -5,7 +5,9 @@ from playwright.sync_api import expect
 
 def test_storage_shows_named_categories_and_escaped_file_paths(live_server, page):
     db_path = live_server["db"]._db_path
-    backup = Path(f"{db_path}.bak-<img src=x onerror=alert(1)>")
+    # Literal angle brackets are invalid in Windows filenames. Encoded markup
+    # still catches missing HTML escaping: its displayed path must stay exact.
+    backup = Path(f"{db_path}.bak-&lt;img src=x onerror=alert(1)&gt;")
     backup.write_bytes(b"backup" * 1024)
     originals = Path(live_server["app"].config["THUMB_CACHE_DIR"]).parent / "originals"
     originals.mkdir(exist_ok=True)

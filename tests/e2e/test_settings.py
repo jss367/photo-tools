@@ -62,9 +62,22 @@ def test_settings_text_search_ignores_hidden_update_section(live_server, page):
 
 
 def _wait_for_settings_idle(page):
-    """Let the initial config load (and any migration autosave) settle."""
+    """Let the initial config load (and any migration autosave) settle.
+
+    Waits for the explicit ready marker the page flips on after both
+    /api/config and /api/workspaces/active/config have been fetched and
+    applied, otherwise an interaction can beat loadConfig() to a field
+    (and see its value overwritten) or trigger saveWsConfig() before
+    _wsOverridesLoaded flips on (a silent no-op that skips the POST the
+    test is asserting against). The autosave-pill idle check comes after
+    that, since it has no state at all before loads complete and would
+    pass immediately on a slow server.
+    """
     status = page.locator("#settingsSaveStatus")
     expect(page.locator("#cfgKeywordCase")).to_be_visible()
+    expect(page.locator("body")).to_have_attribute(
+        "data-settings-ready", "true", timeout=10_000
+    )
     expect(status).not_to_have_attribute("data-state", "saving", timeout=10_000)
     return status
 

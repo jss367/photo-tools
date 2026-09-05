@@ -1437,6 +1437,22 @@ function toggleSection(header) {
   body.classList.toggle('open');
 }
 
+/* ---------- Initial load readiness ----------
+ * The curated forms are populated asynchronously from /api/config and
+ * /api/workspaces/active/config. Tests (and any code that interacts with
+ * form fields on load) need a way to know both have finished, otherwise
+ * they can edit a field before loadConfig() overwrites it, or trigger
+ * saveWsConfig() before _wsOverridesLoaded flips on and get a silent
+ * no-op. The body's data-settings-ready attribute flips to "true" after
+ * both initial loads have settled (success OR handled failure). */
+var _settingsInitialLoads = { config: false, ws: false };
+function _markSettingsInitialLoad(kind) {
+  _settingsInitialLoads[kind] = true;
+  if (_settingsInitialLoads.config && _settingsInitialLoads.ws) {
+    document.body.setAttribute('data-settings-ready', 'true');
+  }
+}
+
 /* ---------- Workspace Config Overrides ---------- */
 var _wsOverridesLoaded = false;
 async function loadWsOverrides() {
@@ -1470,6 +1486,7 @@ async function loadWsOverrides() {
     });
     _wsOverridesLoaded = true;
   } catch(e) {}
+  _markSettingsInitialLoad('ws');
 }
 
 function updateWsLabel(key) {
@@ -1507,7 +1524,8 @@ function saveWsConfig() {
   // wipe persisted state we never displayed. Bail out instead.
   if (!_wsOverridesLoaded) return;
   clearTimeout(_wsSaveTimer);
-  _saveStatusMark('workspace', 'pending');
+  var gen = _nextSaveGen();
+  _saveStatusMark('workspace', 'pending', gen);
   _wsSaveTimer = setTimeout(async function() {
     var overrides = {};
     var needsResync = false;
@@ -1538,16 +1556,16 @@ function saveWsConfig() {
         overrides[key] = null;
       }
     });
-    _saveStatusMark('workspace', 'inflight');
+    _saveStatusMark('workspace', 'inflight', gen);
     try {
       await safeFetch('/api/workspaces/active/config', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(overrides)
       });
-      _saveStatusMark('workspace', 'ok');
+      _saveStatusMark('workspace', 'ok', gen);
     } catch(e) {
-      _saveStatusMark('workspace', 'error');
+      _saveStatusMark('workspace', 'error', gen);
     }
     // Restore any field left empty/invalid to the server's persisted value
     // (or uncheck it if no override actually exists server-side).
@@ -1566,24 +1584,44 @@ function saveWsConfig() {
 // Paths are tracked separately so a failed config save is not masked by a
 // later successful workspace-override save (they persist to different
 // places; only a retry of the SAME path clears its failure).
-var _saveStatus = { pending: {}, inflight: {}, failed: {}, lastSavedAt: null };
+//
+// Every save carries a monotonically increasing generation token so that
+// the completion of an OLDER request cannot clear pending/inflight state
+// belonging to a NEWER edit. Without this, editing a second field while a
+// POST for the first is in flight would show "Saved" as soon as the first
+// completes — during the second edit's debounce window or even while its
+// request was already running.
+var _saveStatus = { pending: {}, inflight: {}, lastResult: {}, lastSavedAt: null };
 var _saveStatusFlashTimer = null;
+var _saveGenCounter = 0;
 
-function _saveStatusMark(path, phase) {
+function _nextSaveGen() { return ++_saveGenCounter; }
+
+function _saveStatusMark(path, phase, gen) {
   if (phase === 'pending') {
-    _saveStatus.pending[path] = true;
+    // Debounced writes are singleton per path (clearTimeout drops any
+    // older timer), so overwrite rather than accumulate — otherwise a
+    // superseded pending gen would linger forever.
+    _saveStatus.pending[path] = gen;
   } else if (phase === 'inflight') {
-    delete _saveStatus.pending[path];
-    _saveStatus.inflight[path] = true;
-  } else if (phase === 'ok') {
-    delete _saveStatus.pending[path];
-    delete _saveStatus.inflight[path];
-    delete _saveStatus.failed[path];
-    _saveStatus.lastSavedAt = new Date();
-  } else if (phase === 'error') {
-    delete _saveStatus.pending[path];
-    delete _saveStatus.inflight[path];
-    _saveStatus.failed[path] = true;
+    if (_saveStatus.pending[path] === gen) delete _saveStatus.pending[path];
+    if (!_saveStatus.inflight[path]) _saveStatus.inflight[path] = {};
+    _saveStatus.inflight[path][gen] = true;
+  } else if (phase === 'ok' || phase === 'error') {
+    if (_saveStatus.inflight[path]) {
+      delete _saveStatus.inflight[path][gen];
+      if (Object.keys(_saveStatus.inflight[path]).length === 0) {
+        delete _saveStatus.inflight[path];
+      }
+    }
+    // Only let the LATEST completion define the visible outcome. An older
+    // 'ok' arriving after a newer 'error' must not overwrite the failure,
+    // and vice versa. Ties (same gen) update in call order.
+    var prev = _saveStatus.lastResult[path];
+    if (!prev || gen >= prev.gen) {
+      _saveStatus.lastResult[path] = { gen: gen, phase: phase };
+    }
+    if (phase === 'ok') _saveStatus.lastSavedAt = new Date();
   } else if (phase === 'cancel') {
     // A queued write was dropped on purpose (settings import replaces the
     // whole config). Nothing was persisted, so don't claim a save happened.
@@ -1597,7 +1635,9 @@ function _renderSaveStatus() {
   if (!el) return;
   var busy = Object.keys(_saveStatus.pending).length > 0 ||
              Object.keys(_saveStatus.inflight).length > 0;
-  var failed = Object.keys(_saveStatus.failed).length > 0;
+  var failed = Object.keys(_saveStatus.lastResult).some(function(p) {
+    return _saveStatus.lastResult[p].phase === 'error';
+  });
   clearTimeout(_saveStatusFlashTimer);
   el.classList.remove('flash');
   if (busy) {
@@ -2627,6 +2667,7 @@ async function loadConfig() {
     document.getElementById('cfgBurstEmb').value = fallbackDistance;
     document.getElementById('cfgBurstEmbVal').textContent = fallbackDistance + '%';
   }
+  _markSettingsInitialLoad('config');
 }
 
 var CARD_FIELD_OPTIONS = [
@@ -2666,7 +2707,11 @@ function getSelectedCardFields() {
   return fields;
 }
 
-async function _saveConfigNow() {
+async function _saveConfigNow(gen) {
+    // Direct callers (NAS wizard, etc.) don't hand us a generation, so mint
+    // one here. Threading a fresh gen through inflight/ok/error keeps the
+    // autosave pill honest when this call overlaps a debounced write.
+    if (gen === undefined) gen = _nextSaveGen();
     var threshold = parseInt(document.getElementById('cfgThreshold').value, 10) / 100;
     var grouping = parseInt(document.getElementById('cfgGroupingWindow').value, 10);
     if (isNaN(grouping)) grouping = 10;
@@ -2675,7 +2720,7 @@ async function _saveConfigNow() {
     var keywordCase = document.getElementById('cfgKeywordCase').value;
     var maxEditHistory = parseInt(document.getElementById('cfgMaxEditHistory').value, 10);
     if (isNaN(maxEditHistory)) maxEditHistory = 1000;
-    _saveStatusMark('config', 'inflight');
+    _saveStatusMark('config', 'inflight', gen);
     try {
       await safeFetch('/api/config', {
         method: 'POST',
@@ -2780,10 +2825,10 @@ async function _saveConfigNow() {
         }),
       });
     } catch (e) {
-      _saveStatusMark('config', 'error');
+      _saveStatusMark('config', 'error', gen);
       throw e;
     }
-    _saveStatusMark('config', 'ok');
+    _saveStatusMark('config', 'ok', gen);
     if (typeof loadPreviewCacheStatus === 'function') loadPreviewCacheStatus();
     // Drop the cached editor list so the next "Open in Editor" action
     // sees changes to the editors list without a page reload.
@@ -2799,9 +2844,10 @@ function saveConfig() {
   // need to KNOW the write landed (e.g. the NAS wizard, before it tears down
   // its modal) must call _saveConfigNow() directly and await it.
   clearTimeout(_saveTimer);
-  _saveStatusMark('config', 'pending');
+  var gen = _nextSaveGen();
+  _saveStatusMark('config', 'pending', gen);
   _saveTimer = setTimeout(function() {
-    _saveConfigNow().catch(function() {});
+    _saveConfigNow(gen).catch(function() {});
   }, 500);
 }
 

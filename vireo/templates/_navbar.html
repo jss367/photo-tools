@@ -6033,7 +6033,11 @@ function _lbRefreshVisiblePhotoImages(photoId) {
   function refreshImg(img, url) {
     if (!img || refreshed.indexOf(img) !== -1) return;
     refreshed.push(img);
-    img.src = url || thumbUrl;
+    // Route through _vireoSetRenderedImageSource so grid cards update
+    // data-thumbnail-src; the queue then cancels any in-flight fetch and
+    // fetches the new URL under the concurrency limit, preventing a stale
+    // response from overwriting the edited pixels.
+    _vireoSetRenderedImageSource(img, url || thumbUrl);
   }
 
   refreshImg(document.querySelector('.grid-card[data-id="' + photoId + '"] img'));

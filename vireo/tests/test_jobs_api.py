@@ -9114,8 +9114,12 @@ def test_import_photos_retry_rejects_second_retry_while_first_is_pausing(
         assert second_retry.status_code == 409, second_retry.get_json()
         assert "already in flight" in second_retry.get_json()["error"]
 
+        # The runner honors pending pauses even when the worker returns.
+        # Withdraw this test's pause before allowing its fake worker to finish.
+        assert client.post(f"/api/jobs/{first_retry_id}/resume").status_code == 200
         release_first_retry.set()
-        wait_for_job_via_client(client, first_retry_id)
+        finished = wait_for_job_via_client(client, first_retry_id)
+        assert finished["status"] == "completed"
 
 
 def test_import_photos_remote_and_destination_mutually_exclusive(

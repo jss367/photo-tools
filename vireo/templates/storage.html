@@ -40,6 +40,12 @@ body { padding-bottom: 36px; }
 .health-value { color: var(--text-primary); font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
 .health-detail { color: var(--text-ghost); font-size: 10px; margin-top: 4px; }
 .stat-card .btn-manage { display: block; margin-left: auto; margin-right: auto; }
+.storage-breakdown { margin-top: 16px; }
+.storage-breakdown summary { cursor: pointer; font-size: 13px; padding: 10px 0; }
+.storage-breakdown-row { padding: 10px 0; border-top: 1px solid var(--border); }
+.storage-breakdown-row strong { float: right; margin-left: 12px; font-variant-numeric: tabular-nums; }
+.storage-breakdown-row p { color: var(--text-dim); font-size: 12px; margin: 5px 0; }
+.storage-breakdown-row code { display: block; font-size: 11px; color: var(--text-secondary); overflow-wrap: anywhere; }
 .storage-location {
   display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:10px 12px;
   background:var(--bg-tertiary); border-radius:6px; margin-bottom:12px;
@@ -153,6 +159,7 @@ dialog.modal-overlay::backdrop { background: transparent; }
       <span class="stat-kind keep">Keep</span> contains catalog or original data
     </div>
     <div id="storageGrid" class="stats-grid"><span style="color:var(--text-ghost);font-size:13px;">Loading...</span></div>
+    <div id="storageBreakdown" class="storage-breakdown"></div>
     <div id="masksCard" style="margin-top:16px;"></div>
   </div>
 
@@ -702,8 +709,26 @@ async function loadStoragePanel() {
       {name: 'Models', size: s.models.size, type: null, kind: 'download', kindLabel: 'Download again', settings: true},
       {name: 'Hugging Face Cache', size: s.hf_cache.size, type: null, kind: 'download', kindLabel: 'Download again', settings: true},
       {name: 'Offline Originals', size: s.offline_originals.size, count: s.offline_originals.count, type: null, kind: 'keep', kindLabel: 'Keep'},
-      {name: 'Other Vireo Data', size: s.other.size, type: null, kind: 'keep', kindLabel: 'Keep'},
     ];
+    var auxiliaryCategories = s.other.categories || [];
+    auxiliaryCategories.forEach(function(c) {
+      categories.push({name: c.name, size: c.size, kind: 'keep', kindLabel: 'Review before removing'});
+    });
+    var breakdownHtml = auxiliaryCategories.length
+      ? '<p class="storage-legend">Files and folders below are sorted by size within each category. Sizes exclude data already counted in the main cache categories.</p>'
+      : '';
+    auxiliaryCategories.forEach(function(c) {
+      breakdownHtml += '<details><summary>' + storageEscapeHtml(c.name) +
+        ' · ' + storageFormatBytes(c.size) + ' · View files and folders</summary>';
+      c.entries.forEach(function(entry) {
+        breakdownHtml += '<div class="storage-breakdown-row"><strong>' +
+          storageFormatBytes(entry.size) + '</strong><p>' +
+          storageEscapeHtml(entry.description) + '</p><code>' +
+          storageEscapeHtml(entry.path) + '</code></div>';
+      });
+      breakdownHtml += '</details>';
+    });
+    document.getElementById('storageBreakdown').innerHTML = breakdownHtml;
     _storageSummary = {};
 
     var html = '';
@@ -712,7 +737,7 @@ async function loadStoragePanel() {
       if (c.type) _storageSummary[c.type] = {count: c.count || 0, size: c.size || 0};
       html += '<div class="stat-card">' +
         '<div class="stat-number">' + storageFormatBytes(c.size) + '</div>' +
-        '<div class="stat-label">' + c.name +
+        '<div class="stat-label">' + storageEscapeHtml(c.name) +
           (c.count != null ? ' (' + c.count.toLocaleString() + ')' : '') +
         '</div>' +
         '<span class="stat-kind ' + c.kind + '">' + c.kindLabel + '</span>';

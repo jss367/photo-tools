@@ -263,3 +263,148 @@ def test_sharpness_auto_flags_observe_pause_and_cancel(
     finally:
         release.set()
         runner.cancel_job(job_id)
+
+
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+def test_export_observes_pause_after_metadata_finishes(
+    client_with_photo, monkeypatch, tmp_path, action,
+):
+    import export
+
+    app, db, photo_id = client_with_photo
+    db.conn.execute("UPDATE photos SET timestamp=? WHERE id=?", ("2026-08-01T12:30:00", photo_id))
+    db.conn.commit()
+    client = app.test_client()
+    runner = app._job_runner
+    entered = threading.Event()
+    release = threading.Event()
+    reaped = threading.Event()
+
+    def metadata_batch(jobs, cancel_check=None):
+        entered.set()
+        assert release.wait(5)
+        # The live subprocess's probe must not park its parent.
+        assert cancel_check() is False
+        reaped.set()
+        return len(jobs), []
+
+    monkeypatch.setattr(export, "_write_export_metadata_batch", metadata_batch)
+    response = client.post("/api/jobs/export", json={
+        "photo_ids": [photo_id], "destination": str(tmp_path / "export"),
+        "metadata_fields": ["capture_date"], "reveal_after_export": False,
+    })
+    assert response.status_code == 200
+    job_id = response.get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert client.post(f"/api/jobs/{job_id}/pause").status_code == 200
+        assert runner.get(job_id)["status"] == "pausing"
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        assert reaped.is_set()
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        finished = wait_for_job_via_client(client, job_id)
+        assert finished["status"] == ("completed" if action == "resume" else "cancelled"), finished
+        assert finished["result"]["exported"] == 1
+    finally:
+        release.set()
+        runner.cancel_job(job_id)
+
+
+def test_ingest_can_pause_during_discovery(app_and_db, monkeypatch, tmp_path):
+    import ingest
+
+    app, _db = app_and_db
+    source = tmp_path / "card"
+    source.mkdir()
+    Image.new("RGB", (8, 8)).save(source / "bird.jpg")
+    entered = threading.Event()
+    release = threading.Event()
+    continued = threading.Event()
+
+    def walk(path, *, cancel_check=None, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        assert cancel_check is not None
+        assert cancel_check() is False
+        continued.set()
+        yield str(source), [], ["bird.jpg"]
+
+    monkeypatch.setattr(ingest, "safe_scan_walk", walk)
+    client = app.test_client()
+    runner = app._job_runner
+    job_id = client.post("/api/jobs/ingest", json={
+        "source": str(source), "destination": str(tmp_path / "archive"),
+    }).get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        assert not continued.is_set()
+        assert runner.cancel_job(job_id)
+        finished = wait_for_job_via_client(client, job_id)
+        assert finished["status"] == "cancelled", finished
+        assert not continued.is_set()
+    finally:
+        release.set()
+        runner.cancel_job(job_id)
+
+
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+@pytest.mark.parametrize("skip_duplicates", [True, False])
+def test_ingest_pauses_between_metadata_batches(
+    app_and_db, monkeypatch, tmp_path, action, skip_duplicates,
+):
+    from datetime import datetime
+
+    import import_dedup
+    import ingest
+
+    app, _db = app_and_db
+    source = tmp_path / "card"
+    source.mkdir()
+    destination = tmp_path / "archive"
+    for i in range(101):
+        Image.new("RGB", (8, 8)).save(source / f"bird-{i:03}.jpg")
+    entered = threading.Event()
+    release = threading.Event()
+    batches = []
+
+    def timestamps(files):
+        batches.append(list(files))
+        if len(batches) == 1:
+            entered.set()
+            assert release.wait(5)
+        return {f: datetime(2026, 8, 1, 12, 30) for f in files}
+
+    # Duplicate preparation and folder planning use the same reader through
+    # different imports; cover both the dedup and no-dedup preparation paths.
+    monkeypatch.setattr(import_dedup, "source_capture_timestamps", timestamps)
+    monkeypatch.setattr(ingest, "source_capture_timestamps", timestamps)
+    client = app.test_client()
+    runner = app._job_runner
+    job_id = client.post("/api/jobs/ingest", json={
+        "source": str(source), "destination": str(destination),
+        "skip_duplicates": skip_duplicates,
+    }).get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        assert [len(batch) for batch in batches] == [100]
+        assert not list(destination.rglob("*.jpg"))
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        finished = wait_for_job_via_client(client, job_id)
+        if action == "resume":
+            assert finished["status"] == "completed", finished
+            assert [len(batch) for batch in batches] == [100, 1]
+            assert finished["result"]["copied"] == 101
+        else:
+            assert finished["status"] == "cancelled", finished
+            assert [len(batch) for batch in batches] == [100]
+            assert not list(destination.rglob("*.jpg"))
+    finally:
+        release.set()
+        runner.cancel_job(job_id)

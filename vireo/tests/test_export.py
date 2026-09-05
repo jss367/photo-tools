@@ -3763,6 +3763,7 @@ def test_export_keeps_metadata_subprocess_polling_cancel_only(export_env, monkey
         # Simulate the active subprocess's repeated cancellation polls.
         assert cancel_check() is False
         assert cancel_check() is False
+        metadata_running = False
         return len(jobs), []
 
     monkeypatch.setattr(export_module, "_write_export_metadata_batch", write_metadata)

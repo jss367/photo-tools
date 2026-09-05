@@ -813,6 +813,10 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
         metadata_exported, metadata_errors = _write_export_metadata_batch(
             metadata_jobs, cancel_check=cancel_only_check or cancel_check,
         )
+        # The subprocess has exited, so a pending pause can now park safely.
+        # Keep completed outputs in the result even if cancellation arrived.
+        if cancel_check:
+            cancel_check()
         exported += metadata_exported
         errors.extend(metadata_errors)
         if exported_files is not None:

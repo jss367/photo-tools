@@ -684,3 +684,24 @@ def test_combined_history_failure_rolls_back_photos_and_cache(app_and_db, monkey
     assert client.post(route).status_code == 200
     if not undo:
         assert _load(db)['encounters'][-1]['bursts'][0]['species_override']['confirmed'] is True
+
+
+def test_pipeline_results_refresh_species_from_database_after_confirm_and_undo(app_and_db):
+    app, db = app_and_db
+    client = app.test_client()
+    ids, cached = _seed(db)
+    for pid in ids:
+        for keyword in db.get_photo_keywords(pid):
+            db.untag_photo(pid, keyword['id'])
+    for photo in cached['photos']:
+        photo['confirmed_species'] = 'Stale cached label'
+    save_results_raw(cached, os.path.dirname(db._db_path), db._ws_id())
+    assert all(p['confirmed_species'] is None for p in client.get('/api/pipeline/results').json['photos'])
+    assert client.post('/api/encounters/species', json={
+        'species': 'Cardinal', 'photo_ids': ids,
+    }).status_code == 200
+    assert all(p['confirmed_species'] == 'Cardinal' for p in client.get('/api/pipeline/results').json['photos'])
+    assert client.post('/api/undo').status_code == 200
+    assert all(p['confirmed_species'] is None for p in client.get('/api/pipeline/results').json['photos'])
+    assert client.post('/api/redo').status_code == 200
+    assert all(p['confirmed_species'] == 'Cardinal' for p in client.get('/api/pipeline/results').json['photos'])

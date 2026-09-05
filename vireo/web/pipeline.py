@@ -1514,6 +1514,28 @@ def create_pipeline_blueprint(
         results["source"] = "browse-selection"
         return jsonify(results)
 
+    def attach_live_pipeline_decisions(db, results):
+        """Overlay saved photo decisions without trusting cached browser metadata."""
+        photo_ids = [p["id"] for p in results.get("photos", [])]
+        species = db.get_species_keywords_for_photos(photo_ids)
+        live = {}
+        for chunk in _chunks(photo_ids):
+            marks = ",".join("?" for _ in chunk)
+            live.update({row["id"]: row for row in db.conn.execute(
+                f"SELECT id, flag, rating FROM photos WHERE id IN ({marks})", chunk,
+            )})
+        for photo in results.get("photos", []):
+            row = live.get(photo["id"])
+            if row is None:
+                continue
+            flag = row["flag"] or "none"
+            if flag != (photo.get("flag") or "none") or flag != "none":
+                photo["label"] = {"flagged": "KEEP", "rejected": "REJECT"}.get(flag, "REVIEW")
+            photo["flag"] = flag
+            photo["rating"] = row["rating"] or 0
+            names = species.get(photo["id"], [])
+            photo["confirmed_species"] = names[0] if names else None
+
     @blueprint.route("/api/pipeline/results")
     def api_pipeline_results():
         """Return the most recent pipeline triage results for the active workspace."""
@@ -1530,6 +1552,7 @@ def create_pipeline_blueprint(
         results = load_results(cache_dir, db._active_workspace_id)
         if results is None:
             return json_error("No pipeline results found. Run regroup first.", 404)
+        attach_live_pipeline_decisions(db, results)
         attach_nested_edit_recipes(db, results)
         return jsonify(results)
 

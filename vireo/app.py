@@ -27048,14 +27048,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # pre-normalization spelling (e.g. ‘Apapane) does not trigger
                 # a needless split against the stored species (Apapane); the
                 # DB write already normalized to the canonical form. Adding a
-                # second species or removing one never detaches: the burst
-                # is deliberately holding both.
+                # second species never detaches (it can only widen overlap);
+                # a remove detaches only when it leaves a non-empty set that
+                # shares nothing with the encounter ([A, B] under an
+                # A-encounter, minus A, is a B burst that belongs elsewhere).
+                # An emptied burst stays put: there is nothing to file it
+                # under.
                 enc_species_list = encounter_confirmed_species_list(target_enc)
                 if not enc_species_list and target_enc.get("species"):
                     enc_species_list = [target_enc["species"][0]]
                 if (
                     not add_mode
-                    and not remove_mode
+                    and new_species_list
                     and enc_species_list
                     and not (
                         species_key_set(new_species_list)
@@ -27064,7 +27068,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     and len(target_enc["bursts"]) > 1
                 ):
                     auto_detach_burst_for_species(
-                        cached, target_enc_idx, burst_index, species
+                        cached, target_enc_idx, burst_index,
+                        new_species_list[0],
                     )
             else:
                 set_encounter_confirmed_species(target_enc, new_species_list)

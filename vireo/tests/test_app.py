@@ -23185,3 +23185,64 @@ def test_pipeline_detach_photo_copies_explicit_empty_override(app_and_db):
     assert enc["bursts"][0]["species_override"] == empty
     assert enc["bursts"][-1]["photo_ids"] == [2]
     assert enc["bursts"][-1]["species_override"] == empty
+
+
+def test_encounter_species_remove_detaches_when_no_overlap_remains(app_and_db):
+    """Removing the only species a burst shares with its encounter leaves a
+    burst that belongs elsewhere: it detaches, carrying its remaining
+    species. Emptying a burst never detaches."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    burst_ids, other_ids = photo_ids[:2], photo_ids[2:]
+    path = _seed_encounter_cache(
+        app, db, photo_ids, confirmed_species="Green-winged Teal",
+        bursts=[
+            {"photo_ids": burst_ids, "species_predictions": [],
+             "species_override": {
+                 "species": "Green-winged Teal", "confirmed": True,
+                 "species_list": ["Green-winged Teal", "American Wigeon"],
+             }},
+            {"photo_ids": other_ids, "species_predictions": [],
+             "species_override": None},
+        ],
+    )
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    wigeon = db.add_keyword("American Wigeon", is_species=True)
+    for pid in photo_ids:
+        db.tag_photo(pid, teal)
+    for pid in burst_ids:
+        db.tag_photo(pid, wigeon)
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "Green-winged Teal", "photo_ids": burst_ids,
+        "burst_index": 0, "remove": True,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    assert resp.get_json()["species_list"] == ["American Wigeon"]
+    with open(path) as f:
+        encounters = _json.load(f)["encounters"]
+    assert len(encounters) == 2
+    detached = next(e for e in encounters if burst_ids[0] in e["photo_ids"])
+    assert detached["photo_ids"] == burst_ids
+    assert detached["species_confirmed"] is True
+    assert detached["confirmed_species"] == "American Wigeon"
+    assert detached["confirmed_species_list"] == ["American Wigeon"]
+    remaining = next(e for e in encounters if other_ids[0] in e["photo_ids"])
+    assert remaining["photo_ids"] == other_ids
+    assert remaining["confirmed_species"] == "Green-winged Teal"
+
+    # Emptying the (now single-burst) detached encounter's burst stays put.
+    detached_idx = encounters.index(detached)
+    resp = client.post("/api/encounters/species", json={
+        "species": "American Wigeon", "photo_ids": burst_ids,
+        "burst_index": 0, "remove": True,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    with open(path) as f:
+        encounters = _json.load(f)["encounters"]
+    assert len(encounters) == 2
+    assert encounters[detached_idx]["bursts"][0]["species_override"] == {
+        "species": None, "confirmed": False, "species_list": [],
+    }

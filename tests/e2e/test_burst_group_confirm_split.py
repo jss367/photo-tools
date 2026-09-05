@@ -731,3 +731,44 @@ def test_species_field_clear_is_not_repopulated(live_server, page):
     expect(page.locator("#grmSpeciesKeywordSummary")).to_contain_text(
         "No species keyword"
     )
+
+
+def test_detached_burst_preserves_explicit_empty_override(live_server, page):
+    """A burst whose species were all removed carries the explicit-empty
+    override ({confirmed: false, species_list: []}). Detaching a frame from
+    it must copy that sentinel onto the new single-photo burst: a null
+    override would make the frame inherit the still-confirmed encounter
+    species even though its database row carries no species tag."""
+    encounter_species = "Northern Harrier"
+    photo_ids = live_server["data"]["photos"][0:3]
+    _write_single_burst_cache(live_server, photo_ids, confirmed_species=encounter_species)
+    empty = {"species": None, "confirmed": False, "species_list": []}
+    cache = _read_cache(live_server)
+    cache["encounters"][0]["bursts"][0]["species_override"] = dict(empty)
+    with open(_cache_path(live_server), "w") as f:
+        json.dump(cache, f)
+
+    _open_burst_modal(page, live_server)
+    # Isolate the detach path: no species work on this apply.
+    page.locator("#grmConfirmSpeciesChk").set_checked(False)
+    expect(page.locator("#grmConfirmSpeciesChk")).not_to_be_checked()
+
+    second_pid = int(
+        page.locator("#grmOverlay .grm-card[data-photo-id]").nth(1).get_attribute("data-photo-id")
+    )
+    page.locator(f"#grmOverlay .grm-card[data-photo-id='{second_pid}']").click()
+    page.locator("#grmRemoveBtn").click()
+    expect(page.locator("#grmApplyFlagsChk")).to_be_checked()
+
+    with page.expect_response("**/api/pipeline/group/apply"):
+        page.locator("#grmApplyBtn").click()
+    expect(page.locator("#grmOverlay")).not_to_have_class(re.compile(r"\bopen\b"))
+
+    cache = _read_cache(live_server)
+    bursts = cache["encounters"][0]["bursts"]
+    assert len(bursts) == 2, [b["photo_ids"] for b in bursts]
+    detached = next(b for b in bursts if b["photo_ids"] == [second_pid])
+    source = next(b for b in bursts if second_pid not in b["photo_ids"])
+    assert detached["species_override"] == empty, detached["species_override"]
+    assert source["species_override"] == empty, source["species_override"]
+    assert _photos_with_species(live_server, photo_ids, encounter_species) == set()

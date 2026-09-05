@@ -8519,11 +8519,25 @@ async function grmApply() {
         // including the mixed/partial state (species_confirmed=false but
         // confirmed_species set) where a classifier-guess override would
         // mask the real prior tag for a later burst-confirm.
+        // Also copy the explicit-empty sentinel ({confirmed:false,
+        // species_list:[]}) a remove leaves on a burst: under a still-
+        // confirmed encounter a null override would make the split-off
+        // photo inherit a species its database row no longer carries.
+        var sourceExplicitEmpty = !!sourceOverride
+          && Array.isArray(sourceOverride.species_list)
+          && sourceOverride.species_list.length === 0;
+        var copiedOverride = null;
+        if (sourceOverride && (sourceOverride.confirmed === true || sourceExplicitEmpty)) {
+          copiedOverride = Object.assign({}, sourceOverride);
+          if (Array.isArray(sourceOverride.species_list)) {
+            copiedOverride.species_list = sourceOverride.species_list.slice();
+          }
+        }
         enc.bursts.push({
           photo_ids: [pid],
           species_predictions: detachedConsensus,
-          species_override: sourceOverride && sourceOverride.confirmed === true
-            ? Object.assign({}, sourceOverride)
+          species_override: copiedOverride
+            ? copiedOverride
             : (enc.confirmed_species
               ? null
               : candidateSpeciesOverrideFromPhotos(detachedPhotos)),

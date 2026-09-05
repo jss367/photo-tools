@@ -845,6 +845,7 @@ class JobRunner:
                     job.get("pausable")
                     and job_id in self._pause_requested
                     and job_id not in self._cancelled
+                    and job_id not in self._uncancellable
                 ):
                     if job.get("status") != "paused":
                         self._publish_status_locked(job, "paused")
@@ -1655,14 +1656,22 @@ class JobRunner:
             return job_id in self._cancelled
 
     def begin_uncancellable(self, job_id):
-        """Atomically enter an uninterruptible phase if not cancelled.
+        """Honor a pending pause, then atomically enter an uninterruptible phase.
 
         Returns False when a cancellation is already pending, leaving that flag
         intact so ``_run_job`` can record the job as cancelled. Once this
-        returns True, later ``cancel_job`` calls are ignored until the job
-        reaches a terminal state.
+        returns True, later pause and cancellation requests are ignored until
+        the job reaches a terminal state. Pausable callers must invoke this at
+        a safe checkpoint before acquiring resources for the commit.
         """
-        with self._lock:
+        with self._pause_condition:
+            while job_id in self._pause_requested and job_id not in self._cancelled:
+                job = self._jobs.get(job_id)
+                if job is None:
+                    return False
+                if job.get("status") != "paused":
+                    self._publish_status_locked(job, "paused")
+                self._pause_condition.wait()
             if job_id in self._cancelled:
                 return False
             self._uncancellable.add(job_id)

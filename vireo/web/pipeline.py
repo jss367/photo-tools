@@ -1914,7 +1914,9 @@ def create_pipeline_blueprint(
         if burst_idx < 0 or burst_idx >= len(bursts):
             return json_error("Invalid burst_index")
 
-        if photo_id not in bursts[burst_idx]["photo_ids"]:
+        source = bursts[burst_idx]
+        source_ids = source["photo_ids"] if isinstance(source, dict) else source
+        if photo_id not in source_ids:
             return json_error("photo_id not in burst")
         detach_review_photo(results, enc_idx, burst_idx, photo_id)
 
@@ -2030,7 +2032,7 @@ def create_pipeline_blueprint(
             enc = next((e for e in restored["encounters"]
                         if e.get("photo_ids") == clear.get("encounter_photo_ids")), None)
             burst = next((b for b in (enc or {}).get("bursts", [])
-                          if b.get("photo_ids") == clear.get("burst_photo_ids")), None)
+                          if isinstance(b, dict) and b.get("photo_ids") == clear.get("burst_photo_ids")), None)
             if burst is None or burst.get("species_override") != clear.get("expected_override"):
                 return json_error("The burst label or grouping changed. Reload before applying.", 409)
             burst["species_override"] = None

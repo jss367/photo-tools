@@ -1411,6 +1411,9 @@ class Database:
             cur.execute("ALTER TABLE predictions ADD COLUMN source_taxon_id INTEGER")
         cur.execute("PRAGMA table_info(keywords)")
         kw_cols = {row[1] for row in cur.fetchall()}
+        if "source_taxon_id" not in kw_cols:
+            cur.execute("ALTER TABLE keywords ADD COLUMN source_taxon_id INTEGER")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_keywords_source_taxon_id ON keywords(source_taxon_id)")
         if "place_id" not in kw_cols:
             cur.execute("ALTER TABLE keywords ADD COLUMN place_id TEXT")
         cur.execute(
@@ -11068,7 +11071,55 @@ class Database:
                     return taxon["id"]
         return None
 
-    def add_keyword(self, name, parent_id=None, is_species=False, kw_type=None, _commit=True):
+    def _add_source_species_keyword(self, name, source_taxon_id, parent_id=None, _commit=True):
+        """Bind accepted source evidence without reassigning same-name tags."""
+        if type(source_taxon_id) is not int or not 0 < source_taxon_id < (1 << 63):
+            raise ValueError("source_taxon_id must be a positive SQLite integer")
+        taxon = self.conn.execute("SELECT id FROM taxa WHERE inat_id = ?", (source_taxon_id,)).fetchone()
+        local_id = taxon["id"] if taxon else None
+        existing = self.conn.execute(
+            "SELECT id FROM keywords WHERE parent_id IS ? AND type IN ('taxonomy', 'general') "
+            "AND (source_taxon_id = ? OR (source_taxon_id IS NULL AND taxon_id = ?)) "
+            "ORDER BY (type = 'taxonomy') DESC, id LIMIT 1",
+            (parent_id, source_taxon_id, local_id),
+        ).fetchone()
+        if existing:
+            kid = existing["id"]
+            self.conn.execute(
+                "UPDATE keywords SET source_taxon_id = ?, taxon_id = ?, is_species = 1, type = 'taxonomy' WHERE id = ?",
+                (source_taxon_id, local_id, kid),
+            )
+        else:
+            from species_identity import SpeciesResolver
+            raw_name = name.removesuffix(f" (taxon {source_taxon_id})")
+            identity = SpeciesResolver(db=self).resolve(raw_name, source={"taxon_id": source_taxon_id})
+            display = self.resolve_species_display_name(identity.display_name)
+            candidate = display
+            suffix = 0
+            while self.conn.execute(
+                "SELECT 1 FROM keywords WHERE name = ? COLLATE NOCASE AND parent_id IS ? LIMIT 1",
+                (candidate, parent_id),
+            ).fetchone():
+                suffix += 1
+                candidate = f"{display} (taxon {source_taxon_id})" + (f" ({suffix})" if suffix > 1 else "")
+            kid = self.conn.execute(
+                "INSERT INTO keywords (name, parent_id, is_species, type, taxon_id, source_taxon_id) "
+                "VALUES (?, ?, 1, 'taxonomy', ?, ?)",
+                (candidate, parent_id, local_id, source_taxon_id),
+            ).lastrowid
+        if _commit:
+            self.conn.commit()
+        return kid
+
+    def relink_source_species_keywords(self):
+        """Refresh local foreign keys after importing source taxa; caller commits."""
+        self.conn.execute(
+            "UPDATE keywords SET taxon_id = (SELECT id FROM taxa WHERE inat_id = keywords.source_taxon_id) "
+            "WHERE source_taxon_id IS NOT NULL AND EXISTS "
+            "(SELECT 1 FROM taxa WHERE inat_id = keywords.source_taxon_id)"
+        )
+
+    def add_keyword(self, name, parent_id=None, is_species=False, kw_type=None, _commit=True, source_taxon_id=None):
         """Insert a keyword. Returns existing id if duplicate (case-insensitive).
 
         If a keyword with the same name but different casing exists, reuses
@@ -11084,6 +11135,8 @@ class Database:
                      a known taxon, otherwise ``general``).
             _commit: If False, skip the internal commit (caller is responsible
                      for committing the transaction).
+            source_taxon_id: Explicit iNaturalist ID for a species keyword;
+                     bypass common-name inference and reuse only that identity.
         """
         if kw_type is not None and kw_type not in KEYWORD_TYPES:
             raise ValueError(f"invalid keyword type: {kw_type!r}")
@@ -11119,6 +11172,10 @@ class Database:
         # the accepted species.
         if is_species and kw_type is None:
             kw_type = 'taxonomy'
+        if source_taxon_id is not None:
+            if not is_species:
+                raise ValueError("source_taxon_id requires a species keyword")
+            return self._add_source_species_keyword(name, source_taxon_id, parent_id, _commit)
         # Case-insensitive lookup with type-aware matching:
         #
         # When kw_type is supplied, only same-type or 'general' rows are
@@ -18424,6 +18481,13 @@ class Database:
         ).fetchone()
         if not pred:
             return None
+        source_taxon_id = pred["source_taxon_id"]
+        native_scientific = pred["scientific_name"] if (
+            pred["labels_fingerprint"] == "tol" or pred["model"].startswith("iNat")
+        ) else None
+        if source_taxon_id is None and native_scientific:
+            from species_identity import SpeciesResolver
+            source_taxon_id = SpeciesResolver(db=self).prediction(pred).taxon_id
 
         def _reject_siblings_of(this_pred_id):
             """Resolve the losing rows on one accepted row's detection.
@@ -18488,6 +18552,9 @@ class Database:
                     species = best
                 except Exception:
                     pass
+
+            if source_taxon_id is None and native_scientific:
+                species = native_scientific
 
             # Settle scope before the first write.
             #
@@ -18596,7 +18663,8 @@ class Database:
                     "photo_ids": [],
                 }
 
-            kid = self.add_keyword(species, is_species=True, _commit=False)
+            source_args = {"source_taxon_id": source_taxon_id} if source_taxon_id is not None else {}
+            kid = self.add_keyword(species, is_species=True, _commit=False, **source_args)
             # Re-read the stored keyword name so the queued sidecar changes,
             # curation renames, and returned history payload all reflect the
             # row actually tagged. add_keyword normalizes punctuation and

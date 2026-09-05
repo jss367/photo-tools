@@ -521,3 +521,62 @@ def test_burst_votes_merge_different_labels_with_same_unknown_id(db, tmp_path):
     for row in rows:
         assert row["vote_count"] == row["total_votes"] == 2
         assert json.loads(row["individual"]) == {"Old parrot name (taxon 900001)": 2}
+
+
+def test_merged_metadata_updates_do_not_make_one_source_taxon_ambiguous(tmp_path, monkeypatch):
+    monkeypatch.setattr("labels.LABELS_DIR", str(tmp_path))
+    before = {"taxon_id": 900001, "scientific_name": "Oldgenus species", "rank": "species", "common_name": "Old name"}
+    after = {"taxon_id": 900001, "scientific_name": "Newgenus species", "rank": "subspecies", "common_name": "New name"}
+    paths = [save_labels(str(i), 14, "CA", ["birds"], SpeciesLabels(["Parrot"], {"Parrot": value}))
+             for i, value in enumerate([before, after])]
+    first = load_merged_labels([{"labels_file": p} for p in paths])
+    second = load_merged_labels([{"labels_file": p} for p in reversed(paths)])
+    assert first.identities["Parrot"]["taxon_id"] == 900001
+    assert not first.identities["Parrot"].get("ambiguous")
+    assert compute_full_fingerprint(first) == compute_full_fingerprint(second)
+
+
+@pytest.mark.parametrize("source_backed", [True, False])
+def test_acceptance_binds_source_ids_without_reassigning_same_name_keywords(db, tmp_path, source_backed):
+    db.conn.execute("UPDATE taxa SET common_name = 'Shared parrot' WHERE inat_id IN (18976, 18997)")
+    existing = db.add_keyword("Shared parrot", is_species=True)
+    original = dict(db.conn.execute("SELECT * FROM keywords WHERE id = ?", (existing,)).fetchone())
+    accepted = []
+    for i, tid in enumerate([18976, 18997]):
+        pid, det = _photo(db, tmp_path, f"accept-{i}.jpg")
+        evidence = {"scientific_name": RED["scientific_name"] if tid == 18976 else BROWED["scientific_name"]}
+        if source_backed:
+            evidence["taxon_id"] = tid
+        db.add_prediction(det, "Shared parrot", .9, "BioCLIP", labels_fingerprint="custom" if source_backed else "tol", taxonomy=evidence)
+        prediction = db.get_predictions_for_detection(det, min_classifier_conf=0)[0]
+        result = db.accept_prediction(prediction["id"])
+        row = db.conn.execute("SELECT k.*, t.inat_id FROM keywords k LEFT JOIN taxa t ON t.id = k.taxon_id WHERE k.id = ?",
+                              (result["keyword_id"],)).fetchone()
+        assert row["inat_id"] == row["source_taxon_id"] == tid
+        assert result["species"] == row["name"]
+        accepted.append(result["keyword_id"])
+    assert len(set(accepted)) == 2
+    assert db.conn.execute("SELECT taxon_id FROM keywords WHERE id = ?", (existing,)).fetchone()[0] == original["taxon_id"]
+
+
+def test_unknown_accepted_source_id_survives_name_changes_and_taxonomy_import(db, tmp_path):
+    from taxonomy import populate_taxa_db_from_json
+
+    accepted = []
+    for i, name in enumerate(["First name", "Later name"]):
+        _, det = _photo(db, tmp_path, f"unknown-accept-{i}.jpg")
+        db.add_prediction(det, name, .9, "BioCLIP", labels_fingerprint="custom", taxonomy={"taxon_id": 900001})
+        prediction = db.get_predictions_for_detection(det, min_classifier_conf=0)[0]
+        accepted.append(db.accept_prediction(prediction["id"])["keyword_id"])
+    assert accepted[0] == accepted[1]
+    keyword = db.conn.execute("SELECT * FROM keywords WHERE id = ?", (accepted[0],)).fetchone()
+    assert keyword["source_taxon_id"] == 900001 and keyword["taxon_id"] is None
+    path = tmp_path / "fresh-taxonomy.json"
+    entry = {"taxon_id": 900001, "scientific_name": "Newgenus species", "rank": "species"}
+    path.write_text(json.dumps({"common_name_identity_version": 1,
+                                "taxa_by_scientific": {"newgenus species": entry}, "taxa_by_common": {}}))
+    populate_taxa_db_from_json(db, path)
+    row = db.conn.execute("SELECT t.inat_id, k.name FROM keywords k JOIN taxa t ON t.id = k.taxon_id WHERE k.id = ?",
+                          (accepted[0],)).fetchone()
+    assert row["inat_id"] == 900001
+    assert row["name"] == keyword["name"]

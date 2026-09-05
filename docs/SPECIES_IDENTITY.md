@@ -73,3 +73,10 @@ confidence, and model through serialization and cache refresh. Encounter scoring
 consensus, rarity protection, and culling use that key. If an explicit source ID
 has no scientific name in the catalog, review labels include the taxon number so
 different unresolved taxa with the same common name remain distinguishable.
+
+Accepting a source-backed prediction retains its iNaturalist ID on the keyword
+and binds the local taxon directly. Existing keywords for another taxon are not
+reassigned; a distinct name is used when necessary. IDs missing from the local
+taxonomy remain on the keyword and are linked after a later taxonomy import,
+without renaming already confirmed keywords. Label-set metadata updates for the
+same source ID do not make the prompt ambiguous.

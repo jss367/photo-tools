@@ -1297,6 +1297,7 @@ def load_taxa_from_file(db, gz_path):
                 (parent_local_id, local_id),
             )
 
+    db.relink_source_species_keywords()
     db.conn.commit()
 
     loaded = len(filtered)
@@ -1524,6 +1525,7 @@ def populate_taxa_db_from_json(db, taxonomy_json_path, progress_callback=None):
         )
         cn_loaded += 1
 
+    db.relink_source_species_keywords()
     db.set_meta("common_name_identity_version", str(COMMON_NAME_IDENTITY_VERSION), _commit=False)
     db.set_meta("ambiguous_common_names", json.dumps(sorted(ambiguous_common)), _commit=False)
     db.conn.commit()

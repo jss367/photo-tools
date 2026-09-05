@@ -37,10 +37,15 @@ def _text_identity(names):
 
 def _merge_identity(identities, name, entry):
     previous = identities.get(name)
-    if previous is not None and previous != entry:
+    if previous is None:
+        identities[name] = entry
+    elif (previous.get("ambiguous") or entry.get("ambiguous")
+          or previous.get("taxon_id") != entry.get("taxon_id")):
         identities[name] = {"ambiguous": True}
     else:
-        identities[name] = entry
+        # Names and ranks can change without changing the source taxon.
+        # Keep metadata selection deterministic across label-set order.
+        identities[name] = min((previous, entry), key=lambda value: json.dumps(value, sort_keys=True))
 
 # Major taxonomic groups with their iNaturalist taxon IDs
 TAXON_GROUPS = {

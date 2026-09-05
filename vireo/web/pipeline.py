@@ -1591,6 +1591,7 @@ def create_pipeline_blueprint(
             save_results,
             serialize_results,
         )
+        from pipeline_locks import acquire_workspace_regroup
 
         body = request.get_json(silent=True) or {}
         overrides = body.get("config", {})
@@ -1619,35 +1620,50 @@ def create_pipeline_blueprint(
         effective_cfg = db.get_effective_config(cfg.load())
         pipeline_cfg = {**effective_cfg.get("pipeline", {}), **overrides}
 
-        # Load features and re-group (grouping is fast, seconds)
-        # We re-group to have the full photo dicts with numpy arrays
-        # (the cached JSON doesn't have embeddings)
-        photos = load_photo_features(
-            db,
-            collection_id=collection_id,
-            config=effective_cfg,
-            photo_ids=photo_ids,
+        # Hold the workspace regroup lock across the full read/compute/save
+        # cycle when this call will write the workspace cache. A concurrent
+        # detach that runs between our load_photo_features and save_results
+        # would land its structural edit and record a grouping-history
+        # entry, then be silently clobbered here — the detach's undo would
+        # later fail as stale (its ``after`` no longer matches the cache).
+        # Scoped runs (collection_id or photo_ids) don't write the workspace
+        # cache and don't need the lock.
+        writes_cache = save_cache and collection_id is None and photo_ids is None
+        lock_ctx = (
+            acquire_workspace_regroup(db._active_workspace_id)
+            if writes_cache
+            else contextlib.nullcontext()
         )
-        if not photos:
-            return json_error("No photos with pipeline features", 404)
+        with lock_ctx:
+            # Load features and re-group (grouping is fast, seconds)
+            # We re-group to have the full photo dicts with numpy arrays
+            # (the cached JSON doesn't have embeddings)
+            photos = load_photo_features(
+                db,
+                collection_id=collection_id,
+                config=effective_cfg,
+                photo_ids=photo_ids,
+            )
+            if not photos:
+                return json_error("No photos with pipeline features", 404)
 
-        # emit_trace=True so the pipeline-review sidebar's algorithm-trace
-        # panel can show per-cut-point details for each encounter on the
-        # very first load (not only after the user drags a live-tuning
-        # slider). Cost is negligible (~300B per adjacent pair).
-        encounters = run_grouping(photos, config=pipeline_cfg, emit_trace=True)
-        results = reflow(encounters, config=pipeline_cfg)
+            # emit_trace=True so the pipeline-review sidebar's algorithm-trace
+            # panel can show per-cut-point details for each encounter on the
+            # very first load (not only after the user drags a live-tuning
+            # slider). Cost is negligible (~300B per adjacent pair).
+            encounters = run_grouping(photos, config=pipeline_cfg, emit_trace=True)
+            results = reflow(encounters, config=pipeline_cfg)
 
-        # Carry the miss-recomputation marker through so the review UI's
-        # "Review misses" shortcut stays visible after a threshold
-        # tweak. reflow/regroup-live do not recompute misses themselves.
-        cache_dir = os.path.dirname(db_path)
-        existing = load_results_raw(cache_dir, db._active_workspace_id)
-        if existing and existing.get("miss_computed_at"):
-            results["miss_computed_at"] = existing["miss_computed_at"]
+            # Carry the miss-recomputation marker through so the review UI's
+            # "Review misses" shortcut stays visible after a threshold
+            # tweak. reflow/regroup-live do not recompute misses themselves.
+            cache_dir = os.path.dirname(db_path)
+            existing = load_results_raw(cache_dir, db._active_workspace_id)
+            if existing and existing.get("miss_computed_at"):
+                results["miss_computed_at"] = existing["miss_computed_at"]
 
-        if save_cache and collection_id is None and photo_ids is None:
-            save_results(results, cache_dir, db._active_workspace_id)
+            if writes_cache:
+                save_results(results, cache_dir, db._active_workspace_id)
 
         serialized = serialize_results(results)
         attach_nested_edit_recipes(db, serialized)
@@ -1672,6 +1688,7 @@ def create_pipeline_blueprint(
             save_results,
             serialize_results,
         )
+        from pipeline_locks import acquire_workspace_regroup
 
         body = request.get_json(silent=True) or {}
         overrides = body.get("config", {})
@@ -1700,30 +1717,41 @@ def create_pipeline_blueprint(
         effective_cfg = db.get_effective_config(cfg.load())
         pipeline_cfg = {**effective_cfg.get("pipeline", {}), **overrides}
 
-        photos = load_photo_features(
-            db,
-            collection_id=collection_id,
-            config=effective_cfg,
-            photo_ids=photo_ids,
+        # Same rationale as ``/api/pipeline/reflow``: hold the workspace
+        # regroup lock across the full read/compute/save cycle so a
+        # concurrent detach cannot land a grouping-history entry that
+        # this endpoint's save would silently clobber.
+        writes_cache = save_cache and collection_id is None and photo_ids is None
+        lock_ctx = (
+            acquire_workspace_regroup(db._active_workspace_id)
+            if writes_cache
+            else contextlib.nullcontext()
         )
-        if not photos:
-            return json_error("No photos with pipeline features", 404)
+        with lock_ctx:
+            photos = load_photo_features(
+                db,
+                collection_id=collection_id,
+                config=effective_cfg,
+                photo_ids=photo_ids,
+            )
+            if not photos:
+                return json_error("No photos with pipeline features", 404)
 
-        # emit_trace=True so the pipeline-review sidebar's algorithm-trace
-        # panel can show per-cut-point details for each encounter. Cost is
-        # negligible (~300B per adjacent pair).
-        results = run_full_pipeline(photos, config=pipeline_cfg, emit_trace=True)
+            # emit_trace=True so the pipeline-review sidebar's algorithm-trace
+            # panel can show per-cut-point details for each encounter. Cost is
+            # negligible (~300B per adjacent pair).
+            results = run_full_pipeline(photos, config=pipeline_cfg, emit_trace=True)
 
-        # Carry the miss-recomputation marker through so the review UI's
-        # "Review misses" shortcut stays visible after a threshold
-        # tweak. regroup-live does not rerun the miss stage itself.
-        cache_dir = os.path.dirname(db_path)
-        existing = load_results_raw(cache_dir, db._active_workspace_id)
-        if existing and existing.get("miss_computed_at"):
-            results["miss_computed_at"] = existing["miss_computed_at"]
+            # Carry the miss-recomputation marker through so the review UI's
+            # "Review misses" shortcut stays visible after a threshold
+            # tweak. regroup-live does not rerun the miss stage itself.
+            cache_dir = os.path.dirname(db_path)
+            existing = load_results_raw(cache_dir, db._active_workspace_id)
+            if existing and existing.get("miss_computed_at"):
+                results["miss_computed_at"] = existing["miss_computed_at"]
 
-        if save_cache and collection_id is None and photo_ids is None:
-            save_results(results, cache_dir, db._active_workspace_id)
+            if writes_cache:
+                save_results(results, cache_dir, db._active_workspace_id)
 
         serialized = serialize_results(results)
         attach_nested_edit_recipes(db, serialized)

@@ -114,6 +114,83 @@ def test_stale_grouping_entry_is_retired_and_preserves_newer_work(app_and_db):
     assert _load(db)['encounters'] == updated['encounters']
 
 
+def test_grouping_undo_preserves_cleared_burst_override(app_and_db):
+    """A ``clearBurstOverride`` clear survives the next grouping undo.
+
+    ``clearBurstOverride`` posts ``species_override = None`` through
+    ``/api/pipeline/save-cache`` and records no history entry. The next
+    grouping undo therefore sees the cache as structurally unchanged
+    (``_grouping_signature`` ignores ``species_override``) and would
+    otherwise silently resurrect the pre-clear override from the
+    detach's ``before`` snapshot. The clear must carry through instead.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    ids, original = _seed(db)
+    # Seed a burst-level override the detach's ``before`` snapshot
+    # captures, so restoring it without a preservation pass would
+    # resurrect the old value.
+    original_state = _load(db)
+    original_state['encounters'][0]['bursts'][0]['species_override'] = {
+        'species': 'Old override', 'confirmed': True,
+    }
+    save_results_raw(original_state, os.path.dirname(db._db_path), db._ws_id())
+    original = _load(db)
+
+    _detach(client)
+    detached = _load(db)
+    # The detached burst is the new encounter appended by the detach
+    # handler — locate it by photo composition so this test survives any
+    # future reordering.
+    detached_photo_ids = ids[:2]
+    detached_enc_idx = next(
+        i for i, enc in enumerate(detached['encounters'])
+        if enc.get('photo_ids') == detached_photo_ids
+    )
+    updated = copy.deepcopy(detached)
+    updated['encounters'][detached_enc_idx]['bursts'][0]['species_override'] = None
+    save_results_raw(updated, os.path.dirname(db._db_path), db._ws_id())
+
+    assert client.post('/api/undo').status_code == 200
+    restored = _load(db)
+    # Structure returns to the pre-detach shape, but the user's clear on
+    # that burst is preserved rather than silently overwritten by the
+    # detach's stale before-snapshot value.
+    assert len(restored['encounters']) == len(original['encounters'])
+    matching_burst = next(
+        b for b in restored['encounters'][0]['bursts']
+        if b.get('photo_ids') == detached_photo_ids
+    )
+    assert matching_burst.get('species_override') is None
+
+
+def test_grouping_undo_restores_summary_counts(app_and_db):
+    """Restored encounter/burst counts stay in sync with the restored groups.
+
+    ``/api/pipeline/page-init`` reads structural counts off ``summary``
+    and the review page's ``updateSummaryBar()`` keeps them when the
+    normal ``confirmed_count`` fields are present, so a stale summary
+    left behind after undo shows the wrong encounter/burst totals.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    _seed(db)
+    _detach(client)
+    after_detach = _load(db)
+    assert after_detach['summary']['encounter_count'] == 2
+    assert after_detach['summary']['burst_count'] == 2
+
+    assert client.post('/api/undo').status_code == 200
+    restored = _load(db)
+    assert restored['summary']['encounter_count'] == 1
+    assert restored['summary']['burst_count'] == 2
+
+    assert client.post('/api/redo').status_code == 200
+    replayed = _load(db)
+    assert replayed['summary']['encounter_count'] == 2
+    assert replayed['summary']['burst_count'] == 2
+
+
 def test_grouping_undo_tolerates_reverted_species_cache_state(app_and_db):
     """A species edit's leftover cache does not block a later grouping undo.
 

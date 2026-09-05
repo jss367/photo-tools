@@ -32,8 +32,8 @@ except ImportError:
     load_working_image = None
 
 from db import AUTO_MATCH_REVIEW_MARKER, Database, commit_with_retry
-from keyword_normalization import _ASCII_LOWER_TABLE, normalize_keyword_display
 from keyword_normalization import folded_species_key as _folded_species_key
+from keyword_normalization import normalize_keyword_display
 from keyword_normalization import species_match_key as _species_match_key
 from models import get_active_model, get_models
 from resource_ledger import ResourceWaitCancelled
@@ -2279,55 +2279,16 @@ def _store_grouped_predictions(
         else:
             group_count += 1
             gid = f"g{job_id[-6:]}-{group_count:04d}"
-            # Fold each frame's species onto the same key ``add_prediction``
-            # uses before computing consensus and the reviewability check.
-            # Without this, a burst whose frames spell the same bird as
-            # both `Say's Phoebe` and `Say’s Phoebe` (because the merged
-            # label set carries both variants) counts as two distinct
-            # species, ``group_reviewable`` becomes False, and the
-            # unanimous burst is stored without its group_id, vote counts,
-            # or individual JSON — so the survivor prediction drops out
-            # of its burst group even though every frame agreed.
-            #
-            # Apostrophe folding alone is not enough: when frames also
-            # differ in ASCII capitalization (`Say's Phoebe` vs
-            # `Say's phoebe` — same word, different label-file entries),
-            # `_folded_species_key` still returns two distinct case
-            # variants. `consensus_prediction` keys on the raw string, so
-            # a semantically unanimous burst gets split votes such as
-            # `1/2`, while `group_species` below already ASCII-folds and
-            # would declare it reviewable — a mismatch that stores split
-            # `individual` entries and a wrong vote count. Canonicalize
-            # to the first-seen casing for each ASCII-lowercase key so
-            # the count sums correctly while `individual_predictions`
-            # still shows a real display-cased species name.
-            #
-            # ASCII-only case fold (``_ASCII_LOWER_TABLE``) rather than
-            # ``.lower()``: SQLite ``COLLATE NOCASE`` and
-            # ``keyword_match_key`` treat non-ASCII case pairs such as
-            # ``Éclair``/``éclair`` as distinct, so ``.lower()`` here
-            # would canonicalize them into one species and inflate a
-            # burst into a spuriously unanimous vote.
-            _canonical_case = {}
+            # Vote on identity, retaining the first display spelling for
+            # each key. Synonymous prompts must not split a unanimous vote.
+            display_by_key = {}
             for item in group:
-                key = _folded_species_key(item.get("prediction"))
-                if key is None:
-                    continue
-                _canonical_case.setdefault(
-                    key.strip().translate(_ASCII_LOWER_TABLE), key,
-                )
-
-            def _cons_key(species, _canon=_canonical_case):
-                folded = _folded_species_key(species)
-                if folded is None:
-                    return folded
-                return _canon.get(
-                    folded.strip().translate(_ASCII_LOWER_TABLE), folded,
-                )
+                identity = identity_for(item)
+                display_by_key.setdefault(identity.key, _folded_species_key(identity.display_name))
 
             cons_input = [
                 {
-                    "prediction": _cons_key(identity_for(item).display_name),
+                    "prediction": identity_for(item).key,
                     "confidence": item["confidence"],
                 }
                 for item in group
@@ -2342,8 +2303,9 @@ def _store_grouped_predictions(
                 if item.get("prediction")
             }
             group_reviewable = len(group_species) == 1
+            cons["prediction"] = display_by_key[cons["prediction"]]
             individual_json = (
-                json.dumps(cons["individual_predictions"])
+                json.dumps({display_by_key[key]: count for key, count in cons["individual_predictions"].items()})
                 if group_reviewable
                 else None
             )

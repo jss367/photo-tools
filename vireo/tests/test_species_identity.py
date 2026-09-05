@@ -500,3 +500,24 @@ def test_unknown_id_enrichment_does_not_borrow_common_name_taxonomy(db, tmp_path
     assert row["scientific_name"] is None
     assert row["taxonomy_genus"] is None
     assert SpeciesResolver(db=db).prediction(row).key == "taxon:900001"
+
+
+def test_burst_votes_merge_different_labels_with_same_unknown_id(db, tmp_path):
+    from datetime import datetime
+
+    from classify_job import _store_grouped_predictions
+
+    raw = []
+    for i, name in enumerate(["Old parrot name", "New parrot name"]):
+        pid, det = _photo(db, tmp_path, f"synonym-{i}.jpg")
+        raw.append({"photo": {"id": pid, "filename": f"synonym-{i}.jpg"},
+                    "folder_path": str(tmp_path), "detection_id": det,
+                    "prediction": name, "confidence": .99, "alternatives": [],
+                    "taxonomy": {"taxon_id": 900001}, "timestamp": datetime(2026, 9, 1, 10, 0, i)})
+    _store_grouped_predictions(raw, "test-job", "BioCLIP", 10, .99, None, db, "custom")
+    rows = db.get_predictions()
+    assert {r["species"] for r in rows} == {"Old parrot name", "New parrot name"}
+    assert rows[0]["group_id"] == rows[1]["group_id"]
+    for row in rows:
+        assert row["vote_count"] == row["total_votes"] == 2
+        assert json.loads(row["individual"]) == {"Old parrot name (taxon 900001)": 2}

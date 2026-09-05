@@ -12292,19 +12292,23 @@ function formatDuration(seconds) {
     if (currentBpTab === 'history') loadEditHistory();
   }
 
-  var _origSafeFetch = safeFetch;
-  safeFetch = function(url, opts, options) {
-    var mutation = opts && opts.method && /^(POST|PUT|PATCH|DELETE)$/i.test(opts.method);
+  // Track at the shared transport so fetch, Request objects, and safeFetch
+  // all participate in the same pending-write guard exactly once.
+  Vireo.api.trackHistoryRequest = function(input, opts, send) {
+    var url = input instanceof Request ? input.url : String(input);
+    var method = (opts && opts.method) || (input instanceof Request ? input.method : 'GET');
+    var mutation = /^(POST|PUT|PATCH|DELETE)$/i.test(method);
     var historyWrite = mutation && /\/(rating|flag|color_label|keywords|edit-recipe|batch\/|predictions\/|culling\/|misses\/reject|highlights\/(confirm|relabel)|species\/label-cluster|encounters\/species|sync\/discard|pipeline\/(detach-|group\/apply)|photos\/\d+\/(wildlife_excluded|location))/.test(url);
     if (historyWrite && historyBusy) {
       var error = new Error('Undo or redo is still finishing — try again in a moment');
-      if (!options || options.toast !== false) showToast(error.message, 'warning');
+      error.code = 'history_busy';
+      showToast(error.message, 'warning');
       return Promise.reject(error);
     }
     if (historyWrite) { historyPendingWrites++; renderHistoryControls(); }
-    return _origSafeFetch(url, opts, options).then(function(data) {
-      if (historyWrite && data && data.ok) _bumpHistoryBadge();
-      return data;
+    return Promise.resolve().then(send).then(function(response) {
+      if (historyWrite && response.ok) _bumpHistoryBadge();
+      return response;
     }).finally(function() {
       if (historyWrite) {
         historyPendingWrites--;

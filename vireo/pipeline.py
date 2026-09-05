@@ -889,9 +889,20 @@ def _shared_confirmed_species(photos):
 
 
 def _photos_uniformly_confirmed(photos):
-    """True when every photo is confirmed as the same species *set*."""
+    """True when every photo is tagged and they all share a species.
+
+    A burst is confirmed as the species every frame carries. A frame that
+    also carries an extra subject ([Wigeon, Teal] beside [Teal]) does not
+    make the burst unconfirmed — the user confirmed Teal on all of it, and
+    the extra shows up in that frame's own list and rapid review's
+    "Mixed species" chip. Requiring identical sets would flip such bursts
+    back to unconfirmed on the next regroup, right after an explicit
+    confirm, and would count every stray legacy tag as review work.
+    """
     keysets = _photo_species_keysets(photos)
-    return bool(photos) and all(keysets) and len(set(keysets)) == 1
+    return bool(photos) and all(keysets) and bool(
+        _shared_confirmed_species(photos)
+    )
 
 
 def _count_raw_confirmation_units(encounters):
@@ -1116,12 +1127,10 @@ def serialize_results(results, prior_results=None):
         # when the user re-confirms.
         photo_species = [p.get("confirmed_species") for p in photos_list]
         if _photos_uniformly_confirmed(photos_list):
-            # Every photo carries the same species set (one or several);
-            # surface the whole list with the reducer's first entry as the
-            # legacy single-valued primary.
-            enc_confirmed_list = list(
-                photo_confirmed_species_list(photos_list[0])
-            )
+            # Every photo is tagged and they share at least one species:
+            # confirmed as the shared set (one or several), with the first
+            # entry as the legacy single-valued primary.
+            enc_confirmed_list = _shared_confirmed_species(photos_list)
             enc_confirmed = enc_confirmed_list[0]
             species_confirmed_flag = True
         else:
@@ -1191,7 +1200,7 @@ def serialize_results(results, prior_results=None):
                 # time a slider moved even though the underlying tags persist.
                 if _photos_uniformly_confirmed(burst):
                     burst_override = build_species_override(
-                        photo_confirmed_species_list(burst[0]),
+                        _shared_confirmed_species(burst),
                     )
                 elif (
                     prior_empty_photo_ids
@@ -1492,9 +1501,8 @@ def refresh_cache_species_for_photos(cache_dir, workspace_id, species_by_photo):
             if not b_photos:
                 continue
             if _photos_uniformly_confirmed(b_photos):
-                from pipeline_results import photo_confirmed_species_list
                 burst["species_override"] = build_species_override(
-                    photo_confirmed_species_list(b_photos[0])
+                    _shared_confirmed_species(b_photos)
                 )
             elif all(
                 not (p.get("confirmed_species_list") or p.get("confirmed_species"))
@@ -1508,8 +1516,7 @@ def refresh_cache_species_for_photos(cache_dir, workspace_id, species_by_photo):
             else:
                 burst["species_override"] = None
         if _photos_uniformly_confirmed(enc_photos):
-            from pipeline_results import photo_confirmed_species_list
-            enc_confirmed_list = list(photo_confirmed_species_list(enc_photos[0]))
+            enc_confirmed_list = _shared_confirmed_species(enc_photos)
             enc["confirmed_species"] = enc_confirmed_list[0] if enc_confirmed_list else None
             enc["confirmed_species_list"] = enc_confirmed_list
             enc["species_confirmed"] = bool(enc_confirmed_list)

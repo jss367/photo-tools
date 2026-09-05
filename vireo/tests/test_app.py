@@ -23342,12 +23342,11 @@ def test_encounter_species_remove_rejects_species_not_confirmed(app_and_db):
         assert _species_names(db, pid) == ["Green-winged Teal", "Mallard"]
 
 
-def test_encounter_species_add_on_mixed_burst_stays_unconfirmed(app_and_db):
-    """A burst whose frames carry different species sets is not confirmed
-    after an add: the override is written unconfirmed with the edited list,
-    so the still-mixed burst is neither hidden as confirmed nor left to
-    inherit the encounter's stale list. A uniform burst is confirmed with
-    the cache's list plus any shared extra."""
+def test_encounter_species_add_on_mixed_burst_confirms_shared_set(app_and_db):
+    """After an add, a burst is confirmed as the species every frame now
+    carries; a per-frame extra ([A, C] beside [A]) neither unconfirms it nor
+    joins the list. A uniform burst's list also picks up an extra the frames
+    all share."""
     import json as _json
     app, db = app_and_db
     client = app.test_client()
@@ -23386,10 +23385,10 @@ def test_encounter_species_add_on_mixed_burst_stays_unconfirmed(app_and_db):
     assert resp.get_json()["species_list"] == ["Green-winged Teal", "American Wigeon"]
     with open(path) as f:
         bursts = _json.load(f)["encounters"][0]["bursts"]
-    # Still mixed → unconfirmed, but the edited list stays authoritative.
+    # Confirmed as what every frame carries; Gadwall stays a per-frame extra.
     assert bursts[0]["species_override"] == {
         "species": "Green-winged Teal",
-        "confirmed": False,
+        "confirmed": True,
         "species_list": ["Green-winged Teal", "American Wigeon"],
     }
     assert _species_names(db, mixed_ids[0]) == ["American Wigeon", "Gadwall", "Green-winged Teal"]
@@ -23410,8 +23409,8 @@ def test_encounter_species_add_on_mixed_burst_stays_unconfirmed(app_and_db):
 
 
 def test_encounter_species_mixed_burst_keeps_edited_baseline(app_and_db):
-    """Removing B from a mixed burst ([A, B, X] / [A, B]) leaves an
-    unconfirmed-but-authoritative override [A]: the burst does not inherit
+    """Removing B from a mixed burst ([A, B, X] / [A, B]) leaves the burst
+    confirmed as [A] (what every frame still carries): it does not inherit
     the encounter's stale [A, B], so a later confirm sees [A], not B."""
     import json as _json
 
@@ -23450,7 +23449,7 @@ def test_encounter_species_mixed_burst_keeps_edited_baseline(app_and_db):
     with open(path) as f:
         enc = _json.load(f)["encounters"][0]
     ovr = enc["bursts"][0]["species_override"]
-    assert ovr == {"species": "Green-winged Teal", "confirmed": False,
+    assert ovr == {"species": "Green-winged Teal", "confirmed": True,
                    "species_list": ["Green-winged Teal"]}
     assert burst_species_list(enc, enc["bursts"][0]) == ["Green-winged Teal"]
     # The other burst still inherits the encounter's full list.
@@ -23596,3 +23595,4 @@ def test_encounter_species_remove_redo_refreshes_pipeline_cache(app_and_db):
     assert cache["encounters"][0]["bursts"][0]["species_override"] == {
         "species": None, "confirmed": False, "species_list": [],
     }
+

@@ -27096,34 +27096,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if cached and target_enc is not None:
             if burst_index is not None:
                 # The override's confirmed state comes from the database, the
-                # same rule serialize_results applies on regroup: confirmed
-                # only when every submitted frame now carries the same
-                # species set. A mixed burst ([A, C] on one frame, [A] on
-                # another) that just gained B is still mixed, so it is
-                # written unconfirmed — but with its edited list, which stays
-                # authoritative (burst_species_list): None would make it
-                # inherit the encounter's stale list and resurrect a species
-                # this edit removed on the next flag-only apply. When uniform,
-                # the list is the cache's ordering plus any extra the frames
-                # already shared that the cache had not recorded. An emptied
+                # same rule serialize_results applies on regroup: a burst is
+                # confirmed as the species every frame carries. Per-frame
+                # extras ([A, C] on one frame beside [A]) do not unconfirm
+                # it — the user just confirmed the set on all of it — and the
+                # list is the cache's ordering plus any extra the frames all
+                # share that the cache had not recorded. Only when some frame
+                # ended up with nothing shared (a remove that left disjoint
+                # extras) is the edited list written unconfirmed; it still
+                # stays authoritative (burst_species_list), because None
+                # would make the burst inherit the encounter's stale list
+                # and resurrect a species this edit removed. An emptied
                 # burst keeps an explicit empty override for the same reason.
                 actual_by_photo = db.get_species_keywords_for_photos(photo_ids)
                 actual_sets = [
-                    frozenset(species_key_set(actual_by_photo.get(pid, [])))
+                    species_key_set(actual_by_photo.get(pid, []))
                     for pid in photo_ids
                 ]
-                frames_uniform = (
-                    bool(actual_sets)
-                    and all(actual_sets)
-                    and len(set(actual_sets)) == 1
+                shared_keys = (
+                    set.intersection(*actual_sets) if actual_sets else set()
                 )
+                frames_share = bool(actual_sets) and all(actual_sets) and bool(shared_keys)
                 if not new_species_list:
                     burst_override = empty_species_override()
-                elif frames_uniform:
+                elif frames_share:
                     recorded = species_key_set(new_species_list)
                     extras = [
                         s for s in actual_by_photo.get(photo_ids[0], [])
-                        if keyword_match_key(s) not in recorded
+                        if keyword_match_key(s) in shared_keys
+                        and keyword_match_key(s) not in recorded
                     ]
                     burst_override = build_species_override(
                         new_species_list + extras,

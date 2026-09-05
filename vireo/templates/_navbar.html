@@ -10762,6 +10762,7 @@ function _lbScheduleSourceSwap(targetZoom) {
     preloader.onerror = function() {
       if (_lightboxCurrentId !== photoId) return;
       if (_lbOpenSeq !== swapOpenSeq) return;
+      if (_lbDesiredSrcKey !== key) return;
       if (key === 'original') {
         var had1To1Pending = _lbPending1To1;
         _lbOriginalUnavailable = true;
@@ -10775,6 +10776,11 @@ function _lbScheduleSourceSwap(targetZoom) {
           // staying stuck on the lower current source.
           _lbScheduleSourceSwap();
         }
+      } else {
+        // The failed request is no longer pending. Keep the usable bitmap
+        // and resume its neighbors without automatically retrying this tier.
+        _lbDesiredSrcKey = _lbCurrentSrcKey;
+        _lbScheduleAdjacentPhoto(_lbCurrentSrcKey);
       }
       // Keep current source on failure
     };

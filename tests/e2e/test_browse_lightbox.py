@@ -4,6 +4,7 @@ import json
 import re
 import time
 
+import pytest
 from PIL import Image
 from playwright.sync_api import expect
 
@@ -2191,6 +2192,97 @@ def test_browse_lightbox_pauses_fit_warmups_during_source_upgrade(live_server, p
             entry => entry.sourceKey === 'original' && entry.status === 'decoded'
         )"""
     )
+
+
+@pytest.mark.parametrize("failed_tier,needed_pixels", [("full", 100), ("2560", 2300), ("3840", 3200)])
+@pytest.mark.parametrize("superseded", [False, True])
+def test_browse_lightbox_resumes_warmups_after_source_failure(
+    live_server, page, failed_tier, needed_pixels, superseded,
+):
+    """A failed tier releases the queue while retaining the usable original."""
+    held_neighbor = []
+    held_tier = []
+    failure_enabled = False
+    neighbor_requests = []
+    original_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="4000" height="2000">'
+        '<rect width="4000" height="2000" fill="#274"/></svg>'
+    )
+
+    def serve_photo(route):
+        """Keep one neighbor and the selected failing tier pending independently."""
+        url = route.request.url
+        speculative = "prefetch=1" in url
+        if (failure_enabled and "/original" not in url and not speculative
+                and not any(held.request.url == url for held in held_tier)):
+            held_tier.append(route)
+            return
+        if "/original" in url:
+            if speculative:
+                neighbor_requests.append(url)
+                if len(neighbor_requests) == 1:
+                    held_neighbor.append(route)
+                    return
+            route.fulfill(body=original_svg, content_type="image/svg+xml")
+        else:
+            route.fulfill(
+                body=original_svg.replace('width="4000"', 'width="1920"').replace('height="2000"', 'height="960"'),
+                content_type="image/svg+xml",
+            )
+
+    page.route("**/photos/*/full*", serve_photo)
+    page.route("**/photos/*/original*", serve_photo)
+    page.route("**/photos/*/preview?*", serve_photo)
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").nth(1).dblclick()
+    page.wait_for_function("_lbFullUsesOriginal === false && _lbFullLongEdge !== null")
+    page.evaluate("_lbSetZoom(100)")
+    page.wait_for_function(
+        """_lbCurrentSrcKey === 'original' && Object.values(_lbAdjacentPreloads).some(
+            entry => entry.sourceKey === 'original' && entry.status === 'loading'
+        )"""
+    )
+    failure_enabled = True
+    target = "/full" if failed_tier == "full" else f"size={failed_tier}"
+    with page.expect_request(lambda request: target in request.url and "prefetch=1" not in request.url):
+        page.evaluate(
+            "pixels => _lbScheduleSourceSwap(pixels / (_lbPhotoW * _lbFitScale * devicePixelRatio))",
+            needed_pixels,
+        )
+    assert page.evaluate("_lbDesiredSrcKey") == failed_tier
+    assert len(held_neighbor) == 1
+    held_neighbor[0].fulfill(body=original_svg, content_type="image/svg+xml")
+    page.wait_for_function(
+        "Object.values(_lbAdjacentPreloads).some(entry => entry.status === 'decoded')"
+    )
+    page.wait_for_timeout(200)
+    assert len(neighbor_requests) == 1
+    assert len(held_tier) == 1
+    expected_source = "original"
+    if superseded:
+        expected_source, next_pixels = ("2560", 2300) if failed_tier == "3840" else ("3840", 3200)
+        with page.expect_request(
+            lambda request: f"size={expected_source}" in request.url and "prefetch=1" not in request.url
+        ):
+            page.evaluate(
+                "pixels => _lbScheduleSourceSwap(pixels / (_lbPhotoW * _lbFitScale * devicePixelRatio))",
+                next_pixels,
+            )
+    held_tier[0].fulfill(status=503, body="Transient tier failure")
+    if superseded:
+        page.wait_for_timeout(200)
+        assert page.evaluate("_lbDesiredSrcKey") == expected_source
+        assert len(neighbor_requests) == 1
+        assert len(held_tier) == 2
+        held_tier[1].fulfill(body=original_svg, content_type="image/svg+xml")
+    page.wait_for_function("_lbDesiredSrcKey === _lbCurrentSrcKey", timeout=5000)
+    page.wait_for_function(
+        """source => Object.values(_lbAdjacentPreloads).filter(
+            entry => entry.sourceKey === source && entry.status === 'decoded'
+        ).length === 2""",
+        arg=expected_source,
+    )
+    assert page.evaluate("_lbCurrentSrcKey") == expected_source
 
 
 def test_browse_lightbox_close_discards_pending_warmup_queue(live_server, page):

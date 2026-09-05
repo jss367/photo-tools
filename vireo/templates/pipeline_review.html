@@ -1966,8 +1966,8 @@ input[type="range"]::-moz-range-thumb {
     </div>
     <div class="grm-res-control" title="Image resolution — higher = slower but better for pixel-peeping">
       <label style="font-size:12px;color:var(--text-muted);">Res:</label>
-      <input type="range" id="grmResSlider" min="0" max="3" step="1" value="3" oninput="grmSetResolution(this.value)">
-      <span id="grmResLabel" style="font-size:11px;color:var(--text-dim);min-width:140px;">1920 · preview</span>
+      <input type="range" id="grmResSlider" min="0" max="3" step="1" value="1" oninput="grmSetResolution(this.value)">
+      <span id="grmResLabel" style="font-size:11px;color:var(--text-dim);min-width:140px;">2560 · preview</span>
     </div>
     <div class="grm-loupe-zoom-control" title="Right preview zoom">
       <label for="grmLoupeZoomSlider">Right:</label>
@@ -2282,7 +2282,10 @@ var GRM_RES_STOPS = [
   {size: 3840, label: '4K',   kind: 'preview'},
   {size: 0,    label: 'Original', kind: 'original'}
 ];
-var grmResolutionIdx = 3;
+// Start with bounded previews so opening a burst does not decode an original
+// for every comparison tile. The resolution slider and 1:1 action still
+// provide originals when the user needs to inspect fine detail.
+var grmResolutionIdx = 1;
 
 function grmPhotoUrl(photoId) {
   var stop = GRM_RES_STOPS[grmResolutionIdx];
@@ -5650,6 +5653,7 @@ function openGroupReview(encIdx, burstIdx, selectPhotoId) {
     applying: false
   };
   _grmLoupeLocked = false;
+  grmCancelHoverFrame();
   _grmZoomMultiplier = 1;
   _grmLoupeZoomLevel = 1;
   _grmLoupeOneToOne = false;
@@ -5901,6 +5905,7 @@ function grmSyncZoneCards() {
 
 function closeGroupReview(force) {
   if (grmState && grmState.applying && force !== true) return false;
+  grmCancelHoverFrame();
   if (grmState && Array.isArray(grmState.items) &&
       typeof window.clearLightboxProvisionalFlags === 'function') {
     window.clearLightboxProvisionalFlags(grmState.items.map(function(photo) { return photo.id; }));
@@ -7094,6 +7099,13 @@ function grmLoupeToggleLock(e) {
   }
 }
 
+var _grmHoverFrame = null;
+
+function grmCancelHoverFrame() {
+  if (_grmHoverFrame !== null) cancelAnimationFrame(_grmHoverFrame);
+  _grmHoverFrame = null;
+}
+
 function grmLoupeMove(e) {
   if (_grmLoupeAlignDragging) return;
   if (_grmLoupeLocked) return;
@@ -7104,10 +7116,15 @@ function grmLoupeMove(e) {
   _grmLastHoverX = x;
   _grmLastHoverY = y;
 
-  grmPositionCrosshair(x, y);
-  grmApplyLoupeZoom();
-
-  grmApplyCardTransforms();
+  // Pointer events can outpace the display. Transform the whole comparison
+  // strip once per frame, using the latest cursor position.
+  if (_grmHoverFrame !== null) return;
+  _grmHoverFrame = requestAnimationFrame(function() {
+    _grmHoverFrame = null;
+    grmPositionCrosshair(_grmLastHoverX, _grmLastHoverY);
+    grmApplyLoupeZoom();
+    grmApplyCardTransforms();
+  });
 }
 
 function _grmSelectedOffsetTargets() {
@@ -7209,6 +7226,7 @@ function grmLoupeReset() {
   if (_grmLoupeLocked) return;
   if (_grmDragging) return;
   if (_grmLoupeAlignDragging) return;
+  grmCancelHoverFrame();
   _grmLastHoverX = null;
   _grmLastHoverY = null;
   // Re-apply transforms in their default (non-hovered, cover-fit, centred)

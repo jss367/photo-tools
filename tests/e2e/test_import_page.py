@@ -2771,6 +2771,74 @@ def test_import_after_move_drops_eligibility_when_root_changes_elsewhere(
     )
 
 
+def test_import_remote_selection_survives_target_refresh(live_server, page):
+    """A background refresh replaces the target list. A selected SSH
+    destination must follow its target across a legacy id change (matched
+    by user/host/remote_path), transfer-defining fields must be refreshed
+    even when the after-move gate fields did not change, and a target that
+    disappeared must fall back to Local *visibly*."""
+    url = live_server["url"]
+    state = {
+        "id": "photo@nas.local:/volume1/Photography",
+        "remote_path": "/volume1/Photography",
+        "targets": True,
+    }
+
+    def remote_targets(route):
+        targets = [] if not state["targets"] else [{
+            "id": state["id"],
+            "name": "Photo NAS",
+            "user": "photo",
+            "host": "nas.local",
+            "remote_path": state["remote_path"],
+            "mount_path": "/Volumes/Photography",
+            "local_archive_root": "",
+            "local_archive_root_present": None,
+        }]
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": targets,
+            }),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destMode").select_option("remote:" + state["id"])
+    page.locator("#remoteSubpath").fill("2026/kenya")
+    expect(page.locator("#remoteSubpathError")).to_be_hidden()
+
+    # Settings re-saved the legacy entry under a generated id AND changed
+    # remote_path (which the after-move gate does not read).
+    state["id"] = "rt-9f3a"
+    state["remote_path"] = "/volume1/Photos"
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+
+    expect(page.locator("#destMode")).to_have_value("remote:rt-9f3a", timeout=10000)
+    assert page.evaluate("importRemoteTargets[0].remote_path") == "/volume1/Photos"
+    assert page.evaluate("resolvedCopyDestination()") == (
+        "/Volumes/Photography/2026/kenya"
+    )
+    expect(page.locator("#remoteTargetsError")).to_be_hidden()
+
+    # The target is deleted entirely: fall back to Local, and say so.
+    state["targets"] = False
+    page.evaluate("() => { _afterMoveTargetsCheckedAt = 0; }")
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+    expect(page.locator("#destMode")).to_have_value("local", timeout=10000)
+    banner = page.locator("#remoteTargetsError")
+    expect(banner).to_be_visible()
+    expect(banner).to_contain_text('"Photo NAS" is no longer configured')
+
+
 def test_import_new_workspace_shows_target_default_in_after_import_display(
     live_server, page
 ):

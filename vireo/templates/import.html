@@ -1105,7 +1105,9 @@ async function fetchImportRemoteTargets() {
 // leaving importRsyncAvailable/importSshAvailable at their initial false
 // while repopulating the dropdown would block the very SSH destinations it
 // just restored.
+let _previousRemoteTargets = [];
 function applyImportRemoteTargets(data) {
+  _previousRemoteTargets = importRemoteTargets;
   importRemoteTargets = (data && data.targets) || [];
   importRsyncAvailable = !!(data && data.rsync_available);
   importSshAvailable = !!(data && data.ssh_available);
@@ -1116,6 +1118,7 @@ function renderRemoteTargetsError(failed) {
   const errEl = document.getElementById('remoteTargetsError');
   if (!errEl) return;
   errEl.textContent = '';
+  errEl.dataset.kind = failed ? 'load-failed' : '';
   errEl.classList.toggle('visible', failed);
   if (!failed) return;
   errEl.append(
@@ -1134,7 +1137,8 @@ function renderRemoteTargetsError(failed) {
 
 function remoteTargetsLoadFailed() {
   const errEl = document.getElementById('remoteTargetsError');
-  return !!(errEl && errEl.classList.contains('visible'));
+  return !!(errEl && errEl.classList.contains('visible')
+    && errEl.dataset.kind === 'load-failed');
 }
 
 async function loadImportRemoteTargets() {
@@ -1163,6 +1167,8 @@ function renderImportDestModes() {
   const sel = document.getElementById('destMode');
   if (!sel) return;
   const prevValue = sel.value;
+  const prevTarget = _previousRemoteTargets.find(
+    (t) => 'remote:' + t.id === prevValue) || null;
   while (sel.options.length > 1) sel.remove(1);
   importRemoteTargets.forEach((t) => {
     const opt = document.createElement('option');
@@ -1170,11 +1176,44 @@ function renderImportDestModes() {
     opt.textContent = t.name + ' — direct transfer over SSH';
     sel.appendChild(opt);
   });
-  if (Array.prototype.some.call(sel.options, (o) => o.value === prevValue)) {
+  let restored = Array.prototype.some.call(sel.options, (o) => o.value === prevValue);
+  if (restored) {
     sel.value = prevValue;
+  } else if (prevTarget) {
+    // A legacy target saved without an id is served under a synthesized
+    // id and re-saved by Settings under a generated one. The connection
+    // tuple is what actually identifies the NAS, so follow it across the
+    // id change rather than silently dropping the user back to Local.
+    const sameHost = importRemoteTargets.filter(
+      (t) => t.user === prevTarget.user && t.host === prevTarget.host);
+    // Exact tuple first; if the remote path was edited in the same save,
+    // a unique user@host is still unambiguous.
+    const same = sameHost.find((t) => t.remote_path === prevTarget.remote_path)
+      || (sameHost.length === 1 ? sameHost[0] : null);
+    if (same) {
+      sel.value = 'remote:' + same.id;
+      restored = true;
+    }
+  }
+  if (String(prevValue).startsWith('remote:') && !restored) {
+    // The selected SSH destination is gone from the saved targets. The
+    // dropdown falls back to Local; say so, because the local path field
+    // may still hold a usable path and a silent switch would let Start
+    // import to a destination the user never chose.
+    noteRemoteSelectionLost(prevTarget ? prevTarget.name : '');
   }
   onImportDestModeChange();
   updateAfterMoveUI();
+}
+
+function noteRemoteSelectionLost(name) {
+  const errEl = document.getElementById('remoteTargetsError');
+  if (!errEl) return;
+  errEl.textContent = (name ? '"' + name + '"' : 'The selected SSH destination')
+    + ' is no longer configured under Settings › Remote targets. '
+    + 'Switched to a local or mounted destination — check it before starting.';
+  errEl.dataset.kind = 'selection-lost';
+  errEl.classList.add('visible');
 }
 
 function renderSources() {
@@ -1783,9 +1822,13 @@ let _afterMoveTargetsCheckedAt = 0;
 let _afterMoveTargetsTimer = null;
 let _afterMoveTargetsRerun = false;
 const AFTER_MOVE_TARGETS_TTL_MS = 5000;
-function afterMoveTargetKey(t) {
-  return JSON.stringify([t.id, t.name, t.local_archive_root,
-    t.local_archive_root_present, !!t.local_archive_root_volume_offline]);
+// Whole-entry identity. Start posts only the target id and the server
+// resolves the saved configuration, so any field the page previews
+// (remote_path, mount_path, host, user, port, ssh_key, bwlimit) must be
+// refreshed too, not just the ones the after-move gate reads — otherwise
+// the UI would display one destination while the import goes to another.
+function remoteTargetKey(t) {
+  return JSON.stringify(t, Object.keys(t).sort());
 }
 function refreshAfterMoveTargets() {
   if (_afterMoveTargetsRefresh) {
@@ -1818,8 +1861,8 @@ function refreshAfterMoveTargets() {
       // the very fix the hint advertises), so an id-keyed merge would skip
       // exactly the entry that changed. renderImportDestModes() keeps the
       // current dropdown selection when its target survived.
-      const listChanged = data.targets.map(afterMoveTargetKey).join('\n')
-        !== importRemoteTargets.map(afterMoveTargetKey).join('\n');
+      const listChanged = data.targets.map(remoteTargetKey).join('\n')
+        !== importRemoteTargets.map(remoteTargetKey).join('\n');
       const capsChanged = !!data.rsync_available !== importRsyncAvailable
         || !!data.ssh_available !== importSshAvailable;
       // A success after a failed initial load is a recovery: apply it in

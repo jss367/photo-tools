@@ -17740,6 +17740,13 @@ def test_import_page_after_move_eligibility_requires_existing_root(
     # when Settings re-saves them, so an id-keyed merge would miss them)
     # and the dropdown is rebuilt with the selection preserved.
     assert "function renderImportDestModes()" in html
+    # The refresh compares whole entries (Start posts only the id; the
+    # server resolves every field), and a selected SSH destination follows
+    # a legacy id change by connection tuple instead of dropping to Local.
+    assert "return JSON.stringify(t, Object.keys(t).sort());" in html
+    assert "t.remote_path === prevTarget.remote_path" in html
+    assert "sameHost.length === 1 ? sameHost[0] : null" in html
+    assert "function noteRemoteSelectionLost(name)" in html
     # Both the initial load and the background refresh go through one
     # bounded fetch (10s abort) and one apply step that also sets the
     # rsync/ssh availability flags and clears the load-error banner.

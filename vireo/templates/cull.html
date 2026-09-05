@@ -401,6 +401,9 @@ body { padding-bottom: 36px; }
 
 <script>
 var cullData = null;
+var cullBusy = false;
+var cullDirty = false;
+var cullUseSavedFlags = false;
 var pipelineResults = null;
 var selectedCollectionId = null;
 var expandedSpecies = {};
@@ -601,8 +604,10 @@ function onGroupingChange(slider) {
   _regroupTimer = setTimeout(doRegroupLive, 500);
 }
 
-function setPipelineResults(data, statusText) {
+function setPipelineResults(data, statusText, useSavedFlags) {
   pipelineResults = data;
+  cullUseSavedFlags = !!useSavedFlags;
+  cullDirty = false;
   rebuildCullDataFromPipeline();
   var status = document.getElementById('cullStatus');
   if (statusText && status) {
@@ -677,11 +682,47 @@ async function runCulling() {
   }
 }
 
-document.addEventListener('vireo:edit-history-changed', function(event) {
-  var result = event.detail.result;
-  document.getElementById('cullStatus').textContent =
-    (event.detail.operation === 'undo' ? 'Undone: ' + result.undone : 'Redone: ' + result.redone);
-});
+window.beforeHistoryChange = function() {
+  if (cullBusy || cullDirty) {
+    showToast('Apply your staged culling decisions or reload before undoing saved edits.', 'info');
+    return false;
+  }
+  return true;
+};
+
+window.afterHistoryChange = async function(result) {
+  cullBusy = true;
+  document.getElementById('applyBtn').disabled = true;
+  var scopedIds = selectedCollectionId == null ? null : new Set(
+    (pipelineResults && pipelineResults.photos || []).map(function(photo) { return photo.id; })
+  );
+  try {
+    var data = await safeFetch('/api/pipeline/page-init', {}, {toast: false});
+    var results = data && data.results;
+    if (results && scopedIds) {
+      results.photos = results.photos.filter(function(photo) { return scopedIds.has(photo.id); });
+      results.encounters = results.encounters.filter(function(enc) {
+        enc.photo_ids = enc.photo_ids.filter(function(id) { return scopedIds.has(id); });
+        enc.bursts = (enc.bursts || []).map(function(burst) {
+          var ids = (burst.photo_ids || burst).filter(function(id) { return scopedIds.has(id); });
+          return Array.isArray(burst) ? ids : Object.assign({}, burst, {photo_ids: ids});
+        }).filter(function(burst) { return (burst.photo_ids || burst).length; });
+        enc.photo_count = enc.photo_ids.length;
+        enc.burst_count = enc.bursts.length;
+        return enc.photo_count > 0;
+      });
+    }
+    setPipelineResults(results,
+      result.undone ? 'Undone: ' + result.undone : 'Redone: ' + result.redone, true);
+  } catch (error) {
+    cullData = null;
+    renderCulling();
+    throw error;
+  } finally {
+    cullBusy = false;
+    document.getElementById('applyBtn').disabled = false;
+  }
+};
 
 async function loadCullingResults() {
   try {
@@ -782,7 +823,9 @@ function pipelineToCullData(results) {
 
     burstOrder.forEach(function(pid) {
       var p = photoMap[pid];
-      var action = actionForLabel(p.label);
+      var action = cullUseSavedFlags
+        ? (p.flag === 'flagged' ? 'keep' : p.flag === 'rejected' ? 'reject' : 'review')
+        : actionForLabel(p.label);
       groupPhotos.push({
         photo_id: pid,
         quality: p.quality_composite || 0,
@@ -1015,6 +1058,7 @@ function toggleSpecies(idx) {
 }
 
 function toggleCullAction(speciesIdx, poseIdx, photoId) {
+  if (cullBusy) return;
   var sg = cullData.species_groups[speciesIdx];
   var groups = sg.scene_groups || sg.pose_groups || [];
   var pg = groups[poseIdx];
@@ -1034,13 +1078,13 @@ function toggleCullAction(speciesIdx, poseIdx, photoId) {
   var next = photo.action === 'keep' ? 'review' : (photo.action === 'review' ? 'reject' : 'keep');
   dec(photo.action);
   photo.action = next;
-  photo.pipeline_label = next.toUpperCase();
+  cullDirty = true;
   inc(next);
   renderCulling();
 }
 
 async function applyCulling() {
-  if (!cullData) return;
+  if (!cullData || cullBusy) return;
 
   var keepers = [];
   var rejects = [];
@@ -1056,16 +1100,22 @@ async function applyCulling() {
 
   if (!confirm('Apply culling decisions?\n\n' + keepers.length + ' photos flagged as keepers\n' + rejects.length + ' photos flagged as rejected\n\nThis sets the flag on each photo. Use Undo below to restore the previous flags.')) return;
 
+  cullBusy = true;
+  document.getElementById('applyBtn').disabled = true;
   try {
     await safeFetch('/api/culling/apply', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({keepers: keepers, rejects: rejects}),
     }, { toast: false });
+    cullDirty = false;
     document.getElementById('cullStatus').textContent = 'Applied! ' + keepers.length + ' keepers, ' + rejects.length + ' rejected';
     document.getElementById('cullStatus').style.color = 'var(--accent)';
   } catch(e) {
     document.getElementById('cullStatus').textContent = 'Error: ' + e.message;
+  } finally {
+    cullBusy = false;
+    document.getElementById('applyBtn').disabled = false;
   }
 }
 

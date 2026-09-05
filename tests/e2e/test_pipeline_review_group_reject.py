@@ -2857,10 +2857,19 @@ def test_culling_can_be_undone_without_leaving_the_page(live_server, page):
     expect(page.locator('#cullStatus')).to_contain_text('Undone: Culling')
     assert page.url.endswith('/cull')
     assert _flags(db, ids) == ['flagged', 'none', 'none', 'none']
+    expect(page.locator(f'.cull-card[data-photo-id="{ids[0]}"]')).to_have_class(re.compile(r'\bkeep\b'))
+    for pid in ids[1:]:
+        expect(page.locator(f'.cull-card[data-photo-id="{pid}"]')).to_have_class(re.compile(r'\breview\b'))
     expect(page.locator('#historyRedoBtn')).to_be_enabled()
     page.locator('#historyRedoBtn').click()
     expect(page.locator('#cullStatus')).to_contain_text('Redone: Culling')
     assert _flags(db, ids) == ['rejected', 'flagged', 'rejected', 'rejected']
+
+    page.locator('#historyUndoBtn').click()
+    expect(page.locator('#cullStatus')).to_contain_text('Undone: Culling')
+    page.locator('#applyBtn').click()
+    expect(page.locator('#cullStatus')).to_contain_text('Applied!')
+    assert _flags(db, ids) == ['flagged', 'none', 'none', 'none']
 
 
 def test_history_panel_undo_labels_the_actual_reversible_edit(live_server, page):

@@ -2710,6 +2710,67 @@ def test_import_after_move_refresh_recovers_failed_initial_target_load(
     assert page.evaluate("importRsyncAvailable && importSshAvailable")
 
 
+def test_import_after_move_drops_eligibility_when_root_changes_elsewhere(
+    live_server, page,
+):
+    """A target eligible at page load must stop being offered when its
+    archive root is changed in Settings (another tab) and the user comes
+    back — otherwise Start posts an id the server rejects against the new
+    root. The tab-return refresh applies even when the snapshot looks
+    eligible."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+    state = {"root": "/Users/me/Pictures/Vireo Archive"}
+
+    def remote_targets(route):
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": [{
+                    "id": "nas1",
+                    "name": "Photo NAS",
+                    "user": "photo",
+                    "host": "nas.local",
+                    "remote_path": "/volume1/Photography",
+                    "mount_path": "/Volumes/Photography",
+                    "local_archive_root": state["root"],
+                    "local_archive_root_present": True,
+                }],
+            }),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    hint = page.locator("#afterMoveUnavailable")
+    row = page.locator("#afterMoveRow")
+    expect(row).to_be_visible()
+    expect(hint).to_be_hidden()
+
+    # Root moved in Settings; user returns to this tab without editing.
+    state["root"] = "/Users/me/Pictures/Staging"
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+
+    expect(row).to_be_hidden(timeout=10000)
+    expect(hint).to_contain_text(
+        "the destination is outside the local archive root of "
+        "Photo NAS (/Users/me/Pictures/Staging)"
+    )
+
+
 def test_import_new_workspace_shows_target_default_in_after_import_display(
     live_server, page
 ):

@@ -2031,8 +2031,15 @@ function updateAdvancedImportOptions() {
 // The hint sends the user to Settings or Finder and back. Coming back is
 // itself the signal to re-check: nothing else on the form changes, so
 // without this the last (unchanged) refresh would be the final word until
-// a reload. updateAfterMoveUI() only re-fetches while the hint is showing.
-const _afterMoveOnReturn = () => { if (!document.hidden) updateAfterMoveUI(); };
+// a reload. Refresh unconditionally here (throttled), not only while the
+// hint is showing: a target that was eligible at load can stop being
+// eligible when its root is changed in Settings, and offering the move
+// against a stale root would only be caught by the server rejecting Start.
+const _afterMoveOnReturn = () => {
+  if (document.hidden) return;
+  if (importRemoteTargets.length) refreshAfterMoveTargets();
+  updateAfterMoveUI();
+};
 window.addEventListener('focus', _afterMoveOnReturn);
 window.addEventListener('pageshow', _afterMoveOnReturn);
 document.addEventListener('visibilitychange', _afterMoveOnReturn);

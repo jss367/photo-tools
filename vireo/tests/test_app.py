@@ -17611,6 +17611,59 @@ def test_remote_targets_list_reports_unreachable_archive_root_volume(
     assert t["local_archive_root_volume_offline"] is True
 
 
+def test_remote_targets_list_bounds_aggregate_probe_time(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """Several archive roots on distinct dead volumes must not add up
+    serially past the Import page's client abort: roots are probed
+    concurrently under one budget, a root still unanswered at the budget
+    is reported as unreachable, and roots that answered in time keep
+    their real state."""
+    import threading
+    import time
+
+    import config as cfg
+    import move
+    import volume_reachability
+    app, _ = app_and_db
+    monkeypatch.setattr(move, "resolve_rsync_bin", lambda _: "/usr/bin/rsync")
+    monkeypatch.setattr(move, "is_gnu_rsync", lambda _: True)
+    monkeypatch.setattr(move, "resolve_ssh_bin", lambda _: "/usr/bin/ssh")
+    app.config["REMOTE_TARGET_PROBE_BUDGET_SECS"] = 0.4
+    release = threading.Event()
+
+    class Gate:
+        def check(self, path):
+            if path.startswith("/Volumes/Dead"):
+                # A hung probe: far longer than the budget.
+                release.wait(5)
+                return "/Volumes/Dead", False
+            return None, True
+
+    monkeypatch.setattr(volume_reachability, "get_shared", lambda: Gate())
+    present = tmp_path / "present"
+    present.mkdir()
+    cfg.save({"remote_targets": [
+        _remote_target_body(id="dead1", local_archive_root="/Volumes/Dead1/a"),
+        _remote_target_body(id="dead2", local_archive_root="/Volumes/Dead2/b"),
+        _remote_target_body(id="ok", local_archive_root=str(present)),
+    ]})
+    started = time.monotonic()
+    try:
+        resp = app.test_client().get("/api/remote-targets")
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+    assert resp.status_code == 200
+    assert elapsed < 3.0, elapsed
+    by_id = {t["id"]: t for t in resp.get_json()["targets"]}
+    assert by_id["dead1"]["local_archive_root_volume_offline"] is True
+    assert by_id["dead1"]["local_archive_root_present"] is None
+    assert by_id["dead2"]["local_archive_root_volume_offline"] is True
+    assert by_id["ok"]["local_archive_root_present"] is True
+    assert by_id["ok"]["local_archive_root_volume_offline"] is False
+
+
 def test_remote_targets_list_reports_archive_root_presence(
     app_and_db, monkeypatch, tmp_path,
 ):

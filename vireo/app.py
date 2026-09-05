@@ -24709,6 +24709,52 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     def _archive_root_present(target):
         return _archive_root_state(target)[0]
 
+    # Aggregate budget for probing every target's archive root in one
+    # /api/remote-targets call. Each individual probe is bounded (see
+    # volume_reachability), but with several roots on distinct dead
+    # volumes the bounded probes would add up serially past the Import
+    # page's 10s client abort, and the page would then report every SSH
+    # destination as unavailable. Probe concurrently and stop waiting at
+    # the budget; a root still unanswered by then is reported the same way
+    # volume_reachability reports "could not be inspected in time" —
+    # unreachable — rather than guessed.
+    app.config.setdefault("REMOTE_TARGET_PROBE_BUDGET_SECS", 6.0)
+
+    def _archive_root_states(targets):
+        """``[(present, volume_offline), ...]`` aligned with ``targets``,
+        probed concurrently under ``REMOTE_TARGET_PROBE_BUDGET_SECS``."""
+        from concurrent.futures import ThreadPoolExecutor, wait
+
+        indexed = [(i, t) for i, t in enumerate(targets)
+                   if (t.get("local_archive_root") or "").strip()]
+        states = [(None, False)] * len(targets)
+        if not indexed:
+            return states
+        budget = float(app.config.get("REMOTE_TARGET_PROBE_BUDGET_SECS", 6.0))
+        pool = ThreadPoolExecutor(
+            max_workers=min(len(indexed), 8),
+            thread_name_prefix="archive-root-probe")
+        futures = {pool.submit(_archive_root_state, t): i for i, t in indexed}
+        done, _ = wait(futures, timeout=budget)
+        # Don't block on stragglers: their probes are bounded and reaped by
+        # volume_reachability, so the worker threads exit on their own.
+        pool.shutdown(wait=False, cancel_futures=True)
+        for fut, i in futures.items():
+            if fut in done and fut.exception() is None:
+                states[i] = fut.result()
+            else:
+                if fut in done:
+                    log.warning("archive-root probe raised for %s",
+                                targets[i].get("local_archive_root"),
+                                exc_info=fut.exception())
+                else:
+                    log.warning(
+                        "archive-root probe for %s did not finish within "
+                        "%.1fs; reporting the volume as unreachable",
+                        targets[i].get("local_archive_root"), budget)
+                states[i] = (None, True)
+        return states
+
     @app.route("/api/remote-targets")
     def api_remote_targets_list():
         """List configured remote (SSH) move targets for the move-form picker,
@@ -24723,8 +24769,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         ssh_bin = move_mod.resolve_ssh_bin(
             effective_cfg.get("ssh_bin", "") or "")
         targets = cfg.get_remote_targets()
-        for t in targets:
-            present, offline = _archive_root_state(t)
+        for t, (present, offline) in zip(
+                targets, _archive_root_states(targets), strict=True):
             t["local_archive_root_present"] = present
             t["local_archive_root_volume_offline"] = offline
         return jsonify({

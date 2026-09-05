@@ -26192,7 +26192,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # filename, so serializing its full cache-check/write sequence
                 # lets Process safely reclaim that predecessor after commit.
                 photo_mask_lock = acquire_photo_mask(photo_id)
-                photo_mask_lock.acquire()
+                while not ctx.runner.is_cancelled(job["id"]):
+                    if not photo_mask_lock.acquire(timeout=0.1):
+                        continue
+                    # A pause can arrive during acquisition. Release before
+                    # parking so another Process job can use this photo.
+                    if (ctx.runner.pause_requested(job["id"])
+                            or ctx.runner.cancellation_requested(job["id"])):
+                        photo_mask_lock.release()
+                        continue
+                    break
+                else:
+                    break
                 mask_file_stage = None
                 try:
                     # Cache hit: photo_masks already has a row for

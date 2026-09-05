@@ -3420,3 +3420,63 @@ def test_serialize_results_mixed_encounter_baseline_is_shared_species(tmp_path):
     for burst in enc.get("bursts", []):
         if set(burst["photo_ids"]) == burst_ids:
             assert burst["species_override"] is None
+
+
+def test_serialize_results_preserves_explicit_empty_burst_after_regroup(tmp_path):
+    """A burst whose last species was removed carries an explicit-empty
+    override; when the next regroup rebuilds bursts from DB photos alone,
+    those same untagged photos must keep the sentinel so they do not
+    inherit their encounter's confirmed species again."""
+    from pipeline import load_photo_features, run_full_pipeline, serialize_results
+
+    db, ids = _setup_db_with_photos(tmp_path)
+    # Photos in encounter 0 are untagged (the "explicitly cleared" burst);
+    # encounter 1's photos are tagged as Teal so regrouping is unaffected.
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    for pid in ids[1]:
+        db.tag_photo(pid, teal)
+
+    # Prior cache marks encounter-0's photos as explicit-empty.
+    prior = {
+        "encounters": [
+            {
+                "photo_ids": list(ids[0]),
+                "bursts": [
+                    {
+                        "photo_ids": list(ids[0]),
+                        "species_override": {
+                            "species": None,
+                            "confirmed": False,
+                            "species_list": [],
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+    serialized = serialize_results(
+        run_full_pipeline(load_photo_features(db)),
+        prior_results=prior,
+    )
+    empty_ids = set(ids[0])
+    found = False
+    for enc in serialized["encounters"]:
+        for burst in enc.get("bursts", []):
+            if set(burst["photo_ids"]) == empty_ids:
+                assert burst["species_override"] == {
+                    "species": None,
+                    "confirmed": False,
+                    "species_list": [],
+                }
+                found = True
+    assert found, "explicit-empty burst should survive regroup"
+
+    # A regroup without the prior cache falls back to None (the previous
+    # behavior): the sentinel only survives when it can be traced back.
+    serialized_no_prior = serialize_results(
+        run_full_pipeline(load_photo_features(db)),
+    )
+    for enc in serialized_no_prior["encounters"]:
+        for burst in enc.get("bursts", []):
+            if set(burst["photo_ids"]) == empty_ids:
+                assert burst["species_override"] is None

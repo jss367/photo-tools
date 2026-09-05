@@ -1045,7 +1045,7 @@ def _build_species_predictions(photos):
     return result
 
 
-def serialize_results(results):
+def serialize_results(results, prior_results=None):
     """Serialize pipeline results to a JSON-safe dict.
 
     Strips numpy arrays and non-serializable objects so results
@@ -1053,14 +1053,42 @@ def serialize_results(results):
 
     Args:
         results: dict from run_full_pipeline()
+        prior_results: previously-serialized cache, used to preserve the
+            explicit-empty burst sentinel across regroups. When a burst had
+            its last species removed, the endpoint records
+            ``empty_species_override()`` so the untagged photos do not
+            inherit the encounter's species. A regroup that rebuilds bursts
+            from DB photos alone cannot tell that "no tags" from an
+            explicit clear apart from "never touched" — pass the prior
+            cache so those photos keep the sentinel.
 
     Returns:
         JSON-serializable dict
     """
     from pipeline_results import (
         build_species_override,
+        empty_species_override,
         photo_confirmed_species_list,
     )
+
+    # Photo ids the prior cache recorded as belonging to an explicit-empty
+    # burst. A regrouped burst whose photos are all untagged in the DB AND
+    # every one of them was in an explicit-empty burst before keeps the
+    # sentinel; anything else is an ordinary unconfirmed burst.
+    prior_empty_photo_ids = set()
+    if isinstance(prior_results, dict):
+        for prior_enc in prior_results.get("encounters", []) or []:
+            for prior_burst in prior_enc.get("bursts") or []:
+                ovr = prior_burst.get("species_override")
+                if (
+                    isinstance(ovr, dict)
+                    and isinstance(ovr.get("species_list"), list)
+                    and not ovr["species_list"]
+                    and not ovr.get("confirmed")
+                ):
+                    prior_empty_photo_ids.update(
+                        prior_burst.get("photo_ids") or []
+                    )
 
     def _clean_photo(p):
         """Strip non-serializable fields from a photo dict."""
@@ -1165,6 +1193,20 @@ def serialize_results(results):
                     burst_override = build_species_override(
                         photo_confirmed_species_list(burst[0]),
                     )
+                elif (
+                    prior_empty_photo_ids
+                    and burst_ids
+                    and all(
+                        not photo_confirmed_species_list(p) for p in burst
+                    )
+                    and all(pid in prior_empty_photo_ids for pid in burst_ids)
+                ):
+                    # All photos are untagged AND every one of them was in
+                    # an explicit-empty burst before this regroup — keep the
+                    # sentinel so the burst does not inherit the encounter's
+                    # species and get its removed tag re-applied on the next
+                    # rapid/classic review apply.
+                    burst_override = empty_species_override()
                 else:
                     burst_override = None
                 s_enc["bursts"].append({
@@ -1208,8 +1250,12 @@ def save_results(results, cache_dir, workspace_id, preserve_miss_marker=True):
     Returns:
         path to the saved JSON file
     """
-    serialized = serialize_results(results)
     path = _results_cache_path(cache_dir, workspace_id)
+    # Load the prior cache once: serialize_results uses it to preserve the
+    # explicit-empty burst sentinel across regroups, and the miss-marker
+    # carry-forward below reads the same file.
+    existing = _load_results_json(path) if os.path.exists(path) else None
+    serialized = serialize_results(results, prior_results=existing)
     # Preserve miss_computed_at across reflow/regroup-live saves: it's
     # written by pipeline_job's miss_stage and gates the review UI's
     # "Review misses" shortcut on whether misses were recomputed in
@@ -1219,11 +1265,10 @@ def save_results(results, cache_dir, workspace_id, preserve_miss_marker=True):
     if (
         preserve_miss_marker
         and "miss_computed_at" not in serialized
-        and os.path.exists(path)
+        and existing
+        and existing.get("miss_computed_at")
     ):
-        existing = _load_results_json(path)
-        if existing and existing.get("miss_computed_at"):
-            serialized["miss_computed_at"] = existing["miss_computed_at"]
+        serialized["miss_computed_at"] = existing["miss_computed_at"]
     _atomic_json_dump(serialized, path)
     log.info("Pipeline results saved to %s", path)
     return path

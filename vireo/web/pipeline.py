@@ -1635,7 +1635,7 @@ def create_pipeline_blueprint(
         if save_cache and collection_id is None and photo_ids is None:
             save_results(results, cache_dir, db._active_workspace_id)
 
-        serialized = serialize_results(results)
+        serialized = serialize_results(results, prior_results=existing)
         attach_nested_edit_recipes(db, serialized)
         return jsonify(serialized)
 
@@ -1711,7 +1711,7 @@ def create_pipeline_blueprint(
         if save_cache and collection_id is None and photo_ids is None:
             save_results(results, cache_dir, db._active_workspace_id)
 
-        serialized = serialize_results(results)
+        serialized = serialize_results(results, prior_results=existing)
         attach_nested_edit_recipes(db, serialized)
         return jsonify(serialized)
 

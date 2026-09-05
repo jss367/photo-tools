@@ -1530,7 +1530,14 @@ function saveWsConfig() {
   clearTimeout(_wsSaveTimer);
   var gen = _nextSaveGen();
   _saveStatusMark('workspace', 'pending', gen);
-  _wsSaveTimer = setTimeout(async function() {
+  _wsSaveTimer = setTimeout(function() {
+    _serializedSave('workspace', function() { return _postWsOverrides(gen); });
+  }, 500);
+}
+
+async function _postWsOverrides(gen) {
+    // Runs only once any earlier override POST has settled; reads the form
+    // now so the snapshot reflects every edit made while waiting.
     var overrides = {};
     var needsResync = false;
     var invalidKeys = [];
@@ -1594,7 +1601,6 @@ function saveWsConfig() {
       }
     }
     _saveStatusMark('workspace', 'ok', gen);
-  }, 500);
 }
 
 // ---------- Autosave status ----------
@@ -1620,6 +1626,23 @@ var _saveStatusFlashTimer = null;
 var _saveGenCounter = 0;
 
 function _nextSaveGen() { return ++_saveGenCounter; }
+
+// Saves for the same path are serialized: the next POST starts only after
+// the previous one has settled. Generation tokens order the UI
+// bookkeeping, but they cannot order what the server sees — two
+// overlapping requests can reach the backend out of order, and the older
+// full-form snapshot could land last and silently revert the newer edit
+// while the pill says "Saved". With one request in flight per path, the
+// server applies snapshots in the order they were sent, and each snapshot
+// is read from the form at send time so a queued save always carries the
+// latest values.
+var _saveChains = {};
+function _serializedSave(path, doSave) {
+  var prev = _saveChains[path] || Promise.resolve();
+  var run = prev.catch(function() {}).then(doSave);
+  _saveChains[path] = run;
+  return run;
+}
 
 function _saveStatusMark(path, phase, gen) {
   if (phase === 'pending') {
@@ -2739,11 +2762,17 @@ function getSelectedCardFields() {
   return fields;
 }
 
-async function _saveConfigNow(gen) {
+function _saveConfigNow(gen) {
     // Direct callers (NAS wizard, etc.) don't hand us a generation, so mint
     // one here. Threading a fresh gen through inflight/ok/error keeps the
     // autosave pill honest when this call overlaps a debounced write.
     if (gen === undefined) gen = _nextSaveGen();
+    return _serializedSave('config', function() { return _postConfigSnapshot(gen); });
+}
+
+async function _postConfigSnapshot(gen) {
+    // Runs only once any earlier config POST has settled; reads the form
+    // now so the snapshot reflects every edit made while waiting.
     var threshold = parseInt(document.getElementById('cfgThreshold').value, 10) / 100;
     var grouping = parseInt(document.getElementById('cfgGroupingWindow').value, 10);
     if (isNaN(grouping)) grouping = 10;

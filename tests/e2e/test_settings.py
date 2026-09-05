@@ -199,3 +199,48 @@ def test_settings_cleared_override_is_not_reported_as_saved(live_server, page):
     expect(value).to_have_value("10")
     overrides = page.request.get(f"{url}/api/workspaces/active/config").json()
     assert overrides["grouping_window_seconds"] == 10
+
+
+def test_settings_saves_for_same_path_are_serialized(live_server, page):
+    """A second edit waits for the in-flight POST so snapshots reach the server in order."""
+    url = live_server["url"]
+    page.goto(f"{url}/settings", timeout=5000)
+    status = _wait_for_settings_idle(page)
+
+    held = []
+
+    def _hold_first_post(route, request):
+        if request.method == "POST" and not held:
+            held.append(route)
+        else:
+            route.continue_()
+
+    page.route("**/api/config", _hold_first_post)
+    page.select_option("#cfgKeywordCase", "title")
+    for _ in range(60):
+        if held:
+            break
+        page.wait_for_timeout(50)
+    assert held, "first POST was never requested"
+
+    # Second edit while the first POST is stalled: its POST must not be sent
+    # until the first one settles.
+    posts_seen = []
+    page.on(
+        "request",
+        lambda r: posts_seen.append(r)
+        if r.url.endswith("/api/config") and r.method == "POST"
+        else None,
+    )
+    page.select_option("#cfgKeywordCase", "lower")
+    page.wait_for_timeout(1200)  # well past the 500 ms debounce
+    assert not posts_seen, "second POST was sent while the first was in flight"
+    expect(status).to_have_attribute("data-state", "saving")
+
+    with page.expect_request(
+        lambda r: r.url.endswith("/api/config") and r.method == "POST"
+    ):
+        held[0].continue_()
+    expect(status).to_have_attribute("data-state", "saved", timeout=10_000)
+    cfg = page.request.get(f"{url}/api/config").json()
+    assert cfg["keyword_case"] == "lower"

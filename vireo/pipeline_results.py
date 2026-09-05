@@ -78,7 +78,11 @@ def burst_species_list(enc, burst):
     detach-time candidate), otherwise the burst inherits the encounter.
     """
     ovr = burst.get("species_override") if isinstance(burst, dict) else None
-    if ovr and (ovr.get("species_list") or ovr.get("species")):
+    if isinstance(ovr, dict) and isinstance(ovr.get("species_list"), list):
+        # An explicit list is authoritative even when empty: a burst whose
+        # last species was removed must not fall back to the encounter's.
+        return [s for s in ovr["species_list"] if s]
+    if ovr and ovr.get("species"):
         return _as_species_list(ovr, "species_list", "species")
     return encounter_confirmed_species_list(enc)
 
@@ -91,7 +95,12 @@ def species_key_set(names):
 
 
 def build_species_override(species_list, confirmed=True):
-    """Burst override dict for ``species_list`` (None when the list is empty)."""
+    """Burst override dict for ``species_list`` (None when the list is empty).
+
+    ``None`` means "no override: inherit the encounter" — the regroup
+    derivation uses it for bursts that are not uniformly confirmed. Use
+    :func:`empty_species_override` for a burst that was explicitly cleared.
+    """
     species_list = [s for s in species_list if s]
     if not species_list:
         return None
@@ -100,6 +109,16 @@ def build_species_override(species_list, confirmed=True):
         "confirmed": confirmed,
         "species_list": list(species_list),
     }
+
+
+def empty_species_override():
+    """Override for a burst explicitly confirmed as *no* species.
+
+    Distinct from ``None`` (inherit the encounter): after a remove strips a
+    burst's last species, the encounter may still be confirmed, and the
+    burst must not present that species as its own.
+    """
+    return {"species": None, "confirmed": False, "species_list": []}
 
 
 def updated_species_list(current, species, previous_species=None,

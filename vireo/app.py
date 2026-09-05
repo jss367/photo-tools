@@ -26508,6 +26508,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         from pipeline_results import (
             build_species_override,
             burst_species_list,
+            empty_species_override,
             encounter_confirmed_species_list,
             set_encounter_confirmed_species,
             species_key_set,
@@ -27033,8 +27034,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # burst override, encounter-scoped requests only touch the encounter.
         if cached and target_enc is not None:
             if burst_index is not None:
+                # An emptied burst keeps an explicit empty override rather
+                # than None: None would make it inherit the encounter's
+                # species, which the remove just untagged.
                 target_enc["bursts"][burst_index]["species_override"] = (
                     build_species_override(new_species_list)
+                    or empty_species_override()
                 )
                 # Auto-detach if the burst's confirmed species no longer
                 # overlap its encounter's — splits it out and merges into an

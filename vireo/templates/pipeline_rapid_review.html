@@ -817,10 +817,38 @@ function speciesKey(name) {
   return (name || '').trim().toLowerCase();
 }
 
+// Split the field into names. Names are separated by commas or semicolons;
+// a name that itself contains a delimiter or a quote is written in double
+// quotes, CSV style ("" inside quotes is a literal quote). joinSpecies()
+// produces exactly this encoding, so a stored keyword such as
+// `Mallard, domestic` round-trips through the field untouched.
 function parseSpeciesList(text) {
   var out = [];
   var seen = {};
-  (text || '').split(/[,;]/).forEach(function(part) {
+  var parts = [];
+  var buf = '';
+  var quoted = false;
+  var str = text || '';
+  for (var i = 0; i < str.length; i++) {
+    var ch = str[i];
+    if (quoted) {
+      if (ch === '"') {
+        if (str[i + 1] === '"') { buf += '"'; i++; }
+        else quoted = false;
+      } else {
+        buf += ch;
+      }
+    } else if (ch === '"') {
+      quoted = true;
+    } else if (ch === ',' || ch === ';') {
+      parts.push(buf);
+      buf = '';
+    } else {
+      buf += ch;
+    }
+  }
+  parts.push(buf);
+  parts.forEach(function(part) {
     var name = part.trim();
     if (!name) return;
     var key = speciesKey(name);
@@ -831,8 +859,13 @@ function parseSpeciesList(text) {
   return out;
 }
 
+function quoteSpeciesName(name) {
+  if (/[,;"]/.test(name)) return '"' + name.replace(/"/g, '""') + '"';
+  return name;
+}
+
 function joinSpecies(list) {
-  return (list || []).join(', ');
+  return (list || []).map(quoteSpeciesName).join(', ');
 }
 
 function sameSpeciesSet(a, b) {
@@ -848,6 +881,13 @@ function overrideSpeciesList(ovr) {
   return ovr.species ? [ovr.species] : [];
 }
 
+// An override with an explicit species_list (even an empty one, after the
+// burst's last species was removed) is authoritative; a null override or a
+// legacy override without a species inherits the encounter.
+function overrideIsExplicit(ovr) {
+  return !!ovr && (Array.isArray(ovr.species_list) || !!ovr.species);
+}
+
 function encounterConfirmedList(enc) {
   if (!enc) return [];
   if (Array.isArray(enc.confirmed_species_list)) return enc.confirmed_species_list.filter(Boolean);
@@ -855,8 +895,8 @@ function encounterConfirmedList(enc) {
 }
 
 function burstSpeciesList(enc, burst) {
-  var ovr = overrideSpeciesList(burst && burst.species_override);
-  if (ovr.length) return ovr;
+  var ovr = burst && burst.species_override;
+  if (overrideIsExplicit(ovr)) return overrideSpeciesList(ovr);
   var confirmed = encounterConfirmedList(enc);
   if (confirmed.length) return confirmed;
   if (enc && enc.species && enc.species.length && enc.species[0]) return [enc.species[0]];
@@ -868,7 +908,7 @@ function burstSpecies(enc, burst) {
 }
 
 function hasBurstSpeciesOverride(burst) {
-  return overrideSpeciesList(burst && burst.species_override).length > 0;
+  return overrideIsExplicit(burst && burst.species_override);
 }
 
 // Find the burst that still holds every one of `ids` after the server
@@ -1906,8 +1946,13 @@ async function applyCurrent(openNext) {
     var snapBursts = (snapEnc.bursts && snapEnc.bursts.length) ? snapEnc.bursts : null;
     var snapBurst = snapBursts ? snapBursts[session.burstIdx] : null;
     var snapOvr = snapBurst && snapBurst.species_override;
+    var explicitlyEmpty = !!snapOvr && Array.isArray(snapOvr.species_list) && !snapOvr.species_list.length;
     if (snapOvr && snapOvr.confirmed === true && overrideSpeciesList(snapOvr).length) {
       alreadyConfirmedList = overrideSpeciesList(snapOvr);
+    } else if (explicitlyEmpty) {
+      // The burst's last species was removed: it is confirmed as nothing,
+      // even if its encounter still carries a species.
+      alreadyConfirmedList = [];
     } else if (snapEnc.species_confirmed && encounterConfirmedList(snapEnc).length) {
       alreadyConfirmedList = encounterConfirmedList(snapEnc);
     }

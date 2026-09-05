@@ -1508,3 +1508,40 @@ def test_rapid_review_clearing_species_field_removes_nothing(live_server, page):
     with page.expect_response("**/api/pipeline/save-cache"):
         page.locator("#applyBtn").click()
     assert species_payloads == []
+
+
+def test_rapid_review_species_name_with_comma_round_trips(live_server, page):
+    """A stored keyword containing a delimiter is shown quoted and parsed back
+    as one name, so an unrelated flag change never rewrites it as two tags."""
+    species_payloads = []
+    results = _two_species_results()
+    name = "Mallard, domestic"
+    for p in results["photos"]:
+        p["confirmed_species"] = name
+        p["confirmed_species_list"] = [name]
+    enc = results["encounters"][0]
+    enc["confirmed_species"] = name
+    enc["confirmed_species_list"] = [name]
+    enc["bursts"][0]["species_override"] = {"species": name, "confirmed": True, "species_list": [name]}
+    state = {
+        str(pid): {"flag": "none", "has_species_keyword": True, "has_species_keywords": {name: True}}
+        for pid in (1, 2, 3)
+    }
+    _mock_pipeline_rapid_review(page, results=results, state_photos=state, species_payloads=species_payloads)
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value('"Mallard, domestic"')
+    expect(page.locator("#applyBtn")).to_have_text("Apply: no DB changes")
+
+    page.keyboard.press("p")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Flag 1")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+    assert species_payloads == []
+
+    # Typing a second, quoted name alongside pairs cleanly with the first.
+    _fill_species_and_settle(page, '"Mallard, domestic", Gadwall')
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Set species · Tag 3")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+    assert [p["species"] for p in species_payloads] == ["Gadwall"]
+    assert species_payloads[0]["add"] is True

@@ -23039,3 +23039,52 @@ def test_encounter_species_replace_detaches_only_when_no_species_shared(app_and_
     assert sorted(detached["confirmed_species_list"]) == ["Gadwall", "Mallard"]
     for pid in burst_ids:
         assert _species_names(db, pid) == ["Gadwall", "Mallard"]
+
+
+def test_encounter_species_remove_last_burst_species_leaves_explicit_empty_override(app_and_db):
+    """Removing a burst's only species must not make it inherit the
+    encounter's species again: the override becomes explicitly empty, and a
+    later confirm on that burst sees no previous species."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    burst_ids, other_ids = photo_ids[:2], photo_ids[2:]
+    path = _seed_encounter_cache(
+        app, db, photo_ids, confirmed_species="Green-winged Teal",
+        bursts=[
+            {"photo_ids": burst_ids, "species_predictions": [],
+             "species_override": {"species": "Green-winged Teal", "confirmed": True}},
+            {"photo_ids": other_ids, "species_predictions": [], "species_override": None},
+        ],
+    )
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    for pid in photo_ids:
+        db.tag_photo(pid, teal)
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "Green-winged Teal", "photo_ids": burst_ids,
+        "burst_index": 0, "remove": True,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    assert resp.get_json()["species_list"] == []
+    for pid in burst_ids:
+        assert _species_names(db, pid) == []
+    for pid in other_ids:
+        assert _species_names(db, pid) == ["Green-winged Teal"]
+
+    with open(path) as f:
+        enc = _json.load(f)["encounters"][0]
+    assert enc["bursts"][0]["species_override"] == {
+        "species": None, "confirmed": False, "species_list": [],
+    }
+    assert enc["confirmed_species"] == "Green-winged Teal"
+
+    # A fresh confirm on the emptied burst is a plain add, not a replace of
+    # the encounter's teal (which these photos no longer carry).
+    resp = client.post("/api/encounters/species", json={
+        "species": "Gadwall", "photo_ids": burst_ids, "burst_index": 0,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    assert resp.get_json()["previous_species"] is None
+    assert resp.get_json()["species_list"] == ["Gadwall"]

@@ -228,6 +228,173 @@ class TestCustomLabelsMode:
                 cancel_check=cancel_check,
             )
 
+    def test_embedding_computation_pauses_between_labels_and_resumes(
+        self, tmp_path,
+    ):
+        """A pause request checkpoints the finished labels and unwinds with
+        ClassifierLoadPaused; the next call resumes from the checkpoint and
+        only encodes the remaining labels."""
+        from classifier import (
+            ClassifierLoadPaused,
+            _compute_embeddings_with_progress,
+        )
+        from embedding_cache import EmbeddingCheckpoint
+
+        text_session = _make_fake_text_session()
+        tokenizer = _make_fake_tokenizer()
+        runs = {"count": 0}
+        original_run = text_session.run
+
+        def counting_run(*args, **kwargs):
+            runs["count"] += 1
+            return original_run(*args, **kwargs)
+
+        text_session.run = counting_run
+
+        labels = ["bird", "cat", "dog", "emu"]
+        checkpoint = EmbeddingCheckpoint(str(tmp_path), "digest", len(labels))
+        pause_polls = {"count": 0}
+
+        def pause_check():
+            pause_polls["count"] += 1
+            # Pause request lands after two labels are finished.
+            return pause_polls["count"] == 3
+
+        with pytest.raises(ClassifierLoadPaused):
+            _compute_embeddings_with_progress(
+                text_session,
+                "input_ids",
+                tokenizer,
+                labels,
+                pause_check=pause_check,
+                checkpoint=checkpoint,
+            )
+
+        saved = checkpoint.load()
+        assert saved is not None and saved.shape == (2, 512), (
+            "the two finished labels must be checkpointed before unwinding"
+        )
+        runs_per_label = runs["count"] // 2
+        assert runs_per_label >= 1
+
+        progress = []
+        runs["count"] = 0
+        result = _compute_embeddings_with_progress(
+            text_session,
+            "input_ids",
+            tokenizer,
+            labels,
+            progress_callback=lambda done, total: progress.append((done, total)),
+            checkpoint=checkpoint,
+        )
+
+        assert progress[0] == (2, 4), (
+            "progress must resume from the checkpoint, not restart at 0 — "
+            f"got {progress[0]}"
+        )
+        assert result.shape == (512, 4)
+        np.testing.assert_array_equal(result[:, :2], saved.T)
+        assert runs["count"] == 2 * runs_per_label, (
+            "only the two remaining labels may be encoded after resume"
+        )
+
+    def test_embedding_cancellation_checkpoints_finished_labels(self, tmp_path):
+        """Cancel keeps the work already done so a later run resumes it."""
+        from classifier import _compute_embeddings_with_progress
+        from embedding_cache import EmbeddingCheckpoint
+
+        text_session = _make_fake_text_session()
+        tokenizer = _make_fake_tokenizer()
+        labels = ["bird", "cat", "dog"]
+        checkpoint = EmbeddingCheckpoint(str(tmp_path), "digest", len(labels))
+        checks = {"count": 0}
+
+        def cancel_check():
+            checks["count"] += 1
+            return checks["count"] >= 3
+
+        with pytest.raises(RuntimeError, match="classification cancelled"):
+            _compute_embeddings_with_progress(
+                text_session,
+                "input_ids",
+                tokenizer,
+                labels,
+                cancel_check=cancel_check,
+                checkpoint=checkpoint,
+            )
+
+        saved = checkpoint.load()
+        assert saved is not None and saved.shape[0] >= 1
+
+    def test_load_or_compute_pause_unwinds_and_resumes_through_cache(
+        self, tmp_path,
+    ):
+        """End to end through the cache service: a pause propagates as
+        ClassifierLoadPaused (not as a cancel), leaves a checkpoint in the
+        cache directory, and the retry publishes the complete payload and
+        removes the checkpoint."""
+        from classifier import (
+            ClassifierLoadPaused,
+            _load_or_compute_label_embeddings,
+        )
+        from embedding_cache import CHECKPOINT_SUFFIX
+
+        model_dir = _make_model_dir(tmp_path)
+        cache_dir = tmp_path / "cache"
+        fake_tokenizer = _make_fake_tokenizer()
+        labels = ["bird", "cat", "dog", "emu"]
+        state = {"paused": True, "polls": 0}
+
+        def pause_check():
+            if not state["paused"]:
+                return False
+            state["polls"] += 1
+            # The pre-load probe passes; the pause lands after two labels.
+            return state["polls"] == 4
+
+        with (
+            patch("classifier.CACHE_DIR", str(cache_dir)),
+            patch(
+                "classifier._MANIFEST_PATH", str(cache_dir / "manifest.json"),
+            ),
+            patch(
+                "classifier.onnx_runtime.create_session_with_self_heal",
+                side_effect=lambda *a, **k: _make_fake_text_session(),
+            ),
+            patch("classifier._load_tokenizer", return_value=fake_tokenizer),
+        ):
+            with pytest.raises(ClassifierLoadPaused):
+                _load_or_compute_label_embeddings(
+                    labels, "ViT-B-16", str(model_dir),
+                    pause_check=pause_check,
+                )
+            partials = list(cache_dir.glob(f"*{CHECKPOINT_SUFFIX}"))
+            assert len(partials) == 1, "pause must leave one checkpoint"
+            assert not list(
+                f for f in cache_dir.glob("*.npy")
+                if not f.name.endswith(CHECKPOINT_SUFFIX)
+            ), "no final payload may exist before completion"
+
+            state["paused"] = False
+            progress = []
+            classes, embeddings, _, _ = _load_or_compute_label_embeddings(
+                labels, "ViT-B-16", str(model_dir),
+                pause_check=pause_check,
+                progress_callback=lambda d, t: progress.append((d, t)),
+            )
+
+        assert classes == labels
+        assert embeddings.shape == (512, 4)
+        assert progress and progress[0][0] >= 2, (
+            f"resume must start from the checkpoint; got {progress[:2]}"
+        )
+        assert not list(cache_dir.glob(f"*{CHECKPOINT_SUFFIX}"))
+        finals = [
+            f for f in cache_dir.glob("*.npy")
+            if not f.name.endswith(CHECKPOINT_SUFFIX)
+        ]
+        assert len(finals) == 1
+
     def test_classify_returns_predictions(self, tmp_path):
         """classify() returns a list of dicts with species, score, and auto_tag."""
         clf = _make_custom_classifier(tmp_path)

@@ -24,6 +24,21 @@ log = logging.getLogger(__name__)
 
 EMBEDDING_SCHEMA_VERSION = 2
 
+# Partial-progress files sit next to the final ``<digest>.npy`` payload.
+# They hold the first ``k`` label embeddings as a ``(k, embedding_dim)``
+# float32 array so a producer interrupted by Pause, Cancel, or a crash
+# can pick up where it stopped instead of re-encoding every label.
+CHECKPOINT_SUFFIX = ".partial.npy"
+
+# Exceptions a producer raises when it steps down for a reason local to
+# its own job. Waiters must not inherit them: the key is still healthy,
+# so one waiter retries and becomes the replacement producer.
+_PRODUCER_STEPPED_DOWN = frozenset({
+    "ClassificationCancelled",
+    "EmbeddingWaitCancelled",
+    "ClassifierLoadPaused",
+})
+
 _identity_lock = threading.Lock()
 _manifest_lock = threading.Lock()
 _flights_lock = threading.Lock()
@@ -274,6 +289,101 @@ def _validate_payload(value, label_count, embedding_dim=None):
     return value
 
 
+def _validate_checkpoint(value, label_count, embedding_dim=None):
+    """Validate a partial payload of shape ``(done, embedding_dim)``."""
+    if not isinstance(value, np.ndarray):
+        raise ValueError("embedding checkpoint is not a NumPy array")
+    if value.ndim != 2 or value.shape[0] < 1 or value.shape[0] > label_count:
+        raise ValueError(
+            "embedding checkpoint has shape "
+            f"{value.shape}; expected (1..{label_count}, embedding_dim)"
+        )
+    if embedding_dim is not None and value.shape[1] != embedding_dim:
+        raise ValueError(
+            "embedding checkpoint has shape "
+            f"{value.shape}; expected (done, {embedding_dim})"
+        )
+    if value.dtype != np.float32:
+        raise ValueError(
+            f"embedding checkpoint has dtype {value.dtype}; expected float32"
+        )
+    if not np.isfinite(value).all():
+        raise ValueError("embedding checkpoint contains non-finite values")
+    return value
+
+
+class EmbeddingCheckpoint:
+    """Resumable partial progress for one embedding identity.
+
+    The file is keyed by the same digest as the final payload, so it can
+    only ever be resumed by a computation with byte-identical text-side
+    inputs (labels in order, templates, tokenizer, encoder revision).
+    ``save`` is atomic; ``load`` unlinks anything it cannot trust so a
+    corrupt partial cannot poison the next producer.
+    """
+
+    def __init__(self, cache_dir, digest, label_count):
+        self.cache_dir = cache_dir
+        self.digest = digest
+        self.label_count = label_count
+        self.path = os.path.join(cache_dir, f"{digest}{CHECKPOINT_SUFFIX}")
+
+    def load(self, embedding_dim=None):
+        """Return the ``(done, embedding_dim)`` array, or ``None``."""
+        if not os.path.isfile(self.path):
+            return None
+        try:
+            value = np.load(self.path, allow_pickle=False)
+            return _validate_checkpoint(
+                value, self.label_count, embedding_dim=embedding_dim,
+            )
+        except (EOFError, OSError, ValueError) as exc:
+            log.warning(
+                "EmbeddingCache: discarding unusable checkpoint key=%s: %s",
+                self.digest[:12], exc,
+            )
+            self.discard()
+            return None
+
+    def save(self, features):
+        """Atomically persist the embeddings finished so far.
+
+        ``features`` is a sequence of 1-D float32 vectors (one per finished
+        label, in label order) or an equivalent 2-D array. An empty
+        sequence removes any stale checkpoint instead of writing one.
+        """
+        if isinstance(features, np.ndarray):
+            value = features
+        else:
+            if not len(features):
+                self.discard()
+                return
+            value = np.stack(list(features), axis=0)
+        value = np.ascontiguousarray(value, dtype=np.float32)
+        if value.ndim != 2 or value.shape[0] == 0:
+            self.discard()
+            return
+        _validate_checkpoint(value, self.label_count)
+        os.makedirs(self.cache_dir, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{self.digest}.", suffix=".partial.tmp",
+            dir=self.cache_dir,
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                np.save(handle, value, allow_pickle=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
+
+    def discard(self):
+        with contextlib.suppress(FileNotFoundError, OSError):
+            os.unlink(self.path)
+
+
 class EmbeddingCache:
     """Durable embedding cache with per-key in-process single-flight."""
 
@@ -288,6 +398,12 @@ class EmbeddingCache:
 
     def path_for(self, identity):
         return cache_path(self.cache_dir, identity)
+
+    def checkpoint_for(self, identity):
+        """Return the resumable partial-progress store for ``identity``."""
+        return EmbeddingCheckpoint(
+            self.cache_dir, identity_digest(identity), len(identity["labels"]),
+        )
 
     def is_cached(self, identity, label_count, embedding_dim=None):
         """Return whether a valid payload for ``identity`` is on disk.
@@ -367,12 +483,12 @@ class EmbeddingCache:
             if cancel_check and cancel_check():
                 raise EmbeddingWaitCancelled("classification cancelled")
             if flight.error is not None:
-                if flight.error.__class__.__name__ in {
-                    "ClassificationCancelled", "EmbeddingWaitCancelled"
-                }:
-                    # Cancellation belongs to the producer, not the key. A
-                    # healthy waiter retries and one of the waiters becomes
-                    # the replacement producer. ``embedding_dim`` must ride
+                if flight.error.__class__.__name__ in _PRODUCER_STEPPED_DOWN:
+                    # Cancellation (or a pause-abort, which checkpoints its
+                    # progress first) belongs to the producer, not the key.
+                    # A healthy waiter retries and one of the waiters becomes
+                    # the replacement producer, resuming from the checkpoint.
+                    # ``embedding_dim`` must ride
                     # the retry so the replacement computation is checked
                     # against this caller's image encoder; dropping it would
                     # bypass the new dimension validation on this branch and
@@ -441,6 +557,13 @@ class EmbeddingCache:
                     actual_digest[:12],
                 )
             flight.published_digest = actual_digest
+            # The complete payload supersedes any partial progress. Remove
+            # the checkpoint under both digests: the producer resumed from
+            # the initial one, and a self-heal can publish under another.
+            for digest in {initial_digest, actual_digest}:
+                EmbeddingCheckpoint(
+                    self.cache_dir, digest, label_count,
+                ).discard()
             with _flights_lock:
                 _diagnostics["producer_publications"] += 1
             log.info("EmbeddingCache: published key=%s", actual_digest[:12])

@@ -11629,6 +11629,47 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
         return updates
 
+    def _refresh_pipeline_cache_species_from_edit(db, entry):
+        """Rewrite the pipeline cache's species fields to match the DB after
+        undo / redo of a species-affecting edit.
+
+        The ``/api/encounters/species`` route writes the new confirmed set
+        onto its target burst (or encounter) and persists the cache in the
+        same request, so undo / redo of that write leaves the cache showing
+        the pre-undo confirmed set even though the DB tags have flipped. Read
+        the affected photos' current species from the DB and rebuild the
+        cache's per-photo, per-burst, and per-encounter species fields so a
+        Process / Rapid Review reload matches what ``/api/encounters/species``
+        would see now.
+        """
+        action = entry.get("action_type") if entry else None
+        if action != "species_replace":
+            return
+        photo_id_rows = db.conn.execute(
+            "SELECT DISTINCT photo_id FROM edit_history_items WHERE edit_id = ?",
+            (entry["id"],),
+        ).fetchall()
+        photo_ids = [r["photo_id"] for r in photo_id_rows if r["photo_id"] is not None]
+        if not photo_ids:
+            return
+        try:
+            species_by_photo = db.get_species_keywords_for_photos(photo_ids)
+            # Photos with no surviving species tags must still be included so
+            # the cache clears their confirmed_species_list — get_species_
+            # keywords_for_photos omits them entirely.
+            for pid in photo_ids:
+                species_by_photo.setdefault(pid, [])
+            from pipeline import refresh_cache_species_for_photos
+            cache_dir = os.path.dirname(db_path)
+            refresh_cache_species_for_photos(
+                cache_dir, db._active_workspace_id, species_by_photo,
+            )
+        except Exception:
+            log.exception(
+                "Failed to refresh pipeline cache species after undo/redo of %s",
+                action,
+            )
+
     @app.route("/api/undo", methods=["POST"])
     def api_undo():
         """Undo the most recent undoable edit.
@@ -11661,6 +11702,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # rows and commits them itself, and it touches no prediction
             # state, so it has nothing to serialize against.
             edit_recipe_updates = _edit_recipe_history_updates(db, result["id"])
+        _refresh_pipeline_cache_species_from_edit(db, result)
         response = {"ok": True, "undone": result["description"]}
         if edit_recipe_updates is not None:
             response["action_type"] = "edit_recipe"
@@ -11714,6 +11756,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if result.get("action_type") == "edit_recipe":
             # Outside the locked section, for the reason ``api_undo`` gives.
             edit_recipe_updates = _edit_recipe_history_updates(db, result["id"])
+        _refresh_pipeline_cache_species_from_edit(db, result)
         response = {"ok": True, "redone": result["description"]}
         if edit_recipe_updates is not None:
             response["action_type"] = "edit_recipe"

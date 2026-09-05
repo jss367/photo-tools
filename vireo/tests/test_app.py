@@ -23406,3 +23406,136 @@ def test_encounter_species_mixed_burst_keeps_edited_baseline(app_and_db):
         "previous_species": "American Wigeon",
     })
     assert resp.status_code == 400
+
+
+def test_encounter_species_remove_undo_refreshes_pipeline_cache(app_and_db):
+    """After undoing a burst-scoped remove, the pipeline cache reflects the
+    restored species: its burst override goes back to confirming the species,
+    and its photos carry the confirmed_species / confirmed_species_list that
+    Process/Rapid Review reads. Without this, /api/undo restored the DB tag
+    but the cache still showed the explicit-empty sentinel."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    burst_ids, other_ids = photo_ids[:2], photo_ids[2:]
+    path = _seed_encounter_cache(
+        app, db, photo_ids, confirmed_species="Green-winged Teal",
+        bursts=[
+            {"photo_ids": burst_ids, "species_predictions": [],
+             "species_override": {
+                 "species": "Green-winged Teal", "confirmed": True,
+                 "species_list": ["Green-winged Teal"],
+             }},
+            {"photo_ids": other_ids, "species_predictions": [],
+             "species_override": {
+                 "species": "Green-winged Teal", "confirmed": True,
+                 "species_list": ["Green-winged Teal"],
+             }},
+        ],
+    )
+    # Photo dicts in the seeded cache need the same list-shape the real
+    # pipeline serializer writes, so the refresh helper can round-trip them.
+    with open(path) as f:
+        cache = _json.load(f)
+    for photo in cache["photos"]:
+        photo["confirmed_species"] = "Green-winged Teal"
+        photo["confirmed_species_list"] = ["Green-winged Teal"]
+    cache["encounters"][0]["confirmed_species_list"] = ["Green-winged Teal"]
+    with open(path, "w") as f:
+        _json.dump(cache, f)
+
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    for pid in photo_ids:
+        db.tag_photo(pid, teal)
+
+    # Remove teal from the first burst — this is the new species_replace path.
+    resp = client.post("/api/encounters/species", json={
+        "species": "Green-winged Teal", "photo_ids": burst_ids,
+        "burst_index": 0, "remove": True,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    for pid in burst_ids:
+        assert _species_names(db, pid) == []
+
+    with open(path) as f:
+        cache = _json.load(f)
+    # Sanity: the remove landed in the cache as the explicit-empty sentinel.
+    assert cache["encounters"][0]["bursts"][0]["species_override"] == {
+        "species": None, "confirmed": False, "species_list": [],
+    }
+
+    # Undo restores the DB tags. The pipeline cache must follow suit.
+    resp = client.post("/api/undo")
+    assert resp.status_code == 200, resp.get_json()
+    for pid in burst_ids:
+        assert _species_names(db, pid) == ["Green-winged Teal"]
+
+    with open(path) as f:
+        cache = _json.load(f)
+    for photo in cache["photos"]:
+        if photo["id"] in burst_ids:
+            assert photo["confirmed_species"] == "Green-winged Teal"
+            assert photo["confirmed_species_list"] == ["Green-winged Teal"]
+    assert cache["encounters"][0]["bursts"][0]["species_override"] == {
+        "species": "Green-winged Teal", "confirmed": True,
+        "species_list": ["Green-winged Teal"],
+    }
+
+
+def test_encounter_species_remove_redo_refreshes_pipeline_cache(app_and_db):
+    """After redoing an undone burst-scoped remove, the pipeline cache goes
+    back to the explicit-empty sentinel so the burst does not silently
+    re-inherit the encounter's still-confirmed species."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    burst_ids, other_ids = photo_ids[:2], photo_ids[2:]
+    path = _seed_encounter_cache(
+        app, db, photo_ids, confirmed_species="Green-winged Teal",
+        bursts=[
+            {"photo_ids": burst_ids, "species_predictions": [],
+             "species_override": {
+                 "species": "Green-winged Teal", "confirmed": True,
+                 "species_list": ["Green-winged Teal"],
+             }},
+            {"photo_ids": other_ids, "species_predictions": [],
+             "species_override": {
+                 "species": "Green-winged Teal", "confirmed": True,
+                 "species_list": ["Green-winged Teal"],
+             }},
+        ],
+    )
+    with open(path) as f:
+        cache = _json.load(f)
+    for photo in cache["photos"]:
+        photo["confirmed_species"] = "Green-winged Teal"
+        photo["confirmed_species_list"] = ["Green-winged Teal"]
+    cache["encounters"][0]["confirmed_species_list"] = ["Green-winged Teal"]
+    with open(path, "w") as f:
+        _json.dump(cache, f)
+
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    for pid in photo_ids:
+        db.tag_photo(pid, teal)
+
+    client.post("/api/encounters/species", json={
+        "species": "Green-winged Teal", "photo_ids": burst_ids,
+        "burst_index": 0, "remove": True,
+    })
+    client.post("/api/undo")
+    resp = client.post("/api/redo")
+    assert resp.status_code == 200, resp.get_json()
+    for pid in burst_ids:
+        assert _species_names(db, pid) == []
+
+    with open(path) as f:
+        cache = _json.load(f)
+    for photo in cache["photos"]:
+        if photo["id"] in burst_ids:
+            assert photo["confirmed_species"] is None
+            assert photo["confirmed_species_list"] == []
+    assert cache["encounters"][0]["bursts"][0]["species_override"] == {
+        "species": None, "confirmed": False, "species_list": [],
+    }

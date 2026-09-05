@@ -340,6 +340,10 @@
   border-radius: 8px;
   margin-bottom: 16px;
   overflow: hidden;
+  /* Large reviews contain thousands of photos. Keep offscreen encounters
+     searchable without laying out and painting every thumbnail on scroll. */
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto var(--encounter-estimated-height, 350px);
 }
 .encounter-header {
   display: flex;
@@ -2483,13 +2487,16 @@ function _grmFinishLoupeOneToOne() {
   _grmSetLoupeZoomLevel(zoom, '1:1');
 }
 
+var _speciesFilterRenderTimer = null;
+
 function setSpeciesFilter(val) {
   speciesFilterText = val;
   speciesFilter = val;
   var clearBtn = document.getElementById('speciesFilterClear');
   if (clearBtn) clearBtn.style.display = val ? 'block' : 'none';
   persistPipelineReviewViewState();
-  renderResults();
+  clearTimeout(_speciesFilterRenderTimer);
+  _speciesFilterRenderTimer = setTimeout(renderResults, 120);
 }
 
 function toggleSpeciesFilterSearchOption(option) {
@@ -2890,8 +2897,9 @@ function speciesCandidateForReviewUnit(enc, burst) {
   return null;
 }
 
-function analyzePhotoSpeciesConflict(photo, expectedSpecies) {
-  var expectedKey = normalizedSpeciesName(expectedSpecies);
+function analyzePhotoSpeciesConflict(photo, expectedSpecies, normalizeSpecies) {
+  normalizeSpecies = normalizeSpecies || normalizedSpeciesName;
+  var expectedKey = normalizeSpecies(expectedSpecies);
   var top5 = (photo && photo.species_top5) || [];
   if (!expectedKey || top5.length === 0) return null;
 
@@ -2914,7 +2922,7 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies) {
   var speciesNames = {};
   models.forEach(function(model) {
     Object.keys(byModel[model]).forEach(function(species) {
-      if (normalizedSpeciesName(species) !== expectedKey) speciesNames[species] = true;
+      if (normalizeSpecies(species) !== expectedKey) speciesNames[species] = true;
     });
   });
 
@@ -2923,7 +2931,7 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies) {
     models.forEach(function(model) {
       var best = 0;
       Object.keys(byModel[model]).forEach(function(species) {
-        if (normalizedSpeciesName(species) === speciesKey) {
+        if (normalizeSpecies(species) === speciesKey) {
           best = Math.max(best, byModel[model][species]);
         }
       });
@@ -2936,7 +2944,7 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies) {
   var alternative = null;
   var alternativeSupport = 0;
   Object.keys(speciesNames).forEach(function(species) {
-    var support = averageSupport(normalizedSpeciesName(species));
+    var support = averageSupport(normalizeSpecies(species));
     if (support > alternativeSupport) {
       alternative = species;
       alternativeSupport = support;
@@ -2949,7 +2957,7 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies) {
     severity: null,
   };
 
-  var alternativeKey = normalizedSpeciesName(alternative);
+  var alternativeKey = normalizeSpecies(alternative);
   var alternativeModelWins = 0;
   models.forEach(function(model) {
     var topSpecies = null;
@@ -2961,7 +2969,7 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies) {
         topConfidence = confidence;
       }
     });
-    if (normalizedSpeciesName(topSpecies) === alternativeKey) alternativeModelWins++;
+    if (normalizeSpecies(topSpecies) === alternativeKey) alternativeModelWins++;
   });
 
   var margin = alternativeSupport - expectedSupport;
@@ -2994,20 +3002,28 @@ function analyzePhotoSpeciesConflict(photo, expectedSpecies) {
 
 function buildSpeciesConflictEvidence(photoMap) {
   var evidence = {};
+  // The same species names recur across predictions, models and photos.
+  // Locale-aware normalization is expensive in WebKit; do it once per name
+  // in this render, without caching decisions that could go stale after edits.
+  var normalizedNames = new Map();
+  function normalizeSpecies(name) {
+    if (!normalizedNames.has(name)) normalizedNames.set(name, normalizedSpeciesName(name));
+    return normalizedNames.get(name);
+  }
   (pipelineResults.encounters || []).forEach(function(enc) {
     if (enc.bursts && enc.bursts.length > 0) {
       enc.bursts.forEach(function(burst) {
         var expected = speciesCandidateForReviewUnit(enc, burst);
         (burst.photo_ids || burst || []).forEach(function(pid) {
           var photo = photoMap[pid];
-          if (photo) evidence[pid] = analyzePhotoSpeciesConflict(photo, expected);
+          if (photo) evidence[pid] = analyzePhotoSpeciesConflict(photo, expected, normalizeSpecies);
         });
       });
     } else {
       var expected = speciesCandidateForReviewUnit(enc, null);
       (enc.photo_ids || []).forEach(function(pid) {
         var photo = photoMap[pid];
-        if (photo) evidence[pid] = analyzePhotoSpeciesConflict(photo, expected);
+        if (photo) evidence[pid] = analyzePhotoSpeciesConflict(photo, expected, normalizeSpecies);
       });
     }
   });
@@ -3123,7 +3139,41 @@ function encounterHasSpeciesSuggestion(enc) {
   return !!(enc && (enc.confirmed_species || (enc.species && enc.species[0])));
 }
 
+// Compare the generated markup rather than object identity: review actions
+// update photos and encounters in place. Retaining unchanged cards also keeps
+// their decoded thumbnails and horizontal burst scroll positions intact.
+var pipelineReviewRenderedCards = new Map();
+
+function reconcilePipelineReviewCards(container, cards) {
+  var nextCards = new Map();
+  var nextNodes = new Set();
+  cards.forEach(function(entry) {
+    var previous = pipelineReviewRenderedCards.get(entry.index);
+    var card;
+    if (previous && previous.html === entry.html && previous.node.parentNode === container) {
+      card = previous.node;
+    } else {
+      var template = document.createElement('template');
+      template.innerHTML = entry.html;
+      card = template.content.firstElementChild;
+    }
+    nextCards.set(entry.index, {html: entry.html, node: card});
+    nextNodes.add(card);
+  });
+  Array.from(container.children).forEach(function(card) {
+    if (!nextNodes.has(card)) card.remove();
+  });
+  var cursor = container.firstElementChild;
+  nextCards.forEach(function(entry) {
+    if (entry.node === cursor) cursor = cursor.nextElementSibling;
+    else container.insertBefore(entry.node, cursor);
+  });
+  pipelineReviewRenderedCards = nextCards;
+}
+
 function renderResults() {
+  clearTimeout(_speciesFilterRenderTimer);
+  _speciesFilterRenderTimer = null;
   if (!pipelineResults) return;
   var container = document.getElementById('encountersContainer');
   if (!container) return;
@@ -3134,10 +3184,13 @@ function renderResults() {
 
   // Build the photo set for encounters matching the species/filename search.
   var speciesVisibleIds = null;
+  var speciesVisibleEncounters = null;
   if (speciesFilter) {
     speciesVisibleIds = new Set();
-    pipelineResults.encounters.forEach(function(enc) {
+    speciesVisibleEncounters = new Set();
+    pipelineResults.encounters.forEach(function(enc, ei) {
       if (encounterMatchesSearch(enc, photoMap)) {
+        speciesVisibleEncounters.add(ei);
         (enc.photo_ids || []).forEach(function(pid) { speciesVisibleIds.add(pid); });
       }
     });
@@ -3191,7 +3244,7 @@ function renderResults() {
   ce = document.getElementById('countReject'); if (ce) ce.textContent = ' (' + (counts.REJECT||0) + ')';
   ce = document.getElementById('countSpeciesConflict'); if (ce) ce.textContent = ' (' + counts.SPECIES_CONFLICT + ')';
 
-  var html = '';
+  var cards = [];
   // Track which encounter indices actually produced a card so focus
   // management below can pick a *visible* encounter (not one that was
   // filtered out by species filter, hide-confirmed, or label filter).
@@ -3204,7 +3257,7 @@ function renderResults() {
     var timeRange = formatEncounterTimeRange(enc.time_range);
 
     // Check if the encounter passes the species/filename search.
-    if (!encounterMatchesSearch(enc, photoMap)) return;
+    if (speciesVisibleEncounters && !speciesVisibleEncounters.has(ei)) return;
     if (hideWithoutSuggestions && !encounterHasSpeciesSuggestion(enc)) return;
 
     // Build the set of photos this encounter will actually draw: skip
@@ -3227,8 +3280,15 @@ function renderResults() {
 
     var encKey = encounterKey(enc);
     var isCollapsed = encKey != null && collapsedEncounters.has(encKey);
-    var focusedCls = (_focusedEncounterIdx === ei) ? ' focused' : '';
-    html += '<div class="encounter-card' + focusedCls + '" data-encounter-index="' + ei + '">';
+    var visibleBurstCount = enc.bursts && enc.bursts.length
+      ? enc.bursts.filter(function(burst) { return !hideConfirmed || !isBurstConfirmed(enc, burst); }).length
+      : visibleEncIds.length;
+    // Until an offscreen card is first laid out, estimate its height from the
+    // visible rows and thumbnail size. The browser remembers its real height.
+    var estimatedHeight = isCollapsed ? '48px'
+      : 'calc(100px + ' + visibleBurstCount + ' * (var(--photo-card-size, 160px) * 2 / 3 + 60px))';
+    var html = '<div class="encounter-card" data-encounter-index="' + ei +
+      '" style="--encounter-estimated-height:' + estimatedHeight + '">';
     html += '<div class="encounter-header" onclick="setFocusedEncounter(' + ei + ')">';
     html += '<span class="encounter-chevron' + (isCollapsed ? ' collapsed' : '') + '" id="encChev' + ei + '" onclick="toggleEncounter(' + ei + ')">&#9660;</span>';
     html += renderSpeciesWidget(enc, ei, 'encounter', null);
@@ -3303,9 +3363,11 @@ function renderResults() {
     html += '</span></div>';
 
     html += '</div></div>';
+    cards.push({index: ei, html: html});
   });
 
-  container.innerHTML = html;
+  closeAllDropdowns();
+  reconcilePipelineReviewCards(container, cards);
 
   // Focus management: only focus encounters that are actually rendered.
   // If we focused an index that got filtered out (species/hide-confirmed/
@@ -4804,7 +4866,7 @@ function renderSpeciesWidget(enc, encIdx, level, burstIdx, pos) {
   // level: 'encounter' or 'burst'
   // pos:   'top' (default) or 'bot' — disambiguates the duplicated bottom widget
   pos = pos || 'top';
-  var isConfirmed, displayName, predictions, candidateSpecies;
+  var isConfirmed, displayName, candidateSpecies;
   if (level === 'burst') {
     var burst = enc.bursts[burstIdx];
     var ovr = burst.species_override;
@@ -4818,12 +4880,10 @@ function renderSpeciesWidget(enc, encIdx, level, burstIdx, pos) {
       candidateSpecies = enc.confirmed_species || (enc.species ? enc.species[0] : null);
     }
     displayName = candidateSpecies || 'Add species';
-    predictions = burst.species_predictions || [];
   } else {
     isConfirmed = enc.species_confirmed;
     candidateSpecies = enc.confirmed_species || (enc.species ? enc.species[0] : null);
     displayName = candidateSpecies || 'Add species';
-    predictions = enc.species_predictions || [];
   }
 
   var hasCandidate = !!candidateSpecies;
@@ -4844,7 +4904,19 @@ function renderSpeciesWidget(enc, encIdx, level, burstIdx, pos) {
 
   // Dropdown — bottom-bar widget opens upward to stay inside the card
   var dropdownCls = 'species-dropdown' + (pos === 'bot' ? ' up' : '');
-  html += '<div class="' + dropdownCls + '" id="spDrop_' + encIdx + '_' + idKey + '">';
+  html += '<div class="' + dropdownCls + '" id="spDrop_' + encIdx + '_' + idKey + '"></div>';
+  html += '</span>';
+  return html;
+}
+
+// A large review can have thousands of species widgets. Build the search
+// controls and prediction rows only for the menu the user actually opens.
+function renderSpeciesDropdownContents(enc, encIdx, burstIdx, pos) {
+  var level = burstIdx != null ? 'burst' : 'encounter';
+  var predictions = level === 'burst'
+    ? (enc.bursts[burstIdx].species_predictions || []) : (enc.species_predictions || []);
+  var idKey = (burstIdx != null ? burstIdx : 'enc') + '_' + pos;
+  var html = '';
   html += '<div class="species-dropdown-search"><div class="search-control"><input type="text" placeholder="Search or type a new name..." oninput="searchSpecies(event, ' + encIdx + ',' + (burstIdx != null ? burstIdx : 'null') + ',\'' + pos + '\')" onkeydown="speciesInputKey(event, ' + encIdx + ',' + (burstIdx != null ? burstIdx : 'null') + ')">';
   html += '<button class="search-option-btn species-dropdown-match-case' + (speciesDropdownSearchOptions.matchCase ? ' active' : '') + '" type="button" aria-pressed="' + (speciesDropdownSearchOptions.matchCase ? 'true' : 'false') + '" onclick="toggleSpeciesDropdownSearchOption(event, \'match_case\')" title="Match case">Aa</button>';
   html += '<button class="search-option-btn species-dropdown-whole-word' + (speciesDropdownSearchOptions.wholeWord ? ' active' : '') + '" type="button" aria-pressed="' + (speciesDropdownSearchOptions.wholeWord ? 'true' : 'false') + '" onclick="toggleSpeciesDropdownSearchOption(event, \'whole_word\')" title="Match whole word">ab</button></div></div>';
@@ -4870,8 +4942,6 @@ function renderSpeciesWidget(enc, encIdx, level, burstIdx, pos) {
 
   // Search results container
   html += '<div id="spSearch_' + encIdx + '_' + idKey + '"></div>';
-  html += '</div>';
-  html += '</span>';
   return html;
 }
 
@@ -4886,6 +4956,7 @@ function toggleSpeciesDropdown(event, encIdx, burstIdx, pos) {
   // Close any open dropdown
   closeAllDropdowns();
   if (!isOpen) {
+    el.innerHTML = renderSpeciesDropdownContents(pipelineResults.encounters[encIdx], encIdx, burstIdx, pos);
     el.classList.add('open');
     activeDropdown = el;
     var input = el.querySelector('input');
@@ -5019,6 +5090,11 @@ function replaceSpeciesWidgetNode(node, encIdx, burstIdx) {
 }
 
 function rerenderSpeciesWidgets(encIdx, burstIdx) {
+  // Partial widget updates change the live card without regenerating its
+  // cached markup. Invalidate it so Undo can restore a former state even
+  // when that state happens to match the markup from the last full render.
+  var rendered = pipelineReviewRenderedCards.get(encIdx);
+  if (rendered) rendered.html = null;
   var selector = '[data-species-widget="1"][data-enc="' + encIdx + '"]';
   if (burstIdx != null) selector += '[data-burst="' + burstIdx + '"]';
   document.querySelectorAll(selector).forEach(function(node) {

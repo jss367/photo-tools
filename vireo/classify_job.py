@@ -1940,8 +1940,8 @@ def _prediction_taxonomy(tax, species, supplied=None):
     identity = SpeciesResolver(taxonomy=tax).resolve(
         species, supplied.get("scientific_name"), supplied if supplied.get("taxon_id") else None,
     )
-    name = identity.scientific_name or species
-    hierarchy = tax.get_hierarchy(name) if tax else {}
+    name = identity.scientific_name or (None if supplied.get("taxon_id") else species)
+    hierarchy = tax.get_hierarchy(name) if tax and name else {}
     return {**hierarchy, **supplied}
 
 

@@ -476,3 +476,27 @@ def test_culling_groups_unresolved_taxa_by_id(db, tmp_path, same_taxon):
     assert len({g["species_key"] for g in result["species_groups"]}) == (1 if same_taxon else 2)
     if not same_taxon:
         assert result["suggested_rejects"] == 0
+
+
+@pytest.mark.parametrize("key", ["scientific:unknownus species", "taxon:900001"])
+def test_cache_refresh_keeps_original_scientific_spelling_without_local_taxon(db, key):
+    entry = ["Unknownus species", .99, "BioCLIP", key]
+    data = {"photos": [{"id": 1, "species_top5": [entry]}], "encounters": []}
+    for _ in range(2):
+        normalize_cached_species(data, SpeciesResolver(db=db))
+        assert data["photos"][0]["species_top5"][0] == entry
+    assert not data.get("species_names_refreshed")
+
+
+def test_unknown_id_enrichment_does_not_borrow_common_name_taxonomy(db, tmp_path, taxonomy):
+    from classify_job import _prediction_taxonomy
+
+    evidence = _prediction_taxonomy(taxonomy, "Red-crowned Amazon", {"taxon_id": 900001})
+    assert evidence == {"taxon_id": 900001}
+    _, det = _photo(db, tmp_path)
+    db.add_prediction(det, "Red-crowned Amazon", .9, "BioCLIP", labels_fingerprint="custom", taxonomy=evidence)
+    row = db.conn.execute("SELECT * FROM predictions").fetchone()
+    assert row["source_taxon_id"] == 900001
+    assert row["scientific_name"] is None
+    assert row["taxonomy_genus"] is None
+    assert SpeciesResolver(db=db).prediction(row).key == "taxon:900001"

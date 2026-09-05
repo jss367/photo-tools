@@ -1395,9 +1395,12 @@ def normalize_cached_species(data, resolver):
                 if key.startswith("taxon:"):
                     tid = int(key.split(":", 1)[1])
                     raw_name = entry[0].removesuffix(f" (taxon {tid})")
-                    name = resolver.resolve(raw_name, source={"taxon_id": tid}).display_name
+                    identity = resolver.resolve(raw_name, source={"taxon_id": tid})
+                    name = identity.display_name if identity.scientific_name else entry[0]
                 elif key.startswith("scientific:"):
-                    name = resolver.resolve(entry[0], scientific_name=key.split(":", 1)[1]).display_name
+                    identity = resolver.resolve(entry[0], scientific_name=key.split(":", 1)[1])
+                    # Comparison keys are case-folded, not display spellings.
+                    name = identity.display_name if identity.taxon_id is not None else entry[0]
                 else:
                     name = resolver.resolve(entry[0]).display_name
                 changed |= name != entry[0]

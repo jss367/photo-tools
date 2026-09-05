@@ -3045,6 +3045,65 @@ def test_import_slow_initial_target_load_does_not_overwrite_newer_refresh(
     expect(page.locator("#afterMoveUnavailable")).to_be_hidden()
 
 
+def test_import_after_move_destination_change_unchecks_instead_of_retargeting(
+    live_server, page,
+):
+    """No refresh at all: two targets share user/host/remote_path with
+    nested archive roots. The picked (inner) target stops being eligible
+    when the destination moves up a level. The pick must not slide to the
+    outer twin (same tuple, different port) — that is not a migration —
+    the box unchecks with a note."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+
+    def target(tid, port, root):
+        return {
+            "id": tid, "name": "NAS " + tid, "user": "photo", "host": "nas.local",
+            "port": port, "remote_path": "/volume1/Photography",
+            "mount_path": "/Volumes/Photography",
+            "local_archive_root": root, "local_archive_root_present": True,
+        }
+
+    def remote_targets(route):
+        route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"rsync_available": True, "ssh_available": True,
+                             "targets": [
+                                 target("outer", 22, "/Users/me/Pictures"),
+                                 target("inner", 2222, "/Users/me/Pictures/Vireo Archive"),
+                             ]}),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    sel = page.locator("#afterMoveTarget")
+    chk = page.locator("#chkAfterMove")
+    expect(sel.locator("option")).to_have_count(2)
+    sel.select_option("inner")
+    chk.check()
+
+    # Destination moves out of the inner root; only the outer twin remains.
+    page.locator("#destInput").fill("/Users/me/Pictures/2026")
+    expect(chk).not_to_be_checked()
+    note = page.locator("#afterMoveUnavailable")
+    expect(note).to_be_visible()
+    expect(note).to_contain_text(
+        '"Then move to NAS" was unchecked: NAS inner is no longer available'
+    )
+    assert page.evaluate("afterMoveRequest()") is None
+
+
 def test_import_new_workspace_shows_target_default_in_after_import_display(
     live_server, page
 ):

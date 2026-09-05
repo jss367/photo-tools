@@ -17747,6 +17747,7 @@ def test_import_page_after_move_eligibility_requires_existing_root(
     assert "function migratedRemoteTarget(prev, targets, previousTargets)" in html
     assert "!known.has(t.id)" in html
     assert html.count("migratedRemoteTarget(") >= 3
+    assert "const prevReplaced = _previousRemoteTargets.find" in html
     assert '"Then move to NAS" was unchecked: ' in html
     assert "t.remote_path === prev.remote_path" in html
     assert "sameHost" not in html

@@ -1996,9 +1996,17 @@ function updateAfterMoveUI() {
     // otherwise never let the select quietly land on a *different* NAS
     // while the box stays checked — the post-processing move deletes the
     // local copies, so uncheck it and say why.
-    const prevTarget = _previousRemoteTargets.find((t) => t.id === previous)
+    // Only a target from the list that was just *replaced* can have
+    // migrated to a new id. If the previous pick is still in the current
+    // list (it merely became ineligible, e.g. the destination moved out of
+    // its root), or no replacement happened at all, there is nothing to
+    // migrate and a same-tuple neighbour must not inherit the pick.
+    const prevReplaced = _previousRemoteTargets.find((t) => t.id === previous) || null;
+    const prevTarget = prevReplaced
       || importRemoteTargets.find((t) => t.id === previous) || null;
-    const same = migratedRemoteTarget(prevTarget, eligible, _previousRemoteTargets);
+    const same = prevReplaced && !importRemoteTargets.some((t) => t.id === previous)
+      ? migratedRemoteTarget(prevReplaced, eligible, _previousRemoteTargets)
+      : null;
     if (same) {
       sel.value = same.id;
     } else if (chk.checked) {

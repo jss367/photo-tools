@@ -10651,8 +10651,10 @@ function _lbPrimeAdjacentPhotos(sourceKey) {
     return true;
   });
   if (!candidate) {
-    _lbStartPendingOriginalPreload();
+    // A neighbor waiting for its retry still has priority over the current
+    // photo's original; do not fill the backoff with a long RAW extraction.
     if (retryAt != null) _lbScheduleAdjacentPhoto(key, retryAt - now);
+    else _lbStartPendingOriginalPreload();
     return;
   }
 

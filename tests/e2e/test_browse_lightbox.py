@@ -2285,7 +2285,8 @@ def test_browse_lightbox_resumes_warmups_after_source_failure(
     assert page.evaluate("_lbCurrentSrcKey") == expected_source
 
 
-def test_browse_lightbox_original_waits_for_slow_neighbor_queue(live_server, page):
+@pytest.mark.parametrize("neighbor_fails", [False, True])
+def test_browse_lightbox_original_waits_for_slow_neighbor_queue(live_server, page, neighbor_fails):
     """The original dwell cannot spend retries competing with slow Fit generation."""
     current_id = live_server["data"]["photos"][0]
     live_server["db"].conn.execute(
@@ -2301,7 +2302,9 @@ def test_browse_lightbox_original_waits_for_slow_neighbor_queue(live_server, pag
 
     def serve_full(route):
         """Hold the first adjacent render longer than both original dwell attempts."""
-        if "prefetch=1" in route.request.url and not held_fit:
+        if "prefetch=1" in route.request.url and (
+            not held_fit or (neighbor_fails and len(held_fit) == 1 and route.request.url == held_fit[0].request.url)
+        ):
             held_fit.append(route)
             return
         route.fulfill(body=full_svg, content_type="image/svg+xml")
@@ -2319,7 +2322,19 @@ def test_browse_lightbox_original_waits_for_slow_neighbor_queue(live_server, pag
     page.wait_for_timeout(1600)
     assert len(held_fit) == 1
     assert original_requests == []
-    held_fit[0].fulfill(body=full_svg, content_type="image/svg+xml")
+    if neighbor_fails:
+        with page.expect_request(lambda request: request.url == held_fit[0].request.url):
+            held_fit[0].fulfill(status=503, body="Temporary neighbor failure")
+        # The request event can arrive before Playwright invokes its route
+        # handler. Wait for the parked retry before inspecting or releasing it.
+        deadline = time.monotonic() + 5
+        while len(held_fit) < 2 and time.monotonic() < deadline:
+            page.wait_for_timeout(10)
+        assert original_requests == []
+        assert len(held_fit) == 2
+        held_fit[1].fulfill(body=full_svg, content_type="image/svg+xml")
+    else:
+        held_fit[0].fulfill(body=full_svg, content_type="image/svg+xml")
     page.wait_for_function("_lbOriginalPreload && _lbOriginalPreload.status === 'decoded'")
     assert len(original_requests) == 1
     assert "prefetch=1" in original_requests[0]

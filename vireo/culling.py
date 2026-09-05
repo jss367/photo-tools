@@ -54,6 +54,7 @@ def analyze_for_culling(
     cross_bucket_merge=False,
     progress_callback=None,
     vireo_dir=None,
+    pause_callback=None,
 ):
     """Run full culling analysis on a set of photos.
 
@@ -110,6 +111,8 @@ def analyze_for_culling(
     # the same model that named its species.
     predictions = {}
     for pid in photo_ids:
+        if pause_callback:
+            pause_callback()
         pred = db.conn.execute(
             """SELECT pr.species, pr.confidence, pr.classifier_model
                FROM predictions pr
@@ -134,6 +137,8 @@ def analyze_for_culling(
     filenames = {}
     missing_phash = []
     for pid in photo_ids:
+        if pause_callback:
+            pause_callback()
         row = db.conn.execute(
             "SELECT quality_score, sharpness, subject_sharpness, extension, timestamp, phash, filename FROM photos WHERE id = ?",
             (pid,),
@@ -168,6 +173,8 @@ def analyze_for_culling(
             for r in db.conn.execute("SELECT id, path FROM folders").fetchall()
         }
         for pid in missing_phash:
+            if pause_callback:
+                pause_callback()
             row = db.conn.execute(
                 "SELECT folder_id, filename, working_copy_path FROM photos WHERE id = ?",
                 (pid,),
@@ -220,6 +227,8 @@ def analyze_for_culling(
     # Group by species (and optionally file type)
     species_map = {}
     for pid in photo_ids:
+        if pause_callback:
+            pause_callback()
         if pid not in predictions:
             continue
         sp = predictions[pid]["species"]
@@ -237,6 +246,8 @@ def analyze_for_culling(
     total_rejects = 0
 
     for group_key, group_data in sorted(species_map.items(), key=lambda x: -len(x[1]["pids"])):
+        if pause_callback:
+            pause_callback()
         species = group_data["species"]
         pids = group_data["pids"]
         sp_embeddings = {pid: embeddings[pid] for pid in pids if pid in embeddings}

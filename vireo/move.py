@@ -1983,7 +1983,8 @@ def _blocked_destination_developed_path(destination, developed_dir):
 
 
 def move_photos(db, photo_ids, destination, progress_cb=None,
-                developed_dir="", developed_listing_cache=None):
+                developed_dir="", developed_listing_cache=None, cancel_check=None,
+                pause_requested=None, pause_callback=None):
     """Move individual photos to a destination directory.
 
     Args:
@@ -2003,6 +2004,10 @@ def move_photos(db, photo_ids, destination, progress_cb=None,
             subdirs. Without this, fanning N photos from one source
             folder across many destination groups relists the same
             developed subdir N times.
+
+    With separate pause hooks, cancel_check must be cancellation-only.
+    pause_requested is a non-parking probe; pause_callback runs after counts
+    are reconciled, so a paused move leaves the folder tree consistent.
 
     Returns dict with keys: moved (int), errors (list of str)
     """
@@ -2131,6 +2136,12 @@ def move_photos(db, photo_ids, destination, progress_cb=None,
 
     try:
         for i, pid in enumerate(photo_ids):
+            if pause_requested and pause_requested():
+                db.update_folder_counts()
+                if pause_callback:
+                    pause_callback()
+            if cancel_check and cancel_check():
+                break
             photo = photos_map.get(pid)
             if not photo:
                 errors.append(f"Photo {pid} not found in database")

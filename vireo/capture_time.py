@@ -399,16 +399,22 @@ def adjust_capture_time(
             written += 1
             shifts_used.append(photo_shift)
         except (subprocess.TimeoutExpired, RuntimeError, OSError) as exc:
+            db.conn.rollback()
             log.warning("Capture-time adjustment failed for photo %s: %s", photo["id"], exc)
             failed += 1
             failures.append({"photo_id": photo["id"], "filename": photo["filename"], "error": str(exc)})
         except Exception as exc:
+            db.conn.rollback()
             log.exception("Unexpected capture-time adjustment error for photo %s", photo["id"])
             failed += 1
             failures.append({"photo_id": photo["id"], "filename": photo["filename"], "error": str(exc)})
         if progress_callback:
             progress_callback(index, total, photo["filename"])
 
+    # ExifTool has exited and the last catalog write is committed/rolled back.
+    # Retain completed work if cancellation arrives while this checkpoint parks.
+    if cancel_check:
+        cancel_check()
     unanimous = bool(shifts_used) and all(s == shifts_used[0] for s in shifts_used)
     summary_shift = shifts_used[0] if unanimous else None
     log.info(

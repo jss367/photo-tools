@@ -21302,6 +21302,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             from labels import fetch_species_list, read_label_file, save_labels
 
             def progress_cb(msg, current=None, total=None):
+                ctx.checkpoint(job)
                 job["progress"]["current_file"] = msg
                 if current is not None:
                     job["progress"]["current"] = current
@@ -21378,6 +21379,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "fetch-labels",
             work,
+            pausable=True,
             config={
                 "place_id": place_id,
                 "place_name": place_name,
@@ -21677,7 +21679,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         })
 
                 revealed = False
-                if exported and reveal and not ctx.runner.is_cancelled(job["id"]):
+                cancelled = ctx.runner.is_cancelled(job["id"])
+                if exported and reveal and not cancelled:
                     revealed = reveal_inat_exports(
                         [item["path"] for item in exported], destination,
                     )
@@ -21694,6 +21697,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "inat-export",
             work,
+            pausable=True,
             config={
                 "photo_ids": [item["photo_id"] for item in submissions],
                 "destination": destination,
@@ -23580,6 +23584,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             job["_start_time"] = time.time()
 
             for i, photo in enumerate(photos):
+                if ctx.runner.is_cancelled(job["id"]):
+                    break
                 detail_photo = thread_db.get_photo(photo["id"]) or photo
                 cache_path = os.path.join(preview_dir, f'{photo["id"]}_{max_size}.jpg')
                 recipe = thread_db.get_photo_edit_recipe(photo["id"])
@@ -23651,6 +23657,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     },
                 )
 
+            # Park a pause requested during the final iteration before the
+            # eviction pass, which can unlink many previews and rewrite their
+            # database rows. Without this checkpoint the accepted request
+            # would remain ``pausing`` while eviction ran, and a cancel from
+            # that state could leave the cache mid-eviction.
+            if ctx.runner.is_cancelled(job["id"]):
+                return {"generated": generated, "skipped": skipped, "total": total}
+
             # Run a single eviction pass at the end so the batch doesn't
             # fsync after every photo.
             evict_preview_cache_if_over_quota(thread_db, vireo_dir)
@@ -23660,6 +23674,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "previews",
             work,
+            pausable=True,
             config={
                 "collection_id": collection_id,
                 "photo_ids": requested_photo_ids,
@@ -23728,12 +23743,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 skip_duplicates=skip_duplicates,
                 verify_by_hash=verify_by_hash,
                 progress_callback=progress_cb,
+                pause_callback=lambda: ctx.checkpoint(job),
             )
             return result
 
         return ctx.start(
             "ingest",
             work,
+            pausable=True,
             config={
                 "source": source,
                 "destination": destination,
@@ -23792,6 +23809,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 destination=destination,
                 progress_cb=progress_cb,
                 developed_dir=developed_dir,
+                cancel_check=lambda: ctx.runner.cancellation_requested(job["id"]),
+                pause_requested=lambda: ctx.runner.pause_requested(job["id"]),
+                pause_callback=lambda: ctx.runner.is_cancelled(job["id"]),
             )
             if int(result.get("moved") or 0) > 0:
                 try:
@@ -23808,7 +23828,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return result
 
         return ctx.start(
-            "move-photos", work,
+            "move-photos", work, pausable=True,
             config={"photo_ids": photo_ids, "destination": destination},
         )
 
@@ -23888,6 +23908,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             job["progress"]["total"] = total
 
             for i, pid in enumerate(photo_ids):
+                if ctx.runner.is_cancelled(job["id"]):
+                    break
                 photo = photos_map.get(pid)
                 filename = photo["filename"] if photo else ""
                 if not photo:
@@ -23909,6 +23931,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                 f'{photo["filename"]}: {result["status"]}'
                             )
                     except Exception as exc:
+                        thread_db.conn.rollback()
                         failed += 1
                         job["errors"].append(f'{photo["filename"]}: {exc}')
                         log.warning("Offline cache failed for %s: %s", filename, exc)
@@ -23946,6 +23969,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "offline-cache",
             work,
+            pausable=True,
             config={"photo_ids": photo_ids},
         )
 
@@ -24063,6 +24087,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                     finally:
                                         response.close()
                         except Exception as exc:
+                            thread_db.conn.rollback()
                             error = str(exc) or exc.__class__.__name__
                             log.warning(
                                 "Full-resolution preparation failed for %s: %s",
@@ -24105,6 +24130,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "prepare-full-resolution",
             work,
+            pausable=True,
             config={"photo_ids": photo_ids},
             extra={"total": len(photo_ids)},
         )
@@ -25180,6 +25206,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "classify",
             work,
+            pausable=True,
             config={
                 "collection_id": collection_id,
                 "model_name": params.model_name,
@@ -25899,6 +25926,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             job["_start_time"] = time.time()
 
             for i, photo in enumerate(photos):
+                if ctx.runner.is_cancelled(job["id"]):
+                    break
                 folder_path = folders.get(photo["folder_id"], "")
                 input_path = os.path.join(folder_path, photo["filename"])
 
@@ -25978,6 +26007,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "develop",
             work,
+            pausable=True,
             config={
                 "photo_ids": photo_ids,
                 "style": style,
@@ -26151,6 +26181,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             job["_start_time"] = time.time()
 
             for i, photo in enumerate(photos):
+                if ctx.runner.is_cancelled(job["id"]):
+                    break
                 photo_id = photo["id"]
                 folder_path = folders.get(photo["folder_id"], "")
                 image_path = os.path.join(folder_path, photo["filename"])
@@ -26160,7 +26192,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # filename, so serializing its full cache-check/write sequence
                 # lets Process safely reclaim that predecessor after commit.
                 photo_mask_lock = acquire_photo_mask(photo_id)
-                photo_mask_lock.acquire()
+                while not ctx.runner.is_cancelled(job["id"]):
+                    if not photo_mask_lock.acquire(timeout=0.1):
+                        continue
+                    # A pause can arrive during acquisition. Release before
+                    # parking so another Process job can use this photo.
+                    if (ctx.runner.pause_requested(job["id"])
+                            or ctx.runner.cancellation_requested(job["id"])):
+                        photo_mask_lock.release()
+                        continue
+                    break
+                else:
+                    break
                 mask_file_stage = None
                 try:
                     # Cache hit: photo_masks already has a row for
@@ -26381,6 +26424,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return ctx.start(
             "extract-masks",
             work,
+            pausable=True,
             config={
                 "collection_id": collection_id,
                 "sam2_variant": sam2_variant,

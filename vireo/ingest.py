@@ -29,6 +29,7 @@ from scanner import ScanCancelled, compute_file_hash
 log = logging.getLogger(__name__)
 
 _WINDOWS = sys.platform == "win32"
+_METADATA_PREP_BATCH_SIZE = 100
 
 
 def _escape_sql_like(s):
@@ -195,7 +196,17 @@ def build_destination_path(exif_timestamp, template="%Y/%Y-%m-%d"):
     return result
 
 
-def _source_file_timestamps(files, capture_times=None):
+def _metadata_batches(files, pause_callback=None):
+    """Bound metadata I/O between checkpoints without parking a subprocess."""
+    if pause_callback is None:
+        yield files
+        return
+    for start in range(0, len(files), _METADATA_PREP_BATCH_SIZE):
+        pause_callback()
+        yield files[start:start + _METADATA_PREP_BATCH_SIZE]
+
+
+def _source_file_timestamps(files, capture_times=None, pause_callback=None):
     """Resolve timestamps for date-folder planning.
 
     EXIF capture time first (lightweight reader, then batched ExifTool —
@@ -208,9 +219,13 @@ def _source_file_timestamps(files, capture_times=None):
     if capture_times is not None:
         timestamps = {f: capture_times.get(str(f)) for f in files}
     else:
-        timestamps = source_capture_timestamps(files)
+        timestamps = {}
+        for batch in _metadata_batches(files, pause_callback):
+            timestamps.update(source_capture_timestamps(batch))
 
     for source_file, exif_dt in timestamps.items():
+        if pause_callback:
+            pause_callback()
         if exif_dt is None:
             with contextlib.suppress(OSError, ValueError, OverflowError):
                 timestamps[source_file] = datetime.fromtimestamp(
@@ -466,6 +481,7 @@ def ingest(
     recursive=True,
     verify_by_hash=False,
     duplicate_checker=None,
+    pause_callback=None,
 ):
     """Copy and organize photos from source to destination.
 
@@ -498,7 +514,14 @@ def ingest(
     Returns:
         dict with counts: copied, skipped_duplicate, failed, total
     """
-    files = discover_source_files(source_dir, file_types, recursive=recursive)
+    def discovery_checkpoint():
+        pause_callback()
+        return False  # Cancellation unwinds through the supplied callback.
+
+    discovery_options = {"recursive": recursive}
+    if pause_callback:
+        discovery_options["cancel_check"] = discovery_checkpoint
+    files = discover_source_files(source_dir, file_types, **discovery_options)
     if skip_paths:
         files = [f for f in files if str(f) not in skip_paths]
     total = len(files)
@@ -659,9 +682,12 @@ def ingest(
     # missing/placeholder metadata (and a plausible size twin) get their
     # bytes read for the hash fallback — or every file when verify_by_hash.
     if checker is not None:
-        checker.prepare(files)
+        for batch in _metadata_batches(files, pause_callback):
+            checker.prepare(batch)
     to_copy: list[Path] = []
     for source_file in files:
+        if pause_callback:
+            pause_callback()
         if checker is not None:
             try:
                 token = checker.match(source_file)
@@ -702,6 +728,7 @@ def ingest(
             if checker is not None and not checker.verify_by_hash
             else None
         ),
+        pause_callback=pause_callback,
     )
 
     # Records the destination folder where each identity token actually
@@ -712,6 +739,8 @@ def ingest(
     batch_dest_folders: dict[tuple, str] = {}
 
     for source_file in to_copy:
+        if pause_callback:
+            pause_callback()
         try:
             # Intra-batch dedup: a byte-identical sibling earlier in this
             # batch already landed (or matched an existing destination

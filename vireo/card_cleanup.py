@@ -24,6 +24,7 @@ from pathlib import Path
 import path_guard
 from image_loader import (
     SUPPORTED_EXTENSIONS,
+    ScanCancelled,
     is_excluded_scan_path,
     safe_iter_dir,
     safe_scan_walk,
@@ -112,7 +113,7 @@ def prune_manifests(manifest_dir, max_age_days=MANIFEST_MAX_AGE_DAYS):
                 os.unlink(full)
 
 
-def classify_source_files(source, recursive=True, onerror=None):
+def classify_source_files(source, recursive=True, onerror=None, should_cancel=None):
     """One walk over the card; returns (candidates, ignored), both sorted.
 
     Mirrors discover_source_files' file_types="both" filter — parity is
@@ -140,7 +141,7 @@ def classify_source_files(source, recursive=True, onerror=None):
     if recursive:
         def _walk():
             for dirpath, _dirnames, filenames in safe_scan_walk(
-                    str(source_path), onerror=onerror):
+                    str(source_path), onerror=onerror, cancel_check=should_cancel):
                 for name in filenames:
                     yield Path(dirpath) / name
         entries = _walk()
@@ -148,6 +149,8 @@ def classify_source_files(source, recursive=True, onerror=None):
         entries = safe_iter_dir(str(source_path), onerror=onerror)
     candidates, ignored = [], []
     for f in entries:
+        if should_cancel is not None and should_cancel():
+            raise ScanCancelled("card discovery cancelled")
         # Symlinks resolve to bytes stored elsewhere. If we followed one
         # (Path.is_file does), the size/hash recorded here would be the
         # target's, but os.remove(path) unlinks only the link — no card
@@ -161,6 +164,8 @@ def classify_source_files(source, recursive=True, onerror=None):
             candidates.append(f)
         else:
             ignored.append(f)
+    if should_cancel is not None and should_cancel():
+        raise ScanCancelled("card discovery cancelled")
     return sorted(candidates), sorted(ignored)
 
 
@@ -516,6 +521,23 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     """
     source_root = manifest["source_root"]
     contains_check = path_guard.make_case_folded_check(source_root)
+    stats = {
+        "hashes_total": 0, "hashes_processed": 0,
+        "archive_files_read": 0, "verified": 0,
+        "modified": 0, "corrupt": 0, "unreadable": 0,
+        "cancelled": False, "remaining": 0,
+        "unblocked_files": 0, "unblocked_bytes": 0,
+    }
+
+    def checkpoint():
+        if should_cancel is not None and should_cancel():
+            stats["cancelled"] = True
+            stats["remaining"] = stats["hashes_total"] - stats["hashes_processed"]
+            # Promotions are only visible after the manifest is published.
+            stats["unblocked_files"] = 0
+            stats["unblocked_bytes"] = 0
+            return True
+        return False
 
     # Codex P2: a prior delete_verified run on this scan unlinks card
     # files but never rewrites the manifest, so its deletable entries
@@ -554,6 +576,8 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     # side effect other card scans keyed off the same hash rely on.
     surviving = []
     for entry in manifest["entries"]:
+        if checkpoint():
+            return stats
         if entry.get("bucket") != "deletable":
             surviving.append(entry)
             continue
@@ -586,19 +610,15 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
 
     pending_by_hash = {}
     for entry in manifest["entries"]:
+        if checkpoint():
+            return stats
         if (entry.get("bucket") == "kept"
                 and entry.get("reason") == KEEP_NOT_VERIFIED
                 and entry.get("hash")):
             pending_by_hash.setdefault(entry["hash"], []).append(entry)
 
     pending = list(pending_by_hash.items())
-    stats = {
-        "hashes_total": len(pending), "hashes_processed": 0,
-        "archive_files_read": 0, "verified": 0,
-        "modified": 0, "corrupt": 0, "unreadable": 0,
-        "cancelled": False, "remaining": 0,
-        "unblocked_files": 0, "unblocked_bytes": 0,
-    }
+    stats["hashes_total"] = len(pending)
     failure_reasons = {}
     # qualify_rows deliberately prioritizes any NULL-status row so a viable
     # independent copy remains retryable. Once this run establishes that no
@@ -608,10 +628,8 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     terminal_reasons = {}
 
     for i, (expected_hash, card_entries) in enumerate(pending):
-        if should_cancel is not None and should_cancel():
-            stats["cancelled"] = True
-            stats["remaining"] = len(pending) - i
-            break
+        if checkpoint():
+            return stats
         if progress_cb is not None:
             progress_cb(
                 i + 1, len(pending),
@@ -842,8 +860,12 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     # deletable rows are not re-audited or invalidated by this scoped job.
     missing_pending_entry_ids = set()
     for expected_hash, card_entries in pending_by_hash.items():
+        if checkpoint():
+            return stats
         rows = fetch_rows_by_hash(db, expected_hash)
         for entry in card_entries:
+            if checkpoint():
+                return stats
             # Codex P2 (follow-up 3): qualify_rows only inspects catalog
             # rows — it cannot see that this card file has been replaced,
             # resized, or turned into a symlink since the scan. Promoting
@@ -922,6 +944,8 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
         "ignored": {"count": 0},
     }
     for entry in manifest["entries"]:
+        if checkpoint():
+            return stats
         bucket = entry.get("bucket")
         if bucket == "ignored":
             totals["ignored"]["count"] += 1
@@ -934,6 +958,8 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     # number the moment it lands. Missing on old manifests (pre-revision
     # schema) is treated as the initial revision — the next write is the
     # first observable change.
+    if checkpoint():
+        return stats
     manifest["revision"] = int(
         manifest.get("revision", INITIAL_MANIFEST_REVISION)) + 1
     write_manifest(manifest_dir, manifest)
@@ -945,9 +971,14 @@ def scan_card(db, source, recursive, manifest_dir, scan_job_id,
     source_root_real = os.path.realpath(source)
     contains_check = path_guard.make_case_folded_check(source_root_real)
     walk_errors = []
-    candidates, ignored = classify_source_files(
-        source, recursive=recursive,
-        onerror=lambda e: walk_errors.append(str(e)))
+    try:
+        candidates, ignored = classify_source_files(
+            source, recursive=recursive, should_cancel=should_cancel,
+            onerror=lambda e: walk_errors.append(str(e)))
+    except ScanCancelled:
+        return {"cancelled": True}
+    if should_cancel is not None and should_cancel():
+        return {"cancelled": True}
     by_hash = _load_catalog_by_hash(db)
     entries = []
     totals = {
@@ -1002,6 +1033,8 @@ def scan_card(db, source, recursive, manifest_dir, scan_job_id,
             totals["kept"]["bytes"] += st.st_size
         entries.append(entry)
     for f in ignored:
+        if should_cancel is not None and should_cancel():
+            return {"cancelled": True}
         entries.append({"path": str(f), "bucket": "ignored"})
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
@@ -1014,6 +1047,8 @@ def scan_card(db, source, recursive, manifest_dir, scan_job_id,
         "totals": totals,
         "revision": INITIAL_MANIFEST_REVISION,
     }
+    if should_cancel is not None and should_cancel():
+        return {"cancelled": True}
     write_manifest(manifest_dir, manifest)
     # Job-result flag only — deliberately NOT part of the persisted
     # manifest (added after write_manifest). A completed scan's manifest

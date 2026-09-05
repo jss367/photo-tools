@@ -117,9 +117,9 @@ def publish_site(db, vireo_dir, destination, life_list, highlights=None, options
             include_locations.
         progress_cb: optional callback(current, total, current_file).
         cancel_check: optional callable; stop before the next photo when true.
-        begin_commit: optional callable that atomically rejects pending cancellation
-            or prevents later cancellation through job completion; false aborts
-            before replacing any published files.
+        begin_commit: optional callable that honors a pending pause, rejects
+            cancellation, and prevents later pause/cancellation through job
+            completion; false aborts before replacing any published files.
     """
     Path(destination).mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".vireo-publish-", dir=destination) as staging:

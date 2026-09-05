@@ -277,9 +277,10 @@ def create_jobs_blueprint(
             return generate_all(
                 thread_db, thumb_cache_dir, progress_callback=progress_cb,
                 vireo_dir=os.path.dirname(thumb_cache_dir),
+                cancel_check=lambda: ctx.runner.is_cancelled(job["id"]),
             )
 
-        return ctx.start("thumbnails", work)
+        return ctx.start("thumbnails", work, pausable=True)
 
     @blueprint.post("/api/duplicates/scan")
     @background_job
@@ -302,11 +303,14 @@ def create_jobs_blueprint(
             from duplicate_scan import run_duplicate_scan
             thread_db = ctx.thread_db()
             try:
-                return run_duplicate_scan(job, thread_db, include_resolved=True)
+                return run_duplicate_scan(
+                    job, thread_db, include_resolved=True,
+                    cancel_check=lambda: ctx.runner.is_cancelled(job["id"]),
+                )
             finally:
                 thread_db.conn.close()
 
-        return ctx.start("duplicate-scan", work)
+        return ctx.start("duplicate-scan", work, pausable=True)
 
     @blueprint.post("/api/jobs/verify-hashes")
     @background_job
@@ -344,10 +348,12 @@ def create_jobs_blueprint(
             return verify_hashes(
                 thread_db,
                 progress_cb=progress_cb,
-                should_cancel=lambda: ctx.runner.is_cancelled(job["id"]),
+                should_cancel=lambda: ctx.runner.cancellation_requested(job["id"]),
+                pause_requested=lambda: ctx.runner.pause_requested(job["id"]),
+                pause_callback=lambda: ctx.runner.is_cancelled(job["id"]),
             )
 
-        return ctx.start("verify-hashes", work)
+        return ctx.start("verify-hashes", work, pausable=True)
 
     @blueprint.post("/api/jobs/capture-time")
     @background_job
@@ -418,6 +424,7 @@ def create_jobs_blueprint(
         return ctx.start(
             "capture-time",
             work,
+            pausable=True,
             config={
                 "photo_count": len(photo_ids),
                 "photo_ids_sample": photo_ids[:20],
@@ -490,14 +497,16 @@ def create_jobs_blueprint(
                     },
                 )
 
-            results = model_verify.verify_all_models(progress_callback=progress_cb)
+            results = model_verify.verify_all_models(
+                progress_callback=progress_cb, pause_callback=lambda: ctx.checkpoint(job),
+            )
             return {
                 "verified": len(results),
                 "failed": [mid for mid, r in results.items() if not r.ok],
                 "ok": [mid for mid, r in results.items() if r.ok],
             }
 
-        return ctx.start("verify-models", work)
+        return ctx.start("verify-models", work, pausable=True)
 
     @blueprint.post("/api/jobs/download-hf-model")
     @background_job
@@ -662,6 +671,7 @@ def create_jobs_blueprint(
                 collection_id,
                 progress_callback=progress_cb,
                 vireo_dir=working_dir,
+                pause_callback=lambda: ctx.checkpoint(job),
             )
             ctx.runner.update_step(job["id"], "score", status="completed",
                                    summary=f"{len(result['results'])} scored")
@@ -680,11 +690,13 @@ def create_jobs_blueprint(
                 },
             )
             for r in result["results"]:
+                ctx.checkpoint(job)
                 thread_db.update_photo_sharpness(r["photo_id"], r["sharpness"])
 
             # Auto-flag: flag best in each group, suggest reject for worst
             best_count = 0
             for r in result["results"]:
+                ctx.checkpoint(job)
                 if r["group_size"] > 1 and r["is_best"]:
                     thread_db.update_photo_flag(r["photo_id"], "flagged",
                                                 verify_workspace=False)
@@ -700,6 +712,7 @@ def create_jobs_blueprint(
         return ctx.start(
             "sharpness",
             work,
+            pausable=True,
             config={
                 "collection_id": collection_id,
             },
@@ -749,9 +762,11 @@ def create_jobs_blueprint(
                 cross_bucket_merge=cross_bucket_merge,
                 progress_callback=progress_cb,
                 vireo_dir=vireo_dir(),
+                pause_callback=lambda: ctx.checkpoint(job),
             )
 
             # Store culling results in a temporary cache for the UI
+            ctx.checkpoint(job)
             cache_path = os.path.join(
                 os.path.dirname(db_path), f"culling_results_ws{ctx.workspace_id}.json"
             )
@@ -767,7 +782,7 @@ def create_jobs_blueprint(
             }
 
         return ctx.start(
-            "cull", work, config={"collection_id": collection_id},
+            "cull", work, pausable=True, config={"collection_id": collection_id},
         )
 
     @blueprint.post("/api/jobs/regroup")
@@ -831,6 +846,8 @@ def create_jobs_blueprint(
             # panel can show per-cut-point details for each encounter on the
             # very first load (not only after the user drags a live-tuning
             # slider). Cost is negligible (~300B per adjacent pair).
+            if ctx.runner.is_cancelled(job["id"]):
+                return {}
             results = run_full_pipeline(photos, config=pipeline_cfg, emit_trace=True)
             summary = results.get("summary", {})
             ctx.runner.update_step(job["id"], "group", status="completed",
@@ -843,12 +860,14 @@ def create_jobs_blueprint(
                 {"phase": "Saving results", "current": 2, "total": 3},
             )
 
+            if ctx.runner.is_cancelled(job["id"]):
+                return {}
             cache_dir = os.path.dirname(db_path)
             save_results(results, cache_dir, ctx.workspace_id)
             ctx.runner.update_step(job["id"], "save", status="completed")
 
             return results["summary"]
 
-        return ctx.start("regroup", work, config={"pipeline": pipeline_cfg})
+        return ctx.start("regroup", work, config={"pipeline": pipeline_cfg}, pausable=True)
 
     return blueprint

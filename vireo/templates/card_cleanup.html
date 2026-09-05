@@ -455,7 +455,8 @@ async function cardCleanupFinishJob(jobId, kind) {
         notFound = 0;
         const polled = await resp.json();
         if (polled.status && polled.status !== 'running'
-            && polled.status !== 'queued') {
+            && polled.status !== 'queued'
+            && polled.status !== 'pausing' && polled.status !== 'paused') {
           job = polled;
           break;
         }

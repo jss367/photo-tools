@@ -425,6 +425,8 @@ def test_publish_cancellation_is_coordinated_with_manifest_commit(
     job_id = response.get_json()["job_id"]
     try:
         assert reached.wait(10), "publish never reached the commit boundary"
+        if boundary != "before_commit":
+            assert client.post(f"/api/jobs/{job_id}/pause").status_code == 409
         cancelled = client.post(f"/api/jobs/{job_id}/cancel")
         assert cancelled.status_code == (200 if boundary == "before_commit" else 404)
     finally:
@@ -443,6 +445,57 @@ def test_publish_cancellation_is_coordinated_with_manifest_commit(
         assert manifests[0]["generated_at"] == manifests[1]["meta"]["generated_at"]
         assert manifests[0]["generated_at"] == manifests[2]["meta"]["generated_at"]
     db.close()
+
+
+@pytest.mark.parametrize("action", ["resume", "cancel", "shutdown"])
+def test_publish_handoff_honors_pending_pause(tmp_path, monkeypatch, action):
+    from jobs import JobRunner
+    from wait import wait_for_job
+
+    app, db, _meta = _seed_publish_app(tmp_path, monkeypatch)
+    reached, release = threading.Event(), threading.Event()
+    original_begin = JobRunner.begin_uncancellable
+
+    def controlled_begin(runner, job_id):
+        reached.set()
+        assert release.wait(10)
+        return original_begin(runner, job_id)
+
+    monkeypatch.setattr(JobRunner, "begin_uncancellable", controlled_begin)
+    destination = tmp_path / "published"
+    data = destination / "data"
+    data.mkdir(parents=True)
+    names = ["site.json", "life-list.json", "highlights.json"]
+    for name in names:
+        (data / name).write_text('{"previous":true}')
+    client = app.test_client()
+    runner = app._job_runner
+    response = client.post("/api/jobs/publish-site", json={
+        "destination": str(destination), "max_size": 512,
+    })
+    assert response.status_code == 200
+    job_id = response.get_json()["job_id"]
+    try:
+        assert reached.wait(10)
+        assert client.post(f"/api/jobs/{job_id}/pause").status_code == 200
+        release.set()
+        wait_for_job(lambda: runner.get(job_id), terminal=("paused",), timeout=5)
+        for name in names:
+            assert (data / name).read_text() == '{"previous":true}'
+        assert list(destination.glob(".vireo-publish-*"))
+        if action == "shutdown":
+            assert runner.shutdown(timeout=5)
+        else:
+            assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        job = wait_for_job_via_client(client, job_id)
+        assert job["status"] == ("completed" if action == "resume" else "cancelled")
+        assert not list(destination.glob(".vireo-publish-*"))
+        for name in names:
+            assert ((data / name).read_text() == '{"previous":true}') == (action != "resume")
+    finally:
+        release.set()
+        runner.shutdown(timeout=5)
+        db.close()
 
 
 @pytest.mark.parametrize("phase", ["image", "manifest"])

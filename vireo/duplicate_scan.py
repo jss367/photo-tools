@@ -203,7 +203,7 @@ def _build_resolved_proposal(db, group):
     }
 
 
-def run_duplicate_scan(job, db, include_resolved=True):
+def run_duplicate_scan(job, db, include_resolved=True, cancel_check=None):
     """Work function for ``JobRunner.start('duplicate-scan', ...)``.
 
     Updates ``job['progress']`` as it walks groups. Returns a dict with a
@@ -223,6 +223,8 @@ def run_duplicate_scan(job, db, include_resolved=True):
 
     proposals = []
     for i, g in enumerate(groups):
+        if cancel_check and cancel_check():
+            break
         if g.get("status") == "resolved":
             proposal = _build_resolved_proposal(db, g)
         else:

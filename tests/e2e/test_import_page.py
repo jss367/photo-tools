@@ -2816,27 +2816,113 @@ def test_import_remote_selection_survives_target_refresh(live_server, page):
     page.locator("#remoteSubpath").fill("2026/kenya")
     expect(page.locator("#remoteSubpathError")).to_be_hidden()
 
-    # Settings re-saved the legacy entry under a generated id AND changed
-    # remote_path (which the after-move gate does not read).
+    # Settings re-saved the legacy entry under a generated id; user, host
+    # and remote path are unchanged, so the match is unambiguous.
     state["id"] = "rt-9f3a"
-    state["remote_path"] = "/volume1/Photos"
     page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
 
     expect(page.locator("#destMode")).to_have_value("remote:rt-9f3a", timeout=10000)
-    assert page.evaluate("importRemoteTargets[0].remote_path") == "/volume1/Photos"
     assert page.evaluate("resolvedCopyDestination()") == (
         "/Volumes/Photography/2026/kenya"
     )
     expect(page.locator("#remoteTargetsError")).to_be_hidden()
 
-    # The target is deleted entirely: fall back to Local, and say so.
-    state["targets"] = False
+    # A field the after-move gate never reads changes under the same id:
+    # the page's copy must still be refreshed (Start posts only the id and
+    # the server will use the new value).
+    state["remote_path"] = "/volume1/Photos"
+    page.evaluate("() => { _afterMoveTargetsCheckedAt = 0; }")
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+    page.wait_for_function(
+        "() => importRemoteTargets[0].remote_path === '/volume1/Photos'",
+        timeout=10000,
+    )
+    expect(page.locator("#destMode")).to_have_value("remote:rt-9f3a")
+
+    # The selected target is replaced by a *different* one on the same
+    # host (deleted + re-added with another remote path): that is not a
+    # migration. Fall back to Local, and say so.
+    state["id"] = "rt-0000"
+    state["remote_path"] = "/volume1/Other"
     page.evaluate("() => { _afterMoveTargetsCheckedAt = 0; }")
     page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
     expect(page.locator("#destMode")).to_have_value("local", timeout=10000)
     banner = page.locator("#remoteTargetsError")
     expect(banner).to_be_visible()
     expect(banner).to_contain_text('"Photo NAS" is no longer configured')
+
+
+def test_import_after_move_target_pick_survives_refresh_or_unchecks(
+    live_server, page,
+):
+    """With several eligible targets and "Then move to NAS" checked, a
+    refresh that re-saves the picked target under a new id must keep the
+    pick (unambiguous match), and one that removes it must uncheck the box
+    with a note rather than silently move the post-processing move to a
+    different NAS."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+    state = {"nas2_id": "photo@backup.local:/volume1/Backup", "nas2": True}
+
+    def target(tid, name, host, remote_path, root):
+        return {
+            "id": tid, "name": name, "user": "photo", "host": host,
+            "remote_path": remote_path, "mount_path": "/Volumes/" + name,
+            "local_archive_root": root, "local_archive_root_present": True,
+        }
+
+    def remote_targets(route):
+        targets = [target("nas1", "Photo NAS", "nas.local",
+                          "/volume1/Photography", "/Users/me/Pictures")]
+        if state["nas2"]:
+            targets.append(target(state["nas2_id"], "Backup NAS", "backup.local",
+                                  "/volume1/Backup",
+                                  "/Users/me/Pictures/Vireo Archive"))
+        route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"rsync_available": True, "ssh_available": True,
+                             "targets": targets}),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    sel = page.locator("#afterMoveTarget")
+    chk = page.locator("#chkAfterMove")
+    expect(sel.locator("option")).to_have_count(2)
+    sel.select_option(state["nas2_id"])
+    chk.check()
+    expect(page.locator("#afterMovePreview")).to_contain_text("/volume1/Backup")
+
+    # Legacy id migration for the picked target: pick follows it.
+    state["nas2_id"] = "rt-b4ck"
+    page.evaluate("() => { _afterMoveTargetsCheckedAt = 0; }")
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+    expect(sel).to_have_value("rt-b4ck", timeout=10000)
+    expect(chk).to_be_checked()
+    expect(page.locator("#afterMovePreview")).to_contain_text("/volume1/Backup")
+
+    # The picked target is deleted: another eligible target remains, but
+    # the move must not silently retarget to it.
+    state["nas2"] = False
+    page.evaluate("() => { _afterMoveTargetsCheckedAt = 0; }")
+    page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
+    expect(chk).not_to_be_checked(timeout=10000)
+    expect(page.locator("#afterMoveUnavailable")).to_contain_text(
+        '"Then move to NAS" was unchecked: Backup NAS is no longer available'
+    )
+    expect(page.locator("#afterMovePreview")).to_be_hidden()
+    assert page.evaluate("afterMoveRequest()") is None
 
 
 def test_import_new_workspace_shows_target_default_in_after_import_display(

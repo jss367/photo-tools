@@ -1181,15 +1181,13 @@ function renderImportDestModes() {
     sel.value = prevValue;
   } else if (prevTarget) {
     // A legacy target saved without an id is served under a synthesized
-    // id and re-saved by Settings under a generated one. The connection
-    // tuple is what actually identifies the NAS, so follow it across the
-    // id change rather than silently dropping the user back to Local.
-    const sameHost = importRemoteTargets.filter(
-      (t) => t.user === prevTarget.user && t.host === prevTarget.host);
-    // Exact tuple first; if the remote path was edited in the same save,
-    // a unique user@host is still unambiguous.
-    const same = sameHost.find((t) => t.remote_path === prevTarget.remote_path)
-      || (sameHost.length === 1 ? sameHost[0] : null);
+    // id and re-saved by Settings under a generated one. Follow it across
+    // the id change only when the match is unambiguous: same user, host
+    // AND remote path. Anything looser (e.g. "the one remaining target on
+    // this host") could turn a deleted target into a different NAS path
+    // while keeping remote mode selected, so that case falls through to
+    // the visible selection-lost fallback instead.
+    const same = migratedRemoteTarget(prevTarget, importRemoteTargets);
     if (same) {
       sel.value = 'remote:' + same.id;
       restored = true;
@@ -1204,6 +1202,17 @@ function renderImportDestModes() {
   }
   onImportDestModeChange();
   updateAfterMoveUI();
+}
+
+// The refreshed entry that is unambiguously the same target as ``prev``
+// under a different id, or null. Shared by the direct-SSH destination
+// dropdown and the chained-move target select.
+function migratedRemoteTarget(prev, targets) {
+  if (!prev) return null;
+  const matches = targets.filter(
+    (t) => t.id !== prev.id && t.user === prev.user && t.host === prev.host
+      && t.remote_path === prev.remote_path);
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function noteRemoteSelectionLost(name) {
@@ -1938,8 +1947,31 @@ function updateAfterMoveUI() {
     opt.textContent = t.name;
     sel.appendChild(opt);
   });
-  if (eligible.some((t) => t.id === previous)) sel.value = previous;
-  if (!document.getElementById('chkAfterMove').checked) {
+  const chk = document.getElementById('chkAfterMove');
+  if (eligible.some((t) => t.id === previous)) {
+    sel.value = previous;
+  } else if (previous) {
+    // The chosen target is no longer eligible under that id (deleted,
+    // re-saved under a generated id, root changed, or the destination
+    // moved outside its root). Follow an unambiguous legacy-id migration;
+    // otherwise never let the select quietly land on a *different* NAS
+    // while the box stays checked — the post-processing move deletes the
+    // local copies, so uncheck it and say why.
+    const prevTarget = _previousRemoteTargets.find((t) => t.id === previous)
+      || importRemoteTargets.find((t) => t.id === previous) || null;
+    const same = migratedRemoteTarget(prevTarget, eligible);
+    if (same) {
+      sel.value = same.id;
+    } else if (chk.checked) {
+      chk.checked = false;
+      unavailable.textContent = '"Then move to NAS" was unchecked: '
+        + (prevTarget ? prevTarget.name : 'the selected target')
+        + ' is no longer available for this destination. Re-check it to '
+        + 'pick another target.';
+      unavailable.style.display = '';
+    }
+  }
+  if (!chk.checked) {
     preview.style.display = 'none';
     preview.textContent = '';
     return;

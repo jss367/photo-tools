@@ -360,3 +360,93 @@ def test_settings_failed_import_requeues_dropped_autosave(live_server, page):
     expect(page.locator("#cfgKeywordCase")).to_have_value("lower")
     cfg = page.request.get(f"{url}/api/config").json()
     assert cfg["keyword_case"] == "lower"
+
+
+def test_settings_import_preserves_queued_workspace_override_save(live_server, page):
+    """A queued workspace-override save must not be canceled by an import.
+
+    The import only replaces global config and preserves workspace overrides;
+    a queued /api/workspaces/active/config POST behind an in-flight one
+    should still fire and land server-side, otherwise the UI would keep
+    showing the newer value while the server retained the older one.
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/settings", timeout=5000)
+    _wait_for_settings_idle(page)
+    page.on("dialog", lambda d: d.accept())
+
+    checkbox = page.locator("#wsOverride_grouping_window_seconds")
+    value_input = page.locator("#wsVal_grouping_window_seconds")
+
+    # Track every workspace-override POST via a global request listener so
+    # that unrouting later doesn't stop counting the queued follow-up.
+    ws_posts = []
+    page.on(
+        "request",
+        lambda r: ws_posts.append(r)
+        if r.url.endswith("/api/workspaces/active/config") and r.method == "POST"
+        else None,
+    )
+
+    # Hold the first workspace-override POST so we can stack a second edit
+    # behind it in the workspace save chain.
+    held_ws = []
+
+    def _hold_first_ws_post(route, request):
+        if request.method == "POST" and not held_ws:
+            held_ws.append(route)
+            return
+        route.continue_()
+
+    page.route("**/api/workspaces/active/config", _hold_first_ws_post)
+
+    checkbox.check()
+    for _ in range(60):
+        if held_ws:
+            break
+        page.wait_for_timeout(50)
+    assert held_ws, "first workspace override POST was never requested"
+
+    # Second override edit is queued behind the stalled POST via the
+    # workspace save chain.
+    value_input.fill("55")
+    value_input.dispatch_event("change")
+    page.wait_for_timeout(700)  # past the 500 ms debounce
+    assert len(ws_posts) == 1, (
+        f"second POST fired before the first settled: {len(ws_posts)}"
+    )
+
+    # Kick off an import. It must NOT cancel the queued workspace save.
+    payload = page.request.get(f"{url}/api/settings/export").json()
+    page.set_input_files(
+        "#settingsImportInput",
+        {
+            "name": "backup.json",
+            "mimeType": "application/json",
+            "buffer": json.dumps(payload).encode(),
+        },
+    )
+    # Give the import a chance to start and reach _cancelQueuedSaves.
+    page.wait_for_timeout(300)
+
+    # Release the first workspace POST — the queued 55 snapshot must fire
+    # (the import must not have discarded it).
+    with page.expect_response(
+        lambda r: r.url.endswith("/api/workspaces/active/config")
+        and r.request.method == "POST"
+    ):
+        held_ws[0].continue_()
+
+    page.unroute("**/api/workspaces/active/config", _hold_first_ws_post)
+    overrides = None
+    for _ in range(80):
+        overrides = page.request.get(f"{url}/api/workspaces/active/config").json()
+        if overrides.get("grouping_window_seconds") == 55:
+            break
+        page.wait_for_timeout(50)
+    assert overrides and overrides.get("grouping_window_seconds") == 55, (
+        f"queued workspace override was dropped by the settings import: {overrides}"
+    )
+    assert len(ws_posts) == 2, (
+        f"expected 2 workspace POSTs (initial + queued), got {len(ws_posts)}"
+    )

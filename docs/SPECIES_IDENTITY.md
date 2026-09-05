@@ -60,3 +60,10 @@ resolution policy. Old portable artifacts cannot satisfy the new runtime identit
 Text-embedding identity still depends on the prompt strings, so changing taxonomy
 metadata does not require recomputing those embeddings. Corrected historical runs
 are marked legacy until republished or classified under the new runtime.
+
+Older downloaded taxonomy files and database name indexes did not retain all
+alternate-name collisions. Until taxonomy is downloaded and imported again,
+those unverified common names retain their raw text instead of inferring a taxon;
+explicit source IDs, scientific names, and the verified red-crowned correction
+continue to resolve. Downloads carry a common-name identity format version, and
+imports preserve the ambiguity exclusions for database-backed review and culling.

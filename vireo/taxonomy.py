@@ -898,6 +898,32 @@ RANK_ORDER = [
 ]
 
 
+COMMON_NAME_IDENTITY_VERSION = 1
+
+
+def _common_name_ambiguity(data):
+    """Recover retained collisions and distrust lossy, unversioned DWCA indexes.
+
+    Old dumps retained only one target per alternate name. No migration can
+    reconstruct the discarded targets; a fresh download is required before
+    those names can identify a species. Scientific names and IDs remain usable.
+    """
+    ambiguous = set(data.get("ambiguous_common_names", []))
+    if (data.get("source") == "iNaturalist DWCA"
+            and data.get("common_name_identity_version") != COMMON_NAME_IDENTITY_VERSION):
+        ambiguous.update(data.get("taxa_by_common", {}))
+    targets = {}
+    for entry in data.get("taxa_by_scientific", {}).values():
+        name = (entry.get("common_name") or "").lower().strip()
+        if not name:
+            continue
+        identity = entry.get("taxon_id") or entry.get("scientific_name")
+        if name in targets and targets[name] != identity:
+            ambiguous.add(name)
+        targets[name] = identity
+    return ambiguous
+
+
 class Taxonomy:
     """Taxonomy lookup backed by a local JSON file.
 
@@ -912,7 +938,7 @@ class Taxonomy:
         self._by_common = data.get("taxa_by_common", {})
         self._by_scientific = data.get("taxa_by_scientific", {})
         from species_identity import COMMON_NAME_CORRECTIONS, correct_common_name_index
-        self._ambiguous_common = set(data.get("ambiguous_common_names", [])) - set(COMMON_NAME_CORRECTIONS)
+        self._ambiguous_common = _common_name_ambiguity(data) - set(COMMON_NAME_CORRECTIONS)
         for name in self._ambiguous_common:
             self._by_common.pop(name, None)
         correct_common_name_index(self._by_common, self._by_scientific)
@@ -1071,6 +1097,7 @@ class Taxonomy:
         with open(self._path) as f:
             data = json.load(f)
         data["taxa_by_common"] = self._by_common
+        data["ambiguous_common_names"] = sorted(self._ambiguous_common)
         data["api_misses"] = sorted(self._api_misses)
         _write_taxonomy_json_atomically(self._path, data)
         self._dirty = False
@@ -1323,7 +1350,10 @@ def populate_taxa_db_from_json(db, taxonomy_json_path, progress_callback=None):
     taxa_by_sci = data.get("taxa_by_scientific", {})
     taxa_by_common = data.get("taxa_by_common", {})
 
-    from species_identity import correct_common_name_index
+    from species_identity import COMMON_NAME_CORRECTIONS, correct_common_name_index
+    ambiguous_common = _common_name_ambiguity(data) - set(COMMON_NAME_CORRECTIONS)
+    for name in ambiguous_common:
+        taxa_by_common.pop(name, None)
     correct_common_name_index(taxa_by_common, taxa_by_sci)
 
     # Dedupe by inat_id (same entry appears in both indices and multiple
@@ -1492,6 +1522,8 @@ def populate_taxa_db_from_json(db, taxonomy_json_path, progress_callback=None):
         )
         cn_loaded += 1
 
+    db.set_meta("common_name_identity_version", str(COMMON_NAME_IDENTITY_VERSION), _commit=False)
+    db.set_meta("ambiguous_common_names", json.dumps(sorted(ambiguous_common)), _commit=False)
     db.conn.commit()
     result = {
         "taxa_loaded": len(entries_by_inat_id),
@@ -1804,6 +1836,7 @@ def download_taxonomy(output_path, progress_callback=None):
             taxa_by_common.pop(name, None)
 
         result = {
+            "common_name_identity_version": COMMON_NAME_IDENTITY_VERSION,
             "ambiguous_common_names": ambiguous_common_names,
             "last_updated": str(date.today()),
             "source": "iNaturalist DWCA",

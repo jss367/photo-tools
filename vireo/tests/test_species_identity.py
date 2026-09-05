@@ -49,6 +49,7 @@ def db(tmp_path):
             "INSERT INTO taxa (inat_id, name, common_name, rank) VALUES (?, ?, ?, ?)",
             (entry["taxon_id"], entry["scientific_name"], entry["common_name"], entry["rank"]),
         )
+    database.set_meta("common_name_identity_version", "1")
     database.conn.commit()
     yield database
     database.close()
@@ -292,3 +293,43 @@ def test_taxonomy_ambiguous_common_name_stays_unresolved(tmp_path):
     tax = Taxonomy(path)
     assert tax.lookup("Parrot") is None
     assert tax.lookup(RED["scientific_name"])["taxon_id"] == 18976
+
+
+def test_legacy_dwca_requires_refresh_before_common_name_inference(tmp_path):
+    path = tmp_path / "taxonomy.json"
+    payload = {"source": "iNaturalist DWCA", "taxa_by_common": {"parrot": LILAC},
+               "taxa_by_scientific": {LILAC["scientific_name"].lower(): LILAC}}
+    path.write_text(json.dumps(payload))
+    legacy = Taxonomy(path)
+    assert legacy.lookup("parrot") is None
+    assert legacy.lookup(LILAC["scientific_name"])["taxon_id"] == LILAC["taxon_id"]
+    assert legacy.lookup_id(LILAC["taxon_id"])["scientific_name"] == LILAC["scientific_name"]
+    # Saving an API miss must not make an old index look verified.
+    legacy._dirty = True
+    legacy.save()
+    assert Taxonomy(path).lookup("parrot") is None
+    assert "parrot" in json.loads(path.read_text())["ambiguous_common_names"]
+    payload.update(common_name_identity_version=1, ambiguous_common_names=[])
+    path.write_text(json.dumps(payload))
+    assert Taxonomy(path).lookup("parrot")["taxon_id"] == LILAC["taxon_id"]
+
+
+def test_unversioned_database_does_not_trust_discarded_alias_collisions(db):
+    db.conn.execute("INSERT INTO taxa_common_names (taxon_id, name, locale) "
+                    "SELECT id, 'Parrot', 'en' FROM taxa WHERE inat_id = ?", (LILAC["taxon_id"],))
+    db.set_meta("common_name_identity_version", "")
+    resolver = SpeciesResolver(db=db)
+    assert resolver.resolve("Parrot").key == "name:parrot"
+    assert resolver.resolve(LILAC["scientific_name"]).taxon_id == LILAC["taxon_id"]
+    assert resolver.resolve("Red-crowned Amazon").taxon_id == 18976
+
+
+def test_import_preserves_ambiguity_even_when_only_one_preferred_name_matches(db, tmp_path):
+    from taxonomy import populate_taxa_db_from_json
+
+    path = tmp_path / "taxonomy.json"
+    path.write_text(json.dumps({"common_name_identity_version": 1, "ambiguous_common_names": ["lilac-crowned parrot"],
+                                "taxa_by_common": {}, "taxa_by_scientific": {LILAC["scientific_name"].lower(): LILAC}}))
+    populate_taxa_db_from_json(db, path)
+    assert SpeciesResolver(db=db).resolve("Lilac-crowned Parrot").taxon_id is None
+    assert SpeciesResolver(db=db).resolve(LILAC["scientific_name"]).taxon_id == LILAC["taxon_id"]

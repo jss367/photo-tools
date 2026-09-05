@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from keyword_normalization import keyword_match_key
 
-RESOLUTION_VERSION = "species-identity-v1"
+RESOLUTION_VERSION = "species-identity-v2"
 
 # Verified against iNaturalist taxon 18976 and Cornell's A. viridigenalis
 # account. Older DWCA snapshots assign this English name to A. rhodocorytha.
@@ -46,6 +46,12 @@ class SpeciesResolver:
         self.taxonomy = taxonomy
         self.db = db
         self._cache = {}
+        self._common_names_verified = False
+        self._ambiguous_common = set()
+        if db is not None:
+            from taxonomy import COMMON_NAME_IDENTITY_VERSION
+            self._common_names_verified = db.get_meta("common_name_identity_version") == str(COMMON_NAME_IDENTITY_VERSION)
+            self._ambiguous_common = set(json.loads(db.get_meta("ambiguous_common_names") or "[]"))
 
     def _lookup_id(self, taxon_id):
         if self.taxonomy is not None:
@@ -70,6 +76,11 @@ class SpeciesResolver:
         correction = COMMON_NAME_CORRECTIONS.get(keyword_match_key(name)) if not scientific else None
         if correction:
             return self._lookup(correction["scientific_name"], scientific=True) or correction
+        # Existing DB indexes also lost alternate-name collisions. Until a
+        # taxonomy import records its provenance, only explicit science/IDs
+        # and the curated corrections above are evidence of identity.
+        if not scientific and (not self._common_names_verified or name.lower().strip() in self._ambiguous_common):
+            return self._lookup(name, scientific=True)
         if scientific:
             rows = self.db.conn.execute(
                 "SELECT inat_id AS taxon_id, name AS scientific_name, common_name, rank "

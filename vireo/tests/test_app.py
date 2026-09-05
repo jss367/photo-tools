@@ -17617,8 +17617,15 @@ def test_import_page_after_move_eligibility_requires_existing_root(
     # The refreshed list replaces the held one (legacy entries change id
     # when Settings re-saves them, so an id-keyed merge would miss them)
     # and the dropdown is rebuilt with the selection preserved.
-    assert "importRemoteTargets = data.targets;" in html
     assert "function renderImportDestModes()" in html
+    # Both the initial load and the background refresh go through one
+    # bounded fetch (10s abort) and one apply step that also sets the
+    # rsync/ssh availability flags and clears the load-error banner.
+    assert html.count("fetch('/api/remote-targets'") == 1
+    assert "function fetchImportRemoteTargets()" in html
+    assert "_afterMoveTargetsRefresh = fetchImportRemoteTargets()" in html
+    assert html.count("applyImportRemoteTargets(") >= 3
+    assert "renderRemoteTargetsError(false);" in html
     # Returning to the tab re-evaluates the gate.
     assert "document.addEventListener('visibilitychange', _afterMoveOnReturn);" in html
     assert "window.addEventListener('focus', _afterMoveOnReturn);" in html

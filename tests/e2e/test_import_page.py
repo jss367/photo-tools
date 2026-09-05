@@ -2632,6 +2632,67 @@ def test_import_after_move_recovers_when_archive_root_is_corrected(
     assert page.locator("#destMode").input_value() == "local"
 
 
+def test_import_after_move_refresh_recovers_failed_initial_target_load(
+    live_server, page,
+):
+    """If the initial /api/remote-targets request fails but a later
+    background refresh succeeds, that success is a full recovery: the
+    SSH destinations come back, the rsync/ssh availability flags are
+    applied (so picking one is not falsely blocked), and the load-error
+    banner clears."""
+    url = live_server["url"]
+    db = live_server["db"]
+    identify_id = next(
+        p["id"] for p in db.get_saved_processes() if p["name"] == "Identify birds"
+    )
+    state = {"calls": 0}
+
+    def remote_targets(route):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            route.fulfill(status=500, content_type="text/plain", body="boom")
+            return
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": [{
+                    "id": "nas1",
+                    "name": "Photo NAS",
+                    "user": "photo",
+                    "host": "nas.local",
+                    "remote_path": "/volume1/Photography",
+                    "mount_path": "/Volumes/Photography",
+                    "local_archive_root": "/Users/me/Pictures/Vireo Archive",
+                    "local_archive_root_present": True,
+                }],
+            }),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
+
+    page.locator("#modeCopy").check()
+    banner = page.locator("#remoteTargetsError")
+    expect(banner).to_be_visible()
+    expect(page.locator("#destMode option")).to_have_count(1)
+
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/Users/me/Pictures/Vireo Archive/2026")
+    page.locator("#afterImportSelect").select_option(str(identify_id))
+
+    # The hint renders (no targets known), which triggers the background
+    # refresh; the deferred refresh succeeds and recovers everything.
+    expect(page.locator("#afterMoveRow")).to_be_visible(timeout=10000)
+    expect(banner).to_be_hidden()
+    expect(page.locator("#destMode option")).to_have_count(2)
+    assert page.evaluate("importRsyncAvailable && importSshAvailable")
+
+
 def test_import_new_workspace_shows_target_default_in_after_import_display(
     live_server, page
 ):

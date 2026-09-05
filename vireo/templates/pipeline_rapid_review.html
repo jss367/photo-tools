@@ -897,9 +897,12 @@ function overrideSpeciesList(ovr) {
 // burst_species_list() and applyCurrent()'s alreadyConfirmedList.
 function overrideIsExplicit(ovr) {
   if (!ovr) return false;
-  if (Array.isArray(ovr.species_list)) {
-    return ovr.confirmed === true || ovr.species_list.length === 0;
-  }
+  // A species_list array is authoritative whatever the confirmed flag:
+  // confirmed (uniform frames), unconfirmed (a mixed burst after an edit —
+  // its edited baseline, not the encounter's stale list, is what it holds)
+  // or empty (the sentinel a remove leaves). Only the legacy shape without
+  // the array is a detach-time candidate guess.
+  if (Array.isArray(ovr.species_list)) return true;
   return ovr.confirmed === true && !!ovr.species;
 }
 
@@ -1965,13 +1968,13 @@ async function applyCurrent(openNext) {
     var snapBursts = (snapEnc.bursts && snapEnc.bursts.length) ? snapEnc.bursts : null;
     var snapBurst = snapBursts ? snapBursts[session.burstIdx] : null;
     var snapOvr = snapBurst && snapBurst.species_override;
-    var explicitlyEmpty = !!snapOvr && Array.isArray(snapOvr.species_list) && !snapOvr.species_list.length;
-    if (snapOvr && snapOvr.confirmed === true && overrideSpeciesList(snapOvr).length) {
+    if (snapOvr && Array.isArray(snapOvr.species_list)) {
+      // Authoritative whatever the confirmed flag (see overrideIsExplicit):
+      // a confirmed list, a mixed burst's edited baseline, or the empty
+      // sentinel after its last species was removed.
       alreadyConfirmedList = overrideSpeciesList(snapOvr);
-    } else if (explicitlyEmpty) {
-      // The burst's last species was removed: it is confirmed as nothing,
-      // even if its encounter still carries a species.
-      alreadyConfirmedList = [];
+    } else if (snapOvr && snapOvr.confirmed === true && snapOvr.species) {
+      alreadyConfirmedList = [snapOvr.species];
     } else {
       // The encounter's list regardless of species_confirmed: a mixed
       // encounter (one frame [A, B], another [A]) still records its

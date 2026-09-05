@@ -71,22 +71,24 @@ def encounter_confirmed_species_list(enc):
 
 
 def burst_species_list(enc, burst):
-    """Species a burst is *confirmed* as: its override, else the encounter's.
+    """The species set a burst currently holds: its override, else the
+    encounter's.
 
-    Only a confirmed override (or the explicit-empty sentinel left by a
-    remove) speaks for the burst. A detach-time candidate override
-    (``confirmed: False``, a classifier guess) is a display hint, not a
-    confirmation: treating it as the current set would make a replace
+    An override carrying a ``species_list`` array is authoritative whatever
+    its ``confirmed`` flag: confirmed (uniform frames), unconfirmed (a mixed
+    burst after a set edit — its frames differ but the edited baseline is
+    still what the burst holds, not the encounter's stale list) or empty
+    (the sentinel a remove leaves so the burst does not inherit the species
+    just untagged). Only the legacy shape without the array is a detach-time
+    candidate (``confirmed: False``, a classifier guess); that is a display
+    hint, not the burst's set — treating it as such would make a replace
     validate ``previous_species`` against the guess and an add promote the
-    guess into the confirmed list. Rapid review derives its baseline the
-    same way.
+    guess. Rapid review derives its baseline the same way.
     """
     ovr = burst.get("species_override") if isinstance(burst, dict) else None
     if isinstance(ovr, dict):
         explicit = ovr.get("species_list")
-        if isinstance(explicit, list) and (ovr.get("confirmed") or not explicit):
-            # An explicit list is authoritative even when empty: a burst
-            # whose last species was removed must not inherit the encounter.
+        if isinstance(explicit, list):
             return [s for s in explicit if s]
         if ovr.get("confirmed") and ovr.get("species"):
             return [ovr["species"]]

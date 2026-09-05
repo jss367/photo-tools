@@ -1760,3 +1760,34 @@ def test_rapid_review_partial_species_failure_keeps_applied_changes_and_reports(
         assert saved[pid]["confirmed_species_list"] == ["Gadwall", "Green-winged Teal"]
     # Apply is usable again and the field reflects server truth after reload.
     expect(page.locator("#applyBtn")).to_be_enabled()
+
+
+def test_rapid_review_mixed_burst_edited_baseline_beats_encounter_list(live_server, page):
+    """A mixed burst that had B removed carries {confirmed: false,
+    species_list: [A]} under an encounter still listing [A, B]. The field
+    prefills A only, and a flag-only apply sends no species request."""
+    species_payloads = []
+    results = _two_species_results()
+    results["photos"][0]["confirmed_species_list"] = ["American Wigeon", "Gadwall"]
+    for p in results["photos"][1:]:
+        p["confirmed_species_list"] = ["American Wigeon"]
+    enc = results["encounters"][0]
+    enc["species_confirmed"] = False
+    enc["confirmed_species_list"] = ["American Wigeon", "Green-winged Teal"]
+    enc["bursts"][0]["species_override"] = {
+        "species": "American Wigeon", "confirmed": False, "species_list": ["American Wigeon"],
+    }
+    state = {
+        str(pid): {"flag": "none", "has_species_keyword": True,
+                   "has_species_keywords": {"American Wigeon": True}}
+        for pid in (1, 2, 3)
+    }
+    _mock_pipeline_rapid_review(page, results=results, state_photos=state, species_payloads=species_payloads)
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: no DB changes")
+
+    page.keyboard.press("p")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+    assert species_payloads == []

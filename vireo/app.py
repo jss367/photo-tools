@@ -27056,14 +27056,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # same rule serialize_results applies on regroup: confirmed
                 # only when every submitted frame now carries the same
                 # species set. A mixed burst ([A, C] on one frame, [A] on
-                # another) that just gained B is still mixed, so it stays
-                # unconfirmed (None → the encounter's list, as regroup would
-                # write) rather than being hidden as confirmed. When uniform,
+                # another) that just gained B is still mixed, so it is
+                # written unconfirmed — but with its edited list, which stays
+                # authoritative (burst_species_list): None would make it
+                # inherit the encounter's stale list and resurrect a species
+                # this edit removed on the next flag-only apply. When uniform,
                 # the list is the cache's ordering plus any extra the frames
                 # already shared that the cache had not recorded. An emptied
-                # burst keeps an explicit empty override rather than None:
-                # None would make it inherit the encounter's species, which
-                # the remove just untagged.
+                # burst keeps an explicit empty override for the same reason.
                 actual_by_photo = db.get_species_keywords_for_photos(photo_ids)
                 actual_sets = [
                     frozenset(species_key_set(actual_by_photo.get(pid, [])))
@@ -27086,7 +27086,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         new_species_list + extras,
                     )
                 else:
-                    burst_override = None
+                    burst_override = build_species_override(
+                        new_species_list, confirmed=False,
+                    )
                 target_enc["bursts"][burst_index]["species_override"] = (
                     burst_override
                 )

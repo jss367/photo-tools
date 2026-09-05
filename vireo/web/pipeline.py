@@ -1790,9 +1790,9 @@ def create_pipeline_blueprint(
         detached["species_predictions"] = new_enc_predictions
         detached_override = detached.get("species_override") or {}
         detached_confirmed = bool(detached_override.get("confirmed"))
-        detached_list = (
-            burst_species_list({}, detached) if detached_confirmed else []
-        )
+        # The burst's own list (confirmed, mixed-but-edited, or empty); a
+        # candidate override contributes nothing.
+        detached_list = burst_species_list({}, detached)
         new_enc = {
             "species": new_enc_species,
             "confirmed_species": detached_list[0] if detached_list else None,

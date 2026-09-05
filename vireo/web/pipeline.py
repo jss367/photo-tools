@@ -22,6 +22,8 @@ from photo_payload import (
     attach_species_representatives,
 )
 from pipeline_results import (
+    build_species_override,
+    burst_species_list,
     candidate_species_override,
     compute_time_range,
     rebuild_encounter_species_label,
@@ -1787,9 +1789,13 @@ def create_pipeline_blueprint(
         detached["species_predictions"] = new_enc_predictions
         detached_override = detached.get("species_override") or {}
         detached_confirmed = bool(detached_override.get("confirmed"))
+        detached_list = (
+            burst_species_list({}, detached) if detached_confirmed else []
+        )
         new_enc = {
             "species": new_enc_species,
-            "confirmed_species": detached_override.get("species") if detached_confirmed else None,
+            "confirmed_species": detached_list[0] if detached_list else None,
+            "confirmed_species_list": detached_list,
             "species_predictions": new_enc_predictions,
             "species_confirmed": detached_confirmed,
             "photo_count": len(detached_ids),
@@ -1861,10 +1867,9 @@ def create_pipeline_blueprint(
         new_burst_predictions = rebuild_species_predictions(results, [photo_id])
         new_burst_species = rebuild_encounter_species_label(results, [photo_id])
         if source_override.get("confirmed") and source_override.get("species"):
-            new_burst_override = {
-                "species": source_override["species"],
-                "confirmed": True,
-            }
+            new_burst_override = build_species_override(
+                burst_species_list({}, burst),
+            )
         elif enc.get("confirmed_species"):
             # Inherit the encounter's prior confirmed species by leaving the
             # override empty. Also covers the mixed/partial state where
@@ -1921,17 +1926,27 @@ def create_pipeline_blueprint(
         in pipelineResults) and show whether each photo already has the
         consensus species keyword applied.
 
-        Body: {photo_ids: [int], species: str}
+        Body: {photo_ids: [int], species: str, species_list: [str]}
         Returns: {photos: {pid: {flag, has_species_keyword,
+                  has_species_keywords: {name: bool},
                   is_species_representative}}, species_kid: int|None}
+
+        ``species_list`` covers multi-species bursts: every listed name is
+        resolved independently and reported per photo in
+        ``has_species_keywords``. ``species`` (single) keeps feeding the
+        legacy ``has_species_keyword`` flag and the representative badge.
         """
         db = get_db()
         body = request.get_json(silent=True) or {}
         photo_ids = list(body.get("photo_ids", []) or [])
         species = (body.get("species") or "").strip()
+        species_list = [
+            str(name).strip()
+            for name in (body.get("species_list") or [])
+            if str(name).strip()
+        ]
 
-        species_kid = None
-        if species:
+        def _species_kid(name):
             # Read-only mirror of the species-aware lookup in db.add_keyword(
             # species, is_species=True): match top-level taxonomy/general rows
             # case-insensitively, prefer taxonomy. Excludes homonym rows of
@@ -1942,10 +1957,12 @@ def create_pipeline_blueprint(
                 "SELECT id FROM keywords WHERE name = ? COLLATE NOCASE "
                 "AND parent_id IS NULL AND type IN ('taxonomy', 'general') "
                 "ORDER BY (type = 'taxonomy') DESC, id ASC LIMIT 1",
-                (species,),
+                (name,),
             ).fetchone()
-            if row:
-                species_kid = row["id"]
+            return row["id"] if row else None
+
+        species_kid = _species_kid(species) if species else None
+        list_kids = {name: _species_kid(name) for name in species_list}
 
         # Gate the badge on the same eligibility rules the shared payload
         # attachers use, so a stale preference row (photo later rejected or
@@ -1963,11 +1980,19 @@ def create_pipeline_blueprint(
             if not row:
                 continue
             has_kw = False
-            if species_kid is not None:
-                has_kw = any(k["id"] == species_kid for k in db.get_photo_keywords(pid))
+            has_kws = {}
+            if species_kid is not None or list_kids:
+                attached = {k["id"] for k in db.get_photo_keywords(pid)}
+                if species_kid is not None:
+                    has_kw = species_kid in attached
+                has_kws = {
+                    name: (kid is not None and kid in attached)
+                    for name, kid in list_kids.items()
+                }
             photos[pid] = {
                 "flag": row["flag"] or "none",
                 "has_species_keyword": has_kw,
+                "has_species_keywords": has_kws,
                 "is_species_representative": bool(
                     species and representatives.get(species) == pid
                 ),

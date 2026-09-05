@@ -26424,19 +26424,39 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Confirm species for all photos in an encounter or a single burst.
 
         Expects JSON: {"species": "Blue Jay", "photo_ids": [1, 2, 3],
-                       "burst_index": <int|null>}
+                       "burst_index": <int|null>,
+                       "add": <bool>, "remove": <bool>,
+                       "previous_species": <str|null>}
 
         Creates the species keyword, tags photos, and queues a sidecar add.
         If the encounter (or burst) was previously confirmed as a different
         species, also untags that species and queues a sidecar remove — or
         cancels the still-pending add if it hadn't synced yet — so the XMP
         doesn't accumulate stale species keywords.
+
+        A burst can legitimately hold two species (two subjects), so the
+        confirmation is a *set* edit with three modes:
+
+        * replace (default): ``species`` swaps out ``previous_species`` —
+          the burst's primary confirmed species unless the client names
+          another entry of the current list.
+        * ``add``: ``species`` joins the current list; nothing is untagged
+          and the burst is never auto-detached.
+        * ``remove``: ``species`` is untagged from the submitted photos and
+          dropped from the list; no keyword is added.
         """
         db = _get_db()
         body = request.get_json(silent=True) or {}
         species = body.get("species", "").strip()
         photo_ids = body.get("photo_ids", [])
         burst_index = body.get("burst_index")
+        add_mode = bool(body.get("add"))
+        remove_mode = bool(body.get("remove"))
+        requested_previous = body.get("previous_species")
+        if add_mode and remove_mode:
+            return json_error("add and remove are mutually exclusive")
+        if requested_previous is not None and (add_mode or remove_mode):
+            return json_error("previous_species only applies to a replace")
 
         # Normalize up front: this route compares the requested species
         # against stored keyword rows and previous_species cache values
@@ -26485,10 +26505,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if r["n"] > 0 and (r["max_conf"] or 0) < det_conf_threshold
         ]
         from pipeline import load_results_raw, save_results_raw
+        from pipeline_results import (
+            build_species_override,
+            burst_species_list,
+            encounter_confirmed_species_list,
+            set_encounter_confirmed_species,
+            species_key_set,
+            updated_species_list,
+        )
 
         cache_dir = os.path.dirname(db_path)
         cached = load_results_raw(cache_dir, db._active_workspace_id)
         previous_species = None
+        current_species_list = []
         target_enc = None
         target_enc_idx = None
         if cached:
@@ -26521,26 +26550,58 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         if target_enc is not None:
             if burst_index is not None:
-                ovr = target_enc["bursts"][burst_index].get("species_override")
-                if ovr and ovr.get("species"):
-                    previous_species = ovr["species"]
-                else:
-                    # No burst override yet — inherit the encounter's confirmed
-                    # species, which is what those photos were actually tagged
-                    # with.
-                    previous_species = target_enc.get("confirmed_species")
+                # A burst override wins when recorded; otherwise the burst
+                # inherits the encounter's confirmed species, which is what
+                # those photos were actually tagged with.
+                current_species_list = burst_species_list(
+                    target_enc, target_enc["bursts"][burst_index],
+                )
             else:
-                previous_species = target_enc.get("confirmed_species")
+                current_species_list = encounter_confirmed_species_list(
+                    target_enc,
+                )
 
-        # previous_species comes from the pipeline cache on disk, which the
+        # The cached list comes from the pipeline cache on disk, which the
         # v5 DB migration does not touch — a pre-normalization cache can
         # still carry a quoted spelling like `‘Apapane`. Normalize before
         # comparing/looking up against stored keyword rows, which are always
         # clean.
-        if previous_species is not None:
-            previous_species = normalize_keyword_display(previous_species)
-            if not previous_species:
-                previous_species = None
+        current_species_list = [
+            name for name in (
+                normalize_keyword_display(s) for s in current_species_list
+            ) if name
+        ]
+
+        if remove_mode:
+            previous_species = species
+        elif add_mode:
+            previous_species = None
+        elif requested_previous is not None:
+            requested_previous = normalize_keyword_display(
+                str(requested_previous),
+            )
+            if not requested_previous:
+                return json_error("previous_species must not be empty")
+            if current_species_list:
+                requested_key = keyword_match_key(requested_previous)
+                previous_species = next(
+                    (
+                        s for s in current_species_list
+                        if keyword_match_key(s) == requested_key
+                    ),
+                    None,
+                )
+                if previous_species is None:
+                    return json_error(
+                        f'"{requested_previous}" is not a confirmed species '
+                        "of the submitted photos",
+                    )
+            else:
+                previous_species = requested_previous
+        else:
+            previous_species = (
+                current_species_list[0] if current_species_list else None
+            )
 
         ws_id = db._ws_id()
 
@@ -26564,7 +26625,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # yet add_keyword's NOCASE lookup would still create/tag a separate
         # `éclair` row — leaving the photo with both taxonomy tags and no
         # remove queued for the old one.
-        is_replacement = (
+        is_replacement = remove_mode or (
             previous_species is not None
             and keyword_match_key(previous_species) != keyword_match_key(species)
         )
@@ -26700,20 +26761,39 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # Resolve the target species keyword id up front so we can precheck
             # which photos already carry it. add_keyword is idempotent and
             # returns the existing id when the species already exists.
-            kid = db.add_keyword(species, is_species=True, _commit=False)
-            # Queue/record the stored spelling (see api_add_keyword).
-            stored = db.conn.execute(
-                "SELECT name FROM keywords WHERE id = ?", (kid,)
-            ).fetchone()
-            if stored and stored["name"]:
-                species = stored["name"]
+            if remove_mode:
+                # Nothing is being added: never create a keyword row just to
+                # remove it. Report the existing root's id when one exists.
+                stored = db.conn.execute(
+                    """SELECT id, name FROM keywords
+                       WHERE name = ? COLLATE NOCASE
+                         AND parent_id IS NULL
+                         AND (is_species = 1 OR type = 'taxonomy')
+                       ORDER BY (type = 'taxonomy') DESC, id""",
+                    (species,),
+                ).fetchone()
+                kid = stored["id"] if stored else None
+                already_has_new = set()
+                newly_tagged = []
+            else:
+                kid = db.add_keyword(species, is_species=True, _commit=False)
+                # Queue/record the stored spelling (see api_add_keyword).
+                stored = db.conn.execute(
+                    "SELECT name FROM keywords WHERE id = ?", (kid,)
+                ).fetchone()
+                if stored and stored["name"]:
+                    species = stored["name"]
 
-            # A species can already be attached through a hierarchical
-            # keyword row with a different id/casing. Compare by taxon_id (or
-            # normalized name for taxonomy-less legacy rows), otherwise a
-            # confirmation creates a redundant top-level association.
-            already_has_new = db.get_photos_with_equivalent_species(photo_ids, kid)
-            newly_tagged = [pid for pid in photo_ids if pid not in already_has_new]
+                # A species can already be attached through a hierarchical
+                # keyword row with a different id/casing. Compare by taxon_id
+                # (or normalized name for taxonomy-less legacy rows), otherwise
+                # a confirmation creates a redundant top-level association.
+                already_has_new = db.get_photos_with_equivalent_species(
+                    photo_ids, kid,
+                )
+                newly_tagged = [
+                    pid for pid in photo_ids if pid not in already_has_new
+                ]
 
             # Resolve every attached keyword row equivalent to the previous
             # species, including nested hierarchy leaves. Multiple hierarchy
@@ -26862,7 +26942,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     remove_names = []
                     for old in old_rows:
                         db.untag_photo(pid, old["id"], _commit=False)
-                        if old["id"] != kid and old["name"] not in remove_names:
+                        # A same-taxon alias replace re-adds ``kid`` right
+                        # after, so its sidecar remove is skipped; a remove
+                        # must queue every untagged row.
+                        if (remove_mode or old["id"] != kid) and (
+                            old["name"] not in remove_names
+                        ):
                             remove_names.append(old["name"])
                     for old_name in remove_names:
                         _queue_keyword_remove(
@@ -26900,10 +26985,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         "old_value": old_value,
                         "new_value": str(kid) if pid in newly_set else "",
                     })
+                if remove_mode:
+                    description = (
+                        f'Removed species "{species}" from {len(changed)} photos'
+                    )
+                else:
+                    description = (
+                        f'Replaced species "{previous_species}" with '
+                        f'"{species}" on {len(changed)} photos'
+                    )
                 db.record_edit(
                     "species_replace",
-                    f'Replaced species "{previous_species}" with "{species}" on {len(changed)} photos',
-                    str(kid),
+                    description,
+                    str(kid) if kid is not None else "",
                     items,
                     is_batch=len(changed) > 1,
                     _commit=False,
@@ -26928,36 +27022,47 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # Prune oldest edit-history rows now that the transaction has landed.
         db._prune_edit_history()
 
+        # The confirmed set after this edit, for the cache and the response.
+        new_species_list = updated_species_list(
+            current_species_list, species, previous_species,
+            add=add_mode, remove=remove_mode,
+        )
+
         # Update pipeline cache. burst_index was validated above, so the
         # branch here is unambiguous: burst-scoped requests only touch the
         # burst override, encounter-scoped requests only touch the encounter.
         if cached and target_enc is not None:
             if burst_index is not None:
-                target_enc["bursts"][burst_index]["species_override"] = {
-                    "species": species,
-                    "confirmed": True,
-                }
-                # Auto-detach if burst's confirmed species differs from its
-                # encounter — splits it out and merges into an adjacent
-                # encounter of the same confirmed species when one exists.
-                # Compare with keyword_match_key so a cached pre-normalization
-                # spelling (e.g. ‘Apapane) does not trigger a needless split
-                # against the stored species (Apapane); the DB write already
-                # normalized to the canonical form.
-                enc_species = target_enc.get("confirmed_species") or (
-                    target_enc["species"][0] if target_enc.get("species") else None
+                target_enc["bursts"][burst_index]["species_override"] = (
+                    build_species_override(new_species_list)
                 )
+                # Auto-detach if the burst's confirmed species no longer
+                # overlap its encounter's — splits it out and merges into an
+                # adjacent encounter of the same confirmed species when one
+                # exists. Compare with keyword_match_key so a cached
+                # pre-normalization spelling (e.g. ‘Apapane) does not trigger
+                # a needless split against the stored species (Apapane); the
+                # DB write already normalized to the canonical form. Adding a
+                # second species or removing one never detaches: the burst
+                # is deliberately holding both.
+                enc_species_list = encounter_confirmed_species_list(target_enc)
+                if not enc_species_list and target_enc.get("species"):
+                    enc_species_list = [target_enc["species"][0]]
                 if (
-                    enc_species is not None
-                    and keyword_match_key(enc_species) != keyword_match_key(species)
+                    not add_mode
+                    and not remove_mode
+                    and enc_species_list
+                    and not (
+                        species_key_set(new_species_list)
+                        & species_key_set(enc_species_list)
+                    )
                     and len(target_enc["bursts"]) > 1
                 ):
                     auto_detach_burst_for_species(
                         cached, target_enc_idx, burst_index, species
                     )
             else:
-                target_enc["species_confirmed"] = True
-                target_enc["confirmed_species"] = species
+                set_encounter_confirmed_species(target_enc, new_species_list)
             save_results_raw(cached, cache_dir, db._active_workspace_id)
 
         # Report `replaced` consistent with the actual replacement decision
@@ -26967,13 +27072,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # keyword rows — so a `.lower()` comparison here would report
         # replaced=None on a request that actually untagged the previous
         # species row and tagged a new one.
-        replaced = previous_species if is_replacement else None
+        replaced = (
+            previous_species if is_replacement and not remove_mode else None
+        )
         response = {
             "ok": True,
             "species": species,
             "keyword_id": kid,
             "photo_count": len(photo_ids),
             "previous_species": replaced,
+            "mode": "remove" if remove_mode else "add" if add_mode else "replace",
+            "species_list": new_species_list,
             "low_confidence_photo_ids": low_confidence_photo_ids,
             # Kept for older clients/tests that checked this field; explicit
             # confirmations no longer skip submitted photos.

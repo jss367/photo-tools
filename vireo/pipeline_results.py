@@ -39,6 +39,108 @@ def candidate_species_override(species_label):
     return {"species": species, "confirmed": False}
 
 
+# -- Multi-species confirmation ---------------------------------------------
+#
+# A photo can legitimately carry two confirmed species (two MegaDetector
+# boxes, two subjects). Cached results keep the legacy single-valued fields
+# (``photo.confirmed_species``, ``encounter.confirmed_species``,
+# ``species_override.species``) as the *primary* species so older consumers
+# keep working, and add list-valued siblings (``confirmed_species_list``,
+# ``species_override.species_list``) that carry every confirmed species.
+# These helpers read either shape.
+
+
+def _as_species_list(container, list_key, single_key):
+    if not isinstance(container, dict):
+        return []
+    lst = container.get(list_key)
+    if lst is None:
+        single = container.get(single_key)
+        lst = [single] if single else []
+    return [s for s in lst if s]
+
+
+def photo_confirmed_species_list(photo):
+    """Every species confirmed on a cached photo dict (primary first)."""
+    return _as_species_list(photo, "confirmed_species_list", "confirmed_species")
+
+
+def encounter_confirmed_species_list(enc):
+    """Every species a cached encounter is confirmed as (primary first)."""
+    return _as_species_list(enc, "confirmed_species_list", "confirmed_species")
+
+
+def burst_species_list(enc, burst):
+    """Species a burst currently carries: its override, else the encounter's.
+
+    Mirrors how the confirm endpoint resolves ``previous_species``: an
+    override's species wins whenever one is recorded (confirmed or a
+    detach-time candidate), otherwise the burst inherits the encounter.
+    """
+    ovr = burst.get("species_override") if isinstance(burst, dict) else None
+    if ovr and (ovr.get("species_list") or ovr.get("species")):
+        return _as_species_list(ovr, "species_list", "species")
+    return encounter_confirmed_species_list(enc)
+
+
+def species_key_set(names):
+    """Case/quote-insensitive identity set for a list of species names."""
+    from keyword_normalization import keyword_match_key
+
+    return {keyword_match_key(n) for n in names if n}
+
+
+def build_species_override(species_list, confirmed=True):
+    """Burst override dict for ``species_list`` (None when the list is empty)."""
+    species_list = [s for s in species_list if s]
+    if not species_list:
+        return None
+    return {
+        "species": species_list[0],
+        "confirmed": confirmed,
+        "species_list": list(species_list),
+    }
+
+
+def updated_species_list(current, species, previous_species=None,
+                         add=False, remove=False):
+    """Return ``current`` after confirming ``species`` in the given mode.
+
+    * remove: drop ``species``.
+    * add: append ``species`` (or refresh its spelling in place).
+    * replace (default): swap ``previous_species`` for ``species`` in place;
+      when nothing matches, ``species`` is appended.
+    Identity is by ``keyword_match_key`` so spelling variants collapse.
+    """
+    from keyword_normalization import keyword_match_key
+
+    target = keyword_match_key(species)
+    prev = keyword_match_key(previous_species) if previous_species else None
+    if remove:
+        return [s for s in current if keyword_match_key(s) != target]
+    out = []
+    placed = False
+    for s in current:
+        k = keyword_match_key(s)
+        if k == target or (not add and prev is not None and k == prev):
+            if not placed:
+                out.append(species)
+                placed = True
+            continue
+        out.append(s)
+    if not placed:
+        out.append(species)
+    return out
+
+
+def set_encounter_confirmed_species(enc, species_list):
+    """Write the encounter-level confirmation fields for ``species_list``."""
+    species_list = [s for s in species_list if s]
+    enc["species_confirmed"] = bool(species_list)
+    enc["confirmed_species"] = species_list[0] if species_list else None
+    enc["confirmed_species_list"] = list(species_list)
+
+
 def find_merge_target(encounters, detached_range, target_species):
     """Find an encounter index whose confirmed species matches target_species and
     whose time range is adjacent to detached_range (no other encounter sits in
@@ -146,9 +248,19 @@ def auto_detach_burst_for_species(results, enc_idx, burst_idx, new_species):
         detached_species = rebuild_encounter_species_label(
             results, detached_ids, fallback=enc.get("species")
         )
+        # The detached burst may carry more than one confirmed species; the
+        # new encounter inherits the whole list with new_species as primary.
+        detached_list = _as_species_list(
+            detached.get("species_override"), "species_list", "species",
+        )
+        confirmed_list = [new_species] + [
+            s for s in detached_list
+            if species_key_set([s]) != species_key_set([new_species])
+        ]
         encounters.append({
             "species": detached_species,
             "confirmed_species": new_species,
+            "confirmed_species_list": confirmed_list,
             "species_predictions": detached["species_predictions"],
             "species_confirmed": True,
             "photo_count": len(detached_ids),

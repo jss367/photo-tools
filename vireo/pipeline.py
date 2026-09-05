@@ -500,6 +500,13 @@ def load_photo_features(db, collection_id=None, config=None,
         for pid, names in species_names_by_photo.items()
         if names
     }
+    # Every confirmed species per photo (a photo can carry two subjects);
+    # ``confirmed_species`` above stays the primary for legacy consumers.
+    confirmed_list_by_photo = {
+        pid: list(names)
+        for pid, names in species_names_by_photo.items()
+        if names
+    }
 
     # Classification is intentionally more permissive than grouping: it may
     # evaluate every bracketed weak run, but grouping promotes the run to an
@@ -636,6 +643,7 @@ def load_photo_features(db, collection_id=None, config=None,
             "species_top5": species_by_photo.get(pid, []),
             "subjects": subjects_by_photo.get(pid, []),
             "confirmed_species": confirmed_by_photo.get(pid),
+            "confirmed_species_list": confirmed_list_by_photo.get(pid, []),
             "subject_absent": subject_absent,
             "subject_present": subject_present,
             "subject_uncertain": subject_uncertain,
@@ -853,10 +861,20 @@ def _make_summary(encounters, all_photos):
     }
 
 
+def _photo_species_keysets(photos):
+    """Per-photo identity sets of confirmed species (empty set = unconfirmed)."""
+    from pipeline_results import photo_confirmed_species_list, species_key_set
+
+    return [
+        frozenset(species_key_set(photo_confirmed_species_list(p)))
+        for p in photos
+    ]
+
+
 def _photos_uniformly_confirmed(photos):
-    species = [p.get("confirmed_species") for p in photos]
-    confirmed = {s for s in species if s}
-    return bool(photos) and len(confirmed) == 1 and all(species)
+    """True when every photo is confirmed as the same species *set*."""
+    keysets = _photo_species_keysets(photos)
+    return bool(photos) and all(keysets) and len(set(keysets)) == 1
 
 
 def _count_raw_confirmation_units(encounters):
@@ -1022,6 +1040,11 @@ def serialize_results(results):
     Returns:
         JSON-serializable dict
     """
+    from pipeline_results import (
+        build_species_override,
+        photo_confirmed_species_list,
+    )
+
     def _clean_photo(p):
         """Strip non-serializable fields from a photo dict."""
         cleaned = {}
@@ -1047,11 +1070,17 @@ def serialize_results(results):
         # the /api/encounters/species endpoint can find the keyword to untag
         # when the user re-confirms.
         photo_species = [p.get("confirmed_species") for p in photos_list]
-        confirmed_set = {s for s in photo_species if s}
-        if photos_list and len(confirmed_set) == 1 and all(s for s in photo_species):
-            enc_confirmed = next(iter(confirmed_set))
+        if _photos_uniformly_confirmed(photos_list):
+            # Every photo carries the same species set (one or several);
+            # surface the whole list with the reducer's first entry as the
+            # legacy single-valued primary.
+            enc_confirmed_list = list(
+                photo_confirmed_species_list(photos_list[0])
+            )
+            enc_confirmed = enc_confirmed_list[0]
             species_confirmed_flag = True
         else:
+            confirmed_set = {s for s in photo_species if s}
             # For mixed/partial encounters, pick the most frequent confirmed
             # species, breaking ties by first appearance in photo order. Set
             # iteration order is not stable across processes, so iterating
@@ -1070,6 +1099,7 @@ def serialize_results(results):
                     counts,
                     key=lambda s: (counts[s], -first_index[s]),
                 )
+            enc_confirmed_list = [enc_confirmed] if enc_confirmed else []
             species_confirmed_flag = False
 
         species_votes = _build_species_predictions(photos_list)
@@ -1077,6 +1107,7 @@ def serialize_results(results):
         s_enc = {
             "species": enc.get("species"),
             "confirmed_species": enc_confirmed,
+            "confirmed_species_list": enc_confirmed_list,
             "species_predictions": species_votes,
             "species_confirmed": species_confirmed_flag,
             "photo_count": enc.get("photo_count"),
@@ -1103,13 +1134,10 @@ def serialize_results(results):
                 # burst-confirmed indicators survive a regroup. Previously this
                 # was always None, wiping per-burst confirmation state every
                 # time a slider moved even though the underlying tags persist.
-                burst_species = [p.get("confirmed_species") for p in burst]
-                burst_set = {s for s in burst_species if s}
-                if burst and len(burst_set) == 1 and all(s for s in burst_species):
-                    burst_override = {
-                        "species": next(iter(burst_set)),
-                        "confirmed": True,
-                    }
+                if _photos_uniformly_confirmed(burst):
+                    burst_override = build_species_override(
+                        photo_confirmed_species_list(burst[0]),
+                    )
                 else:
                     burst_override = None
                 s_enc["bursts"].append({

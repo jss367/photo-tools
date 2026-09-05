@@ -7620,7 +7620,11 @@ def test_encounter_species_confirm_single_burst_does_not_detach(app_and_db):
     assert len(updated["encounters"]) == 1
     enc = updated["encounters"][0]
     assert len(enc["bursts"]) == 1
-    assert enc["bursts"][0]["species_override"] == {"species": "Golden Eagle", "confirmed": True}
+    assert enc["bursts"][0]["species_override"] == {
+        "species": "Golden Eagle",
+        "confirmed": True,
+        "species_list": ["Golden Eagle"],
+    }
 
 
 def test_encounter_species_burst_confirm_does_not_detach_on_variant_spelling(app_and_db):
@@ -22776,3 +22780,262 @@ def test_compare_canonical_display_keeps_raw_when_only_case_differs(
     # The keyword comparison still uses the case-applying resolution, since
     # that is the spelling add_keyword would land on.
     assert db.resolve_species_display_name("Bubulcus ibis") == "Bubulcus Ibis"
+
+
+# -- Multi-species burst confirmation (issue #1298) ---------------------------
+
+
+def _species_names(db, pid):
+    return db.get_species_keywords_for_photos([pid]).get(pid, [])
+
+
+def test_encounter_species_add_mode_keeps_existing_species(app_and_db):
+    """``add`` confirms a second species alongside the first: nothing is
+    untagged, the burst override lists both, and no detach happens."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    burst_ids, other_ids = photo_ids[:2], photo_ids[2:]
+    path = _seed_encounter_cache(
+        app, db, photo_ids, confirmed_species="Green-winged Teal",
+        bursts=[
+            {"photo_ids": burst_ids, "species_predictions": [],
+             "species_override": {"species": "Green-winged Teal", "confirmed": True}},
+            {"photo_ids": other_ids, "species_predictions": [], "species_override": None},
+        ],
+    )
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    for pid in burst_ids:
+        db.tag_photo(pid, teal)
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "American Wigeon", "photo_ids": burst_ids,
+        "burst_index": 0, "add": True,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert body["mode"] == "add"
+    assert body["previous_species"] is None
+    assert body["species_list"] == ["Green-winged Teal", "American Wigeon"]
+
+    for pid in burst_ids:
+        assert _species_names(db, pid) == ["American Wigeon", "Green-winged Teal"]
+
+    with open(path) as f:
+        updated = _json.load(f)
+    assert len(updated["encounters"]) == 1, "add must never auto-detach"
+    ovr = updated["encounters"][0]["bursts"][0]["species_override"]
+    assert ovr == {
+        "species": "Green-winged Teal",
+        "confirmed": True,
+        "species_list": ["Green-winged Teal", "American Wigeon"],
+    }
+    history = db.get_edit_history()
+    assert history[0]["action_type"] == "keyword_add"
+
+
+def test_encounter_species_replace_named_previous_on_two_species_burst(app_and_db):
+    """``previous_species`` picks which entry of a two-species burst a replace
+    swaps out; the other subject's keyword survives."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    path = _seed_encounter_cache(
+        app, db, photo_ids, confirmed_species="Green-winged Teal",
+        bursts=[{
+            "photo_ids": photo_ids, "species_predictions": [],
+            "species_override": {
+                "species": "Green-winged Teal", "confirmed": True,
+                "species_list": ["Green-winged Teal", "American Wigeon"],
+            },
+        }],
+    )
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    wigeon = db.add_keyword("American Wigeon", is_species=True)
+    for pid in photo_ids:
+        db.tag_photo(pid, teal)
+        db.tag_photo(pid, wigeon)
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "Gadwall", "photo_ids": photo_ids, "burst_index": 0,
+        "previous_species": "american wigeon",
+    })
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert body["mode"] == "replace"
+    assert body["previous_species"] == "American Wigeon"
+    assert body["species_list"] == ["Green-winged Teal", "Gadwall"]
+    for pid in photo_ids:
+        assert _species_names(db, pid) == ["Gadwall", "Green-winged Teal"]
+
+    with open(path) as f:
+        updated = _json.load(f)
+    ovr = updated["encounters"][0]["bursts"][0]["species_override"]
+    assert ovr["species"] == "Green-winged Teal"
+    assert ovr["species_list"] == ["Green-winged Teal", "Gadwall"]
+    # The burst still shares the encounter's teal, so it stays put.
+    assert len(updated["encounters"]) == 1
+
+    # Undo restores the wigeon and drops the gadwall, leaving the teal alone.
+    assert client.post("/api/undo").status_code == 200
+    for pid in photo_ids:
+        assert _species_names(db, pid) == ["American Wigeon", "Green-winged Teal"]
+
+
+def test_encounter_species_replace_rejects_unknown_previous(app_and_db):
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    _seed_encounter_cache(app, db, photo_ids, confirmed_species="Green-winged Teal")
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "Gadwall", "photo_ids": photo_ids,
+        "previous_species": "Mallard",
+    })
+    assert resp.status_code == 400
+    assert "not a confirmed species" in resp.get_json()["error"]
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "Gadwall", "photo_ids": photo_ids, "add": True, "remove": True,
+    })
+    assert resp.status_code == 400
+
+
+def test_encounter_species_remove_mode_untags_one_species(app_and_db):
+    """``remove`` drops one species from a two-species burst: the keyword is
+    untagged, a sidecar remove is queued, the list shrinks, and undo restores
+    it."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    path = _seed_encounter_cache(
+        app, db, photo_ids, confirmed_species="Green-winged Teal",
+        bursts=[{
+            "photo_ids": photo_ids, "species_predictions": [],
+            "species_override": {
+                "species": "Green-winged Teal", "confirmed": True,
+                "species_list": ["Green-winged Teal", "American Wigeon"],
+            },
+        }],
+    )
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    wigeon = db.add_keyword("American Wigeon", is_species=True)
+    for pid in photo_ids:
+        db.tag_photo(pid, teal)
+        db.tag_photo(pid, wigeon)
+    db.conn.execute("DELETE FROM pending_changes")
+    db.conn.commit()
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "American Wigeon", "photo_ids": photo_ids,
+        "burst_index": 0, "remove": True,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert body["mode"] == "remove"
+    assert body["keyword_id"] == wigeon
+    assert body["species_list"] == ["Green-winged Teal"]
+    for pid in photo_ids:
+        assert _species_names(db, pid) == ["Green-winged Teal"]
+    pending = db.conn.execute(
+        "SELECT change_type, value FROM pending_changes"
+    ).fetchall()
+    assert {(r["change_type"], r["value"]) for r in pending} == {
+        ("keyword_remove", "American Wigeon")
+    }
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM keywords WHERE name = 'American Wigeon'"
+    ).fetchone()[0] == 1, "remove must not create keyword rows"
+
+    with open(path) as f:
+        updated = _json.load(f)
+    ovr = updated["encounters"][0]["bursts"][0]["species_override"]
+    assert ovr == {
+        "species": "Green-winged Teal",
+        "confirmed": True,
+        "species_list": ["Green-winged Teal"],
+    }
+
+    history = db.get_edit_history()
+    assert history[0]["action_type"] == "species_replace"
+    assert history[0]["description"].startswith('Removed species "American Wigeon"')
+    assert client.post("/api/undo").status_code == 200
+    for pid in photo_ids:
+        assert _species_names(db, pid) == ["American Wigeon", "Green-winged Teal"]
+
+
+def test_encounter_species_remove_last_species_clears_encounter_confirmation(app_and_db):
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    path = _seed_encounter_cache(app, db, photo_ids, confirmed_species="Green-winged Teal")
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    for pid in photo_ids:
+        db.tag_photo(pid, teal)
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "Green-winged Teal", "photo_ids": photo_ids, "remove": True,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    assert resp.get_json()["species_list"] == []
+    for pid in photo_ids:
+        assert _species_names(db, pid) == []
+    import json as _json
+    with open(path) as f:
+        enc = _json.load(f)["encounters"][0]
+    assert enc["species_confirmed"] is False
+    assert enc["confirmed_species"] is None
+    assert enc["confirmed_species_list"] == []
+
+
+def test_encounter_species_replace_detaches_only_when_no_species_shared(app_and_db):
+    """A two-species burst that still shares one species with its encounter
+    is not split off when the *other* species is replaced; once nothing is
+    shared, it detaches and carries both species into the new encounter."""
+    import json as _json
+    app, db = app_and_db
+    client = app.test_client()
+    photo_ids = [p["id"] for p in db.conn.execute("SELECT id FROM photos").fetchall()]
+    burst_ids, other_ids = photo_ids[:2], photo_ids[2:]
+    path = _seed_encounter_cache(
+        app, db, photo_ids, confirmed_species="Green-winged Teal",
+        bursts=[
+            {"photo_ids": burst_ids, "species_predictions": [],
+             "species_override": {
+                 "species": "Green-winged Teal", "confirmed": True,
+                 "species_list": ["Green-winged Teal", "American Wigeon"],
+             }},
+            {"photo_ids": other_ids, "species_predictions": [],
+             "species_override": None},
+        ],
+    )
+    teal = db.add_keyword("Green-winged Teal", is_species=True)
+    wigeon = db.add_keyword("American Wigeon", is_species=True)
+    for pid in burst_ids:
+        db.tag_photo(pid, teal)
+        db.tag_photo(pid, wigeon)
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "Gadwall", "photo_ids": burst_ids, "burst_index": 0,
+        "previous_species": "American Wigeon",
+    })
+    assert resp.status_code == 200, resp.get_json()
+    assert len(resp.get_json()["encounters"]) == 1
+
+    resp = client.post("/api/encounters/species", json={
+        "species": "Mallard", "photo_ids": burst_ids, "burst_index": 0,
+        "previous_species": "Green-winged Teal",
+    })
+    assert resp.status_code == 200, resp.get_json()
+    with open(path) as f:
+        encounters = _json.load(f)["encounters"]
+    assert len(encounters) == 2
+    detached = next(e for e in encounters if burst_ids[0] in e["photo_ids"])
+    assert detached["species_confirmed"] is True
+    assert detached["confirmed_species"] == "Mallard"
+    assert sorted(detached["confirmed_species_list"]) == ["Gadwall", "Mallard"]
+    for pid in burst_ids:
+        assert _species_names(db, pid) == ["Gadwall", "Mallard"]

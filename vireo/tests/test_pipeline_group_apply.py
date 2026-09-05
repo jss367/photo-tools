@@ -388,3 +388,36 @@ def test_state_endpoint_gates_representative_on_current_eligibility(app_and_db):
     })
     assert resp.status_code == 200
     assert resp.get_json()['photos'][str(untagged_id)]['is_species_representative'] is False
+
+
+def test_state_endpoint_reports_each_listed_species(app_and_db):
+    """``species_list`` resolves every name independently so a two-species
+    burst can tell which frames still lack which keyword."""
+    app, db = app_and_db
+    pids = _photo_ids(db)
+    both_id, teal_only_id, none_id = pids[0], pids[1], pids[2]
+    teal = db.add_keyword('Green-winged Teal', is_species=True)
+    wigeon = db.add_keyword('American Wigeon', is_species=True)
+    db.tag_photo(both_id, teal)
+    db.tag_photo(both_id, wigeon)
+    db.tag_photo(teal_only_id, teal)
+    client = app.test_client()
+
+    resp = client.post('/api/pipeline/group/state', json={
+        'photo_ids': [both_id, teal_only_id, none_id],
+        'species': 'Green-winged Teal',
+        'species_list': ['Green-winged Teal', 'American Wigeon', 'Gadwall'],
+    })
+    assert resp.status_code == 200
+    photos = resp.get_json()['photos']
+    assert photos[str(both_id)]['has_species_keyword'] is True
+    assert photos[str(both_id)]['has_species_keywords'] == {
+        'Green-winged Teal': True, 'American Wigeon': True, 'Gadwall': False,
+    }
+    assert photos[str(teal_only_id)]['has_species_keywords'] == {
+        'Green-winged Teal': True, 'American Wigeon': False, 'Gadwall': False,
+    }
+    assert photos[str(none_id)]['has_species_keyword'] is False
+    assert photos[str(none_id)]['has_species_keywords'] == {
+        'Green-winged Teal': False, 'American Wigeon': False, 'Gadwall': False,
+    }

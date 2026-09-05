@@ -1344,3 +1344,167 @@ def test_rapid_review_adopts_detach_restructure_without_clobbering_cache(live_se
     # The sibling that kept the original species was NOT given the divergent one.
     sibling = next(e for e in saved["encounters"] if e["photo_ids"] == [2])
     assert sibling["species"] == ["Original bird"]
+
+
+# -- Multi-species bursts (issue #1298) --------------------------------------
+
+
+def _two_species_results():
+    return {
+        "photos": [
+            {"id": 1, "filename": "a.jpg", "label": "REVIEW", "quality_composite": 0.3, "subject_tenengrad": 10,
+             "confirmed_species": "American Wigeon",
+             "confirmed_species_list": ["American Wigeon", "Green-winged Teal"]},
+            {"id": 2, "filename": "b.jpg", "label": "REVIEW", "quality_composite": 0.6, "subject_tenengrad": 20,
+             "confirmed_species": "American Wigeon",
+             "confirmed_species_list": ["American Wigeon", "Green-winged Teal"]},
+            {"id": 3, "filename": "c.jpg", "label": "REVIEW", "quality_composite": 0.9, "subject_tenengrad": 30,
+             "confirmed_species": "American Wigeon",
+             "confirmed_species_list": ["American Wigeon", "Green-winged Teal"]},
+        ],
+        "encounters": [
+            {
+                "photo_ids": [1, 2, 3],
+                "photo_count": 3,
+                "burst_count": 1,
+                "species": ["American Wigeon"],
+                "species_confirmed": True,
+                "confirmed_species": "American Wigeon",
+                "confirmed_species_list": ["American Wigeon", "Green-winged Teal"],
+                "bursts": [{
+                    "photo_ids": [1, 2, 3],
+                    "species_override": {
+                        "species": "American Wigeon",
+                        "confirmed": True,
+                        "species_list": ["American Wigeon", "Green-winged Teal"],
+                    },
+                }],
+            }
+        ],
+        "summary": {"keep_count": 0, "review_count": 3, "reject_count": 0},
+    }
+
+
+def _two_species_state():
+    both = {"American Wigeon": True, "Green-winged Teal": True}
+    return {
+        "1": {"flag": "none", "has_species_keyword": True, "has_species_keywords": both},
+        "2": {"flag": "none", "has_species_keyword": True, "has_species_keywords": both},
+        "3": {"flag": "none", "has_species_keyword": True, "has_species_keywords": both},
+    }
+
+
+def test_rapid_review_two_species_burst_prefills_both_and_is_not_queued(live_server, page):
+    _mock_pipeline_rapid_review(
+        page, results=_two_species_results(), state_photos=_two_species_state(),
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+    # Fully confirmed on both subjects: nothing left to tag, no species change.
+    expect(page.locator("#applyBtn")).to_have_text("Apply: no DB changes")
+    expect(page.locator(".reason-chip", has_text="No species")).to_have_count(0)
+    expect(page.locator(".reason-chip", has_text="Mixed species")).to_have_count(0)
+
+
+def _fill_species_and_settle(page, value):
+    """Type a species list and wait for the debounced keyword-state refresh,
+    so Apply plans against the server's per-species keyword state rather than
+    the conservative "everything missing" placeholder."""
+    with page.expect_response("**/api/pipeline/group/state"):
+        page.locator("#speciesInput").fill(value)
+    # The response event fires before the page's .then() handler runs; wait
+    # for the snapshot to be adopted so a click can't plan against the
+    # pre-refresh placeholder state.
+    page.wait_for_function(
+        "(v) => window.rapid && rapid.keywordStateSpecies === v", arg=value,
+    )
+
+
+def test_rapid_review_swapping_one_species_replaces_only_that_species(live_server, page):
+    species_payloads = []
+    _mock_pipeline_rapid_review(
+        page, results=_two_species_results(), state_photos=_two_species_state(),
+        species_payloads=species_payloads,
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+
+    _fill_species_and_settle(page, "American Wigeon, Gadwall")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Set species · Tag 3")
+    expect(page.locator("#applyBtn")).to_have_attribute(
+        "title",
+        'Apply will set confirmed species to "American Wigeon, Gadwall", '
+        'add species keywords "American Wigeon, Gadwall" to 3 burst frames.',
+    )
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+
+    # One replace, scoped to the dropped species: the wigeon is untouched.
+    assert len(species_payloads) == 1, species_payloads
+    body = species_payloads[0]
+    assert body["species"] == "Gadwall"
+    assert body["previous_species"] == "Green-winged Teal"
+    assert body["burst_index"] == 0
+    assert sorted(body["photo_ids"]) == [1, 2, 3]
+    assert "add" not in body and "remove" not in body
+
+
+def test_rapid_review_adding_a_species_posts_add_mode(live_server, page):
+    species_payloads = []
+    _mock_pipeline_rapid_review(
+        page, results=_two_species_results(), state_photos=_two_species_state(),
+        species_payloads=species_payloads,
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+
+    _fill_species_and_settle(page, "American Wigeon, Green-winged Teal, Gadwall")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Set species · Tag 3")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+
+    assert len(species_payloads) == 1, species_payloads
+    assert species_payloads[0]["species"] == "Gadwall"
+    assert species_payloads[0]["add"] is True
+    assert "previous_species" not in species_payloads[0]
+
+
+def test_rapid_review_dropping_a_species_posts_remove_mode(live_server, page):
+    species_payloads = []
+    _mock_pipeline_rapid_review(
+        page, results=_two_species_results(), state_photos=_two_species_state(),
+        species_payloads=species_payloads,
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+
+    _fill_species_and_settle(page, "American Wigeon")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: Set species")
+    expect(page.locator("#applyBtn")).to_have_attribute(
+        "title",
+        'Apply will set confirmed species to "American Wigeon", '
+        'remove species keyword "Green-winged Teal" from every burst frame.',
+    )
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+
+    assert len(species_payloads) == 1, species_payloads
+    assert species_payloads[0]["species"] == "Green-winged Teal"
+    assert species_payloads[0]["remove"] is True
+    assert species_payloads[0]["burst_index"] == 0
+
+
+def test_rapid_review_clearing_species_field_removes_nothing(live_server, page):
+    species_payloads = []
+    _mock_pipeline_rapid_review(
+        page, results=_two_species_results(), state_photos=_two_species_state(),
+        species_payloads=species_payloads,
+    )
+    _goto_rapid_review(page, live_server, "?enc=0&burst=0")
+    expect(page.locator("#speciesInput")).to_have_value("American Wigeon, Green-winged Teal")
+
+    _fill_species_and_settle(page, "")
+    expect(page.locator("#applyBtn")).to_have_text("Apply: no DB changes")
+    with page.expect_response("**/api/pipeline/save-cache"):
+        page.locator("#applyBtn").click()
+    assert species_payloads == []

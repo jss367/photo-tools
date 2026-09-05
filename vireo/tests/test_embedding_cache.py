@@ -573,3 +573,133 @@ def test_concurrent_manifest_updates_do_not_lose_entries(tmp_path):
     assert set(manifest) == {
         f"{identity_digest(identity)}.npy" for identity in identities
     }
+
+
+# ---------------------------------------------------------------------------
+# Resumable checkpoints: a paused/cancelled/crashed producer keeps its work
+# ---------------------------------------------------------------------------
+
+
+def _rows(count, dim=4, start=1):
+    return [
+        np.full(dim, start + i, dtype=np.float32) for i in range(count)
+    ]
+
+
+def test_checkpoint_roundtrip_is_keyed_by_identity(tmp_path):
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity(labels=("bird", "cat", "dog"))
+    checkpoint = cache.checkpoint_for(identity)
+    assert checkpoint.load() is None
+
+    checkpoint.save(_rows(2))
+    loaded = checkpoint.load()
+    assert loaded.shape == (2, 4)
+    assert np.array_equal(loaded, np.stack(_rows(2)))
+
+    # A different text-side identity must never see another run's rows.
+    other = cache.checkpoint_for(
+        _identity(labels=("bird", "cat", "dog"), suffix="b")
+    )
+    assert other.load() is None
+
+    # The final payload path is untouched by partial progress.
+    assert not os.path.exists(cache.path_for(identity))
+
+
+def test_checkpoint_rejects_unusable_partials_and_removes_them(tmp_path):
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity(labels=("bird", "cat", "dog"))
+    checkpoint = cache.checkpoint_for(identity)
+
+    # More rows than labels can never be a prefix of this identity.
+    with pytest.raises(ValueError):
+        checkpoint.save(_rows(5))
+    assert checkpoint.load() is None
+
+    # A width that disagrees with the image encoder is rejected on load.
+    checkpoint.save(_rows(2))
+    assert checkpoint.load(embedding_dim=8) is None
+    assert not os.path.exists(checkpoint.path), (
+        "an unusable checkpoint must be unlinked so the next producer "
+        "does not keep tripping over it"
+    )
+
+    # Non-finite rows written by an interrupted process are discarded too.
+    os.makedirs(checkpoint.cache_dir, exist_ok=True)
+    bad = np.full((2, 4), np.nan, dtype=np.float32)
+    np.save(checkpoint.path, bad, allow_pickle=False)
+    assert checkpoint.load() is None
+    assert not os.path.exists(checkpoint.path)
+
+    # Truncated bytes are handled the same way.
+    with open(checkpoint.path, "wb") as handle:
+        handle.write(b"\x93NUMPY")
+    assert checkpoint.load() is None
+    assert not os.path.exists(checkpoint.path)
+
+
+def test_checkpoint_save_with_no_rows_clears_stale_file(tmp_path):
+    cache = EmbeddingCache(tmp_path / "cache")
+    checkpoint = cache.checkpoint_for(_identity(labels=("bird", "cat")))
+    checkpoint.save(_rows(1))
+    assert os.path.exists(checkpoint.path)
+    checkpoint.save([])
+    assert not os.path.exists(checkpoint.path)
+
+
+def test_publishing_the_full_payload_discards_the_checkpoint(tmp_path):
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity()
+    checkpoint = cache.checkpoint_for(identity)
+    checkpoint.save(_rows(1))
+    assert os.path.exists(checkpoint.path)
+
+    value, _ = cache.get_or_compute(identity, _payload)
+
+    assert np.array_equal(value, _payload())
+    assert os.path.exists(cache.path_for(identity))
+    assert not os.path.exists(checkpoint.path), (
+        "a complete payload supersedes partial progress; leaving the "
+        "checkpoint behind would waste disk and confuse the next resume"
+    )
+
+
+def test_producer_pause_wakes_waiter_and_waiter_takes_over(tmp_path):
+    """A producer that steps down for Pause (checkpointing its progress)
+    must not poison the key: the waiter retries and becomes the producer,
+    exactly as it does when the producer was cancelled."""
+
+    class ClassifierLoadPaused(RuntimeError):
+        pass
+
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity()
+    producer_started = threading.Event()
+    pause_producer = threading.Event()
+    waiter_computed = threading.Event()
+
+    def paused_compute():
+        producer_started.set()
+        assert pause_producer.wait(2)
+        cache.checkpoint_for(identity).save(_rows(1))
+        raise ClassifierLoadPaused("classifier load paused")
+
+    def healthy_compute():
+        waiter_computed.set()
+        # The replacement producer sees the checkpoint the first one left.
+        assert cache.checkpoint_for(identity).load() is not None
+        return _payload(value=2)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        producer = pool.submit(cache.get_or_compute, identity, paused_compute)
+        assert producer_started.wait(2)
+        waiter = pool.submit(cache.get_or_compute, identity, healthy_compute)
+        pause_producer.set()
+        with pytest.raises(ClassifierLoadPaused):
+            producer.result(timeout=2)
+        value, _ = waiter.result(timeout=2)
+
+    assert waiter_computed.is_set()
+    assert np.array_equal(value, _payload(value=2))
+    assert not os.path.exists(cache.checkpoint_for(identity).path)

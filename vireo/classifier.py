@@ -18,6 +18,26 @@ class ClassificationCancelled(RuntimeError):
     """Raised when caller-local cancellation interrupts classifier setup."""
 
 
+class ClassifierLoadPaused(RuntimeError):
+    """Raised when a pause request interrupts classifier setup.
+
+    Classifier construction runs under shared single-flight locks
+    (``ModelCache`` entry load lock, ``EmbeddingCache`` flight), so the
+    factory must not park there. Instead it checkpoints the label
+    embeddings finished so far, raises this, and lets the owning job park
+    at its normal pause boundary with every lock released. On Resume the
+    job re-enters construction and the computation continues from the
+    checkpoint. Both caches treat this like a producer-local cancel:
+    healthy waiters retry rather than inherit it.
+    """
+
+
+# Persist partial label embeddings every this many labels so a crash or
+# hard stop loses at most one interval of text-encoder work. Pause and
+# Cancel always checkpoint before unwinding regardless of this cadence.
+_EMBEDDING_CHECKPOINT_INTERVAL = 10
+
+
 CACHE_DIR = os.path.expanduser("~/.vireo/embedding_cache")
 _MANIFEST_PATH = os.path.join(CACHE_DIR, "manifest.json")
 
@@ -330,6 +350,8 @@ def _compute_embeddings_with_progress(
     progress_callback=None,
     cancel_check=None,
     model_dir=None,
+    pause_check=None,
+    checkpoint=None,
 ):
     """Compute text embeddings for labels with progress logging.
 
@@ -343,19 +365,52 @@ def _compute_embeddings_with_progress(
         labels: list of label strings
         progress_callback: optional callable(current, total) for UI progress
         cancel_check: optional callable() -> bool checked between labels
+        pause_check: optional callable() -> bool checked between labels;
+            when it reports a pause request the finished labels are
+            checkpointed and :class:`ClassifierLoadPaused` is raised so the
+            caller can park outside any shared lock
+        checkpoint: optional ``EmbeddingCheckpoint``; when given, resumes
+            from its saved rows and persists progress periodically and on
+            every pause/cancel unwind
 
     Returns:
         numpy float32 array of shape (embedding_dim, num_labels) --
         transposed so it can be used directly for matmul with image features
     """
     total = len(labels)
-    log.info("Computing label embeddings: 0/%d", total)
-    if progress_callback:
-        progress_callback(0, total)
 
     all_features = []
-    for i, classname in enumerate(labels):
+    resumed = checkpoint.load() if checkpoint is not None else None
+    if resumed is not None:
+        all_features = [row for row in resumed]
+        log.info(
+            "Resuming label embeddings from checkpoint: %d/%d",
+            len(all_features), total,
+        )
+    else:
+        log.info("Computing label embeddings: 0/%d", total)
+    start = len(all_features)
+    if progress_callback:
+        progress_callback(start, total)
+
+    def _persist():
+        if checkpoint is not None and len(all_features) > start:
+            try:
+                checkpoint.save(all_features)
+            except (OSError, ValueError):
+                # Checkpointing is an optimisation; the computation itself
+                # is unaffected if the partial file cannot be written.
+                log.warning(
+                    "Could not write label-embedding checkpoint", exc_info=True,
+                )
+
+    for i in range(start, total):
+        classname = labels[i]
+        if pause_check and pause_check():
+            _persist()
+            raise ClassifierLoadPaused("classifier load paused")
         if cancel_check and cancel_check():
+            _persist()
             raise ClassificationCancelled("classification cancelled")
         txts = [template(classname) for template in OPENAI_IMAGENET_TEMPLATE]
         tokens = _tokenize(tokenizer, txts)
@@ -371,9 +426,16 @@ def _compute_embeddings_with_progress(
         all_features.append(mean_feature)
 
         done = i + 1
+        if (
+            checkpoint is not None
+            and done < total
+            and (done - start) % _EMBEDDING_CHECKPOINT_INTERVAL == 0
+        ):
+            _persist()
         if progress_callback:
             progress_callback(done, total)
         if cancel_check and cancel_check():
+            _persist()
             raise ClassificationCancelled("classification cancelled")
         if done % 50 == 0 or done == total:
             log.info("Computing label embeddings: %d/%d", done, total)
@@ -392,6 +454,7 @@ def _load_or_compute_label_embeddings(
     progress_callback=None,
     cancel_check=None,
     embedding_dim=None,
+    pause_check=None,
 ):
     """Resolve custom-label embeddings through the shared cache service.
 
@@ -399,6 +462,11 @@ def _load_or_compute_label_embeddings(
     when supplied, cached payloads with a mismatched first axis are rejected
     so a malformed file cannot slip past to fail at inference time on
     ``img_features @ txt_embeddings``.
+
+    ``pause_check`` lets the producer step down for a pause request
+    without parking inside the single-flight: progress is checkpointed and
+    :class:`ClassifierLoadPaused` propagates to the caller, which parks and
+    retries. Cached hits never raise it.
     """
     from embedding_cache import (
         EmbeddingWaitCancelled,
@@ -420,8 +488,11 @@ def _load_or_compute_label_embeddings(
 
     initial_identity = _embedding_identity(classes, model_str, model_dir)
     cache = _embedding_cache_service()
+    checkpoint = cache.checkpoint_for(initial_identity)
 
     def _compute():
+        if pause_check and pause_check():
+            raise ClassifierLoadPaused("classifier load paused")
         if cancel_check and cancel_check():
             raise ClassificationCancelled("classification cancelled")
         text_session = onnx_runtime.create_session_with_self_heal(
@@ -438,6 +509,8 @@ def _load_or_compute_label_embeddings(
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
                 model_dir=model_dir,
+                pause_check=pause_check,
+                checkpoint=checkpoint,
             )
         finally:
             del text_session
@@ -485,8 +558,14 @@ def precompute_label_embeddings(
     *,
     progress_callback=None,
     cancel_check=None,
+    pause_check=None,
 ):
-    """Populate custom-label embeddings without loading the image encoder."""
+    """Populate custom-label embeddings without loading the image encoder.
+
+    Raises :class:`ClassifierLoadPaused` when ``pause_check`` reports a
+    pause mid-computation; progress is checkpointed, so the caller should
+    park and call again once resumed.
+    """
     model_dir = _resolve_model_dir(model_str, pretrained_str)
     if model_dir is None:
         raise ValueError(
@@ -503,6 +582,7 @@ def precompute_label_embeddings(
         redownload=redownload,
         progress_callback=progress_callback,
         cancel_check=cancel_check,
+        pause_check=pause_check,
     )
     return len(classes)
 
@@ -522,6 +602,10 @@ class Classifier:
         embedding_progress_callback: optional callable(current, total) for
                                      embedding computation progress
         cancel_check: optional callable() -> bool checked during slow setup
+        pause_check: optional callable() -> bool checked between label
+                embeddings; a pause request checkpoints progress and raises
+                ClassifierLoadPaused so the caller can park outside shared
+                locks and construct again after Resume
     """
 
     def __init__(
@@ -531,6 +615,7 @@ class Classifier:
         pretrained_str=None,
         embedding_progress_callback=None,
         cancel_check=None,
+        pause_check=None,
     ):
         # Resolve model directory.
         # pretrained_str may be a configured weights_path (e.g. from a custom
@@ -630,6 +715,7 @@ class Classifier:
                     progress_callback=embedding_progress_callback,
                     cancel_check=cancel_check,
                     embedding_dim=expected_dim,
+                    pause_check=pause_check,
                 )
 
             expected_embedding_dim = _image_encoder_embedding_dim(

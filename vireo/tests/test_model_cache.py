@@ -341,10 +341,10 @@ def _cancellation_exception_classes():
     fresh entry. Parameterizing over both classes keeps one test body
     and prevents the two identical shapes from drifting.
     """
-    from classifier import ClassificationCancelled
+    from classifier import ClassificationCancelled, ClassifierLoadPaused
     from resource_ledger import ResourceWaitCancelled
 
-    return [ClassificationCancelled, ResourceWaitCancelled]
+    return [ClassificationCancelled, ResourceWaitCancelled, ClassifierLoadPaused]
 
 
 @pytest.mark.parametrize("exc_class", _cancellation_exception_classes())

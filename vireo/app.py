@@ -20674,9 +20674,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         if not os.path.isdir(CACHE_DIR):
             return jsonify({"entries": [], "total_size": 0})
+        from embedding_cache import CHECKPOINT_SUFFIX
+
         entries = []
         total_size = 0
         for f in sorted(os.listdir(CACHE_DIR)):
+            if f.endswith(CHECKPOINT_SUFFIX):
+                # Partial progress from a paused or interrupted
+                # computation, not a usable embedding set.
+                continue
             if f.endswith(".npy") or f.endswith(".pt"):
                 fp = os.path.join(CACHE_DIR, f)
                 size = os.path.getsize(fp)
@@ -20790,15 +20796,41 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     },
                 )
 
+            from classifier import ClassifierLoadPaused
+
+            def _pause_requested():
+                return ctx.runner.pause_requested(job["id"])
+
+            def _cancelled():
+                # Pure cancel probe: the pause is handled by the retry
+                # loop below, outside the embedding single-flight, so the
+                # producer never parks while equal-key waiters are joined.
+                return ctx.runner.cancellation_requested(job["id"])
+
             # The shared service loads only the text side and joins an
             # equal-key pipeline/precompute already doing this work.
-            precompute_label_embeddings(
-                labels=labels,
-                model_str=model["model_str"],
-                pretrained_str=model["weights_path"],
-                progress_callback=_progress,
-                cancel_check=lambda: ctx.runner.is_cancelled(job["id"]),
-            )
+            while True:
+                try:
+                    precompute_label_embeddings(
+                        labels=labels,
+                        model_str=model["model_str"],
+                        pretrained_str=model["weights_path"],
+                        progress_callback=_progress,
+                        cancel_check=_cancelled,
+                        pause_check=_pause_requested,
+                    )
+                    break
+                except ClassifierLoadPaused:
+                    # Progress is checkpointed. Park here with no shared
+                    # lock held; the next attempt resumes from the
+                    # checkpoint. A Cancel during the pause surfaces on
+                    # the retry through the cancel probe.
+                    log.info(
+                        "Pre-computing embeddings paused; parking until "
+                        "Resume",
+                    )
+                    ctx.runner.is_cancelled(job["id"])
+                    continue
 
             return {"labels": len(labels), "model": model["name"]}
 
@@ -20809,6 +20841,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "model_id": model_id,
                 "labels_file": labels_file,
             },
+            pausable=True,
             runtime_warning=build_cpu_runtime_warning(
                 "precompute-embeddings",
                 work_units=runtime_warning_work_units(

@@ -2987,3 +2987,29 @@ def test_cull_history_preserves_analysis_scope_and_unrelated_suggestions(live_se
     for pid, action in zip(ids[:2], actions, strict=True):
         expect(page.locator(f'.cull-card[data-photo-id="{pid}"]')).to_have_class(re.compile(r'\b' + action + r'\b'))
     assert page.evaluate('JSON.stringify(pipelineResults.encounters) === window.cullAnalysisBefore')
+
+
+def test_rapid_review_can_retry_a_failed_history_refresh(live_server, page):
+    ids = live_server['data']['photos'][:4]
+    _write_grouped_pipeline_cache(live_server, ids)
+    page.goto(live_server['url'] + '/pipeline/rapid-review')
+    page.wait_for_function('rapid.seeded')
+    page.evaluate("changeQueue({filter: 'all'})")
+    page.wait_for_function('rapid.seeded')
+    page.evaluate("decideCurrent('reject')")
+    page.evaluate('applyCurrent(false)')
+    page.wait_for_function('rapid.seeded && !rapid.applying')
+    rejected = page.evaluate("Object.values(rapid.photoMap).find(p => p.flag === 'rejected').id")
+    page.route('**/api/pipeline/results', lambda route: route.fulfill(status=503, json={'error': 'Try again'}))
+    page.locator('#historyUndoBtn').click()
+    retry = page.get_by_role('button', name='Retry', exact=True)
+    expect(retry).to_be_visible()
+    page.evaluate('doRedo()')
+    expect(page.get_by_text('Rapid Review could not load. Use Retry before undoing or redoing saved edits.', exact=True)).to_be_visible()
+    assert live_server['db'].get_photo(rejected)['flag'] == 'none'
+    page.unroute('**/api/pipeline/results')
+    retry.click()
+    page.wait_for_function('rapid.seeded && !rapid.applying && !rapid.loadError')
+    assert page.evaluate('(id) => rapid.photoMap[id].flag', rejected) == 'none'
+    page.locator('#historyRedoBtn').click()
+    page.wait_for_function('(id) => rapid.photoMap[id].flag === "rejected" && rapid.seeded', arg=rejected)

@@ -675,6 +675,7 @@ var rapid = {
   seeded: false,
   applying: false,
   loadError: false,
+  historyRefreshFailed: false,
   zoomed: false,
   zoomPhotoId: null,
   zoomAnchor: null,
@@ -1085,6 +1086,10 @@ function requestOpenSession(index) {
 }
 
 window.beforeHistoryChange = function() {
+  if (rapid.loadError) {
+    showToast('Rapid Review could not load. Use Retry before undoing or redoing saved edits.', 'error');
+    return false;
+  }
   if (rapid.applying || (rapid.sessionIndex >= 0 && !rapid.seeded)) {
     showToast('Wait for Rapid Review to finish loading or saving.', 'info');
     return false;
@@ -1097,6 +1102,8 @@ window.beforeHistoryChange = function() {
 };
 
 window.afterHistoryChange = async function() {
+  rapid.loadError = false;
+  rapid.historyRefreshFailed = false;
   var previous = rapid.sessions[rapid.sessionIndex];
   var previousIds = previous ? previous.ids.slice() : [];
   rapid.openToken++;
@@ -1120,12 +1127,26 @@ window.afterHistoryChange = async function() {
     else showEmptyQueue();
   } catch (error) {
     rapid.loadError = true;
+    rapid.historyRefreshFailed = true;
+    rapid.seeded = false;
+    rapid.openToken++;
+    renderAll();
     throw error;
   } finally {
     rapid.applying = false;
     renderApplyState();
   }
 };
+
+async function retryRapidReview() {
+  if (rapid.applying) return;
+  try {
+    if (rapid.historyRefreshFailed) await window.afterHistoryChange();
+    else await openSession(rapid.sessionIndex);
+  } catch (error) {
+    showToast('Rapid Review could not refresh. Use Retry to try again.', 'error');
+  }
+}
 
 async function initRapidReview() {
   try {
@@ -1204,6 +1225,7 @@ function showEmptyQueue() {
 }
 
 async function openSession(index) {
+  if (rapid.historyRefreshFailed) return retryRapidReview();
   if (index < 0 || index >= rapid.sessions.length) return;
   rapid.sessionIndex = index;
   var session = rapid.sessions[index];
@@ -1513,7 +1535,7 @@ function renderCurrent() {
   document.getElementById('burstTitle').textContent = session ? session.title : 'Rapid Review';
   var subtitle = document.getElementById('burstSubtitle');
   if (rapid.loadError) {
-    subtitle.innerHTML = 'Failed to load burst state. <button type="button" class="rapid-inline-btn" onclick="openSession(rapid.sessionIndex)">Retry</button>';
+    subtitle.innerHTML = 'Failed to load burst state. <button type="button" class="rapid-inline-btn" onclick="retryRapidReview()">Retry</button>';
   } else {
     var queue = QUEUE_FILTERS[rapid.queue.filter] || QUEUE_FILTERS.all;
     var position = session ? ((rapid.sessionIndex + 1) + ' of ' + rapid.sessions.length + ' in ' + queue.label) : '';

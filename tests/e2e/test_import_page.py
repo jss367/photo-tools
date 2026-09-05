@@ -2918,11 +2918,24 @@ def test_import_after_move_target_pick_survives_refresh_or_unchecks(
     page.evaluate("() => { _afterMoveTargetsCheckedAt = 0; }")
     page.evaluate("() => document.dispatchEvent(new Event('visibilitychange'))")
     expect(chk).not_to_be_checked(timeout=10000)
-    expect(page.locator("#afterMoveUnavailable")).to_contain_text(
+    note = page.locator("#afterMoveUnavailable")
+    # Visible, not merely present: the refresh re-renders twice and the
+    # second pass must not hide the only explanation of the state change.
+    expect(note).to_be_visible()
+    expect(note).to_contain_text(
         '"Then move to NAS" was unchecked: Backup NAS is no longer available'
     )
     expect(page.locator("#afterMovePreview")).to_be_hidden()
     assert page.evaluate("afterMoveRequest()") is None
+    # The note survives an unrelated re-render, and clears once the user
+    # re-checks the box (acknowledging it) — the remaining target is then
+    # offered normally.
+    page.locator("#destInput").dispatch_event("input")
+    expect(note).to_be_visible()
+    chk.check()
+    expect(note).to_be_hidden()
+    expect(sel).to_have_value("nas1")
+    expect(page.locator("#afterMovePreview")).to_contain_text("/volume1/Photography")
 
 
 def test_import_new_workspace_shows_target_default_in_after_import_display(

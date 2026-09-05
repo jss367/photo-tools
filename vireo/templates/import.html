@@ -1897,6 +1897,7 @@ function refreshAfterMoveTargets() {
     });
 }
 
+let _afterMoveNotice = '';
 function updateAfterMoveUI() {
   const row = document.getElementById('afterMoveRow');
   const unavailable = document.getElementById('afterMoveUnavailable');
@@ -1904,6 +1905,7 @@ function updateAfterMoveUI() {
   const sel = document.getElementById('afterMoveTarget');
   if (!row || !unavailable || !preview || !sel) return;
   const hideAll = () => {
+    _afterMoveNotice = '';
     row.style.display = 'none';
     unavailable.style.display = 'none';
     preview.style.display = 'none';
@@ -1934,8 +1936,19 @@ function updateAfterMoveUI() {
     }
     return;
   }
-  unavailable.style.display = 'none';
   row.style.display = '';
+  const chk = document.getElementById('chkAfterMove');
+  // A "was unchecked" note must survive the re-renders that follow the
+  // refresh that produced it (renderImportDestModes → onImportDestModeChange
+  // → updateAfterMoveUI runs this twice); it clears when the user re-checks
+  // the box, i.e. acknowledges it.
+  if (_afterMoveNotice && !chk.checked) {
+    unavailable.textContent = _afterMoveNotice;
+    unavailable.style.display = '';
+  } else {
+    _afterMoveNotice = '';
+    unavailable.style.display = 'none';
+  }
   // Repopulate with the currently-eligible targets, preserving the user's
   // pick when it is still eligible; a single eligible target selects
   // itself (a freshly-populated select shows its first option).
@@ -1947,7 +1960,6 @@ function updateAfterMoveUI() {
     opt.textContent = t.name;
     sel.appendChild(opt);
   });
-  const chk = document.getElementById('chkAfterMove');
   if (eligible.some((t) => t.id === previous)) {
     sel.value = previous;
   } else if (previous) {
@@ -1964,10 +1976,11 @@ function updateAfterMoveUI() {
       sel.value = same.id;
     } else if (chk.checked) {
       chk.checked = false;
-      unavailable.textContent = '"Then move to NAS" was unchecked: '
+      _afterMoveNotice = '"Then move to NAS" was unchecked: '
         + (prevTarget ? prevTarget.name : 'the selected target')
         + ' is no longer available for this destination. Re-check it to '
         + 'pick another target.';
+      unavailable.textContent = _afterMoveNotice;
       unavailable.style.display = '';
     }
   }

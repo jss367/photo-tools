@@ -494,6 +494,80 @@ def test_verify_bumps_manifest_revision(app_and_db, tmp_path):
     assert after["revision"] == before["revision"] + 1
 
 
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+def test_verify_pauses_while_rechecking_manifest(
+    app_and_db, tmp_path, monkeypatch, count, action,
+):
+    from db import Database
+    from wait import wait_for_job
+
+    app, db = app_and_db
+    card_paths = set()
+    for i in range(count):
+        name = f"IMG_{i}.NEF"
+        _archive_photo(db, tmp_path, name=name)
+        card_paths.add(str(_card_file(tmp_path, name=name)))
+    manifest_dir = str(tmp_path / "manifests")
+    manifest = card_cleanup.scan_card(
+        db, str(tmp_path / "card"), True, manifest_dir, "scan-pause",
+    )
+    manifest_path = card_cleanup.manifest_path(manifest_dir, "scan-pause")
+    with open(manifest_path, "rb") as f:
+        before = f.read()
+    entered, release = threading.Event(), threading.Event()
+    checked = []
+    original = card_cleanup.os.lstat
+
+    def lstat(path, *args, **kwargs):
+        st = original(path, *args, **kwargs)
+        if str(path) in card_paths:
+            checked.append(str(path))
+            if len(checked) == 1:
+                entered.set()
+                assert release.wait(5)
+        return st
+
+    monkeypatch.setattr(card_cleanup.os, "lstat", lstat)
+    runner = app._job_runner
+
+    def work(job):
+        thread_db = Database(db._db_path)
+        thread_db.set_active_workspace(db._ws_id())
+        try:
+            return card_cleanup.verify_manifest_archives(
+                thread_db, manifest, manifest_dir,
+                should_cancel=lambda: runner.is_cancelled(job["id"]),
+            )
+        finally:
+            thread_db.close()
+
+    job_id = runner.start("card-cleanup-verify", work, pausable=True)
+    client = app.test_client()
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        release.set()
+        wait_for_job(lambda: runner.get(job_id), terminal=("paused",), timeout=5)
+        assert len(checked) == 1
+        with open(manifest_path, "rb") as f:
+            assert f.read() == before
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        job = wait_for_job_via_client(client, job_id)
+        assert job["status"] == ("completed" if action == "resume" else "cancelled")
+        with open(manifest_path, "rb") as f:
+            after = f.read()
+        if action == "resume":
+            assert len(checked) == count
+            assert json.loads(after)["revision"] == json.loads(before)["revision"] + 1
+        else:
+            assert len(checked) == 1
+            assert after == before
+    finally:
+        release.set()
+        runner.cancel_job(job_id)
+
+
 def test_verify_endpoint_loads_manifest_inside_cleanup_job_lock():
     """Codex P1 (commit ad9375db): the verify endpoint must load the
     manifest INSIDE the ``_CARD_CLEANUP_JOB_LOCK`` critical section, not

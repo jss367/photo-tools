@@ -521,6 +521,23 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     """
     source_root = manifest["source_root"]
     contains_check = path_guard.make_case_folded_check(source_root)
+    stats = {
+        "hashes_total": 0, "hashes_processed": 0,
+        "archive_files_read": 0, "verified": 0,
+        "modified": 0, "corrupt": 0, "unreadable": 0,
+        "cancelled": False, "remaining": 0,
+        "unblocked_files": 0, "unblocked_bytes": 0,
+    }
+
+    def checkpoint():
+        if should_cancel is not None and should_cancel():
+            stats["cancelled"] = True
+            stats["remaining"] = stats["hashes_total"] - stats["hashes_processed"]
+            # Promotions are only visible after the manifest is published.
+            stats["unblocked_files"] = 0
+            stats["unblocked_bytes"] = 0
+            return True
+        return False
 
     # Codex P2: a prior delete_verified run on this scan unlinks card
     # files but never rewrites the manifest, so its deletable entries
@@ -559,6 +576,8 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     # side effect other card scans keyed off the same hash rely on.
     surviving = []
     for entry in manifest["entries"]:
+        if checkpoint():
+            return stats
         if entry.get("bucket") != "deletable":
             surviving.append(entry)
             continue
@@ -591,19 +610,15 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
 
     pending_by_hash = {}
     for entry in manifest["entries"]:
+        if checkpoint():
+            return stats
         if (entry.get("bucket") == "kept"
                 and entry.get("reason") == KEEP_NOT_VERIFIED
                 and entry.get("hash")):
             pending_by_hash.setdefault(entry["hash"], []).append(entry)
 
     pending = list(pending_by_hash.items())
-    stats = {
-        "hashes_total": len(pending), "hashes_processed": 0,
-        "archive_files_read": 0, "verified": 0,
-        "modified": 0, "corrupt": 0, "unreadable": 0,
-        "cancelled": False, "remaining": 0,
-        "unblocked_files": 0, "unblocked_bytes": 0,
-    }
+    stats["hashes_total"] = len(pending)
     failure_reasons = {}
     # qualify_rows deliberately prioritizes any NULL-status row so a viable
     # independent copy remains retryable. Once this run establishes that no
@@ -613,10 +628,8 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     terminal_reasons = {}
 
     for i, (expected_hash, card_entries) in enumerate(pending):
-        if should_cancel is not None and should_cancel():
-            stats["cancelled"] = True
-            stats["remaining"] = len(pending) - i
-            break
+        if checkpoint():
+            return stats
         if progress_cb is not None:
             progress_cb(
                 i + 1, len(pending),
@@ -847,8 +860,12 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     # deletable rows are not re-audited or invalidated by this scoped job.
     missing_pending_entry_ids = set()
     for expected_hash, card_entries in pending_by_hash.items():
+        if checkpoint():
+            return stats
         rows = fetch_rows_by_hash(db, expected_hash)
         for entry in card_entries:
+            if checkpoint():
+                return stats
             # Codex P2 (follow-up 3): qualify_rows only inspects catalog
             # rows — it cannot see that this card file has been replaced,
             # resized, or turned into a symlink since the scan. Promoting
@@ -927,6 +944,8 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
         "ignored": {"count": 0},
     }
     for entry in manifest["entries"]:
+        if checkpoint():
+            return stats
         bucket = entry.get("bucket")
         if bucket == "ignored":
             totals["ignored"]["count"] += 1
@@ -939,6 +958,8 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     # number the moment it lands. Missing on old manifests (pre-revision
     # schema) is treated as the initial revision — the next write is the
     # first observable change.
+    if checkpoint():
+        return stats
     manifest["revision"] = int(
         manifest.get("revision", INITIAL_MANIFEST_REVISION)) + 1
     write_manifest(manifest_dir, manifest)

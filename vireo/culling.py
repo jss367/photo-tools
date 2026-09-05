@@ -111,6 +111,8 @@ def analyze_for_culling(
     # the same model that named its species.
     predictions = {}
     for pid in photo_ids:
+        if pause_callback:
+            pause_callback()
         pred = db.conn.execute(
             """SELECT pr.species, pr.confidence, pr.classifier_model
                FROM predictions pr
@@ -135,6 +137,8 @@ def analyze_for_culling(
     filenames = {}
     missing_phash = []
     for pid in photo_ids:
+        if pause_callback:
+            pause_callback()
         row = db.conn.execute(
             "SELECT quality_score, sharpness, subject_sharpness, extension, timestamp, phash, filename FROM photos WHERE id = ?",
             (pid,),
@@ -223,6 +227,8 @@ def analyze_for_culling(
     # Group by species (and optionally file type)
     species_map = {}
     for pid in photo_ids:
+        if pause_callback:
+            pause_callback()
         if pid not in predictions:
             continue
         sp = predictions[pid]["species"]

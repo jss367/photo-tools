@@ -12,17 +12,17 @@ not a checkpoint that survives restarting the application.
 | --- | --- |
 | Prepare full resolution, generate previews, cache originals for offline use | Between photos |
 | Generate thumbnails, develop photos, extract subject masks | Between photos |
-| Export photos, export for iNaturalist, move selected photos | Between photos and after export metadata finishes; active subprocesses finish before a pause is confirmed |
+| Export photos, export for iNaturalist, move selected photos | Between photos and after export metadata finishes; active subprocesses finish and moved-folder counts are reconciled before a pause is confirmed |
 | Verify photo hashes | Between files, after committing the completed batch prefix |
 | Adjust capture time | Between photos, after the metadata write and catalog update |
 | Scan for duplicates | Between duplicate groups |
 | Score sharpness | Between burst groups, saved scores, and automatic flags |
-| Analyze photos for culling | Between scene-hash calculations and species groups, and before saving the final result |
+| Analyze photos for culling | During metadata loading, between scene-hash calculations and species groups, and before saving the final result |
 | Regroup encounters and bursts | Between loading, grouping, and saving stages |
 | Verify installed models | Between models |
 | Fetch regional species labels | Between request progress updates |
 | Import and organize photos | During discovery, between metadata batches of at most 100 files, and between copies; combined imports also use the scanner's pause coordination |
-| Import Lightroom catalog keywords | Between photos, after committing completed keyword writes |
+| Import Lightroom catalog keywords | During catalog reading and merging, and between photos after committing completed keyword writes; source catalog read locks are released before pausing |
 | Verify abandoned import staging folders | During directory enumeration and between files |
 | Scan memory cards, verify archive copies, delete verified card files | During card discovery, between files or archive hash groups |
 | Classify photos | Between photos and stages; label embedding computation checkpoints and releases shared cache locks before pausing |

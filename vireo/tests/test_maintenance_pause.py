@@ -34,6 +34,165 @@ def _second_photo(db, photo_id):
 
 
 @pytest.mark.parametrize("action", ["resume", "cancel"])
+def test_move_pause_reconciles_folder_counts(client_with_photo, monkeypatch, tmp_path, action):
+    import move
+
+    app, db, first = client_with_photo
+    second = _second_photo(db, first)
+    source_id = db.get_photo(first)["folder_id"]
+    db.update_folder_counts()
+    destination = tmp_path / "moved"
+    entered, release = threading.Event(), threading.Event()
+    copies = []
+    original = move._copy_and_verify
+
+    def copy(src, dst):
+        copies.append(src)
+        if len(copies) == 1:
+            entered.set()
+            assert release.wait(5)
+        return original(src, dst)
+
+    monkeypatch.setattr(move, "_copy_and_verify", copy)
+    client = app.test_client()
+    runner = app._job_runner
+    job_id = client.post("/api/jobs/move-photos", json={
+        "photo_ids": [first, second], "destination": str(destination),
+    }).get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        assert len(copies) == 1
+        moved_folder = db.get_photo(first)["folder_id"]
+        tree = {f["id"]: f for f in db.get_folder_tree()}
+        assert tree[source_id]["photo_count"] == 1
+        assert tree[moved_folder]["photo_count"] == 1
+        db.conn.execute("UPDATE photos SET rating=3 WHERE id=?", (first,))
+        db.conn.commit()
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        job = wait_for_job_via_client(client, job_id)
+        assert job["status"] == ("completed" if action == "resume" else "cancelled")
+        tree = {f["id"]: f for f in db.get_folder_tree()}
+        assert tree[source_id]["photo_count"] == (0 if action == "resume" else 1)
+        assert tree[moved_folder]["photo_count"] == (2 if action == "resume" else 1)
+        assert job["result"]["moved"] == (2 if action == "resume" else 1)
+    finally:
+        release.set()
+        runner.cancel_job(job_id)
+
+
+@pytest.mark.parametrize("phase", ["predictions", "metadata"])
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+def test_culling_pauses_during_metadata_loading(client_with_photo, monkeypatch, phase, action):
+    from web.background_jobs import JobLaunch
+
+    app, db, first = client_with_photo
+    _second_photo(db, first)
+    db.conn.execute("UPDATE photos SET phash='0000000000000000'")
+    db.conn.commit()
+    entered, release = threading.Event(), threading.Event()
+    queries = []
+    match = "FROM predictions pr" if phase == "predictions" else "SELECT quality_score, sharpness"
+    original = JobLaunch.thread_db
+
+    class Connection:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __getattr__(self, name):
+            return getattr(self.conn, name)
+
+        def execute(self, query, *args):
+            if match in query:
+                queries.append(query)
+                if len(queries) == 1:
+                    entered.set()
+                    assert release.wait(5)
+            return self.conn.execute(query, *args)
+
+    def thread_db(ctx):
+        database = original(ctx)
+        database.conn = Connection(database.conn)
+        return database
+
+    monkeypatch.setattr(JobLaunch, "thread_db", thread_db)
+    client = app.test_client()
+    runner = app._job_runner
+    job_id = client.post("/api/jobs/cull", json={}).get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        assert len(queries) == 1
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        job = wait_for_job_via_client(client, job_id)
+        assert job["status"] == ("completed" if action == "resume" else "cancelled")
+        assert len(queries) == (2 if action == "resume" else 1)
+    finally:
+        release.set()
+        runner.cancel_job(job_id)
+
+
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+def test_lightroom_import_pauses_during_catalog_read(client_with_photo, monkeypatch, tmp_path, action):
+    import sqlite3
+
+    import catalog
+    from test_importer import _create_test_catalog
+
+    app, db, photo_id = client_with_photo
+    photo = db.get_photo(photo_id)
+    source = db.conn.execute(
+        "SELECT path FROM folders WHERE id=?", (photo["folder_id"],),
+    ).fetchone()["path"]
+    catalog_path = tmp_path / "keywords.lrcat"
+    entries = [(photo["filename"], "", [("Bird", None)])]
+    entries.extend((f"extra{i}.jpg", "", [("Bird", None)]) for i in range(256))
+    _create_test_catalog(str(catalog_path), source + os.sep, entries)
+    entered, release = threading.Event(), threading.Event()
+    processed = []
+    original = catalog._build_hierarchy_path
+
+    def hierarchy(*args):
+        processed.append(True)
+        if len(processed) == 1:
+            entered.set()
+            assert release.wait(5)
+        return original(*args)
+
+    monkeypatch.setattr(catalog, "_build_hierarchy_path", hierarchy)
+    client = app.test_client()
+    runner = app._job_runner
+    job_id = client.post("/api/jobs/import", json={
+        "catalogs": [str(catalog_path)],
+    }).get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        assert len(processed) == 1
+        # A paused import must not retain the external catalog's read lock.
+        with sqlite3.connect(str(catalog_path), timeout=0.5) as writer:
+            writer.execute("UPDATE AgLibraryKeyword SET name=name")
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        job = wait_for_job_via_client(client, job_id)
+        assert job["status"] == ("completed" if action == "resume" else "cancelled")
+        if action == "resume":
+            assert len(processed) == 257
+            assert job["result"]["imported"] == 1
+            assert job["result"]["skipped"] == 256
+        else:
+            assert len(processed) == 1
+    finally:
+        release.set()
+        runner.cancel_job(job_id)
+
+
+@pytest.mark.parametrize("action", ["resume", "cancel"])
 def test_previews_pause_before_eviction(client_with_photo, monkeypatch, action):
     import app as app_module
 

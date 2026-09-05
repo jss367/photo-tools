@@ -23809,7 +23809,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 destination=destination,
                 progress_cb=progress_cb,
                 developed_dir=developed_dir,
-                cancel_check=lambda: ctx.runner.is_cancelled(job["id"]),
+                cancel_check=lambda: ctx.runner.cancellation_requested(job["id"]),
+                pause_requested=lambda: ctx.runner.pause_requested(job["id"]),
+                pause_callback=lambda: ctx.runner.is_cancelled(job["id"]),
             )
             if int(result.get("moved") or 0) > 0:
                 try:

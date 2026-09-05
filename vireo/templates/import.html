@@ -2035,7 +2035,8 @@ async function pollJobResult(jobId) {
     const resp = await fetch('/api/jobs/' + jobId);
     if (resp.ok) {
       const job = await resp.json();
-      if (job.status && job.status !== 'running' && job.status !== 'queued') {
+      if (['queued', 'running', 'pausing', 'paused'].includes(job.status)) i = -1;
+      if (['completed', 'failed', 'cancelled', 'expired'].includes(job.status)) {
         if (job.status === 'failed') {
           const msg = (job.errors && job.errors[0]) || 'job failed';
           throw new Error(msg);
@@ -3771,7 +3772,8 @@ async function finishJob(jobId) {
     const resp = await fetch('/api/jobs/' + jobId);
     if (resp.ok) {
       job = await resp.json();
-      if (job.status && job.status !== 'running' && job.status !== 'queued') break;
+      if (['queued', 'running', 'pausing', 'paused'].includes(job.status)) i = -1;
+      if (['completed', 'failed', 'cancelled', 'expired'].includes(job.status)) break;
     }
     await new Promise(r => setTimeout(r, 1000));
   }

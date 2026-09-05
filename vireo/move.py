@@ -1983,7 +1983,7 @@ def _blocked_destination_developed_path(destination, developed_dir):
 
 
 def move_photos(db, photo_ids, destination, progress_cb=None,
-                developed_dir="", developed_listing_cache=None):
+                developed_dir="", developed_listing_cache=None, cancel_check=None):
     """Move individual photos to a destination directory.
 
     Args:
@@ -2131,6 +2131,8 @@ def move_photos(db, photo_ids, destination, progress_cb=None,
 
     try:
         for i, pid in enumerate(photo_ids):
+            if cancel_check and cancel_check():
+                break
             photo = photos_map.get(pid)
             if not photo:
                 errors.append(f"Photo {pid} not found in database")

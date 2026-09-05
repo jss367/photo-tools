@@ -654,7 +654,7 @@ async function runHashVerify() {
     while (true) {
       await new Promise(function(r) { setTimeout(r, 1000); });
       job = await safeFetch('/api/jobs/' + jobId, {}, { toast: false });
-      if (job.status !== 'running') break;
+      if (['completed', 'failed', 'cancelled', 'expired'].includes(job.status)) break;
       var p = job.progress || {};
       if (p.total) {
         status.textContent = 'Hashing ' + p.current + ' / ' + p.total +

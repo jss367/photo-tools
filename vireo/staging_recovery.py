@@ -211,7 +211,7 @@ def _infer_destination(source_root: str, staged_file: str, folder_path: str) -> 
     return folder_path
 
 
-def verify_orphaned_staging(db, vireo_dir: str, cleanup_root: str) -> dict:
+def verify_orphaned_staging(db, vireo_dir: str, cleanup_root: str, pause_callback=None) -> dict:
     """Reconcile a staging folder against the catalog and archive filesystem."""
     entry = _resolve_entry(vireo_dir, cleanup_root)
     files: list[tuple[str, str, int]] = []
@@ -245,6 +245,8 @@ def verify_orphaned_staging(db, vireo_dir: str, cleanup_root: str) -> dict:
     archive_listing_cache: dict[str, set[str] | OSError] = {}
 
     for staged_path, rel_path, size in files:
+        if pause_callback:
+            pause_callback()
         candidates = _catalog_candidates(
             db, os.path.basename(staged_path), size, entry.cleanup_root,
         )

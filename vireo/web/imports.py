@@ -1371,6 +1371,7 @@ def create_imports_blueprint(
                     skip_duplicates=skip_duplicates,
                     verify_by_hash=verify_by_hash,
                     progress_callback=ingest_cb,
+                    pause_callback=lambda: ctx.checkpoint(job),
                     skip_paths=exclude_paths or None,
                 )
                 copied_paths = ingest_result.get("copied_paths", [])
@@ -1516,6 +1517,7 @@ def create_imports_blueprint(
             thumb_result = generate_all(
                 thread_db, config["THUMB_CACHE_DIR"],
                 progress_callback=thumb_cb,
+                cancel_check=lambda: ctx.runner.is_cancelled(job["id"]),
                 vireo_dir=vireo_dir,
             )
             from thumbnails import format_summary as thumb_summary
@@ -1582,7 +1584,7 @@ def create_imports_blueprint(
             return result
 
         return ctx.start(
-            "import-full", work,
+            "import-full", work, pausable=True,
             config={"source": source, "destination": destination, "copy": copy, "file_types": file_types},
         )
 
@@ -1619,10 +1621,11 @@ def create_imports_blueprint(
                 write_xmp=write_xmp,
                 strategy=strategy,
                 progress_callback=progress_cb,
+                pause_callback=lambda: ctx.checkpoint(job),
             )
 
         return ctx.start(
-            "import", work, config={"catalogs": catalogs, "strategy": strategy},
+            "import", work, pausable=True, config={"catalogs": catalogs, "strategy": strategy},
         )
 
     @blueprint.route("/api/import/orphaned-staging", methods=["GET"])
@@ -1648,11 +1651,14 @@ def create_imports_blueprint(
 
         def work(job):
             thread_db = ctx.thread_db()
-            return verify_orphaned_staging(thread_db, vireo_dir, path)
+            return verify_orphaned_staging(
+                thread_db, vireo_dir, path, pause_callback=lambda: ctx.checkpoint(job),
+            )
 
         return ctx.start(
             "staging-verify",
             work,
+            pausable=True,
             config={"path": path},
         )
 

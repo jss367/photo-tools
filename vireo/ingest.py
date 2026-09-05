@@ -466,6 +466,7 @@ def ingest(
     recursive=True,
     verify_by_hash=False,
     duplicate_checker=None,
+    pause_callback=None,
 ):
     """Copy and organize photos from source to destination.
 
@@ -662,6 +663,8 @@ def ingest(
         checker.prepare(files)
     to_copy: list[Path] = []
     for source_file in files:
+        if pause_callback:
+            pause_callback()
         if checker is not None:
             try:
                 token = checker.match(source_file)
@@ -712,6 +715,8 @@ def ingest(
     batch_dest_folders: dict[tuple, str] = {}
 
     for source_file in to_copy:
+        if pause_callback:
+            pause_callback()
         try:
             # Intra-batch dedup: a byte-identical sibling earlier in this
             # batch already landed (or matched an existing destination

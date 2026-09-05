@@ -550,7 +550,7 @@ def load_export_image(photo, vireo_dir, folders, *, recipe=None, exif_data=None,
 
 
 def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
-                  progress_cb=None, cancel_check=None):
+                  progress_cb=None, cancel_check=None, cancel_only_check=None):
     """Export photos with optional resize and renaming.
 
     Args:
@@ -595,6 +595,8 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
                 job result.
         progress_cb: optional callback(current, total, current_file)
         cancel_check: optional callable; stop before the next photo when true.
+        cancel_only_check: non-parking cancellation probe for polling a live
+            metadata subprocess. Defaults to cancel_check for existing callers.
 
     Returns:
         dict with the export count, errors, destination mode, and resolved
@@ -809,7 +811,7 @@ def export_photos(db, vireo_dir, photo_ids, destination=None, options=None,
 
     if metadata_jobs:
         metadata_exported, metadata_errors = _write_export_metadata_batch(
-            metadata_jobs, cancel_check=cancel_check,
+            metadata_jobs, cancel_check=cancel_only_check or cancel_check,
         )
         exported += metadata_exported
         errors.extend(metadata_errors)

@@ -399,10 +399,12 @@ def adjust_capture_time(
             written += 1
             shifts_used.append(photo_shift)
         except (subprocess.TimeoutExpired, RuntimeError, OSError) as exc:
+            db.conn.rollback()
             log.warning("Capture-time adjustment failed for photo %s: %s", photo["id"], exc)
             failed += 1
             failures.append({"photo_id": photo["id"], "filename": photo["filename"], "error": str(exc)})
         except Exception as exc:
+            db.conn.rollback()
             log.exception("Unexpected capture-time adjustment error for photo %s", photo["id"])
             failed += 1
             failures.append({"photo_id": photo["id"], "filename": photo["filename"], "error": str(exc)})

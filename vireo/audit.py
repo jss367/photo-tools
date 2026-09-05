@@ -312,7 +312,7 @@ def delete_stray_sidecars(paths, allowed_roots):
     return deleted
 
 
-def verify_hashes(db, progress_cb=None, should_cancel=None):
+def verify_hashes(db, progress_cb=None, should_cancel=None, pause_requested=None, pause_callback=None):
     """Re-hash every workspace photo and compare against the stored SHA-256.
 
     Verdicts per photo (stored in photos.hash_status):
@@ -338,7 +338,10 @@ def verify_hashes(db, progress_cb=None, should_cancel=None):
     Args:
         db: Database instance (workspace must be active)
         progress_cb: optional callable(current, total, filename)
-        should_cancel: optional callable() -> bool, checked per file
+        should_cancel: optional cancellation-only callable() -> bool, checked per file
+        pause_requested: optional non-parking probe; a pending pause commits
+            the current batch before pause_callback may park the worker
+        pause_callback: optional safe checkpoint, called after that commit
 
     Returns stats dict: {checked, ok, baselined, modified, corrupt,
     unreadable, missing, cancelled}
@@ -353,6 +356,12 @@ def verify_hashes(db, progress_cb=None, should_cancel=None):
     }
 
     for i, photo in enumerate(photos):
+        # Commit the completed prefix before a cooperative pause. Otherwise
+        # the sleeping verifier retains SQLite's writer lock.
+        if pause_requested and pause_requested():
+            db.conn.commit()
+            if pause_callback:
+                pause_callback()
         if should_cancel and should_cancel():
             stats["cancelled"] = True
             break

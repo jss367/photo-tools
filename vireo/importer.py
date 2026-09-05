@@ -96,7 +96,8 @@ def preview_import(catalog_paths, db):
 
 
 def execute_import(
-    catalog_paths, db, write_xmp=False, strategy="merge_all", progress_callback=None
+    catalog_paths, db, write_xmp=False, strategy="merge_all", progress_callback=None,
+    pause_callback=None,
 ):
     """Import keywords from catalogs into the Vireo database.
 
@@ -152,6 +153,9 @@ def execute_import(
     total = len(merged)
 
     for i, (file_path, kw_data) in enumerate(merged.items()):
+        if pause_callback:
+            db.conn.commit()
+            pause_callback()
         # Find matching photo in DB
         photo = photos_by_path.get(file_path)
         if not photo:

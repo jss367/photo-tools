@@ -3739,3 +3739,37 @@ def test_export_metadata_subprocess_can_be_cancelled(tmp_path, monkeypatch, canc
     assert count == (0 if cancel else 1)
     assert bool(errors) == cancel
     assert output.exists() != cancel
+
+
+def test_export_keeps_metadata_subprocess_polling_cancel_only(export_env, monkeypatch):
+    """A pause request cannot park the parent while ExifTool still writes."""
+    import export as export_module
+
+    env = export_env
+    metadata_running = False
+    polls = []
+
+    def photo_checkpoint():
+        assert not metadata_running, "reported paused with metadata still active"
+        return False
+
+    def cancel_only():
+        polls.append("cancel")
+        return False
+
+    def write_metadata(jobs, cancel_check=None):
+        nonlocal metadata_running
+        metadata_running = True
+        # Simulate the active subprocess's repeated cancellation polls.
+        assert cancel_check() is False
+        assert cancel_check() is False
+        return len(jobs), []
+
+    monkeypatch.setattr(export_module, "_write_export_metadata_batch", write_metadata)
+    result = export_photos(
+        db=env["db"], vireo_dir=env["vireo_dir"], photo_ids=[env["p1"]],
+        destination=env["dest"], options={"metadata_fields": ["capture_date"]},
+        cancel_check=photo_checkpoint, cancel_only_check=cancel_only,
+    )
+    assert result["exported"] == 1
+    assert polls == ["cancel", "cancel"]

@@ -231,8 +231,9 @@ def test_delete_refuses_cancelled_scan(app_and_db):
     assert resp.status_code == 400
 
 
+@pytest.mark.parametrize("status", ["running", "pausing", "paused"])
 def test_delete_refuses_running_scan_without_telling_user_to_rescan(
-        app_and_db):
+        app_and_db, status):
     """A delete requested while the scan is still going is early, not
     doomed — the error must say to wait, not to re-scan."""
     app, db = app_and_db
@@ -240,7 +241,7 @@ def test_delete_refuses_running_scan_without_telling_user_to_rescan(
     db.conn.execute(
         "INSERT INTO job_history (id, type, status, started_at) "
         "VALUES (?, ?, ?, ?)",
-        ("scan-run", "card-cleanup-scan", "running", "2026-08-08T00:00:00"),
+        ("scan-run", "card-cleanup-scan", status, "2026-08-08T00:00:00"),
     )
     db.conn.commit()
     resp = client.post(
@@ -321,7 +322,8 @@ def test_delete_expired_manifest_404(app_and_db, tmp_path):
     assert "re-scan" in delete_resp.get_json()["error"]
 
 
-def test_delete_concurrent_delete_409(app_and_db, tmp_path, monkeypatch):
+@pytest.mark.parametrize("status", ["running", "pausing", "paused"])
+def test_delete_concurrent_delete_409(app_and_db, tmp_path, monkeypatch, status):
     app, db = app_and_db
     client = app.test_client()
     _make_verified_pair(db, tmp_path)
@@ -340,6 +342,8 @@ def test_delete_concurrent_delete_409(app_and_db, tmp_path, monkeypatch):
                                  should_cancel=None):
         started.set()
         release.wait(timeout=15)
+        if should_cancel:
+            should_cancel()
         return {
             "deleted": 0, "deleted_bytes": 0, "skipped": [], "failed": [],
             "cancelled": False, "remaining": 0,
@@ -371,6 +375,14 @@ def test_delete_concurrent_delete_409(app_and_db, tmp_path, monkeypatch):
         while not _running() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert _running()
+        if status != "running":
+            assert runner.pause_job(job1_id)
+            if status == "paused":
+                release.set()
+                deadline = time.monotonic() + 15
+                while runner.get(job1_id)["status"] != "paused" and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            assert runner.get(job1_id)["status"] == status
 
         resp2 = client.post(
             "/api/card-cleanup/delete",
@@ -382,6 +394,7 @@ def test_delete_concurrent_delete_409(app_and_db, tmp_path, monkeypatch):
         monkeypatch.setattr(
             card_cleanup, "delete_verified", real_delete_verified)
         if job1_id:
+            app._job_runner.resume_job(job1_id)
             _wait_for_job(client, job1_id)
 
 

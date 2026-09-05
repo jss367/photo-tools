@@ -424,6 +424,10 @@ def verify_hashes(db, progress_cb=None, should_cancel=None, pause_requested=None
 
     # A cancelled run verified only a prefix of the library — recording it
     # would let the summary banner claim coverage that doesn't exist.
+    if pause_callback:
+        pause_callback()
+    if should_cancel and should_cancel():
+        stats["cancelled"] = True
     if not stats["cancelled"]:
         problems = stats["modified"] + stats["corrupt"] + stats["unreadable"]
         db.record_audit_run("integrity", problems)

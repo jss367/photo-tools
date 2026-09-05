@@ -106,6 +106,40 @@ def _wait_for_status(runner, job_id, status, timeout=3.0):
     )
 
 
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+def test_pause_during_final_work_is_honored_before_completion(action):
+    from jobs import JobRunner
+
+    runner = JobRunner()
+    started = threading.Event()
+    release = threading.Event()
+    resources_released = threading.Event()
+
+    def work(job):
+        try:
+            started.set()
+            assert release.wait(3)
+            return {"items": 1}
+        finally:
+            resources_released.set()
+
+    job_id = runner.start("test", work, pausable=True)
+    try:
+        assert started.wait(3)
+        assert runner.pause_job(job_id)
+        release.set()
+        _wait_for_status(runner, job_id, "paused")
+        assert resources_released.is_set()
+        assert not any(e["type"] == "complete" for e in runner.get_events(job_id))
+        assert getattr(runner, f"{action}_job")(job_id)
+        job = wait_for_job_via_runner(runner, job_id)
+        assert job["status"] == ("completed" if action == "resume" else "cancelled")
+        assert job["result"] == {"items": 1}
+    finally:
+        release.set()
+        runner.shutdown(timeout=3)
+
+
 def test_pausable_job_stops_at_checkpoint_and_resumes():
     """Paused work retains its local state and continues after Resume."""
     from jobs import JobRunner

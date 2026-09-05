@@ -31,6 +31,9 @@ not a checkpoint that survives restarting the application.
 
 Cancelling a paused job wakes it so it can exit and perform its normal cleanup.
 Completed work remains subject to the job's usual cancellation behavior.
+An accepted pause during the final item is honored before the runner publishes
+completion, after the worker has released its resources. Completed file writes
+remain intact while the job waits for Resume or Cancel.
 
 ## Exceptions
 
@@ -47,8 +50,8 @@ These jobs deliberately remain without Pause in the current implementation:
 | Automatic startup backfills, missing-original scans, and new-image discovery | These are internal, ephemeral maintenance or discovery tasks rather than user-managed jobs. |
 
 Website publishing's final replacement step is also uninterrupted, even when
-Pause was available earlier in preparation. A pause request arriving after the
-last safe checkpoint may be overtaken by normal job completion.
+Pause was available earlier in preparation. Once that commit step begins,
+new pause and cancellation requests are rejected.
 
 ## Adding a new job
 

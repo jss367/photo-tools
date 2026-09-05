@@ -244,11 +244,16 @@ def test_cache_pause_finishes_current_photo_and_preserves_progress(
         runner.cancel_job(job_id)
 
 
-def test_hash_verification_commits_before_pause(client_with_photo, monkeypatch):
+@pytest.mark.parametrize("photo_count", [1, 2])
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+def test_hash_verification_commits_before_pause(
+    client_with_photo, monkeypatch, photo_count, action,
+):
     import scanner
 
     app, db, first = client_with_photo
-    _second_photo(db, first)
+    if photo_count == 2:
+        _second_photo(db, first)
     client = app.test_client()
     runner = app._job_runner
     original = scanner.compute_file_hash
@@ -275,12 +280,93 @@ def test_hash_verification_commits_before_pause(client_with_photo, monkeypatch):
         assert db.conn.execute(
             "SELECT COUNT(*) FROM photos WHERE hash_status='ok'",
         ).fetchone()[0] == 1
+        assert not db.get_audit_runs()
         db.conn.execute("UPDATE photos SET rating=4 WHERE id=?", (first,))
         db.conn.commit()
-        assert client.post(f"/api/jobs/{job_id}/resume").status_code == 200
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
         finished = wait_for_job_via_client(client, job_id)
-        assert finished["status"] == "completed", finished
-        assert len(calls) == 2
+        assert finished["status"] == ("completed" if action == "resume" else "cancelled")
+        assert len(calls) == (photo_count if action == "resume" else 1)
+        assert bool(db.get_audit_runs()) == (action == "resume")
+    finally:
+        release.set()
+        runner.cancel_job(job_id)
+
+
+@pytest.mark.parametrize("endpoint", ["capture-time", "inat-export"])
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+def test_final_file_write_pauses_after_completion(
+    client_with_photo, monkeypatch, tmp_path, endpoint, action,
+):
+    from types import SimpleNamespace
+
+    app, db, photo_id = client_with_photo
+    entered = threading.Event()
+    release = threading.Event()
+    writing = threading.Event()
+
+    def finish_write():
+        writing.set()
+        entered.set()
+        assert release.wait(5)
+        writing.clear()
+
+    if endpoint == "capture-time":
+        import capture_time
+
+        def run(*args, **kwargs):
+            finish_write()
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def refresh(database, ident, path):
+            database.conn.execute("UPDATE photos SET rating=2 WHERE id=?", (ident,))
+
+        monkeypatch.setattr(capture_time.shutil, "which", lambda _: "/usr/bin/exiftool")
+        monkeypatch.setattr(capture_time.subprocess, "run", run)
+        monkeypatch.setattr(capture_time, "_refresh_photo_metadata", refresh)
+        url = "/api/jobs/capture-time"
+        body = {"photo_ids": [photo_id], "mode": "manual", "shift_minutes": 60}
+    else:
+        import inat_export
+
+        output = tmp_path / "exported.jpg"
+
+        def export(*args, **kwargs):
+            finish_write()
+            output.write_bytes(b"exported photo")
+            return str(output)
+
+        monkeypatch.setattr(inat_export, "export_inat_photo", export)
+        url = "/api/inat/export"
+        body = {"submissions": [{"photo_id": photo_id}], "destination": str(tmp_path)}
+
+    client = app.test_client()
+    runner = app._job_runner
+    response = client.post(url, json=body)
+    assert response.status_code == 200, response.get_json()
+    job_id = response.get_json()["job_id"]
+    try:
+        assert entered.wait(5)
+        assert runner.pause_job(job_id)
+        assert runner.get(job_id)["status"] == "pausing"
+        release.set()
+        _wait_status(runner, job_id, "paused")
+        assert not writing.is_set()
+        if endpoint == "capture-time":
+            assert db.get_photo(photo_id)["rating"] == 2
+        else:
+            assert output.exists()
+        db.conn.execute("UPDATE photos SET rating=3 WHERE id=?", (photo_id,))
+        db.conn.commit()
+        assert client.post(f"/api/jobs/{job_id}/{action}").status_code == 200
+        finished = wait_for_job_via_client(client, job_id)
+        assert finished["status"] == ("completed" if action == "resume" else "cancelled")
+        if endpoint == "capture-time":
+            assert finished["result"]["updated"] == 1
+        else:
+            assert len(finished["result"]["exported"]) == 1
+            assert finished["result"]["revealed"] is False
+            assert output.exists()
     finally:
         release.set()
         runner.cancel_job(job_id)

@@ -835,11 +835,20 @@ class JobRunner:
                 _job_cancel_probe,
             ):
                 result = work_fn(job)
-            # Atomically check cancellation and set final status under the
-            # same lock acquisition to prevent a race where cancel_job()
-            # returns True but the job still finishes as "completed".
-            with self._lock:
+            # The worker has returned and released its resources. Honor a
+            # pause accepted during its final unit before publishing completion.
+            # Waiting and finalizing share the pause/cancel lock, so neither
+            # request can be accepted and then silently overtaken by completion.
+            with self._pause_condition:
                 job_id = job["id"]
+                while (
+                    job.get("pausable")
+                    and job_id in self._pause_requested
+                    and job_id not in self._cancelled
+                ):
+                    if job.get("status") != "paused":
+                        self._publish_status_locked(job, "paused")
+                    self._pause_condition.wait()
                 self._pause_requested.discard(job_id)
                 if job_id in self._cancelled:
                     job["status"] = "cancelled"
@@ -1535,8 +1544,9 @@ class JobRunner:
         """Request a cooperative pause at the job's next safe checkpoint.
 
         The public state moves to ``pausing`` immediately. The worker changes
-        it to ``paused`` only after it reaches :meth:`is_cancelled`, so the UI
-        never claims an in-flight ExifTool/copy batch has already stopped.
+        it to ``paused`` only at a cooperative checkpoint or after the worker
+        returns, so the UI never claims an in-flight ExifTool/copy batch has
+        already stopped.
         """
         with self._pause_condition:
             job = self._jobs.get(job_id)

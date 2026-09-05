@@ -21624,7 +21624,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         })
 
                 revealed = False
-                if exported and reveal and not ctx.runner.is_cancelled(job["id"]):
+                cancelled = ctx.runner.is_cancelled(job["id"])
+                if exported and reveal and not cancelled:
                     revealed = reveal_inat_exports(
                         [item["path"] for item in exported], destination,
                     )

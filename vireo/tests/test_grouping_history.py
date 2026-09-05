@@ -79,16 +79,7 @@ def test_grouping_restore_preserves_new_photo_metadata(app_and_db):
 
 
 def test_stale_grouping_entry_is_retired_and_preserves_newer_work(app_and_db):
-    """A stale grouping entry never blocks older undoable edits.
-
-    When reflow, regroup-live, or a later pipeline run replaces the cached
-    encounters after a detach, the entry's ``after`` snapshot no longer
-    matches the cache and can never be restored without erasing that newer
-    work. Undo must retire the stale row (deleting only the row, not the
-    cache) so the search resumes with the next candidate — otherwise the
-    row would remain the newest undoable grouping entry forever and every
-    older undoable edit would sit permanently unreachable behind it.
-    """
+    """A stale action is reported before an older, unrelated edit is undone."""
     app, db = app_and_db
     client = app.test_client()
     ids, _ = _seed(db)
@@ -101,7 +92,14 @@ def test_stale_grouping_entry_is_retired_and_preserves_newer_work(app_and_db):
     updated['encounters'][0]['bursts'].append({'photo_ids': [ids[0]]})
     save_results_raw(updated, os.path.dirname(db._db_path), db._ws_id())
 
-    # Undo retires the stale detach and then undoes the older flag edit.
+    # The advertised grouping action must not silently undo the older flag.
+    advertised = client.get('/api/undo/status').json
+    assert 'detach' in advertised['description'].lower()
+    assert client.post('/api/undo').status_code == 409
+    assert all(db.get_photo(pid)['flag'] == 'flagged' for pid in ids)
+    refreshed = client.get('/api/undo/status').json
+    assert refreshed['id'] != advertised['id']
+    assert 'flag' in refreshed['description'].lower()
     response = client.post('/api/undo')
     assert response.status_code == 200, response.get_json()
     assert 'flag' in response.get_json()['undone'].lower()
@@ -491,7 +489,7 @@ def test_confirm_history_preserves_cleared_override(app_and_db, undo_before_clea
 
     # A superseded confirmation is retired, never made redoable by a no-op undo.
     direction = 'redo' if undo_before_clear else 'undo'
-    assert client.post('/api/' + direction).status_code == 400
+    assert client.post('/api/' + direction).status_code == 409
     assert _load(db) == cleared
     assert client.get('/api/undo/status').json['available'] is False
     assert client.post('/api/redo').status_code == 400
@@ -745,6 +743,8 @@ def test_stale_combined_photo_history_retains_writer_lock(app_and_db, monkeypatc
     newer = _load(db)
     newer['encounters'][0]['bursts'].append({'photo_ids': []})
     save_results_raw(newer, os.path.dirname(db._db_path), db._ws_id())
+    assert client.post('/api/undo').status_code == 409
+    assert client.get('/api/undo/status').json['description'].startswith('Photo changes from:')
     if not undo:
         assert client.post('/api/undo').status_code == 200
     apply = grouping_history.apply_grouping_photo_edit
@@ -817,3 +817,24 @@ def test_legacy_burst_photo_detach_is_undoable_and_clear_is_rejected(app_and_db)
     assert _load(db)['encounters'] == before['encounters']
     assert client.post('/api/redo').status_code == 200
     assert _load(db)['encounters'][0]['burst_count'] == 3
+
+
+def test_stale_redo_reports_retirement_before_replaying_next_action(app_and_db):
+    app, db = app_and_db
+    client = app.test_client()
+    ids, _ = _seed(db)
+    _detach(client)
+    client.post('/api/batch/flag', json={'photo_ids': ids, 'flag': 'flagged'})
+    assert client.post('/api/undo').status_code == 200
+    assert client.post('/api/undo').status_code == 200
+    newer = _load(db)
+    newer['encounters'][0]['bursts'].append({'photo_ids': []})
+    save_results_raw(newer, os.path.dirname(db._db_path), db._ws_id())
+    assert 'detach' in client.get('/api/redo/status').json['description'].lower()
+    assert client.post('/api/redo').status_code == 409
+    assert all(db.get_photo(pid)['flag'] == 'none' for pid in ids)
+    assert _load(db) == newer
+    assert 'flag' in client.get('/api/redo/status').json['description'].lower()
+    assert client.post('/api/redo').status_code == 200
+    assert all(db.get_photo(pid)['flag'] == 'flagged' for pid in ids)
+    assert _load(db) == newer

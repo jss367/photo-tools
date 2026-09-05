@@ -3085,3 +3085,34 @@ def test_cull_pending_analysis_blocks_history_until_response(live_server, page, 
     assert page.evaluate('doUndo()') is True
     assert live_server['db'].get_photo(ids[0])['flag'] == 'none'
     expect(page.locator(f'.cull-card[data-photo-id="{ids[0]}"]')).to_have_class(re.compile(r'\breview\b'))
+
+
+def test_stale_undo_refreshes_the_advertised_action_without_undoing_another(live_server, page):
+    ids = live_server['data']['photos'][:4]
+    db = live_server['db']
+    _write_grouped_pipeline_cache(live_server, ids)
+    page.goto(live_server['url'] + '/pipeline/review')
+    page.evaluate('''async id => {
+      await safeFetch('/api/photos/' + id + '/flag', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({flag: 'flagged'})
+      });
+      await safeFetch('/api/pipeline/detach-burst', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({encounter_index: 0, burst_index: 0})
+      });
+    }''', ids[0])
+    button = page.locator('#historyUndoBtn')
+    expect(button).to_have_attribute('title', re.compile('detached', re.I))
+    path = os.path.join(os.path.dirname(db._db_path), f'pipeline_results_ws{db._ws_id()}.json')
+    with open(path) as cache_file:
+        newer = json.load(cache_file)
+    newer['encounters'][0]['bursts'].append({'photo_ids': []})
+    with open(path, 'w') as cache_file:
+        json.dump(newer, cache_file)
+    button.click()
+    expect(button).to_be_enabled()
+    expect(button).to_have_attribute('title', re.compile('flag', re.I))
+    assert db.get_photo(ids[0])['flag'] == 'flagged'
+    button.click()
+    expect(page.locator('#historyRedoBtn')).to_be_enabled()
+    assert db.get_photo(ids[0])['flag'] == 'none'

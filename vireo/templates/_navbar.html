@@ -10822,6 +10822,13 @@ function _lbScheduleSourceSwap(targetZoom) {
         // The failed request is no longer pending. Keep the usable bitmap
         // and resume its neighbors without automatically retrying this tier.
         _lbDesiredSrcKey = _lbCurrentSrcKey;
+        if (_lbPending1To1) {
+          _lbPending1To1 = false;
+          _lbPending1To1Anchor = null;
+          _lbPendingViewportState = null;
+          _lbUpdateZoomControl();
+          _lbSaveViewportState(photoId);
+        }
         _lbScheduleAdjacentPhoto(_lbCurrentSrcKey);
       }
       // Keep current source on failure

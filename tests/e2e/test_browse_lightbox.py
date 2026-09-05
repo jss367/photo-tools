@@ -3722,8 +3722,9 @@ def test_browse_lightbox_one_to_one_nav_falls_back_when_original_fails(live_serv
 
 
 @pytest.mark.parametrize("late_metadata", [False, True], ids=["early-metadata", "late-metadata"])
+@pytest.mark.parametrize("fallback_fails", [False, True], ids=["fallback-loads", "fallback-fails"])
 def test_browse_lightbox_restored_pending_one_to_one_waits_for_fallback_after_initial_original_fails(
-    live_server, page, late_metadata
+    live_server, page, late_metadata, fallback_fails
 ):
     """A restored pending 1:1 must not snap on /full after initial /original fails."""
     page.add_init_script(
@@ -3832,6 +3833,16 @@ def test_browse_lightbox_restored_pending_one_to_one_waits_for_fallback_after_in
     assert abs(waiting["zoom"] - 1) < 0.001
     assert waiting["currentSource"] == "full"
     assert waiting["desiredSource"] in ("2560", "3840")
+
+    if fallback_fails:
+        held_fallback.pop("route").abort()
+        page.wait_for_function("window._lbPending1To1 === false", timeout=3000)
+        assert page.evaluate("window._lbDesiredSrcKey") == "full"
+        assert page.evaluate("window._lbCurrentSrcKey") == "full"
+        assert page.evaluate("window._lbPending1To1Anchor") is None
+        assert abs(page.evaluate("window._lbZoom") - 1) < 0.001
+        expect(page.locator("#lightboxZoomBadge")).not_to_contain_text("Loading")
+        return
 
     held_fallback["released"] = True
     held_fallback.pop("route").fulfill(
